@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+workspace="${TINKER_WS:-/home/tinker/tk25_ws}"
+module="${1:-navigation}"
+dds_profile="${TINKER_SIM_DDS_PROFILE:-local}"
+shift || true
+
+if [[ "${module}" != "navigation" && "${module}" != "whole-robot" && "${module}" != "fixtures" && "${module}" != "manipulation" ]]; then
+  echo "usage: $0 {navigation|whole-robot|manipulation|fixtures} [ros2 launch arguments...]" >&2
+  exit 2
+fi
+
+source /opt/ros/humble/setup.bash
+source "${project_root}/.ros-vendor/humble/local_setup.bash"
+source "${workspace}/install/setup.bash"
+source "${project_root}/ros2_ws/install/setup.bash"
+set -u
+
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-25}"
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+export ROS2CLI_NO_DAEMON=1
+export TINKER_SIM_ROOT="${project_root}"
+export TINKER_WS="${workspace}"
+export PYTHONPATH="${project_root}/simulation${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ "${dds_profile}" == "lan" ]]; then
+  export FASTRTPS_DEFAULT_PROFILES_FILE="${project_root}/config/fastdds-lan.xml"
+elif [[ "${dds_profile}" == "local" ]]; then
+  unset FASTRTPS_DEFAULT_PROFILES_FILE
+else
+  echo "TINKER_SIM_DDS_PROFILE must be local or lan" >&2
+  exit 2
+fi
+
+launch_file="navigation.launch.py"
+if [[ "${module}" == "whole-robot" ]]; then
+  launch_file="whole_robot.launch.py"
+elif [[ "${module}" == "fixtures" ]]; then
+  launch_file="fixtures.launch.py"
+elif [[ "${module}" == "manipulation" ]]; then
+  launch_file="manipulation.launch.py"
+fi
+exec ros2 launch tinker_sim_bridge "${launch_file}" \
+  project_root:="${project_root}" tinker_workspace:="${workspace}" "$@"

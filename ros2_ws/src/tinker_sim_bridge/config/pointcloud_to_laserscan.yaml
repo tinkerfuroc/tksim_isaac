@@ -1,0 +1,15 @@
+pointcloud_to_laserscan:
+  ros__parameters:
+    use_sim_time: true
+    target_frame: livox360
+    transform_tolerance: 0.01
+    min_height: -0.05
+    max_height: 0.05
+    angle_min: -3.141592653589793
+    angle_max: 3.141592653589793
+    angle_increment: 0.017453292519943295
+    scan_time: 0.1
+    range_min: 0.3
+    range_max: 40.0
+    use_inf: true
+    inf_epsilon: 1.0

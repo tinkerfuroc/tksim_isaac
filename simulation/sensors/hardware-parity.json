@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "implementation": "isaac_omnigraph",
+  "clock": {"topic": "/clock", "reset_on_stop": false},
+  "head_camera": {
+    "color_topic": "/camera/color/image_raw",
+    "depth_topic": "/camera/depth/image_raw",
+    "camera_info_topic": "/camera/color/camera_info",
+    "frame_id": "camera_color_optical_frame",
+    "tick_rate_hz": 30,
+    "qos": "sensor_data"
+  },
+  "wrist_camera": {
+    "color_topic": "/camera/xarm_camera/color/image_raw",
+    "depth_topic": "/camera/xarm_camera/aligned_depth_to_color/image_raw",
+    "camera_info_topic": "/camera/xarm_camera/color/camera_info",
+    "frame_id": "xarm_camera_color_optical_frame",
+    "tick_rate_hz": 30,
+    "qos": "sensor_data"
+  },
+  "lidar": {
+    "pointcloud_topic": "/livox/lidar",
+    "scan_topic": "/scan",
+    "frame_id": "livox360",
+    "tick_rate_hz": 10,
+    "require_tick_rate_equal_scan_rate_base_hz": true,
+    "qos": "sensor_data"
+  },
+  "imu": {
+    "topic": "/livox/imu",
+    "frame_id": "livox360",
+    "tick_rate_hz": 200,
+    "qos": "sensor_data"
+  },
+  "contacts": {
+    "implementation": "isaacsim.sensors.experimental.physics.ContactSensor",
+    "links": ["left_finger", "right_finger", "link_tcp"],
+    "parity_topic": "/sim/parity/finger_contact",
+    "truth_topic": "/sim/truth/contacts"
+  }
+}

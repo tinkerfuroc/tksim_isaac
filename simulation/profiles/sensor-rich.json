@@ -1,0 +1,9 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": true,
+  "rtx_cameras": true,
+  "lidar": true,
+  "streaming": false,
+  "modules": ["base", "arm", "gripper", "pan_tilt", "rtx_cameras", "rtx_lidar", "contact"]
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "id": "qualification-free-gripper",
+  "qualification_gate": "free-gripper",
+  "seed": 7,
+  "world": {"mode": "current"},
+  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "actors": [],
+  "objects": [],
+  "events": [
+    {"at_sim_time": 0.0, "event": "spawn_once_while_paused"},
+    {"at_sim_time": 1.0, "event": "close_gripper"},
+    {"at_sim_time": 2.0, "event": "open_gripper"}
+  ],
+  "postconditions": [
+    {"name": "gripper traveled freely", "path": "gripper.travel_rad", "operator": "greater_than_or_equal", "value": 0.75},
+    {"name": "no object contact", "path": "contacts.count", "operator": "equals", "value": 0}
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": false,
+  "rtx_cameras": false,
+  "lidar": false,
+  "streaming": false,
+  "modules": ["base", "arm", "gripper", "pan_tilt", "deterministic_scenarios"]
+}

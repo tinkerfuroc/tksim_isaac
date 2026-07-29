@@ -1,0 +1,15 @@
+.venv/
+.deployment.env
+.cache/
+.deps/
+.ros-vendor/
+artifacts/
+reports/
+outputs/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.etli

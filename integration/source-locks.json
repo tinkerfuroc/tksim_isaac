@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "workspace_policy": "read_only",
+  "isaacsim_ros_workspaces": {
+    "repository": "https://github.com/isaac-sim/IsaacSim-ros_workspaces.git",
+    "tag": "IsaacSim-6.0.1",
+    "commit": "dd3eeede7912755996a18f4884285d9f50843f79"
+  },
+  "tinker_cumotion": {
+    "path": "src/tk25_manipulation/src/isaac_ros_cumotion",
+    "commit": "cda2765199a14bb3e7a2e72aacad304788a057b2",
+    "working_tree_patch_sha256": "0fcda8d9e18680cf44f2a922a831443f7ae50c5d31f23dc21c5e6dbd023e564a"
+  },
+  "tinker_isaac_ros_common": {
+    "path": "src/tk25_manipulation/src/isaac_ros_common",
+    "commit": "c4ba19faa7b302cdc76ff04f45d3a630279e9cba",
+    "ignored_untracked_build_directories": true
+  }
+}

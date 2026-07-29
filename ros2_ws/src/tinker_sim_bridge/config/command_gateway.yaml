@@ -1,0 +1,12 @@
+tinker_sim_command_gateway:
+  ros__parameters:
+    base_joints:
+      - front_left_wheel_joint
+      - front_right_wheel_joint
+      - rear_left_wheel_joint
+      - rear_right_wheel_joint
+    arm_joints: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+    gripper_joints: [drive_joint]
+    pan_tilt_joints: [pan_joint, tilt_joint]
+    base_timeout_s: 0.25
+    controller_timeout_s: 0.5

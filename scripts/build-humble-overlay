@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+workspace="${TINKER_WS:-/home/tinker/tk25_ws}"
+
+source /opt/ros/humble/setup.bash
+source "${project_root}/.ros-vendor/humble/local_setup.bash"
+source "${workspace}/install/setup.bash"
+set -u
+cd "${project_root}/ros2_ws"
+exec colcon build --symlink-install --packages-select \
+  tinker_sim_interfaces tinker_sim_bridge

@@ -1,0 +1,51 @@
+[project]
+name = "tinker-sim-runtime"
+version = "0.1.0"
+description = "Pinned host-native runtime for Tinker whole-robot Isaac Sim"
+requires-python = "==3.12.13"
+dependencies = [
+  "coverage==7.4.4",
+  "isaaclab[isaacsim]",
+  "isaaclab-newton",
+  "isaaclab-physx",
+  "pillow==12.2.0",
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
+  "torchvision==0.26.0",
+]
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+prerelease = "allow"
+required-version = ">=0.10,<0.11"
+override-dependencies = [
+  # Isaac Sim 6.0.1 kernel requires 7.4.4 while the pinned Isaac Lab checkout
+  # unnecessarily pins its test-only coverage dependency to 7.6.1.
+  "coverage==7.4.4",
+]
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+isaaclab = { path = ".deps/IsaacLab/source/isaaclab", editable = true }
+isaaclab-newton = { path = ".deps/IsaacLab/source/isaaclab_newton", editable = true }
+isaaclab-physx = { path = ".deps/IsaacLab/source/isaaclab_physx", editable = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

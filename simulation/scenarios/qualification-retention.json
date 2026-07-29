@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "id": "qualification-retention",
+  "qualification_gate": "retention",
+  "seed": 7,
+  "world": {"mode": "current"},
+  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "actors": [
+    {
+      "id": "qualification_pedestal",
+      "class_name": "static_pedestal",
+      "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
+      "fixed": true,
+      "pose": {"xyz": [0.65, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    }
+  ],
+  "objects": [
+    {
+      "id": "qualification_cube",
+      "class_name": "dynamic_cube",
+      "asset_uri": "simulation/assets/primitives/task-object.usda",
+      "gravity": true,
+      "collision": true,
+      "pose": {"xyz": [0.65, 0.0, 0.6], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    }
+  ],
+  "events": [
+    {"at_sim_time": 0.0, "event": "spawn_once_while_paused"},
+    {"at_sim_time": 1.0, "event": "close_gripper"},
+    {"at_sim_time": 2.0, "event": "lift_and_translate"},
+    {"at_sim_time": 3.0, "event": "hold_for_one_simulated_second"}
+  ],
+  "postconditions": [
+    {"name": "bilateral physical contact", "path": "evaluator.bilateral_contact", "operator": "equals", "value": true},
+    {"name": "retained without action inference", "path": "evaluator.retained", "operator": "equals", "value": true}
+  ]
+}

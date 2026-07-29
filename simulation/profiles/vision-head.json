@@ -1,0 +1,6 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": true,
+  "modules": ["head_rtx_camera", "pan_tilt", "deterministic_people"]
+}

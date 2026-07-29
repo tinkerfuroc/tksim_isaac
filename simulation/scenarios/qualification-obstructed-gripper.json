@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "id": "qualification-obstructed-gripper",
+  "qualification_gate": "obstructed-gripper",
+  "seed": 7,
+  "world": {"mode": "current"},
+  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "actors": [
+    {
+      "id": "qualification_pedestal",
+      "class_name": "static_pedestal",
+      "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
+      "fixed": true,
+      "pose": {"xyz": [0.65, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    }
+  ],
+  "objects": [
+    {
+      "id": "qualification_cube",
+      "class_name": "dynamic_cube",
+      "asset_uri": "simulation/assets/primitives/task-object.usda",
+      "gravity": true,
+      "collision": true,
+      "pose": {"xyz": [0.65, 0.0, 0.6], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    }
+  ],
+  "events": [{"at_sim_time": 0.0, "event": "spawn_once_while_paused"}],
+  "postconditions": [
+    {"name": "left finger contacts cube", "path": "contacts.left_finger_cube", "operator": "equals", "value": true},
+    {"name": "right finger contacts cube", "path": "contacts.right_finger_cube", "operator": "equals", "value": true},
+    {"name": "closure is obstructed", "path": "gripper.stalled", "operator": "equals", "value": true}
+  ]
+}

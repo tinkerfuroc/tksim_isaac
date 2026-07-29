@@ -1,0 +1,48 @@
+{
+  "schema_version": 2,
+  "id": "reception-seat-assignment",
+  "world": {"mode": "current"},
+  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "actors": [
+    {
+      "id": "guest_1",
+      "asset_uri": "simulation/assets/primitives/person.usda",
+      "pose": {"xyz": [1.5, 0.6, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    },
+    {
+      "id": "guest_2",
+      "asset_uri": "simulation/assets/primitives/person.usda",
+      "pose": {"xyz": [1.5, -0.6, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    }
+  ],
+  "objects": [],
+  "regions": [
+    {"id": "seat_1", "center": [3.0, 0.8, 0.0], "radius": 0.4},
+    {"id": "seat_2", "center": [3.0, -0.8, 0.0], "radius": 0.4}
+  ],
+  "events": [],
+  "dialogue": [
+    {"endpoint": "listen_action", "actor": "guest_1", "outcome": "my name is Alex"},
+    {"endpoint": "listen_action", "actor": "guest_2", "outcome": "my name is Sam"}
+  ],
+  "postconditions": [
+    {
+      "name": "all guests identified",
+      "path": "reception.identified_guests",
+      "operator": "set_equals",
+      "value": ["guest_1", "guest_2"]
+    },
+    {
+      "name": "all guests assigned",
+      "path": "reception.assigned_guests",
+      "operator": "set_equals",
+      "value": ["guest_1", "guest_2"]
+    },
+    {
+      "name": "assignments verbally confirmed",
+      "path": "reception.confirmed",
+      "operator": "equals",
+      "value": true
+    }
+  ]
+}

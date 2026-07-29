@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Deprecated compatibility filename. Local runs intentionally do not set
+     FASTRTPS_DEFAULT_PROFILES_FILE so Fast DDS can use shared memory. -->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles/>
+</dds>

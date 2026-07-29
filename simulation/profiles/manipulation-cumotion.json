@@ -1,0 +1,6 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": true,
+  "modules": ["manipulation_sensor", "cumotion_single_robot"]
+}
