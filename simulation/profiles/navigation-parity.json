@@ -1,0 +1,12 @@
+{
+  "backend": "isaac", "robot": "tinker2", "headless": true, "render": false,
+  "physics_device": "cpu", "modules": ["navigation", "development_lidar"],
+  "physics_hz": 120.0, "base_facade_hz": 50.0, "lidar_hz": 10.0, "imu_hz": 200.0,
+  "cmd_vel_timeout_s": 0.25, "odometry_source": "front_wheel_observations",
+  "canonical_tf_publishers": {
+    "map->odom": "amcl_or_slam", "odom->base_link": "ekf_filter_node",
+    "base_link->robot_links": "robot_state_publisher"
+  },
+  "calibration": "simulation/calibration/tinker2-missing.json",
+  "qualification": "blocked_calibration_missing"
+}

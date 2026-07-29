@@ -1,0 +1,6 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": true,
+  "modules": ["manipulation_core", "wrist_rtx_camera", "rtx_depth"]
+}

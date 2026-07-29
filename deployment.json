@@ -1,0 +1,69 @@
+{
+  "schema_version": 2,
+  "platform": {
+    "os_id": "ubuntu",
+    "os_version": "22.04",
+    "architecture": "x86_64",
+    "minimum_glibc": "2.35",
+    "minimum_disk_gb": 100,
+    "minimum_ram_gb": 32,
+    "recommended_ram_gb": 64,
+    "minimum_vram_gb": 16,
+    "supported_driver": "595.58.03"
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "uv": "0.10.8",
+    "isaac_sim": "6.0.1.0",
+    "isaac_lab_release": "v3.0.0-beta2.patch1",
+    "isaac_lab_commit": "ffff603eafc6b74264a5261cc0183d6a65390d78",
+    "torch": "2.11.0",
+    "torchvision": "0.26.0",
+    "torchaudio": "2.11.0",
+    "pillow": "12.2.0"
+  },
+  "dependencies": {
+    "isaacsim_ros_workspaces": {
+      "tag": "IsaacSim-6.0.1",
+      "commit": "dd3eeede7912755996a18f4884285d9f50843f79",
+      "path": ".deps/IsaacSim-ros_workspaces"
+    },
+    "ros_debian_packages": {
+      "simulation_interfaces": "1.4.0-1jammy.20260605.131229",
+      "topic_based_ros2_control": "0.2.0-1jammy.20260605.160608",
+      "manifest": "artifacts/provenance/ros-debs.json"
+    }
+  },
+  "ros": {
+    "distro": "humble",
+    "domain_id": 25,
+    "rmw_implementation": "rmw_fastrtps_cpp",
+    "dds_profiles": {
+      "local": null,
+      "lan": "config/fastdds-lan.xml"
+    },
+    "allowed_interfaces": [
+      "builtin_interfaces",
+      "control_msgs",
+      "geometry_msgs",
+      "nav_msgs",
+      "rosgraph_msgs",
+      "sensor_msgs",
+      "simulation_interfaces",
+      "std_msgs",
+      "tf2_msgs",
+      "trajectory_msgs"
+    ]
+  },
+  "paths": {
+    "uv_cache": ".cache/uv/0.10",
+    "uv_python": ".cache/uv-python/3.12.13",
+    "isaac_cache": ".cache/isaac/6.0.1",
+    "isaac_lab": ".deps/IsaacLab",
+    "isaacsim_ros_workspaces": ".deps/IsaacSim-ros_workspaces",
+    "ros_deb_cache": ".cache/ros-debs/humble",
+    "ros_vendor": ".ros-vendor/humble",
+    "reports": "reports",
+    "artifacts": "artifacts"
+  }
+}

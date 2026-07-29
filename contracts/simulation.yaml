@@ -1,0 +1,67 @@
+schema_version: 2
+ownership:
+  truth_namespace: evaluator_only
+  dynamic_tf_edges: exactly_one_publisher
+control:
+  provider: isaacsim.ros2.sim_control
+  interface_package: simulation_interfaces
+  minimum_interface_version: 1.4.0
+  services:
+    - /get_simulation_state
+    - /set_simulation_state
+    - /get_entities
+    - /delete_entity
+    - /get_entity_info
+    - /spawn_entity
+    - /spawn_entities
+    - /reset_simulation
+    - /step_simulation
+    - /get_entity_state
+    - /get_entities_states
+    - /set_entity_state
+    - /get_entity_bounds
+    - /get_simulator_features
+    - /get_spawnables
+    - /load_world
+    - /unload_world
+    - /get_current_world
+    - /get_available_worlds
+  actions:
+    - /simulate_steps
+  forbidden_compatibility_aliases:
+    - /sim/control/reset
+    - /sim/control/pause
+    - /sim/control/step
+    - /sim/control/set_seed
+    - /sim/scenario/load
+    - /sim/scenario/status
+scenario:
+  orchestration: external_cli
+  inputs: [scenario, seed]
+  transport: simulation_interfaces_composition
+  mutable_seed_service: false
+truth:
+  /sim/truth/robot_state: evaluator_only
+  /sim/truth/object_state: evaluator_only
+  /sim/truth/contacts: evaluator_only
+  /sim/truth/task_state: evaluator_only
+launch_parameters:
+  backend: [gazebo, isaac]
+  profile: [parity, oracle]
+  scenario: string
+  seed: uint64
+  headless: bool
+  streaming: bool
+  sensor_profile: [physics_only, sensor_rich, streaming]
+  dds_profile: [local, lan]
+hardware_parity:
+  base: [cmd_vel, odometry, tf]
+  arm: [joint_states, follow_joint_trajectory, effort, contacts, safety_stop]
+  gripper: [command, state, effort, object_retained]
+  pan_tilt: [joint_states, follow_joint_trajectory]
+  sensors: [camera, camera_info, lidar, imu]
+topics:
+  isaac_joint_state: /isaac_joint_states
+  isaac_joint_command: /isaac_joint_commands
+  controller_joint_command: /sim/controller/ros2_control_commands
+  base_joint_command: /sim/controller/base_commands

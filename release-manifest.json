@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "generated_with": {
+    "uv": "0.10.8",
+    "uv_sha256": "be1df219772b0ae668a327e5c5f7950adf34bb528bd9fabf7810f10fa666e93a"
+  },
+  "python": {
+    "version": "3.12.13",
+    "executable_sha256": "9ed008e5a8685235361f0c53771b520ab082dd99a877ad2fd796a93fa4c0b488"
+  },
+  "environment": {
+    "lock_sha256": "b555fceb1ccb7cca29c354830819d66e6d14ef6ea5db3f6dfa4380ad5144b849",
+    "pyproject_sha256": "11ead97480172b22bb74d7e541ec731a8c5ac4d18f0881c26a5db659923486bf",
+    "resolved_packages": 219
+  },
+  "isaac_lab": {
+    "release": "v3.0.0-beta2.patch1",
+    "commit": "ffff603eafc6b74264a5261cc0183d6a65390d78",
+    "git_tree": "2f82f1afb2cfaf6816b328e03c7b3ddc12069658"
+  },
+  "pinned_packages": {
+    "isaacsim": "6.0.1.0",
+    "isaaclab": "6.1.14",
+    "isaaclab-newton": "0.13.6",
+    "isaaclab-physx": "1.1.3",
+    "pillow": "12.2.0",
+    "torch": "2.11.0+cu128",
+    "torchaudio": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128"
+  }
+}

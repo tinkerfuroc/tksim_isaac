@@ -1,0 +1,52 @@
+{
+  "schema_version": 1, "workspace_policy": "read_only", "robot": "tinker2",
+  "order": ["basic", "navigation", "manipulation", "vision", "audio", "decision", "vla"],
+  "modules": {
+    "basic": {"mode": "hashed_export", "isaac_import": false},
+    "navigation": {
+      "mode": "external_humble_processes",
+      "source_policy": "locked_read_only",
+      "isaac_gateway": "standard_messages_only",
+      "controllers": ["dwb", "mppi"],
+      "odometry": "wheel_derived",
+      "truth_input": false,
+      "status": "development_validated",
+      "release_blockers": ["calibration_missing", "driver_below_595.58.03", "ram_below_64_gb"]
+    },
+    "vision": {
+      "mode": "official_rtx_graphs_and_hardware_topics",
+      "truth_input": false,
+      "status": "configured_pending_live_qualification"
+    },
+    "manipulation": {
+      "mode": "external_ros2_control_fjt_and_xarm_facade",
+      "truth_input": false,
+      "command_owner": "tinker_sim_command_gateway",
+      "operator_launch": "ros2 launch tinker_sim_bridge manipulation.launch.py",
+      "scenario_control": "scenario_runner_waits_for_simulation_interfaces",
+      "status": "operator_launch_wired_development_only_pending_live_qualification",
+      "live_pass": false,
+      "deferred_until_qualification": ["moveit", "cumotion", "vision", "decision", "vla"]
+    },
+    "decision": {
+      "mode": "unmodified_external_nodes",
+      "success_source": "truth_evaluator",
+      "status": "pending_vertical_slice"
+    },
+    "audio": {
+      "mode": "deterministic_dialogue_fixture",
+      "acoustic_simulation": false,
+      "status": "scenario_contract_ready"
+    },
+    "hardware": {
+      "mode": "standard_joint_state_gateway",
+      "firmware_in_simulation": false,
+      "status": "implemented"
+    },
+    "legacy_tk26_sim": {"mode": "read_only_reference", "runtime_authoritative": false},
+    "vla": {
+      "mode": "recorded_policy_replay_through_safety_gateway",
+      "status": "deferred_until_facades_qualified"
+    }
+  }
+}

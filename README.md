@@ -1,0 +1,233 @@
+# Tinker whole-robot simulation deployment
+
+This is a standalone deployment project for x86_64 Tinker simulation servers.
+It neither imports nor modifies the surrounding ROS workspace. For production,
+copy this directory to a dedicated location such as
+`/srv/tinker-sim/6.0.1`; do not overlay it on a sourced ROS workspace.
+
+## Qualified baseline
+
+| Component | Pinned value |
+| --- | --- |
+| Host | Ubuntu 22.04, x86_64, GLIBC 2.35 or newer |
+| NVIDIA driver | 595.58.03 or newer |
+| Python | CPython 3.12.13 |
+| uv | 0.10.8 (0.10 lock format) |
+| Isaac Sim | 6.0.1.0 |
+| Isaac Lab | v3.0.0-beta2.patch1, commit `ffff603eafc6b74264a5261cc0183d6a65390d78` |
+| Isaac Lab PhysX extension | 1.1.3 from the same pinned checkout |
+| Isaac Lab Newton interface shim | 0.13.6 from the same pinned checkout |
+| PyTorch | 2.11.0, CUDA 12.8 wheel |
+| TorchVision / TorchAudio | 0.26.0 / 2.11.0, CUDA 12.8 wheels |
+| Pillow | 12.2.0 |
+| IsaacSim ROS workspaces | tag `IsaacSim-6.0.1`, commit `dd3eeede7912755996a18f4884285d9f50843f79` |
+| ROS simulation interfaces | Humble 1.4.0, vendored Debian artifact |
+| Topic-based ros2_control | Humble 0.2.0, vendored Debian artifact |
+
+Provisioning requires at least 100 GB free disk, 32 GB RAM, and an RTX GPU
+with 16 GB VRAM. Sixty-four GB RAM is the supported whole-robot target.
+Drivers older than 595.58.03 produce an explicit experimental warning and are
+not release-qualified.
+
+`uv.lock` is authoritative for Python. The static `release-manifest.json` records the
+lock, project, uv executable, managed Python, and Isaac Lab Git tree hashes.
+`artifacts/provenance/ros-debs.json` is authoritative for the isolated Humble
+runtime additions.
+Each completed deployment also writes a machine-readable report under
+`reports/`.
+
+## Online bootstrap
+
+Install uv 0.10.8 from its official release, start a fresh shell that has not
+sourced `/opt/ros/humble`, then:
+
+```bash
+cd /srv/tinker-sim/6.0.1
+cp deployment.env.example .deployment.env
+# Read NVIDIA's Omniverse EULA, then set TINKER_ACCEPT_OMNIVERSE_EULA=Y.
+set -a
+source .deployment.env
+set +a
+
+./scripts/tinker-sim preflight
+./scripts/bootstrap --mode online
+```
+
+EULA acceptance is never set by a script or repository default. Bootstrap
+fails until the deployment configuration explicitly contains
+`TINKER_ACCEPT_OMNIVERSE_EULA=Y`. After that explicit gate passes, bootstrap
+sets Isaac Kit's required `OMNI_KIT_ACCEPT_EULA=YES` only for its child
+processes.
+
+Bootstrap is idempotent. It:
+
+1. validates the OS, architecture, GLIBC, disk, RAM, GPU, VRAM, driver, and
+   registered NVENC encoder;
+2. installs CPython 3.12.13 into the project-local managed-Python directory;
+3. fetches and verifies the exact Isaac Lab commit without patching it;
+4. runs only `uv sync --frozen` and reconstructs a temporary environment with
+   `uv sync --frozen --offline` to audit cache completeness;
+5. runs Isaac's compatibility checker, 10,000 headless PhysX steps, requires
+   non-empty RTX camera and LiDAR output, performs a real NVENC encode, and
+   starts the headless WebRTC experience;
+6. warms core, ROS, RTX-sensor, and URDF extension caches; and
+7. vendors the exact ROS Debian artifacts and pins NVIDIA's IsaacSim ROS
+   workspace without installing either into the host; and
+8. writes a deployment report containing runtime hashes, package versions,
+   ROS domain settings, and test results.
+
+`--skip-preflight`, `--skip-validation`, and `--skip-prewarm` exist for tooling
+tests only. A deployment made with any of them is not release-qualified.
+
+No system CUDA toolkit is read or installed. CUDA runtime libraries come from
+the Isaac Sim and PyTorch wheels.
+
+## ROS 2 Humble boundary
+
+There are two process environments:
+
+- Isaac runs from this uv environment with Python 3.12 and Isaac's internal
+  Humble libraries.
+- Tinker gateways, Nav2, MoveIt/cuMotion, vision, decision, audio, VLA, FJT,
+  and hardware-facade nodes run under system Humble with Python 3.10.
+
+`scripts/launch-isaac` refuses to start if `PYTHONPATH`,
+`AMENT_PREFIX_PATH`, `CMAKE_PREFIX_PATH`, `COLCON_PREFIX_PATH`,
+`ROS_PACKAGE_PATH`, or `LD_LIBRARY_PATH` contains `/opt/ros/` or
+`python3.10`. It then locates Isaac's internal
+`isaacsim.ros2.* / humble / lib` directory and sets the shared ROS domain and
+Fast DDS implementation. The default `--dds-profile local` leaves Fast DDS
+shared memory enabled. `--dds-profile lan` selects the committed UDP-only
+profile and must be used by every machine in that run.
+
+Only the standard interfaces listed in `deployment.json` cross the Isaac DDS
+boundary. NVIDIA's `isaacsim.ros2.sim_control` owns the standard
+`simulation_interfaces` lifecycle API. The external overlay defines only
+evaluator truth messages and hardware/task adapters; it must never be installed
+in this uv environment.
+
+Navigation is the first live module integration.  It reuses the existing
+Tinker Humble Nav2/localization implementation without modifying the source
+workspace, with a hardware-parity base facade, wheel-derived odometry, Livox
+scan adapter, AMCL initialization, TF ownership guard, and public simulation
+control gateway.  The exact build, two-terminal launch, interfaces, readiness
+checks, and live results are documented in [`integration/NAVIGATION.md`](integration/NAVIGATION.md).
+
+Example launch profiles:
+
+```bash
+./scripts/launch-isaac --sensor-profile physics-only --scenario empty
+./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \
+  --scenario find-and-approach-person --seed 7
+./scripts/launch-isaac --sensor-profile streaming --dds-profile lan
+```
+
+Streaming uses Isaac's headless WebRTC experience, explicitly disables GPU
+physics, and uses a local process lock to
+enforce one viewer per simulator instance. Restrict its ports to a trusted LAN
+or VPN. Use SSH for installation, process management, logs, tests, and bags.
+
+## Offline provisioning
+
+Run a complete online bootstrap first. Add generated robot USDs and their
+checksums to `artifacts/asset-manifest.json` using the committed example; do
+not reference the surrounding ROS workspace. Both generated-USD and warmed
+asset groups must be non-empty, present on disk, and hash-correct.
+Then:
+
+```bash
+./scripts/create-offline-bundle artifacts/tinker-sim-6.0.1.tar.gz
+```
+
+Bundle creation first creates a fresh temporary environment using
+`uv sync --frozen --offline`. This proves that no package is missing from the
+cache. It refuses to package an unverified Isaac Lab tree or an unwarmed Isaac
+cache. The deterministic archive contains:
+
+- the lock and environment definition;
+- the exact uv executable and managed Python;
+- the populated, versioned uv cache;
+- the pinned Isaac Lab checkout;
+- warmed Isaac caches and generated assets;
+- this deployment tooling and ROS contract workspace; and
+- a per-file SHA-256 manifest.
+
+On an offline server:
+
+```bash
+mkdir -p /srv/tinker-sim/6.0.1
+./scripts/restore-offline-bundle \
+  /media/bundle/tinker-sim-6.0.1.tar.gz /srv/tinker-sim/6.0.1
+cd /srv/tinker-sim/6.0.1
+export PATH="$PWD/bin:$PATH"
+export TINKER_ACCEPT_OMNIVERSE_EULA=Y
+./scripts/bootstrap --mode offline
+```
+
+Restore requires an empty destination and verifies every file before use.
+Offline bootstrap runs `uv sync --frozen --offline` and never falls back to
+the network.
+
+## Miniconda recovery only
+
+Miniconda may create a Python 3.12.13 environment if uv's managed Python cannot
+be bootstrapped. It is not a second dependency definition:
+
+```bash
+./scripts/tinker-sim conda-export artifacts/requirements-from-uv-lock.txt
+conda create -n tinker-isaac-recovery python=3.12.13
+conda activate tinker-isaac-recovery
+python -m pip install -r artifacts/requirements-from-uv-lock.txt
+```
+
+Always regenerate the requirements file from the committed lock. Never edit
+or maintain it independently.
+
+## Simulation contract and rollout
+
+`contracts/simulation.yaml` defines the standard `simulation_interfaces`
+surface and evaluator-only `/sim/truth/*` topics. There are deliberately no
+custom `/sim/control/*` or `/sim/scenario/*` aliases.
+`simulation/tinker_sim_core` provides:
+
+- a Gazebo/Isaac backend protocol;
+- deterministic single-owner command arbitration;
+- hardware-parity versus hidden-truth separation; and
+- postcondition scoring for person approach, pick/deliver/place, and reception
+  seat assignment.
+
+The parity profile is the only input to navigation, perception,
+manipulation, decision, and VLA software. Only the evaluator may receive
+truth. The scenario evaluators reject a task server's claimed success when the
+world postcondition is false.
+
+The Tinker 2 USD/URDF/map export, navigation gateway, external FJT controller,
+xArm/gripper/pan-tilt facades, deterministic scenario orchestration, and audio
+fixtures are implemented as
+content-addressed artifacts under `artifacts/`.  Vision, manipulation,
+decision, and VLA vertical slices still require live qualification and must
+not be represented as release-qualified. Controller gains and sensor/base
+noise still require synchronized robot calibration; qualification fails explicitly while
+`simulation/calibration/tinker2-missing.json` remains uncalibrated.
+
+## Developer verification
+
+The non-GPU tests run with the Ubuntu system Python:
+
+```bash
+python3 -m unittest discover -s tests -v
+uv lock --check
+./scripts/build-humble-overlay
+```
+
+Release qualification additionally requires a clean server, the full online
+and offline bootstrap paths, ROS cross-process contract tests, RTX camera and
+LiDAR initialization, and a 60-second continuous WebRTC connection using
+NVIDIA's native Ubuntu Omniverse Streaming Client (never a downloaded browser).
+
+References:
+
+- [Isaac Sim Python installation](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_python.html)
+- [Isaac Sim requirements](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/requirements.html)
+- [Isaac Sim ROS integration](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_ros.html)
+- [Isaac Lab installation](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "profile_id": "tinker2-development-uncalibrated",
+  "status": "missing",
+  "qualification": "blocked",
+  "reason": "No synchronized Tinker 2 navigation bag with independent pose ground truth has been supplied.",
+  "base": {
+    "wheel_radius_m": 0.0525, "wheel_track_m": 0.25, "command_timeout_s": 0.25,
+    "max_linear_mps": 0.6, "max_angular_rps": 1.0, "odom_rate_hz": 50.0,
+    "command_latency_s": 0.0, "linear_scale": 1.0, "angular_scale": 1.0,
+    "linear_bias_mps": 0.0, "angular_bias_rps": 0.0
+  },
+  "sensors": {
+    "lidar_rate_hz": 10.0, "imu_rate_hz": 200.0, "range_min_m": 0.3,
+    "range_max_m": 40.0, "horizontal_fov_deg": [-90.0, 90.0],
+    "output_scan_schema_deg": [-180.0, 180.0]
+  }
+}

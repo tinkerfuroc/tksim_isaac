@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "id": "qualification-arm-collision",
+  "qualification_gate": "arm-collision",
+  "seed": 7,
+  "world": {"mode": "current"},
+  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "actors": [],
+  "objects": [
+    {
+      "id": "qualification_arm_obstacle",
+      "asset_uri": "simulation/assets/primitives/obstacle.usda",
+      "class_name": "static_obstacle",
+      "fixed": true,
+      "pose": {"xyz": [0.65, 0.0, 0.515], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    }
+  ],
+  "events": [{"at_sim_time": 0.0, "event": "spawn_once_while_paused"}],
+  "postconditions": [
+    {"name": "identified arm obstacle contact", "path": "contacts.arm_obstacle", "operator": "equals", "value": true},
+    {"name": "safety response", "path": "robot.safety_stop", "operator": "equals", "value": true}
+  ]
+}

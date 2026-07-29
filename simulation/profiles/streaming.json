@@ -1,0 +1,11 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": true,
+  "rtx_cameras": true,
+  "lidar": true,
+  "streaming": true,
+  "maximum_viewers": 1,
+  "network_scope": "trusted_lan_or_vpn",
+  "modules": ["sensor_rich", "native_webrtc"]
+}

@@ -1,0 +1,20 @@
+#usda 1.0
+(
+    defaultPrim = "QualificationPedestal"
+    upAxis = "Z"
+    metersPerUnit = 1
+)
+def Xform "QualificationPedestal"
+{
+    # A collider without a rigid-body API is static in PhysX.
+    def Cube "Body" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        double size = 1
+        double3 xformOp:scale = (0.12, 0.12, 0.60)
+        double3 xformOp:translate = (0, 0, 0.30)
+        color3f[] primvars:displayColor = [(0.22, 0.25, 0.30)]
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+}

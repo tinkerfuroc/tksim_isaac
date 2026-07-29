@@ -1,0 +1,6 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": true,
+  "modules": ["manipulation_sensor", "recorded_policy_replay", "safety_gateway"]
+}

@@ -1,0 +1,6 @@
+{
+  "physics_device": "cpu",
+  "headless": true,
+  "render": true,
+  "modules": ["navigation", "manipulation_sensor", "vision_head", "audio_fixtures", "decision"]
+}

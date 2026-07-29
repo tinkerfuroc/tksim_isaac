@@ -1,0 +1,155 @@
+{
+  "schema_version": 2,
+  "id": "manipulation-core",
+  "profile": "manipulation-core",
+  "backend": "isaac",
+  "robot": "tinker2",
+  "headless": true,
+  "render": false,
+  "physics": {
+    "device": "cpu",
+    "use_gpu": false,
+    "cuda_device": -1,
+    "hz": 120.0
+  },
+  "thresholds": {
+    "fjt_final_max_error_rad": 0.01,
+    "fjt_rms_error_rad": 0.05,
+    "safety_stop_velocity_rad_s": 0.02,
+    "safety_stop_frames": 5,
+    "safety_stop_position_creep_rad": 0.005,
+    "free_gripper_min_travel_rad": 0.75,
+    "obstructed_gripper_min_gap_rad": 0.02,
+    "gripper_max_effort_n": 20.0,
+    "retention_lift_m": 0.10,
+    "retention_translation_m": 0.20,
+    "retention_hold_s": 1.0,
+    "retention_drift_m": 0.02,
+    "retention_drift_deg": 5.0,
+    "stable_speed_m_s": 0.02
+  },
+  "truth": {
+    "input_topic": "/sim/internal/physics_truth",
+    "outputs": [
+      "/sim/truth/robot_state",
+      "/sim/truth/object_state",
+      "/sim/truth/contacts",
+      "/sim/truth/task_state"
+    ],
+    "jsonl": "evaluator.jsonl"
+  },
+  "readiness_topics": ["/clock", "/isaac_joint_states", "/sim/internal/physics_truth"],
+  "rosbag_minimum_message_counts": {
+    "free-space-fjt": {
+      "/clock": 1,
+      "/isaac_joint_states": 1,
+      "/isaac_joint_commands": 1,
+      "/sim/truth/robot_state": 1,
+      "/sim/truth/object_state": 0,
+      "/sim/truth/contacts": 0,
+      "/sim/truth/task_state": 1,
+      "/sim/safety/collision": 1,
+      "/sim/hardware/safety_stop": 1,
+      "/sim/status/contract": 1,
+      "/sim/status/command_gateway": 1
+    },
+    "safety-stop": {
+      "/clock": 1,
+      "/isaac_joint_states": 1,
+      "/isaac_joint_commands": 1,
+      "/sim/truth/robot_state": 1,
+      "/sim/truth/object_state": 0,
+      "/sim/truth/contacts": 0,
+      "/sim/truth/task_state": 1,
+      "/sim/safety/collision": 1,
+      "/sim/hardware/safety_stop": 1,
+      "/sim/status/contract": 1,
+      "/sim/status/command_gateway": 1
+    },
+    "free-gripper": {
+      "/clock": 1,
+      "/isaac_joint_states": 1,
+      "/isaac_joint_commands": 1,
+      "/sim/truth/robot_state": 1,
+      "/sim/truth/object_state": 0,
+      "/sim/truth/contacts": 0,
+      "/sim/truth/task_state": 1,
+      "/sim/safety/collision": 1,
+      "/sim/hardware/safety_stop": 1,
+      "/sim/status/contract": 1,
+      "/sim/status/command_gateway": 1
+    },
+    "obstructed-gripper": {
+      "/clock": 1,
+      "/isaac_joint_states": 1,
+      "/isaac_joint_commands": 1,
+      "/sim/truth/robot_state": 1,
+      "/sim/truth/object_state": 1,
+      "/sim/truth/contacts": 1,
+      "/sim/truth/task_state": 1,
+      "/sim/safety/collision": 1,
+      "/sim/hardware/safety_stop": 1,
+      "/sim/status/contract": 1,
+      "/sim/status/command_gateway": 1
+    },
+    "arm-collision": {
+      "/clock": 1,
+      "/isaac_joint_states": 1,
+      "/isaac_joint_commands": 1,
+      "/sim/truth/robot_state": 1,
+      "/sim/truth/object_state": 0,
+      "/sim/truth/contacts": 1,
+      "/sim/truth/task_state": 1,
+      "/sim/safety/collision": 1,
+      "/sim/hardware/safety_stop": 1,
+      "/sim/status/contract": 1,
+      "/sim/status/command_gateway": 1
+    },
+    "retention": {
+      "/clock": 1,
+      "/isaac_joint_states": 1,
+      "/isaac_joint_commands": 1,
+      "/sim/truth/robot_state": 1,
+      "/sim/truth/object_state": 1,
+      "/sim/truth/contacts": 1,
+      "/sim/truth/task_state": 1,
+      "/sim/safety/collision": 1,
+      "/sim/hardware/safety_stop": 1,
+      "/sim/status/contract": 1,
+      "/sim/status/command_gateway": 1
+    }
+  },
+  "gates": [
+    "free-space-fjt",
+    "safety-stop",
+    "free-gripper",
+    "obstructed-gripper",
+    "arm-collision",
+    "retention"
+  ],
+  "scenarios": {
+    "free-space-fjt": "qualification-free-space",
+    "safety-stop": "qualification-safety-stop",
+    "free-gripper": "qualification-free-gripper",
+    "obstructed-gripper": "qualification-obstructed-gripper",
+    "arm-collision": "qualification-arm-collision",
+    "retention": "qualification-retention"
+  },
+  "fixtures": {
+    "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"],
+    "trajectory_start_offset_s": 0.5,
+    "fjt_outbound": [0.20, -0.20, 0.15, 0.30, -0.15, 0.20, 0.15],
+    "gripper_close": 0.83,
+    "gripper_open": 0.0,
+    "gripper_max_effort_n": 20.0,
+    "grasp_joint_target": [0.000002, 0.836049, 0.000005, 2.040282, 0.000003, 1.189480, 0.000006],
+    "lift_joint_target": [0.000004, 1.262552, 0.000013, 2.714944, -0.000002, 0.616009, 0.000006],
+    "safety_stop_at_trajectory_s": 1.5,
+    "safety_stopped_s": 0.5,
+    "safety_observe_after_clear_s": 1.0,
+    "spawn_once_while_paused": true,
+    "allow_post_start_pose_changes": false,
+    "allow_fixed_joint_attachment": false,
+    "allow_direct_joint_command_publishing": false
+  }
+}

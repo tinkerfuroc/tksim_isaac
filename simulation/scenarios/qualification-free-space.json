@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "id": "qualification-free-space",
+  "qualification_gate": "free-space-fjt",
+  "seed": 7,
+  "world": {"mode": "current"},
+  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "actors": [],
+  "objects": [],
+  "events": [
+    {"at_sim_time": 0.0, "event": "spawn_once_while_paused"},
+    {"at_sim_time": 0.5, "event": "start_free_space_trajectory"}
+  ],
+  "postconditions": [
+    {"name": "seven joints observed", "path": "robot.joint_count", "operator": "equals", "value": 7},
+    {"name": "no safety stop", "path": "robot.safety_stop", "operator": "equals", "value": false}
+  ]
+}

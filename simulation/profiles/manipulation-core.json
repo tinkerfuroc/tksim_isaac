@@ -1,0 +1,10 @@
+{
+  "backend": "isaac",
+  "robot": "tinker2",
+  "artifact_pointer": "artifacts/robot/tinker2/current.json",
+  "physics_device": "cpu",
+  "headless": true,
+  "render": false,
+  "contacts": true,
+  "modules": ["arm_fjt", "gripper", "xarm_facade", "contact", "physics_truth"]
+}

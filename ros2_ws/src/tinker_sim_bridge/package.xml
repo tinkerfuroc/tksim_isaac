@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>tinker_sim_bridge</name>
+  <version>0.1.0</version>
+  <description>External Humble hardware-parity gateways for Tinker simulation.</description>
+  <maintainer email="tinker@example.invalid">Tinker Team</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>controller_manager_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>simulation_interfaces</exec_depend>
+  <exec_depend>tinker_sim_interfaces</exec_depend>
+  <exec_depend>tinker_audio_msgs</exec_depend>
+  <exec_depend>tinker_vision_msgs_26</exec_depend>
+  <exec_depend>topic_based_ros2_control</exec_depend>
+  <exec_depend>tracer_msgs</exec_depend>
+  <exec_depend>xarm_msgs</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "id": "qualification-safety-stop",
+  "qualification_gate": "safety-stop",
+  "seed": 7,
+  "world": {"mode": "current"},
+  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "actors": [],
+  "objects": [],
+  "events": [
+    {"at_sim_time": 0.0, "event": "spawn_once_while_paused"},
+    {"at_sim_time": 1.5, "event": "operator_safety_stop"},
+    {"at_sim_time": 2.0, "event": "clear_operator_safety_stop"},
+    {"at_sim_time": 3.0, "event": "finish_post_clear_observation"}
+  ],
+  "postconditions": [
+    {"name": "safety stop asserted", "path": "robot.safety_stop", "operator": "equals", "value": true},
+    {"name": "no objects", "path": "objects.count", "operator": "equals", "value": 0}
+  ]
+}

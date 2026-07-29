@@ -1,0 +1,8 @@
+tinker_base_facade:
+  ros__parameters:
+    use_sim_time: true
+    left_joint: front_left_wheel_joint
+    right_joint: front_right_wheel_joint
+    odom_frame: odom
+    base_frame: base_link
+    battery_voltage: 29.0
