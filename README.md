@@ -203,11 +203,22 @@ world postcondition is false.
 
 The Tinker 2 USD/URDF/map export, navigation gateway, external FJT controller,
 xArm/gripper/pan-tilt facades, deterministic scenario orchestration, and audio
-fixtures are implemented as
-content-addressed artifacts under `artifacts/`.  Vision, manipulation,
-decision, and VLA vertical slices still require live qualification and must
-not be represented as release-qualified. Controller gains and sensor/base
-noise still require synchronized robot calibration; qualification fails explicitly while
+fixtures are implemented as content-addressed artifacts under `artifacts/`.
+The artifact exporter derives only the canonical URDF metadata needed by the
+strict planning contract: it adds the zero `world -> base_link` mount, names
+the existing `base_link -> link_base` mount, and records a state-only
+`drive_joint` entry. The USD is copied byte-for-byte and remains the simulator
+physics artifact. The canonical URDF bytes and canonicalizer algorithm version
+are part of the artifact identity; the manifest and source lock record both
+input and output hashes, and `current.json` is updated only after atomic,
+complete publication. Use the project-managed interpreter, for example
+`./.venv/bin/python tools/deploy.py artifact-export`, rather than editing an
+artifact directory in place.
+
+Vision, manipulation, decision, and VLA vertical slices still require live
+qualification and must not be represented as release-qualified. Controller
+gains and sensor/base noise still require synchronized robot calibration;
+qualification fails explicitly while
 `simulation/calibration/tinker2-missing.json` remains uncalibrated.
 
 ## Developer verification
@@ -231,3 +242,9 @@ References:
 - [Isaac Sim requirements](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/requirements.html)
 - [Isaac Sim ROS integration](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_ros.html)
 - [Isaac Lab installation](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)
+
+## Changelog
+
+- 2026-07-30: Added deterministic exporter-side canonical URDF derivation with
+  content-addressed provenance and atomic artifact publication. The USD physics
+  bytes remain unchanged.
