@@ -2,7 +2,8 @@
 set -eo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-workspace="${TINKER_WS:-/home/tinker/tk25_ws}"
+: "${TINKER_WS:?TINKER_WS must name the external Humble workspace}"
+workspace="${TINKER_WS}"
 module="${1:-navigation}"
 dds_profile="${TINKER_SIM_DDS_PROFILE:-local}"
 shift || true

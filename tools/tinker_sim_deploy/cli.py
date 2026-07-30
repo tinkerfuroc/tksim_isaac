@@ -69,11 +69,11 @@ def _parser() -> argparse.ArgumentParser:
     launch.add_argument("isaac_args", nargs=argparse.REMAINDER)
 
     lock = commands.add_parser("workspace-lock", help="capture read-only Tinker source hashes")
-    lock.add_argument("--workspace", type=Path, default=Path("/home/tinker/tk25_ws"))
+    lock.add_argument("--workspace", type=Path, default=None)
     verify_lock = commands.add_parser("workspace-verify", help="verify the Tinker source lock")
-    verify_lock.add_argument("--workspace", type=Path, default=Path("/home/tinker/tk25_ws"))
+    verify_lock.add_argument("--workspace", type=Path, default=None)
     artifact = commands.add_parser("artifact-export", help="export a content-addressed Tinker 2 artifact")
-    artifact.add_argument("--workspace", type=Path, default=Path("/home/tinker/tk25_ws"))
+    artifact.add_argument("--workspace", type=Path, default=None)
 
     export = commands.add_parser(
         "conda-export", help="export recovery requirements from the authoritative uv lock"
@@ -228,17 +228,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "launch":
             return _launch(config, args)
         if args.command in {"workspace-lock", "workspace-verify", "artifact-export"}:
+            workspace_value = args.workspace or (Path(os.environ["TINKER_WS"]) if os.environ.get("TINKER_WS") else None)
+            if workspace_value is None:
+                raise RuntimeError("external Tinker workspace is required; pass --workspace or set TINKER_WS")
             lock_path = config.path("artifacts") / "provenance" / "tinker2-source-lock.json"
             if args.command == "workspace-lock":
-                print(json.dumps(capture_workspace_lock(args.workspace, lock_path), indent=2))
+                print(json.dumps(capture_workspace_lock(workspace_value, lock_path), indent=2))
                 return 0
             if args.command == "workspace-verify":
-                mismatches = verify_workspace_lock(args.workspace, lock_path)
+                mismatches = verify_workspace_lock(workspace_value, lock_path)
                 if mismatches:
                     raise RuntimeError("workspace source-lock mismatch: " + ", ".join(mismatches[:12]))
                 print(lock_path)
                 return 0
-            result = export_tinker2(args.workspace, config.path("artifacts"), lock_path)
+            result = export_tinker2(workspace_value, config.path("artifacts"), lock_path)
             print(result.artifact_dir)
             return 0
         if args.command == "conda-export":

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 import unittest
@@ -10,8 +9,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from tinker_sim_deploy.config import sha256_file
-from tinker_sim_deploy.workspace import verify_workspace_lock
+from tinker_sim_deploy.workspace import capture_workspace_lock, verify_workspace_lock
 
 
 class WorkspaceLockTest(unittest.TestCase):
@@ -22,8 +20,8 @@ class WorkspaceLockTest(unittest.TestCase):
             source = workspace / "source"
             source.write_text("one", encoding="utf-8")
             lock = Path(temporary) / "lock.json"
-            lock.write_text(json.dumps({"files": [{"path": "source", "size": 3, "sha256": sha256_file(source)}]}))
             with mock.patch("tinker_sim_deploy.workspace.SOURCE_GLOBS", ("**/*",)):
+                capture_workspace_lock(workspace, lock)
                 self.assertEqual(verify_workspace_lock(workspace, lock), [])
                 source.write_text("two", encoding="utf-8")
                 self.assertEqual(verify_workspace_lock(workspace, lock), ["changed:source"])
