@@ -5,7 +5,8 @@ import os
 import sys
 from pathlib import Path
 
-_tools = Path(os.environ.get("TINKER_SIM_ROOT", "/home/tinker/tinker-sim/6.0.1")) / "tools"
+_project_root = Path(os.environ["TINKER_SIM_ROOT"]) if os.environ.get("TINKER_SIM_ROOT") else Path(__file__).resolve().parents[4]
+_tools = _project_root / "tools"
 if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
@@ -49,7 +50,10 @@ def _resolve(context):
     root = Path(LaunchConfiguration("project_root").perform(context)).resolve()
     # Resolve the workspace argument here so launch rejects an invalid path
     # early, while keeping the Tinker source tree read-only at runtime.
-    workspace = Path(LaunchConfiguration("tinker_workspace").perform(context)).resolve()
+    workspace_value = LaunchConfiguration("tinker_workspace").perform(context).strip()
+    if not workspace_value:
+        raise RuntimeError("tinker_workspace is required; set TINKER_WS or pass tinker_workspace:=...")
+    workspace = Path(workspace_value).expanduser().resolve()
     if not workspace.is_dir():
         raise RuntimeError(f"tinker workspace not found: {workspace}")
     scenario = LaunchConfiguration("scenario").perform(context)
@@ -230,11 +234,11 @@ def generate_launch_description():
         [
             DeclareLaunchArgument(
                 "project_root",
-                default_value=os.environ.get("TINKER_SIM_ROOT", "/home/tinker/tinker-sim/6.0.1"),
+                default_value=os.environ.get("TINKER_SIM_ROOT", str(_project_root)),
             ),
             DeclareLaunchArgument(
                 "tinker_workspace",
-                default_value=os.environ.get("TINKER_WS", "/home/tinker/tk25_ws"),
+                default_value=os.environ.get("TINKER_WS", ""),
             ),
             DeclareLaunchArgument("scenario", default_value="pick-deliver-place"),
             DeclareLaunchArgument("seed", default_value="0"),

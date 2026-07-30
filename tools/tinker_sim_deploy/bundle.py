@@ -11,8 +11,10 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
+from .assets import verify_assets
 from .config import Config, sha256_file
 from .runtime import resolve_current_artifact
+from .workspace import _safe_relative
 
 
 PROJECT_ENTRIES = (
@@ -109,6 +111,7 @@ def _write_reproducible_tar_gz(source: Path, output: Path) -> None:
 def create(config: Config, output: Path, uv_executable: Path) -> Path:
     # Whole-robot bundles are not usable without one verified immutable robot generation.
     resolve_current_artifact(config.root)
+    verify_assets(config)
     required = [
         config.root / "uv.lock",
         config.path("uv_cache"),
@@ -178,9 +181,14 @@ def _validate_member(member: tarfile.TarInfo) -> None:
 def restore(bundle: Path, destination: Path, *, profile: str = "whole_robot") -> Path:
     if profile not in {"whole_robot", "physics_only"}:
         raise RuntimeError(f"unknown bundle restore profile: {profile}")
-    if destination.exists() and any(destination.iterdir()):
-        raise RuntimeError(f"restore destination must be empty: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        destination_stat = os.lstat(destination)
+        if stat.S_ISLNK(destination_stat.st_mode) or not stat.S_ISDIR(destination_stat.st_mode):
+            raise RuntimeError(f"restore destination must be a real directory: {destination}")
+        if any(destination.iterdir()):
+            raise RuntimeError(f"restore destination must be empty: {destination}")
+    else:
+        destination.mkdir(parents=True, exist_ok=False)
     with tarfile.open(bundle, "r:gz") as archive:
         members = archive.getmembers()
         for member in members:
@@ -188,9 +196,18 @@ def restore(bundle: Path, destination: Path, *, profile: str = "whole_robot") ->
         archive.extractall(destination, members=members)
     manifest_path = destination / "checksums.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+        raise RuntimeError("offline bundle checksums manifest is invalid")
     failures = []
     for relative, expected in manifest["files"].items():
-        path = destination / relative
+        safe_relative = _safe_relative(relative, "offline bundle checksum path")
+        path = destination / Path(*PurePosixPath(safe_relative).parts)
+        try:
+            path.parent.resolve().relative_to(destination.resolve())
+        except ValueError as error:
+            raise RuntimeError(f"offline bundle checksum path escapes destination: {relative}") from error
+        if not isinstance(expected, dict) or expected.get("type") not in {"file", "symlink"}:
+            raise RuntimeError(f"offline bundle checksum record is invalid: {relative}")
         if expected["type"] == "symlink":
             valid = path.is_symlink() and os.readlink(path) == expected["target"]
         else:

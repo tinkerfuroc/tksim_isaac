@@ -5,7 +5,8 @@ import os
 import sys
 from pathlib import Path
 
-_tools = Path(os.environ.get("TINKER_SIM_ROOT", "/home/tinker/tinker-sim/6.0.1")) / "tools"
+_project_root = Path(os.environ["TINKER_SIM_ROOT"]) if os.environ.get("TINKER_SIM_ROOT") else Path(__file__).resolve().parents[4]
+_tools = _project_root / "tools"
 if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
@@ -21,7 +22,12 @@ from launch_ros.substitutions import FindPackageShare
 
 def _resolve(context):
     root = Path(LaunchConfiguration("project_root").perform(context)).resolve()
-    workspace = Path(LaunchConfiguration("tinker_workspace").perform(context)).resolve()
+    workspace_value = LaunchConfiguration("tinker_workspace").perform(context).strip()
+    if not workspace_value:
+        raise RuntimeError("tinker_workspace is required; set TINKER_WS or pass tinker_workspace:=...")
+    workspace = Path(workspace_value).expanduser().resolve()
+    if not workspace.is_dir():
+        raise RuntimeError(f"tinker workspace not found: {workspace}")
     qualification = LaunchConfiguration("qualification").perform(context).lower() in {"1", "true", "yes"}
     resolved_artifact = resolve_current_artifact(root)
     artifact = resolved_artifact.artifact_dir
@@ -109,8 +115,9 @@ def _resolve(context):
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument("project_root", default_value=os.environ.get("TINKER_SIM_ROOT", "/home/tinker/tinker-sim/6.0.1")),
-        DeclareLaunchArgument("tinker_workspace", default_value=os.environ.get("TINKER_WS", "/home/tinker/tk25_ws")),
+        DeclareLaunchArgument("project_root", default_value=os.environ.get("TINKER_SIM_ROOT", str(_project_root))),
+        DeclareLaunchArgument("tinker_workspace", default_value=os.environ.get("TINKER_WS", "")),
+
         DeclareLaunchArgument("qualification", default_value="false"),
         SetEnvironmentVariable("ROBOT_NAME", "tinker2"),
         OpaqueFunction(function=_resolve),

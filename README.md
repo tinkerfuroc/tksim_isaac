@@ -219,10 +219,33 @@ source lock, and `current.json` record the complete generation and all payload
 hashes. Publication fsyncs files/directories, atomically claims the immutable
 artifact directory, and replaces `current.json` as the sole commit point; a
 crash before that replacement can leave only an ignored orphan generation and
-cannot mix a pointer with a mutable root lock. Use the project-managed
-interpreter, for example
-`./.venv/bin/python tools/deploy.py artifact-export`, rather than editing an
-artifact directory in place.
+cannot mix a pointer with a mutable root lock. Export publication is serialized
+by a nonblocking inter-process lock; a normal concurrent exporter fails without
+recovering the active exporter's staging directory. The exporter reads the
+external workspace once, derives the immutable lock in memory, and only accepts
+an already captured shared lock when it exactly matches; a failed export never
+creates or rewrites that shared lock. `workspace-lock` is the separate explicit
+atomic capture operation.
+
+### Portable deployment inputs
+
+The simulator checkout is relocatable. Set `TINKER_SIM_ROOT` when invoking a
+launch wrapper from an installed/copy deployment; launch files otherwise derive
+the project root from their installed/source package location. Set `TINKER_WS`
+to the external Humble workspace, or pass `tinker_workspace:=...` explicitly.
+There is no host-specific workspace default. `scripts/launch-humble` fails
+clearly when `TINKER_WS` is absent. The external workspace is read-only runtime
+input and is never bundled as an absolute provenance path.
+
+The source lock schema is portable and exact: it contains robot `tinker2`, a
+SHA-256 source identity derived from the fixed source contract plus the ordered
+relative path/size/SHA-256 records, and no fake repository revision. The
+immutable per-artifact lock is authoritative for that generation; manifest
+canonicalization, USD provenance, source records, payload hashes, and the
+content-addressed identity are cross-checked against it by every consumer.
+Use the project-managed interpreter, for example
+`TINKER_WS=/path/to/tk25_ws ./.venv/bin/python tools/deploy.py artifact-export`,
+rather than editing an artifact directory in place.
 
 Vision, manipulation, decision, and VLA vertical slices still require live
 qualification and must not be represented as release-qualified. Controller
@@ -255,6 +278,7 @@ References:
 ## Changelog
 
 - 2026-07-30: Added deterministic exporter-side canonical URDF derivation with
-  full-SHA immutable generation identity, per-artifact source-lock provenance,
-  crash-consistent current-pointer publication, shared runtime validation, and
-  bundle admission checks. The USD physics bytes remain unchanged.
+  full-SHA immutable generation identity, exact portable source-lock identity,
+  serialized crash-consistent publication, physical arm-joint validation,
+  relocatable Humble launch inputs, shared runtime validation, and bundle
+  admission checks. The USD physics bytes remain unchanged.

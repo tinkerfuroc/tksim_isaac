@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
 import os
 import shutil
 import stat
-import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from .config import sha256_file
 
@@ -28,10 +28,17 @@ SOURCE_GLOBS = (
     "src/tk26_sim/_generated/tinker_full.usd",
     "src/tk26_sim/reference/tinker_gazebo_snapshot/docs/**",
 )
-
-CANONICALIZER_ALGORITHM = "tinker2-urdf-canonical-v2"
-PUBLICATION_SCHEMA = 3
-SOURCE_LOCK_SCHEMA = 2
+SOURCE_PATHS = {
+    "robot.usd": "src/tk26_sim/_generated/tinker_full.usd",
+    "robot.urdf": "src/tk26_sim/_generated/tinker_full.full.urdf",
+    "map.yaml": "src/tk26_navigation/src/navigation_bringup/maps/0701_robocup_arena3.yaml",
+    "map.pgm": "src/tk26_navigation/src/navigation_bringup/maps/0701_robocup_arena3.pgm",
+    "robot-profile.yaml": "src/tk25_basic/src/tinker_robot_config/robots/tinker2/robot.yaml",
+}
+SOURCE_CONTRACT_VERSION = 1
+CANONICALIZER_ALGORITHM = "tinker2-urdf-canonical-v3"
+PUBLICATION_SCHEMA = 4
+SOURCE_LOCK_SCHEMA = 3
 ARTIFACT_FILES = ("robot.urdf", "robot.usd", "map.yaml", "map.pgm", "robot-profile.yaml")
 ARM_JOINTS = tuple(f"joint{index}" for index in range(1, 8))
 _ZERO_ORIGIN = (0.0, 0.0, 0.0)
@@ -167,14 +174,16 @@ def _files(workspace: Path) -> Iterable[Path]:
                     yield path
 
 
-def _git_head(path: Path) -> str | None:
-    try:
-        return subprocess.check_output(
-            ["git", "-C", str(path), "rev-parse", "HEAD"], text=True,
-            stderr=subprocess.DEVNULL, timeout=10,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
+def _source_identity(records: list[dict[str, object]]) -> dict[str, str]:
+    contract = {
+        "version": SOURCE_CONTRACT_VERSION,
+        "robot": "tinker2",
+        "source_globs": list(SOURCE_GLOBS),
+        "source_paths": SOURCE_PATHS,
+    }
+    canonical = {"contract": contract, "files": records}
+    encoded = (json.dumps(canonical, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    return {"algorithm": "sha256", "value": hashlib.sha256(encoded).hexdigest()}
 
 
 def _snapshot_workspace(workspace: Path) -> tuple[list[dict[str, object]], dict[str, bytes]]:
@@ -215,20 +224,36 @@ def _validate_lock_records(raw: object) -> list[dict[str, object]]:
         if not isinstance(size, int) or size < 0:
             raise ArtifactExportError(f"invalid source lock size for {relative}")
         records.append({"path": relative, "size": size, "sha256": digest})
-    return sorted(records, key=lambda item: str(item["path"]))
+    paths = [str(item["path"]) for item in records]
+    if paths != sorted(paths):
+        raise ArtifactExportError("source lock records must be in canonical path order")
+    return records
 
 
-def _normalized_source_lock(workspace: Path, records: list[dict[str, object]]) -> bytes:
+def _normalized_source_lock(records: list[dict[str, object]]) -> bytes:
     payload = {
         "schema_version": SOURCE_LOCK_SCHEMA,
         "robot": "tinker2",
-        "source_identity": {
-            "repository": "tinker-workspace",
-            "revision": _git_head(workspace) or "unknown",
-        },
+        "source_identity": _source_identity(records),
         "files": records,
     }
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _validate_source_lock(raw: object, expected_records: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
+    if not isinstance(raw, dict) or set(raw) != {"schema_version", "robot", "source_identity", "files"}:
+        raise ArtifactExportError("source lock schema is unsupported")
+    if raw["schema_version"] != SOURCE_LOCK_SCHEMA or raw["robot"] != "tinker2":
+        raise ArtifactExportError("source lock schema or robot is unsupported")
+    identity = raw["source_identity"]
+    if not isinstance(identity, dict) or set(identity) != {"algorithm", "value"} or identity.get("algorithm") != "sha256":
+        raise ArtifactExportError("source lock identity is unsupported")
+    records = _validate_lock_records(raw)
+    if identity.get("value") != _source_identity(records)["value"]:
+        raise ArtifactExportError("source lock identity does not match its records")
+    if expected_records is not None and records != expected_records:
+        raise ArtifactExportError("source lock records do not exactly match the read-once source snapshot")
+    return records
 
 
 def capture_workspace_lock(workspace: Path, output: Path) -> dict[str, object]:
@@ -236,8 +261,8 @@ def capture_workspace_lock(workspace: Path, output: Path) -> dict[str, object]:
     output = Path(output)
     _path_parts_are_safe(output, "source lock output")
     records, _ = _snapshot_workspace(workspace)
-    payload = json.loads(_normalized_source_lock(workspace, records))
-    _atomic_write(output, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    payload = json.loads(_normalized_source_lock(records))
+    _atomic_write(output, _normalized_source_lock(records))
     return payload
 
 
@@ -255,7 +280,7 @@ def _load_json_bytes(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
 def verify_workspace_lock(workspace: Path, lock_path: Path) -> list[str]:
     records, _ = _snapshot_workspace(workspace)
     _, raw = _load_json_bytes(Path(lock_path), "source lock")
-    locked = _validate_lock_records(raw)
+    locked = _validate_source_lock(raw)
     current_by_path = {str(item["path"]): item for item in records}
     locked_by_path = {str(item["path"]): item for item in locked}
     mismatches: list[str] = []
@@ -342,6 +367,58 @@ def _validate_graph(root: ET.Element) -> None:
             raise CanonicalizationError(f"joint {joint.get('name')!r} references missing child link {child.get('link')!r}")
         if parent.get("link") == child.get("link"):
             raise CanonicalizationError(f"joint {joint.get('name')!r} connects a link to itself")
+
+
+def _finite_float(value: str | None, label: str) -> float:
+    try:
+        number = float(value) if value is not None else float("nan")
+    except ValueError as error:
+        raise CanonicalizationError(f"{label} is not numeric") from error
+    if not math.isfinite(number):
+        raise CanonicalizationError(f"{label} is not finite")
+    return number
+
+
+def _validate_physical_arm(root: ET.Element) -> None:
+    joints = {joint.get("name"): joint for joint in root.findall("joint")}
+    for name in ARM_JOINTS:
+        joint = joints.get(name)
+        if joint is None:
+            raise CanonicalizationError(f"missing physical arm joint: {name}")
+        if joint.get("type") not in {"revolute", "continuous", "prismatic"}:
+            raise CanonicalizationError(f"physical arm joint {name} is not actuated")
+        axis = joint.find("axis")
+        if axis is None:
+            raise CanonicalizationError(f"physical arm joint {name} is missing an axis")
+        axis_values = (axis.get("xyz") or "").split()
+        if len(axis_values) != 3:
+            raise CanonicalizationError(f"physical arm joint {name} axis must contain three components")
+        components = [_finite_float(value, f"physical arm joint {name} axis") for value in axis_values]
+        if sum(component * component for component in components) <= 0.0:
+            raise CanonicalizationError(f"physical arm joint {name} has a zero axis")
+        limit = joint.find("limit")
+        if limit is None:
+            raise CanonicalizationError(f"physical arm joint {name} is missing limits")
+        for key in ("effort", "velocity"):
+            if _finite_float(limit.get(key), f"physical arm joint {name} limit {key}") <= 0.0:
+                raise CanonicalizationError(f"physical arm joint {name} has an invalid {key} limit")
+        if joint.get("type") != "continuous":
+            lower = _finite_float(limit.get("lower"), f"physical arm joint {name} lower limit")
+            upper = _finite_float(limit.get("upper"), f"physical arm joint {name} upper limit")
+            if lower >= upper:
+                raise CanonicalizationError(f"physical arm joint {name} has inverted limits")
+
+
+def _validate_physical_drive(root: ET.Element) -> None:
+    joint = _special_joint(root, "drive_joint")
+    if joint is None or joint.get("type") not in {"revolute", "continuous", "prismatic"}:
+        raise CanonicalizationError("physical drive_joint must be a non-fixed actuated joint")
+    axis = joint.find("axis")
+    if axis is None:
+        raise CanonicalizationError("physical drive_joint must have an axis")
+    values = (axis.get("xyz") or "").split()
+    if len(values) != 3 or sum(_finite_float(value, "drive_joint axis") ** 2 for value in values) <= 0.0:
+        raise CanonicalizationError("physical drive_joint must have a nonzero axis")
 
 
 def _special_joint(root: ET.Element, name: str) -> ET.Element | None:
@@ -448,6 +525,8 @@ def _ensure_drive_control(root: ET.Element) -> None:
 
 def _validate_canonical_root(root: ET.Element) -> None:
     _validate_graph(root)
+    _validate_physical_arm(root)
+    _validate_physical_drive(root)
     if len([link for link in root.findall("link") if link.get("name") == "world"]) != 1:
         raise CanonicalizationError("canonical URDF must contain exactly one world link")
     world_joints = [joint for joint in root.findall("joint") if joint.get("name") == "world_joint"]
@@ -534,19 +613,30 @@ def _same_directory(left: Path, right: Path) -> bool:
 
 
 def _source_paths(workspace: Path) -> dict[str, str]:
-    return {
-        "robot.usd": "src/tk26_sim/_generated/tinker_full.usd",
-        "robot.urdf": "src/tk26_sim/_generated/tinker_full.full.urdf",
-        "map.yaml": "src/tk26_navigation/src/navigation_bringup/maps/0701_robocup_arena3.yaml",
-        "map.pgm": "src/tk26_navigation/src/navigation_bringup/maps/0701_robocup_arena3.pgm",
-        "robot-profile.yaml": "src/tk25_basic/src/tinker_robot_config/robots/tinker2/robot.yaml",
-    }
+    return dict(SOURCE_PATHS)
 
 
 @dataclass(frozen=True)
 class ExportResult:
     artifact_dir: Path
     manifest: dict[str, object]
+
+
+@contextmanager
+def _publication_lock(artifact_root: Path) -> Iterator[None]:
+    lock_path = artifact_root / ".artifact-export.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ArtifactPublicationError("another artifact exporter is active") from error
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _recover_staging(artifact_root: Path) -> None:
@@ -561,11 +651,19 @@ def _recover_staging(artifact_root: Path) -> None:
 
 
 def export_tinker2(workspace: Path, artifacts: Path, lock_path: Path) -> ExportResult:
+    artifacts = _safe_dir(artifacts, "artifacts root", create=True)
+    artifact_root = artifacts / "robot" / "tinker2"
+    _safe_dir(artifact_root, "artifact root", create=True)
+    with _publication_lock(artifact_root):
+        return _export_tinker2_locked(workspace, artifacts, lock_path)
+
+
+def _export_tinker2_locked(workspace: Path, artifacts: Path, lock_path: Path) -> ExportResult:
     workspace = _safe_dir(workspace, "workspace")
     artifacts = _safe_dir(artifacts, "artifacts root", create=True)
     lock_path = Path(lock_path)
     _path_parts_are_safe(lock_path, "source lock")
-    lock_parent = _safe_dir(lock_path.parent, "source lock parent", create=True)
+    _path_parts_are_safe(lock_path.parent, "source lock parent")
     try:
         lock_path.relative_to(artifacts / "provenance")
     except ValueError as error:
@@ -573,20 +671,10 @@ def export_tinker2(workspace: Path, artifacts: Path, lock_path: Path) -> ExportR
 
     current_records, consumed = _snapshot_workspace(workspace)
     if lock_path.exists():
-        lock_input_bytes, lock_input = _load_json_bytes(lock_path, "source lock")
-        locked_records = _validate_lock_records(lock_input)
-        if locked_records != current_records:
-            current_set = {str(item["path"]) for item in current_records}
-            locked_set = {str(item["path"]) for item in locked_records}
-            details = [f"added:{item}" for item in sorted(current_set - locked_set)] + [f"removed:{item}" for item in sorted(locked_set - current_set)]
-            details += [f"changed:{item}" for item in sorted(current_set & locked_set) if next(x for x in current_records if x["path"] == item) != next(x for x in locked_records if x["path"] == item)]
-            raise ArtifactExportError("workspace differs from source lock: " + ", ".join(details[:12]))
-    else:
-        lock_input_bytes = _normalized_source_lock(workspace, current_records)
-        lock_input = json.loads(lock_input_bytes)
-        _atomic_write(lock_path, lock_input_bytes)
+        _, lock_input = _load_json_bytes(lock_path, "source lock")
+        _validate_source_lock(lock_input, current_records)
 
-    source_lock_bytes = _normalized_source_lock(workspace, current_records)
+    source_lock_bytes = _normalized_source_lock(current_records)
     source_paths = _source_paths(workspace)
     missing = [relative for relative in source_paths.values() if relative not in consumed]
     if missing:
@@ -622,13 +710,15 @@ def export_tinker2(workspace: Path, artifacts: Path, lock_path: Path) -> ExportR
             "algorithm": CANONICALIZER_ALGORITHM,
             "source_path": source_paths["robot.urdf"],
             "source_sha256": hashlib.sha256(source_data["robot.urdf"]).hexdigest(),
+            "source_lock_record": next(record for record in current_records if record["path"] == source_paths["robot.urdf"]),
             "output_sha256": payload_hashes["robot.urdf"],
         },
         "provenance": {
             "source_lock_sha256": hashlib.sha256(source_lock_bytes).hexdigest(),
             "source_identity": json.loads(source_lock_bytes)["source_identity"],
-            "source_files": {record["path"]: record["sha256"] for record in current_records},
-            "usd_source_sha256": payload_hashes["robot.usd"],
+            "source_files": current_records,
+            "usd_source_path": source_paths["robot.usd"],
+            "usd_source_sha256": hashlib.sha256(source_data["robot.usd"]).hexdigest(),
         },
         "kinematics": {
             "front_left_joint": "front_left_wheel_joint", "front_right_joint": "front_right_wheel_joint",
@@ -640,6 +730,7 @@ def export_tinker2(workspace: Path, artifacts: Path, lock_path: Path) -> ExportR
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
     current_payload = {
         "schema_version": PUBLICATION_SCHEMA,
+        "robot": "tinker2",
         "artifact_id": digest,
         "artifact_dir": f"artifacts/robot/tinker2/{digest}",
         "manifest": f"artifacts/robot/tinker2/{digest}/manifest.json",

@@ -4,10 +4,13 @@ import copy
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -100,6 +103,49 @@ def _make_workspace(root: Path) -> None:
     (profile / "robot.yaml").write_text("robot: tinker2\n", encoding="utf-8")
 
 
+def _launch_stub_modules() -> dict[str, types.ModuleType]:
+    class Dummy:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def perform(self, _context):
+            return ""
+
+    launch = types.ModuleType("launch")
+    launch.LaunchDescription = lambda actions: Dummy(actions)
+    logging = types.ModuleType("launch.logging")
+    logging.get_logger = lambda _name: Dummy()
+    actions = types.ModuleType("launch.actions")
+    for name in ("DeclareLaunchArgument", "EmitEvent", "ExecuteProcess", "IncludeLaunchDescription", "OpaqueFunction", "RegisterEventHandler", "SetEnvironmentVariable"):
+        setattr(actions, name, Dummy)
+    event_handlers = types.ModuleType("launch.event_handlers")
+    event_handlers.OnProcessExit = Dummy
+    events = types.ModuleType("launch.events")
+    events.Shutdown = Dummy
+    sources = types.ModuleType("launch.launch_description_sources")
+    sources.PythonLaunchDescriptionSource = Dummy
+    substitutions = types.ModuleType("launch.substitutions")
+    substitutions.LaunchConfiguration = Dummy
+    launch_ros = types.ModuleType("launch_ros")
+    launch_ros_actions = types.ModuleType("launch_ros.actions")
+    launch_ros_actions.Node = Dummy
+    launch_ros_substitutions = types.ModuleType("launch_ros.substitutions")
+    launch_ros_substitutions.FindPackageShare = Dummy
+    return {
+        "launch": launch,
+        "launch.logging": logging,
+        "launch.actions": actions,
+        "launch.event_handlers": event_handlers,
+        "launch.events": events,
+        "launch.launch_description_sources": sources,
+        "launch.substitutions": substitutions,
+        "launch_ros": launch_ros,
+        "launch_ros.actions": launch_ros_actions,
+        "launch_ros.substitutions": launch_ros_substitutions,
+    }
+
+
 def _export_fixture() -> tuple[tempfile.TemporaryDirectory[str], Path, Path, Path]:
     temporary = tempfile.TemporaryDirectory()
     root = Path(temporary.name)
@@ -110,6 +156,15 @@ def _export_fixture() -> tuple[tempfile.TemporaryDirectory[str], Path, Path, Pat
     capture_workspace_lock(workspace, lock)
     result = export_tinker2(workspace, artifacts, lock)
     return temporary, workspace, artifacts, result.artifact_dir
+
+
+def _hold_publication_lock(artifact_root: str, ready, release) -> None:
+    from tinker_sim_deploy.workspace import _publication_lock
+    with _publication_lock(Path(artifact_root)):
+        stage = Path(artifact_root) / ".artifact-stage-active"
+        stage.mkdir()
+        ready.set()
+        release.wait(10)
 
 
 class CanonicalUrdfTest(unittest.TestCase):
@@ -147,6 +202,41 @@ class CanonicalUrdfTest(unittest.TestCase):
         self.assertEqual(root.find("transmission").find("opaque").text, "  opaque text  ")
         self.assertEqual(root.find("root_metadata").text, "  root text  ")
 
+    def test_physical_arm_joints_are_required_and_well_formed(self) -> None:
+        source = _fixture_urdf()
+        for mutation in (
+            source.replace(b'name="joint1"', b'name="renamed_joint1"', 1),
+            source.replace(b'xyz="0 0 1"', b'xyz="0 0 0"', 1),
+            source.replace(b' velocity="3" />', b" />", 1),
+        ):
+            with self.assertRaises(CanonicalizationError):
+                canonicalize_urdf(mutation)
+
+    def test_export_without_shared_lock_publishes_only_immutable_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            artifacts = root / "artifacts"
+            _make_workspace(workspace)
+            lock = artifacts / "provenance/tinker2-source-lock.json"
+            result = export_tinker2(workspace, artifacts, lock)
+            self.assertTrue((result.artifact_dir / "source-lock.json").is_file())
+            self.assertFalse(lock.exists())
+            self.assertTrue((artifacts / "robot/tinker2/current.json").is_file())
+
+    def test_failed_export_without_shared_lock_writes_no_lock_or_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            artifacts = root / "artifacts"
+            _make_workspace(workspace)
+            lock = artifacts / "provenance/tinker2-source-lock.json"
+            with mock.patch("tinker_sim_deploy.workspace.canonicalize_urdf", side_effect=CanonicalizationError("expected failure")):
+                with self.assertRaises(CanonicalizationError):
+                    export_tinker2(workspace, artifacts, lock)
+            self.assertFalse(lock.exists())
+            self.assertFalse((artifacts / "robot/tinker2/current.json").exists())
+
     def test_duplicate_hidden_provider_and_malformed_graph_fail_closed(self) -> None:
         duplicate = _fixture_urdf().replace(b"</robot>", b'<ros2_control name="hidden" type="system"><joint name="joint1"/></ros2_control></robot>')
         with self.assertRaises(CanonicalizationError):
@@ -163,7 +253,7 @@ class CanonicalUrdfTest(unittest.TestCase):
         try:
             artifact_id = artifact.name
             self.assertEqual(len(artifact_id), 64)
-            self.assertNotEqual(artifact_id, "36ac0317025d20a5")
+            self.assertRegex(artifact_id, r"^[0-9a-f]{64}$")
         finally:
             temporary.cleanup()
 
@@ -198,6 +288,18 @@ class CanonicalUrdfTest(unittest.TestCase):
             _make_workspace(workspace)
             artifacts = root / "artifacts"
             lock = artifacts / "provenance/tinker2-source-lock.json"
+            capture_workspace_lock(workspace, lock)
+            raw = json.loads(lock.read_text())
+            raw["robot"] = "foreign"
+            lock.write_text(json.dumps(raw))
+            with self.assertRaises(ArtifactExportError):
+                export_tinker2(workspace, artifacts, lock)
+            capture_workspace_lock(workspace, lock)
+            raw = json.loads(lock.read_text())
+            raw["source_identity"]["value"] = "0" * 64
+            lock.write_text(json.dumps(raw))
+            with self.assertRaises(ArtifactExportError):
+                export_tinker2(workspace, artifacts, lock)
             capture_workspace_lock(workspace, lock)
             raw = json.loads(lock.read_text())
             raw["files"].append({"path": "foreign", "size": 0, "sha256": "0" * 64})
@@ -258,6 +360,28 @@ class CanonicalUrdfTest(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_active_exporter_stage_is_not_recovered_by_concurrent_process(self) -> None:
+        temporary, workspace, artifacts, _ = _export_fixture()
+        try:
+            artifact_root = artifacts / "robot/tinker2"
+            ready = multiprocessing.Event()
+            release = multiprocessing.Event()
+            process = multiprocessing.Process(target=_hold_publication_lock, args=(str(artifact_root), ready, release))
+            process.start()
+            self.assertTrue(ready.wait(5))
+            with self.assertRaises(ArtifactPublicationError):
+                export_tinker2(workspace, artifacts, artifacts / "provenance/tinker2-source-lock.json")
+            self.assertTrue((artifact_root / ".artifact-stage-active").is_dir())
+            release.set()
+            process.join(5)
+            self.assertEqual(process.exitcode, 0)
+        finally:
+            release.set()
+            if process.is_alive():
+                process.terminate()
+                process.join()
+            temporary.cleanup()
+
     def test_resolver_rejects_tampered_current_manifest_hash_and_mixed_generation(self) -> None:
         temporary, _, artifacts, artifact = _export_fixture()
         try:
@@ -304,6 +428,24 @@ class CanonicalUrdfTest(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_resolver_cross_checks_manifest_provenance_against_lock(self) -> None:
+        temporary, _, artifacts, artifact = _export_fixture()
+        try:
+            root = artifacts.parent
+            current_path = artifacts / "robot/tinker2/current.json"
+            current = json.loads(current_path.read_text())
+            manifest_path = artifact / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["canonicalization"]["source_sha256"] = "0" * 64
+            manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+            manifest_path.write_bytes(manifest_bytes)
+            current["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+            current_path.write_text(json.dumps(current))
+            with self.assertRaises(RuntimeError):
+                resolve_current_artifact(root)
+        finally:
+            temporary.cleanup()
+
     def test_runtime_transformer_is_shared_and_arm_only(self) -> None:
         temporary, _, artifacts, _ = _export_fixture()
         try:
@@ -315,19 +457,58 @@ class CanonicalUrdfTest(unittest.TestCase):
         finally:
             temporary.cleanup()
 
-    def test_launch_modules_use_shared_resolver_when_ros_environment_is_available(self) -> None:
-        for relative in ("ros2_ws/src/tinker_sim_bridge/launch/manipulation.launch.py", "ros2_ws/src/tinker_sim_bridge/launch/whole_robot.launch.py"):
-            with self.subTest(relative=relative):
-                path = ROOT / relative
-                spec = importlib.util.spec_from_file_location(f"launch_{path.stem}", path)
+    def test_launch_modules_resolve_from_a_copied_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copied_root = Path(temporary) / "copied-checkout"
+            launch_dir = copied_root / "ros2_ws/src/tinker_sim_bridge/launch"
+            launch_dir.mkdir(parents=True)
+            source = ROOT / "ros2_ws/src/tinker_sim_bridge/launch/navigation.launch.py"
+            copied = launch_dir / source.name
+            shutil.copy2(source, copied)
+            with mock.patch.dict(sys.modules, _launch_stub_modules()):
+                spec = importlib.util.spec_from_file_location("copied_navigation", copied)
                 module = importlib.util.module_from_spec(spec)
-                try:
+                spec.loader.exec_module(module)
+                self.assertEqual(module._project_root, copied_root)
+                self.assertNotIn("/home/tinker/", copied.read_text())
+                self.assertIsNotNone(module.generate_launch_description())
+
+    def test_launch_wrapper_requires_external_workspace(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("TINKER_WS", None)
+        result = subprocess.run(
+            ["bash", str(ROOT / "scripts/launch-humble"), "navigation"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TINKER_WS", result.stderr)
+
+    def test_launch_modules_import_and_execute_without_host_fallbacks(self) -> None:
+        modules = _launch_stub_modules()
+        relatives = (
+            "ros2_ws/src/tinker_sim_bridge/launch/manipulation.launch.py",
+            "ros2_ws/src/tinker_sim_bridge/launch/whole_robot.launch.py",
+            "ros2_ws/src/tinker_sim_bridge/launch/navigation.launch.py",
+        )
+        with mock.patch.dict(sys.modules, modules):
+            for relative in relatives:
+                with self.subTest(relative=relative):
+                    path = ROOT / relative
+                    spec = importlib.util.spec_from_file_location(f"launch_{path.stem}", path)
+                    module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
-                except ModuleNotFoundError as error:
-                    self.skipTest(f"ROS launch environment unavailable: {error}")
-                self.assertIs(module.resolve_current_artifact, resolve_current_artifact)
-                self.assertEqual(module.topic_control_description, topic_control_description)
-                self.assertEqual(path.read_text().count('executable="gripper_facade"'), 1)
+                    description = module.generate_launch_description()
+                    self.assertIsNotNone(description)
+                    self.assertNotIn("/home/tinker/", path.read_text())
+                    self.assertNotIn("/home/tinker/", repr(description))
+                    if hasattr(module, "topic_control_description"):
+                        self.assertIs(module.topic_control_description, topic_control_description)
+                    self.assertIs(module.resolve_current_artifact, resolve_current_artifact)
+            self.assertEqual((ROOT / relatives[0]).read_text().count('executable="gripper_facade"'), 1)
+            self.assertEqual((ROOT / relatives[1]).read_text().count('executable="gripper_facade"'), 1)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ class AssetManifestTest(unittest.TestCase):
     def test_portable_template_is_outside_ignored_artifact_output(self) -> None:
         self.assertTrue((ROOT / "config/asset-manifest.example.json").is_file())
         self.assertFalse((ROOT / "config/asset-manifest.example.json").is_symlink())
+        self.assertFalse((ROOT / "artifacts/asset-manifest.example.json").exists())
 
     def test_requires_complete_hash_verified_groups(self) -> None:
         base = Config.load(ROOT)
@@ -49,6 +50,27 @@ class AssetManifestTest(unittest.TestCase):
             }
             (artifacts / "asset-manifest.json").write_text(json.dumps(manifest))
             self.assertEqual(verify_assets(config), manifest)
+
+    def test_rejects_symlink_asset(self) -> None:
+        base = Config.load(ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = Config(root=root, raw=copy.deepcopy(base.raw))
+            artifacts = config.path("artifacts")
+            artifacts.mkdir(parents=True)
+            outside = root / "outside.usd"
+            outside.write_text("outside", encoding="utf-8")
+            alias = artifacts / "alias.usd"
+            alias.symlink_to(outside)
+            cache = config.path("isaac_cache") / "assets" / "room.usd"
+            cache.parent.mkdir(parents=True)
+            cache.write_text("room", encoding="utf-8")
+            (artifacts / "asset-manifest.json").write_text(json.dumps({
+                "generated_robot_usds": [{"path": "artifacts/alias.usd", "sha256": sha256_file(outside)}],
+                "warmed_isaac_assets": [{"path": cache.relative_to(root).as_posix(), "sha256": sha256_file(cache)}],
+            }))
+            with self.assertRaises(RuntimeError):
+                verify_assets(config)
 
     def test_rejects_empty_asset_group(self) -> None:
         base = Config.load(ROOT)

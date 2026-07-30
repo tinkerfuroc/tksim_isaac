@@ -33,7 +33,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "project_root",
                 default_value=os.environ.get(
-                    "TINKER_SIM_ROOT", "/home/tinker/tinker-sim/6.0.1"
+                    "TINKER_SIM_ROOT", str(Path(__file__).resolve().parents[4])
                 ),
             ),
             DeclareLaunchArgument(
