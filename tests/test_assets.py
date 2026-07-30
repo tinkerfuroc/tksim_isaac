@@ -15,6 +15,10 @@ from tinker_sim_deploy.config import Config, sha256_file
 
 
 class AssetManifestTest(unittest.TestCase):
+    def test_portable_template_is_outside_ignored_artifact_output(self) -> None:
+        self.assertTrue((ROOT / "config/asset-manifest.example.json").is_file())
+        self.assertFalse((ROOT / "config/asset-manifest.example.json").is_symlink())
+
     def test_requires_complete_hash_verified_groups(self) -> None:
         base = Config.load(ROOT)
         with tempfile.TemporaryDirectory() as temporary:

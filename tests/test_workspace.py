@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -21,10 +22,11 @@ class WorkspaceLockTest(unittest.TestCase):
             source = workspace / "source"
             source.write_text("one", encoding="utf-8")
             lock = Path(temporary) / "lock.json"
-            lock.write_text(json.dumps({"files": [{"path": "source", "sha256": sha256_file(source)}]}))
-            self.assertEqual(verify_workspace_lock(workspace, lock), [])
-            source.write_text("two", encoding="utf-8")
-            self.assertEqual(verify_workspace_lock(workspace, lock), ["sha256:source"])
+            lock.write_text(json.dumps({"files": [{"path": "source", "size": 3, "sha256": sha256_file(source)}]}))
+            with mock.patch("tinker_sim_deploy.workspace.SOURCE_GLOBS", ("**/*",)):
+                self.assertEqual(verify_workspace_lock(workspace, lock), [])
+                source.write_text("two", encoding="utf-8")
+                self.assertEqual(verify_workspace_lock(workspace, lock), ["changed:source"])
 
 
 if __name__ == "__main__":

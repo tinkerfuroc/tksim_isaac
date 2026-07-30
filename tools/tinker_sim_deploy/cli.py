@@ -18,7 +18,6 @@ from .process import deployment_env, run
 from .provenance import verify
 from .ros_boundary import clean_isaac_environment
 from .workspace import capture_workspace_lock, export_tinker2, verify_workspace_lock
-from .workspace import capture_workspace_lock, export_tinker2, verify_workspace_lock
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,6 +44,7 @@ def _parser() -> argparse.ArgumentParser:
     restore = commands.add_parser("bundle-restore", help="restore and verify an offline bundle")
     restore.add_argument("bundle", type=Path)
     restore.add_argument("destination", type=Path)
+    restore.add_argument("--profile", choices=("whole_robot", "physics_only"), default="whole_robot")
 
     launch = commands.add_parser("launch", help="launch through the isolated Isaac ROS boundary")
     launch.add_argument(
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             print(output)
             return 0
         if args.command == "bundle-restore":
-            restored = bundle.restore(args.bundle.resolve(), args.destination.resolve())
+            restored = bundle.restore(args.bundle.resolve(), args.destination.resolve(), profile=args.profile)
             print(restored)
             return 0
         if args.command == "launch":
