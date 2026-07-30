@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from .config import Config, sha256_file
+from .runtime import resolve_current_artifact
 
 
 PROJECT_ENTRIES = (
@@ -106,6 +107,8 @@ def _write_reproducible_tar_gz(source: Path, output: Path) -> None:
 
 
 def create(config: Config, output: Path, uv_executable: Path) -> Path:
+    # Whole-robot bundles are not usable without one verified immutable robot generation.
+    resolve_current_artifact(config.root)
     required = [
         config.root / "uv.lock",
         config.path("uv_cache"),
@@ -172,7 +175,9 @@ def _validate_member(member: tarfile.TarInfo) -> None:
                 raise RuntimeError(f"unsafe link in offline bundle: {member.name}")
 
 
-def restore(bundle: Path, destination: Path) -> Path:
+def restore(bundle: Path, destination: Path, *, profile: str = "whole_robot") -> Path:
+    if profile not in {"whole_robot", "physics_only"}:
+        raise RuntimeError(f"unknown bundle restore profile: {profile}")
     if destination.exists() and any(destination.iterdir()):
         raise RuntimeError(f"restore destination must be empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
@@ -198,4 +203,6 @@ def restore(bundle: Path, destination: Path) -> Path:
             failures.append(relative)
     if failures:
         raise RuntimeError("offline bundle checksum failure: " + ", ".join(failures[:20]))
+    if profile == "whole_robot":
+        resolve_current_artifact(destination)
     return destination

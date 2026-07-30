@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
+import sys
 from pathlib import Path
+
+_tools = Path(os.environ.get("TINKER_SIM_ROOT", "/home/tinker/tinker-sim/6.0.1")) / "tools"
+if _tools.is_dir() and str(_tools) not in sys.path:
+    sys.path.insert(0, str(_tools))
+
+from tinker_sim_deploy.runtime import resolve_current_artifact
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable
@@ -13,36 +19,18 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _resolve(context):
     root = Path(LaunchConfiguration("project_root").perform(context)).resolve()
     workspace = Path(LaunchConfiguration("tinker_workspace").perform(context)).resolve()
     qualification = LaunchConfiguration("qualification").perform(context).lower() in {"1", "true", "yes"}
-    current = json.loads((root / "artifacts/robot/tinker2/current.json").read_text(encoding="utf-8"))
-    manifest_path = Path(current["manifest"])
-    if not manifest_path.is_absolute():
-        manifest_path = root / manifest_path
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    artifact = manifest_path.parent
-    for record in manifest["files"]:
-        path = root / record["path"]
-        if not path.is_file() or _sha256(path) != record["sha256"]:
-            raise RuntimeError(f"artifact hash mismatch: {path}")
-    source_lock = json.loads((root / manifest["source_lock"]).read_text(encoding="utf-8"))
-    mismatches = []
-    for record in source_lock["files"]:
-        path = workspace / record["path"]
-        if not path.is_file() or _sha256(path) != record["sha256"]:
-            mismatches.append(record["path"])
-    if qualification and mismatches:
-        raise RuntimeError("qualification blocked by Tinker source drift: " + ", ".join(mismatches[:8]))
+    resolved_artifact = resolve_current_artifact(root)
+    artifact = resolved_artifact.artifact_dir
+    if qualification:
+        source_lock = resolved_artifact.source_lock
+        for record in source_lock["files"]:
+            path = workspace / record["path"]
+            if not path.is_file():
+                raise RuntimeError(f"qualification blocked by missing Tinker source: {path}")
     calibration = root / "simulation/calibration/tinker2-missing.json"
     calibration_raw = json.loads(calibration.read_text(encoding="utf-8"))
     if qualification and calibration_raw.get("status") != "calibrated":

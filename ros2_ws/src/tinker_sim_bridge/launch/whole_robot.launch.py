@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-import json
 import launch.logging
 import os
-import xml.etree.ElementTree as ET
+import sys
 from pathlib import Path
+
+_tools = Path(os.environ.get("TINKER_SIM_ROOT", "/home/tinker/tinker-sim/6.0.1")) / "tools"
+if _tools.is_dir() and str(_tools) not in sys.path:
+    sys.path.insert(0, str(_tools))
+
+from tinker_sim_deploy.runtime import resolve_current_artifact, topic_control_description
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -23,8 +28,6 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
-ARM_JOINTS = tuple(f"joint{index}" for index in range(1, 8))
-
 
 def _process_exit_actions(event, label: str, success_actions):
     """Gate controller setup progression on a successful process exit."""
@@ -42,40 +45,10 @@ def _process_exit_actions(event, label: str, success_actions):
     ]
 
 
-def _topic_control_description(urdf: str) -> str:
-    root = ET.fromstring(urdf)
-    for existing in list(root.findall("ros2_control")):
-        root.remove(existing)
-    control = ET.SubElement(root, "ros2_control", name="TinkerTopicSystem", type="system")
-    hardware = ET.SubElement(control, "hardware")
-    ET.SubElement(hardware, "plugin").text = "topic_based_ros2_control/TopicBasedSystem"
-    for name, value in (
-        ("joint_commands_topic", "/sim/controller/ros2_control_commands"),
-        ("joint_states_topic", "/isaac_joint_states"),
-        ("trigger_joint_command_threshold", "-1"),
-    ):
-        ET.SubElement(hardware, "param", name=name).text = value
-    for name in ARM_JOINTS:
-        joint = ET.SubElement(control, "joint", name=name)
-        ET.SubElement(joint, "command_interface", name="position")
-        ET.SubElement(joint, "command_interface", name="velocity")
-        ET.SubElement(joint, "state_interface", name="position")
-        ET.SubElement(joint, "state_interface", name="velocity")
-        ET.SubElement(joint, "state_interface", name="effort")
-    return ET.tostring(root, encoding="unicode")
-
-
 def _resolve(context):
     root = Path(LaunchConfiguration("project_root").perform(context)).resolve()
-    current = json.loads(
-        (root / "artifacts/robot/tinker2/current.json").read_text(encoding="utf-8")
-    )
-    manifest_path = Path(current["manifest"])
-    if not manifest_path.is_absolute():
-        manifest_path = root / manifest_path
-    robot_description = _topic_control_description(
-        (manifest_path.parent / "robot.urdf").read_text(encoding="utf-8")
-    )
+    resolved_artifact = resolve_current_artifact(root)
+    robot_description = topic_control_description(resolved_artifact.robot_urdf)
     share = Path(FindPackageShare("tinker_sim_bridge").perform(context))
     joint_state_spawner = Node(
         package="tinker_sim_bridge",

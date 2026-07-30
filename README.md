@@ -130,9 +130,14 @@ or VPN. Use SSH for installation, process management, logs, tests, and bags.
 ## Offline provisioning
 
 Run a complete online bootstrap first. Add generated robot USDs and their
-checksums to `artifacts/asset-manifest.json` using the committed example; do
-not reference the surrounding ROS workspace. Both generated-USD and warmed
-asset groups must be non-empty, present on disk, and hash-correct.
+checksums to `artifacts/asset-manifest.json` using the tracked portable template
+at `config/asset-manifest.example.json`; do not reference the surrounding ROS
+workspace. Both generated-USD and warmed asset groups must be non-empty, present
+on disk, and hash-correct. Whole-robot bundles also require a verified immutable
+`artifacts/robot/tinker2/current.json` generation. The only intentional
+artifact-free mode is the explicitly selected `bundle-restore --profile
+physics_only` validation profile; whole-robot creation and restore fail closed
+when the verified generation is absent.
 Then:
 
 ```bash
@@ -209,9 +214,13 @@ strict planning contract: it adds the zero `world -> base_link` mount, names
 the existing `base_link -> link_base` mount, and records a state-only
 `drive_joint` entry. The USD is copied byte-for-byte and remains the simulator
 physics artifact. The canonical URDF bytes and canonicalizer algorithm version
-are part of the artifact identity; the manifest and source lock record both
-input and output hashes, and `current.json` is updated only after atomic,
-complete publication. Use the project-managed interpreter, for example
+are part of the artifact identity; the manifest, immutable per-artifact
+source lock, and `current.json` record the complete generation and all payload
+hashes. Publication fsyncs files/directories, atomically claims the immutable
+artifact directory, and replaces `current.json` as the sole commit point; a
+crash before that replacement can leave only an ignored orphan generation and
+cannot mix a pointer with a mutable root lock. Use the project-managed
+interpreter, for example
 `./.venv/bin/python tools/deploy.py artifact-export`, rather than editing an
 artifact directory in place.
 
@@ -246,5 +255,6 @@ References:
 ## Changelog
 
 - 2026-07-30: Added deterministic exporter-side canonical URDF derivation with
-  content-addressed provenance and atomic artifact publication. The USD physics
-  bytes remain unchanged.
+  full-SHA immutable generation identity, per-artifact source-lock provenance,
+  crash-consistent current-pointer publication, shared runtime validation, and
+  bundle admission checks. The USD physics bytes remain unchanged.

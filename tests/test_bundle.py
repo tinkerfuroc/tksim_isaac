@@ -16,11 +16,21 @@ from tinker_sim_deploy.bundle import (
     _checksums,
     _copy_entry,
     _write_reproducible_tar_gz,
+    create,
     restore,
 )
+from tinker_sim_deploy.config import Config
 
 
 class BundleSafetyTest(unittest.TestCase):
+    def test_create_rejects_clean_clone_without_verified_robot_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = json.loads((ROOT / "deployment.json").read_text())
+            config = Config(root=root, raw=raw)
+            with self.assertRaises(RuntimeError):
+                create(config, root / "bundle.tar.gz", root / "uv")
+
     def test_rejects_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -55,7 +65,7 @@ class BundleSafetyTest(unittest.TestCase):
             (stage / "checksums.json").write_text(json.dumps(manifest), encoding="utf-8")
             archive = root / "bundle.tar.gz"
             _write_reproducible_tar_gz(stage, archive)
-            destination = restore(archive, root / "destination")
+            destination = restore(archive, root / "destination", profile="physics_only")
             self.assertEqual((destination / "payload").read_text(), "content")
             self.assertTrue((destination / "alias").is_symlink())
             self.assertEqual(os.readlink(destination / "alias"), "payload")
