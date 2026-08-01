@@ -137,8 +137,12 @@ MOVEIT_ERROR_CODES: Mapping[int, str] = {
 }
 
 # Documented planning/collision/constraint failure codes accepted for blocked
-# mode.  SUCCESS (1), FAILURE (99999), and every control/execution/transport/
-# setup/configuration failure are deliberately excluded (adversarial C1).
+# mode.  Restricted to genuine planning/collision/constraint outcomes only:
+# request/state/config-validation codes (INVALID_GROUP_NAME -15,
+# INVALID_GOAL_CONSTRAINTS -16, INVALID_ROBOT_STATE -17, START_STATE_INVALID
+# -26, GOAL_STATE_INVALID -27, UNRECOGNIZED_GOAL_TYPE -28) and every control/
+# execution/transport/setup/configuration failure are deliberately excluded so
+# a misconfigured overlay cannot pass blocked mode (fix1 adversarial A).
 MOVEIT_PLANNING_FAILURE_CODES = frozenset(
     {
         -1,   # PLANNING_FAILED
@@ -149,13 +153,33 @@ MOVEIT_PLANNING_FAILURE_CODES = frozenset(
         -12,  # GOAL_IN_COLLISION
         -13,  # GOAL_VIOLATES_PATH_CONSTRAINTS
         -14,  # GOAL_CONSTRAINTS_VIOLATED
-        -15,  # INVALID_GROUP_NAME
-        -16,  # INVALID_GOAL_CONSTRAINTS
-        -17,  # INVALID_ROBOT_STATE
-        -26,  # START_STATE_INVALID
-        -27,  # GOAL_STATE_INVALID
-        -28,  # UNRECOGNIZED_GOAL_TYPE
         -31,  # NO_IK_SOLUTION
+    }
+)
+
+# Explicitly-rejected MoveItErrorCodes used as documentation/evidence: the
+# request/state/config-validation codes (blocked-mode masquerades) plus the
+# control/execution/transport/setup codes already excluded by the allowlist.
+MOVEIT_CONFIGURATION_FAILURE_CODES = frozenset(
+    {
+        -4,    # CONTROL_FAILED
+        -5,    # UNABLE_TO_AQUIRE_SENSOR_DATA
+        -6,    # TIMED_OUT
+        -7,    # PREEMPTED
+        -15,   # INVALID_GROUP_NAME
+        -16,   # INVALID_GOAL_CONSTRAINTS
+        -17,   # INVALID_ROBOT_STATE
+        -21,   # FRAME_TRANSFORM_FAILURE
+        -22,   # COLLISION_CHECKING_UNAVAILABLE
+        -23,   # ROBOT_STATE_STALE
+        -24,   # SENSOR_INFO_STALE
+        -25,   # COMMUNICATION_FAILURE
+        -26,   # START_STATE_INVALID
+        -27,   # GOAL_STATE_INVALID
+        -28,   # UNRECOGNIZED_GOAL_TYPE
+        -29,   # CRASH
+        -30,   # ABORT
+        99999,  # FAILURE
     }
 )
 
@@ -250,6 +274,20 @@ def _shell_meta() -> dict[str, object]:
         "dds_profile": os.environ.get("TINKER_SIM_DDS_PROFILE", ""),
         "simulator_root": str(REPO_ROOT),
     }
+
+
+def _exception_meta() -> dict[str, object]:
+    """Exception-path meta; includes the rclpy version when rclpy imported
+    successfully before the failure (fix1 spec M1)."""
+    meta = _shell_meta()
+    if "rclpy" in sys.modules:
+        try:
+            import rclpy
+
+            meta["rclpy"] = str(getattr(rclpy, "__version__", ""))
+        except Exception:  # noqa: BLE001 - never let meta collection mask the failure
+            meta["rclpy"] = ""
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -731,10 +769,16 @@ def _evaluate_readiness(
         reasons.append("readiness degraded to fail during the observation window")
     if window_counts.get("malformed"):
         reasons.append("readiness produced a malformed payload during the window")
+    if window_counts.get("identity_invalid"):
+        reasons.append(
+            "readiness produced a wrong-identity pass during the observation window"
+        )
     if readiness.get("any_fail_in_window"):
         reasons.append("readiness observed fail during the window")
     if readiness.get("any_malformed_in_window"):
         reasons.append("readiness observed malformed payload during the window")
+    if readiness.get("any_identity_invalid_in_window"):
+        reasons.append("readiness observed wrong-identity pass during the window")
     if readiness.get("publisher_graph_changed"):
         reasons.append("readiness publisher graph changed during the window")
     return reasons
@@ -819,6 +863,10 @@ def _evaluate_commands(
             reasons.append("command observation window is empty or inverted")
     else:
         reasons.append("command observation window timestamps missing")
+    if commands.get("publisher_graph_changed"):
+        reasons.append(
+            "{} publisher graph changed during the window".format(COMMAND_TOPIC)
+        )
     return reasons
 
 
@@ -1095,9 +1143,15 @@ class OmplPlanSmokeClient:
         self._readiness_valid = False
         self._readiness_received_at_s: float | None = None
         self._readiness_gate_refreshed_at: float | None = None
+        self._readiness_expected: dict[str, object] | None = None
         self._readiness_counts = {"pass": 0, "fail": 0, "malformed": 0}
         self._readiness_window_open = False
-        self._readiness_window_counts = {"pass": 0, "fail": 0, "malformed": 0}
+        self._readiness_window_counts = {
+            "pass": 0,
+            "fail": 0,
+            "malformed": 0,
+            "identity_invalid": 0,
+        }
         self._readiness_window: dict[str, object] = {"start_s": None, "end_s": None}
         self._readiness_publisher: dict[str, object] = {}
         self._readiness_pub_changed = False
@@ -1168,8 +1222,11 @@ class OmplPlanSmokeClient:
                 self._readiness_window_counts["malformed"] += 1
             elif state == READINESS_STATE_FAIL:
                 self._readiness_window_counts["fail"] += 1
-            else:
+            elif state == READINESS_STATE_PASS:
                 self._readiness_window_counts["pass"] += 1
+                expected = self._readiness_expected
+                if expected and readiness_identity_reasons(payload, expected):
+                    self._readiness_window_counts["identity_invalid"] += 1
 
     def _on_command(self, message: object) -> None:
         if not self._window_open:
@@ -1276,7 +1333,9 @@ class OmplPlanSmokeClient:
             expected_type=COMMAND_TYPE,
             expected_source=COMMAND_SOURCE,
         )
-        obs["expected_depth"] = 10
+        # Verified gateway source truth: command_gateway.py creates
+        # /isaac_joint_commands with RELIABLE/KEEP_LAST depth=50.
+        obs["expected_depth"] = 50
         return obs
 
     # -- readiness gating ---------------------------------------------------
@@ -1357,11 +1416,22 @@ class OmplPlanSmokeClient:
         }
 
     def _endpoint_ok(self, endpoint: Mapping[str, object]) -> bool:
-        """Quick endpoint sanity used only to decide whether to run the goal."""
+        """Endpoint sanity used to decide whether to run the goal.
+
+        Requires the exact observed ``_action/get_result`` type before sending:
+        a goal is never sent against a malformed result endpoint merely to
+        reject afterward (fix1 spec M2).
+        """
+        expected_result_type = derive_result_service_type(MOVE_ACTION_TYPE)
         return (
             endpoint.get("count") == 1
             and endpoint.get("source") == MOVE_ACTION_SOURCE
             and endpoint.get("kind") == MOVE_ACTION_KIND
+            and endpoint.get("result_service_present") is True
+            and sorted(
+                str(value) for value in (endpoint.get("result_service_types") or [])
+            )
+            == [expected_result_type]
         )
 
     # -- goal conversion -----------------------------------------------------
@@ -1467,6 +1537,7 @@ class OmplPlanSmokeClient:
         cancel_requested: bool = False,
         cancel_accepted: bool = False,
         cancel_confirmed: bool = False,
+        cancel_terminal_status: object | None = None,
     ) -> dict[str, object]:
         return {
             "kind": kind,
@@ -1487,6 +1558,10 @@ class OmplPlanSmokeClient:
             "cancel_requested": bool(cancel_requested),
             "cancel_accepted": bool(cancel_accepted),
             "cancel_confirmed": bool(cancel_confirmed),
+            "cancel_terminal_status": int(cancel_terminal_status)
+            if cancel_terminal_status is not None
+            else None,
+            "cancel_terminal_status_name": goal_status_name(cancel_terminal_status),
         }
 
     def _run_action(
@@ -1564,13 +1639,20 @@ class OmplPlanSmokeClient:
         """Boundedly request cancel, confirm, and return a fail-closed timeout.
 
         The command window stays open (the caller closes it after the tail).
-        All unresolved cancellation paths remain fail-closed.
+        ``cancel_confirmed`` means the goal actually reached ``STATUS_CANCELED``;
+        if it instead ended ``SUCCEEDED``/``ABORTED`` concurrently, that terminal
+        completion is recorded separately (``cancel_terminal_status``) rather
+        than mislabeled as confirmed (fix1 adv D).  All unresolved cancellation
+        paths remain fail-closed.
         """
         import rclpy
+
+        from action_msgs.msg import GoalStatus
 
         cancel_requested = True
         cancel_accepted = False
         cancel_confirmed = False
+        cancel_terminal_status: object | None = None
         try:
             cancel_future = goal_handle.cancel_goal_async()
             rclpy.spin_until_future_complete(self._node, cancel_future, timeout_sec=2.0)
@@ -1587,10 +1669,9 @@ class OmplPlanSmokeClient:
                 if result_future.done():
                     response = result_future.result()
                     if response is not None:
-                        cancel_confirmed = int(response.status) in (
-                            STATUS_CANCELED,
-                            STATUS_ABORTED,
-                            STATUS_SUCCEEDED,
+                        cancel_terminal_status = int(response.status)
+                        cancel_confirmed = (
+                            cancel_terminal_status == GoalStatus.STATUS_CANCELED
                         )
         except Exception:  # noqa: BLE001 - unresolved cancellation stays fail-closed
             cancel_accepted = cancel_accepted
@@ -1601,6 +1682,7 @@ class OmplPlanSmokeClient:
             cancel_requested=cancel_requested,
             cancel_accepted=cancel_accepted,
             cancel_confirmed=cancel_confirmed,
+            cancel_terminal_status=cancel_terminal_status,
         )
 
     def _execute_goal(self, goal: object) -> dict[str, object]:
@@ -1628,6 +1710,10 @@ class OmplPlanSmokeClient:
             tail_end = time.monotonic() + tail_s
             while time.monotonic() < tail_end:
                 rclpy.spin_once(self._node, timeout_sec=0.05)
+            # Final bounded nonblocking executor drain while the window is
+            # still open, then snapshot and close; this eliminates the
+            # unobserved close sliver as far as rclpy permits (fix1 adv C).
+            rclpy.spin_once(self._node, timeout_sec=0.0)
             self._command_window["tail_s"] = time.monotonic()
             self._window_open = False
             self._command_window["end_s"] = time.monotonic()
@@ -1755,6 +1841,10 @@ class OmplPlanSmokeClient:
             "window_counts": dict(self._readiness_window_counts),
             "any_fail_in_window": self._readiness_window_counts["fail"] > 0,
             "any_malformed_in_window": self._readiness_window_counts["malformed"] > 0,
+            "any_identity_invalid_in_window": self._readiness_window_counts[
+                "identity_invalid"
+            ]
+            > 0,
             "publisher_graph_changed": bool(self._readiness_pub_changed),
             "window": {
                 "start_s": self._readiness_window.get("start_s"),
@@ -1822,6 +1912,9 @@ class OmplPlanSmokeClient:
                 "trajectory_min_points": DEFAULT_TRAJECTORY_MIN_POINTS,
             }
         )
+        # Store the identity contract so the readiness callback can classify
+        # wrong-identity pass samples observed during the window.
+        self._readiness_expected = expected
 
         # 1. Canonical pass with identity agreement.
         if not self._wait_for_readiness(args.readiness_timeout, expected):
@@ -1862,7 +1955,12 @@ class OmplPlanSmokeClient:
                 meta=meta_info,
             )
 
-        # 4. Re-verify readiness freshness immediately before send.
+        # 4. Endpoint probe.
+        endpoint_obs = self._probe_move_action()
+
+        # 5. Re-verify readiness freshness as the final check immediately
+        # before opening the window/sending (after action + command publisher
+        # discovery).  A stale/wrong-identity pass at this point rejects.
         gate_refreshed = self._ensure_fresh_readiness(
             args.readiness_max_age, min(args.timeout, 10.0), expected
         )
@@ -1874,13 +1972,15 @@ class OmplPlanSmokeClient:
                 meta=meta_info,
             )
 
-        # 5. Endpoint probe.
-        endpoint_obs = self._probe_move_action()
-
         # 6. Open the readiness observation window around the request/result/tail.
         self._readiness_window_open = True
         self._readiness_window["start_s"] = time.monotonic()
-        self._readiness_window_counts = {"pass": 0, "fail": 0, "malformed": 0}
+        self._readiness_window_counts = {
+            "pass": 0,
+            "fail": 0,
+            "malformed": 0,
+            "identity_invalid": 0,
+        }
         try:
             if not self._endpoint_ok(endpoint_obs):
                 outcome_obs = self._make_outcome(
@@ -1985,14 +2085,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode=arguments.mode,
             scenario="",
             blocker="interrupted",
-            meta=_shell_meta(),
+            meta=_exception_meta(),
         )
     except Exception as exc:  # noqa: BLE001 - every representable failure writes a report
         report = fail_closed_report(
             mode=arguments.mode,
             scenario="",
             blocker="live attempt failed: {}".format(exc),
-            meta=_shell_meta(),
+            meta=_exception_meta(),
         )
     try:
         data = serialize_report(report)

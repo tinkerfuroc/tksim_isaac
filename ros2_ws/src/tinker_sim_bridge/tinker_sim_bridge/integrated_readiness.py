@@ -169,7 +169,10 @@ INTEGRATED_PUBLISHERS: Mapping[str, Mapping[str, object]] = {
         "max_age_s": None,
         "durability": "VOLATILE",
         "reliability": "RELIABLE",
-        "depth": 10,
+        # Verified gateway source truth: command_gateway.py creates this topic
+        # with RELIABLE/KEEP_LAST depth=50 (not 10).  The contract is aligned to
+        # the existing provider behavior; no provider change was made.
+        "depth": 50,
     },
     "/sim/controller/gripper_commands": {
         "type": "sensor_msgs/msg/JointState",
