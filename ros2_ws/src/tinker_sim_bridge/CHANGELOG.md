@@ -40,3 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   higher value cannot escape the mandatory memory bound.
 - Dropped inert package dependencies (`moveit_msgs`, `shape_msgs`,
   `tinker_arm_msgs`) not used by any source in this package.
+
+### Fixed (copied-install boundary + selector/identity strictness)
+
+- Shared-resolver discovery now prefers the authoritative simulator project
+  root supplied by the caller or derived from the manifest artifact path
+  (`current_artifact._shared_resolver`), so a genuine copied ROS install
+  outside the checkout can locate `tools/tinker_sim_deploy/runtime.py` without
+  `TINKER_SIM_ROOT`; discovery stays fail-closed when neither a project root
+  nor an authoritative artifact tree is available.
+- Legacy dispatch in `tools/tinker_sim_deploy/runtime.py` now accepts only the
+  deployed legacy shapes (unversioned pointer plus absent/schema-2 manifest);
+  hypothetical schema-1/3/other manifest values are rejected instead of being
+  treated as legacy, while schema-4 strict validation is unchanged.
+- Preflight artifact identity is proven against the authoritative
+  `current.json` selection by SHA-256 bytes: an outside-tree simulator artifact
+  with identical bytes passes, stale/different bytes fail, and an unresolvable
+  authoritative root returns a typed not-ready identity check (never
+  `ok=true`/`not applicable`).

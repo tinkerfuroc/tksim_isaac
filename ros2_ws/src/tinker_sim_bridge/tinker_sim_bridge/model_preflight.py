@@ -153,18 +153,6 @@ def _recompute_contract(manifest: Mapping[str, object]) -> dict[str, object]:
     return computed
 
 
-def _artifact_tree_root(sim_path: Path) -> Path | None:
-    """Return the project root when *sim_path* is inside ``artifacts/robot/tinker2``."""
-    for ancestor in (sim_path, *sim_path.parents):
-        if (
-            ancestor.name == "tinker2"
-            and ancestor.parent.name == "robot"
-            and ancestor.parent.parent.name == "artifacts"
-        ):
-            return ancestor.parent.parent.parent
-    return None
-
-
 def _effective_project_root(explicit, manifest) -> Path | None:
     if explicit is not None:
         return Path(explicit)
@@ -188,37 +176,20 @@ def _check_artifact_identity(
 ) -> None:
     """Append a typed installed/source artifact-identity check (never omitted).
 
-    When the manifest's simulator artifact lives inside an artifact tree and no
-    authoritative project root can be resolved, the check fails closed instead
-    of being silently dropped.
+    A fully-ready preflight must prove equality with the authoritative
+    ``current.json`` selection.  Outside-tree simulator artifacts are therefore
+    compared against a resolvable authoritative selection and fail if different;
+    if no authoritative root can be resolved the check fails closed.  There is
+    never an ``ok=true`` "not applicable" result.
     """
     sim_path = Path(manifest["artifacts"]["simulator_full_urdf"]["path"]).resolve()
     root = _effective_project_root(project_root, manifest)
     if root is None:
-        if _artifact_tree_root(sim_path) is not None:
-            checks.append(
-                {
-                    "name": "artifact_identity",
-                    "ok": False,
-                    "detail": "cannot resolve an authoritative current-artifact selection; set TINKER_SIM_ROOT or run from the simulator checkout",
-                }
-            )
-        else:
-            checks.append(
-                {
-                    "name": "artifact_identity",
-                    "ok": True,
-                    "detail": "simulator artifact is outside the project artifact tree; installed identity not applicable",
-                }
-            )
-        return
-    artifacts_root = (root / "artifacts").resolve()
-    if not sim_path.is_relative_to(artifacts_root):
         checks.append(
             {
                 "name": "artifact_identity",
-                "ok": True,
-                "detail": "simulator artifact is outside the project artifact tree; installed identity not applicable",
+                "ok": False,
+                "detail": "cannot resolve an authoritative current-artifact selection; set TINKER_SIM_ROOT or run from the simulator checkout",
             }
         )
         return
@@ -234,8 +205,22 @@ def _check_artifact_identity(
             }
         )
         return
-    ok = sim_path == expected
-    detail = "current.json selects {}; manifest references {}".format(expected, sim_path)
+    try:
+        sim_sha = sha256_file(sim_path)
+        expected_sha = sha256_file(expected)
+    except OSError as exc:
+        checks.append(
+            {
+                "name": "artifact_identity",
+                "ok": False,
+                "detail": "unable to read artifacts for identity comparison: {}".format(exc),
+            }
+        )
+        return
+    ok = sim_sha == expected_sha
+    detail = "current.json selects {} (sha256 {}); manifest references {} (sha256 {})".format(
+        expected, expected_sha, sim_path, sim_sha
+    )
     if not ok:
         detail += " (identity mismatch)"
     checks.append({"name": "artifact_identity", "ok": ok, "detail": detail})

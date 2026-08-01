@@ -135,6 +135,74 @@ def test_unsupported_schema_rejected(tmp_path: Path) -> None:
     assert typed.value.code == "artifact_current"
 
 
+def test_pointer_schema_1_rejected(tmp_path: Path) -> None:
+    artifact_id = "36ac0317025d20a5"
+    write_legacy_current(tmp_path, artifact_id, _URDF_BYTES)
+    # A hypothetical schema-1 pointer must not fall through to legacy dispatch.
+    (tmp_path / "artifacts" / "robot" / "tinker2" / "current.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_id": artifact_id,
+                "manifest": "artifacts/robot/tinker2/{}/manifest.json".format(artifact_id),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(Exception) as error:
+        runtime_resolve(tmp_path)
+    assert "unsupported" in str(error.value)
+    with pytest.raises(ModelContractError) as typed:
+        overlay_resolve(tmp_path)
+    assert typed.value.code == "artifact_current"
+
+
+def test_legacy_manifest_schema_1_rejected(tmp_path: Path) -> None:
+    artifact_id = "36ac0317025d20a5"
+    write_legacy_current(tmp_path, artifact_id, _URDF_BYTES)
+    manifest_path = tmp_path / "artifacts" / "robot" / "tinker2" / artifact_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(Exception) as error:
+        runtime_resolve(tmp_path)
+    assert "legacy manifest schema_version 1" in str(error.value)
+    with pytest.raises(ModelContractError) as typed:
+        overlay_resolve(tmp_path)
+    assert typed.value.code == "artifact_current"
+
+
+def test_legacy_manifest_schema_3_rejected(tmp_path: Path) -> None:
+    artifact_id = "36ac0317025d20a5"
+    write_legacy_current(tmp_path, artifact_id, _URDF_BYTES)
+    manifest_path = tmp_path / "artifacts" / "robot" / "tinker2" / artifact_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 3
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(Exception) as error:
+        runtime_resolve(tmp_path)
+    assert "legacy manifest schema_version 3" in str(error.value)
+    with pytest.raises(ModelContractError) as typed:
+        overlay_resolve(tmp_path)
+    assert typed.value.code == "artifact_current"
+
+
+def test_copied_install_resolves_through_provided_project_root(tmp_path: Path, monkeypatch) -> None:
+    current = ROOT / "artifacts" / "robot" / "tinker2" / "current.json"
+    if not current.is_file():
+        pytest.skip("simulator artifact tree is not present in this checkout")
+    data = json.loads(current.read_text(encoding="utf-8"))
+    # Simulate a genuine copied install: the module is not under the sim repo,
+    # the cwd is non-repository, and TINKER_SIM_ROOT is unset.  The caller still
+    # provides the authoritative project root, so the shared resolver must locate
+    # tools/tinker_sim_deploy there first rather than falling back.
+    monkeypatch.setattr("tinker_sim_bridge.current_artifact._simulation_root", lambda: None)
+    monkeypatch.delenv("TINKER_SIM_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    resolved = overlay_resolve(ROOT)
+    assert resolved.artifact_dir == ROOT / "artifacts" / "robot" / "tinker2" / data["artifact_id"]
+
+
 def test_legacy_urdf_hash_mismatch_rejected(tmp_path: Path) -> None:
     artifact_id = "36ac0317025d20a5"
     urdf = write_legacy_current(tmp_path, artifact_id, _URDF_BYTES)

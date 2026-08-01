@@ -192,8 +192,11 @@ def _resolve_legacy(root: Path, artifact_root: Path, current: dict[str, object])
     _, manifest = _load_json_bytes(manifest_path, "legacy artifact manifest")
     if manifest.get("robot") != "tinker2" or manifest.get("artifact_id") != artifact_id:
         raise RuntimeError("legacy manifest does not bind the selected Tinker 2 artifact")
-    if manifest.get("schema_version") == PUBLICATION_SCHEMA:
-        raise RuntimeError("legacy pointer points at a publication-schema manifest")
+    manifest_schema = manifest.get("schema_version")
+    if manifest_schema not in (None, 2):
+        raise RuntimeError(
+            "legacy manifest schema_version {} is not a deployed legacy shape".format(manifest_schema)
+        )
     canonicalization = manifest.get("canonicalization")
     if not isinstance(canonicalization, dict) or not isinstance(canonicalization.get("output_sha256"), str):
         raise RuntimeError("legacy manifest canonicalization provenance is incomplete")
