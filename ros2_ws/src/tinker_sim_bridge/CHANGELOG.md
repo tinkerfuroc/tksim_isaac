@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Atomic fixture PlanningScene adapter (`fixture_planning_scene`): applies one
+  atomic replacement diff of all desired `sim_fixture/*` objects plus every
+  stale existing `sim_fixture/*` id, gates on `/sim/ready/physics`, reads back
+  the scene, confirms readback/status, serves `/sim/ready/fixture`
+  (`std_srvs/srv/Trigger`), and publishes a reliable transient-local 5 Hz compact
+  canonical JSON heartbeat on `/sim/status/planning_scene_fixture`.  Registers
+  the console script and declares the direct interface dependencies used by the
+  node (`moveit_msgs`, `shape_msgs`, `std_srvs`).
+- Pure ROS-free fixture contract (`fixture_contract.py`): typed immutable
+  `CollisionObjectSpec`, `PlanningSceneDiffPlan`, and `Confirmation` types plus
+  `revision_digest`, `parse_required_fixture_owned_ids`,
+  `build_atomic_revision_diff` (namespace-scoped ADD+REMOVE in one diff), and
+  `confirm_fixture_revision` (fail-closed readback/status consistency).
+- ROS-free adapter (`fixture_planning_scene.py`): `fixture_to_specs`,
+  `fixture_owned_ids`, `fixture_descriptor`/`fixture_descriptor_sha256`, and the
+  canonical shared fixture-status mapping with exactly `schema_version`,
+  `state`, `scenario`, `owner`, `revision`, `revision_digest`, monotonic
+  `sequence`, finite `published_at`, `owned_ids`, `target_source_id`, scalar
+  `target_handoff="pick_and_place/object_mesh"`, and `fixture_descriptor_sha256`.
+- Scenario schema version 2 optional `planning_scene` with strict validation
+  (nonempty revision, canonical digest input, frame `base_link`, unique
+  `sim_fixture/*` ids, finite poses, positive primitive dimensions, hashed
+  absolute/declared mesh assets, declared target identity, exact handoff, and
+  explicit `enter_collision_bodies` for diagnostics).
+- Three public qualification scenarios
+  (`qualification-moveit-plan-joint`, `qualification-moveit-plan-pose`,
+  `qualification-moveit-plan-blocked`) sharing the pedestal and public-target
+  identity, with the blocked scenario adding `sim_fixture/plan_blocker`.
+- Pure contract/scenario tests (`tests/test_fixture_planning_scene.py`) and a
+  planning-scene scenario compilation test in
+  `tests/test_scenario_runner.py`.
+
 - Integrated eight-joint state contract: `drive_joint` is now state-only
   (`position`/`velocity`/`effort`, zero command interfaces) in both the checked-in
   `config/tinker_topic_control.ros2_control.xacro` and the live controller

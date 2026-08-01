@@ -42,6 +42,7 @@ setup(
             "command_gateway = tinker_sim_bridge.command_gateway:main",
             "contract_guard = tinker_sim_bridge.contract_guard:main",
             "controller_reconciler = tinker_sim_bridge.controller_reconciler:main",
+            "fixture_planning_scene = tinker_sim_bridge.fixture_planning_scene_node:main",
             "gripper_facade = tinker_sim_bridge.gripper_facade:main",
             "initial_pose = tinker_sim_bridge.initial_pose:main",
             "joint_state_probe = tinker_sim_bridge.joint_state_probe:main",
