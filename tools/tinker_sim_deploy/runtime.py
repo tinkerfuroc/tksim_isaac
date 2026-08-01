@@ -12,6 +12,8 @@ from .workspace import (
     CANONICALIZER_ALGORITHM,
     PUBLICATION_SCHEMA,
     SOURCE_PATHS,
+    ArtifactExportError,
+    UnsafePathError,
     _contained,
     _load_json_bytes,
     _safe_dir,
@@ -141,12 +143,8 @@ def _validate_manifest(
     return urdf
 
 
-def resolve_current_artifact(project_root: Path) -> ArtifactResolution:
-    root = _safe_dir(project_root, "project root")
-    artifact_root = _artifact_root(root)
-    current_path = artifact_root / "current.json"
-    _, current = _load_json_bytes(current_path, "current artifact pointer")
-    if current.get("schema_version") != PUBLICATION_SCHEMA or current.get("robot") != "tinker2":
+def _resolve_schema4(root: Path, artifact_root: Path, current: dict[str, object]) -> ArtifactResolution:
+    if current.get("robot") != "tinker2":
         raise RuntimeError("current artifact pointer schema is unsupported")
     artifact_id = current.get("artifact_id")
     artifact_dir_value = current.get("artifact_dir")
@@ -168,6 +166,87 @@ def resolve_current_artifact(project_root: Path) -> ArtifactResolution:
     source_lock_bytes, source_lock = _load_json_bytes(source_lock_path, "immutable artifact source lock")
     urdf = _validate_manifest(root, artifact_dir, current, manifest_bytes, manifest, source_lock_bytes, source_lock)
     return ArtifactResolution(root, artifact_dir, current, manifest, source_lock, urdf)
+
+
+def _resolve_legacy(root: Path, artifact_root: Path, current: dict[str, object]) -> ArtifactResolution:
+    """Resolve the legacy unversioned ``current.json`` + schema-2 manifest.
+
+    The legacy publication pipeline wrote an unversioned pointer
+    ``{"artifact_id": "<16-hex>", "manifest": "artifacts/robot/tinker2/<id>/manifest.json"}``
+    with a manifest whose ``schema_version`` is not the publication schema.
+    This compatibility path validates every invariant the legacy pointer and
+    manifest actually expose: exact Tinker-2/artifact binding, safe contained
+    paths, manifest agreement, and the selected canonical ``robot.urdf``.
+    """
+    artifact_id = current.get("artifact_id")
+    if not isinstance(artifact_id, str) or len(artifact_id) < 16 or any(c not in "0123456789abcdef" for c in artifact_id):
+        raise RuntimeError("legacy current artifact_id is not a valid content-addressed identity")
+    artifact_dir_value = f"artifacts/robot/tinker2/{artifact_id}"
+    manifest_value = current.get("manifest")
+    expected_manifest = f"{artifact_dir_value}/manifest.json"
+    if manifest_value != expected_manifest:
+        raise RuntimeError("legacy current manifest path is not inside the selected artifact")
+    artifact_dir = _contained(root, artifact_dir_value, "legacy artifact directory")
+    _safe_dir(artifact_dir, "selected legacy artifact directory")
+    manifest_path = _contained(root, manifest_value, "legacy manifest")
+    _, manifest = _load_json_bytes(manifest_path, "legacy artifact manifest")
+    if manifest.get("robot") != "tinker2" or manifest.get("artifact_id") != artifact_id:
+        raise RuntimeError("legacy manifest does not bind the selected Tinker 2 artifact")
+    if manifest.get("schema_version") == PUBLICATION_SCHEMA:
+        raise RuntimeError("legacy pointer points at a publication-schema manifest")
+    canonicalization = manifest.get("canonicalization")
+    if not isinstance(canonicalization, dict) or not isinstance(canonicalization.get("output_sha256"), str):
+        raise RuntimeError("legacy manifest canonicalization provenance is incomplete")
+    urdf_path = _contained(root, f"{artifact_dir_value}/robot.urdf", "legacy canonical URDF")
+    urdf = _safe_file_bytes(urdf_path, "legacy canonical URDF")
+    if canonicalization["output_sha256"] != _hash(urdf):
+        raise RuntimeError("legacy canonical URDF hash does not match manifest provenance")
+    files = manifest.get("files")
+    if isinstance(files, list):
+        for record in files:
+            if isinstance(record, dict) and str(record.get("path", "")).endswith("/robot.urdf"):
+                if not isinstance(record.get("sha256"), str) or record["sha256"] != _hash(urdf):
+                    raise RuntimeError("legacy manifest payload hash does not match canonical URDF")
+                break
+    source_lock_value = manifest.get("source_lock")
+    if source_lock_value is not None:
+        if not isinstance(source_lock_value, str):
+            raise RuntimeError("legacy manifest source lock path is invalid")
+        _safe_relative(source_lock_value, "legacy source lock path")
+    try:
+        ET.fromstring(urdf)
+    except ET.ParseError as error:
+        raise RuntimeError("legacy canonical URDF is not well-formed XML") from error
+    source_lock: dict[str, object] = {}
+    if isinstance(source_lock_value, str):
+        try:
+            lock_path = _contained(root, source_lock_value, "legacy source lock")
+            _, source_lock = _load_json_bytes(lock_path, "legacy source lock")
+        except (ArtifactExportError, UnsafePathError, OSError, json.JSONDecodeError):
+            # The legacy provenance lock is not a required deployment invariant;
+            # its absence/decay must not fail the pointer resolution.
+            source_lock = {}
+    return ArtifactResolution(root, artifact_dir, current, manifest, source_lock, urdf)
+
+
+def resolve_current_artifact(project_root: Path) -> ArtifactResolution:
+    """Resolve the selected canonical Tinker 2 artifact through ``current.json``.
+
+    One authoritative resolver for runtime selection, model-bundle resolution,
+    and preflight identity.  It explicitly dispatches the currently deployed
+    legacy (unversioned pointer + schema-2 manifest) shape and the schema-4
+    publication shape; any other shape is rejected.
+    """
+    root = _safe_dir(project_root, "project root")
+    artifact_root = _artifact_root(root)
+    current_path = artifact_root / "current.json"
+    _, current = _load_json_bytes(current_path, "current artifact pointer")
+    schema = current.get("schema_version")
+    if schema == PUBLICATION_SCHEMA:
+        return _resolve_schema4(root, artifact_root, current)
+    if schema is None:
+        return _resolve_legacy(root, artifact_root, current)
+    raise RuntimeError("current artifact pointer schema is unsupported")
 
 
 def topic_control_description(urdf: str | bytes) -> str:

@@ -116,7 +116,7 @@ def test_ready_preflight_reports_all_checks(tmp_path: Path) -> None:
     assert result["ready"] is True
     assert result["structural_fingerprint"] == json.loads(manifest_path.read_text(encoding="utf-8"))["structural_fingerprint"]
     names = [check["name"] for check in result["checks"]]
-    for expected in ("manifest_schema", "manifest_structure", "artifact_path_simulator_full_urdf", "artifact_hash_simulator_full_urdf", "contract", "fingerprint", "finite_json"):
+    for expected in ("manifest_schema", "manifest_structure", "artifact_path_simulator_full_urdf", "artifact_hash_simulator_full_urdf", "contract", "fingerprint", "finite_json", "artifact_identity"):
         assert expected in names
     assert all(check["ok"] for check in result["checks"])
 
@@ -187,20 +187,17 @@ def test_timeout_is_bounded_and_not_ready(tmp_path: Path) -> None:
 
 
 def test_artifact_identity_follows_current_json(tmp_path: Path) -> None:
+    from model_fixtures import write_legacy_current
+
     manifest_path = write_ready_manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     sim_path = Path(manifest["artifacts"]["simulator_full_urdf"]["path"])
     # Mirror the artifact tree: selected generation contains exactly this URDF.
     gen = "abcdef0123456789"
-    artifact_dir = tmp_path / "artifacts" / "robot" / "tinker2" / gen
-    artifact_dir.mkdir(parents=True)
-    (artifact_dir / "robot.urdf").write_bytes(sim_path.read_bytes())
-    (tmp_path / "artifacts" / "robot" / "tinker2" / "current.json").write_text(
-        json.dumps({"artifact_id": gen}), encoding="utf-8"
-    )
+    urdf = write_legacy_current(tmp_path, gen, sim_path.read_bytes())
     # Point the manifest at the mirrored generation path so identity matches.
-    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(artifact_dir / "robot.urdf")
-    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(artifact_dir / "robot.urdf")
+    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(urdf)
+    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(urdf)
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     result = preflight_manifest(manifest_path, timeout=60.0, project_root=tmp_path)
     identity = [check for check in result["checks"] if check["name"] == "artifact_identity"]
@@ -209,28 +206,94 @@ def test_artifact_identity_follows_current_json(tmp_path: Path) -> None:
 
 
 def test_artifact_identity_mismatch_is_not_ready(tmp_path: Path) -> None:
+    from model_fixtures import write_legacy_current
+
     manifest_path = write_ready_manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     sim_bytes = Path(manifest["artifacts"]["simulator_full_urdf"]["path"]).read_bytes()
     # The manifest references a generation that is NOT what current.json selects.
     selected_gen = "aaaa1111aaaa1111"
     other_gen = "bbbb2222bbbb2222"
-    selected_dir = tmp_path / "artifacts" / "robot" / "tinker2" / selected_gen
-    other_dir = tmp_path / "artifacts" / "robot" / "tinker2" / other_gen
-    selected_dir.mkdir(parents=True)
-    other_dir.mkdir(parents=True)
-    (selected_dir / "robot.urdf").write_bytes(sim_bytes)
-    (other_dir / "robot.urdf").write_bytes(sim_bytes)
+    other_urdf = write_legacy_current(tmp_path, other_gen, sim_bytes)
+    write_legacy_current(tmp_path, selected_gen, sim_bytes)
+    # Re-point the selector at the selected generation (last helper call won).
     (tmp_path / "artifacts" / "robot" / "tinker2" / "current.json").write_text(
-        json.dumps({"artifact_id": selected_gen}), encoding="utf-8"
+        json.dumps(
+            {"artifact_id": selected_gen, "manifest": "artifacts/robot/tinker2/{}/manifest.json".format(selected_gen)}
+        ),
+        encoding="utf-8",
     )
-    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(other_dir / "robot.urdf")
-    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(other_dir / "robot.urdf")
+    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(other_urdf)
+    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(other_urdf)
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     result = preflight_manifest(manifest_path, timeout=60.0, project_root=tmp_path)
     assert result["status"] == "mismatch"
     identity = [check for check in result["checks"] if check["name"] == "artifact_identity"]
     assert identity and identity[0]["ok"] is False
+
+
+def test_reversed_selected_links_not_ready_and_consumer_rejects(tmp_path: Path) -> None:
+    manifest_path = write_ready_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    links = manifest["normalization"]["selected_links"]
+    manifest["normalization"]["selected_links"] = list(reversed(links))
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    result = preflight_manifest(manifest_path, timeout=60.0, project_root=None)
+    assert result["status"] == "mismatch"
+    contract_check = [check for check in result["checks"] if check["name"] == "contract"]
+    assert contract_check and contract_check[0]["ok"] is False
+
+
+def test_wrong_groups_value_not_ready(tmp_path: Path) -> None:
+    manifest_path = write_ready_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["normalization"]["groups"] = {"arm": "xarm7", "gripper": "other_group"}
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    result = preflight_manifest(manifest_path, timeout=60.0, project_root=None)
+    assert result["status"] in {"invalid", "mismatch"}
+    assert result["ready"] is False
+
+
+def test_identity_fails_closed_without_project_root(tmp_path: Path, monkeypatch) -> None:
+    manifest_path = write_ready_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Move the manifest's sim artifact inside an artifact tree with no selector.
+    sim_src = Path(manifest["artifacts"]["simulator_full_urdf"]["path"])
+    artifact_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "abcdef0123456789"
+    artifact_dir.mkdir(parents=True)
+    urdf = artifact_dir / "robot.urdf"
+    urdf.write_bytes(sim_src.read_bytes())
+    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(urdf)
+    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(urdf)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    # Simulate a non-repository cwd and no TINKER_SIM_ROOT: no authoritative
+    # current.json can be resolved, so identity must fail closed, not be omitted.
+    monkeypatch.delenv("TINKER_SIM_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    result = preflight_manifest(manifest_path, timeout=60.0, project_root=None)
+    identity = [check for check in result["checks"] if check["name"] == "artifact_identity"]
+    assert identity and identity[0]["ok"] is False
+    assert result["status"] == "mismatch"
+    assert result["ready"] is False
+
+
+def test_identity_ready_from_manifest_derived_root(tmp_path: Path) -> None:
+    from model_fixtures import write_legacy_current
+
+    manifest_path = write_ready_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    sim_src = Path(manifest["artifacts"]["simulator_full_urdf"]["path"])
+    # Put the manifest sim path inside a valid legacy artifact tree (the tree
+    # carries its own current.json), and pass project_root=None so the root is
+    # derived from the manifest path.
+    urdf = write_legacy_current(tmp_path, "abcdef0123456789", sim_src.read_bytes())
+    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(urdf)
+    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(urdf)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    result = preflight_manifest(manifest_path, timeout=60.0, project_root=None)
+    identity = [check for check in result["checks"] if check["name"] == "artifact_identity"]
+    assert identity and identity[0]["ok"] is True
+    assert result["status"] == "ready"
 
 
 def _sha(path: Path) -> str:

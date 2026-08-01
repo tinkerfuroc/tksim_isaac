@@ -543,6 +543,18 @@ def canonical_contract(
     return _finite(contract, field="contract")
 
 
+def _normalize_groups_value(value: object) -> dict[str, str]:
+    if isinstance(value, dict):
+        names = {str(item) for item in value.values()}
+    elif isinstance(value, list):
+        names = {str(item) for item in value}
+    else:
+        raise _error("invalid_manifest", "normalization.groups must be a mapping or list", "normalization.groups")
+    if names != set(GROUPS.values()):
+        raise _error("invalid_manifest", "normalization.groups must name xarm7 and xarm_gripper", "normalization.groups")
+    return dict(GROUPS)
+
+
 def validate_bundle_manifest(manifest: Mapping[str, object]) -> None:
     """Validate a model-bundle manifest structure without recomputing bytes."""
     if not isinstance(manifest, dict):
@@ -575,6 +587,7 @@ def validate_bundle_manifest(manifest: Mapping[str, object]) -> None:
         raise _error("invalid_manifest", "normalization is incomplete", "normalization")
     if not isinstance(normalization["prefix"], str):
         raise _error("invalid_manifest", "normalization.prefix must be a string", "normalization.prefix")
+    _normalize_groups_value(normalization["groups"])
     if tuple(normalization["ordered_joints"]) != ORDERED_JOINTS:
         raise _error("invalid_manifest", "normalization.ordered_joints is not canonical", "normalization.ordered_joints")
     selected_links = normalization["selected_links"]

@@ -54,8 +54,45 @@ The producer validates every input, parses the narrow manipulation subgraph,
 computes exact byte hashes and the structural fingerprint, and atomically
 renames the complete manifest into the output directory.  The simulator full
 URDF should be resolved through the current content-addressed selector via
-`resolve_simulator_full_urdf(project_root)`, which reads
-`artifacts/robot/tinker2/current.json` and never pins an artifact hash.
+`resolve_simulator_full_urdf(project_root)`, which delegates to the one shared
+authoritative resolver (see below) and never pins an artifact hash.
+
+### Joint-limit synthesis (required for the canonical bundle)
+
+The canonical schema requires all eight selected joints in `joint_limits`, but
+the production arm file (`xarm_moveit_config/config/xarm7/joint_limits.yaml`)
+defines only `joint1`..`joint7`.  `model_limits` deterministically synthesizes
+the canonical eight-joint `joint_limits` artifact from the committed arm and
+gripper source YAML files and writes it atomically, so the merged artifact is
+itself the path+bytes hashed into the manifest and is reproducible:
+
+```bash
+ros2 run tinker_sim_bridge model_limits \
+  --arm-joint-limits "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm7/joint_limits.yaml" \
+  --gripper-joint-limits "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm_gripper/joint_limits.yaml" \
+  --output "$PWD/outputs/ompl-overlay/model-bundle/joint_limits.yaml"
+ros2 run tinker_sim_bridge model_bundle \
+  --simulator-full-urdf "$(./scripts/model-bundle-sim-urdf.sh)" \
+  --planning-urdf "$TINKER_WS/src/tk25_basic/src/cumotion_description/config/xarm7.urdf" \
+  --planning-srdf "$TINKER_WS/src/tk25_basic/src/cumotion_description/config/xarm7.srdf" \
+  --joint-limits "$PWD/outputs/ompl-overlay/model-bundle/joint_limits.yaml" \
+  --kinematics "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm7/kinematics.yaml" \
+  --prefix "" --mount-parent world --mount-child base_link \
+  --output "$PWD/outputs/ompl-overlay/model-bundle/model-bundle.json"
+```
+
+### Current-artifact resolution (one shared resolver)
+
+`model_bundle`, `model_preflight`, and the runtime deployment tooling all
+resolve `artifacts/robot/tinker2/current.json` through the single authoritative
+resolver in `tools/tinker_sim_deploy/runtime.py`.  It explicitly dispatches and
+validates both the currently deployed legacy selector (unversioned pointer +
+schema-2 manifest) and the schema-4 publication shape; any other shape is
+rejected.  The overlay accesses it through `tinker_sim_bridge.current_artifact`,
+keeping the model modules ROS-free at import while sharing the resolver's full
+integrity checks (schema, robot/artifact binding, safe contained paths, manifest
+agreement, selected `robot.urdf`).  On migration to schema 4 the resolver
+automatically enforces the stronger checks; no overlay-specific reader exists.
 
 ### Preflight CLI
 

@@ -277,3 +277,41 @@ def test_validate_bundle_manifest_rejects_relative_artifact_path() -> None:
     with pytest.raises(ModelContractError) as error:
         validate_bundle_manifest(manifest)
     assert error.value.code == "invalid_manifest"
+
+
+def test_validate_bundle_manifest_rejects_wrong_groups_value() -> None:
+    manifest = valid_manifest()
+    manifest["normalization"]["groups"] = {"arm": "xarm7", "gripper": "other_group"}
+    with pytest.raises(ModelContractError) as error:
+        validate_bundle_manifest(manifest)
+    assert error.value.code == "invalid_manifest"
+    assert "groups" in str(error.value)
+
+
+def test_validate_bundle_manifest_rejects_extra_groups_name() -> None:
+    manifest = valid_manifest()
+    manifest["normalization"]["groups"] = {"arm": "xarm7", "gripper": "xarm_gripper", "extra": "not_a_group"}
+    with pytest.raises(ModelContractError) as error:
+        validate_bundle_manifest(manifest)
+    assert error.value.code == "invalid_manifest"
+
+
+def test_validate_bundle_manifest_accepts_list_form_groups() -> None:
+    manifest = valid_manifest()
+    manifest["normalization"]["groups"] = ["xarm7", "xarm_gripper"]
+    validate_bundle_manifest(manifest)
+
+
+def test_validate_bundle_manifest_rejects_non_mapping_list_groups() -> None:
+    manifest = valid_manifest()
+    manifest["normalization"]["groups"] = ["xarm7"]
+    with pytest.raises(ModelContractError) as error:
+        validate_bundle_manifest(manifest)
+    assert error.value.code == "invalid_manifest"
+
+
+def test_fingerprint_unchanged_for_valid_groups_mutations() -> None:
+    base = valid_manifest()
+    list_form = valid_manifest()
+    list_form["normalization"]["groups"] = ["xarm7", "xarm_gripper"]
+    assert list_form["structural_fingerprint"] == base["structural_fingerprint"]

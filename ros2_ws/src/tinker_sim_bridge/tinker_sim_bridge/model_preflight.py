@@ -18,13 +18,14 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 import yaml
 
-from .model_bundle import resolve_simulator_full_urdf
+from .current_artifact import resolve_current_artifact as _resolve_current_artifact
 from .model_contract import (
     ARTIFACT_NAMES,
+    GROUPS,
     ModelContractError,
     canonical_contract,
     canonical_json,
@@ -39,6 +40,7 @@ _MISMATCH = "mismatch"
 _INVALID = "invalid"
 _TIMEOUT = "timeout"
 _ERROR = "error"
+MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 
 class _PreflightTimeout(Exception):
@@ -124,7 +126,7 @@ def _recompute_contract(manifest: Mapping[str, object]) -> dict[str, object]:
     normalization = manifest["normalization"]
     if not isinstance(normalization, dict):
         raise ModelContractError("invalid_manifest", "normalization must be an object", field="normalization")
-    return canonical_contract(
+    computed = canonical_contract(
         sim_xml,
         plan_xml,
         srdf_xml,
@@ -133,22 +135,73 @@ def _recompute_contract(manifest: Mapping[str, object]) -> dict[str, object]:
         prefix=normalization["prefix"],
         mount=normalization["mount"],
     )
+    # Mirror the landed production consumer: group names/content and exact
+    # selected-link ordering must agree with the recomputed resolved graph.
+    groups = normalization.get("groups")
+    if isinstance(groups, dict):
+        names = {str(item) for item in groups.values()}
+    elif isinstance(groups, list):
+        names = {str(item) for item in groups}
+    else:
+        raise ModelContractError("invalid_manifest", "normalization.groups must be a mapping or list", field="normalization.groups")
+    if names != set(GROUPS.values()):
+        raise ModelContractError("invalid_manifest", "normalization.groups must name xarm7 and xarm_gripper", field="normalization.groups")
+    if tuple(normalization["selected_links"]) != tuple(computed["selected_links"]):
+        raise ModelContractError(
+            "semantic_mismatch", "normalization.selected_links does not match resolved graph", field="normalization.selected_links"
+        )
+    return computed
+
+
+def _artifact_tree_root(sim_path: Path) -> Path | None:
+    """Return the project root when *sim_path* is inside ``artifacts/robot/tinker2``."""
+    for ancestor in (sim_path, *sim_path.parents):
+        if (
+            ancestor.name == "tinker2"
+            and ancestor.parent.name == "robot"
+            and ancestor.parent.parent.name == "artifacts"
+        ):
+            return ancestor.parent.parent.parent
+    return None
+
+
+def _effective_project_root(explicit, manifest) -> Path | None:
+    if explicit is not None:
+        return Path(explicit)
+    sim_path = Path(manifest["artifacts"]["simulator_full_urdf"]["path"])
+    for ancestor in (sim_path, *sim_path.parents):
+        if (ancestor / "artifacts" / "robot" / "tinker2" / "current.json").is_file():
+            return ancestor
+    env = os.environ.get("TINKER_SIM_ROOT")
+    if env:
+        return Path(env)
+    cwd = Path.cwd()
+    if (cwd / "artifacts" / "robot" / "tinker2" / "current.json").is_file():
+        return cwd
+    return None
 
 
 def _check_artifact_identity(
     checks: list[dict[str, object]],
     manifest: Mapping[str, object],
-    project_root: Path,
+    project_root: Path | None,
 ) -> None:
+    """Append a typed installed/source artifact-identity check (never omitted).
+
+    When the manifest's simulator artifact lives inside an artifact tree and no
+    authoritative project root can be resolved, the check fails closed instead
+    of being silently dropped.
+    """
     sim_path = Path(manifest["artifacts"]["simulator_full_urdf"]["path"]).resolve()
-    artifacts_root = (project_root / "artifacts").resolve()
-    inside_tree = sim_path.is_relative_to(artifacts_root)
-    try:
-        expected = resolve_simulator_full_urdf(project_root).resolve()
-    except ModelContractError as exc:
-        if inside_tree:
+    root = _effective_project_root(project_root, manifest)
+    if root is None:
+        if _artifact_tree_root(sim_path) is not None:
             checks.append(
-                {"name": "artifact_identity", "ok": False, "detail": "{}: {}".format(exc.code, exc)}
+                {
+                    "name": "artifact_identity",
+                    "ok": False,
+                    "detail": "cannot resolve an authoritative current-artifact selection; set TINKER_SIM_ROOT or run from the simulator checkout",
+                }
             )
         else:
             checks.append(
@@ -159,12 +212,25 @@ def _check_artifact_identity(
                 }
             )
         return
-    if not inside_tree:
+    artifacts_root = (root / "artifacts").resolve()
+    if not sim_path.is_relative_to(artifacts_root):
         checks.append(
             {
                 "name": "artifact_identity",
                 "ok": True,
                 "detail": "simulator artifact is outside the project artifact tree; installed identity not applicable",
+            }
+        )
+        return
+    try:
+        resolved = _resolve_current_artifact(root)
+        expected = (resolved.artifact_dir / "robot.urdf").resolve()
+    except (ModelContractError, RuntimeError) as exc:
+        checks.append(
+            {
+                "name": "artifact_identity",
+                "ok": False,
+                "detail": "cannot resolve current artifact selection: {}".format(exc),
             }
         )
         return
@@ -184,8 +250,10 @@ def preflight_manifest(
     """Run a bounded preflight over one model-bundle manifest.
 
     *timeout* is a wall-clock budget in seconds (``None`` disables the bound).
-    When *project_root* names a simulator checkout, the installed/source
-    artifact identity check follows ``current.json``.
+    The installed/source artifact identity check always runs: *project_root*
+    may name a simulator checkout explicitly, otherwise it is derived from the
+    manifest's simulator artifact path or the environment, and the check fails
+    closed (never omitted) when no authoritative selection can be resolved.
     """
     manifest_path = Path(manifest_path)
     if not manifest_path.is_absolute():
@@ -204,6 +272,19 @@ def preflight_manifest(
             raise _PreflightTimeout()
 
     try:
+        try:
+            if manifest_path.stat().st_size > MAX_ARTIFACT_BYTES:
+                checks.append(
+                    {
+                        "name": "manifest_schema",
+                        "ok": False,
+                        "detail": "manifest exceeds the {} MiB artifact bound".format(MAX_ARTIFACT_BYTES // (1024 * 1024)),
+                    }
+                )
+                return _result(_INVALID, checks, {"_manifest_path": str(manifest_path)}, elapsed_ms())
+        except OSError as exc:
+            checks.append({"name": "manifest_schema", "ok": False, "detail": "unable to stat manifest: {}".format(exc)})
+            return _result(_INVALID, checks, {"_manifest_path": str(manifest_path)}, elapsed_ms())
         try:
             manifest = _load_manifest(manifest_path)
         except (OSError, json.JSONDecodeError) as exc:
@@ -236,6 +317,26 @@ def preflight_manifest(
                     }
                 )
                 continue
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                checks.append(
+                    {
+                        "name": "artifact_path_{}".format(name),
+                        "ok": False,
+                        "detail": "unable to stat {}: {}".format(path, exc),
+                    }
+                )
+                continue
+            if size > MAX_ARTIFACT_BYTES:
+                checks.append(
+                    {
+                        "name": "artifact_path_{}".format(name),
+                        "ok": False,
+                        "detail": "{} exceeds the {} MiB artifact bound".format(path, MAX_ARTIFACT_BYTES // (1024 * 1024)),
+                    }
+                )
+                continue
             checks.append({"name": "artifact_path_{}".format(name), "ok": True, "detail": str(path)})
             _bounded()
             actual = sha256_file(path)
@@ -252,6 +353,7 @@ def preflight_manifest(
             code = exc.code if isinstance(exc, ModelContractError) else "artifact_parse"
             checks.append({"name": "contract", "ok": False, "detail": "{}: {}".format(code, exc)})
             return _result(_MISMATCH, checks, manifest, elapsed_ms())
+        _bounded()
         checks.append(
             {
                 "name": "contract",
@@ -275,8 +377,7 @@ def preflight_manifest(
         except (ValueError, TypeError) as exc:
             checks.append({"name": "finite_json", "ok": False, "detail": str(exc)})
 
-        if project_root is not None:
-            _check_artifact_identity(checks, manifest, Path(project_root))
+        _check_artifact_identity(checks, manifest, project_root)
 
         if any(not item["ok"] for item in checks):
             return _result(_MISMATCH, checks, manifest, elapsed_ms())
@@ -295,16 +396,6 @@ def preflight_manifest(
         return _result(_ERROR, checks, {"_manifest_path": str(manifest_path)}, elapsed_ms())
 
 
-def _project_root() -> Path | None:
-    env = os.environ.get("TINKER_SIM_ROOT")
-    if env:
-        return Path(env)
-    candidate = Path.cwd()
-    if (candidate / "artifacts" / "robot" / "tinker2" / "current.json").is_file():
-        return candidate
-    return None
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="model_preflight",
@@ -315,10 +406,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=60.0, metavar="SECONDS", help="wall-clock preflight budget")
     args = parser.parse_args(argv)
 
+    # The project root is derived inside preflight_manifest (explicit input,
+    # manifest artifact path, then environment/cwd), and the artifact-identity
+    # check fails closed when no authoritative selection can be resolved.
     result = preflight_manifest(
         Path(args.model_bundle_manifest),
         timeout=args.timeout,
-        project_root=_project_root(),
+        project_root=None,
     )
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     if result["status"] == _READY:
