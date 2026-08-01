@@ -98,8 +98,8 @@ def _publisher(
     type_: str = COMMAND_TYPE,
     reliability: str = "RELIABLE",
     durability: str = "VOLATILE",
-    depth: int = 10,
-    expected_depth: int | None = 10,
+    depth: int = 50,
+    expected_depth: int | None = 50,
     settled: bool = True,
 ) -> dict[str, object]:
     return {
@@ -179,9 +179,10 @@ def _readiness(mode: str, *, gate_refreshed: bool = True) -> dict[str, object]:
         "publisher": _readiness_publisher(),
         "identity": _identity(mode),
         "counts": {"pass": 1, "fail": 0, "malformed": 0},
-        "window_counts": {"pass": 1, "fail": 0, "malformed": 0},
+        "window_counts": {"pass": 1, "fail": 0, "malformed": 0, "identity_invalid": 0},
         "any_fail_in_window": False,
         "any_malformed_in_window": False,
+        "any_identity_invalid_in_window": False,
         "publisher_graph_changed": False,
         "window": {"start_s": 100.1, "end_s": 100.15},
     }
@@ -959,6 +960,58 @@ def test_evaluate_rejects_command_empty_window() -> None:
     assert any("window" in reason for reason in reasons)
 
 
+def test_evaluate_rejects_command_publisher_graph_changed() -> None:
+    snapshot = ready_snapshot("joint")
+    snapshot["command_observations"]["publisher_graph_changed"] = True
+    ready, reasons = evaluate_smoke(snapshot, expected_for("joint"))
+    assert not ready
+    assert any("publisher graph changed" in reason for reason in reasons)
+
+
+def test_evaluate_accepts_command_publisher_graph_unchanged() -> None:
+    snapshot = ready_snapshot("joint")
+    snapshot["command_observations"]["publisher_graph_changed"] = False
+    ready, reasons = evaluate_smoke(snapshot, expected_for("joint"))
+    assert ready, reasons
+
+
+def test_evaluate_rejects_command_publisher_wrong_depth() -> None:
+    snapshot = ready_snapshot("joint")
+    snapshot["command_observations"]["publisher"] = _publisher(depth=10)
+    ready, reasons = evaluate_smoke(snapshot, expected_for("joint"))
+    assert not ready
+    assert any("publisher depth" in reason for reason in reasons)
+
+
+def test_evaluate_accepts_command_publisher_depth_50() -> None:
+    snapshot = ready_snapshot("joint")
+    snapshot["command_observations"]["publisher"] = _publisher(depth=50)
+    ready, reasons = evaluate_smoke(snapshot, expected_for("joint"))
+    assert ready, reasons
+
+
+# ---------------------------------------------------------------------------
+# Evaluator: readiness identity-invalid window mutations
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_rejects_readiness_identity_invalid_during_window() -> None:
+    snapshot = ready_snapshot("joint")
+    snapshot["readiness"]["any_identity_invalid_in_window"] = True
+    snapshot["readiness"]["window_counts"]["identity_invalid"] = 1
+    ready, reasons = evaluate_smoke(snapshot, expected_for("joint"))
+    assert not ready
+    assert any("identity" in reason for reason in reasons)
+
+
+def test_evaluate_accepts_no_identity_invalid_in_window() -> None:
+    snapshot = ready_snapshot("joint")
+    snapshot["readiness"]["any_identity_invalid_in_window"] = False
+    snapshot["readiness"]["window_counts"]["identity_invalid"] = 0
+    ready, reasons = evaluate_smoke(snapshot, expected_for("joint"))
+    assert ready, reasons
+
+
 # ---------------------------------------------------------------------------
 # Evaluator: endpoint mutations
 # ---------------------------------------------------------------------------
@@ -1025,6 +1078,47 @@ def test_evaluate_rejects_missing_result_service() -> None:
     ready, reasons = evaluate_smoke(snapshot, expected_for("joint"))
     assert not ready
     assert any("result-service" in reason for reason in reasons)
+
+
+# ---------------------------------------------------------------------------
+# Live-client pre-send endpoint gate (ROS-free method, no rclpy needed)
+# ---------------------------------------------------------------------------
+
+
+def _client_without_rclpy() -> "object":
+    """Construct an OmplPlanSmokeClient instance without running __init__
+    (which would import rclpy).  _endpoint_ok only uses the endpoint dict and
+    pure derive functions, so no ROS is required."""
+    from ompl_plan_smoke import OmplPlanSmokeClient
+
+    return object.__new__(OmplPlanSmokeClient)
+
+
+def test_endpoint_ok_accepts_exact_result_type() -> None:
+    client = _client_without_rclpy()
+    assert client._endpoint_ok(_endpoint()) is True
+
+
+def test_endpoint_ok_rejects_wrong_result_type() -> None:
+    client = _client_without_rclpy()
+    endpoint = _endpoint()
+    endpoint["result_service_types"] = ["tinker_arm_msgs/action/Pick_GetResult"]
+    assert client._endpoint_ok(endpoint) is False
+
+
+def test_endpoint_ok_rejects_missing_result_service() -> None:
+    client = _client_without_rclpy()
+    endpoint = _endpoint()
+    endpoint["result_service_present"] = False
+    endpoint["result_service_types"] = []
+    assert client._endpoint_ok(endpoint) is False
+
+
+def test_endpoint_ok_rejects_wrong_kind() -> None:
+    client = _client_without_rclpy()
+    endpoint = _endpoint()
+    endpoint["kind"] = "ExecuteTrajectory"
+    assert client._endpoint_ok(endpoint) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1232,9 +1326,20 @@ def test_evaluate_blocked_accepts_genuine_planning_failure(code: int, name: str)
     "code, name",
     [
         (-4, "CONTROL_FAILED"),
+        (-5, "UNABLE_TO_AQUIRE_SENSOR_DATA"),
         (-6, "TIMED_OUT"),
         (-7, "PREEMPTED"),
+        (-15, "INVALID_GROUP_NAME"),
+        (-16, "INVALID_GOAL_CONSTRAINTS"),
+        (-17, "INVALID_ROBOT_STATE"),
+        (-21, "FRAME_TRANSFORM_FAILURE"),
+        (-22, "COLLISION_CHECKING_UNAVAILABLE"),
+        (-23, "ROBOT_STATE_STALE"),
+        (-24, "SENSOR_INFO_STALE"),
         (-25, "COMMUNICATION_FAILURE"),
+        (-26, "START_STATE_INVALID"),
+        (-27, "GOAL_STATE_INVALID"),
+        (-28, "UNRECOGNIZED_GOAL_TYPE"),
         (-29, "CRASH"),
         (-30, "ABORT"),
         (99999, "FAILURE"),

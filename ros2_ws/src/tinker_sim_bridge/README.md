@@ -483,7 +483,9 @@ action-introspection API), records graph-observed goal-service types, maps
 services to their serving nodes, steps `/controller_manager/list_controllers`,
 checks joint and Boolean sample content/freshness plus real publisher QoS
 (reliability/durability from `PublishersInfo`; depth is compared when a
-publisher actually reports it), composes the multi-hop TF chain with
+publisher actually reports it — the canonical command topic
+`/isaac_joint_commands` expects RELIABLE/KEEP_LAST depth 50, matching the
+gateway's actual QoS in `command_gateway.py`), composes the multi-hop TF chain with
 `tf2_ros.Buffer` + `TransformListener`, reconciles the provider manifest
 against the live graph, and publishes `std_msgs/msg/String` JSON on
 `/sim/status/integrated_manipulation` at `check_period_s`; any check failure

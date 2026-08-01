@@ -44,6 +44,7 @@ from ompl_goal_builders import (  # noqa: E402
 from ompl_plan_smoke import (  # noqa: E402
     COMMAND_TOPIC,
     COMMAND_SOURCE,
+    COMMAND_TYPE,
     MOVE_ACTION,
     MOVE_ACTION_SOURCE,
     MOVE_ACTION_TYPE,
@@ -55,6 +56,8 @@ from ompl_plan_smoke import (  # noqa: E402
     STATUS_SUCCEEDED,
     OmplPlanSmokeClient,
     _action_name_from_type,
+    _evaluate_commands,
+    _evaluate_readiness,
     derive_goal_service_type,
     derive_result_service_type,
     parse_readiness_payload,
@@ -183,7 +186,7 @@ def test_to_moveit_goal_pose(rclpy_context) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _canonical_pass_json() -> str:
+def _canonical_pass_json(*, scenario_id: str = "qualification-moveit-plan-joint") -> str:
     payload = {
         "schema_version": 1,
         "state": "pass",
@@ -194,7 +197,7 @@ def _canonical_pass_json() -> str:
             "shared_report": {
                 "ready": True,
                 "identities": {
-                    "scenario_id": "qualification-moveit-plan-joint",
+                    "scenario_id": scenario_id,
                     "seed": 7,
                     "scenario_declaration_sha256": "a" * 64,
                     "planning_scene_sha256": "b" * 64,
@@ -206,7 +209,7 @@ def _canonical_pass_json() -> str:
             "fixture_status": {
                 "ready": True,
                 "status": {
-                    "scenario": "qualification-moveit-plan-joint",
+                    "scenario": scenario_id,
                     "revision": "2026-08-01-moveit-qualification-joint",
                     "revision_digest": "e" * 64,
                     "sequence": 1,
@@ -219,6 +222,33 @@ def _canonical_pass_json() -> str:
         },
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _canonical_fail_json() -> str:
+    payload = {
+        "schema_version": 1,
+        "state": "fail",
+        "ready": False,
+        "reasons": ["boom"],
+        "published_at": time.monotonic(),
+        "evidence": {"shared_report": {"ready": False, "identities": {}}, "fixture_status": {"status": None}},
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _matching_expected() -> dict[str, object]:
+    """Expected-identity dict matching _canonical_pass_json's dummy digests."""
+    return {
+        "scenario_id": "qualification-moveit-plan-joint",
+        "seed": 7,
+        "scenario_declaration_sha256": "a" * 64,
+        "planning_scene_sha256": "b" * 64,
+        "planning_scene_revision": "2026-08-01-moveit-qualification-joint",
+        "planning_scene_revision_digest": "e" * 64,
+        "planning_scene_owned_ids": ["sim_fixture/pedestal", "sim_fixture/public_target"],
+        "planning_scene_target_source_id": "sim_fixture/public_target",
+        "planning_scene_target_handoff": "pick_and_place/object_mesh",
+    }
 
 
 def test_readiness_publisher_metadata_observed(rclpy_context) -> None:
@@ -320,8 +350,9 @@ def test_readiness_callback_rejects_malformed(rclpy_context) -> None:
 
 def test_command_publisher_discovery_and_qos(rclpy_context) -> None:
     gateway = Node("tinker_sim_command_gateway")
+    # Match the verified gateway truth (depth=50); Humble still reports 0.
     qos = QoSProfile(
-        depth=10,
+        depth=50,
         reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.VOLATILE,
     )
@@ -339,6 +370,7 @@ def test_command_publisher_discovery_and_qos(rclpy_context) -> None:
         assert obs["type"] == "sensor_msgs/msg/JointState"
         assert obs["qos"]["reliability"] == "RELIABLE"
         assert obs["qos"]["durability"] == "VOLATILE"
+        assert obs["expected_depth"] == 50
         assert obs["settled"] is True
     finally:
         executor.remove_node(gateway)
@@ -610,3 +642,359 @@ def test_cancel_path_is_bounded_and_fail_closed(rclpy_context) -> None:
         _stop_server(server_executor, server_thread)
         client_node.destroy_node()
         server_node.destroy_node()
+
+
+# ---------------------------------------------------------------------------
+# 7. Adverse publisher/window paths (fix round 2)
+# ---------------------------------------------------------------------------
+
+
+def test_command_wrong_source_publisher_rejected(rclpy_context) -> None:
+    """A command publisher from the wrong source must fail the real metadata
+    checker/evaluator."""
+    rogue = Node("rogue_gateway")
+    rogue.create_publisher(JointState, COMMAND_TOPIC, 50)
+    node = Node("cmd_wrong_source_probe")
+    client = OmplPlanSmokeClient(node, _args())
+    executor = SingleThreadedExecutor()
+    executor.add_node(rogue)
+    executor.add_node(node)
+    try:
+        _spin(executor, count=40)
+        pub = client._read_publisher_metadata(COMMAND_TOPIC)
+        assert pub["source"] == "/rogue_gateway"
+        assert pub["type"] == COMMAND_TYPE
+        obs = {
+            "publisher": pub,
+            "settled": True,
+            "samples": 0,
+            "window_start_s": 1.0,
+            "window_end_s": 2.0,
+            "publisher_graph_changed": False,
+        }
+        reasons = _evaluate_commands(obs)
+        assert any("publisher source" in reason for reason in reasons)
+    finally:
+        executor.remove_node(rogue)
+        executor.remove_node(node)
+        executor.shutdown()
+        node.destroy_node()
+        rogue.destroy_node()
+
+
+def test_command_wrong_qos_publisher_rejected(rclpy_context) -> None:
+    """A correct-source command publisher with BEST_EFFORT QoS must be
+    rejected by the real metadata checker."""
+    gateway = Node("tinker_sim_command_gateway")
+    qos = QoSProfile(
+        depth=50,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+    gateway.create_publisher(JointState, COMMAND_TOPIC, qos)
+    node = Node("cmd_wrong_qos_probe")
+    client = OmplPlanSmokeClient(node, _args())
+    executor = SingleThreadedExecutor()
+    executor.add_node(gateway)
+    executor.add_node(node)
+    try:
+        _spin(executor, count=40)
+        pub = client._read_publisher_metadata(COMMAND_TOPIC)
+        assert pub["source"] == COMMAND_SOURCE
+        assert pub["qos"]["reliability"] == "BEST_EFFORT"
+        obs = {
+            "publisher": pub,
+            "settled": True,
+            "samples": 0,
+            "window_start_s": 1.0,
+            "window_end_s": 2.0,
+            "publisher_graph_changed": False,
+        }
+        reasons = _evaluate_commands(obs)
+        assert any("reliability" in reason for reason in reasons)
+    finally:
+        executor.remove_node(gateway)
+        executor.remove_node(node)
+        executor.shutdown()
+        node.destroy_node()
+        gateway.destroy_node()
+
+
+def test_command_duplicate_publisher_rejected(rclpy_context) -> None:
+    """Two publishers on /isaac_joint_commands must be rejected (cardinality)."""
+    gateway = Node("tinker_sim_command_gateway")
+    rogue = Node("rogue_gateway")
+    gateway.create_publisher(JointState, COMMAND_TOPIC, 50)
+    rogue.create_publisher(JointState, COMMAND_TOPIC, 50)
+    node = Node("cmd_dup_probe")
+    client = OmplPlanSmokeClient(node, _args())
+    executor = SingleThreadedExecutor()
+    executor.add_node(gateway)
+    executor.add_node(rogue)
+    executor.add_node(node)
+    try:
+        _spin(executor, count=50)
+        pub = client._read_publisher_metadata(COMMAND_TOPIC)
+        assert pub["count"] == 2
+        obs = {
+            "publisher": pub,
+            "settled": True,
+            "samples": 0,
+            "window_start_s": 1.0,
+            "window_end_s": 2.0,
+            "publisher_graph_changed": False,
+        }
+        reasons = _evaluate_commands(obs)
+        assert any("publisher count" in reason for reason in reasons)
+    finally:
+        executor.remove_node(gateway)
+        executor.remove_node(rogue)
+        executor.remove_node(node)
+        executor.shutdown()
+        node.destroy_node()
+        rogue.destroy_node()
+        gateway.destroy_node()
+
+
+def test_readiness_wrong_source_publisher_fails_settle(rclpy_context) -> None:
+    """A readiness publisher from the wrong source never settles the live
+    probe (source mismatch), so the gate refuses to open."""
+    rogue = Node("rogue_readiness")
+    qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    rogue.create_publisher(String, READINESS_TOPIC, qos)
+    node = Node("readiness_wrong_source_probe")
+    client = OmplPlanSmokeClient(node, _args())
+    executor = SingleThreadedExecutor()
+    executor.add_node(rogue)
+    executor.add_node(node)
+    try:
+        _spin(executor, count=40)
+        obs = client._probe_readiness_publisher(2.0)
+        assert obs["settled"] is False
+    finally:
+        executor.remove_node(rogue)
+        executor.remove_node(node)
+        executor.shutdown()
+        node.destroy_node()
+        rogue.destroy_node()
+
+
+def test_readiness_fail_mid_window_rejects(rclpy_context) -> None:
+    """A canonical readiness 'fail' published mid-window must reject the
+    assembled observation even if a later correct pass arrives."""
+    publisher = Node("integrated_readiness")
+    qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    pub = publisher.create_publisher(String, READINESS_TOPIC, qos)
+    node = Node("readiness_fail_window_client")
+    client = OmplPlanSmokeClient(node, _args())
+    executor = SingleThreadedExecutor()
+    executor.add_node(publisher)
+    executor.add_node(node)
+    try:
+        client._readiness_expected = _matching_expected()
+        pass_msg = String()
+        pass_msg.data = _canonical_pass_json()
+        for _ in range(5):
+            pub.publish(pass_msg)
+            executor.spin_once(timeout_sec=0.1)
+        assert _spin_until(executor, lambda: client._readiness_valid)
+        client._readiness_window_open = True
+        client._readiness_window["start_s"] = time.monotonic()
+        client._readiness_window_counts = {
+            "pass": 0,
+            "fail": 0,
+            "malformed": 0,
+            "identity_invalid": 0,
+        }
+        fail_msg = String()
+        fail_msg.data = _canonical_fail_json()
+        pub.publish(fail_msg)
+        _spin(executor, count=5)
+        # A later correct pass arrives but the window already observed fail.
+        pub.publish(pass_msg)
+        _spin(executor, count=5)
+        client._readiness_window_open = False
+        client._readiness_window["end_s"] = time.monotonic()
+        obs = client._assemble_readiness_obs(_matching_expected(), True)
+        assert obs["window_counts"]["fail"] >= 1
+        reasons = _evaluate_readiness(obs, _matching_expected())
+        assert any("fail" in reason for reason in reasons)
+    finally:
+        executor.remove_node(publisher)
+        executor.remove_node(node)
+        executor.shutdown()
+        node.destroy_node()
+        publisher.destroy_node()
+
+
+def test_readiness_wrong_identity_mid_window_rejects(rclpy_context) -> None:
+    """A wrong-identity pass published mid-window must be tracked and reject
+    the assembled observation even if a correct pass follows."""
+    publisher = Node("integrated_readiness")
+    qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    pub = publisher.create_publisher(String, READINESS_TOPIC, qos)
+    node = Node("readiness_identity_window_client")
+    client = OmplPlanSmokeClient(node, _args())
+    executor = SingleThreadedExecutor()
+    executor.add_node(publisher)
+    executor.add_node(node)
+    try:
+        client._readiness_expected = _matching_expected()
+        pass_msg = String()
+        pass_msg.data = _canonical_pass_json()
+        for _ in range(5):
+            pub.publish(pass_msg)
+            executor.spin_once(timeout_sec=0.1)
+        assert _spin_until(executor, lambda: client._readiness_valid)
+        client._readiness_window_open = True
+        client._readiness_window["start_s"] = time.monotonic()
+        client._readiness_window_counts = {
+            "pass": 0,
+            "fail": 0,
+            "malformed": 0,
+            "identity_invalid": 0,
+        }
+        wrong_msg = String()
+        wrong_msg.data = _canonical_pass_json(
+            scenario_id="qualification-moveit-plan-pose"
+        )
+        pub.publish(wrong_msg)
+        _spin(executor, count=5)
+        # A later correct pass arrives but the window already observed a
+        # wrong-identity pass.
+        pub.publish(pass_msg)
+        _spin(executor, count=5)
+        client._readiness_window_open = False
+        client._readiness_window["end_s"] = time.monotonic()
+        obs = client._assemble_readiness_obs(_matching_expected(), True)
+        assert obs["window_counts"]["identity_invalid"] >= 1
+        assert obs["any_identity_invalid_in_window"] is True
+        reasons = _evaluate_readiness(obs, _matching_expected())
+        assert any("identity" in reason for reason in reasons)
+    finally:
+        executor.remove_node(publisher)
+        executor.remove_node(node)
+        executor.shutdown()
+        node.destroy_node()
+        publisher.destroy_node()
+
+
+def test_command_sample_in_window_rejects(rclpy_context) -> None:
+    """A command published during the request/result/tail window is counted
+    and the assembled observation rejects."""
+    server_node = Node("move_group")
+
+    def execute(goal_handle):
+        goal_handle.succeed()
+        return _joint_success_result()
+
+    server = ActionServer(server_node, MoveGroup, MOVE_ACTION, execute)
+    gateway = Node("tinker_sim_command_gateway")
+    gw_pub = gateway.create_publisher(JointState, COMMAND_TOPIC, 50)
+    client_node = Node("cmd_sample_window_client")
+    client = OmplPlanSmokeClient(client_node, _args(timeout=5.0))
+    server_executor, server_thread = _spin_server(server_node)
+    gw_executor = SingleThreadedExecutor()
+    gw_executor.add_node(gateway)
+    gw_thread = threading.Thread(target=gw_executor.spin, daemon=True)
+    gw_thread.start()
+    stop_publish = threading.Event()
+
+    def publish_commands() -> None:
+        message = JointState()
+        message.name = list(JOINT_NAMES)
+        message.position = [0.0] * 7
+        while not stop_publish.is_set():
+            gw_pub.publish(message)
+            time.sleep(0.01)
+
+    gw_pub_thread = threading.Thread(target=publish_commands, daemon=True)
+    gw_pub_thread.start()
+    try:
+        time.sleep(0.5)
+        client._command_publisher = client._read_publisher_metadata(COMMAND_TOPIC)
+        action_client = ActionClient(client_node, MoveGroup, MOVE_ACTION)
+        outcome = client._execute_goal(build_joint_goal())
+        assert outcome["kind"] == "success"
+        assert client._command_samples > 0
+        obs = client._assemble_command_obs()
+        assert obs["samples"] > 0
+        reasons = _evaluate_commands(obs)
+        assert any("command sample" in reason for reason in reasons)
+        action_client.destroy()
+    finally:
+        stop_publish.set()
+        gw_pub_thread.join(timeout=2.0)
+        server.destroy()
+        _stop_server(server_executor, server_thread)
+        gw_executor.shutdown()
+        gw_thread.join(timeout=2.0)
+        client_node.destroy_node()
+        server_node.destroy_node()
+        gateway.destroy_node()
+
+
+def test_command_publisher_graph_change_during_window_rejects(rclpy_context) -> None:
+    """A command publisher graph change during the window (a second gateway
+    appearing mid-planning) must be detected and the assembled observation
+    rejects."""
+    second_node = {"node": None}
+
+    def execute(goal_handle):
+        rogue = Node("rogue_gateway_second")
+        second_node["node"] = rogue
+        rogue.create_publisher(JointState, COMMAND_TOPIC, 50)
+        time.sleep(0.3)  # let it appear on the graph during the window
+        goal_handle.succeed()
+        return _joint_success_result()
+
+    server_node = Node("move_group")
+    server = ActionServer(server_node, MoveGroup, MOVE_ACTION, execute)
+    gateway = Node("tinker_sim_command_gateway")
+    gateway.create_publisher(JointState, COMMAND_TOPIC, 50)
+    client_node = Node("cmd_graph_change_client")
+    client = OmplPlanSmokeClient(client_node, _args(timeout=5.0))
+    server_executor, server_thread = _spin_server(server_node)
+    try:
+        time.sleep(0.5)
+        client._command_publisher = client._read_publisher_metadata(COMMAND_TOPIC)
+        assert client._command_publisher["count"] == 1
+        action_client = ActionClient(client_node, MoveGroup, MOVE_ACTION)
+        outcome = client._execute_goal(build_joint_goal())
+        assert outcome["kind"] == "success"
+        # Wait for the second publisher to be discovered by spinning the client.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            rclpy.spin_once(client_node, timeout_sec=0.05)
+            if client._read_publisher_metadata(COMMAND_TOPIC)["count"] == 2:
+                break
+        tail = client._read_publisher_metadata(COMMAND_TOPIC)
+        changed = not OmplPlanSmokeClient._publisher_same(
+            client._command_publisher, tail
+        )
+        assert changed is True
+        obs = client._assemble_command_obs()
+        obs["publisher_graph_changed"] = changed
+        reasons = _evaluate_commands(obs)
+        assert any("publisher graph changed" in reason for reason in reasons)
+        action_client.destroy()
+    finally:
+        if second_node["node"] is not None:
+            second_node["node"].destroy_node()
+        server.destroy()
+        _stop_server(server_executor, server_thread)
+        client_node.destroy_node()
+        server_node.destroy_node()
+        gateway.destroy_node()

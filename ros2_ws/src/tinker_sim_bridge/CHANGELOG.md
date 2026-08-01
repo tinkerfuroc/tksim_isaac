@@ -167,6 +167,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before building the contract and reads Humble's list-typed
   `get_service_names_and_types_by_node` result correctly.
 
+### Changed (Task 6 fix round 2: command QoS depth contract alignment)
+
+- `/isaac_joint_commands` expected QoS depth is aligned from the stale-declared
+  `10` to the verified provider truth `50`.  `command_gateway.py` creates the
+  topic with RELIABLE/KEEP_LAST `depth=50`; the Task 6 `INTEGRATED_PUBLISHERS`
+  contract and `integration/provider-manifest.json` previously declared `10`.
+  Humble reports depth 0/UNKNOWN (masking the mismatch), so an RMW that reports
+  positive depth would have failed every readiness/smoke run.  No provider
+  behavior was changed; the contract now matches the existing gateway QoS.
+  The provider-manifest canonical self-hash was recomputed accordingly
+  (raw-byte digest behavior is unchanged).
+
 ### Added
 
 - Atomic fixture PlanningScene adapter (`fixture_planning_scene`): applies one
