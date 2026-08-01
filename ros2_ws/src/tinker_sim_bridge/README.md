@@ -383,6 +383,126 @@ rebuilds the current provisioned manifest through the Task 3 producer and
 asserts its exact eight touch links equal the exported fixture set (it skips
 only when the artifact tree is absent).
 
+## Staged integrated OMPL overlay and typed integrated readiness (Task 6)
+
+`integrated_ompl_manipulation.launch.py` composes the Task 3 model, Task 4
+joint-state, and Task 5 fixture providers into the first integrated
+OMPL/readiness boundary.  It is the only path that installs the staged
+production planning/task overlay, and it is reached from
+`manipulation.launch.py` with `planning_overlay:=true` (the default `false`
+path preserves the legacy launch exactly).
+
+### Exact staging order
+
+The launch resolves everything synchronously in one `OpaqueFunction`, then
+chains the staged providers through `OnProcessExit` handlers:
+
+1. Validate environment, model-bundle manifest (structural fingerprint is a
+   nonzero lowercase SHA-256), provider manifest (raw-byte digest + canonical
+   self-hash), scenario declaration, planning-scene revision/digest/owned
+   `sim_fixture/*` IDs, integrated mapping, and attempt paths.  Provider
+   actions are constructed only after this validation succeeds.
+2. Start the simulator safety/controller/gateway/RSP providers exactly once:
+   `safety_supervisor`, `ros2_control_node`, `controller_reconciler` (one
+   process requesting both `joint_state_broadcaster` and
+   `xarm7_traj_controller`, gated on the safety supervisor ready parameter),
+   `command_gateway`, `xarm_facade`, `gripper_facade`, `pan_tilt_facade`,
+   `contract_guard`, `truth_evaluator`, `robot_state_publisher`.
+3. Start `scenario_runner` with the exact expected identities.  On nonzero
+   exit the launch shuts down; on exit 0 it writes the canonical compact
+   scenario report atomically (sibling temp file + `os.replace`, final bytes
+   digested for `scenario_report_sha256`) and starts `physics_ready_gate`.
+4. `physics_ready_gate` parses the atomic report (exact scenario ID/seed/
+   declaration digest, planning-scene mapping, integrated mapping, model/
+   provider identities, `final_simulation_state="STATE_PLAYING"`, an accepted
+   operation with integer `state=1` and `boundary="PHYSICS_READY"`), atomically
+   writes `physics-ready.json`, publishes transient reliable
+   `state="PHYSICS_READY"` status, and serves `/sim/ready/physics`
+   (`std_srvs/srv/Trigger`).  The launch waits for that typed service before
+   starting the production planning-only launch.
+5. After `/sim/ready/physics`, start the production planning-only overlay
+   (`manipulation_planning_task_only.launch.py` with
+   `start_move_group=true,start_task_server=false,
+   execution_profile="sim_ompl"`) and the fixture adapter.  The fixture
+   adapter gates on `/sim/ready/physics`, applies one atomic diff, confirms
+   readback, and serves `/sim/ready/fixture`.
+6. After `/sim/ready/fixture`, start the production task-only overlay
+   (`start_move_group=false,start_task_server=true,safety_required=true`,
+   exact fixture revision/digest/owned IDs, scenario status path, exact
+   scenario identities, model fingerprint, fixture descriptor digest) and
+   `integrated_readiness`.
+7. `integrated_readiness` performs live graph/type/cardinality probes and
+   fresh message checks, independently of status topics, and publishes the
+   pass/fail JSON on `/sim/status/integrated_manipulation`.
+
+### Provider manifest
+
+`integration/provider-manifest.json` (schema version 1) records the four
+explicit sections `persistent_nodes`, `one_shot_processes`,
+`controller_resources`, and `publishers`, each entry carrying concrete
+`owner`, package/executable, fully qualified node, `cardinality`, and
+`evidence`.  The manifest records `provider_manifest_sha256` (the canonical
+self-hash) and the exact `cardinality_source`.  The launch passes the raw-byte
+SHA-256 digest of the manifest file separately to every consumer so a changed
+provider set is detected against unchanged bytes.
+
+### Readiness evaluator and Python split
+
+`integrated_readiness.py` is ROS-free at import time.  It defines
+`build_integrated_mapping()` (the canonical composition mapping:
+`report_revision`, typed `actions`, `services`, `publishers`, eight
+`joint_names`, eight `touch_links`, `tf`, `controller_resources`,
+`final_simulation_state`), the immutable `ReadinessReport` result type, and
+`evaluate_integrated_readiness(snapshot, contract) -> ReadinessReport`.  The
+evaluator checks model preflight, the parsed shared-report `PHYSICS_READY`
+evidence (including the external `scenario_report_sha256` and mapping identity
+digests), exact joint-state content/stamp/age/source, `base_link -> link_tcp`
+TF, active trajectory-controller logical-resource identity, fresh operator
+input and effective safety output, every typed action (including
+Cartesian/Joint/Fold), every typed MoveIt/controller/gate service, the typed
+`/arm_joint_service` (`tinker_arm_msgs/srv/ArmJointService`) with exactly one
+`/pick_and_place` server, exact canonical fixture status fields, full
+scenario/planning-scene/integrated mapping and digest agreement,
+provider-manifest path/digest agreement, semantic model/kinematics equality,
+and initial collision state.
+
+`integrated_readiness_node.py` (`class IntegratedReadiness`, `main()`) is the
+only module that imports `rclpy`/message types.  It probes actions via the
+`/_action/send_goal` service pattern (Humble rclpy has no action-introspection
+API), maps services to their serving nodes, steps `/controller_manager/
+list_controllers`, checks joint and Boolean sample content/freshness, and
+publishes `std_msgs/msg/String` JSON on
+`/sim/status/integrated_manipulation` at `check_period_s`; any check failure
+publishes `fail` and (with `fail_exit_s>0`) exits nonzero.
+
+### Run
+
+```bash
+./scripts/launch-humble integrated-ompl \
+  model_bundle_manifest:="$PWD/outputs/ompl-overlay/model-bundle/model-bundle.json" \
+  provider_manifest_path:="$PWD/ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json"
+```
+
+### Tests
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+./scripts/build-humble-overlay
+PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
+  ./.venv/bin/python -m pytest -q \
+  tests/test_integrated_readiness.py \
+  tests/test_integrated_ompl_launch_contract.py
+source /opt/ros/humble/setup.bash
+source /home/tinker/tk25_ws/install/setup.bash
+source /home/tinker/tinker-sim/6.0.1/ros2_ws/install/setup.bash
+python3 -m pytest -q tests/ros_humble/test_live_graph_probe.py
+```
+
+The pure evaluator and AST-based launch-contract tests run under the simulator
+CPython 3.12 venv (no ROS import needed).  The live graph probe imports
+`rclpy` only inside the test after a sourced Humble environment and skips
+cleanly when the integrated overlay is not running.
+
 ## Deployment gateways
 
 The remaining bridge nodes implement hardware-parity gateways and controllers

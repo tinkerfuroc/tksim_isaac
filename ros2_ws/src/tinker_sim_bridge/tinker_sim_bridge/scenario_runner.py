@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -19,6 +21,92 @@ from simulation_interfaces.srv import (
 
 from tinker_sim_core.orchestration import standard_operations
 from tinker_sim_core.scenario import load_named_scenario
+
+from .fixture_planning_scene import fixture_owned_ids
+from .integrated_readiness import (
+    FINAL_SIMULATION_STATE,
+    build_canonical_report,
+    planning_scene_digest,
+    planning_scene_mapping,
+    serialize_report,
+    sha256_bytes,
+    validate_report,
+)
+
+
+def verify_expected_values(
+    *,
+    scenario_id: str,
+    seed: int,
+    declaration: dict[str, object],
+    planning_scene: dict[str, object],
+    integrated: dict[str, object],
+    expected: dict[str, object],
+) -> list[str]:
+    """Verify the live scenario identities against the launch-supplied expected values.
+
+    Returns a list of human-readable reasons; an empty list means every expected
+    identity matches.  The launch computes the same digests over the same
+    unchanged scenario bytes, so a mismatch is a hard fail-closed error.
+    """
+    reasons: list[str] = []
+    report = build_canonical_report(
+        scenario_id=scenario_id,
+        seed=seed,
+        declaration=declaration,
+        planning_scene=planning_scene,
+        integrated=integrated,
+        operations=[{"operation": "set_simulation_state", "accepted": True, "state": 1, "boundary": "PHYSICS_READY"}],
+        model_fingerprint=str(expected.get("model_fingerprint", "")),
+        provider_manifest_sha256=str(expected.get("provider_manifest_sha256", "")),
+    )
+    validation = validate_report(report, expected)
+    reasons.extend(validation["reasons"])
+    actual_digest = planning_scene_digest(planning_scene)
+    expected_digest = str(expected.get("planning_scene_revision_digest", ""))
+    if actual_digest != expected_digest:
+        reasons.append(
+            "planning_scene digest {!r} != expected {!r}".format(
+                actual_digest, expected_digest
+            )
+        )
+    owned = fixture_owned_ids(planning_scene)
+    expected_owned = tuple(
+        str(item)
+        for item in json.loads(str(expected.get("planning_scene_owned_ids", "[]")))
+    )
+    if owned != expected_owned:
+        reasons.append(
+            "planning_scene owned ids {!r} != expected {!r}".format(
+                list(owned), list(expected_owned)
+            )
+        )
+    return reasons
+
+
+def write_report_atomic(report: dict[str, object], path: Path) -> bytes:
+    """Atomically publish the canonical compact report bytes to *path*.
+
+    Writes to a sibling temporary file, flushes/closes it, uses ``os.replace``,
+    and returns the exact final report bytes for digest recording.
+    """
+    data = serialize_report(report)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".{}.".format(path.name), dir=str(path.parent)
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return data
 
 
 class _RetryableServiceError(RuntimeError):
@@ -174,6 +262,31 @@ class ScenarioRunner(Node):
         return results
 
 
+def _parse_json_argument(value: str | None, label: str) -> object:
+    if value is None or not value.strip():
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("{} is not valid JSON: {}".format(label, exc)) from exc
+
+
+def _build_integrated_mapping(arguments) -> dict[str, object] | None:
+    """Parse the expected full integrated mapping argument, if provided.
+
+    ``None`` means the legacy non-overlay path (no canonical report is built);
+    the overlay path always provides the mapping so its digest agrees everywhere.
+    """
+    raw = _parse_json_argument(
+        arguments.expected_integrated_mapping, "expected_integrated_mapping"
+    )
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RuntimeError("expected_integrated_mapping must be a JSON object")
+    return {str(key): value for key, value in raw.items()}
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -183,11 +296,72 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--reset-attempts", type=int, default=3)
     parser.add_argument("--reset-retry-delay", type=float, default=0.5)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--expected-scenario-declaration-sha256")
+    parser.add_argument("--expected-planning-scene-revision")
+    parser.add_argument("--expected-planning-scene-revision-digest")
+    parser.add_argument("--expected-planning-scene-owned-ids", default="[]")
+    parser.add_argument("--expected-planning-scene-target-source-id")
+    parser.add_argument("--expected-planning-scene-target-handoff")
+    parser.add_argument("--expected-integrated-mapping")
+    parser.add_argument("--expected-integrated-sha256")
+    parser.add_argument("--expected-model-fingerprint")
+    parser.add_argument("--provider-manifest", type=Path)
+    parser.add_argument("--provider-manifest-sha256")
     arguments = parser.parse_args(
         rclpy.utilities.remove_ros_args(args=sys.argv if argv is None else argv)[1:]
     )
     root = arguments.root.resolve()
     scenario = load_named_scenario(root, arguments.scenario)
+    scenario_path = root / "simulation" / "scenarios" / "{}.json".format(arguments.scenario)
+    raw = json.loads(scenario_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError("scenario declaration must be a JSON object")
+    declaration = {
+        str(key): value for key, value in raw.items() if key not in {"id", "seed"}
+    }
+    integrated = _build_integrated_mapping(arguments)
+
+    if integrated is not None:
+        if scenario.planning_scene is None:
+            raise RuntimeError(
+                "canonical integrated report requires a planning_scene declaration"
+            )
+        planning_scene = dict(scenario.planning_scene)
+        expected = {
+            "scenario_id": arguments.scenario,
+            "seed": arguments.seed,
+            "scenario_declaration_sha256": arguments.expected_scenario_declaration_sha256 or "",
+            "planning_scene_revision": arguments.expected_planning_scene_revision or "",
+            "planning_scene_revision_digest": arguments.expected_planning_scene_revision_digest or "",
+            "planning_scene_owned_ids": arguments.expected_planning_scene_owned_ids or "[]",
+            "planning_scene_target_source_id": arguments.expected_planning_scene_target_source_id or "",
+            "planning_scene_target_handoff": arguments.expected_planning_scene_target_handoff or "",
+            "integrated_mapping": integrated,
+            "integrated_sha256": arguments.expected_integrated_sha256 or "",
+            "model_fingerprint": arguments.expected_model_fingerprint or "",
+            "provider_manifest_path": str(arguments.provider_manifest or ""),
+            "provider_manifest_sha256": arguments.provider_manifest_sha256 or "",
+        }
+        reasons = verify_expected_values(
+            scenario_id=arguments.scenario,
+            seed=arguments.seed,
+            declaration=declaration,
+            planning_scene=planning_scene,
+            integrated=integrated,
+            expected=expected,
+        )
+        if reasons:
+            raise RuntimeError("scenario identity mismatch: {}".format("; ".join(reasons)))
+        if arguments.provider_manifest is not None:
+            provider_data = arguments.provider_manifest.read_bytes()
+            actual_digest = sha256_bytes(provider_data)
+            if actual_digest != arguments.provider_manifest_sha256:
+                raise RuntimeError(
+                    "provider manifest sha256 {} does not match bytes {}".format(
+                        arguments.provider_manifest_sha256, actual_digest
+                    )
+                )
+
     operations = standard_operations(root, scenario, arguments.seed)
     rclpy.init(args=argv)
     node = ScenarioRunner(
@@ -197,19 +371,27 @@ def main(argv: list[str] | None = None) -> None:
     )
     try:
         results = node.execute(operations)
-        report = {
-            "schema_version": 1,
-            "scenario": scenario.scenario_id,
-            "seed": arguments.seed,
-            "control_api": "simulation_interfaces",
-            "custom_control_services": False,
-            "operations": results,
-        }
-        output = json.dumps(report, indent=2, sort_keys=True)
+        if integrated is None:
+            # Legacy non-overlay path: preserve the previous operation report.
+            print(
+                json.dumps(results, sort_keys=True, separators=(",", ":"))
+            )
+            return
+        report = build_canonical_report(
+            scenario_id=scenario.scenario_id,
+            seed=arguments.seed,
+            declaration=declaration,
+            planning_scene=planning_scene,
+            integrated=integrated,
+            operations=results,
+            model_fingerprint=arguments.expected_model_fingerprint or "",
+            provider_manifest_sha256=arguments.provider_manifest_sha256 or "",
+            final_simulation_state=FINAL_SIMULATION_STATE,
+        )
+        data = write_report_atomic(report, arguments.report) if arguments.report is not None else serialize_report(report)
+        print(data.decode("utf-8"))
         if arguments.report is not None:
-            arguments.report.parent.mkdir(parents=True, exist_ok=True)
-            arguments.report.write_text(output + "\n", encoding="utf-8")
-        print(output)
+            print("scenario_report_sha256: {}".format(sha256_bytes(data)))
     finally:
         node.destroy_node()
         if rclpy.ok():

@@ -8,8 +8,8 @@ module="${1:-navigation}"
 dds_profile="${TINKER_SIM_DDS_PROFILE:-local}"
 shift || true
 
-if [[ "${module}" != "navigation" && "${module}" != "whole-robot" && "${module}" != "fixtures" && "${module}" != "manipulation" ]]; then
-  echo "usage: $0 {navigation|whole-robot|manipulation|fixtures} [ros2 launch arguments...]" >&2
+if [[ "${module}" != "navigation" && "${module}" != "whole-robot" && "${module}" != "fixtures" && "${module}" != "manipulation" && "${module}" != "integrated-ompl" ]]; then
+  echo "usage: $0 {navigation|whole-robot|manipulation|fixtures|integrated-ompl} [ros2 launch arguments...]" >&2
   exit 2
 fi
 
@@ -41,6 +41,8 @@ elif [[ "${module}" == "fixtures" ]]; then
   launch_file="fixtures.launch.py"
 elif [[ "${module}" == "manipulation" ]]; then
   launch_file="manipulation.launch.py"
+elif [[ "${module}" == "integrated-ompl" ]]; then
+  launch_file="integrated_ompl_manipulation.launch.py"
 fi
 exec ros2 launch tinker_sim_bridge "${launch_file}" \
   project_root:="${project_root}" tinker_workspace:="${workspace}" "$@"
