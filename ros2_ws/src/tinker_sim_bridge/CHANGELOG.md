@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Task 8: OMPL overlay acceptance contract)
+
+- `tests/test_provenance.py` extended (not replaced) with a deterministic
+  acceptance-contract provenance suite (`Task8OMPLOverlayProvenanceTest`) that
+  recomputes every derived hash/contract in the committed
+  `integration/ompl-overlay-contract.json` from the real source and artifacts
+  and fails on mutations: canonical-JSON determinism (no timestamps, no
+  self-referential Task 8 commit), repository/commit identities from actual git
+  history (simulator `f34de5f`; production runtime hardening
+  `f3e2ce4..df702a5` and Task 2 launch `f7fea50..39d96a1`), production overlay
+  18-argument contract and literal-false `use_cumotion_*` compatibility values,
+  provider-manifest raw + canonical identity, model-bundle schema/artifact
+  hashes/current-artifact identity, typed action/service/topic contract
+  (including `/isaac_joint_commands` depth 50 and the external future
+  `/tinker_integrated_gate_executor` publisher ownership), fixture/scenario
+  identities, build commands (never raw colcon), and source-lock exclusion.
+  The pre-existing uv environment provenance failure (installed `uv 0.12.0` vs
+  pinned `uv 0.10.8`) remains and is not masked.
+- `setup.py` now registers the `readiness_waiter` console script and the
+  provenance suite verifies every launch/config/integration asset and every
+  `main()`-bearing module is registered in `data_files`/`console_scripts`.
+- `package.xml` direct-dependency coverage is asserted by the provenance suite
+  with no transitive-import assumptions (`xarm_moveit_config` is intentionally
+  left to the `mobile_bringup` production launch, which declares it directly).
+  Added the missing direct `robot_localization` dependency (the shipped
+  `launch/navigation.launch.py` launches `robot_localization/ekf_node`).
+
 ### Added (Task 6: staged integrated OMPL overlay + typed integrated readiness)
 
 - `launch/integrated_ompl_manipulation.launch.py`: the staged overlay that

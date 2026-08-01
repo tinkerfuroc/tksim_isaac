@@ -253,6 +253,29 @@ gains and sensor/base noise still require synchronized robot calibration;
 qualification fails explicitly while
 `simulation/calibration/tinker2-missing.json` remains uncalibrated.
 
+### OMPL overlay acceptance contract
+
+`integration/ompl-overlay-contract.json` is the deterministic acceptance
+contract for the reviewed OMPL overlay (Tasks 3-7): canonical model-bundle
+producer/preflight, integrated eight-joint state contract, atomic fixture
+PlanningScene adapter, staged integrated OMPL overlay with typed integrated
+readiness, and the deterministic OMPL plan-only smoke.  The contract is
+canonical JSON (schema version 1, sorted keys, minimal separators) with exact
+repository/commit identities, the production overlay
+(`mobile_bringup` / `manipulation_planning_task_only.launch.py`, 18-argument
+contract, literal-false `use_cumotion_*` compatibility values), the provider
+manifest (raw + canonical identities, distinct persistent/one-shot/controller/
+publisher classes), the model-bundle schema/artifact hashes and full eight-link
+touch set, the typed action/service/topic contract (including
+`/isaac_joint_commands` depth 50 and the external future
+`/tinker_integrated_gate_executor` publisher ownership), fixture/scenario
+identities, Task 6/7 evidence, and build commands (`tkbuild` /
+`scripts/build-humble-overlay`, never raw colcon).  It does not itself prove
+live OMPL or authorize cuMotion.  `tests/test_provenance.py` recomputes every
+derived hash/contract from the real source and fails on mutations.  The two
+repository-local source-lock files are Task 9 only.  See
+`integration/MANIPULATION.md` for the operator workflow.
+
 ## Developer verification
 
 The non-GPU tests run with the Ubuntu system Python:
@@ -277,6 +300,17 @@ References:
 
 ## Changelog
 
+- 2026-08-02: Added the deterministic OMPL overlay acceptance contract
+  (`integration/ompl-overlay-contract.json`) packaging the reviewed Tasks 3-7
+  interfaces: exact repository/commit identities (simulator `f34de5f`;
+  production runtime hardening `f3e2ce4..df702a5` and Task 2 launch
+  `f7fea50..39d96a1` from actual git history), production overlay and
+  literal-false `use_cumotion_*` compatibility values, provider-manifest raw +
+  canonical identities, model-bundle schema/artifact hashes and full eight-link
+  touch set, typed action/service/topic contract, fixture/scenario identities,
+  Task 6/7 evidence, and `tkbuild`/`build-humble-overlay` build commands.
+  `tests/test_provenance.py` recomputes every derived hash/contract.  The two
+  source-lock files remain Task 9 only.
 - 2026-07-30: Added deterministic exporter-side canonical URDF derivation with
   full-SHA immutable generation identity, exact portable source-lock identity,
   serialized crash-consistent publication, physical arm-joint validation,
