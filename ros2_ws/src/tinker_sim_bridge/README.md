@@ -166,16 +166,25 @@ by both the contract tests and the live probe:
   on `use_sim_time` and that an active `/clock` has advanced past zero.
 - `derive_logical_joint_state_publishers(...)` — derives the logical
   `joint_state_broadcaster` source only when the evidence proves it (a standalone
-  exact-name node, or a controller-manager-hosted publisher with exactly one
-  active controller of that exact name from `list_controllers`); otherwise it
-  preserves the raw label and fails honestly.
+  exact-name node at the root namespace, or a controller-manager-hosted
+  publisher with exactly one active controller of that exact name from
+  `list_controllers`); otherwise it preserves the raw label and fails honestly.
+  A standalone exact broadcaster satisfies attribution without any
+  controller-manager list; only controller-manager-hosted endpoints require
+  fresh exact active-controller proof.
 - `evaluate_sample_freshness(...)` — wall-clock watchdog so a later sample
   loss/staleness produces FAIL.
 - `evaluate_probe_verdict(...)` — fail-closed aggregation seam: sample readiness
   participates unconditionally, so no sample/stale sample/controller or graph
   failure after a prior PASS yields FAIL, replacing any latched PASS.
 - `step_service(...)` — bounded, recoverable async ROS service state machine
-  (discovery-pending, in-flight, exception, malformed response, recovery).
+  (discovery-pending, in-flight, timeout, exception, malformed response,
+  recovery).  It accepts an explicit monotonic `now_s` plus a freshness `ttl_s`
+  and an in-flight `timeout_s`: successful evidence is re-polled after its TTL
+  (so a controller_manager restart or parameter change is re-verified on a
+  bounded cadence), and an in-flight request older than `timeout_s` is abandoned
+  and the client reset so the probe retries without leaking a client or keeping a
+  stale future.  `succeeded_at` / `started_at` are tracked per state.
 
 Each returns a complete mapping with `ready`, `reasons`, and the observed
 values.  These modules stay import-time ROS-free and run under both simulator
@@ -185,15 +194,21 @@ CPython 3.12 and Humble CPython 3.10.
 
 `joint_state_probe` (`ros2 run tinker_sim_bridge joint_state_probe`) is the
 Task 6 evidence path.  It reads the `/controller_manager` `robot_description`
-and `use_sim_time` parameters, queries `/controller_manager/list_controllers` to
-prove the publisher source, parses the checked-in xacro, subscribes to
-`/joint_states`, reads `/joint_states` and `/clock` publisher graph metadata, and
-evaluates all of the above pure helpers.  The verdict is fail-closed — no
-sample, stale/no-new sample, clock-domain mismatch, unproven publisher source,
-or any service failure produces FAIL with explicit evidence — and is published
-as compact JSON on `/sim/status/joint_state_contract` (latched, reliable).  It
-never counts source text as primary evidence; `source_text_diagnostics` in the
-report is supplemental only.
+and `use_sim_time` parameters (parsed with the real Humble
+`rcl_interfaces.msg.ParameterType` constants), queries
+`/controller_manager/list_controllers` to prove the publisher source, parses the
+checked-in xacro, subscribes to `/joint_states`, reads `/joint_states` and
+`/clock` publisher graph metadata, and evaluates all of the above pure helpers.
+Both service reads are re-polled on a 30 s TTL with a 5 s in-flight timeout, so
+a controller_manager restart or parameter change is re-verified on a bounded
+cadence and latched PASS evidence cannot survive the restart.  The verdict is
+fail-closed — no sample, stale/no-new sample, clock-domain mismatch, unproven
+publisher source, stale/expired service evidence, or any service failure
+produces FAIL with explicit evidence — and is published as compact JSON on
+`/sim/status/joint_state_contract` (latched, reliable).  `controller_evidence`
+and `parameter_evidence` carry `fresh`, `ttl_s`, `timeout_s`, and `succeeded_at`
+so the freshness gate is observable.  It never counts source text as primary
+evidence; `source_text_diagnostics` in the report is supplemental only.
 
 The probe must run on the same clock as the controller_manager (sim time):
 

@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 import rclpy
+from rcl_interfaces.msg import ParameterType
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -41,6 +42,8 @@ from std_msgs.msg import String
 from .contract_guard import (
     JOINT_STATE_BROADCASTER,
     JOINT_STATE_DEFAULT_WATCHDOG_S,
+    JOINT_STATE_SERVICE_TIMEOUT_S,
+    JOINT_STATE_SERVICE_TTL_S,
     derive_logical_joint_state_publishers,
     evaluate_clock_domain,
     evaluate_integrated_cardinality,
@@ -58,8 +61,14 @@ _PARAMETER_NAMES = ["robot_description", "use_sim_time"]
 
 
 def _parameter_string_value(value) -> str | None:
+    """Read a ``PARAMETER_STRING`` from a real Humble ``ParameterValue``.
+
+    The type constants live on ``rcl_interfaces.msg.ParameterType``; generated
+    ``ParameterValue`` instances expose no such attributes, so the comparison is
+    made against ``ParameterType`` directly.
+    """
     try:
-        if value.type == value.PARAMETER_STRING:
+        if value.type == ParameterType.PARAMETER_STRING:
             return str(value.string_value)
     except AttributeError:
         return None
@@ -68,7 +77,7 @@ def _parameter_string_value(value) -> str | None:
 
 def _parameter_bool_value(value) -> bool | None:
     try:
-        if value.type == value.PARAMETER_BOOL:
+        if value.type == ParameterType.PARAMETER_BOOL:
             return bool(value.bool_value)
     except AttributeError:
         return None
@@ -76,10 +85,17 @@ def _parameter_bool_value(value) -> bool | None:
 
 
 def _endpoint_label_from_info(info: object) -> str:
+    """Build a normalized ``/namespace/name`` label without a double slash.
+
+    A root-namespace publisher (``node_namespace == "/"``) becomes
+    ``"/<name>"``, matching the labels the pure attribution helpers expect.
+    """
     namespace = str(getattr(info, "node_namespace", ""))
     name = str(getattr(info, "node_name", ""))
-    label = "/{}/{}".format(namespace.rstrip("/"), name)
-    return label.replace("//", "/") if label.startswith("//") else label
+    namespace = namespace.rstrip("/")
+    if namespace:
+        return "{}/{}".format(namespace, name)
+    return "/" + name
 
 
 class JointStateProbe(Node):
@@ -219,6 +235,9 @@ class JointStateProbe(Node):
             request=request,
             extract=extract,
             reset_client=reset_client,
+            now_s=time.monotonic(),
+            ttl_s=JOINT_STATE_SERVICE_TTL_S,
+            timeout_s=JOINT_STATE_SERVICE_TIMEOUT_S,
         )
         if self._parameters_state.get("succeeded"):
             description, remote = self._parameters_state["result"]  # type: ignore[misc]
@@ -263,6 +282,9 @@ class JointStateProbe(Node):
             request=request,
             extract=extract,
             reset_client=reset_client,
+            now_s=time.monotonic(),
+            ttl_s=JOINT_STATE_SERVICE_TTL_S,
+            timeout_s=JOINT_STATE_SERVICE_TIMEOUT_S,
         )
         result = self._controllers_state.get("result")
         if isinstance(result, list):
@@ -288,7 +310,13 @@ class JointStateProbe(Node):
             broadcaster_controller=self._broadcaster,
             controller_entries=list(self._controller_entries),
         )
-        if not self._controllers_state.get("succeeded"):
+        # A controller-manager-hosted publisher requires fresh exact active
+        # controller proof; a standalone exact-name broadcaster satisfies
+        # attribution without any controller-manager list, so the manager state
+        # gate only applies when the graph actually shows a manager publisher.
+        manager_label = "/" + self._controller_manager
+        manager_hosted = any(label == manager_label for label in raw_labels)
+        if manager_hosted and not self._controllers_state.get("succeeded"):
             attribution_reasons.append(
                 "controller manager state is unavailable: {}".format(
                     self._controllers_state.get("error")
@@ -304,19 +332,33 @@ class JointStateProbe(Node):
         clock_now_ns = self._clock.now().nanoseconds
         sim_clock_active = bool(self.get_publishers_info_by_topic("/clock"))
         local_use_sim_time = bool(self.get_parameter("use_sim_time").value)
+        # Successful parameter evidence is only fresh within its TTL; once the
+        # success latch is revoked the stale description/use_sim_time values must
+        # not contribute readiness until a fresh response arrives.
+        parameters_fresh = bool(self._parameters_state.get("succeeded"))
         clock_domain = evaluate_clock_domain(
             local_use_sim_time=local_use_sim_time,
-            remote_use_sim_time=self._remote_use_sim_time,
+            remote_use_sim_time=(
+                self._remote_use_sim_time if parameters_fresh else None
+            ),
             sim_clock_active=sim_clock_active,
             clock_now_ns=clock_now_ns,
         )
 
-        description_contract = evaluate_robot_description_contract(
-            self._robot_description
-            if self._robot_description is not None
-            else "<unavailable: {}>".format(
-                self._parameters_state.get("error") or "not read yet"
-            )
+        description_contract = (
+            evaluate_robot_description_contract(self._robot_description)
+            if parameters_fresh and self._robot_description is not None
+            else {
+                "ready": False,
+                "reasons": [
+                    "controller_manager robot_description is stale or unavailable: {}".format(
+                        self._parameters_state.get("error")
+                        or self._parameters_state.get("pending")
+                        or "not read yet"
+                    )
+                ],
+                "observed": {},
+            }
         )
         xacro_contract = (
             evaluate_xacro_contract(self._xacro_text)
@@ -403,15 +445,25 @@ class JointStateProbe(Node):
             },
             "controller_evidence": {
                 "succeeded": bool(self._controllers_state.get("succeeded")),
+                "fresh": bool(self._controllers_state.get("succeeded")),
                 "error": self._controllers_state.get("error"),
                 "pending": self._controllers_state.get("pending"),
+                "ttl_s": JOINT_STATE_SERVICE_TTL_S,
+                "timeout_s": JOINT_STATE_SERVICE_TIMEOUT_S,
+                "succeeded_at": self._controllers_state.get("succeeded_at"),
                 "controller_states": controller_states,
             },
             "parameter_evidence": {
-                "succeeded": self._robot_description is not None,
+                "succeeded": parameters_fresh,
+                "fresh": parameters_fresh,
                 "error": self._parameters_state.get("error"),
                 "pending": self._parameters_state.get("pending"),
-                "remote_use_sim_time": self._remote_use_sim_time,
+                "ttl_s": JOINT_STATE_SERVICE_TTL_S,
+                "timeout_s": JOINT_STATE_SERVICE_TIMEOUT_S,
+                "succeeded_at": self._parameters_state.get("succeeded_at"),
+                "remote_use_sim_time": (
+                    self._remote_use_sim_time if parameters_fresh else None
+                ),
             },
             "joint_state_sample": sample_content,
             "sample_freshness": freshness,

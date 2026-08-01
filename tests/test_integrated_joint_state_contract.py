@@ -818,6 +818,8 @@ def _make_service_state() -> dict[str, object]:
         "pending": None,
         "succeeded": False,
         "result": None,
+        "succeeded_at": None,
+        "started_at": None,
     }
 
 
@@ -963,3 +965,345 @@ def test_step_service_extract_never_crashes_callback() -> None:
     )
     assert state["succeeded"] is False
     assert "malformed" in str(state["error"])
+
+
+# ---------------------------------------------------------------------------
+# step_service TTL / freshness of successful evidence
+# ---------------------------------------------------------------------------
+
+
+def test_step_service_success_stays_fresh_within_ttl() -> None:
+    state = _make_service_state()
+    client = mock_client(ready=True, result="payload")
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    assert state["result"] == "payload"
+    assert state["succeeded_at"] == 100.0
+    # Within TTL: the success latch is not re-polled.
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=120.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    assert state["result"] == "payload"
+
+
+def test_step_service_ttl_expiry_revokes_success_and_repolls() -> None:
+    state = _make_service_state()
+    client = mock_client(ready=True, result="payload")
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    # TTL expired: the latch is revoked so the caller publishes FAIL.
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=131.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is False
+    assert state["result"] is None
+    assert state["succeeded_at"] is None
+    assert state["future"] is client.future  # re-issued on the same client
+    # A fresh success restores the latch.
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=131.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    assert state["succeeded_at"] == 131.0
+
+
+def _refreshing_client(result):
+    """A fake client whose ``call_async`` returns a fresh future each call."""
+    class FakeSrvType:
+        @staticmethod
+        def Request():
+            return object()
+
+    client = type("RefreshingClient", (), {})()
+    client.service_is_ready = lambda: True
+    client.srv_type = FakeSrvType
+    client._result = result
+    client.call_async = lambda request: _FakeFuture(result=client._result, done=True)
+    client.destroy = lambda: None
+    return client
+
+
+def test_step_service_parameter_content_change_after_restart() -> None:
+    state = _make_service_state()
+    client = _refreshing_client("old")
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["result"] == "old"
+    # Restart changes the served content; TTL expiry re-polls and observes it.
+    client._result = "new"
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=131.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is False and state["result"] is None
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=131.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    assert state["result"] == "new"
+
+
+def test_step_service_ttl_expiry_with_unavailable_service_pends() -> None:
+    state = _make_service_state()
+    client = _refreshing_client("old")
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=100.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    # Controller goes down at the TTL boundary: evidence revoked, no re-poll.
+    client.service_is_ready = lambda: False
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=131.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is False
+    assert state["pending"] == "service not ready"
+    # Controller returns: re-poll succeeds and the fresh result is adopted.
+    client.service_is_ready = lambda: True
+    client._result = "new"
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=132.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: client, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=132.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    assert state["result"] == "new"
+
+
+# ---------------------------------------------------------------------------
+# step_service in-flight timeout / generation-safe retry
+# ---------------------------------------------------------------------------
+
+
+def test_step_service_in_flight_timeout_resets_and_recovers() -> None:
+    state = _make_service_state()
+    slow = mock_client(ready=True, result="payload", done=False)
+    step_service(
+        state, create_client=lambda: slow, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=0.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["future"] is slow.future
+    assert state["started_at"] == 0.0
+    # Still in flight but under the deadline.
+    step_service(
+        state, create_client=lambda: slow, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=3.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["pending"] == "request in flight"
+    assert state["client"] is slow
+    # Deadline exceeded: abandon the future and reset the client.
+    step_service(
+        state, create_client=lambda: slow, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=6.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert "timed out" in str(state["error"])
+    assert state["client"] is None
+    assert state["future"] is None
+    assert state["started_at"] is None
+    # A new generation recovers.
+    fast = mock_client(ready=True, result="payload")
+    step_service(
+        state, create_client=lambda: fast, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=7.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: fast, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=7.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    assert state["result"] == "payload"
+
+
+def test_step_service_repeated_timeouts_then_recovery() -> None:
+    state = _make_service_state()
+    now = 0.0
+    for _ in range(3):
+        slow = mock_client(ready=True, result=None, done=False)
+        step_service(
+            state, create_client=lambda: slow, request=lambda c: mock_request(c),
+            extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+            now_s=now, ttl_s=30.0, timeout_s=5.0,
+        )
+        step_service(
+            state, create_client=lambda: slow, request=lambda c: mock_request(c),
+            extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+            now_s=now + 6.0, ttl_s=30.0, timeout_s=5.0,
+        )
+        assert "timed out" in str(state["error"])
+        now += 10.0
+    fast = mock_client(ready=True, result="payload")
+    step_service(
+        state, create_client=lambda: fast, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=now, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: fast, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=now, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is True
+    assert state["result"] == "payload"
+
+
+def test_step_service_exception_after_timeout() -> None:
+    state = _make_service_state()
+    slow = mock_client(ready=True, result=RuntimeError("boom"), done=False)
+    step_service(
+        state, create_client=lambda: slow, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=0.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: slow, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=6.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert "timed out" in str(state["error"])
+    boom = mock_client(ready=True, result=RuntimeError("connection reset"))
+    step_service(
+        state, create_client=lambda: boom, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=7.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: boom, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=7.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert "service call failed" in str(state["error"])
+    assert state["succeeded"] is False
+
+
+def test_step_service_no_stale_result_from_old_generation() -> None:
+    state = _make_service_state()
+    old = mock_client(ready=True, result="old", done=False)
+    step_service(
+        state, create_client=lambda: old, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=0.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: old, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=6.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["succeeded"] is False and state["result"] is None
+    new = mock_client(ready=True, result="new")
+    step_service(
+        state, create_client=lambda: new, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=7.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    step_service(
+        state, create_client=lambda: new, request=lambda c: mock_request(c),
+        extract=lambda r: r, reset_client=lambda s: s.update(client=None, future=None),
+        now_s=7.0, ttl_s=30.0, timeout_s=5.0,
+    )
+    assert state["result"] == "new"
+
+
+# ---------------------------------------------------------------------------
+# derive_logical_joint_state_publishers endpoint/source edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_attribution_standalone_bare_name_matches() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["joint_state_broadcaster"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[],
+    )
+    assert labels == ["joint_state_broadcaster"]
+    assert reasons == []
+
+
+def test_attribution_standalone_renamed_preserved() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/joint_state_broadcaster2"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[],
+    )
+    assert labels == ["/joint_state_broadcaster2"]
+    assert reasons == []
+
+
+def test_attribution_nested_namespace_controller_manager_preserved() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/some_ns/controller_manager"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[("joint_state_broadcaster", "active")],
+    )
+    assert labels == ["/some_ns/controller_manager"]
+    assert reasons == []
+
+
+def test_attribution_standalone_exact_beats_stale_controller_entries() -> None:
+    # A standalone exact-name broadcaster satisfies attribution even when the
+    # controller-manager list is stale/absent; only controller-manager-hosted
+    # publishers require exact active-controller proof.
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/joint_state_broadcaster"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[("foo_broadcaster", "active")],
+    )
+    assert labels == ["joint_state_broadcaster"]
+    assert reasons == []
