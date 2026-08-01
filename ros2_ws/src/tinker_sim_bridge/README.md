@@ -323,12 +323,21 @@ the collision-body set.
 `fixture_planning_scene_node.FixturePlanningScene` gates on the staged
 `/sim/ready/physics` Trigger service, waits boundedly for `/apply_planning_scene`
 and `/get_planning_scene`, pre-reads the current scene (requesting the explicit
-`WORLD_OBJECT_NAMES | WORLD_OBJECT_GEOMETRY` PlanningScene components) to
-discover stale `sim_fixture/*` ids, applies exactly one atomic diff (with real
-mesh geometry for mesh fixtures), reads the scene back with full
-`CollisionObject` geometry, confirms readback ids, geometry, and status, and
-only then serves `/sim/ready/fixture` (`std_srvs/srv/Trigger`).  While alive it
-publishes a reliable transient-local 5 Hz compact JSON heartbeat on
+`WORLD_OBJECT_NAMES | WORLD_OBJECT_GEOMETRY` PlanningScene components bitmask,
+never the server-dependent `components=0` default) to discover stale
+`sim_fixture/*` ids, applies exactly one atomic diff (with real mesh geometry
+for mesh fixtures), reads the scene back with full `CollisionObject` geometry,
+confirms readback ids, geometry, and status, and only then serves
+`/sim/ready/fixture` (`std_srvs/srv/Trigger`).  The mesh loader and project root
+are installed by scenario load and preserved for the node lifetime, so a real
+schema-valid mesh scenario applies real geometry (never a misleading apply
+timeout).  Foreign-namespace objects are outside fixture ownership: their raw
+ids are preserved for namespace isolation/leak checks but their geometry is
+never parsed, so a malformed foreign object cannot block fixture readiness
+(while malformed `sim_fixture/*` objects still fail closed).  Startup
+`heartbeat_period` and `start_deadline_s` are validated as finite positive
+values during construction.  While alive the node publishes a reliable
+transient-local 5 Hz compact JSON heartbeat on
 `/sim/status/planning_scene_fixture` (`std_msgs/msg/String`) with exactly:
 `schema_version=1`, `state`, `scenario`, `owner="sim_fixture"`, `revision`,
 `revision_digest`, monotonic `sequence`, finite `published_at`, declared-order

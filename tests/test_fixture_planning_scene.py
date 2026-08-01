@@ -786,6 +786,60 @@ def test_parse_mesh_rejects_degenerate_triangle() -> None:
         parse_mesh_bytes(data, filename="deg.stl")
 
 
+def test_parse_ascii_stl_rejects_over_vertex_facet() -> None:
+    data = (
+        b"solid over\nfacet normal 0 0 1\nouter loop\n"
+        b"vertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nvertex 1 1 0\n"
+        b"endloop\nendfacet\nendsolid over\n"
+    )
+    with pytest.raises(Exception, match="exactly 3"):
+        parse_mesh_bytes(data, filename="over.stl")
+
+
+def test_parse_ascii_stl_rejects_under_vertex_facet() -> None:
+    data = (
+        b"solid short\nfacet normal 0 0 1\nouter loop\n"
+        b"vertex 0 0 0\nvertex 1 0 0\n"
+        b"endloop\nendfacet\nendsolid short\n"
+    )
+    with pytest.raises(Exception, match="exactly 3"):
+        parse_mesh_bytes(data, filename="short.stl")
+
+
+def test_parse_ascii_stl_rejects_vertex_outside_facet() -> None:
+    data = (
+        b"solid loose\nvertex 0 0 0\nfacet normal 0 0 1\nouter loop\n"
+        b"vertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid loose\n"
+    )
+    with pytest.raises(Exception, match="outside a facet"):
+        parse_mesh_bytes(data, filename="loose.stl")
+
+
+def test_parse_ascii_stl_rejects_unterminated_facet() -> None:
+    data = (
+        b"solid unter\nfacet normal 0 0 1\nouter loop\n"
+        b"vertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\n"
+    )
+    with pytest.raises(Exception, match="unterminated"):
+        parse_mesh_bytes(data, filename="unterminated.stl")
+
+
+def test_parse_ascii_stl_respects_facet_boundaries() -> None:
+    # Two well-formed facets with distinct vertices produce two triangles in
+    # declared order, not an arbitrary regrouping of vertex lines.
+    data = (
+        b"solid two\n"
+        b"facet normal 0 0 1\nouter loop\n"
+        b"vertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\n"
+        b"facet normal 0 0 1\nouter loop\n"
+        b"vertex 0 0 1\nvertex 1 0 1\nvertex 0 1 1\nendloop\nendfacet\n"
+        b"endsolid two\n"
+    )
+    vertices, triangles = parse_mesh_bytes(data, filename="two.stl")
+    assert len(vertices) == 6
+    assert triangles == ((0, 1, 2), (3, 4, 5))
+
+
 def test_parse_mesh_rejects_out_of_range_index() -> None:
     data = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 9\n"
     with pytest.raises(Exception, match="out of range"):
@@ -1712,3 +1766,391 @@ def test_real_constructor_full_ready_loop_with_mock_services(ros_context) -> Non
             node.destroy_node()
         if server is not None:
             server.destroy_node()
+
+
+def test_get_request_requests_world_object_names_and_geometry(ros_context) -> None:
+    """The GetPlanningScene request must carry the explicit component bitmask
+    (WORLD_OBJECT_NAMES | WORLD_OBJECT_GEOMETRY), never the server-dependent
+    components=0 default."""
+    _humble()
+    from moveit_msgs.msg import PlanningSceneComponents
+    from moveit_msgs.srv import GetPlanningScene
+
+    from tinker_sim_bridge.fixture_planning_scene_node import _get_planning_scene_request
+
+    client = type("Client", (), {})()
+    client.srv_type = GetPlanningScene
+    request = _get_planning_scene_request(client)
+    expected = (
+        PlanningSceneComponents.WORLD_OBJECT_NAMES
+        | PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+    )
+    assert request.components.components == expected
+    assert request.components.components == (8 | 16)
+    assert request.components.components & PlanningSceneComponents.WORLD_OBJECT_NAMES
+    assert request.components.components & PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+
+
+def test_real_constructor_rejects_nonfinite_or_nonpositive_deadlines(ros_context) -> None:
+    _humble()
+    from rclpy.parameter import Parameter
+
+    from tinker_sim_bridge.fixture_planning_scene_node import FixturePlanningScene
+
+    base = [
+        Parameter("scenario_file", value=str(SCENARIOS / "qualification-moveit-plan-joint.json"))
+    ]
+    with pytest.raises(ValueError, match="finite positive"):
+        FixturePlanningScene(
+            node_name="fixture_bad_period",
+            context=ros_context,
+            parameter_overrides=base + [Parameter("heartbeat_period", value=float("nan"))],
+        )
+    with pytest.raises(ValueError, match="finite positive"):
+        FixturePlanningScene(
+            node_name="fixture_inf_period",
+            context=ros_context,
+            parameter_overrides=base + [Parameter("heartbeat_period", value=float("inf"))],
+        )
+    with pytest.raises(ValueError, match="finite positive"):
+        FixturePlanningScene(
+            node_name="fixture_nan_deadline",
+            context=ros_context,
+            parameter_overrides=base + [Parameter("start_deadline_s", value=float("nan"))],
+        )
+    with pytest.raises(ValueError, match="finite positive"):
+        FixturePlanningScene(
+            node_name="fixture_zero_deadline",
+            context=ros_context,
+            parameter_overrides=base + [Parameter("start_deadline_s", value=0.0)],
+        )
+
+
+def _mesh_scenario_payload(tmp_path: Path, *, mesh: Mapping[str, object], scenario_id: str) -> Path:
+    """Write a schema-valid single-mesh-fixture scenario and return its path."""
+    payload = {
+        "schema_version": 2,
+        "id": scenario_id,
+        "world": {"mode": "current"},
+        "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+        "actors": [],
+        "objects": [],
+        "events": [{"at_sim_time": 0.0, "event": "spawn_once_while_paused"}],
+        "postconditions": [{"name": "ready", "path": "x", "operator": "equals", "value": True}],
+        "planning_scene": {
+            "revision": "r-mesh",
+            "frame_id": "base_link",
+            "target_source_id": "sim_fixture/table",
+            "target_handoff": "pick_and_place/object_mesh",
+            "objects": [
+                {
+                    "id": "sim_fixture/table",
+                    "mesh": dict(mesh),
+                    "pose": {"xyz": [0.5, 0.0, 0.5], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+                }
+            ],
+        },
+    }
+    ps = payload["planning_scene"]
+    ps["revision_digest"] = sha256(
+        json.dumps(
+            {k: v for k, v in ps.items() if k != "revision_digest"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(json.dumps(payload), encoding="utf-8")
+    return scenario_path
+
+
+def test_real_constructor_mesh_failures_fail_immediately(ros_context, tmp_path: Path) -> None:
+    """Unsupported/missing/hash-mismatched mesh scenarios must fail at
+    construction (clear immediate error), not after a misleading apply timeout."""
+    _humble()
+    from rclpy.parameter import Parameter
+
+    from tinker_sim_bridge.fixture_planning_scene_node import FixturePlanningScene
+
+    # Missing file.
+    missing = _mesh_scenario_payload(
+        tmp_path,
+        mesh={"uri": "missing.stl", "sha256": "a" * 64, "scale": [1.0, 1.0, 1.0]},
+        scenario_id="mesh-missing",
+    )
+    with pytest.raises(ValueError, match="not found"):
+        FixturePlanningScene(
+            node_name="fixture_mesh_missing",
+            context=ros_context,
+            parameter_overrides=[Parameter("scenario_file", value=str(missing))],
+        )
+    # Unsupported format.
+    bad = tmp_path / "box.xyz"
+    bad.write_bytes(b"garbage")
+    xyz = _mesh_scenario_payload(
+        tmp_path,
+        mesh={"uri": "box.xyz", "sha256": sha256(b"garbage").hexdigest(), "scale": [1.0, 1.0, 1.0]},
+        scenario_id="mesh-unsupported",
+    )
+    with pytest.raises(ValueError, match="not supported"):
+        FixturePlanningScene(
+            node_name="fixture_mesh_unsupported",
+            context=ros_context,
+            parameter_overrides=[Parameter("scenario_file", value=str(xyz))],
+        )
+    # Hash mismatch against the actual file bytes.
+    asset = tmp_path / "box.stl"
+    asset.write_bytes(_tiny_binary_stl())
+    mismatched = _mesh_scenario_payload(
+        tmp_path,
+        mesh={"uri": "box.stl", "sha256": "a" * 64, "scale": [1.0, 1.0, 1.0]},
+        scenario_id="mesh-mismatch",
+    )
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        FixturePlanningScene(
+            node_name="fixture_mesh_mismatch",
+            context=ros_context,
+            parameter_overrides=[Parameter("scenario_file", value=str(mismatched))],
+        )
+
+
+def test_real_constructor_mesh_ready_loop(ros_context, tmp_path: Path) -> None:
+    """A real schema-valid mesh scenario keeps its loader for the node lifetime:
+    _build_apply_request emits a non-empty scaled shape_msgs/Mesh and the real
+    ready-loop applies, reads back, and confirms it to FIXTURE_READY."""
+    _humble()
+    import rclpy
+    from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
+    from rclpy.parameter import Parameter
+    from std_srvs.srv import Trigger
+
+    from tinker_sim_bridge.fixture_planning_scene_node import (
+        FixturePlanningScene,
+        _spec_to_collision_object,
+    )
+    from tinker_sim_bridge.fixture_planning_scene import fixture_to_specs
+
+    asset = tmp_path / "box.stl"
+    asset.write_bytes(_tiny_binary_stl())
+    digest = sha256(asset.read_bytes()).hexdigest()
+    scenario = _mesh_scenario_payload(
+        tmp_path,
+        mesh={"uri": "box.stl", "sha256": digest, "scale": [2.0, 3.0, 4.0]},
+        scenario_id="mesh-ready-loop",
+    )
+
+    context = ros_context
+    server = None
+    node = None
+    executor = None
+    applied_request = {}
+    try:
+        server = rclpy.create_node("fixture_mesh_servers", context=context)
+        applied = {"value": False}
+
+        def on_physics(request, response):
+            del request
+            response.success = True
+            return response
+
+        def on_apply(request, response):
+            applied["value"] = True
+            applied_request["request"] = request
+            response.success = True
+            return response
+
+        def on_get(request, response):
+            del request
+            if applied["value"]:
+                for spec in node._specs:
+                    response.scene.world.collision_objects.append(
+                        _spec_to_collision_object(spec, mesh_loader=node._load_mesh)
+                    )
+            return response
+
+        server.create_service(Trigger, "/sim/ready/physics", on_physics)
+        server.create_service(ApplyPlanningScene, "/apply_planning_scene", on_apply)
+        server.create_service(GetPlanningScene, "/get_planning_scene", on_get)
+
+        node = FixturePlanningScene(
+            node_name="fixture_mesh_loop",
+            context=context,
+            parameter_overrides=[Parameter("scenario_file", value=str(scenario))],
+        )
+        # The mesh loader must be preserved (Critical fix) and project root set.
+        assert callable(node._load_mesh)
+        assert node._project_root is not None
+
+        executor = rclpy.executors.SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        executor.add_node(server)
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline and node._state != FIXTURE_STATE_READY:
+            executor.spin_once(timeout_sec=0.05)
+        executor.shutdown()
+        executor = None
+        assert node._state == FIXTURE_STATE_READY, (
+            "state={} phase={} reason={}".format(node._state, node._phase, node._fail_reason)
+        )
+        # The apply request carried a real, non-empty, scaled mesh.
+        request = applied_request["request"]
+        mesh_objects = [
+            obj for obj in request.scene.world.collision_objects if obj.meshes
+        ]
+        assert len(mesh_objects) == 1
+        mesh_msg = mesh_objects[0].meshes[0]
+        assert len(mesh_msg.vertices) == 3
+        assert len(mesh_msg.triangles) == 1
+        assert mesh_msg.vertices[0] == _point(0.0, 0.0, 0.0)
+        assert mesh_msg.vertices[1] == _point(2.0, 0.0, 0.0)
+        assert mesh_msg.vertices[2] == _point(0.0, 3.0, 0.0)
+        assert list(mesh_msg.triangles[0].vertex_indices) == [0, 1, 2]
+        # Ready service confirms.
+        response = Trigger.Response()
+        node._on_ready(Trigger.Request(), response)
+        assert response.success is True
+        payload = json.loads(response.message)
+        assert payload["state"] == FIXTURE_STATE_READY
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if server is not None:
+            server.destroy_node()
+
+
+def _point(x: float, y: float, z: float):
+    from geometry_msgs.msg import Point
+
+    point = Point()
+    point.x, point.y, point.z = x, y, z
+    return point
+
+
+def test_get_extract_foreign_namespace_ignored_for_geometry(ros_context) -> None:
+    """A malformed foreign object is preserved by raw id for leak checks but its
+    geometry is never parsed, so it cannot block fixture readiness; malformed
+    sim_fixture/* objects are still rejected."""
+    _humble()
+    from moveit_msgs.msg import CollisionObject
+    from moveit_msgs.srv import GetPlanningScene
+
+    from tinker_sim_bridge.fixture_planning_scene_node import (
+        FixturePlanningScene,
+        _spec_to_collision_object,
+    )
+    from tinker_sim_bridge.fixture_planning_scene import fixture_to_specs
+
+    node = FixturePlanningScene.__new__(FixturePlanningScene)
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    specs = fixture_to_specs(declaration)
+    response = GetPlanningScene.Response()
+    for spec in specs:
+        response.scene.world.collision_objects.append(_spec_to_collision_object(spec))
+    # Malformed foreign object: empty frame_id (invalid for geometry, but the
+    # fixture does not own it and must not fail because of it).
+    foreign = CollisionObject()
+    foreign.id = "nav/foreign"
+    foreign.header.frame_id = ""
+    response.scene.world.collision_objects.append(foreign)
+
+    extracted = node._get_extract(response)
+    pairs = dict(extracted)
+    assert "nav/foreign" in pairs
+    assert pairs["nav/foreign"] is None
+    assert len(extracted) == len(specs) + 1
+    assert all(
+        geometry is not None
+        for oid, geometry in extracted
+        if oid.startswith("sim_fixture/")
+    )
+
+    # A malformed sim_fixture/* object is still rejected (fail closed).
+    bad = CollisionObject()
+    bad.id = "sim_fixture/bad"
+    bad.header.frame_id = ""
+    response.scene.world.collision_objects.append(bad)
+    with pytest.raises(Exception, match="empty frame"):
+        node._get_extract(response)
+
+
+def test_foreign_namespace_geometry_confirm_and_diff(ros_context) -> None:
+    """Foreign ids survive the readback for leak checks; geometry confirmation
+    covers only owned sim_fixture/* objects; the atomic diff never removes a
+    foreign object."""
+    _humble()
+    from moveit_msgs.msg import CollisionObject
+    from rclpy.parameter import Parameter
+
+    from tinker_sim_bridge.fixture_contract import (
+        build_atomic_revision_diff,
+        confirm_fixture_revision,
+        spec_geometry,
+    )
+    from tinker_sim_bridge.fixture_planning_scene import (
+        canonical_fixture_status,
+        fixture_descriptor_sha256,
+        fixture_owned_ids,
+    )
+    from tinker_sim_bridge.fixture_planning_scene_node import (
+        FixturePlanningScene,
+        _spec_to_collision_object,
+    )
+
+    node = FixturePlanningScene(
+        node_name="fixture_foreign_confirm",
+        context=ros_context,
+        parameter_overrides=[
+            Parameter("scenario_file", value=str(SCENARIOS / "qualification-moveit-plan-joint.json")),
+        ],
+    )
+    try:
+        specs = node._specs
+        scene_objects = [
+            _spec_to_collision_object(spec, mesh_loader=node._load_mesh) for spec in specs
+        ]
+        foreign = CollisionObject()
+        foreign.id = "nav/foreign"
+        foreign.header.frame_id = "map"
+        scene_objects.append(foreign)
+        extracted = node._get_extract(type("Resp", (), {"scene": type("Sc", (), {"world": type("W", (), {"collision_objects": scene_objects})()})()})())
+        scene_ids = tuple(oid for oid, _geometry in extracted)
+        observed_geometry = tuple(
+            geometry for _oid, geometry in extracted if geometry is not None
+        )
+        status = canonical_fixture_status(
+            scenario=node._scenario_id,
+            revision=node._revision,
+            revision_digest=node._revision_digest,
+            sequence=1,
+            published_at=1.0,
+            owned_ids=node._owned_ids,
+            target_source_id=node._target_source_id,
+            target_handoff=node._target_handoff,
+            descriptor_sha256=node._descriptor_sha256,
+            state=FIXTURE_STATE_READY,
+        )
+        confirmation = confirm_fixture_revision(
+            service_result=True,
+            scene_ids=scene_ids,
+            status=status,
+            expected_revision=node._revision,
+            expected_digest=node._revision_digest,
+            expected_owned_ids=node._owned_ids,
+            expected_geometry={
+                spec.id: spec_geometry(spec, resolve_mesh=node._load_mesh) for spec in specs
+            },
+            observed_geometry=observed_geometry,
+        )
+        assert confirmation.ready, confirmation.reasons
+        assert "nav/foreign" in confirmation.observed_scene_ids
+        assert confirmation.foreign_fixture_ids == ()
+        # The atomic diff excludes the foreign object from removal.
+        diff = build_atomic_revision_diff(desired_objects=specs, existing_ids=scene_ids)
+        assert "nav/foreign" not in diff.removed_ids
+        assert "nav/foreign" not in [
+            obj["id"] for obj in diff.apply_request["world"]["collision_objects"]
+        ]
+    finally:
+        node.destroy_node()
