@@ -446,14 +446,26 @@ class CanonicalUrdfTest(unittest.TestCase):
         finally:
             temporary.cleanup()
 
-    def test_runtime_transformer_is_shared_and_arm_only(self) -> None:
+    def test_runtime_transformer_is_shared_with_state_only_drive_joint(self) -> None:
         temporary, _, artifacts, _ = _export_fixture()
         try:
             resolved = resolve_current_artifact(artifacts.parent)
             output = ET.fromstring(topic_control_description(resolved.robot_urdf))
             control = output.find("ros2_control")
-            self.assertEqual([j.get("name") for j in control.findall("joint")], [f"joint{i}" for i in range(1, 8)])
-            self.assertNotIn("drive_joint", ET.tostring(control, encoding="unicode"))
+            self.assertEqual(
+                [j.get("name") for j in control.findall("joint")],
+                [f"joint{i}" for i in range(1, 8)] + ["drive_joint"],
+            )
+            drives = [j for j in control.findall("joint") if j.get("name") == "drive_joint"]
+            self.assertEqual(len(drives), 1)
+            self.assertEqual(
+                [i.get("name") for i in drives[0].findall("command_interface")],
+                [],
+            )
+            self.assertEqual(
+                [i.get("name") for i in drives[0].findall("state_interface")],
+                ["position", "velocity", "effort"],
+            )
         finally:
             temporary.cleanup()
 

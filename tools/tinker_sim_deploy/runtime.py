@@ -269,4 +269,8 @@ def topic_control_description(urdf: str | bytes) -> str:
         ET.SubElement(joint, "state_interface", name="position")
         ET.SubElement(joint, "state_interface", name="velocity")
         ET.SubElement(joint, "state_interface", name="effort")
+    drive = ET.SubElement(control, "joint", name="drive_joint")
+    ET.SubElement(drive, "state_interface", name="position")
+    ET.SubElement(drive, "state_interface", name="velocity")
+    ET.SubElement(drive, "state_interface", name="effort")
     return ET.tostring(root, encoding="unicode")

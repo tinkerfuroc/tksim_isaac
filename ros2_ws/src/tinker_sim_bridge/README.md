@@ -128,6 +128,68 @@ PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
   tests/test_model_contract.py tests/test_model_bundle.py tests/test_model_preflight.py
 ```
 
+## Integrated eight-joint state contract (Task 4)
+
+The integrated `/joint_states` contract is exactly eight joints — `joint1` ..
+`joint7` followed by `drive_joint` — where `drive_joint` is state-only
+(`position`, `velocity`, `effort`; zero command interfaces).  `drive_joint`
+appears exactly once in the checked-in
+`config/tinker_topic_control.ros2_control.xacro` and in the live controller
+description produced by `tools/tinker_sim_deploy/runtime.py:
+topic_control_description` from the complete canonical robot URDF.  The
+`xarm7_traj_controller` keeps the seven arm joints, the gripper command path
+remains `/sim/controller/gripper_commands`, and `joint_state_broadcaster`
+remains the sole `/joint_states` publisher.
+
+### Pure contract helpers (ROS-free)
+
+`tinker_sim_bridge/contract_guard.py` exposes complete-input pure helpers used
+by both the contract tests and the live probe:
+
+- `evaluate_joint_state_sample(*, publisher_node, publisher_count, names,
+  positions, velocities, header_stamp_ns, received_at_ns, now_ns)` — classifies
+  one actual `sensor_msgs/msg/JointState` sample (exact names, cardinality one,
+  source `joint_state_broadcaster`, nonzero stamp, finite arrays, bounded
+  age/transport).  All times are explicit; no global clock or implicit topic.
+- `evaluate_integrated_cardinality(*, joint_state_publishers)` — classifies
+  publisher cardinality/source from ROS graph endpoint metadata.
+- `evaluate_robot_description_contract(description)` — evaluates the same
+  `drive_joint` state-only contract in the `robot_description` parameter
+  received by `/controller_manager`.
+- `evaluate_xacro_contract(xacro_text)` and
+  `evaluate_joint_state_evidence_pair(...)` — parse the checked-in xacro source
+  and compare source-xacro and live-parameter evidence together.
+
+Each returns a complete mapping with `ready`, `reasons`, and the observed
+values.  These modules stay import-time ROS-free and run under both simulator
+CPython 3.12 and Humble CPython 3.10.
+
+### ROS Humble live probe
+
+`joint_state_probe` (`ros2 run tinker_sim_bridge joint_state_probe`) is the
+Task 6 evidence path.  It reads the `/controller_manager` `robot_description`
+parameter, parses the checked-in xacro, subscribes to `/joint_states`, and reads
+`/joint_states` publisher graph metadata, then evaluates all of the above pure
+helpers and publishes compact JSON on `/sim/status/joint_state_contract`
+(latched, reliable).  It never counts source text as primary evidence;
+`source_text_diagnostics` in the report is supplemental only.
+
+```bash
+ros2 run tinker_sim_bridge joint_state_probe \
+  --ros-args -p controller_manager:=/controller_manager -p broadcaster:=joint_state_broadcaster
+```
+
+### Tests
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
+  ./.venv/bin/python -m pytest -q \
+  tests/test_integrated_joint_state_contract.py \
+  tests/test_manipulation_integration_contract.py \
+  tests/test_contract_guard.py
+```
+
 ## Deployment gateways
 
 The remaining bridge nodes implement hardware-parity gateways and controllers

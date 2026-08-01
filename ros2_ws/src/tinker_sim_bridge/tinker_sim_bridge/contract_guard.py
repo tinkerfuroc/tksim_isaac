@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping, Sequence
 
 try:
@@ -264,6 +266,336 @@ def evaluate_overall_state(
     if contract["missing_topics"] or contract["missing_standard_services"]:
         return "fail" if startup_grace_elapsed else "starting"
     return "pass"
+
+
+INTEGRATED_JOINT_STATE_NAMES = tuple(f"joint{index}" for index in range(1, 8)) + (
+    "drive_joint",
+)
+JOINT_STATE_BROADCASTER = "joint_state_broadcaster"
+JOINT_STATE_MAX_AGE_NS = 5_000_000_000
+JOINT_STATE_MAX_TRANSPORT_NS = 2_000_000_000
+_EXPECTED_ARM_COMMAND_INTERFACES = ("position", "velocity")
+_EXPECTED_ARM_STATE_INTERFACES = ("position", "velocity", "effort")
+_EXPECTED_DRIVE_STATE_INTERFACES = ("position", "velocity", "effort")
+
+
+def evaluate_integrated_cardinality(
+    *,
+    joint_state_publishers: Sequence[str],
+) -> dict[str, object]:
+    """Classify the integrated ``/joint_states`` publisher cardinality.
+
+    *joint_state_publishers* carries the logical publisher source labels derived
+    from ROS graph endpoint metadata; cardinality one and the sole source
+    ``joint_state_broadcaster`` are required.  This helper never inspects source
+    text and never relies on an implicit topic name.
+    """
+    publishers = tuple(joint_state_publishers)
+    reasons: list[str] = []
+    if len(publishers) != 1:
+        reasons.append(
+            f"joint_state publisher count is {len(publishers)}, expected 1"
+        )
+    if publishers != (JOINT_STATE_BROADCASTER,):
+        reasons.append(
+            "joint_state publisher source is {!r}, expected {!r}".format(
+                list(publishers), JOINT_STATE_BROADCASTER
+            )
+        )
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "observed": {
+            "joint_state_publishers": list(publishers),
+            "joint_state_publisher_count": len(publishers),
+            "joint_state_publisher_source": publishers[0] if publishers else None,
+        },
+    }
+
+
+def evaluate_joint_state_sample(
+    *,
+    publisher_node: str,
+    publisher_count: int,
+    names: Sequence[str],
+    positions: Sequence[float],
+    velocities: Sequence[float],
+    header_stamp_ns: int,
+    received_at_ns: int,
+    now_ns: int,
+) -> dict[str, object]:
+    """Classify one actual ``sensor_msgs/msg/JointState`` sample.
+
+    Every time input is explicit: *header_stamp_ns* (message header), the
+    *received_at_ns* observation time, and *now_ns* evaluation time.  The
+    contract requires the exact eight integrated joint names, a single
+    ``joint_state_broadcaster`` publisher, a nonzero header stamp, finite
+    eight-element position/velocity arrays, and bounded age/transport latency.
+    """
+    reasons: list[str] = []
+    observed_names = tuple(names)
+    observed_positions = tuple(float(value) for value in positions)
+    observed_velocities = tuple(float(value) for value in velocities)
+    if observed_names != INTEGRATED_JOINT_STATE_NAMES:
+        reasons.append(
+            "joint names are {!r}, expected {!r}".format(
+                list(observed_names), list(INTEGRATED_JOINT_STATE_NAMES)
+            )
+        )
+    if publisher_count != 1:
+        reasons.append(f"joint_state publisher count is {publisher_count}, expected 1")
+    if publisher_node != JOINT_STATE_BROADCASTER:
+        reasons.append(
+            "joint_state publisher is {!r}, expected {!r}".format(
+                publisher_node, JOINT_STATE_BROADCASTER
+            )
+        )
+    if not header_stamp_ns:
+        reasons.append(f"header stamp is zero ({header_stamp_ns} ns)")
+    if len(observed_positions) != len(INTEGRATED_JOINT_STATE_NAMES):
+        reasons.append(
+            "positions length is {}, expected {}".format(
+                len(observed_positions), len(INTEGRATED_JOINT_STATE_NAMES)
+            )
+        )
+    elif not all(math.isfinite(value) for value in observed_positions):
+        reasons.append("positions contain non-finite values")
+    if len(observed_velocities) != len(INTEGRATED_JOINT_STATE_NAMES):
+        reasons.append(
+            "velocities length is {}, expected {}".format(
+                len(observed_velocities), len(INTEGRATED_JOINT_STATE_NAMES)
+            )
+        )
+    elif not all(math.isfinite(value) for value in observed_velocities):
+        reasons.append("velocities contain non-finite values")
+    age_ns = now_ns - header_stamp_ns
+    transport_ns = received_at_ns - header_stamp_ns
+    if age_ns < 0:
+        reasons.append(f"header stamp is in the future by {-age_ns} ns")
+    elif age_ns > JOINT_STATE_MAX_AGE_NS:
+        reasons.append(
+            "header stamp is stale by {} ns (bound {})".format(
+                age_ns, JOINT_STATE_MAX_AGE_NS
+            )
+        )
+    if transport_ns < 0:
+        reasons.append(f"transport latency is negative ({transport_ns} ns)")
+    elif transport_ns > JOINT_STATE_MAX_TRANSPORT_NS:
+        reasons.append(
+            "transport latency {} ns exceeds bound {}".format(
+                transport_ns, JOINT_STATE_MAX_TRANSPORT_NS
+            )
+        )
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "observed": {
+            "publisher_node": publisher_node,
+            "publisher_count": publisher_count,
+            "names": list(observed_names),
+            "positions": list(observed_positions),
+            "velocities": list(observed_velocities),
+            "header_stamp_ns": header_stamp_ns,
+            "received_at_ns": received_at_ns,
+            "now_ns": now_ns,
+            "age_ns": age_ns,
+            "transport_ns": transport_ns,
+        },
+    }
+
+
+def _joint_records_from_description(
+    description: str | bytes,
+) -> tuple[list[str], dict[str, dict[str, list[str]]], str | None]:
+    """Parse ``ros2_control`` joint interface records from a description string.
+
+    Returns ``(joint_names, records_by_name, error)`` where *error* is a
+    human-readable failure reason when the description is malformed or does not
+    contain exactly one ``ros2_control`` block.
+    """
+    try:
+        raw = description.decode("utf-8") if isinstance(description, bytes) else description
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        return [], {}, f"description is not well-formed XML: {exc}"
+    controls = root.findall("ros2_control")
+    if len(controls) != 1:
+        return [], {}, f"expected exactly one ros2_control block, found {len(controls)}"
+    records: dict[str, dict[str, list[str]]] = {}
+    for joint in controls[0].findall("joint"):
+        name = joint.get("name")
+        commands = [
+            item.get("name")
+            for item in joint.findall("command_interface")
+            if item.get("name")
+        ]
+        states = [
+            item.get("name")
+            for item in joint.findall("state_interface")
+            if item.get("name")
+        ]
+        records[name] = {"command_interfaces": commands, "state_interfaces": states}
+    return list(records), records, None
+
+
+def _joint_state_contract(
+    records: dict[str, dict[str, list[str]]],
+) -> tuple[list[str], dict[str, object]]:
+    """Evaluate the eight-joint state-only drive_joint contract on parsed records."""
+    reasons: list[str] = []
+    names = list(records)
+    if names != list(INTEGRATED_JOINT_STATE_NAMES):
+        reasons.append(
+            "ros2_control joint names are {!r}, expected {!r}".format(
+                names, list(INTEGRATED_JOINT_STATE_NAMES)
+            )
+        )
+    for arm in [f"joint{index}" for index in range(1, 8)]:
+        record = records.get(arm)
+        if record is None:
+            reasons.append(f"arm joint {arm} is missing from ros2_control")
+        elif record["command_interfaces"] != list(_EXPECTED_ARM_COMMAND_INTERFACES):
+            reasons.append(
+                "arm joint {0} command interfaces are {1!r}, expected {2!r}".format(
+                    arm, record["command_interfaces"], list(_EXPECTED_ARM_COMMAND_INTERFACES)
+                )
+            )
+        elif record["state_interfaces"] != list(_EXPECTED_ARM_STATE_INTERFACES):
+            reasons.append(
+                "arm joint {0} state interfaces are {1!r}, expected {2!r}".format(
+                    arm, record["state_interfaces"], list(_EXPECTED_ARM_STATE_INTERFACES)
+                )
+            )
+    drive = records.get("drive_joint")
+    if drive is None:
+        reasons.append("drive_joint is missing from ros2_control")
+    else:
+        if drive["command_interfaces"] != []:
+            reasons.append(
+                "drive_joint command interfaces are {!r}, expected []".format(
+                    drive["command_interfaces"]
+                )
+            )
+        if drive["state_interfaces"] != list(_EXPECTED_DRIVE_STATE_INTERFACES):
+            reasons.append(
+                "drive_joint state interfaces are {!r}, expected {!r}".format(
+                    drive["state_interfaces"], list(_EXPECTED_DRIVE_STATE_INTERFACES)
+                )
+            )
+    observed: dict[str, object] = {
+        "ros2_control_joint_names": names,
+        "joint_records": records,
+        "arm_joints": {
+            arm: records.get(arm) for arm in [f"joint{index}" for index in range(1, 8)]
+        },
+        "drive_joint": drive,
+    }
+    return reasons, observed
+
+
+def evaluate_robot_description_contract(description: str | bytes) -> dict[str, object]:
+    """Evaluate the drive_joint state-only contract in a live robot_description.
+
+    The ROS Humble live probe feeds the ``robot_description`` parameter received
+    by ``/controller_manager`` through this helper; the same helper is exercised
+    deterministically on the complete real robot URDF through the runtime
+    transformer in the contract tests.
+    """
+    names, records, error = _joint_records_from_description(description)
+    if error is not None:
+        return {"ready": False, "reasons": [error], "observed": {}}
+    reasons, observed = _joint_state_contract(records)
+    if not names:
+        reasons.append("ros2_control contains no joints")
+    return {"ready": not reasons, "reasons": reasons, "observed": observed}
+
+
+_XACRO_NAMESPACES = {"xacro": "http://www.ros.org/wiki/xacro"}
+
+
+def evaluate_xacro_contract(xacro_text: str) -> dict[str, object]:
+    """Evaluate the same drive_joint contract in the checked-in xacro source.
+
+    The live probe compares this evidence with the controller_manager
+    ``robot_description`` evidence; both must agree on the state-only
+    ``drive_joint``.
+    """
+    try:
+        root = ET.fromstring(xacro_text)
+    except ET.ParseError as exc:
+        return {"ready": False, "reasons": [f"xacro is not well-formed XML: {exc}"], "observed": {}}
+    macro = root.find("xacro:macro", _XACRO_NAMESPACES)
+    control = macro.find("ros2_control") if macro is not None else None
+    if control is None:
+        control = root.find("ros2_control")
+    if control is None:
+        return {
+            "ready": False,
+            "reasons": ["xacro contains no ros2_control or xacro:macro container"],
+            "observed": {},
+        }
+    records: dict[str, dict[str, list[str]]] = {}
+    for joint in control.findall("joint"):
+        name = joint.get("name")
+        commands = [
+            item.get("name")
+            for item in joint.findall("command_interface")
+            if item.get("name")
+        ]
+        states = [
+            item.get("name")
+            for item in joint.findall("state_interface")
+            if item.get("name")
+        ]
+        records[name] = {"command_interfaces": commands, "state_interfaces": states}
+    reasons, observed = _joint_state_contract(records)
+    if not records:
+        reasons.append("ros2_control contains no joints")
+    return {"ready": not reasons, "reasons": reasons, "observed": observed}
+
+
+def evaluate_joint_state_evidence_pair(
+    *,
+    xacro_contract: Mapping[str, object],
+    description_contract: Mapping[str, object],
+) -> dict[str, object]:
+    """Compare the checked-in xacro and live robot_description drive_joint evidence.
+
+    Source-xacro and live-parameter evidence are recorded together so the live
+    probe (and its deterministic test seam) prove they agree on the exact
+    state-only ``drive_joint`` contract.
+    """
+    reasons: list[str] = []
+    xacro_observed = xacro_contract.get("observed")
+    description_observed = description_contract.get("observed")
+    xacro_drive = (
+        xacro_observed.get("drive_joint")
+        if isinstance(xacro_observed, dict)
+        else None
+    )
+    description_drive = (
+        description_observed.get("drive_joint")
+        if isinstance(description_observed, dict)
+        else None
+    )
+    if not xacro_contract.get("ready"):
+        reasons.append("checked-in xacro drive_joint contract is not ready")
+    if not description_contract.get("ready"):
+        reasons.append("controller_manager robot_description drive_joint contract is not ready")
+    if xacro_drive != description_drive:
+        reasons.append(
+            "checked-in xacro drive_joint {!r} differs from live robot_description drive_joint {!r}".format(
+                xacro_drive, description_drive
+            )
+        )
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "observed": {
+            "xacro_drive_joint": xacro_drive,
+            "description_drive_joint": description_drive,
+        },
+    }
 
 
 def _endpoint_label(info: object) -> str:
