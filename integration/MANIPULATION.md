@@ -27,6 +27,7 @@ Terminal B runs the system-Humble side:
 
 ```bash
 cd /home/tinker/tinker-sim/6.0.1
+export TINKER_WS=/home/tinker/tk25_ws               # required by launch-humble
 ./scripts/launch-humble manipulation scenario:=pick-deliver-place seed:=7 \
   qualification:=false attempt_dir:=outputs/manipulation-dev-7
 ```
@@ -131,6 +132,7 @@ smoke `--mode` below):
 
 ```bash
 cd /home/tinker/tinker-sim/6.0.1
+export TINKER_WS=/home/tinker/tk25_ws               # required by launch-humble
 export ROS_DOMAIN_ID=25
 export TINKER_SIM_DDS_PROFILE=local        # or lan, must match Terminal A
 export TINKER_SIM_MODEL_BUNDLE_MANIFEST=outputs/ompl-overlay/model-bundle-r2/model-bundle.json
@@ -150,7 +152,9 @@ source /opt/ros/humble/setup.bash
 source /home/tinker/tk25_ws/install/setup.bash
 export ROS_DOMAIN_ID=25
 export TINKER_SIM_DDS_PROFILE=local        # or lan, must match
-export PYTHONPATH="$PWD/validation:$PYTHONPATH"
+# The smoke imports the Task 6 canonical helpers (identity digests) from the
+# tinker_sim_bridge source tree, plus the ROS-free goal builders in validation/.
+export PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/validation:$PYTHONPATH"
 python3 validation/ompl_plan_smoke.py --mode joint \
   --report outputs/ompl-plan-smoke/ompl-plan-smoke.json
 ```
@@ -161,7 +165,7 @@ python3 validation/ompl_plan_smoke.py --mode joint \
 |---|---|---|---|
 | Joint | `qualification-moveit-plan-joint` | `joint` | `evaluation.ready=true`, `outcome.kind="success"`, `trajectory_point_count >= 1`, `command_observations.samples == 0` |
 | Pose | `qualification-moveit-plan-pose` | `pose` | same as joint |
-| Blocked | `qualification-moveit-plan-blocked` | `blocked` | `evaluation.ready=true`, `outcome.kind="non_success"`, `error_code != 1` |
+| Blocked | `qualification-moveit-plan-blocked` | `blocked` | `evaluation.ready=true`, `outcome.kind="non_success"`, accepted goal ending `STATUS_ABORTED` with an explicit MoveIt planning/collision/constraint failure code (e.g. `PLANNING_FAILED`/`GOAL_IN_COLLISION`), `command_observations.samples == 0` |
 
 The smoke exits 0 on `evaluation.ready=true` and 1 otherwise.  A mode/scenario
 mismatch (the scenario's `qualification_gate` is not `moveit-plan-<mode>`) is
@@ -169,7 +173,12 @@ rejected fail-closed before any goal is sent.  Joint mode plans to a small
 reach from a vertical arm; pose mode targets a point
 `POSE_APPROACH_Z_OFFSET` above the scenario's `target` object; blocked mode
 targets the interior of the `blocker` object so every goal sample is in
-collision, giving a deterministic non-success.
+collision, giving a deterministic non-success.  Blocked acceptance requires an
+accepted goal ending `STATUS_ABORTED` (or a `STATUS_SUCCEEDED` terminal carrying
+a non-success MoveIt result) with an explicit MoveIt planning/collision/
+constraint failure code; a rejected goal, an empty/default (`0`/`None`) code, a
+cancel, a result timeout, a transport/setup failure, or an unknown terminal
+status is always rejected fail-closed.
 
 If the readiness gate never publishes a fresh `pass` within
 `--readiness-timeout`, the client writes a compact canonical fail-closed report
@@ -182,7 +191,7 @@ source /opt/ros/humble/setup.bash
 source /home/tinker/tk25_ws/install/setup.bash
 export ROS_DOMAIN_ID=25
 export TINKER_SIM_DDS_PROFILE=local
-export PYTHONPATH="$PWD/validation:$PYTHONPATH"
+export PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/validation:$PYTHONPATH"
 python3 validation/ompl_plan_smoke.py --mode joint --readiness-timeout 5 \
   --report outputs/ompl-plan-smoke/ompl-plan-smoke-failclosed.json
 ```
