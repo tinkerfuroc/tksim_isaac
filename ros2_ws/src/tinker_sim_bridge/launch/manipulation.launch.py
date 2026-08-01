@@ -16,11 +16,13 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
+    IncludeLaunchDescription,
     OpaqueFunction,
     RegisterEventHandler,
 )
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -46,6 +48,37 @@ def _process_exit_actions(event, label: str, success_actions):
     ]
 
 
+def _planning_overlay_actions(context, root: Path, workspace: Path):
+    """Return the integrated staging overlay include, or ``None`` when the
+    legacy non-overlay path is requested.
+
+    The staging overlay composes the Task 3/4/5 providers into the first
+    integrated OMPL/readiness boundary; it is the only path that installs the
+    staged production planning/task overlay.
+    """
+    share = Path(FindPackageShare("tinker_sim_bridge").perform(context))
+    project_root_text = str(root)
+    workspace_text = str(workspace)
+    integrated = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            str(share / "launch" / "integrated_ompl_manipulation.launch.py")
+        ),
+        launch_arguments={
+            "project_root": project_root_text,
+            "tinker_workspace": workspace_text,
+            "scenario": LaunchConfiguration("scenario"),
+            "seed": LaunchConfiguration("seed"),
+            "reset_attempts": LaunchConfiguration("reset_attempts"),
+            "reset_retry_delay": LaunchConfiguration("reset_retry_delay"),
+            "qualification": LaunchConfiguration("qualification"),
+            "model_bundle_manifest": LaunchConfiguration("model_bundle_manifest"),
+            "provider_manifest_path": LaunchConfiguration("provider_manifest_path"),
+            "attempt_dir": LaunchConfiguration("attempt_dir"),
+        }.items(),
+    )
+    return [integrated]
+
+
 def _resolve(context):
     root = Path(LaunchConfiguration("project_root").perform(context)).resolve()
     # Resolve the workspace argument here so launch rejects an invalid path
@@ -56,6 +89,8 @@ def _resolve(context):
     workspace = Path(workspace_value).expanduser().resolve()
     if not workspace.is_dir():
         raise RuntimeError(f"tinker workspace not found: {workspace}")
+    if _bool(LaunchConfiguration("planning_overlay").perform(context)):
+        return _planning_overlay_actions(context, root, workspace)
     scenario = LaunchConfiguration("scenario").perform(context)
     if not scenario or "/" in scenario or "\\" in scenario or scenario in {".", ".."}:
         raise RuntimeError(f"unsafe scenario id: {scenario!r}")
@@ -247,6 +282,15 @@ def generate_launch_description():
             DeclareLaunchArgument("qualification", default_value="false"),
             DeclareLaunchArgument(
                 "attempt_dir", default_value=os.environ.get("TINKER_SIM_ATTEMPT_DIR", "")
+            ),
+            DeclareLaunchArgument("planning_overlay", default_value="false"),
+            DeclareLaunchArgument(
+                "model_bundle_manifest",
+                default_value=os.environ.get("TINKER_SIM_MODEL_BUNDLE_MANIFEST", ""),
+            ),
+            DeclareLaunchArgument(
+                "provider_manifest_path",
+                default_value=os.environ.get("TINKER_SIM_PROVIDER_MANIFEST", ""),
             ),
             OpaqueFunction(function=_resolve),
         ]
