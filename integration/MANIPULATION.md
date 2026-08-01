@@ -212,6 +212,89 @@ attempt immutable. Do not bypass
 `/isaac_joint_commands`, teleport an object after spawn, fabricate truth, or
 use an action return code as a physical postcondition.
 
+## Acceptance contract (Task 8)
+
+`integration/ompl-overlay-contract.json` is the deterministic acceptance
+contract for the reviewed OMPL overlay (Tasks 3-7).  It packages the reviewed
+interfaces and writes the acceptance contract; it does not itself prove live
+OMPL or authorize cuMotion.  It is a single canonical JSON document
+(schema version 1, sorted keys, minimal separators, no timestamps, no
+host-transient data, and no self-referential Task 8 commit hash).
+
+The contract records, with exact values:
+
+- **Repository identities.**  The simulator implementation identity is commit
+  `f34de5f4cd472e2dbb50d65eb53e089bb1c84891` (clean baseline).  The production
+  implementation identity is recorded from the actual git history, not a
+  mutable concurrent HEAD: runtime hardening is the range
+  `f3e2ce4f6e00b23f9b35fef14555ff48d8993058..df702a573f971bb3e2008789adc882c09567de7a`
+  (canonical OMPL overlay consumer + pick_and_place/xarm_controller hardening),
+  and the Task 2 production launch is the range
+  `f7fea50b5e15ba22deb9d2ec401097056519bf97..39d96a176904c0b7966b11333c5517b3b54b6ae3`
+  (mobile_bringup planning/task-only launch).  Clean/dirty policy is recorded
+  for both repositories: the simulator identity is the clean tree; the
+  production workspace is a read-only runtime input whose local modifications
+  are not part of the recorded identity.
+- **Production overlay.**  Package `mobile_bringup`, launch file
+  `manipulation_planning_task_only.launch.py`
+  (`src/mobile_bringup/launch/manipulation_planning_task_only.launch.py`), the
+  exact 18-argument launch contract, and the literal-false
+  `use_cumotion_object_attachment` / `use_cumotion_goalset` /
+  `use_cumotion_straight_approach` / `esdf_freshness_wait_enabled`
+  compatibility values (and literal-true `safety_required` /
+  `fixture_revision_required` / `use_sim_time`).  The provider/import/action
+  client allow-lists, the task-owned lifecycle
+  (`pick_and_place` creates and owns `pick_and_place/object_mesh` after the
+  hardening prerequisite), and the exact 7-step staging sequence are recorded.
+- **ROS policy.**  Humble, `ROS_DOMAIN_ID=25`, `rmw_fastrtps_cpp`, and the
+  `local`/`lan` Fast DDS profiles.
+- **Provider manifest.**  The committed
+  `ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json` is
+  recorded verbatim with its canonical self-hash
+  `4bc177890393b5b6d434e17aed3dc85889e55efce7cb9874a6d4c4575bc1362b` and the
+  raw-byte digest.  Persistent nodes, one-shot processes/lifecycle, logical
+  controller resources, and publishers are distinct sections and are never
+  collapsed.
+- **Model bundle.**  The canonical schema, the unchanged manifest path
+  `outputs/ompl-overlay/model-bundle-r2/model-bundle.json`, the artifact
+  hashes, the semantic kinematics/model contract, the normalized selected
+  subgraph, the full eight-link SRDF touch set, and the preflight report
+  (16 checks, `ready=true`).
+- **Typed contract.**  Every typed action (including `/move_action` as
+  `moveit_msgs/action/MoveGroup`, `/execute_trajectory`, gripper/FJT,
+  pickup/place, Cartesian/Joint/Fold), the typed `/arm_joint_service`
+  (`tinker_arm_msgs/srv/ArmJointService`), the controller-manager services,
+  MoveIt scene services, gate services, and every typed publisher with exact
+  type/source/cardinality/stamp/QoS policy — including the corrected
+  `/isaac_joint_commands` depth 50 and the external future
+  `/tinker_integrated_gate_executor` ownership of `/sim/safety/operator`.
+  The public `scenario-runner.json` report carries the one-key
+  `{"execution_profile": "sim_ompl"}` mapping exactly as the shipped
+  `pick_and_place` canonical parser requires, while the full runtime contract
+  is carried separately as `runtime_contract_sha256`.
+- **Fixture/scenario identities.**  Exact `sim_fixture/*` ownership and parser
+  encoding, canonical `target_source_id="sim_fixture/public_target"`,
+  `target_handoff="pick_and_place/object_mesh"`, and the three OMPL plan-only
+  scenarios with their declaration/revision/digest/owned-ID/descriptor
+  identities.
+- **Evidence.**  Task 6 runtime/public-report separation and Task 7 plan-only
+  joint/pose/blocked plus zero-command evidence and the exact blocked-mode
+  MoveIt failure-code allowlist.
+- **Build commands.**  `MAKEFLAGS='-j2 -l2'
+  /home/tinker/tk25_ws/tkbuild tk25_manipulation --parallel-workers 2` for the
+  production workspace and `MAKEFLAGS='-j2 -l2'
+  TINKER_WS=/home/tinker/tk25_ws ./scripts/build-humble-overlay` for the
+  simulator overlay — never raw colcon.
+- **Source locks.**  Both repository-local source-lock files are Task 9 only;
+  Task 8 does not create or modify either.
+
+`tests/test_provenance.py` recomputes every derived hash/contract from the
+real source and artifacts and fails on mutations (including raw-colcon text,
+provider-manifest drift, wrong compatibility booleans, dirty-policy
+violations, and premature source-lock inclusion).  The pre-existing uv
+environment provenance failure (installed `uv 0.12.0` vs pinned `uv 0.10.8`)
+remains an environment failure, not a code failure.
+
 ## Deferred work and status
 
 This is development-only and not release-qualified. The current tree has no

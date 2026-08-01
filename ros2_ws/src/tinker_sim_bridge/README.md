@@ -544,3 +544,31 @@ The remaining bridge nodes implement hardware-parity gateways and controllers
 for the external Humble boundary (base, xArm, gripper, pan-tilt, command
 gateway, safety supervisor, contract guard, truth evaluator, scenario runner,
 audio fixtures).  See the repository root README for the deployment model.
+
+## Acceptance contract provenance (Task 8)
+
+`tests/test_provenance.py` was extended (not replaced) with a deterministic
+acceptance-contract provenance suite that recomputes every derived hash and
+contract in the committed `integration/ompl-overlay-contract.json` from the
+real source and artifacts.  It fails on mutations: stale `setup.py`/`package.xml`
+registrations, missing data files, provider-manifest drift, wrong model/current
+artifact, wrong endpoint/type/source/cardinality/QoS, wrong fixture/order/
+handoff, wrong compatibility booleans, raw-colcon text, dirty-policy
+violations, and source-lock files being prematurely included.  The pre-existing
+uv environment provenance failure (installed `uv 0.12.0` vs pinned `uv 0.10.8`)
+is unchanged and is not masked: it is an environment failure, not a code
+failure.
+
+As part of this task the package metadata is completed:
+
+- `setup.py` registers the `readiness_waiter` console script (the installed
+  module already existed and is invoked as `python3 -m
+  tinker_sim_bridge.readiness_waiter` by the integrated launch) and verifies
+  every launch/config/integration asset and every `main()`-bearing module is
+  registered.
+- `package.xml` declares the direct message/service/action and runtime package
+  dependencies with no transitive-import assumptions (`xarm_moveit_config` is
+  deliberately not listed: it is consumed transitively through the
+  `mobile_bringup` production launch, which declares it directly).  The missing
+  direct `robot_localization` dependency was added: the shipped
+  `launch/navigation.launch.py` launches `robot_localization/ekf_node`.

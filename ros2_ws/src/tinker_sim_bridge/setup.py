@@ -59,6 +59,7 @@ setup(
             "model_preflight = tinker_sim_bridge.model_preflight:main",
             "pan_tilt_facade = tinker_sim_bridge.pan_tilt_facade:main",
             "physics_ready_gate = tinker_sim_bridge.physics_ready_gate:main",
+            "readiness_waiter = tinker_sim_bridge.readiness_waiter:main",
             "scenario_runner = tinker_sim_bridge.scenario_runner:main",
             "safety_supervisor = tinker_sim_bridge.safety_supervisor:main",
             "truth_evaluator = tinker_sim_bridge.truth_evaluator:main",
