@@ -94,6 +94,14 @@ integrity checks (schema, robot/artifact binding, safe contained paths, manifest
 agreement, selected `robot.urdf`).  On migration to schema 4 the resolver
 automatically enforces the stronger checks; no overlay-specific reader exists.
 
+`current_artifact._shared_resolver` locates `tools/tinker_sim_deploy` first
+through the authoritative project root supplied by the caller or derived from
+the manifest simulator-artifact path, then falls back to module-tree/
+environment/cwd discovery.  This keeps a genuine copied ROS install outside the
+checkout able to reach the real resolver without `TINKER_SIM_ROOT`, and it
+stays fail-closed when neither a project root nor an authoritative artifact
+tree is available.
+
 ### Preflight CLI
 
 ```text
@@ -101,12 +109,15 @@ model_preflight --model-bundle-manifest PATH --report PATH --timeout SECONDS
 ```
 
 The preflight verifies manifest schema, absolute paths, exact hashes, the
-selected-subgraph contract, installed/source artifact identity (via
-`current.json` when a simulator checkout root is available), prefix, mount,
+selected-subgraph contract, installed/source artifact identity, prefix, mount,
 groups, end-effector parent, resolved touch links, limits, collision geometry,
-and finite JSON output.  It returns a typed result for every mismatch,
-artifact/path state, timeout, or safety classification and atomically writes a
-report only for the fully ready result.
+and finite JSON output.  Artifact identity proves the manifest simulator
+artifact byte-equals the authoritative `current.json` selection (identical
+copied bytes pass; stale/different bytes fail) and fails closed whenever no
+authoritative root can be resolved — never `ok=true`/`not applicable`.  It
+returns a typed result for every mismatch, artifact/path state, timeout, or
+safety classification and atomically writes a report only for the fully ready
+result.
 
 ### Tests
 

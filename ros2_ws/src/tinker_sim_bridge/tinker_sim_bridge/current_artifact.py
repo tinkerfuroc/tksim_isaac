@@ -37,13 +37,27 @@ def _simulation_root() -> Path | None:
     return None
 
 
-def _shared_resolver():
-    root = _simulation_root()
+def _shared_resolver(project_root=None):
+    """Locate the authoritative ``tinker_sim_deploy`` resolver.
+
+    *project_root*, when supplied, is the preferred source of
+    ``tools/tinker_sim_deploy``: a copied ROS install outside the simulator
+    checkout can still resolve the real runtime tooling when the caller passes
+    or derives the simulator project root from the manifest artifact path.  The
+    module-tree/environment/cwd discovery remains the fallback.
+    """
+    root = None
+    if project_root is not None:
+        candidate = Path(project_root)
+        if (candidate / "tools" / "tinker_sim_deploy").is_dir():
+            root = candidate
+    if root is None:
+        root = _simulation_root()
     if root is None:
         raise ModelContractError(
             "artifact_current",
             "cannot locate the simulator checkout to load the shared current-artifact resolver; "
-            "set TINKER_SIM_ROOT or run from the simulator repository",
+            "set TINKER_SIM_ROOT, pass the simulator project root, or run from the simulator repository",
         )
     tools = root / "tools"
     if str(tools) not in sys.path:
@@ -63,10 +77,12 @@ def resolve_current_artifact(project_root):
 
     The return value mirrors ``tinker_sim_deploy.runtime.ArtifactResolution``
     and carries ``artifact_dir``, ``manifest``, ``source_lock``, and
-    ``robot_urdf``.  Failures surface as typed ``ModelContractError`` so the
-    model overlay can classify them consistently.
+    ``robot_urdf``.  The authoritative resolver is located through
+    *project_root* first (then module-tree/environment/cwd).  Failures surface
+    as typed ``ModelContractError`` so the model overlay can classify them
+    consistently.
     """
-    _, resolver, _resolution_type = _shared_resolver()
+    _, resolver, _resolution_type = _shared_resolver(project_root)
     try:
         return resolver(Path(project_root))
     except ModelContractError:

@@ -103,6 +103,15 @@ def write_ready_manifest(tmp_path: Path) -> Path:
         prefix="",
         mount=MOUNT,
     )
+    # Provide a valid synthetic authoritative current selector so a fully-ready
+    # preflight can prove identity with the selected simulator artifact
+    # regardless of the repository cwd: mirror the canonical URDF into a legacy
+    # artifact tree and point the manifest at that tree's robot.urdf.
+    from model_fixtures import write_legacy_current
+    sim_bytes = artifacts["simulator_full_urdf"].read_bytes()
+    selected_urdf = write_legacy_current(tmp_path, "abcdef0123456789", sim_bytes)
+    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(selected_urdf)
+    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(selected_urdf)
     output = tmp_path / "model-bundle.json"
     from tinker_sim_bridge.model_bundle import write_manifest as _write
     _write(manifest, output)
@@ -211,10 +220,12 @@ def test_artifact_identity_mismatch_is_not_ready(tmp_path: Path) -> None:
     manifest_path = write_ready_manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     sim_bytes = Path(manifest["artifacts"]["simulator_full_urdf"]["path"]).read_bytes()
-    # The manifest references a generation that is NOT what current.json selects.
+    # The manifest references a generation that is NOT what current.json selects
+    # and whose bytes differ from the selected generation (stale outside-tree
+    # copy), so byte-identity must reject it.
     selected_gen = "aaaa1111aaaa1111"
     other_gen = "bbbb2222bbbb2222"
-    other_urdf = write_legacy_current(tmp_path, other_gen, sim_bytes)
+    other_urdf = write_legacy_current(tmp_path, other_gen, sim_bytes + b"\n")
     write_legacy_current(tmp_path, selected_gen, sim_bytes)
     # Re-point the selector at the selected generation (last helper call won).
     (tmp_path / "artifacts" / "robot" / "tinker2" / "current.json").write_text(
@@ -256,11 +267,15 @@ def test_wrong_groups_value_not_ready(tmp_path: Path) -> None:
 
 def test_identity_fails_closed_without_project_root(tmp_path: Path, monkeypatch) -> None:
     manifest_path = write_ready_manifest(tmp_path)
+    # write_ready_manifest provides a synthetic authoritative selector; remove
+    # it so no authoritative current.json can be resolved from any root.
+    selector = tmp_path / "artifacts" / "robot" / "tinker2" / "current.json"
+    selector.unlink()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     # Move the manifest's sim artifact inside an artifact tree with no selector.
     sim_src = Path(manifest["artifacts"]["simulator_full_urdf"]["path"])
-    artifact_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "abcdef0123456789"
-    artifact_dir.mkdir(parents=True)
+    artifact_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "deadbeefdeadbeef"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     urdf = artifact_dir / "robot.urdf"
     urdf.write_bytes(sim_src.read_bytes())
     manifest["artifacts"]["simulator_full_urdf"]["path"] = str(urdf)
@@ -294,6 +309,42 @@ def test_identity_ready_from_manifest_derived_root(tmp_path: Path) -> None:
     identity = [check for check in result["checks"] if check["name"] == "artifact_identity"]
     assert identity and identity[0]["ok"] is True
     assert result["status"] == "ready"
+
+
+def test_outside_tree_copied_current_bytes_ready(tmp_path: Path) -> None:
+    manifest_path = write_ready_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected = Path(manifest["artifacts"]["simulator_full_urdf"]["path"])
+    # Copy the selected canonical URDF bytes OUTSIDE any artifact tree; the
+    # bytes are identical to the authoritative selection, so identity holds.
+    copied = tmp_path / "copied-simulator-full.urdf"
+    copied.write_bytes(selected.read_bytes())
+    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(copied)
+    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(copied)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    result = preflight_manifest(manifest_path, timeout=60.0, project_root=None)
+    identity = [check for check in result["checks"] if check["name"] == "artifact_identity"]
+    assert identity and identity[0]["ok"] is True
+    assert result["status"] == "ready"
+    assert result["ready"] is True
+
+
+def test_outside_tree_stale_bytes_not_ready(tmp_path: Path) -> None:
+    manifest_path = write_ready_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected = Path(manifest["artifacts"]["simulator_full_urdf"]["path"])
+    # A stale outside-tree copy whose bytes differ from the authoritative
+    # selection must fail identity even though the manifest hashes the copy.
+    stale = tmp_path / "stale-simulator-full.urdf"
+    stale.write_bytes(selected.read_bytes() + b"\n")
+    manifest["artifacts"]["simulator_full_urdf"]["path"] = str(stale)
+    manifest["artifacts"]["simulator_full_urdf"]["sha256"] = _sha(stale)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    result = preflight_manifest(manifest_path, timeout=60.0, project_root=None)
+    identity = [check for check in result["checks"] if check["name"] == "artifact_identity"]
+    assert identity and identity[0]["ok"] is False
+    assert result["status"] == "mismatch"
+    assert result["ready"] is False
 
 
 def _sha(path: Path) -> str:
