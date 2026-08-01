@@ -128,6 +128,15 @@ PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
   tests/test_model_contract.py tests/test_model_bundle.py tests/test_model_preflight.py
 ```
 
+The focused Task 8 provenance suite (deterministic OMPL-overlay acceptance
+contract) is invoked with the ROS `launch_pytest` plugin autoload disabled so
+pytest collection does not fail on the unavailable `lark` dependency:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv/bin/python -m pytest -q \
+  tests/test_provenance.py
+```
+
 ## Integrated eight-joint state contract (Task 4)
 
 The integrated `/joint_states` contract is exactly eight joints — `joint1` ..

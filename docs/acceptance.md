@@ -72,10 +72,31 @@ or authorize cuMotion; live qualification remains a separate gate.
   kinematics/model contract, full eight-link SRDF touch set, fixture
   `sim_fixture/*` ownership and `target_handoff="pick_and_place/object_mesh"`,
   and the three plan-only scenarios are recorded verbatim.
+- Production overlay scope is split: `production_overlay.production_allowlists`
+  records the exact production launch import/node/executable/controller
+  allow-lists (including `re`/`importlib`/`rviz2`) from
+  `launch_contract_helpers.py`, while
+  `production_overlay.simulator_overlay_provider_set` derives the simulator
+  overlay provider packages/executables from the committed provider manifest.
+- The model-bundle acceptance evidence is reproducible on a clean checkout: the
+  canonical simulator full URDF's source and provenance descriptor are
+  committed (`integration/model-bundle-r2/simulator_full_urdf/`), and
+  `model_bundle.stable_manifest_sha256` / `preflight_report.stable_sha256` hash
+  deterministic projections that exclude host-absolute paths and `elapsed_ms`.
+- The acceptance contract and the three qualification scenarios are installed
+  under `share/tinker_sim_bridge/integration/` and
+  `share/tinker_sim_bridge/scenarios/` (byte-identical to source), and the
+  integrated launch resolves a scenario through a deterministic package-share
+  fallback, rejecting byte disagreement when both sources exist.
 - Build commands use `tkbuild` and `scripts/build-humble-overlay` only, never
   raw colcon.
 - Both repository-local source-lock files are Task 9 only.
-- `tests/test_provenance.py` recomputes every derived hash/contract and fails
-  on mutations.  The pre-existing uv environment provenance failure (installed
-  `uv 0.12.0` vs pinned `uv 0.10.8`) is an environment failure, not a code
-  failure.
+- `tests/test_provenance.py` recomputes every derived hash/contract from
+  immutable git objects and committed source and fails on mutations (argument
+  order/count, literal compatibility booleans, strict-sim keys, production
+  import/node/executable allow-lists, simulator provider set, handoff,
+  model-bundle source evidence, stale current selection).  The pre-existing uv
+  environment provenance failure (installed `uv 0.12.0` vs pinned `uv 0.10.8`)
+  is an environment failure, not a code failure.  The focused invocation uses
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` (the ROS `launch_pytest` plugin otherwise
+  fails collection on the unavailable `lark` module).

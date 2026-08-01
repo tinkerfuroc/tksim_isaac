@@ -2,6 +2,22 @@ from setuptools import find_packages, setup
 
 package_name = "tinker_sim_bridge"
 
+# The canonical OMPL acceptance contract and the three required qualification
+# scenarios live in the simulator checkout (integration/ and simulation/scenarios/),
+# outside the bridge package directory.  They are exposed to the build through
+# tracked source symlinks under integration/ and scenarios/ so the build's
+# ``data_files`` sources stay relative (colcon rejects absolute sources) while
+# the canonical source bytes remain the single authoritative copy.  The
+# provenance suite verifies installed bytes equal the canonical source bytes.
+_scenario_sources = [
+    "scenarios/" + name
+    for name in (
+        "qualification-moveit-plan-joint.json",
+        "qualification-moveit-plan-pose.json",
+        "qualification-moveit-plan-blocked.json",
+    )
+]
+
 setup(
     name=package_name,
     version="0.1.0",
@@ -33,7 +49,12 @@ setup(
             "share/" + package_name + "/integration",
             [
                 "integration/provider-manifest.json",
+                "integration/ompl-overlay-contract.json",
             ],
+        ),
+        (
+            "share/" + package_name + "/scenarios",
+            _scenario_sources,
         ),
     ],
     install_requires=["setuptools"],

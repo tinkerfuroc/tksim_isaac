@@ -286,6 +286,18 @@ uv lock --check
 ./scripts/build-humble-overlay
 ```
 
+The focused OMPL-overlay provenance suite runs under the simulator venv.  On
+this host the ROS Humble `launch_pytest` plugin otherwise auto-loads and fails
+collection with `ModuleNotFoundError: No module named 'lark'`, so the
+reproducible invocation disables plugin autoload:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv/bin/python -m pytest -q tests/test_provenance.py
+```
+
+This does not hide the pre-existing pinned-uv environment failure
+(installed `uv 0.12.0` vs pinned `uv 0.10.8`), which is reported visibly.
+
 Release qualification additionally requires a clean server, the full online
 and offline bootstrap paths, ROS cross-process contract tests, RTX camera and
 LiDAR initialization, and a 60-second continuous WebRTC connection using
@@ -300,6 +312,23 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (fix round 1): Made the OMPL-overlay acceptance evidence
+  reproducible.  The production-overlay scope is split into the exact production
+  allow-lists (from `launch_contract_helpers.py`, including
+  `re`/`importlib`/`rviz2`) and a simulator-overlay provider set derived from
+  the provider manifest; the provenance suite now recomputes the 18-argument
+  contract, literal booleans, strict-sim keys, allow-lists, handoff, and
+  action-client scope from immutable production git objects.  The model-bundle
+  evidence is reproducible on a clean checkout: the canonical simulator full
+  URDF source + provenance descriptor are committed under
+  `integration/model-bundle-r2/simulator_full_urdf/`, and stable manifest /
+  preflight hashes exclude host-absolute paths and `elapsed_ms`.  The
+  acceptance contract and three qualification scenarios are installed under
+  `share/tinker_sim_bridge/{integration,scenarios}/` with a deterministic
+  launch package-share fallback.  `tests/test_provenance.py` fails (never
+  skips) when required source evidence is absent, and the documented focused
+  pytest invocation uses `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`.  The two
+  source-lock files remain Task 9 only.
 - 2026-08-02: Added the deterministic OMPL overlay acceptance contract
   (`integration/ompl-overlay-contract.json`) packaging the reviewed Tasks 3-7
   interfaces: exact repository/commit identities (simulator `f34de5f`;
