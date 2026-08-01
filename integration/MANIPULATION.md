@@ -81,6 +81,112 @@ simulator processes. External `--gate-command NAME=...` commands are recorded
 as `executed-unverified` when they exit zero; they can never produce a
 qualification pass until built-in evidence recomputation exists.
 
+## Deterministic OMPL plan-only smoke (Task 7)
+
+`validation/ompl_plan_smoke.py` is deterministic plan-only qualification tooling
+on top of the review-clean integrated readiness boundary.  It does **not**
+begin cuMotion and does **not** claim a live plan without a running, qualified
+graph: the client first requires a fresh `pass` on
+`/sim/status/integrated_manipulation`, then verifies `/move_action` is exactly
+one `moveit_msgs/action/MoveGroup` action server with observed
+action-kind/type/cardinality/source metadata, then sends a goal with
+`request.pipeline_id="ompl"` and `planning_options.plan_only=true` while
+observing `/isaac_joint_commands` for zero command samples across the full
+request/result window.  The MoveGroup action client is the only action client;
+no execute-trajectory/controller/task action client is constructed.
+
+- `validation/ompl_goal_builders.py` — ROS-free plain-data goal builders
+  (`build_joint_goal`, `build_pose_goal`) that run under simulator Python 3.12.
+- `validation/ompl_plan_smoke.py` — pure evaluator/serializer plus the live
+  Humble client seam.  `rclpy`, `rclpy.action`, and `moveit_msgs` are imported
+  only inside `main()` / the `OmplPlanSmokeClient` methods.
+- `tests/test_ompl_plan_smoke.py` — pure CPython 3.12 contract tests.
+
+Pure tests (simulator Python 3.12):
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+PYTHONPATH="$PWD/validation:$PWD/ros2_ws/src/tinker_sim_bridge" \
+  ./.venv/bin/python -m pytest -q tests/test_ompl_plan_smoke.py
+```
+
+### Three-terminal live workflow
+
+All three terminals use `ROS_DOMAIN_ID=25` and the **same**
+`TINKER_SIM_DDS_PROFILE=local|lan`.
+
+**Terminal A — Isaac Sim** (do not source `/opt/ros/humble` here):
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+export TINKER_ACCEPT_OMNIVERSE_EULA=Y
+export ROS_DOMAIN_ID=25
+export TINKER_SIM_DDS_PROFILE=local        # or lan
+./scripts/launch-isaac --sensor-profile manipulation-core --profile parity \
+  --scenario qualification-moveit-plan-joint --seed 7 --ros
+```
+
+**Terminal B — Humble overlay** (sourced system Humble; scenario must match the
+smoke `--mode` below):
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+export ROS_DOMAIN_ID=25
+export TINKER_SIM_DDS_PROFILE=local        # or lan, must match Terminal A
+export TINKER_SIM_MODEL_BUNDLE_MANIFEST=outputs/ompl-overlay/model-bundle-r2/model-bundle.json
+export TINKER_SIM_PROVIDER_MANIFEST=ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json
+./scripts/launch-humble integrated-ompl scenario:=qualification-moveit-plan-joint \
+  seed:=7 qualification:=false attempt_dir:=outputs/ompl-plan-smoke/attempt-joint
+```
+
+Wait for `/sim/status/integrated_manipulation` to publish `pass` before running
+Terminal C.
+
+**Terminal C — smoke client** (sourced system Humble Python 3.10):
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+source /opt/ros/humble/setup.bash
+source /home/tinker/tk25_ws/install/setup.bash
+export ROS_DOMAIN_ID=25
+export TINKER_SIM_DDS_PROFILE=local        # or lan, must match
+export PYTHONPATH="$PWD/validation:$PYTHONPATH"
+python3 validation/ompl_plan_smoke.py --mode joint \
+  --report outputs/ompl-plan-smoke/ompl-plan-smoke.json
+```
+
+### Scenario selection and expected terminal outcomes
+
+| Mode | Terminal B `scenario:=` | Smoke `--mode` | Expected report |
+|---|---|---|---|
+| Joint | `qualification-moveit-plan-joint` | `joint` | `evaluation.ready=true`, `outcome.kind="success"`, `trajectory_point_count >= 1`, `command_observations.samples == 0` |
+| Pose | `qualification-moveit-plan-pose` | `pose` | same as joint |
+| Blocked | `qualification-moveit-plan-blocked` | `blocked` | `evaluation.ready=true`, `outcome.kind="non_success"`, `error_code != 1` |
+
+The smoke exits 0 on `evaluation.ready=true` and 1 otherwise.  A mode/scenario
+mismatch (the scenario's `qualification_gate` is not `moveit-plan-<mode>`) is
+rejected fail-closed before any goal is sent.  Joint mode plans to a small
+reach from a vertical arm; pose mode targets a point
+`POSE_APPROACH_Z_OFFSET` above the scenario's `target` object; blocked mode
+targets the interior of the `blocker` object so every goal sample is in
+collision, giving a deterministic non-success.
+
+If the readiness gate never publishes a fresh `pass` within
+`--readiness-timeout`, the client writes a compact canonical fail-closed report
+(`evaluation.ready=false` with an exact `blocker` reason) and exits nonzero.
+This bounded fail-closed invocation can be verified without a live overlay:
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+source /opt/ros/humble/setup.bash
+source /home/tinker/tk25_ws/install/setup.bash
+export ROS_DOMAIN_ID=25
+export TINKER_SIM_DDS_PROFILE=local
+export PYTHONPATH="$PWD/validation:$PYTHONPATH"
+python3 validation/ompl_plan_smoke.py --mode joint --readiness-timeout 5 \
+  --report outputs/ompl-plan-smoke/ompl-plan-smoke-failclosed.json
+```
+
 ## Artifact policy
 
 Use a unique `attempt_dir` for every run. Preserve successful and failed
