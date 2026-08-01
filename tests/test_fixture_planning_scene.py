@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import struct
 import sys
 import time
 from hashlib import sha256
@@ -30,8 +32,11 @@ from tinker_sim_bridge.fixture_contract import (  # noqa: E402
     build_atomic_revision_diff,
     canonical_json,
     confirm_fixture_revision,
+    geometry_signature_sha256,
     parse_required_fixture_owned_ids,
+    readback_geometry,
     revision_digest,
+    spec_geometry,
 )
 from tinker_sim_bridge.fixture_contract import (  # noqa: E402
     FIXTURE_STATE_FAILED,
@@ -41,10 +46,13 @@ from tinker_sim_bridge.fixture_planning_scene import (  # noqa: E402
     FIXTURE_OWNER,
     FIXTURE_STATE_READY,
     STATUS_SCHEMA_VERSION,
+    SUPPORTED_MESH_EXTENSIONS,
     canonical_fixture_status,
     fixture_descriptor_sha256,
     fixture_owned_ids,
     fixture_to_specs,
+    load_mesh_asset,
+    parse_mesh_bytes,
 )
 
 SCENARIOS = ROOT / "simulation/scenarios"
@@ -99,6 +107,32 @@ def fixture_to_scene(declaration: Mapping[str, object]) -> tuple[CollisionObject
         if record.get("enter_collision_bodies") is True:
             specs.append(_record_spec(record, frame_id))
     return tuple(specs)
+
+
+def _tiny_binary_stl() -> bytes:
+    """Return a valid one-triangle binary STL byte string (nondegenerate)."""
+    header = b"\x00" * 80
+    count = struct.pack("<I", 1)
+    normal = struct.pack("<fff", 0.0, 0.0, 1.0)
+    vertices = b"".join(
+        struct.pack("<fff", x, y, z)
+        for (x, y, z) in ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    )
+    attribute = struct.pack("<H", 0)
+    return header + count + normal + vertices + attribute
+
+
+def _tiny_ascii_stl() -> bytes:
+    return (
+        b"solid tiny\n"
+        b"facet normal 0 0 1\nouter loop\n"
+        b"vertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\n"
+        b"endloop\nendfacet\nendsolid tiny\n"
+    )
+
+
+def _tiny_obj() -> bytes:
+    return b"# tiny triangle\no cube\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
 
 
 def _ready_status(
@@ -661,29 +695,356 @@ def test_scenario_validation_rejects_bad_planning_scene() -> None:
     diag = fresh(diag)
     with pytest.raises(ValueError, match="enter_collision_bodies"):
         load_scenario(with_planning_scene(diag))
-    # Hashed absolute/declared mesh asset.
-    mesh = dict(valid_ps)
-    mesh["objects"] = [
+    # Hashed mesh asset must exist with matching content (real temp file).
+    with tempfile.TemporaryDirectory() as tmp_mesh_dir:
+        mesh_abs = Path(tmp_mesh_dir) / "table.stl"
+        mesh_abs.write_bytes(_tiny_binary_stl())
+        mesh_digest = hashlib.sha256(mesh_abs.read_bytes()).hexdigest()
+        mesh = dict(valid_ps)
+        mesh["objects"] = [
+            {
+                "id": "sim_fixture/table",
+                "mesh": {"uri": "table.stl", "sha256": mesh_digest},
+                "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ]
+        mesh["target_source_id"] = "sim_fixture/table"
+        scenario_json = Path(tmp_mesh_dir) / "scenario.json"
+        scenario_json.write_text(
+            json.dumps(with_planning_scene(fresh(mesh))), encoding="utf-8"
+        )
+        ScenarioDefinition.load(scenario_json)
+        # Content-hash mismatch against the actual file bytes.
+        bad_mesh = dict(mesh)
+        bad_mesh["objects"] = [
+            {
+                "id": "sim_fixture/table",
+                "mesh": {"uri": "table.stl", "sha256": "a" * 64},
+                "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ]
+        scenario_json.write_text(
+            json.dumps(with_planning_scene(fresh(bad_mesh))), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="sha256 mismatch"):
+            ScenarioDefinition.load(scenario_json)
+
+
+# ---------------------------------------------------------------------------
+# Mesh parsing / asset loading (pure, ROS-free)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_binary_stl() -> None:
+    vertices, triangles = parse_mesh_bytes(_tiny_binary_stl(), filename="box.stl")
+    assert len(vertices) == 3
+    assert triangles == ((0, 1, 2),)
+    assert all(all(math.isfinite(coord) for coord in vertex) for vertex in vertices)
+
+
+def test_parse_ascii_stl() -> None:
+    vertices, triangles = parse_mesh_bytes(_tiny_ascii_stl(), filename="box.stl")
+    assert len(vertices) == 3
+    assert triangles == ((0, 1, 2),)
+    assert vertices[1] == (1.0, 0.0, 0.0)
+    assert vertices[2] == (0.0, 1.0, 0.0)
+
+
+def test_parse_obj() -> None:
+    vertices, triangles = parse_mesh_bytes(_tiny_obj(), filename="box.obj")
+    assert len(vertices) == 3
+    assert triangles == ((0, 1, 2),)
+    assert vertices[0] == (0.0, 0.0, 0.0)
+
+
+def test_parse_obj_with_vertex_texcoord_normal_indices() -> None:
+    data = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1/1/1 2/2/2 3/3/3\n"
+    vertices, triangles = parse_mesh_bytes(data, filename="box.obj")
+    assert triangles == ((0, 1, 2),)
+
+
+def test_parse_mesh_rejects_empty_geometry() -> None:
+    with pytest.raises(Exception, match="vertex"):
+        parse_mesh_bytes(b"solid empty\nendsolid empty\n", filename="empty.stl")
+    with pytest.raises(Exception, match="vertex"):
+        parse_mesh_bytes(b"", filename="empty.obj")
+
+
+def test_parse_mesh_rejects_nonfinite_vertex() -> None:
+    data = _tiny_ascii_stl().replace(b"1 0 0", b"nan 0 0")
+    with pytest.raises(Exception, match="finite"):
+        parse_mesh_bytes(data, filename="bad.stl")
+
+
+def test_parse_mesh_rejects_degenerate_triangle() -> None:
+    data = (
+        b"solid deg\nfacet normal 0 0 1\nouter loop\n"
+        b"vertex 0 0 0\nvertex 0 0 0\nvertex 0 0 0\n"
+        b"endloop\nendfacet\nendsolid deg\n"
+    )
+    with pytest.raises(Exception, match="nondegenerate"):
+        parse_mesh_bytes(data, filename="deg.stl")
+
+
+def test_parse_mesh_rejects_out_of_range_index() -> None:
+    data = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 9\n"
+    with pytest.raises(Exception, match="out of range"):
+        parse_mesh_bytes(data, filename="bad.obj")
+
+
+def test_parse_mesh_rejects_unsupported_format() -> None:
+    with pytest.raises(Exception, match="unsupported"):
+        parse_mesh_bytes(b"garbage", filename="mesh.xyz")
+
+
+def test_load_mesh_asset_roundtrip(tmp_path: Path) -> None:
+    asset = tmp_path / "box.stl"
+    asset.write_bytes(_tiny_binary_stl())
+    digest = sha256(asset.read_bytes()).hexdigest()
+    mesh = {"uri": "box.stl", "sha256": digest, "scale": [1.0, 1.0, 1.0]}
+    vertices, triangles = load_mesh_asset(mesh, project_root=tmp_path)
+    assert len(vertices) == 3
+    assert triangles == ((0, 1, 2),)
+
+
+def test_load_mesh_asset_scale_applied(tmp_path: Path) -> None:
+    asset = tmp_path / "box.stl"
+    asset.write_bytes(_tiny_binary_stl())
+    digest = sha256(asset.read_bytes()).hexdigest()
+    mesh = {"uri": "box.stl", "sha256": digest, "scale": [2.0, 3.0, 4.0]}
+    vertices, _ = load_mesh_asset(mesh, project_root=tmp_path)
+    assert vertices[1] == (2.0, 0.0, 0.0)
+    assert vertices[2] == (0.0, 3.0, 0.0)
+
+
+def test_load_mesh_asset_hash_mismatch(tmp_path: Path) -> None:
+    asset = tmp_path / "box.stl"
+    asset.write_bytes(_tiny_binary_stl())
+    mesh = {"uri": "box.stl", "sha256": "a" * 64}
+    with pytest.raises(Exception, match="sha256 mismatch"):
+        load_mesh_asset(mesh, project_root=tmp_path)
+
+
+def test_load_mesh_asset_missing_file(tmp_path: Path) -> None:
+    mesh = {"uri": "missing.stl", "sha256": "a" * 64}
+    with pytest.raises(Exception, match="not found"):
+        load_mesh_asset(mesh, project_root=tmp_path)
+
+
+def test_load_mesh_asset_unsupported_format(tmp_path: Path) -> None:
+    asset = tmp_path / "box.xyz"
+    asset.write_bytes(b"garbage")
+    digest = sha256(b"garbage").hexdigest()
+    mesh = {"uri": "box.xyz", "sha256": digest}
+    with pytest.raises(Exception, match="unsupported"):
+        load_mesh_asset(mesh, project_root=tmp_path)
+
+
+def test_supported_mesh_extensions_documented() -> None:
+    assert set(SUPPORTED_MESH_EXTENSIONS) == {".stl", ".obj"}
+
+
+def test_geometry_signature_sha256_deterministic() -> None:
+    first = [
         {
-            "id": "sim_fixture/table",
-            "mesh": {"uri": "simulation/assets/table.stl", "sha256": "a" * 64},
-            "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            "id": "sim_fixture/a",
+            "frame_id": "base_link",
+            "primitives": [{"type": "box", "dimensions": [1.0, 2.0, 3.0]}],
         }
     ]
-    mesh["target_source_id"] = "sim_fixture/table"
-    mesh = fresh(mesh)
-    load_scenario(with_planning_scene(mesh))
-    bad_mesh = dict(mesh)
-    bad_mesh["objects"] = [
+    assert geometry_signature_sha256(first) == geometry_signature_sha256(list(first))
+    second = [
         {
-            "id": "sim_fixture/table",
-            "mesh": {"uri": "simulation/assets/table.stl", "sha256": "not-a-digest"},
-            "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            "id": "sim_fixture/a",
+            "frame_id": "base_link",
+            "primitives": [{"type": "box", "dimensions": [1.0, 2.0, 4.0]}],
         }
     ]
-    bad_mesh = fresh(bad_mesh)
-    with pytest.raises(ValueError, match="sha256"):
-        load_scenario(with_planning_scene(bad_mesh))
+    assert geometry_signature_sha256(first) != geometry_signature_sha256(second)
+
+
+def test_touch_links_alias_equals_validated_model_contract() -> None:
+    from tinker_sim_bridge.fixture_contract import MODEL_CONTRACT_TOUCH_LINKS
+    from tinker_sim_bridge.model_contract import TOUCH_LINKS
+
+    assert MODEL_CONTRACT_TOUCH_LINKS == TOUCH_LINKS
+    assert len(MODEL_CONTRACT_TOUCH_LINKS) == 8
+
+
+def test_real_model_bundle_touch_links_match_exported_fixture_set() -> None:
+    """Prove the real/current model-bundle contract's exact eight touch links
+    equal the exported fixture/handoff set (must run when artifacts are
+    provisioned; explicit skip only when the artifact tree is absent)."""
+    import json as _json
+
+    from tinker_sim_bridge.current_artifact import resolve_current_artifact
+    from tinker_sim_bridge.fixture_contract import MODEL_CONTRACT_TOUCH_LINKS
+    from tinker_sim_bridge.model_bundle import build_manifest
+
+    try:
+        resolve_current_artifact(ROOT)
+    except Exception as exc:  # noqa: BLE001 - artifacts absent
+        pytest.skip("real Tinker 2 artifact is not provisioned: {}".format(exc))
+    manifest_path = ROOT / "outputs/ompl-overlay/model-bundle/model-bundle.json"
+    if not manifest_path.is_file():
+        pytest.skip("real model-bundle manifest is not provisioned: {}".format(manifest_path))
+    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = manifest["artifacts"]
+    paths = {name: entry["path"] for name, entry in artifacts.items()}
+    if any(not Path(path).is_file() for path in paths.values()):
+        pytest.skip("real model-bundle artifact files are not provisioned")
+    rebuilt = build_manifest(
+        simulator_full_urdf=paths["simulator_full_urdf"],
+        planning_urdf=paths["planning_urdf"],
+        planning_srdf=paths["planning_srdf"],
+        joint_limits=paths["joint_limits"],
+        kinematics=paths["kinematics"],
+        prefix=manifest["normalization"]["prefix"],
+        mount=manifest["normalization"]["mount"],
+    )
+    assert tuple(rebuilt["contract"]["touch_links"]) == tuple(MODEL_CONTRACT_TOUCH_LINKS)
+
+
+def test_scenario_validation_rejects_target_diagnostic_excluded_from_collision() -> None:
+    """target_source_id naming a diagnostic with enter_collision_bodies=false is
+    rejected at schema validation (it never enters the owned collision set)."""
+    import tempfile
+
+    from tinker_sim_core.scenario import ScenarioDefinition
+
+    def with_digest(ps: Mapping[str, object]) -> dict[str, object]:
+        ps = dict(ps)
+        ps["revision_digest"] = sha256(
+            json.dumps(
+                {k: v for k, v in ps.items() if k != "revision_digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return ps
+
+    payload = {
+        "schema_version": 2,
+        "id": "qualification-target-diag",
+        "world": {"mode": "current"},
+        "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+        "actors": [],
+        "objects": [
+            {
+                "id": "sim_fixture/a",
+                "primitive": {"type": "box", "dimensions": [0.1, 0.1, 0.1]},
+                "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ],
+        "diagnostic_objects": [
+            {
+                "id": "sim_fixture/diag",
+                "enter_collision_bodies": False,
+                "primitive": {"type": "box", "dimensions": [0.1, 0.1, 0.1]},
+                "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ],
+        "events": [{"at_sim_time": 0.0, "event": "spawn_once_while_paused"}],
+        "postconditions": [{"name": "ready", "path": "x", "operator": "equals", "value": True}],
+        "planning_scene": with_digest(
+            {
+                "revision": "r-1",
+                "frame_id": "base_link",
+                "target_source_id": "sim_fixture/diag",
+                "target_handoff": "pick_and_place/object_mesh",
+                "objects": [
+                    {
+                        "id": "sim_fixture/a",
+                        "primitive": {"type": "box", "dimensions": [0.1, 0.1, 0.1]},
+                        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+                    }
+                ],
+                "diagnostic_objects": [
+                    {
+                        "id": "sim_fixture/diag",
+                        "enter_collision_bodies": False,
+                        "primitive": {"type": "box", "dimensions": [0.1, 0.1, 0.1]},
+                        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+                    }
+                ],
+            }
+        ),
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scenario.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match="collision-body set"):
+            ScenarioDefinition.load(path)
+    # A diagnostic marked enter_collision_bodies: true IS a valid target.
+    payload["planning_scene"] = with_digest(dict(payload["planning_scene"]))
+    payload["planning_scene"]["diagnostic_objects"] = [
+        dict(record, enter_collision_bodies=True)
+        for record in payload["planning_scene"]["diagnostic_objects"]
+    ]
+    payload["planning_scene"] = with_digest(payload["planning_scene"])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scenario.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        ScenarioDefinition.load(path)
+
+
+def test_scenario_validation_mesh_supported_format_and_rejection(tmp_path: Path) -> None:
+    """Mesh fixtures require an existing supported-format asset whose content
+    matches the declared digest; missing/unsupported assets are rejected."""
+    from tinker_sim_core.scenario import ScenarioDefinition
+
+    stl = tmp_path / "box.stl"
+    stl.write_bytes(_tiny_binary_stl())
+    stl_digest = sha256(stl.read_bytes()).hexdigest()
+    scenario_path = tmp_path / "scenario.json"
+    base_ps = {
+        "revision": "r-1",
+        "frame_id": "base_link",
+        "target_source_id": "sim_fixture/table",
+        "target_handoff": "pick_and_place/object_mesh",
+    }
+
+    def write(mesh: Mapping[str, object]) -> None:
+        ps = dict(base_ps)
+        ps["objects"] = [
+            {
+                "id": "sim_fixture/table",
+                "mesh": dict(mesh),
+                "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ]
+        ps["revision_digest"] = sha256(
+            json.dumps(
+                {k: v for k, v in ps.items() if k != "revision_digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "schema_version": 2,
+            "id": "mesh-scenario",
+            "world": {"mode": "current"},
+            "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+            "actors": [],
+            "objects": [],
+            "events": [{"at_sim_time": 0.0, "event": "spawn_once_while_paused"}],
+            "postconditions": [{"name": "ready", "path": "x", "operator": "equals", "value": True}],
+            "planning_scene": ps,
+        }
+        scenario_path.write_text(json.dumps(payload), encoding="utf-8")
+        return scenario_path
+
+    ScenarioDefinition.load(write({"uri": "box.stl", "sha256": stl_digest}))
+    with pytest.raises(ValueError, match="not found"):
+        ScenarioDefinition.load(write({"uri": "missing.stl", "sha256": "a" * 64}))
+    bad_digest = {"uri": "box.stl", "sha256": "a" * 64}
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        ScenarioDefinition.load(write(bad_digest))
+    xyz = tmp_path / "box.xyz"
+    xyz.write_bytes(b"garbage")
+    xyz_digest = sha256(b"garbage").hexdigest()
+    with pytest.raises(ValueError, match="not supported"):
+        ScenarioDefinition.load(write({"uri": "box.xyz", "sha256": xyz_digest}))
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +1092,9 @@ def _make_node() -> "object":
     node._sequence = 0
     node._clock = _fake_clock()
     node._last_status = None
+    node._load_mesh = None
+    node._project_root = None
+    node._scene_objects = ()
     published: list[str] = []
     node._publisher = type("Pub", (), {})()
     node._publisher.publish = lambda message: published.append(message.data)
@@ -902,3 +1266,449 @@ def test_physics_gate_timeout_fails_closed() -> None:
     assert node._phase == "failed"
     assert node._state == FIXTURE_STATE_FAILED
     assert "physics" in str(node._fail_reason)
+
+
+# ---------------------------------------------------------------------------
+# Geometry readback confirmation (Humble messages)
+# ---------------------------------------------------------------------------
+
+
+def _confirm_with_geometry(
+    declaration: Mapping[str, object],
+    objects,
+    *,
+    mesh_loader=None,
+) -> "object":
+    from tinker_sim_bridge.fixture_contract import confirm_fixture_revision, spec_geometry
+    from tinker_sim_bridge.fixture_planning_scene import (
+        canonical_fixture_status,
+        fixture_descriptor_sha256,
+        fixture_owned_ids,
+        fixture_to_specs,
+    )
+
+    specs = fixture_to_specs(declaration)
+    expected_geometry = {
+        spec.id: spec_geometry(spec, resolve_mesh=mesh_loader) for spec in specs
+    }
+    observed_geometry = [readback_geometry(obj) for obj in objects]
+    status = canonical_fixture_status(
+        scenario="qualification-geometry",
+        revision=str(declaration["revision"]),
+        revision_digest=revision_digest(declaration),
+        sequence=1,
+        published_at=1.0,
+        owned_ids=fixture_owned_ids(declaration),
+        target_source_id=str(declaration["target_source_id"]),
+        target_handoff=str(declaration["target_handoff"]),
+        descriptor_sha256=fixture_descriptor_sha256(declaration),
+        state=FIXTURE_STATE_READY,
+    )
+    return confirm_fixture_revision(
+        service_result=True,
+        scene_ids=[obj.id for obj in objects],
+        status=status,
+        expected_revision=str(declaration["revision"]),
+        expected_digest=revision_digest(declaration),
+        expected_owned_ids=fixture_owned_ids(declaration),
+        expected_geometry=expected_geometry,
+        observed_geometry=observed_geometry,
+    )
+
+
+def _geometry_objects(declaration: Mapping[str, object], *, mesh_loader=None):
+    from tinker_sim_bridge.fixture_planning_scene import fixture_to_specs
+    from tinker_sim_bridge.fixture_planning_scene_node import _spec_to_collision_object
+
+    specs = fixture_to_specs(declaration)
+    return [_spec_to_collision_object(spec, mesh_loader=mesh_loader) for spec in specs]
+
+
+def test_confirm_geometry_roundtrip_is_ready() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    confirmation = _confirm_with_geometry(declaration, _geometry_objects(declaration))
+    assert confirmation.ready, confirmation.reasons
+    assert confirmation.geometry_consistent
+    assert confirmation.geometry_reasons == ()
+
+
+def test_confirm_geometry_wrong_frame_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    for obj in objects:
+        obj.header.frame_id = "map"
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert not confirmation.ready
+    assert any("geometry mismatch" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_wrong_pose_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    objects[0].primitive_poses[0].position.x += 0.05
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert not confirmation.ready
+    assert any("geometry mismatch" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_wrong_dimension_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    objects[0].primitives[0].dimensions[0] += 0.1
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert not confirmation.ready
+    assert any("geometry mismatch" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_wrong_type_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    objects[0].primitives[0].type = 2  # sphere instead of box
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert not confirmation.ready
+    assert any("geometry mismatch" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_empty_geometry_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    for obj in objects:
+        obj.primitives.clear()
+        obj.meshes.clear()
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert not confirmation.ready
+    assert any("geometry mismatch" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_duplicate_readback_id_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    objects.append(_geometry_objects(declaration)[0])
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert not confirmation.ready
+    assert any("duplicate" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_reordered_objects_normalized() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
+    objects = list(reversed(_geometry_objects(declaration)))
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert confirmation.ready, confirmation.reasons
+
+
+def test_confirm_geometry_stale_foreign_id_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    stale = CollisionObjectSpec(
+        id="sim_fixture/stale",
+        frame_id="base_link",
+        operation=OBJECT_ADD,
+        primitives=({"type": "box", "dimensions": [1.0, 1.0, 1.0]},),
+        primitive_poses=((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),),
+    )
+    from tinker_sim_bridge.fixture_planning_scene_node import _spec_to_collision_object
+
+    objects.append(_spec_to_collision_object(stale))
+    confirmation = _confirm_with_geometry(declaration, objects)
+    assert not confirmation.ready
+    assert any("unexpected sim_fixture" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_requires_both_expected_and_observed() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    from tinker_sim_bridge.fixture_contract import confirm_fixture_revision
+    from tinker_sim_bridge.fixture_planning_scene import (
+        canonical_fixture_status,
+        fixture_descriptor_sha256,
+        fixture_owned_ids,
+    )
+
+    status = canonical_fixture_status(
+        scenario="s", revision=str(declaration["revision"]),
+        revision_digest=revision_digest(declaration), sequence=1, published_at=1.0,
+        owned_ids=fixture_owned_ids(declaration),
+        target_source_id=str(declaration["target_source_id"]),
+        target_handoff=str(declaration["target_handoff"]),
+        descriptor_sha256=fixture_descriptor_sha256(declaration),
+        state=FIXTURE_STATE_READY,
+    )
+    confirmation = confirm_fixture_revision(
+        service_result=True,
+        scene_ids=[obj.id for obj in objects],
+        status=status,
+        expected_revision=str(declaration["revision"]),
+        expected_digest=revision_digest(declaration),
+        expected_owned_ids=fixture_owned_ids(declaration),
+        observed_geometry=[readback_geometry(obj) for obj in objects],
+    )
+    assert not confirmation.ready
+    assert any("both expected and observed" in reason for reason in confirmation.reasons)
+
+
+def test_confirm_geometry_mesh_roundtrip_and_vertex_mutation(tmp_path: Path) -> None:
+    _humble()
+    asset = tmp_path / "box.stl"
+    asset.write_bytes(_tiny_binary_stl())
+    digest = sha256(asset.read_bytes()).hexdigest()
+    declaration = {
+        "revision": "r-mesh",
+        "frame_id": "base_link",
+        "target_source_id": "sim_fixture/table",
+        "target_handoff": "pick_and_place/object_mesh",
+        "objects": [
+            {
+                "id": "sim_fixture/table",
+                "mesh": {"uri": "box.stl", "sha256": digest, "scale": [1.0, 1.0, 1.0]},
+                "pose": {"xyz": [0.5, 0.0, 0.5], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ],
+    }
+    loader = lambda mesh: load_mesh_asset(mesh, project_root=tmp_path)
+    objects = _geometry_objects(declaration, mesh_loader=loader)
+    confirmation = _confirm_with_geometry(declaration, objects, mesh_loader=loader)
+    assert confirmation.ready, confirmation.reasons
+    assert confirmation.geometry_consistent
+    # Mutate a mesh vertex in the readback -> geometry mismatch.
+    objects[0].meshes[0].vertices[1].x += 0.05
+    confirmation = _confirm_with_geometry(declaration, objects, mesh_loader=loader)
+    assert not confirmation.ready
+    assert any("geometry mismatch" in reason for reason in confirmation.reasons)
+
+
+def test_malformed_readback_empty_id_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    objects[0].id = ""
+    with pytest.raises(Exception, match="empty id"):
+        readback_geometry(objects[0])
+
+
+def test_malformed_readback_empty_frame_rejected() -> None:
+    _humble()
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    objects[0].header.frame_id = ""
+    with pytest.raises(Exception, match="empty frame"):
+        readback_geometry(objects[0])
+
+
+# ---------------------------------------------------------------------------
+# Real constructor wiring (Humble isolated ROS domain/context)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def ros_context():
+    """One isolated ROS context shared by the real-constructor tests.
+
+    A single rclpy init/shutdown per module minimizes FastDDS in-process churn;
+    each test still creates and destroys its own nodes within the shared
+    context.  The context is skipped under the simulator venv (no rclpy).
+    """
+    _humble()
+    import rclpy
+
+    os.environ["ROS_DOMAIN_ID"] = "47"
+    os.environ["ROS_LOCALHOST_ONLY"] = "1"
+    context = rclpy.context.Context()
+    rclpy.init(context=context)
+    yield context
+    rclpy.shutdown(context=context)
+
+
+def test_real_constructor_required_ids_mismatch_rejected(ros_context) -> None:
+    _humble()
+    from rclpy.parameter import Parameter
+
+    from tinker_sim_bridge.fixture_planning_scene_node import FixturePlanningScene
+
+    with pytest.raises(ValueError, match="required_fixture_owned_ids"):
+        FixturePlanningScene(
+            node_name="fixture_ctor_mismatch",
+            context=ros_context,
+            parameter_overrides=[
+                Parameter("scenario_file", value=str(SCENARIOS / "qualification-moveit-plan-joint.json")),
+                Parameter("required_fixture_owned_ids", value="sim_fixture/wrong"),
+            ],
+        )
+
+
+def test_real_constructor_malformed_scenario_rejected(ros_context) -> None:
+    _humble()
+    from rclpy.parameter import Parameter
+
+    from tinker_sim_bridge.fixture_planning_scene_node import FixturePlanningScene
+
+    with pytest.raises(Exception):
+        FixturePlanningScene(
+            node_name="fixture_ctor_missing",
+            context=ros_context,
+            parameter_overrides=[
+                Parameter("scenario_file", value="/nonexistent/scenario.json"),
+            ],
+        )
+
+
+def test_real_constructor_wiring_and_heartbeat(ros_context) -> None:
+    _humble()
+    import rclpy
+    from rclpy.parameter import Parameter
+    from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+    from std_msgs.msg import String
+
+    from tinker_sim_bridge.fixture_planning_scene_node import FixturePlanningScene
+
+    context = ros_context
+    node = None
+    sub_node = None
+    executor = None
+    try:
+        node = FixturePlanningScene(
+            node_name="fixture_ctor_wiring",
+            context=context,
+            parameter_overrides=[
+                Parameter("scenario_file", value=str(SCENARIOS / "qualification-moveit-plan-joint.json")),
+                Parameter("heartbeat_period", value=0.2),
+            ],
+        )
+        # Scenario load.
+        assert node._scenario_id == "qualification-moveit-plan-joint"
+        assert node._revision == "2026-08-01-moveit-qualification-joint"
+        assert node._owned_ids == ("sim_fixture/pedestal", "sim_fixture/public_target")
+        assert node._target_source_id == "sim_fixture/public_target"
+        assert node._target_handoff == "pick_and_place/object_mesh"
+        assert node._descriptor_sha256
+        # Publisher topic + QoS.
+        assert node._publisher.topic_name == "/sim/status/planning_scene_fixture"
+        qos = node._publisher.qos_profile
+        assert qos.reliability == ReliabilityPolicy.RELIABLE
+        assert qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
+        assert qos.depth == 1
+        # Ready service advertised.
+        service_names = dict(node.get_service_names_and_types())
+        assert "/sim/ready/fixture" in service_names
+        # 5 Hz heartbeat through the real publisher (no physics gate -> PENDING).
+        sub_node = rclpy.create_node("fixture_ctor_sub", context=context)
+        received: list[Mapping[str, object]] = []
+        sub_node.create_subscription(
+            String,
+            "/sim/status/planning_scene_fixture",
+            lambda message: received.append(json.loads(message.data)),
+            10,
+        )
+        executor = rclpy.executors.SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        executor.add_node(sub_node)
+        end = time.monotonic() + 1.3
+        while time.monotonic() < end:
+            executor.spin_once(timeout_sec=0.05)
+        executor.shutdown()
+        executor = None
+        assert len(received) >= 4, "expected ~5 Hz heartbeat, got {}".format(len(received))
+        sequences = [payload["sequence"] for payload in received]
+        assert sequences == sorted(sequences) and len(set(sequences)) == len(sequences)
+        assert all(payload["state"] == "FIXTURE_PENDING" for payload in received)
+        assert all(payload["owner"] == "sim_fixture" for payload in received)
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if sub_node is not None:
+            sub_node.destroy_node()
+
+
+def test_real_constructor_full_ready_loop_with_mock_services(ros_context) -> None:
+    _humble()
+    import rclpy
+    from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
+    from rclpy.parameter import Parameter
+    from std_srvs.srv import Trigger
+
+    from tinker_sim_bridge.fixture_planning_scene_node import (
+        FixturePlanningScene,
+        _spec_to_collision_object,
+    )
+    from tinker_sim_bridge.fixture_planning_scene import fixture_to_specs
+
+    scenario_file = SCENARIOS / "qualification-moveit-plan-blocked.json"
+    declaration = load_fixture_scenario(scenario_file)
+    specs = fixture_to_specs(declaration)
+    readback_objects = [
+        _spec_to_collision_object(spec, mesh_loader=None) for spec in specs
+    ]
+
+    context = ros_context
+    server = None
+    node = None
+    executor = None
+    try:
+        server = rclpy.create_node("fixture_ctor_servers", context=context)
+        applied = {"value": False}
+
+        def on_physics(request, response):
+            del request
+            response.success = True
+            return response
+
+        def on_apply(request, response):
+            del request
+            applied["value"] = True
+            response.success = True
+            return response
+
+        def on_get(request, response):
+            del request
+            if applied["value"]:
+                response.scene.world.collision_objects.extend(readback_objects)
+            return response
+
+        server.create_service(Trigger, "/sim/ready/physics", on_physics)
+        server.create_service(ApplyPlanningScene, "/apply_planning_scene", on_apply)
+        server.create_service(GetPlanningScene, "/get_planning_scene", on_get)
+
+        node = FixturePlanningScene(
+            node_name="fixture_ctor_loop",
+            context=context,
+            parameter_overrides=[
+                Parameter("scenario_file", value=str(scenario_file)),
+            ],
+        )
+        executor = rclpy.executors.SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        executor.add_node(server)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and node._state != FIXTURE_STATE_READY:
+            executor.spin_once(timeout_sec=0.05)
+        executor.shutdown()
+        executor = None
+        assert node._state == FIXTURE_STATE_READY, (
+            "state={} phase={} reason={}".format(node._state, node._phase, node._fail_reason)
+        )
+        # The ready service now succeeds.
+        response = Trigger.Response()
+        node._on_ready(Trigger.Request(), response)
+        assert response.success is True
+        payload = json.loads(response.message)
+        assert payload["state"] == FIXTURE_STATE_READY
+        assert tuple(payload["owned_ids"]) == node._owned_ids
+        assert applied["value"] is True
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if server is not None:
+            server.destroy_node()

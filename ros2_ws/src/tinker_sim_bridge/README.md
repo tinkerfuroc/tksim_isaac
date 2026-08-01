@@ -262,12 +262,22 @@ the same target source/handoff.
   every stale existing `sim_fixture/*` id as a REMOVE; foreign-namespace ids
   are never touched.  `apply_request` is exactly one canonical JSON-able
   PlanningScene diff.
+- `spec_geometry(spec, resolve_mesh=...)` and `readback_geometry(obj)` — a
+  deterministic canonical ROS-free geometry descriptor (declared-order id,
+  frame, poses, primitive type+dimensions, mesh vertices+triangles normalized
+  through the float32 wire representation, operation-independent).  The
+  internal `geometry_signature_sha256` digests those descriptors and is used to
+  prove the readback matches the declared fixture geometry; it is separate from
+  the published 12-key `fixture_descriptor_sha256` (the declaration digest).
 - `confirm_fixture_revision(*, service_result, scene_ids, status,
-  expected_revision, expected_digest, expected_owned_ids)` — fail-closed
-  readback/status confirmation covering owned-id presence, no foreign
-  `sim_fixture/*` leakage, and canonical status consistency (schema version,
-  ready state, owner, revision, digest, owned ids, target identity, monotonic
-  sequence, finite `published_at`, descriptor digest).
+  expected_revision, expected_digest, expected_owned_ids, expected_geometry,
+  observed_geometry)` — fail-closed readback/status confirmation covering
+  owned-id presence, no foreign `sim_fixture/*` leakage, no duplicate
+  `sim_fixture/*` id, exact readback-vs-declared geometry (frame, poses,
+  primitive type/dimensions, mesh vertices/triangles), and canonical status
+  consistency (schema version, ready state, owner, revision, digest, owned ids,
+  target identity, monotonic sequence, finite `published_at`, descriptor
+  digest).  Readback object order is normalized (not semantic).
 
 The immutable data types `CollisionObjectSpec`, `PlanningSceneDiffPlan`, and
 `Confirmation` carry every field the node and tests consume.
@@ -279,30 +289,54 @@ declaration into ADD specs (`fixture_to_specs`), the declared-order owned ids
 (`canonical_fixture_status`).  Diagnostic regions enter the collision-body set
 only when explicitly marked `enter_collision_bodies: true`.
 
+The touch-link set exported as `MODEL_CONTRACT_TOUCH_LINKS` is imported from
+the validated Task 3 `model_contract.TOUCH_LINKS` (a single authoritative
+source), never an independent literal.
+
+### Mesh assets
+
+Mesh-declared fixtures are fully supported: `parse_mesh_bytes` parses STL
+(binary or ASCII) and OBJ into finite vertices and nondegenerate in-range
+triangle indices with a narrow ROS-free stdlib-only parser (no heavyweight
+dependency), and `load_mesh_asset` resolves a declared `uri` against the
+project root, requires the file to exist, recomputes and compares its SHA-256
+against the declaration, applies the positive scale, and emits real
+`shape_msgs/Mesh` content.  Only `.stl` and `.obj` extensions are supported;
+any other extension is rejected during scenario validation and mesh loading so
+a mesh fixture can never become a silently-empty `Mesh()`.
+
 ### Scenario schema
 
 Scenario schema version 2 gains an optional `planning_scene` object (no parallel
 scenario format).  Strict validation requires a nonempty revision, a canonical
 matching `revision_digest`, frame `base_link`, unique `sim_fixture/*` ids, finite
-poses, positive primitive dimensions, hashed absolute/declared mesh assets, a
-declared `target_source_id`, and the exact scalar `target_handoff` of
-`pick_and_place/object_mesh`.
+poses, positive primitive dimensions, a declared `target_source_id`, and the
+exact scalar `target_handoff` of `pick_and_place/object_mesh`.  Mesh fixtures
+must name an existing supported-format (`/\.(stl|obj)$/`) asset whose content
+SHA-256 matches the declaration.  `target_source_id` must name a fixture that
+enters the collision-body/owned set — a public object or a diagnostic explicitly
+marked `enter_collision_bodies: true`; it cannot name a diagnostic excluded from
+the collision-body set.
 
 ### Live node
 
 `fixture_planning_scene_node.FixturePlanningScene` gates on the staged
 `/sim/ready/physics` Trigger service, waits boundedly for `/apply_planning_scene`
-and `/get_planning_scene`, pre-reads the current scene to discover stale
-`sim_fixture/*` ids, applies exactly one atomic diff, reads the scene back,
-confirms readback/status, and only then serves `/sim/ready/fixture`
-(`std_srvs/srv/Trigger`).  While alive it publishes a reliable transient-local
-5 Hz compact JSON heartbeat on `/sim/status/planning_scene_fixture`
-(`std_msgs/msg/String`) with exactly: `schema_version=1`, `state`, `scenario`,
-`owner="sim_fixture"`, `revision`, `revision_digest`, monotonic `sequence`,
-finite `published_at`, declared-order `owned_ids`, `target_source_id`, scalar
+and `/get_planning_scene`, pre-reads the current scene (requesting the explicit
+`WORLD_OBJECT_NAMES | WORLD_OBJECT_GEOMETRY` PlanningScene components) to
+discover stale `sim_fixture/*` ids, applies exactly one atomic diff (with real
+mesh geometry for mesh fixtures), reads the scene back with full
+`CollisionObject` geometry, confirms readback ids, geometry, and status, and
+only then serves `/sim/ready/fixture` (`std_srvs/srv/Trigger`).  While alive it
+publishes a reliable transient-local 5 Hz compact JSON heartbeat on
+`/sim/status/planning_scene_fixture` (`std_msgs/msg/String`) with exactly:
+`schema_version=1`, `state`, `scenario`, `owner="sim_fixture"`, `revision`,
+`revision_digest`, monotonic `sequence`, finite `published_at`, declared-order
+`owned_ids`, `target_source_id`, scalar
 `target_handoff="pick_and_place/object_mesh"`, and `fixture_descriptor_sha256`.
-Any service failure, malformed readback, status mismatch, or deadline exhaustion
-fails closed to `state="FIXTURE_FAILED"` and the ready service returns failure.
+Any service failure, malformed readback, geometry mismatch, status mismatch, or
+deadline exhaustion fails closed to `state="FIXTURE_FAILED"` and the ready
+service returns failure.
 
 The fixture adapter never owns task objects: the downstream hardening
 reconciler receives the full SRDF-derived eight-link touch set
@@ -330,7 +364,15 @@ PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
 
 Pure contract/scenario tests run under the simulator Python 3.12 venv; the node
 is imported only in the Humble Python 3.10 tests through a local import after
-sourcing system ROS.
+sourcing system ROS.  The Humble tests cover real `FixturePlanningScene`
+construction in an isolated ROS domain/context: scenario load, exact owned-id
+parsing/guard, publisher topic + RELIABLE/TRANSIENT_LOCAL depth-1 QoS, the
+`/sim/ready/fixture` service, physics/apply/get clients, the 5 Hz timer, clean
+destroy/shutdown, and constructor failure paths.  The real
+model-bundle/touch-link gate (`test_real_model_bundle_touch_links_match_exported_fixture_set`)
+rebuilds the current provisioned manifest through the Task 3 producer and
+asserts its exact eight touch links equal the exported fixture set (it skips
+only when the artifact tree is absent).
 
 ## Deployment gateways
 

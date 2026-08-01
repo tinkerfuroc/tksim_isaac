@@ -23,13 +23,13 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import rclpy
-from geometry_msgs.msg import Pose
-from moveit_msgs.msg import CollisionObject
+from geometry_msgs.msg import Point, Pose
+from moveit_msgs.msg import CollisionObject, PlanningSceneComponents
 from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from shape_msgs.msg import Mesh, SolidPrimitive
+from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
@@ -39,16 +39,21 @@ from .fixture_contract import (
     FIXTURE_STATE_PENDING,
     FIXTURE_STATE_READY,
     FIXTURE_NAMESPACE_PREFIX,
+    FixtureContractError,
     build_atomic_revision_diff,
     confirm_fixture_revision,
     parse_required_fixture_owned_ids,
+    readback_geometry,
     revision_digest,
+    spec_geometry,
 )
 from .fixture_planning_scene import (
     canonical_fixture_status,
     fixture_descriptor_sha256,
     fixture_owned_ids,
     fixture_to_specs,
+    find_project_root,
+    load_mesh_asset,
     serialize_status,
 )
 
@@ -83,7 +88,7 @@ def _pose_from_seven(pose7: Sequence[float]) -> Pose:
     return pose
 
 
-def _spec_to_collision_object(spec) -> CollisionObject:
+def _spec_to_collision_object(spec, *, mesh_loader=None) -> CollisionObject:
     obj = CollisionObject()
     obj.id = spec.id
     obj.header.frame_id = spec.frame_id
@@ -96,7 +101,25 @@ def _spec_to_collision_object(spec) -> CollisionObject:
     for pose7 in spec.primitive_poses:
         obj.primitive_poses.append(_pose_from_seven(pose7))
     for mesh in spec.meshes:
-        obj.meshes.append(Mesh())
+        if mesh_loader is None:
+            raise ValueError(
+                "mesh fixture {!r} cannot be built without a mesh loader".format(spec.id)
+            )
+        vertices, triangles = mesh_loader(mesh)
+        mesh_msg = Mesh()
+        for vertex in vertices:
+            point = Point()
+            point.x, point.y, point.z = (
+                float(vertex[0]),
+                float(vertex[1]),
+                float(vertex[2]),
+            )
+            mesh_msg.vertices.append(point)
+        for triangle in triangles:
+            mesh_triangle = MeshTriangle()
+            mesh_triangle.vertex_indices = [int(index) for index in triangle]
+            mesh_msg.triangles.append(mesh_triangle)
+        obj.meshes.append(mesh_msg)
     for pose7 in spec.mesh_poses:
         obj.mesh_poses.append(_pose_from_seven(pose7))
     return obj
@@ -105,8 +128,31 @@ def _spec_to_collision_object(spec) -> CollisionObject:
 class FixturePlanningScene(Node):
     """Apply the one atomic fixture diff and serve readiness once confirmed."""
 
-    def __init__(self) -> None:
-        super().__init__("tinker_sim_fixture_planning_scene")
+    def __init__(
+        self,
+        *,
+        node_name: str | None = None,
+        context=None,
+        parameter_overrides=None,
+    ) -> None:
+        super().__init__(
+            node_name or "tinker_sim_fixture_planning_scene",
+            context=context,
+            parameter_overrides=parameter_overrides or [],
+        )
+        try:
+            self._initialize()
+        except Exception:
+            # A partially-initialized rclpy Node must be destroyed before
+            # re-raising, otherwise its C++ handle leaks and later GC of the
+            # half-constructed object can crash the process.
+            try:
+                self.destroy_node()
+            except Exception:  # noqa: BLE001 - destroy must never mask the cause
+                pass
+            raise
+
+    def _initialize(self) -> None:
         self.declare_parameter("scenario_file", "")
         self.declare_parameter("heartbeat_period", 0.2)
         self.declare_parameter("start_deadline_s", 60.0)
@@ -138,6 +184,9 @@ class FixturePlanningScene(Node):
         self._existing_ids: tuple[str, ...] = ()
         self._diff_plan = None
         self._scene_ids: tuple[str, ...] = ()
+        self._scene_objects: tuple = ()
+        self._project_root = None
+        self._load_mesh = None
         self._service_group = ReentrantCallbackGroup()
         self._clock = self.get_clock()
 
@@ -190,12 +239,16 @@ class FixturePlanningScene(Node):
         self._target_source_id = str(planning_scene["target_source_id"])
         self._target_handoff = str(planning_scene["target_handoff"])
         self._descriptor_sha256 = fixture_descriptor_sha256(planning_scene)
+        self._project_root = find_project_root(scenario_path)
+        self._load_mesh = (
+            lambda mesh: load_mesh_asset(mesh, project_root=self._project_root)
+        )
 
     # ------------------------------------------------------------------
     # Heartbeat / status
     # ------------------------------------------------------------------
 
-    def _current_status(self) -> Mapping[str, object]:
+    def _current_status(self, *, state: str | None = None) -> Mapping[str, object]:
         return canonical_fixture_status(
             scenario=self._scenario_id,
             revision=self._revision,
@@ -206,7 +259,7 @@ class FixturePlanningScene(Node):
             target_source_id=self._target_source_id,
             target_handoff=self._target_handoff,
             descriptor_sha256=self._descriptor_sha256,
-            state=self._state,
+            state=self._state if state is None else state,
         )
 
     def _publish_heartbeat(self) -> None:
@@ -273,7 +326,12 @@ class FixturePlanningScene(Node):
         collision_objects = getattr(world, "collision_objects", None)
         if collision_objects is None:
             return None
-        return tuple(str(obj.id) for obj in collision_objects)
+        try:
+            return tuple(readback_geometry(obj) for obj in collision_objects)
+        except FixtureContractError as exc:
+            raise FixtureContractError(
+                "malformed readback collision object: {}".format(exc)
+            ) from exc
 
     def _make_get_service(self, state: dict[str, object]):
         def create_client():
@@ -284,7 +342,15 @@ class FixturePlanningScene(Node):
             )
 
         def request(client):
-            return client.srv_type.Request()
+            # Request the world object names AND geometry explicitly; do not rely
+            # on the default components=0 (server-dependent) readback behavior.
+            request = client.srv_type.Request()
+            request.components = PlanningSceneComponents()
+            request.components.components = (
+                PlanningSceneComponents.WORLD_OBJECT_NAMES
+                | PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+            )
+            return request
 
         def reset_client(inner):
             client = inner.get("client")
@@ -377,9 +443,9 @@ class FixturePlanningScene(Node):
             return
         if self._discover_state.get("succeeded"):
             existing = tuple(
-                fixture_id
-                for fixture_id in self._discover_state["result"]
-                if fixture_id.startswith(FIXTURE_NAMESPACE_PREFIX)
+                str(obj["id"])
+                for obj in self._discover_state["result"]
+                if str(obj["id"]).startswith(FIXTURE_NAMESPACE_PREFIX)
             )
             self._existing_ids = existing
             self._diff_plan = build_atomic_revision_diff(
@@ -401,7 +467,9 @@ class FixturePlanningScene(Node):
         request.scene.is_diff = True
         for spec in plan.operations:
             request.scene.world.collision_objects.append(
-                _spec_to_collision_object(spec)
+                _spec_to_collision_object(
+                    spec, mesh_loader=getattr(self, "_load_mesh", None)
+                )
             )
         return request
 
@@ -478,7 +546,8 @@ class FixturePlanningScene(Node):
             self._fail(str(self._readback_state["error"]))
             return
         if self._readback_state.get("succeeded"):
-            self._scene_ids = self._readback_state["result"]
+            self._scene_objects = tuple(self._readback_state["result"])
+            self._scene_ids = tuple(str(obj["id"]) for obj in self._scene_objects)
             self._phase = _PHASE_CONFIRM
 
     # ------------------------------------------------------------------
@@ -486,7 +555,14 @@ class FixturePlanningScene(Node):
     # ------------------------------------------------------------------
 
     def _advance_confirm(self) -> None:
-        status = self._current_status()
+        # The status the node will publish once ready must itself be a fully
+        # self-consistent READY status; confirm it before committing the
+        # transition so a malformed final status can never be served.
+        status = self._current_status(state=FIXTURE_STATE_READY)
+        expected_geometry = {
+            spec.id: spec_geometry(spec, resolve_mesh=self._load_mesh)
+            for spec in self._specs
+        }
         confirmation = confirm_fixture_revision(
             service_result=True,
             scene_ids=self._scene_ids,
@@ -494,6 +570,8 @@ class FixturePlanningScene(Node):
             expected_revision=self._revision,
             expected_digest=self._revision_digest,
             expected_owned_ids=self._owned_ids,
+            expected_geometry=expected_geometry,
+            observed_geometry=self._scene_objects,
         )
         if not confirmation.ready:
             self._fail("fixture readback/status confirmation failed: {}".format(
