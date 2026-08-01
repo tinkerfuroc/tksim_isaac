@@ -204,14 +204,12 @@ def test_bundle_main_end_to_end(tmp_path: Path, capsys) -> None:
 
 
 def test_resolve_simulator_full_urdf_follows_current_json(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "abc123456789def0"
-    artifact_dir.mkdir(parents=True)
-    (artifact_dir / "robot.urdf").write_text("<robot/>", encoding="utf-8")
-    (tmp_path / "artifacts" / "robot" / "tinker2" / "current.json").write_text(
-        json.dumps({"artifact_id": "abc123456789def0"}), encoding="utf-8"
-    )
+    from model_fixtures import write_legacy_current
+
+    artifact_id = "abc123456789def0"
+    urdf = write_legacy_current(tmp_path, artifact_id, b"<robot/>")
     resolved = resolve_simulator_full_urdf(tmp_path)
-    assert resolved == (artifact_dir / "robot.urdf")
+    assert resolved == urdf
 
 
 def test_resolve_simulator_full_urdf_missing_current_json(tmp_path: Path) -> None:
@@ -225,3 +223,14 @@ def test_setup_registers_model_entrypoints() -> None:
     text = setup.read_text(encoding="utf-8")
     assert "model_bundle = tinker_sim_bridge.model_bundle:main" in text
     assert "model_preflight = tinker_sim_bridge.model_preflight:main" in text
+    assert "model_limits = tinker_sim_bridge.model_limits:main" in text
+
+
+def test_build_wrapper_forces_job_cap() -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts/build-humble-overlay"
+    text = script.read_text(encoding="utf-8")
+    # The memory-safety bound must be FORCED, not default-preserving, so a
+    # preset higher MAKEFLAGS cannot escape the -j2 -l2 cap.
+    assert "export MAKEFLAGS=\"-j2 -l2\"" in text
+    assert '${MAKEFLAGS:--j2 -l2}' not in text
+    assert "--parallel-workers 2" in text

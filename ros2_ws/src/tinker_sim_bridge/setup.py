@@ -45,6 +45,7 @@ setup(
             "gripper_facade = tinker_sim_bridge.gripper_facade:main",
             "initial_pose = tinker_sim_bridge.initial_pose:main",
             "model_bundle = tinker_sim_bridge.model_bundle:main",
+            "model_limits = tinker_sim_bridge.model_limits:main",
             "model_preflight = tinker_sim_bridge.model_preflight:main",
             "pan_tilt_facade = tinker_sim_bridge.pan_tilt_facade:main",
             "scenario_runner = tinker_sim_bridge.scenario_runner:main",

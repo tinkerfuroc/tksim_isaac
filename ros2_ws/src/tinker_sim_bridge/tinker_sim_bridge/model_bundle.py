@@ -12,14 +12,14 @@ output directory.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 import yaml
 
+from .current_artifact import resolve_current_artifact as _resolve_current_artifact
 from .model_contract import (
     GROUPS,
     ORDERED_JOINTS,
@@ -161,42 +161,13 @@ def build_manifest(
 def resolve_simulator_full_urdf(project_root: Path | str) -> Path:
     """Resolve the selected canonical Tinker 2 ``robot.urdf`` through current.json.
 
-    Follows the content-addressed selector without pinning any specific
-    artifact hash: reads ``artifacts/robot/tinker2/current.json`` and returns
-    the selected generation's ``robot.urdf`` absolute path.
+    Delegates to the one shared authoritative resolver (see
+    ``tinker_sim_bridge.current_artifact`` and ``tinker_sim_deploy.runtime``)
+    so runtime selection, bundle resolution, and preflight identity all follow
+    the same legacy/schema-4 dispatch.  Never pins any specific artifact hash.
     """
-    root = Path(project_root)
-    if not root.is_absolute():
-        root = root.absolute()
-    artifact_root = root / "artifacts" / "robot" / "tinker2"
-    current_path = artifact_root / "current.json"
-    try:
-        current = json.loads(current_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ModelContractError(
-            "artifact_current", "cannot read current artifact selector {}".format(current_path), field=str(current_path)
-        ) from exc
-    if not isinstance(current, dict):
-        raise ModelContractError("artifact_current", "current.json must contain a JSON object", field=str(current_path))
-    artifact_id = current.get("artifact_id")
-    if (
-        not isinstance(artifact_id, str)
-        or len(artifact_id) < 16
-        or any(char not in "0123456789abcdef" for char in artifact_id)
-    ):
-        raise ModelContractError(
-            "artifact_current",
-            "current.json artifact_id is not a valid content-addressed identity",
-            field=str(current_path),
-        )
-    selected = root / "artifacts" / "robot" / "tinker2" / artifact_id / "robot.urdf"
-    if not selected.is_absolute() or not selected.is_file() or selected.is_symlink():
-        raise ModelContractError(
-            "artifact_current",
-            "selected artifact robot.urdf is not an existing regular file: {}".format(selected),
-            field=str(selected),
-        )
-    return selected
+    resolved = _resolve_current_artifact(Path(project_root))
+    return resolved.artifact_dir / "robot.urdf"
 
 
 def main(argv: Sequence[str] | None = None) -> int:

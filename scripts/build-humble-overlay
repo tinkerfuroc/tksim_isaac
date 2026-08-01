@@ -10,7 +10,8 @@ source "${project_root}/.ros-vendor/humble/local_setup.bash"
 source "${workspace}/install/setup.bash"
 set -u
 cd "${project_root}/ros2_ws"
-# Build memory safety: bound colcon package workers and the compiler job/load.
-export MAKEFLAGS="${MAKEFLAGS:--j2 -l2}"
+# Build memory safety: FORCE the compiler job/load cap to exactly -j2 -l2 and
+# bound colcon package workers; a pre-set higher MAKEFLAGS cannot escape it.
+export MAKEFLAGS="-j2 -l2"
 exec colcon build --symlink-install --parallel-workers 2 \
   --packages-select tinker_sim_interfaces tinker_sim_bridge
