@@ -18,6 +18,7 @@ objects and only inserts the declared ``sim_fixture/*`` geometry.
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -86,6 +87,21 @@ def _pose_from_seven(pose7: Sequence[float]) -> Pose:
         pose7[6],
     )
     return pose
+
+
+def _get_planning_scene_request(client) -> "GetPlanningScene.Request":
+    """Build a GetPlanningScene request asking for the explicit component mask.
+
+    Requests world object names AND geometry (bits 8|16 = 24) so the readback is
+    not dependent on the server's ``components=0`` default behavior.
+    """
+    request = client.srv_type.Request()
+    request.components = PlanningSceneComponents()
+    request.components.components = (
+        PlanningSceneComponents.WORLD_OBJECT_NAMES
+        | PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+    )
+    return request
 
 
 def _spec_to_collision_object(spec, *, mesh_loader=None) -> CollisionObject:
@@ -160,13 +176,21 @@ class FixturePlanningScene(Node):
         self._scenario_file = str(self.get_parameter("scenario_file").value)
         if not self._scenario_file:
             raise ValueError("scenario_file parameter is required")
+        # Initialize the mesh loader slots BEFORE _load_scenario installs the
+        # real resolver/loader; they are never reset afterwards, so a real
+        # schema-valid mesh scenario keeps its loader for the node lifetime.
+        self._project_root = None
+        self._load_mesh = None
         self._load_scenario(self._scenario_file)
 
         period = float(self.get_parameter("heartbeat_period").value)
-        if period <= 0:
-            raise ValueError("heartbeat_period must be positive")
+        if not math.isfinite(period) or period <= 0:
+            raise ValueError("heartbeat_period must be a finite positive number")
         self._heartbeat_period = period
-        self._start_deadline_s = float(self.get_parameter("start_deadline_s").value)
+        start_deadline = float(self.get_parameter("start_deadline_s").value)
+        if not math.isfinite(start_deadline) or start_deadline <= 0:
+            raise ValueError("start_deadline_s must be a finite positive number")
+        self._start_deadline_s = start_deadline
         declared_owned = str(self.get_parameter("required_fixture_owned_ids").value)
         required_owned = parse_required_fixture_owned_ids(declared_owned) if declared_owned else self._owned_ids
         if tuple(required_owned) != self._owned_ids:
@@ -185,8 +209,6 @@ class FixturePlanningScene(Node):
         self._diff_plan = None
         self._scene_ids: tuple[str, ...] = ()
         self._scene_objects: tuple = ()
-        self._project_root = None
-        self._load_mesh = None
         self._service_group = ReentrantCallbackGroup()
         self._clock = self.get_clock()
 
@@ -326,12 +348,25 @@ class FixturePlanningScene(Node):
         collision_objects = getattr(world, "collision_objects", None)
         if collision_objects is None:
             return None
-        try:
-            return tuple(readback_geometry(obj) for obj in collision_objects)
-        except FixtureContractError as exc:
-            raise FixtureContractError(
-                "malformed readback collision object: {}".format(exc)
-            ) from exc
+        # The fixture owns only sim_fixture/*.  Foreign-namespace objects are
+        # outside fixture ownership: preserve their raw id for namespace
+        # isolation/leak checks but do not parse/validate their geometry, so a
+        # malformed foreign object can never block fixture readiness.  A
+        # malformed sim_fixture/* object is still rejected (fail closed).
+        extracted = []
+        for obj in collision_objects:
+            oid = str(getattr(obj, "id", "") or "")
+            if oid.startswith(FIXTURE_NAMESPACE_PREFIX):
+                try:
+                    geometry = readback_geometry(obj)
+                except FixtureContractError as exc:
+                    raise FixtureContractError(
+                        "malformed readback collision object: {}".format(exc)
+                    ) from exc
+                extracted.append((oid, geometry))
+            else:
+                extracted.append((oid, None))
+        return tuple(extracted)
 
     def _make_get_service(self, state: dict[str, object]):
         def create_client():
@@ -342,15 +377,7 @@ class FixturePlanningScene(Node):
             )
 
         def request(client):
-            # Request the world object names AND geometry explicitly; do not rely
-            # on the default components=0 (server-dependent) readback behavior.
-            request = client.srv_type.Request()
-            request.components = PlanningSceneComponents()
-            request.components.components = (
-                PlanningSceneComponents.WORLD_OBJECT_NAMES
-                | PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
-            )
-            return request
+            return _get_planning_scene_request(client)
 
         def reset_client(inner):
             client = inner.get("client")
@@ -443,9 +470,9 @@ class FixturePlanningScene(Node):
             return
         if self._discover_state.get("succeeded"):
             existing = tuple(
-                str(obj["id"])
-                for obj in self._discover_state["result"]
-                if str(obj["id"]).startswith(FIXTURE_NAMESPACE_PREFIX)
+                oid
+                for oid, _geometry in self._discover_state["result"]
+                if oid.startswith(FIXTURE_NAMESPACE_PREFIX)
             )
             self._existing_ids = existing
             self._diff_plan = build_atomic_revision_diff(
@@ -546,8 +573,14 @@ class FixturePlanningScene(Node):
             self._fail(str(self._readback_state["error"]))
             return
         if self._readback_state.get("succeeded"):
-            self._scene_objects = tuple(self._readback_state["result"])
-            self._scene_ids = tuple(str(obj["id"]) for obj in self._scene_objects)
+            self._scene_objects = tuple(
+                geometry
+                for _oid, geometry in self._readback_state["result"]
+                if geometry is not None
+            )
+            self._scene_ids = tuple(
+                oid for oid, _geometry in self._readback_state["result"]
+            )
             self._phase = _PHASE_CONFIRM
 
     # ------------------------------------------------------------------

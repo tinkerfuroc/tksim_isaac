@@ -67,6 +67,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ready service, physics/apply/get clients, timer, clean shutdown, and
   constructor failure paths; a real model-bundle touch-link gate proves the
   provisioned contract's eight touch links equal the exported fixture set.
+- The mesh loader and project root installed by scenario load are preserved for
+  the node lifetime (the post-load reset that erased them is removed), so a real
+  schema-valid mesh scenario applies real geometry; the mesh ready-loop now
+  proves apply/readback/confirm to `FIXTURE_READY` and mesh constructor
+  failures (missing/unsupported/hash-mismatch) fail immediately at
+  construction instead of after a misleading apply timeout.
+- `_get_extract` preserves raw foreign-namespace ids for isolation/leak checks
+  but parses/validates canonical geometry only for `sim_fixture/*` objects, so a
+  malformed foreign object can no longer block fixture readiness; malformed
+  `sim_fixture/*` objects still fail closed.
+- The `GetPlanningScene` component bitmask
+  (`WORLD_OBJECT_NAMES | WORLD_OBJECT_GEOMETRY`) is asserted by tests instead of
+  being left to the server default.
+- `heartbeat_period` and `start_deadline_s` are validated as finite positive
+  during real construction (NaN/Inf/nonpositive rejected rather than hanging
+  phases), and ASCII STL parsing now respects facet boundaries (exactly three
+  finite vertices per facet; vertices outside/unterminated/over-filled facets
+  rejected).
 
 - Integrated eight-joint state contract: `drive_joint` is now state-only
   (`position`/`velocity`/`effort`, zero command interfaces) in both the checked-in

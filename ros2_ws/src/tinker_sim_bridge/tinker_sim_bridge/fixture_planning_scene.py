@@ -277,12 +277,33 @@ def _parse_stl_ascii(data: bytes):
     vertices: list[tuple[float, float, float]] = []
     triangles: list[tuple[int, int, int]] = []
     current: list[tuple[float, float, float]] = []
+    in_facet = False
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         parts = line.split()
-        if parts[0] == "vertex":
+        keyword = parts[0].lower()
+        if keyword == "facet":
+            if in_facet:
+                raise FixtureContractError("STL ASCII has a nested facet")
+            in_facet = True
+            current = []
+        elif keyword == "endfacet":
+            if not in_facet:
+                raise FixtureContractError("STL ASCII endfacet without a facet")
+            if len(current) != 3:
+                raise FixtureContractError(
+                    "STL ASCII facet must contain exactly 3 vertices"
+                )
+            base = len(vertices)
+            vertices.extend(current)
+            triangles.append((base, base + 1, base + 2))
+            current = []
+            in_facet = False
+        elif keyword == "vertex":
+            if not in_facet:
+                raise FixtureContractError("STL ASCII vertex outside a facet")
             if len(parts) < 4:
                 raise FixtureContractError("STL ASCII vertex requires x y z")
             try:
@@ -290,13 +311,12 @@ def _parse_stl_ascii(data: bytes):
             except ValueError as exc:
                 raise FixtureContractError("STL ASCII vertex has non-numeric coordinate") from exc
             current.append(values)
-            if len(current) == 3:
-                base = len(vertices)
-                vertices.extend(current)
-                triangles.append((base, base + 1, base + 2))
-                current = []
-    if current:
-        raise FixtureContractError("STL ASCII has an incomplete triangle")
+        elif keyword == "endsolid":
+            break
+        # 'solid', 'normal', 'outer', 'loop', 'endloop' are structural keywords;
+        # they carry no vertex data and are skipped.
+    if in_facet:
+        raise FixtureContractError("STL ASCII has an unterminated facet")
     return _validate_mesh(vertices, triangles)
 
 
