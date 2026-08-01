@@ -151,6 +151,9 @@ by both the contract tests and the live probe:
   one actual `sensor_msgs/msg/JointState` sample (exact names, cardinality one,
   source `joint_state_broadcaster`, nonzero stamp, finite arrays, bounded
   age/transport).  All times are explicit; no global clock or implicit topic.
+  An epoch-scale header/now difference additionally records a probable
+  `use_sim_time` clock-domain-mismatch reason (without replacing the ordinary
+  stale/transport reasons).
 - `evaluate_integrated_cardinality(*, joint_state_publishers)` — classifies
   publisher cardinality/source from ROS graph endpoint metadata.
 - `evaluate_robot_description_contract(description)` — evaluates the same
@@ -159,6 +162,20 @@ by both the contract tests and the live probe:
 - `evaluate_xacro_contract(xacro_text)` and
   `evaluate_joint_state_evidence_pair(...)` — parse the checked-in xacro source
   and compare source-xacro and live-parameter evidence together.
+- `evaluate_clock_domain(...)` — verifies the probe and controller_manager agree
+  on `use_sim_time` and that an active `/clock` has advanced past zero.
+- `derive_logical_joint_state_publishers(...)` — derives the logical
+  `joint_state_broadcaster` source only when the evidence proves it (a standalone
+  exact-name node, or a controller-manager-hosted publisher with exactly one
+  active controller of that exact name from `list_controllers`); otherwise it
+  preserves the raw label and fails honestly.
+- `evaluate_sample_freshness(...)` — wall-clock watchdog so a later sample
+  loss/staleness produces FAIL.
+- `evaluate_probe_verdict(...)` — fail-closed aggregation seam: sample readiness
+  participates unconditionally, so no sample/stale sample/controller or graph
+  failure after a prior PASS yields FAIL, replacing any latched PASS.
+- `step_service(...)` — bounded, recoverable async ROS service state machine
+  (discovery-pending, in-flight, exception, malformed response, recovery).
 
 Each returns a complete mapping with `ready`, `reasons`, and the observed
 values.  These modules stay import-time ROS-free and run under both simulator
@@ -168,15 +185,23 @@ CPython 3.12 and Humble CPython 3.10.
 
 `joint_state_probe` (`ros2 run tinker_sim_bridge joint_state_probe`) is the
 Task 6 evidence path.  It reads the `/controller_manager` `robot_description`
-parameter, parses the checked-in xacro, subscribes to `/joint_states`, and reads
-`/joint_states` publisher graph metadata, then evaluates all of the above pure
-helpers and publishes compact JSON on `/sim/status/joint_state_contract`
-(latched, reliable).  It never counts source text as primary evidence;
-`source_text_diagnostics` in the report is supplemental only.
+and `use_sim_time` parameters, queries `/controller_manager/list_controllers` to
+prove the publisher source, parses the checked-in xacro, subscribes to
+`/joint_states`, reads `/joint_states` and `/clock` publisher graph metadata, and
+evaluates all of the above pure helpers.  The verdict is fail-closed — no
+sample, stale/no-new sample, clock-domain mismatch, unproven publisher source,
+or any service failure produces FAIL with explicit evidence — and is published
+as compact JSON on `/sim/status/joint_state_contract` (latched, reliable).  It
+never counts source text as primary evidence; `source_text_diagnostics` in the
+report is supplemental only.
+
+The probe must run on the same clock as the controller_manager (sim time):
 
 ```bash
 ros2 run tinker_sim_bridge joint_state_probe \
-  --ros-args -p controller_manager:=/controller_manager -p broadcaster:=joint_state_broadcaster
+  --ros-args -p use_sim_time:=true \
+  -p controller_manager:=/controller_manager \
+  -p broadcaster:=joint_state_broadcaster
 ```
 
 ### Tests
@@ -189,6 +214,12 @@ PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
   tests/test_manipulation_integration_contract.py \
   tests/test_contract_guard.py
 ```
+
+The real selected production artifact is exercised by
+`tests/test_integrated_joint_state_contract.py::test_real_selected_artifact_state_only_drive_joint_contract`
+through the authoritative Task 3 resolver (it skips only when the gitignored
+artifact tree is not provisioned).  Probe-node behavior under the Humble Python
+3.10 runtime is covered by `tests/test_joint_state_probe_node.py`.
 
 ## Deployment gateways
 

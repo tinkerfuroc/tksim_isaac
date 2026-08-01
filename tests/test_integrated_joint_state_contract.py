@@ -18,6 +18,8 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
@@ -25,13 +27,22 @@ sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
 from tinker_sim_bridge.contract_guard import (  # noqa: E402
     INTEGRATED_JOINT_STATE_NAMES,
     JOINT_STATE_BROADCASTER,
+    JOINT_STATE_CLOCK_DOMAIN_THRESHOLD_NS,
+    derive_logical_joint_state_publishers,
+    evaluate_clock_domain,
     evaluate_integrated_cardinality,
     evaluate_joint_state_evidence_pair,
     evaluate_joint_state_sample,
+    evaluate_probe_verdict,
     evaluate_robot_description_contract,
+    evaluate_sample_freshness,
     evaluate_xacro_contract,
+    step_service,
 )
-from tinker_sim_deploy.runtime import topic_control_description  # noqa: E402
+from tinker_sim_deploy.runtime import (  # noqa: E402
+    resolve_current_artifact,
+    topic_control_description,
+)
 from tinker_sim_deploy.workspace import canonicalize_urdf  # noqa: E402
 
 
@@ -135,6 +146,40 @@ def test_topic_control_description_has_exactly_one_state_only_drive_joint() -> N
         "velocity",
         "effort",
     ]
+
+
+def mock_request(client):
+    return client.srv_type.Request()
+
+
+class _FakeFuture:
+    def __init__(self, result=None, done=True):
+        self._result = result
+        self._done = done
+
+    def done(self) -> bool:
+        return self._done
+
+    def result(self):
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+def mock_client(*, ready: bool, result="payload", done: bool = True):
+    """Build a fake ROS service client exposing the step_service contract."""
+    class FakeSrvType:
+        @staticmethod
+        def Request():
+            return object()
+
+    client = type("FakeClient", (), {})()
+    client.service_is_ready = lambda: ready
+    client.srv_type = FakeSrvType
+    client.future = _FakeFuture(result=result, done=done)
+    client.call_async = lambda request: client.future
+    client.destroy = lambda: None
+    return client
 
 
 def test_topic_control_description_keeps_arm_joint_interfaces() -> None:
@@ -448,3 +493,473 @@ def test_joint_state_sample_reports_complete_observed_mapping() -> None:
     assert all(math.isfinite(value) for value in result["observed"]["positions"])
     assert all(math.isfinite(value) for value in result["observed"]["velocities"])
     assert result["observed"]["header_stamp_ns"] != 0
+
+
+# ---------------------------------------------------------------------------
+# Real selected production artifact (must not skip when artifacts are provisioned)
+# ---------------------------------------------------------------------------
+
+
+def test_real_selected_artifact_state_only_drive_joint_contract() -> None:
+    """Feed the actual selected ``robot.urdf`` through the live transformer.
+
+    Resolves ``artifacts/robot/tinker2/current.json`` through the authoritative
+    Task 3 resolver and asserts the exact eight-joint ordering plus the single
+    state-only ``drive_joint``.  Skips only when the gitignored artifact tree is
+    not provisioned in this checkout.
+    """
+    try:
+        resolved = resolve_current_artifact(ROOT)
+    except Exception as exc:  # noqa: BLE001 - artifact tree absent in some checkouts
+        pytest.skip(
+            "real Tinker 2 artifact is not provisioned in this checkout: {}".format(exc)
+        )
+    urdf = resolved.robot_urdf
+    assert urdf
+    description = topic_control_description(urdf)
+    result = evaluate_robot_description_contract(description)
+    assert result["ready"], result["reasons"]
+    assert result["observed"]["ros2_control_joint_names"] == list(
+        INTEGRATED_JOINT_STATE_NAMES
+    )
+    assert result["observed"]["drive_joint"] == {
+        "command_interfaces": [],
+        "state_interfaces": ["position", "velocity", "effort"],
+    }
+    root = ET.fromstring(description)
+    control = root.find("ros2_control")
+    assert control is not None
+    drives = [joint for joint in control.findall("joint") if joint.get("name") == "drive_joint"]
+    assert len(drives) == 1
+    assert [item.get("name") for item in drives[0].findall("command_interface")] == []
+    assert [item.get("name") for item in drives[0].findall("state_interface")] == [
+        "position",
+        "velocity",
+        "effort",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Clock-domain helpers
+# ---------------------------------------------------------------------------
+
+
+def test_clock_domain_ready_for_matching_sim_time() -> None:
+    result = evaluate_clock_domain(
+        local_use_sim_time=True,
+        remote_use_sim_time=True,
+        sim_clock_active=True,
+        clock_now_ns=3_000_000_000,
+    )
+    assert result["ready"] is True, result["reasons"]
+    assert result["observed"]["clock_domain"] == "sim"
+
+
+def test_clock_domain_rejects_wall_vs_sim_mismatch() -> None:
+    result = evaluate_clock_domain(
+        local_use_sim_time=False,
+        remote_use_sim_time=True,
+        sim_clock_active=False,
+        clock_now_ns=1_700_000_000_000_000_000,
+    )
+    assert result["ready"] is False
+    assert any("use_sim_time" in reason for reason in result["reasons"])
+
+
+def test_clock_domain_rejects_unknown_remote() -> None:
+    result = evaluate_clock_domain(
+        local_use_sim_time=True,
+        remote_use_sim_time=None,
+        sim_clock_active=True,
+        clock_now_ns=3_000_000_000,
+    )
+    assert result["ready"] is False
+    assert any("unknown" in reason for reason in result["reasons"])
+
+
+def test_clock_domain_rejects_zero_not_started_sim_clock() -> None:
+    result = evaluate_clock_domain(
+        local_use_sim_time=True,
+        remote_use_sim_time=True,
+        sim_clock_active=True,
+        clock_now_ns=0,
+    )
+    assert result["ready"] is False
+    assert any("past zero" in reason for reason in result["reasons"])
+
+
+def test_clock_domain_rejects_missing_clock_publisher() -> None:
+    result = evaluate_clock_domain(
+        local_use_sim_time=True,
+        remote_use_sim_time=True,
+        sim_clock_active=False,
+        clock_now_ns=3_000_000_000,
+    )
+    assert result["ready"] is False
+    assert any("/clock" in reason for reason in result["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# evaluate_probe_verdict (fail-closed aggregation seam)
+# ---------------------------------------------------------------------------
+
+
+def _verdict(**flags) -> dict[str, object]:
+    defaults = {
+        "sample_ready": True,
+        "sample_reasons": [],
+        "cardinality_ready": True,
+        "attribution_ready": True,
+        "description_ready": True,
+        "xacro_ready": True,
+        "evidence_pair_ready": True,
+        "clock_domain_ready": True,
+    }
+    defaults.update(flags)
+    return evaluate_probe_verdict(**defaults)
+
+
+def test_verdict_no_sample_is_fail() -> None:
+    result = _verdict(sample_ready=False, sample_reasons=["no joint_state sample received yet"])
+    assert result["state"] == "fail"
+    assert any("sample" in reason for reason in result["reasons"])
+
+
+def test_verdict_fresh_valid_sample_is_pass() -> None:
+    result = _verdict()
+    assert result["state"] == "pass"
+    assert result["reasons"] == []
+
+
+def test_verdict_stale_sample_after_prior_pass_is_fail() -> None:
+    result = _verdict(
+        sample_ready=False,
+        sample_reasons=["header stamp is stale by 9000000000 ns (bound 5000000000)"],
+    )
+    assert result["state"] == "fail"
+
+
+def test_verdict_graph_failure_after_prior_pass_is_fail() -> None:
+    result = _verdict(cardinality_ready=False)
+    assert result["state"] == "fail"
+    assert any("cardinality" in reason for reason in result["reasons"])
+
+
+def test_verdict_attribution_failure_is_fail() -> None:
+    result = _verdict(attribution_ready=False)
+    assert result["state"] == "fail"
+    assert any("attribution" in reason for reason in result["reasons"])
+
+
+def test_verdict_clock_domain_failure_is_fail() -> None:
+    result = _verdict(clock_domain_ready=False)
+    assert result["state"] == "fail"
+    assert any("clock" in reason for reason in result["reasons"])
+
+
+def test_verdict_reports_observed_flags() -> None:
+    result = _verdict(sample_ready=False)
+    assert result["observed"]["sample_ready"] is False
+    assert result["observed"]["cardinality_ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# evaluate_sample_freshness (watchdog)
+# ---------------------------------------------------------------------------
+
+
+def test_freshness_ready_for_recent_sample() -> None:
+    result = evaluate_sample_freshness(
+        sample_present=True, wall_age_s=1.0, wall_watchdog_s=15.0
+    )
+    assert result["ready"] is True, result["reasons"]
+
+
+def test_freshness_rejects_missing_sample() -> None:
+    result = evaluate_sample_freshness(
+        sample_present=False, wall_age_s=None, wall_watchdog_s=15.0
+    )
+    assert result["ready"] is False
+    assert any("no joint_state sample" in reason for reason in result["reasons"])
+
+
+def test_freshness_rejects_stalled_sample_after_prior_sample() -> None:
+    result = evaluate_sample_freshness(
+        sample_present=True, wall_age_s=30.0, wall_watchdog_s=15.0
+    )
+    assert result["ready"] is False
+    assert any("no new joint_state sample" in reason for reason in result["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# evaluate_joint_state_sample clock-domain mismatch diagnostic
+# ---------------------------------------------------------------------------
+
+
+def test_sample_reports_epoch_scale_clock_domain_mismatch() -> None:
+    result = _ready_sample(
+        header_stamp_ns=500_000_000,
+        now_ns=1_700_000_000_000_000_000,
+        received_at_ns=1_700_000_000_000_000_000,
+    )
+    assert result["ready"] is False
+    assert any("clock-domain mismatch" in reason for reason in result["reasons"])
+    assert any("stale" in reason for reason in result["reasons"])
+    assert any("transport latency" in reason for reason in result["reasons"])
+    assert abs(result["observed"]["age_ns"]) > JOINT_STATE_CLOCK_DOMAIN_THRESHOLD_NS
+
+
+# ---------------------------------------------------------------------------
+# derive_logical_joint_state_publishers (proven attribution)
+# ---------------------------------------------------------------------------
+
+
+def test_attribution_controller_manager_hosted_active_broadcaster() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/controller_manager"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[("joint_state_broadcaster", "active")],
+    )
+    assert labels == ["joint_state_broadcaster"]
+    assert reasons == []
+
+
+def test_attribution_standalone_exact_broadcaster() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/joint_state_broadcaster"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[],
+    )
+    assert labels == ["joint_state_broadcaster"]
+    assert reasons == []
+
+
+def test_attribution_missing_broadcaster_controller() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/controller_manager"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[],
+    )
+    assert labels == ["/controller_manager"]
+    assert any("cannot be attributed" in reason for reason in reasons)
+
+
+def test_attribution_inactive_broadcaster_controller() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/controller_manager"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[("joint_state_broadcaster", "inactive")],
+    )
+    assert labels == ["/controller_manager"]
+    assert any("cannot be attributed" in reason for reason in reasons)
+
+
+def test_attribution_renamed_broadcaster_controller() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/controller_manager"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[("joint_state_broadcaster2", "active")],
+    )
+    assert labels == ["/controller_manager"]
+    assert any("cannot be attributed" in reason for reason in reasons)
+
+
+def test_attribution_duplicate_broadcaster_controllers() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/controller_manager"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[
+            ("joint_state_broadcaster", "active"),
+            ("joint_state_broadcaster", "active"),
+        ],
+    )
+    assert labels == ["/controller_manager"]
+    assert any("cannot be attributed" in reason for reason in reasons)
+
+
+def test_attribution_namespaced_node_not_converted() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/some_ns/joint_state_broadcaster"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[],
+    )
+    assert labels == ["/some_ns/joint_state_broadcaster"]
+    assert reasons == []
+
+
+def test_attribution_multiple_raw_publishers_preserved() -> None:
+    labels, reasons = derive_logical_joint_state_publishers(
+        raw_labels=["/controller_manager", "/other"],
+        controller_manager="controller_manager",
+        broadcaster_controller="joint_state_broadcaster",
+        controller_entries=[("joint_state_broadcaster", "active")],
+    )
+    assert labels == ["joint_state_broadcaster", "/other"]
+    assert reasons == []
+
+
+# ---------------------------------------------------------------------------
+# step_service (bounded, recoverable async service state machine)
+# ---------------------------------------------------------------------------
+
+
+def _make_service_state() -> dict[str, object]:
+    return {
+        "client": None,
+        "future": None,
+        "error": None,
+        "pending": None,
+        "succeeded": False,
+        "result": None,
+    }
+
+
+def test_step_service_success_path() -> None:
+    state = _make_service_state()
+    client = mock_client(ready=True)
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=lambda response: {"ok": response} if response == "payload" else None,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    # First call discovers service and issues request.
+    assert state["pending"] is None
+    assert state["future"] is client.future
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=lambda response: {"ok": response} if response == "payload" else None,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    assert state["succeeded"] is True
+    assert state["result"] == {"ok": "payload"}
+
+
+def test_step_service_service_not_ready_pending() -> None:
+    state = _make_service_state()
+    client = mock_client(ready=False)
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=lambda response: response,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    assert state["succeeded"] is False
+    assert state["pending"] == "service not ready"
+
+
+def test_step_service_in_flight_pending() -> None:
+    state = _make_service_state()
+    client = mock_client(ready=True, done=False)
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=lambda response: response,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=lambda response: response,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    assert state["succeeded"] is False
+    assert state["pending"] == "request in flight"
+
+
+def test_step_service_exception_recovers_and_succeeds() -> None:
+    state = _make_service_state()
+    first = mock_client(ready=True, result=RuntimeError("boom"))
+    second = mock_client(ready=True, result="payload")
+    sequence = iter([first, second])
+
+    def create():
+        return next(sequence)
+
+    def extract(response):
+        return response
+
+    reset_client = lambda s: s.update(client=None, future=None)
+    step_service(state, create_client=create, request=lambda c: mock_request(c), extract=extract, reset_client=reset_client)
+    step_service(state, create_client=create, request=lambda c: mock_request(c), extract=extract, reset_client=reset_client)
+    assert state["succeeded"] is False
+    assert "service call failed" in str(state["error"])
+    # Recovery on the next client.
+    step_service(state, create_client=create, request=lambda c: mock_request(c), extract=extract, reset_client=reset_client)
+    step_service(state, create_client=create, request=lambda c: mock_request(c), extract=extract, reset_client=reset_client)
+    assert state["succeeded"] is True
+    assert state["result"] == "payload"
+
+
+def test_step_service_malformed_response_recovers() -> None:
+    state = _make_service_state()
+    client = mock_client(ready=True, result="malformed")
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=lambda response: None if response == "malformed" else response,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=lambda response: None if response == "malformed" else response,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    assert state["succeeded"] is False
+    assert "no usable response" in str(state["error"])
+
+
+def test_step_service_repeated_failures_never_raise() -> None:
+    state = _make_service_state()
+    for _ in range(50):
+        client = mock_client(ready=True, result=RuntimeError("flaky"))
+        step_service(
+            state,
+            create_client=lambda: client,
+            request=lambda c: mock_request(c),
+            extract=lambda response: response,
+            reset_client=lambda s: s.update(client=None, future=None),
+        )
+    assert state["succeeded"] is False
+    assert "service call failed" in str(state["error"])
+
+
+def test_step_service_extract_never_crashes_callback() -> None:
+    state = _make_service_state()
+
+    def bad_extract(_response):
+        raise ValueError("parse error")
+
+    client = mock_client(ready=True, result="anything")
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=bad_extract,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    step_service(
+        state,
+        create_client=lambda: client,
+        request=lambda c: mock_request(c),
+        extract=bad_extract,
+        reset_client=lambda s: s.update(client=None, future=None),
+    )
+    assert state["succeeded"] is False
+    assert "malformed" in str(state["error"])

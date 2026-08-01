@@ -274,6 +274,10 @@ INTEGRATED_JOINT_STATE_NAMES = tuple(f"joint{index}" for index in range(1, 8)) +
 JOINT_STATE_BROADCASTER = "joint_state_broadcaster"
 JOINT_STATE_MAX_AGE_NS = 5_000_000_000
 JOINT_STATE_MAX_TRANSPORT_NS = 2_000_000_000
+# An epoch-scale difference (≳ 11.6 days) cannot be ordinary latency; it is the
+# signature of a wall-clock-vs-sim-clock domain mismatch.
+JOINT_STATE_CLOCK_DOMAIN_THRESHOLD_NS = 1_000_000_000_000_000
+JOINT_STATE_DEFAULT_WATCHDOG_S = 15.0
 _EXPECTED_ARM_COMMAND_INTERFACES = ("position", "velocity")
 _EXPECTED_ARM_STATE_INTERFACES = ("position", "velocity", "effort")
 _EXPECTED_DRIVE_STATE_INTERFACES = ("position", "velocity", "effort")
@@ -385,6 +389,13 @@ def evaluate_joint_state_sample(
             "transport latency {} ns exceeds bound {}".format(
                 transport_ns, JOINT_STATE_MAX_TRANSPORT_NS
             )
+        )
+    if abs(age_ns) > JOINT_STATE_CLOCK_DOMAIN_THRESHOLD_NS:
+        # Additional, non-replacing diagnostic: an epoch-scale difference is a
+        # probable wall-vs-sim clock-domain mismatch, not ordinary staleness.
+        reasons.append(
+            "header and evaluation clock differ by {} ns; probable use_sim_time "
+            "clock-domain mismatch".format(age_ns)
         )
     return {
         "ready": not reasons,
@@ -596,6 +607,256 @@ def evaluate_joint_state_evidence_pair(
             "description_drive_joint": description_drive,
         },
     }
+
+
+def evaluate_sample_freshness(
+    *,
+    sample_present: bool,
+    wall_age_s: float | None,
+    wall_watchdog_s: float,
+) -> dict[str, object]:
+    """Classify sample presence and wall-clock freshness.
+
+    ``wall_age_s`` is the wall-clock age of the most recent sample (``None`` when
+    no sample exists).  A missing sample, or a later wall-clock gap beyond the
+    watchdog, is a fail-closed condition: the probe must not affirm a healthy
+    ``/joint_states`` endpoint on evidence that stopped arriving.
+    """
+    reasons: list[str] = []
+    if not sample_present:
+        reasons.append("no joint_state sample received yet")
+    elif wall_age_s is None or wall_age_s > wall_watchdog_s:
+        reasons.append(
+            "no new joint_state sample for {:.1f} s (watchdog {:.1f} s)".format(
+                wall_age_s if wall_age_s is not None else float("inf"),
+                wall_watchdog_s,
+            )
+        )
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "observed": {
+            "sample_present": bool(sample_present),
+            "wall_age_s": wall_age_s,
+            "wall_watchdog_s": wall_watchdog_s,
+        },
+    }
+
+
+def evaluate_clock_domain(
+    *,
+    local_use_sim_time: bool,
+    remote_use_sim_time: bool | None,
+    sim_clock_active: bool,
+    clock_now_ns: int,
+) -> dict[str, object]:
+    """Classify probe/controller clock-domain agreement and sim-clock readiness.
+
+    The probe and the controller_manager must agree on ``use_sim_time``; when
+    running on the sim clock the probe additionally requires an active ``/clock``
+    that has advanced past zero.  A mismatch is a typed FAIL with a probable
+    ``use_sim_time`` explanation rather than a bare stale/transport verdict.
+    """
+    reasons: list[str] = []
+    if remote_use_sim_time is None:
+        reasons.append("controller_manager use_sim_time parameter is unknown")
+    elif local_use_sim_time != remote_use_sim_time:
+        reasons.append(
+            "probe use_sim_time={} does not match controller_manager use_sim_time={} "
+            "(probable use_sim_time clock-domain mismatch)".format(
+                local_use_sim_time, remote_use_sim_time
+            )
+        )
+    if not local_use_sim_time:
+        reasons.append("probe is not running on the sim clock (use_sim_time=false)")
+    elif not sim_clock_active:
+        reasons.append("use_sim_time=true but /clock is not published")
+    elif clock_now_ns <= 0:
+        reasons.append("sim clock is active but has not advanced past zero")
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "observed": {
+            "local_use_sim_time": bool(local_use_sim_time),
+            "remote_use_sim_time": remote_use_sim_time,
+            "sim_clock_active": bool(sim_clock_active),
+            "clock_now_ns": clock_now_ns,
+            "clock_domain": "sim" if local_use_sim_time else "wall",
+        },
+    }
+
+
+def _standalone_broadcaster_label(label: str, broadcaster: str) -> str | None:
+    """Return the normalized broadcaster label for a standalone broadcaster node.
+
+    A raw label is the standalone broadcaster only when its name is exactly
+    *broadcaster* at the root namespace (``/joint_state_broadcaster`` or the
+    bare ``joint_state_broadcaster``).  A namespaced node such as
+    ``/ns/joint_state_broadcaster`` is a different node and is not converted.
+    """
+    stripped = label.strip("/")
+    if stripped == broadcaster and "/" not in stripped:
+        return stripped
+    return None
+
+
+def derive_logical_joint_state_publishers(
+    *,
+    raw_labels: Sequence[str],
+    controller_manager: str,
+    broadcaster_controller: str,
+    controller_entries: Sequence[tuple[str, str]],
+) -> tuple[list[str], list[str]]:
+    """Derive logical ``/joint_states`` publisher labels from graph + controller evidence.
+
+    *controller_entries* is the ordered ``(name, state)`` list reported by
+    ``controller_manager/list_controllers`` (duplicates preserved).  A raw
+    publisher is labeled *broadcaster_controller* only when the evidence proves
+    that exact controller is the source:
+
+    - a standalone node named exactly *broadcaster_controller*, or
+    - a controller-manager-hosted publisher with exactly one controller named
+      *broadcaster_controller* in the ``active`` state.
+
+    Otherwise the raw label is preserved and a reason records the attribution
+    gap, so the caller fails honestly instead of relabeling an arbitrary
+    controller-manager publisher.
+    """
+    reasons: list[str] = []
+    logical: list[str] = []
+    manager = "/" + controller_manager.strip("/")
+    matching = [
+        state for name, state in controller_entries if name == broadcaster_controller
+    ]
+    for label in raw_labels:
+        standalone = _standalone_broadcaster_label(label, broadcaster_controller)
+        if standalone is not None:
+            logical.append(standalone)
+            continue
+        if label == manager:
+            if len(matching) == 1 and matching[0] == "active":
+                logical.append(broadcaster_controller)
+                continue
+            reasons.append(
+                "controller-manager-hosted publisher cannot be attributed to "
+                "broadcaster controller {!r}: need exactly one active controller "
+                "of that exact name, found {!r}".format(broadcaster_controller, matching)
+            )
+        logical.append(label)
+    return logical, reasons
+
+
+def evaluate_probe_verdict(
+    *,
+    sample_ready: bool,
+    sample_reasons: Sequence[str],
+    cardinality_ready: bool,
+    attribution_ready: bool,
+    description_ready: bool,
+    xacro_ready: bool,
+    evidence_pair_ready: bool,
+    clock_domain_ready: bool,
+) -> dict[str, object]:
+    """Aggregate probe evidence into a single fail-closed verdict.
+
+    Sample readiness participates unconditionally: no sample, stale sample,
+    malformed sample, or later loss/staleness produces FAIL with explicit
+    evidence.  Because every evaluation tick recomputes the verdict from current
+    inputs, a latched old PASS is replaced by the current failure status.
+    """
+    reasons: list[str] = []
+    if not sample_ready:
+        if sample_reasons:
+            reasons.extend("sample: {}".format(reason) for reason in sample_reasons)
+        else:
+            reasons.append("sample: no joint_state evidence")
+    if not cardinality_ready:
+        reasons.append("publisher cardinality not ready")
+    if not attribution_ready:
+        reasons.append("publisher attribution not ready")
+    if not description_ready:
+        reasons.append("controller_manager robot_description contract not ready")
+    if not xacro_ready:
+        reasons.append("checked-in xacro drive_joint contract not ready")
+    if not evidence_pair_ready:
+        reasons.append("checked-in xacro and live robot_description evidence differ")
+    if not clock_domain_ready:
+        reasons.append("clock domain evidence not ready")
+    return {
+        "state": "pass" if not reasons else "fail",
+        "ready": not reasons,
+        "reasons": reasons,
+        "observed": {
+            "sample_ready": bool(sample_ready),
+            "cardinality_ready": bool(cardinality_ready),
+            "attribution_ready": bool(attribution_ready),
+            "description_ready": bool(description_ready),
+            "xacro_ready": bool(xacro_ready),
+            "evidence_pair_ready": bool(evidence_pair_ready),
+            "clock_domain_ready": bool(clock_domain_ready),
+        },
+    }
+
+
+def step_service(
+    state: dict[str, object],
+    *,
+    create_client,
+    request,
+    extract,
+    reset_client,
+) -> dict[str, object]:
+    """Advance one bounded, recoverable async ROS service request.
+
+    *state* carries ``client``, ``future``, ``error``, ``pending``,
+    ``succeeded``, and ``result`` keys and is mutated in place (the same dict is
+    returned for convenience).  The step never raises: discovery-pending and
+    in-flight requests leave the state unchanged (the caller publishes FAIL that
+    tick), while a completed-with-exception or malformed response records an
+    error, resets the client via *reset_client*, and retries on the next step.
+    A successful *extract* marks the request succeeded with its result.
+    """
+    if state.get("succeeded"):
+        return state
+    client = state.get("client")
+    if client is None:
+        client = create_client()
+        state["client"] = client
+        state["future"] = None
+    future = state.get("future")
+    if future is None:
+        if not client.service_is_ready():
+            state["pending"] = "service not ready"
+            return state
+        state["pending"] = None
+        state["future"] = client.call_async(request(client))
+        return state
+    if not future.done():
+        state["pending"] = "request in flight"
+        return state
+    state["pending"] = None
+    try:
+        response = future.result()
+    except Exception as exc:  # noqa: BLE001 - transient service failures must recover
+        state["error"] = "service call failed: {}".format(exc)
+        state["future"] = None
+        reset_client(state)
+        return state
+    state["future"] = None
+    try:
+        result = extract(response)
+    except Exception as exc:  # noqa: BLE001 - malformed responses must not crash
+        state["error"] = "service response is malformed: {}".format(exc)
+        reset_client(state)
+        return state
+    if result is None:
+        state["error"] = "service returned no usable response"
+        reset_client(state)
+        return state
+    state["error"] = None
+    state["succeeded"] = True
+    state["result"] = result
+    return state
 
 
 def _endpoint_label(info: object) -> str:
