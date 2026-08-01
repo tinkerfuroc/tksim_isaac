@@ -12,6 +12,9 @@ _FIXTURE_PREFIX = "sim_fixture/"
 _TARGET_HANDOFF = "pick_and_place/object_mesh"
 _HEX64 = re.compile(r"^(?!0{64}$)[0-9a-f]{64}$")
 _PRIMITIVE_TYPES = {"box", "cylinder", "sphere"}
+# Mesh fixture formats the adapter can parse deterministically.  Any other
+# extension is rejected during scenario validation (no silently-empty meshes).
+_SUPPORTED_MESH_EXTENSIONS = (".stl", ".obj")
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,24 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
+def _find_project_root(path: Path) -> Path:
+    """Return the source-tree project root owning a scenario file.
+
+    Mesh asset ``uri`` values are project-root-relative (e.g.
+    ``simulation/assets/table.stl``); the root is the nearest ancestor holding a
+    ``simulation/scenarios`` directory, falling back to the scenario's own
+    parent directory.
+    """
+    resolved = Path(path).resolve()
+    cursor = resolved.parent
+    while True:
+        if (cursor / "simulation" / "scenarios").is_dir():
+            return cursor
+        if cursor == cursor.parent:
+            return resolved.parent
+        cursor = cursor.parent
+
+
 def _planning_scene_digest(planning_scene: Mapping[str, Any]) -> str:
     payload = {key: value for key, value in planning_scene.items() if key != "revision_digest"}
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
@@ -123,7 +144,7 @@ def _validate_fixture_pose(record: Mapping[str, Any], path: Path, fixture_id: st
     _finite_numbers(pose.get("quaternion_xyzw", [0.0, 0.0, 0.0, 1.0]), 4, f"{fixture_id}.pose.quaternion_xyzw")
 
 
-def _validate_fixture_shape(record: Mapping[str, Any], path: Path, fixture_id: str) -> None:
+def _validate_fixture_shape(record: Mapping[str, Any], path: Path, fixture_id: str, project_root: Path) -> None:
     has_primitive = "primitive" in record
     has_mesh = "mesh" in record
     if has_primitive == has_mesh:
@@ -152,6 +173,21 @@ def _validate_fixture_shape(record: Mapping[str, Any], path: Path, fixture_id: s
             scale = _finite_numbers(mesh.get("scale"), 3, f"{fixture_id}.mesh.scale")
             if any(value <= 0 for value in scale):
                 raise ValueError(f"{path}: fixture {fixture_id} mesh scale must be positive")
+        # The mesh asset must exist and its content must match the declaration.
+        candidate = Path(uri)
+        if not candidate.is_absolute():
+            candidate = project_root / uri
+        if not candidate.is_file():
+            raise ValueError(f"{path}: fixture {fixture_id} mesh asset not found: {candidate}")
+        extension = candidate.suffix.lower()
+        if extension not in _SUPPORTED_MESH_EXTENSIONS:
+            raise ValueError(
+                f"{path}: fixture {fixture_id} mesh format {extension!r} is not supported "
+                f"(supported: {', '.join(_SUPPORTED_MESH_EXTENSIONS)})"
+            )
+        actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        if actual != digest:
+            raise ValueError(f"{path}: fixture {fixture_id} mesh sha256 mismatch")
 
 
 def _validate_planning_scene(planning_scene: Mapping[str, Any], path: Path) -> None:
@@ -180,6 +216,7 @@ def _validate_planning_scene(planning_scene: Mapping[str, Any], path: Path) -> N
     if not isinstance(diagnostics, list):
         raise ValueError(f"{path}: planning_scene.diagnostic_objects must be an array")
 
+    project_root = _find_project_root(path)
     fixture_ids: list[str] = []
     for record in [*objects, *diagnostics]:
         if not isinstance(record, dict):
@@ -189,11 +226,21 @@ def _validate_planning_scene(planning_scene: Mapping[str, Any], path: Path) -> N
             raise ValueError(f"{path}: fixture id must be prefixed {_FIXTURE_PREFIX!r}")
         fixture_ids.append(fixture_id)
         _validate_fixture_pose(record, path, fixture_id)
-        _validate_fixture_shape(record, path, fixture_id)
+        _validate_fixture_shape(record, path, fixture_id, project_root)
     if len(fixture_ids) != len(set(fixture_ids)):
         raise ValueError(f"{path}: sim_fixture ids must be unique")
-    if target_source_id not in fixture_ids:
-        raise ValueError(f"{path}: planning_scene.target_source_id must name a declared fixture id")
+    # target_source_id must name an object that actually enters the
+    # collision-body/owned set: a public object or a diagnostic explicitly
+    # marked enter_collision_bodies: true (never a diagnostic excluded from it).
+    collision_body_ids: list[str] = [str(record["id"]) for record in objects]
+    for record in diagnostics:
+        if record.get("enter_collision_bodies") is True:
+            collision_body_ids.append(str(record["id"]))
+    if target_source_id not in collision_body_ids:
+        raise ValueError(
+            f"{path}: planning_scene.target_source_id must name a fixture that "
+            "enters the collision-body set"
+        )
 
     for record in diagnostics:
         if "enter_collision_bodies" not in record:

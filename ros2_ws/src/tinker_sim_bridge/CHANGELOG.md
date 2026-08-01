@@ -41,6 +41,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   planning-scene scenario compilation test in
   `tests/test_scenario_runner.py`.
 
+### Changed
+
+- Fixture readback now proves geometry, not just IDs: `_get_extract` preserves
+  full `CollisionObject` payloads and the `GetPlanningScene` request explicitly
+  requests `WORLD_OBJECT_NAMES | WORLD_OBJECT_GEOMETRY`; the node compares the
+  readback geometry (frame, poses, primitive type/dimensions, mesh
+  vertices/triangles) against the declared fixture before serving ready, and
+  rejects duplicate `sim_fixture/*` ids.
+- Mesh-declared fixtures are no longer applied as empty `Mesh()` payloads: a
+  narrow ROS-free stdlib STL (binary/ASCII) and OBJ parser
+  (`parse_mesh_bytes`), asset resolution + SHA-256 verification + scale
+  application (`load_mesh_asset`), and real `shape_msgs/Mesh` emission are
+  implemented; only `.stl`/`.obj` extensions are supported and any other
+  extension is rejected at scenario validation.
+- `MODEL_CONTRACT_TOUCH_LINKS` is now imported from the validated Task 3
+  `model_contract.TOUCH_LINKS` (single authoritative source) instead of an
+  independent literal.
+- Scenario validation requires mesh assets to exist with content SHA-256
+  matching the declaration and requires `target_source_id` to name a fixture
+  that enters the collision-body/owned set (a diagnostic with
+  `enter_collision_bodies=false` is rejected).
+- Real `FixturePlanningScene` constructor tests run under Humble in an isolated
+  ROS domain/context and verify scenario load, owned-id guard, publisher QoS,
+  ready service, physics/apply/get clients, timer, clean shutdown, and
+  constructor failure paths; a real model-bundle touch-link gate proves the
+  provisioned contract's eight touch links equal the exported fixture set.
+
 - Integrated eight-joint state contract: `drive_joint` is now state-only
   (`position`/`velocity`/`effort`, zero command interfaces) in both the checked-in
   `config/tinker_topic_control.ros2_control.xacro` and the live controller

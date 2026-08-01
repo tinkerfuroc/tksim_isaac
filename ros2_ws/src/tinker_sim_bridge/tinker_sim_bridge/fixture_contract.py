@@ -18,8 +18,11 @@ import hashlib
 import json
 import math
 import re
+import struct
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
+
+from .model_contract import TOUCH_LINKS as MODEL_CONTRACT_TOUCH_LINKS
 
 FIXTURE_NAMESPACE_PREFIX = "sim_fixture/"
 FIXTURE_OWNER = "sim_fixture"
@@ -37,19 +40,16 @@ FIXTURE_STATE_FAILED = "FIXTURE_FAILED"
 
 _HEX64 = re.compile(r"^(?!0{64}$)[0-9a-f]{64}$")
 
-# touch links are supplied by the validated model contract; the fixture adapter
-# never owns task objects.  The downstream hardening reconciler receives the
-# full SRDF-derived eight-link touch set.
-MODEL_CONTRACT_TOUCH_LINKS = (
-    "xarm_gripper_base_link",
-    "left_outer_knuckle",
-    "left_finger",
-    "left_inner_knuckle",
-    "right_inner_knuckle",
-    "right_outer_knuckle",
-    "right_finger",
-    "link_tcp",
-)
+# The touch-link set is supplied by the validated model contract
+# (``model_contract.TOUCH_LINKS``); the fixture adapter never owns task objects.
+# The downstream hardening reconciler receives the full SRDF-derived eight-link
+# touch set through this single authoritative source.
+
+# Canonical geometry precision: coordinates/dimensions are rounded to this many
+# decimal places so the wire float32 mesh representation and the float64
+# declaration normalize to the same deterministic signature.
+_GEOM_PRECISION = 6
+_SOLID_PRIMITIVE_NAME = {1: "box", 2: "sphere", 3: "cylinder"}
 
 
 class FixtureContractError(ValueError):
@@ -66,6 +66,217 @@ def canonical_json(value: Any) -> bytes:
 def sha256_json(value: Any) -> str:
     """Return the lowercase SHA-256 of the canonical JSON bytes of *value*."""
     return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def _quant(value: Any) -> float:
+    """Round a finite number to the canonical geometry precision."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FixtureContractError("geometry value must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise FixtureContractError("geometry value must be finite")
+    return round(number, _GEOM_PRECISION)
+
+
+def _float32(value: Any) -> float:
+    """Return the float32 wire round-trip of a number.
+
+    ``shape_msgs/Mesh`` vertices serialize as ``float32``; the declaration side
+    parses STL/OBJ text as ``float64``.  Quantizing the declaration through the
+    same ``float32`` wire representation keeps the canonical geometry descriptor
+    byte-identical to the readback for exact signature comparison.
+    """
+    return float(struct.unpack("<f", struct.pack("<f", float(value)))[0])
+
+
+def _pose_spec(pose: Sequence[float]) -> list[float]:
+    """Canonical ``(x, y, z, qx, qy, qz, qw)`` descriptor for a spec pose."""
+    values = [_quant(value) for value in pose]
+    if len(values) != 7:
+        raise FixtureContractError("spec pose must contain exactly 7 values")
+    return values
+
+
+def _pose_readback(pose) -> list[float]:
+    """Canonical ``(x, y, z, qx, qy, qz, qw)`` descriptor for a readback pose."""
+    position = getattr(pose, "position", None)
+    orientation = getattr(pose, "orientation", None)
+    values = [
+        _quant(getattr(position, "x", 0.0)) if position is not None else 0.0,
+        _quant(getattr(position, "y", 0.0)) if position is not None else 0.0,
+        _quant(getattr(position, "z", 0.0)) if position is not None else 0.0,
+        _quant(getattr(orientation, "x", 0.0)) if orientation is not None else 0.0,
+        _quant(getattr(orientation, "y", 0.0)) if orientation is not None else 0.0,
+        _quant(getattr(orientation, "z", 0.0)) if orientation is not None else 0.0,
+        _quant(getattr(orientation, "w", 0.0)) if orientation is not None else 0.0,
+    ]
+    return values
+
+
+def spec_geometry(
+    spec: "CollisionObjectSpec", *, resolve_mesh=None
+) -> Mapping[str, object]:
+    """Return the canonical ROS-free geometry descriptor for a desired spec.
+
+    The descriptor covers the object id, frame, primitive type+dimensions and
+    poses, and (for mesh fixtures) the resolved vertices+triangles with scale
+    applied.  Mesh resolution requires *resolve_mesh* (a callable mapping a
+    ``{"uri", "sha256", "scale"}`` declaration to ``(vertices, triangles)``).
+    """
+    primitives = [
+        {
+            "type": str(primitive["type"]),
+            "dimensions": [_quant(value) for value in primitive["dimensions"]],
+        }
+        for primitive in spec.primitives
+    ]
+    meshes: list[dict[str, object]] = []
+    for mesh in spec.meshes:
+        if resolve_mesh is None:
+            raise FixtureContractError(
+                "mesh geometry requires a mesh resolver for spec {!r}".format(spec.id)
+            )
+        vertices, triangles = resolve_mesh(mesh)
+        meshes.append(
+            {
+                "vertices": [
+                    [_quant(_float32(coord)) for coord in vertex] for vertex in vertices
+                ],
+                "triangles": [
+                    [int(index) for index in triangle] for triangle in triangles
+                ],
+            }
+        )
+    return {
+        "id": spec.id,
+        "frame_id": spec.frame_id,
+        "primitives": primitives,
+        "primitive_poses": [_pose_spec(pose) for pose in spec.primitive_poses],
+        "meshes": meshes,
+        "mesh_poses": [_pose_spec(pose) for pose in spec.mesh_poses],
+    }
+
+
+def readback_geometry(obj) -> Mapping[str, object]:
+    """Return the canonical ROS-free geometry descriptor for a readback object.
+
+    *obj* is a ``moveit_msgs/CollisionObject`` message; the function reads only
+    attributes (id, header.frame_id, primitives, primitive_poses, meshes,
+    mesh_poses) so this module stays import-time ROS-free.
+    """
+    oid = str(getattr(obj, "id", ""))
+    if not oid:
+        raise FixtureContractError("readback collision object has an empty id")
+    frame_id = str(getattr(getattr(obj, "header", None), "frame_id", ""))
+    if not frame_id:
+        raise FixtureContractError(
+            "readback collision object {!r} has an empty frame_id".format(oid)
+        )
+    primitives: list[dict[str, object]] = []
+    for primitive in getattr(obj, "primitives", ()) or ():
+        primitive_type = int(getattr(primitive, "type", -1))
+        primitives.append(
+            {
+                "type": _SOLID_PRIMITIVE_NAME.get(primitive_type, primitive_type),
+                "dimensions": [
+                    _quant(value)
+                    for value in getattr(primitive, "dimensions", ()) or ()
+                ],
+            }
+        )
+    meshes: list[dict[str, object]] = []
+    for mesh in getattr(obj, "meshes", ()) or ():
+        vertices = [
+            [
+                _quant(getattr(vertex, "x", 0.0)),
+                _quant(getattr(vertex, "y", 0.0)),
+                _quant(getattr(vertex, "z", 0.0)),
+            ]
+            for vertex in getattr(mesh, "vertices", ()) or ()
+        ]
+        triangles = [
+            [
+                int(index)
+                for index in (
+                    getattr(triangle, "vertex_indices", ())
+                    if getattr(triangle, "vertex_indices", None) is not None
+                    else ()
+                )
+            ]
+            for triangle in getattr(mesh, "triangles", ()) or ()
+        ]
+        meshes.append({"vertices": vertices, "triangles": triangles})
+    return {
+        "id": oid,
+        "frame_id": frame_id,
+        "primitives": primitives,
+        "primitive_poses": [
+            _pose_readback(pose)
+            for pose in getattr(obj, "primitive_poses", ()) or ()
+        ],
+        "meshes": meshes,
+        "mesh_poses": [
+            _pose_readback(pose) for pose in getattr(obj, "mesh_poses", ()) or ()
+        ],
+    }
+
+
+def geometry_signature_sha256(objects: Sequence[Mapping[str, object]]) -> str:
+    """Return the SHA-256 of the canonical geometry descriptors (internal digest).
+
+    This is the internal geometry digest used to prove the readback matches the
+    declared fixture geometry; it is not part of the published 12-key status
+    schema (whose ``fixture_descriptor_sha256`` remains the declaration digest).
+    """
+    return sha256_json(list(objects))
+
+
+def _compare_geometry(
+    expected_geometry: Mapping[str, Mapping[str, object]],
+    observed_geometry: Sequence[Mapping[str, object]],
+) -> list[str]:
+    """Compare declared fixture geometry against the readback, fail-closed.
+
+    Readback objects are normalized by id (order is not semantic); duplicate
+    ``sim_fixture/*`` ids, missing owned objects, and per-object geometry
+    mismatches each produce a reason.  Each mismatch reason carries the compact
+    canonical SHA-256 of the expected and observed descriptors.
+    """
+    reasons: list[str] = []
+    observed_by_id: dict[str, Mapping[str, object]] = {}
+    observed_counts: dict[str, int] = {}
+    for obj in observed_geometry:
+        oid = str(obj.get("id", ""))
+        observed_counts[oid] = observed_counts.get(oid, 0) + 1
+        if oid not in observed_by_id:
+            observed_by_id[oid] = obj
+    duplicates = [
+        oid
+        for oid, count in observed_counts.items()
+        if count > 1 and oid.startswith(FIXTURE_NAMESPACE_PREFIX)
+    ]
+    if duplicates:
+        reasons.append(
+            "readback contains duplicate fixture geometry ids: {}".format(
+                ", ".join(sorted(duplicates))
+            )
+        )
+    for oid, expected in expected_geometry.items():
+        if oid not in observed_by_id:
+            reasons.append(
+                "readback is missing expected fixture object geometry: {}".format(oid)
+            )
+            continue
+        observed = observed_by_id[oid]
+        if observed != expected:
+            reasons.append(
+                "readback geometry mismatch for {}: expected {} observed {}".format(
+                    oid,
+                    sha256_json(expected),
+                    sha256_json(observed),
+                )
+            )
+    return reasons
 
 
 @dataclass(frozen=True)
@@ -119,6 +330,8 @@ class Confirmation:
     owned_ids_present: bool
     foreign_fixture_ids: tuple[str, ...]
     status_consistent: bool
+    geometry_consistent: bool = False
+    geometry_reasons: tuple[str, ...] = ()
 
 
 def revision_digest(planning_scene: Mapping[str, object]) -> str:
@@ -250,15 +463,24 @@ def confirm_fixture_revision(
     expected_revision: str,
     expected_digest: str,
     expected_owned_ids: Sequence[str],
+    expected_geometry: Mapping[str, Mapping[str, object]] | None = None,
+    observed_geometry: Sequence[Mapping[str, object]] | None = None,
 ) -> Confirmation:
     """Confirm a fixture readback against the canonical status, fail-closed.
 
     Proves the apply service succeeded, every expected owned id is present in
-    the readback, no unexpected ``sim_fixture/*`` id leaked into the scene, and
-    the supplied canonical status is internally consistent with the expected
-    revision, digest, owned ids, target identity, and heartbeat fields.
+    the readback, no unexpected ``sim_fixture/*`` id leaked into the scene, no
+    duplicate ``sim_fixture/*`` id is present, and the supplied canonical status
+    is internally consistent with the expected revision, digest, owned ids,
+    target identity, and heartbeat fields.
+
+    When both *expected_geometry* (id -> canonical descriptor built from the
+    desired specs) and *observed_geometry* (readback canonical descriptors) are
+    supplied, the exact fixture geometry (frame, poses, primitive type+
+    dimensions, mesh vertices+triangles) is compared before ready.
     """
     reasons: list[str] = []
+    geometry_reasons: list[str] = []
     observed_scene = tuple(str(fixture_id) for fixture_id in scene_ids)
     expected = tuple(str(fixture_id) for fixture_id in expected_owned_ids)
     expected_set = set(expected)
@@ -270,6 +492,21 @@ def confirm_fixture_revision(
     if not owned_present:
         reasons.append("readback is missing expected fixture owned ids")
 
+    observed_counts: dict[str, int] = {}
+    for fixture_id in observed_scene:
+        observed_counts[fixture_id] = observed_counts.get(fixture_id, 0) + 1
+    duplicate_ids = tuple(
+        fixture_id
+        for fixture_id, count in observed_counts.items()
+        if count > 1 and fixture_id.startswith(FIXTURE_NAMESPACE_PREFIX)
+    )
+    if duplicate_ids:
+        reasons.append(
+            "readback contains duplicate sim_fixture ids: {}".format(
+                ", ".join(sorted(duplicate_ids))
+            )
+        )
+
     foreign = tuple(
         fixture_id
         for fixture_id in observed_scene
@@ -277,6 +514,16 @@ def confirm_fixture_revision(
     )
     if foreign:
         reasons.append("readback contains unexpected sim_fixture ids")
+
+    if expected_geometry is not None or observed_geometry is not None:
+        if expected_geometry is None or observed_geometry is None:
+            geometry_reasons.append(
+                "geometry verification requires both expected and observed geometry"
+            )
+        else:
+            geometry_reasons = _compare_geometry(
+                expected_geometry, observed_geometry
+            )
 
     status_checks: list[str] = []
     status_value: Mapping[str, object] = status if isinstance(status, Mapping) else {}
@@ -307,6 +554,7 @@ def confirm_fixture_revision(
         status_checks.append("fixture_descriptor_sha256")
     if status_checks:
         reasons.append("status inconsistent: {}".format(", ".join(status_checks)))
+    reasons.extend(geometry_reasons)
 
     return Confirmation(
         ready=not reasons,
@@ -320,6 +568,8 @@ def confirm_fixture_revision(
         owned_ids_present=owned_present,
         foreign_fixture_ids=foreign,
         status_consistent=not status_checks,
+        geometry_consistent=not geometry_reasons,
+        geometry_reasons=tuple(geometry_reasons),
     )
 
 
@@ -341,7 +591,10 @@ __all__ = [
     "build_atomic_revision_diff",
     "canonical_json",
     "confirm_fixture_revision",
+    "geometry_signature_sha256",
     "parse_required_fixture_owned_ids",
+    "readback_geometry",
     "revision_digest",
     "sha256_json",
+    "spec_geometry",
 ]
