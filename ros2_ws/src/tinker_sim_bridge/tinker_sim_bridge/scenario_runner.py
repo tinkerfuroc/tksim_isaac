@@ -372,10 +372,23 @@ def main(argv: list[str] | None = None) -> None:
     try:
         results = node.execute(operations)
         if integrated is None:
-            # Legacy non-overlay path: preserve the previous operation report.
-            print(
-                json.dumps(results, sort_keys=True, separators=(",", ":"))
-            )
+            # Legacy non-overlay path: restore the byte/schema-compatible report
+            # (top-level scenario string + seed + control_api/custom_control_
+            # services + operations) and honor --report, exactly as before the
+            # overlay landed.  The canonical compact report is produced only in
+            # the integrated overlay mode.
+            legacy_report = {
+                "schema_version": 1,
+                "scenario": scenario.scenario_id,
+                "seed": arguments.seed,
+                "control_api": "simulation_interfaces",
+                "custom_control_services": False,
+                "operations": results,
+            }
+            output = json.dumps(legacy_report, indent=2, sort_keys=True)
+            if arguments.report is not None:
+                write_report_atomic(legacy_report, arguments.report)
+            print(output)
             return
         report = build_canonical_report(
             scenario_id=scenario.scenario_id,

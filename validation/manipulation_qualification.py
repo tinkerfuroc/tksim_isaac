@@ -1126,14 +1126,24 @@ class QualificationRunner:
         except (OSError, ValueError, json.JSONDecodeError) as error:
             return False, {"path": str(path), "present": True, "error": str(error)}, "qualification scenario schema is invalid"
         expected_seed = self.seed
+        # Schema-tolerant identity: the legacy scenario-runner report carries a
+        # top-level ``scenario`` string + ``seed``; the integrated overlay
+        # canonical report carries ``scenario`` as {id, seed, declaration} with
+        # ``seed`` nested inside.  Both must agree with the requested identity.
+        scenario_value = report.get("scenario")
+        observed_scenario = scenario_value
+        observed_seed = report.get("seed")
+        if isinstance(scenario_value, Mapping):
+            observed_scenario = scenario_value.get("id")
+            observed_seed = scenario_value.get("seed", observed_seed)
         identity = {
             "expected_scenario": expected["id"],
-            "observed_scenario": report.get("scenario"),
+            "observed_scenario": observed_scenario,
             "expected_seed": expected_seed,
-            "observed_seed": report.get("seed"),
+            "observed_seed": observed_seed,
             "expected_entity_ids": expected["entity_ids"],
         }
-        if report.get("scenario") != expected["id"] or report.get("seed") != expected_seed:
+        if observed_scenario != expected["id"] or observed_seed != expected_seed:
             return False, {"path": str(path), "present": True, "identity": identity, "report": report}, "scenario runner identity does not match requested scenario/seed"
         operations = report.get("operations")
         if (

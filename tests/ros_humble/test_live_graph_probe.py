@@ -44,7 +44,14 @@ def test_live_integrated_overlay_graph() -> None:
         )
         from tinker_sim_bridge.integrated_readiness_node import IntegratedReadiness
 
-        readiness = IntegratedReadiness()
+        # A uniquely-named observer with no status publisher so observing a
+        # running overlay never creates a duplicate /integrated_readiness node
+        # or a second /sim/status/integrated_manipulation publisher (which would
+        # perturb the very cardinality evidence this probe asserts).
+        readiness = IntegratedReadiness(
+            node_name="live_graph_observer",
+            create_status_publisher=False,
+        )
         try:
             time.sleep(2.0)
             actions = readiness._probe_actions()
@@ -53,8 +60,14 @@ def test_live_integrated_overlay_graph() -> None:
                 assert entry.get("count") == 1, (
                     "action {} count {} != 1".format(endpoint, entry.get("count"))
                 )
-                assert entry.get("type") == expected["type"], (
-                    "action {} type mismatch".format(endpoint)
+                goal_type = "{}/action/{}_SendGoal".format(
+                    expected["type"].split("/action/")[0],
+                    expected["type"].split("/action/")[1],
+                )
+                assert goal_type in entry.get("observed_types", []), (
+                    "action {} observed goal-service types {} do not include {}".format(
+                        endpoint, entry.get("observed_types"), goal_type
+                    )
                 )
                 if not expected["source"].startswith("controller_resource:"):
                     assert entry.get("source") == expected["source"], (

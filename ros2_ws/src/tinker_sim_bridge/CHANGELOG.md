@@ -93,6 +93,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `separators=(",", ":")` so digest and readiness consumers see canonical
   bytes.
 
+### Fixed (Task 6 fix round 1: make staged OMPL readiness executable)
+
+- **Public report schema is now production-compatible.**  The canonical
+  `scenario-runner.json` `integrated` field is exactly
+  `{"execution_profile": "sim_ompl"}` (with exact digest and operation
+  identities), matching the shipped `pick_and_place` canonical parser
+  (`goal_validation.cpp::parse_scenario_status_json`); the full typed runtime
+  readiness contract is carried separately as the
+  `runtime_contract_sha256` / `integrated_mapping` evidence and never enters
+  the public report.  `public_integrated_mapping()`,
+  `build_integrated_mapping()`, `runtime_contract_sha256`, and the launch's
+  `public_integrated_mapping`/`runtime_contract_sha256` parameters split the
+  two identities.
+- **Report validation now passes against a real fixture scenario.**
+  `planning_scene_mapping()` derives `owned_ids` from the authoritative Task 5
+  `fixture_owned_ids()` helper in declaration order; `_coerce_owned_ids`
+  parses both in-memory sequences and JSON-array wire strings and rejects
+  malformed values fail-closed.  `validate_report` accepts the public
+  `integrated` mapping supplied via `public_integrated_mapping` with the
+  full runtime contract falling back to `integrated_mapping`.
+- **Launch-required identities now agree with the parsed report.**
+  `planning_scene_sha256` is the digest of the four-key report planning-scene
+  mapping (`sha256_json(planning_scene_mapping(planning_scene))`); the full
+  Task 5 `revision_digest` remains the separate
+  `planning_scene_revision_digest`/`required_fixture_revision_digest`.
+- **Readiness waiters are bounded and executable.**  The embedded non-spinning
+  waiter is replaced by the installed `readiness_waiter` module
+  (`python3 -m tinker_sim_bridge.readiness_waiter`) which bounds discovery,
+  call, response, and total lifetime by the deadline, spins the client future
+  with `rclpy.spin_until_future_complete`, and exits 0 only for a typed
+  `success=true` Trigger response.  Verified with a real Humble Trigger
+  server/executor test.
+- **TF readiness composes the real multi-hop chain.**  `IntegratedReadiness`
+  uses `tf2_ros.Buffer` + `TransformListener` (consuming `/tf` and `/tf_static`)
+  and records the composed lookup result with no incompatible clock
+  comparison.
+- **Type evidence is graph-observed, not self-stamped.**  Action backing
+  `{endpoint}/_action/send_goal` and `_action/get_result` service types are
+  recorded as `observed_types` and compared by the evaluator; wrong/missing/
+  ambiguous observed types, duplicate endpoints, wrong sources, and missing
+  result/goal services fail closed.
+- **QoS is observed and enforced.**  `normalize_qos_value` maps Humble enum
+  strings to short names; reliability and durability are compared strictly for
+  every typed publisher (joint state, operator, effective safety, fixture,
+  integrated status, command publishers).  Depth is compared when a publisher
+  actually reports it (Humble `PublishersInfo` reports depth as 0/UNKNOWN, so
+  depth is a documented soft dimension at runtime while the pure evaluator
+  enforces it from reported values).
+- **Command publishers and publisher metadata are probed.**  `/isaac_joint_commands`
+  and `/sim/controller/gripper_commands` are probed for count/source/type/QoS,
+  and `evaluate_publisher_metadata` compares every typed publisher against the
+  contract.
+- **Provider-manifest resolved/live agreement is enforced.**  The readiness
+  node reports observed nodes/publishers/controllers; the evaluator's
+  `_provider_manifest_agreement` reconciles persistent nodes, publishers, and
+  typed controller resources against the manifest, excluding the intentionally
+  later-provided `/sim/safety/operator` publisher.
+- **Collision source corrected.**  `/sim/safety/collision` is asserted from the
+  real `/tinker_isaac_gateway` publisher with type/cardinality/QoS/freshness
+  and collision-free value.
+- **Legacy scenario-runner behavior restored.**  The non-overlay
+  (`integrated is None`) branch again writes the previous report shape to
+  `--report` and prints the previous payload; the canonical compact report is
+  produced only in integrated overlay mode.
+- **Qualification reader is schema-tolerant.**  `manipulation_qualification.py`
+  `_scenario_readiness` accepts both the legacy top-level
+  `scenario` string + `seed` and the canonical `{id, seed, declaration}`
+  object without weakening identity/digest validation.
+- **Zero structural fingerprints are rejected** consistently with the
+  production overlay and model contract.
+- `IntegratedReadiness` initializes `_provider_manifest_path`/`_model_bundle_manifest`
+  before building the contract and reads Humble's list-typed
+  `get_service_names_and_types_by_node` result correctly.
+
 ### Added
 
 - Atomic fixture PlanningScene adapter (`fixture_planning_scene`): applies one

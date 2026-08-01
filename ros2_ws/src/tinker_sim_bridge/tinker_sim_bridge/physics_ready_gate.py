@@ -127,7 +127,9 @@ class PhysicsReadyGate(Node):
         self.declare_parameter("planning_scene_target_source_id", "")
         self.declare_parameter("planning_scene_target_handoff", "")
         self.declare_parameter("integrated_mapping", "{}")
+        self.declare_parameter("public_integrated_mapping", "")
         self.declare_parameter("integrated_sha256", "")
+        self.declare_parameter("runtime_contract_sha256", "")
         self.declare_parameter("model_fingerprint", "")
         self.declare_parameter("provider_manifest_path", "")
         self.declare_parameter("provider_manifest_sha256", "")
@@ -173,6 +175,18 @@ class PhysicsReadyGate(Node):
             raise ValueError("integrated_mapping parameter is not valid JSON") from exc
         if not isinstance(integrated, dict):
             raise ValueError("integrated_mapping parameter must be a JSON object")
+        # The public report's ``integrated`` field is the production-canonical
+        # one-key mapping; the full runtime contract is carried separately.
+        public_raw = str(self.get_parameter("public_integrated_mapping").value)
+        if public_raw and public_raw.strip():
+            try:
+                public_integrated = json.loads(public_raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError("public_integrated_mapping parameter is not valid JSON") from exc
+            if not isinstance(public_integrated, dict):
+                raise ValueError("public_integrated_mapping parameter must be a JSON object")
+        else:
+            public_integrated = integrated
         return {
             "scenario_id": str(self.get_parameter("scenario_id").value),
             "seed": int(self.get_parameter("seed").value),
@@ -194,8 +208,13 @@ class PhysicsReadyGate(Node):
             "planning_scene_target_handoff": str(
                 self.get_parameter("planning_scene_target_handoff").value
             ),
-            "integrated_mapping": integrated,
+            "integrated_mapping": public_integrated,
+            "public_integrated_mapping": public_integrated,
             "integrated_sha256": str(self.get_parameter("integrated_sha256").value),
+            "runtime_contract_mapping": integrated,
+            "runtime_contract_sha256": str(
+                self.get_parameter("runtime_contract_sha256").value
+            ),
             "model_fingerprint": str(self.get_parameter("model_fingerprint").value),
             "provider_manifest_path": str(
                 self.get_parameter("provider_manifest_path").value
@@ -222,6 +241,9 @@ class PhysicsReadyGate(Node):
             "provider_manifest_path": self._expected.get("provider_manifest_path", ""),
             "provider_manifest_sha256": self._expected.get(
                 "provider_manifest_sha256", ""
+            ),
+            "runtime_contract_sha256": self._expected.get(
+                "runtime_contract_sha256", ""
             ),
             "scenario_report_sha256": self._scenario_report_sha256,
             "sim_state_observed": self._sim_state_observed,

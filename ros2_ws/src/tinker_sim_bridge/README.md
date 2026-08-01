@@ -449,31 +449,53 @@ provider set is detected against unchanged bytes.
 ### Readiness evaluator and Python split
 
 `integrated_readiness.py` is ROS-free at import time.  It defines
-`build_integrated_mapping()` (the canonical composition mapping:
+`build_integrated_mapping()` (the full runtime readiness contract:
 `report_revision`, typed `actions`, `services`, `publishers`, eight
 `joint_names`, eight `touch_links`, `tf`, `controller_resources`,
-`final_simulation_state`), the immutable `ReadinessReport` result type, and
+`final_simulation_state`) and `public_integrated_mapping()`, which returns the
+production-canonical public report `integrated` field
+`{"execution_profile": "sim_ompl"}` exactly as the shipped `pick_and_place`
+canonical parser requires.  The public `scenario-runner.json` report carries
+the one-key `integrated` mapping and its exact digest; the full runtime
+contract is carried separately as `runtime_contract_sha256` / `integrated_mapping`
+evidence in the physics gate and readiness node.  The module also defines the
+immutable `ReadinessReport` result type and
 `evaluate_integrated_readiness(snapshot, contract) -> ReadinessReport`.  The
 evaluator checks model preflight, the parsed shared-report `PHYSICS_READY`
 evidence (including the external `scenario_report_sha256` and mapping identity
-digests), exact joint-state content/stamp/age/source, `base_link -> link_tcp`
-TF, active trajectory-controller logical-resource identity, fresh operator
-input and effective safety output, every typed action (including
-Cartesian/Joint/Fold), every typed MoveIt/controller/gate service, the typed
+digests), exact joint-state content/stamp/age/source, the composed
+`base_link -> link_tcp` TF chain, active trajectory-controller
+logical-resource identity, fresh operator input and effective safety output,
+every typed action (including Cartesian/Joint/Fold) with graph-observed
+goal-service types, every typed MoveIt/controller/gate service, the typed
 `/arm_joint_service` (`tinker_arm_msgs/srv/ArmJointService`) with exactly one
 `/pick_and_place` server, exact canonical fixture status fields, full
 scenario/planning-scene/integrated mapping and digest agreement,
-provider-manifest path/digest agreement, semantic model/kinematics equality,
-and initial collision state.
+publisher count/source/type/QoS metadata for every typed publisher
+(including `/isaac_joint_commands` and `/sim/controller/gripper_commands`),
+provider-manifest resolved/live agreement, semantic model/kinematics equality,
+and initial collision state (published by `/tinker_isaac_gateway`).
 
 `integrated_readiness_node.py` (`class IntegratedReadiness`, `main()`) is the
 only module that imports `rclpy`/message types.  It probes actions via the
-`/_action/send_goal` service pattern (Humble rclpy has no action-introspection
-API), maps services to their serving nodes, steps `/controller_manager/
-list_controllers`, checks joint and Boolean sample content/freshness, and
-publishes `std_msgs/msg/String` JSON on
+`{endpoint}/_action/send_goal` service pattern (Humble rclpy has no
+action-introspection API), records graph-observed goal-service types, maps
+services to their serving nodes, steps `/controller_manager/list_controllers`,
+checks joint and Boolean sample content/freshness plus real publisher QoS
+(reliability/durability from `PublishersInfo`; depth is compared when a
+publisher actually reports it), composes the multi-hop TF chain with
+`tf2_ros.Buffer` + `TransformListener`, reconciles the provider manifest
+against the live graph, and publishes `std_msgs/msg/String` JSON on
 `/sim/status/integrated_manipulation` at `check_period_s`; any check failure
 publishes `fail` and (with `fail_exit_s>0`) exits nonzero.
+
+`readiness_waiter.py` is the installed, testable readiness waiter used by the
+launch for the `/sim/ready/physics` and `/sim/ready/fixture` gates
+(`python3 -m tinker_sim_bridge.readiness_waiter`).  It bounds service
+discovery, the call, the response, and the total process lifetime by the
+deadline, services the `call_async` future with
+`rclpy.spin_until_future_complete`, and exits 0 only for a typed Trigger
+`success=true` response.
 
 ### Run
 
@@ -491,17 +513,28 @@ cd /home/tinker/tinker-sim/6.0.1
 PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
   ./.venv/bin/python -m pytest -q \
   tests/test_integrated_readiness.py \
-  tests/test_integrated_ompl_launch_contract.py
+  tests/test_integrated_ompl_launch_contract.py \
+  tests/test_qualification_scenario_schema.py
 source /opt/ros/humble/setup.bash
+source /home/tinker/tinker-sim/6.0.1/.ros-vendor/humble/local_setup.bash
 source /home/tinker/tk25_ws/install/setup.bash
-source /home/tinker/tinker-sim/6.0.1/ros2_ws/install/setup.bash
-python3 -m pytest -q tests/ros_humble/test_live_graph_probe.py
+export PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation:$PYTHONPATH"
+python3 -m pytest -q \
+  tests/ros_humble/test_readiness_waiter.py \
+  tests/ros_humble/test_composed_tf.py \
+  tests/ros_humble/test_graph_evidence.py \
+  tests/ros_humble/test_live_graph_probe.py \
+  tests/test_scenario_runner.py
 ```
 
 The pure evaluator and AST-based launch-contract tests run under the simulator
-CPython 3.12 venv (no ROS import needed).  The live graph probe imports
-`rclpy` only inside the test after a sourced Humble environment and skips
-cleanly when the integrated overlay is not running.
+CPython 3.12 venv (no ROS import needed).  The Humble node/graph tests
+(real Trigger waiter, composed multi-hop TF, graph type/source/QoS observation,
+legacy scenario-runner regression) run under system Python 3.10 with a sourced
+Humble environment.  The live graph probe imports `rclpy` only inside the test
+after a sourced Humble environment and skips cleanly when the integrated
+overlay is not running; it uses a uniquely-named observer with no status
+publisher so it never perturbs a running overlay's cardinality evidence.
 
 ## Deployment gateways
 

@@ -39,6 +39,8 @@ from tinker_sim_bridge.fixture_planning_scene import (
 from tinker_sim_bridge.integrated_readiness import (
     build_integrated_mapping,
     canonical_json,
+    planning_scene_mapping,
+    public_integrated_mapping,
     sha256_json,
 )
 
@@ -71,34 +73,25 @@ def _process_exit_actions(event, label: str, success_actions):
 
 
 def _service_waiter(svc: str, label: str, timeout_s: float = _WAIT_TIMEOUT_S):
-    """Return a one-shot process that exits 0 only when the Trigger service succeeds."""
-    code = (
-        "import rclpy,sys,time\n"
-        "from rclpy.node import Node\n"
-        "from std_srvs.srv import Trigger\n"
-        "rclpy.init()\n"
-        f"n=Node('{label}')\n"
-        f"c=n.create_client(Trigger,{svc!r})\n"
-        f"deadline=time.monotonic()+{float(timeout_s)}\n"
-        "ok=False\n"
-        "while time.monotonic()<deadline:\n"
-        "    if c.wait_for_service(timeout_sec=min(1.0,deadline-time.monotonic())):\n"
-        "        f=c.call_async(Trigger.Request())\n"
-        "        try:\n"
-        "            while rclpy.ok() and not f.done():\n"
-        "                time.sleep(0.05)\n"
-        "            r=f.result()\n"
-        "            ok=r is not None and r.success\n"
-        "        except Exception:\n"
-        "            ok=False\n"
-        "        if ok:\n"
-        "            break\n"
-        "    time.sleep(0.2)\n"
-        "n.destroy_node()\n"
-        "rclpy.shutdown()\n"
-        "sys.exit(0 if ok else 1)\n"
+    """Return a one-shot process that exits 0 only when the Trigger service succeeds.
+
+    The waiter runs the installed ``tinker_sim_bridge.readiness_waiter`` module
+    (bounded, executor-serviced, tested under Humble).  It exits 0 only for a
+    typed Trigger response with ``success=true`` and nonzero otherwise.
+    """
+    return ExecuteProcess(
+        cmd=[
+            "python3",
+            "-m",
+            "tinker_sim_bridge.readiness_waiter",
+            "--service",
+            svc,
+            "--deadline",
+            str(timeout_s),
+        ],
+        name=label,
+        output="screen",
     )
-    return ExecuteProcess(cmd=["python3", "-c", code], name=label, output="screen")
 
 
 def _resolve(context):
@@ -131,8 +124,12 @@ def _resolve(context):
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"model bundle manifest unreadable: {exc}") from exc
     model_fingerprint = str(bundle.get("structural_fingerprint", "")).strip()
-    if len(model_fingerprint) != 64 or any(c not in "0123456789abcdef" for c in model_fingerprint):
-        raise RuntimeError(f"model bundle manifest structural_fingerprint is not a SHA-256: {model_fingerprint!r}")
+    if (
+        len(model_fingerprint) != 64
+        or any(c not in "0123456789abcdef" for c in model_fingerprint)
+        or model_fingerprint == "0" * 64
+    ):
+        raise RuntimeError(f"model bundle manifest structural_fingerprint is not a nonzero SHA-256: {model_fingerprint!r}")
 
     provider_manifest_value = LaunchConfiguration("provider_manifest_path").perform(context).strip()
     if not provider_manifest_value:
@@ -180,17 +177,26 @@ def _resolve(context):
     target_handoff = str(planning_scene["target_handoff"])
     fixture_descriptor_sha = fixture_descriptor_sha256(planning_scene)
 
-    integrated_mapping = build_integrated_mapping()
-    integrated_sha256 = sha256_json(integrated_mapping)
-    integrated_mapping_json = canonical_json(integrated_mapping).decode("utf-8")
+    # The full runtime readiness contract is carried separately from the public
+    # report's production-canonical one-key ``integrated`` mapping.  The report
+    # identity ``planning_scene_sha256`` is the digest of the report's four-key
+    # planning-scene mapping (matching what the report computes), while the full
+    # Task 5 revision digest remains the fixture-status digest passed separately.
+    runtime_contract = build_integrated_mapping()
+    runtime_contract_sha256 = sha256_json(runtime_contract)
+    runtime_contract_json = canonical_json(runtime_contract).decode("utf-8")
+    public_integrated = public_integrated_mapping()
+    public_integrated_sha256 = sha256_json(public_integrated)
+    public_integrated_json = canonical_json(public_integrated).decode("utf-8")
+    planning_scene_report_sha256 = sha256_json(planning_scene_mapping(planning_scene))
     owned_ids_json = canonical_json(list(owned_ids)).decode("utf-8")
 
     identities = {
         "scenario_id": scenario_id,
         "seed": seed,
         "scenario_declaration_sha256": scenario_declaration_sha256,
-        "planning_scene_sha256": planning_scene_revision_digest,
-        "integrated_sha256": integrated_sha256,
+        "planning_scene_sha256": planning_scene_report_sha256,
+        "integrated_sha256": public_integrated_sha256,
         "model_fingerprint": model_fingerprint,
         "provider_manifest_sha256": provider_manifest_sha256,
     }
@@ -223,8 +229,8 @@ def _resolve(context):
         "--expected-planning-scene-owned-ids", owned_ids_json,
         "--expected-planning-scene-target-source-id", target_source_id,
         "--expected-planning-scene-target-handoff", target_handoff,
-        "--expected-integrated-mapping", integrated_mapping_json,
-        "--expected-integrated-sha256", integrated_sha256,
+        "--expected-integrated-mapping", public_integrated_json,
+        "--expected-integrated-sha256", public_integrated_sha256,
         "--expected-model-fingerprint", model_fingerprint,
         "--provider-manifest", str(provider_manifest),
         "--provider-manifest-sha256", provider_manifest_sha256,
@@ -289,8 +295,10 @@ def _resolve(context):
                     "planning_scene_owned_ids": owned_ids_json,
                     "planning_scene_target_source_id": target_source_id,
                     "planning_scene_target_handoff": target_handoff,
-                    "integrated_mapping": integrated_mapping_json,
-                    "integrated_sha256": integrated_sha256,
+                    "integrated_mapping": runtime_contract_json,
+                    "public_integrated_mapping": public_integrated_json,
+                    "integrated_sha256": public_integrated_sha256,
+                    "runtime_contract_sha256": runtime_contract_sha256,
                     "model_fingerprint": model_fingerprint,
                     "provider_manifest_path": str(provider_manifest),
                     "provider_manifest_sha256": provider_manifest_sha256,
@@ -395,8 +403,10 @@ def _resolve(context):
                             "planning_scene_owned_ids": owned_ids_json,
                             "planning_scene_target_source_id": target_source_id,
                             "planning_scene_target_handoff": target_handoff,
-                            "integrated_mapping": integrated_mapping_json,
-                            "integrated_sha256": integrated_sha256,
+                            "integrated_mapping": runtime_contract_json,
+                            "public_integrated_mapping": public_integrated_json,
+                            "integrated_sha256": public_integrated_sha256,
+                            "runtime_contract_sha256": runtime_contract_sha256,
                             "model_fingerprint": model_fingerprint,
                             "fail_exit_s": 0.0,
                         }

@@ -1,13 +1,16 @@
 """Task 6: ROS-free integrated readiness evaluator contract tests.
 
 Exercises ``tinker_sim_bridge.integrated_readiness.evaluate_integrated_readiness``
-with a complete ready snapshot and fail-closed mismatching snapshots.  The pure
-evaluator imports neither ROS nor Isaac Sim, so this test runs under the
+with a complete ready snapshot and fail-closed mismatching snapshots, and proves
+the public ``scenario-runner.json`` report validates against the real scenario
+with launch-shaped expected values and matches the production-canonical schema.
+The pure evaluator imports neither ROS nor Isaac Sim, so this test runs under the
 simulator CPython 3.12 venv.
 """
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Mapping
 
@@ -28,14 +31,18 @@ from tinker_sim_bridge.integrated_readiness import (  # noqa: E402
     REPORT_REVISION,
     build_canonical_report,
     build_integrated_mapping,
+    canonical_json,
     evaluate_integrated_readiness,
+    parse_canonical_report,
+    public_integrated_mapping,
+    serialize_report,
     sha256_bytes,
     sha256_json,
+    validate_report,
 )
 
 SCENARIO_ID = "qualification-moveit-plan-joint"
 SEED = 7
-SCENARIO_DECLARATION_SHA256 = "1" * 64
 PLANNING_SCENE_REVISION = "2026-08-01-moveit-qualification-joint"
 PLANNING_SCENE_REVISION_DIGEST = "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d"
 PLANNING_SCENE_OWNED_IDS = ["sim_fixture/pedestal", "sim_fixture/public_target"]
@@ -44,6 +51,24 @@ PLANNING_SCENE_TARGET_HANDOFF = "pick_and_place/object_mesh"
 MODEL_FINGERPRINT = "2" * 64
 PROVIDER_MANIFEST_SHA256 = "3" * 64
 PROVIDER_MANIFEST_PATH = "/srv/tinker-sim/integration/provider-manifest.json"
+
+SCENARIO_FILE = ROOT / "simulation/scenarios/qualification-moveit-plan-joint.json"
+
+
+def _goal_service_type(action_type: str) -> str:
+    """Derive the canonical ``_action/send_goal`` service type."""
+    marker = "/action/"
+    package, action = action_type.split(marker, 1)
+    return "{}/action/{}_SendGoal".format(package, action)
+
+
+def _real_planning_scene() -> dict[str, object]:
+    """Load the real qualification planning-scene declaration (ROS-free)."""
+    raw = json.loads(SCENARIO_FILE.read_text(encoding="utf-8"))
+    scene = dict(raw["planning_scene"])
+    # The launch supplies the derived declared-order owned ids, not a top-level
+    # key (the real scenario has none).
+    return scene
 
 
 def provider_manifest() -> dict[str, object]:
@@ -109,24 +134,34 @@ def provider_manifest() -> dict[str, object]:
 
 def contract() -> dict[str, object]:
     """Return the expected integrated readiness contract."""
+    runtime_mapping = build_integrated_mapping()
     return {
         "schema_version": 1,
         "report_revision": REPORT_REVISION,
         "scenario_id": SCENARIO_ID,
         "seed": SEED,
-        "scenario_declaration_sha256": SCENARIO_DECLARATION_SHA256,
+        "scenario_declaration_sha256": sha256_json(
+            {
+                "id": SCENARIO_ID,
+                "seed": SEED,
+                "declaration": _declaration(),
+            }
+        ),
         "planning_scene_revision": PLANNING_SCENE_REVISION,
         "planning_scene_revision_digest": PLANNING_SCENE_REVISION_DIGEST,
         "planning_scene_owned_ids": list(PLANNING_SCENE_OWNED_IDS),
         "planning_scene_target_source_id": PLANNING_SCENE_TARGET_SOURCE_ID,
         "planning_scene_target_handoff": PLANNING_SCENE_TARGET_HANDOFF,
-        "integrated_mapping": build_integrated_mapping(),
-        "integrated_sha256": sha256_json(build_integrated_mapping()),
+        "integrated_mapping": runtime_mapping,
+        "public_integrated_mapping": public_integrated_mapping(),
+        "integrated_sha256": sha256_json(public_integrated_mapping()),
+        "runtime_contract_sha256": sha256_json(runtime_mapping),
         "model_fingerprint": MODEL_FINGERPRINT,
         "provider_manifest_path": PROVIDER_MANIFEST_PATH,
         "provider_manifest_sha256": PROVIDER_MANIFEST_SHA256,
         "actions": {endpoint: dict(spec) for endpoint, spec in INTEGRATED_ACTIONS.items()},
         "services": {endpoint: dict(spec) for endpoint, spec in INTEGRATED_SERVICES.items()},
+        "publishers": INTEGRATED_PUBLISHERS,
         "controller_resources": {
             "joint_state_broadcaster": "active",
             "xarm7_traj_controller": "active",
@@ -139,20 +174,12 @@ def contract() -> dict[str, object]:
 
 
 def _declaration() -> dict[str, object]:
-    return {"schema_version": 2, "world": {"mode": "current"}}
+    raw = json.loads(SCENARIO_FILE.read_text(encoding="utf-8"))
+    return {k: v for k, v in raw.items() if k not in {"id", "seed"}}
 
 
 def _planning_scene() -> dict[str, object]:
-    return {
-        "revision": PLANNING_SCENE_REVISION,
-        "frame_id": "base_link",
-        "target_source_id": PLANNING_SCENE_TARGET_SOURCE_ID,
-        "target_handoff": PLANNING_SCENE_TARGET_HANDOFF,
-        "objects": [
-            {"id": "sim_fixture/pedestal", "class": "static", "primitive": {"type": "box", "dimensions": [0.7, 0.7, 0.85]}, "pose": {"xyz": [0.55, 0.0, 0.425], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}},
-            {"id": "sim_fixture/public_target", "class": "target", "primitive": {"type": "box", "dimensions": [0.08, 0.08, 0.08]}, "pose": {"xyz": [0.55, 0.0, 0.89], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}},
-        ],
-    }
+    return _real_planning_scene()
 
 
 def _shared_report_evidence() -> dict[str, object]:
@@ -161,7 +188,7 @@ def _shared_report_evidence() -> dict[str, object]:
         seed=SEED,
         declaration=_declaration(),
         planning_scene=_planning_scene(),
-        integrated=build_integrated_mapping(),
+        integrated=public_integrated_mapping(),
         operations=[
             {
                 "operation": "load_world",
@@ -178,7 +205,7 @@ def _shared_report_evidence() -> dict[str, object]:
         provider_manifest_sha256=PROVIDER_MANIFEST_SHA256,
         final_simulation_state=FINAL_SIMULATION_STATE,
     )
-    data = __import__("tinker_sim_bridge.integrated_readiness", fromlist=["serialize_report"]).serialize_report(report)
+    data = serialize_report(report)
     return {
         "ready": True,
         "reasons": [],
@@ -196,6 +223,7 @@ def _actions() -> dict[str, object]:
         endpoint: {
             "count": 1,
             "type": spec["type"],
+            "observed_types": [_goal_service_type(spec["type"])],
             "source": spec["source"],
             "ready": True,
             "reasons": [],
@@ -209,11 +237,29 @@ def _services() -> dict[str, object]:
         endpoint: {
             "count": 1,
             "type": spec["type"],
+            "observed_types": [spec["type"]],
             "source": spec["source"],
             "ready": True,
             "reasons": [],
         }
         for endpoint, spec in INTEGRATED_SERVICES.items()
+    }
+
+
+def _publisher_metadata() -> dict[str, object]:
+    return {
+        topic: {
+            "count": spec.get("cardinality", 1),
+            "source": spec.get("source", ""),
+            "sources": [spec.get("source", "")],
+            "types": [spec.get("type", "")],
+            "qos": {
+                "reliability": spec.get("reliability", "RELIABLE"),
+                "durability": spec.get("durability", "VOLATILE"),
+                "depth": spec.get("depth", 10),
+            },
+        }
+        for topic, spec in INTEGRATED_PUBLISHERS.items()
     }
 
 
@@ -242,6 +288,7 @@ def ready_snapshot() -> dict[str, object]:
             "parent": "base_link",
             "child": "link_tcp",
             "exists": True,
+            "stamp_ns": 1_000_000_000,
         },
         "controller_resources": {
             "joint_state_broadcaster": {
@@ -295,14 +342,16 @@ def ready_snapshot() -> dict[str, object]:
             },
             "age_s": 0.05,
         },
+        "publishers": _publisher_metadata(),
         "mapping_agreement": {
             "ready": True,
             "reasons": [],
             "observed": {
-                "scenario_declaration_sha256": SCENARIO_DECLARATION_SHA256,
-                "integrated_sha256": sha256_json(build_integrated_mapping()),
+                "scenario_declaration_sha256": contract()["scenario_declaration_sha256"],
+                "integrated_sha256": sha256_json(public_integrated_mapping()),
                 "model_fingerprint": MODEL_FINGERPRINT,
                 "provider_manifest_sha256": PROVIDER_MANIFEST_SHA256,
+                "runtime_contract_sha256": sha256_json(build_integrated_mapping()),
             },
         },
         "provider_manifest": {
@@ -310,6 +359,13 @@ def ready_snapshot() -> dict[str, object]:
             "reasons": [],
             "path": PROVIDER_MANIFEST_PATH,
             "sha256": PROVIDER_MANIFEST_SHA256,
+            "manifest": provider_manifest(),
+            "observed_nodes": ["/move_group", "/tinker_controller_reconciler"],
+            "observed_publishers": ["/joint_states", "/sim/safety/operator"],
+            "observed_controllers": {
+                "joint_state_broadcaster": "active",
+                "xarm7_traj_controller": "active",
+            },
         },
         "semantic_model": {
             "ready": True,
@@ -321,6 +377,7 @@ def ready_snapshot() -> dict[str, object]:
             "ready": True,
             "reasons": [],
             "value": False,
+            "source": "/tinker_isaac_gateway",
         },
     }
 
@@ -345,7 +402,6 @@ def test_ready_snapshot_passes() -> None:
 
 
 def test_mismatching_snapshot_preserves_ready() -> None:
-    # The override must actually flip a check, or the snapshot stays ready.
     assert _evaluate({"model_preflight": {"ready": False, "reasons": ["bad model"]}}).ready is False
 
 
@@ -373,7 +429,7 @@ def test_shared_report_bad_digest_fails() -> None:
 
 
 def test_tf_missing_fails() -> None:
-    report = _evaluate({"tf": {"ready": False, "reasons": ["base_link -> link_tcp not observed"], "exists": False}})
+    report = _evaluate({"tf": {"ready": False, "reasons": ["composed lookup failed"], "exists": False}})
     assert report.ready is False
     assert any("tf" in reason for reason in report.reasons)
 
@@ -419,10 +475,28 @@ def test_action_server_count_fails() -> None:
     actions["/move_action"] = {
         "count": 0,
         "type": INTEGRATED_ACTIONS["/move_action"]["type"],
+        "observed_types": [_goal_service_type(INTEGRATED_ACTIONS["/move_action"]["type"])],
         "source": INTEGRATED_ACTIONS["/move_action"]["source"],
         "ready": False,
         "reasons": ["server count is 0"],
     }
+    report = _evaluate({"actions": actions})
+    assert report.ready is False
+    assert any("action /move_action" in reason for reason in report.reasons)
+
+
+def test_action_observed_type_fails() -> None:
+    """A wrong observed goal-service type must fail, not self-confirm."""
+    actions = _actions()
+    actions["/move_action"]["observed_types"] = ["wrong_msgs/action/Wrong_SendGoal"]
+    report = _evaluate({"actions": actions})
+    assert report.ready is False
+    assert any("action /move_action" in reason for reason in report.reasons)
+
+
+def test_action_missing_observed_type_fails() -> None:
+    actions = _actions()
+    actions["/move_action"]["observed_types"] = []
     report = _evaluate({"actions": actions})
     assert report.ready is False
     assert any("action /move_action" in reason for reason in report.reasons)
@@ -433,10 +507,19 @@ def test_service_source_fails() -> None:
     services["/get_planning_scene"] = {
         "count": 1,
         "type": INTEGRATED_SERVICES["/get_planning_scene"]["type"],
+        "observed_types": [INTEGRATED_SERVICES["/get_planning_scene"]["type"]],
         "source": "/wrong_node",
         "ready": False,
         "reasons": ["source mismatch"],
     }
+    report = _evaluate({"services": services})
+    assert report.ready is False
+    assert any("service /get_planning_scene" in reason for reason in report.reasons)
+
+
+def test_service_observed_type_fails() -> None:
+    services = _services()
+    services["/get_planning_scene"]["observed_types"] = ["wrong_msgs/srv/Wrong"]
     report = _evaluate({"services": services})
     assert report.ready is False
     assert any("service /get_planning_scene" in reason for reason in report.reasons)
@@ -454,8 +537,74 @@ def test_fixture_status_fails() -> None:
     assert any("fixture_status" in reason for reason in report.reasons)
 
 
+def test_publisher_source_mismatch_fails() -> None:
+    publishers = _publisher_metadata()
+    publishers["/joint_states"]["source"] = "/wrong_publisher"
+    report = _evaluate({"publishers": publishers})
+    assert report.ready is False
+    assert any("publishers" in reason and "/joint_states" in reason for reason in report.reasons)
+
+
+def test_publisher_count_mismatch_fails() -> None:
+    publishers = _publisher_metadata()
+    publishers["/isaac_joint_commands"]["count"] = 2
+    report = _evaluate({"publishers": publishers})
+    assert report.ready is False
+    assert any("publishers" in reason and "/isaac_joint_commands" in reason for reason in report.reasons)
+
+
+def test_publisher_qos_mismatch_fails() -> None:
+    publishers = _publisher_metadata()
+    publishers["/sim/hardware/safety_stop"]["qos"]["reliability"] = "BEST_EFFORT"
+    report = _evaluate({"publishers": publishers})
+    assert report.ready is False
+    assert any("publishers" in reason and "/sim/hardware/safety_stop" in reason for reason in report.reasons)
+
+
+def test_publisher_durability_mismatch_fails() -> None:
+    publishers = _publisher_metadata()
+    publishers["/sim/safety/operator"]["qos"]["durability"] = "VOLATILE"
+    report = _evaluate({"publishers": publishers})
+    assert report.ready is False
+    assert any("publishers" in reason and "/sim/safety/operator" in reason for reason in report.reasons)
+
+
+def test_command_publisher_type_fails() -> None:
+    publishers = _publisher_metadata()
+    publishers["/sim/controller/gripper_commands"]["types"] = ["std_msgs/msg/Float64MultiArray"]
+    report = _evaluate({"publishers": publishers})
+    assert report.ready is False
+    assert any("publishers" in reason and "/sim/controller/gripper_commands" in reason for reason in report.reasons)
+
+
+def test_provider_manifest_live_agreement_fails() -> None:
+    provider = dict(ready_snapshot()["provider_manifest"])
+    provider["observed_nodes"] = []  # missing /move_group
+    report = _evaluate({"provider_manifest": provider})
+    assert report.ready is False
+    assert any("provider_manifest" in reason for reason in report.reasons)
+
+
+def test_provider_manifest_controller_agreement_fails() -> None:
+    provider = dict(ready_snapshot()["provider_manifest"])
+    provider["observed_controllers"] = {"xarm7_traj_controller": "inactive"}
+    report = _evaluate({"provider_manifest": provider})
+    assert report.ready is False
+    assert any("provider_manifest" in reason for reason in report.reasons)
+
+
 def test_mapping_agreement_fails() -> None:
     report = _evaluate({"mapping_agreement": {"ready": False, "reasons": ["integrated_sha256 does not match"]}})
+    assert report.ready is False
+    assert any("mapping_agreement" in reason for reason in report.reasons)
+
+
+def test_runtime_contract_digest_mismatch_fails() -> None:
+    mapping = dict(ready_snapshot()["mapping_agreement"])
+    mapping = dict(mapping)
+    mapping["ready"] = False
+    mapping["reasons"] = ["runtime contract mapping sha256 does not match expected"]
+    report = _evaluate({"mapping_agreement": mapping})
     assert report.ready is False
     assert any("mapping_agreement" in reason for reason in report.reasons)
 
@@ -493,3 +642,159 @@ def test_build_integrated_mapping_is_stable() -> None:
         "controller_resources",
         "final_simulation_state",
     }
+
+
+# ---------------------------------------------------------------------------
+# Real-scenario report validation and production-canonical schema
+# ---------------------------------------------------------------------------
+
+
+def _launch_shaped_expected() -> dict[str, object]:
+    """Build the launch-shaped expected contract (owned ids as a JSON string)."""
+    return {
+        "scenario_id": SCENARIO_ID,
+        "seed": SEED,
+        "scenario_declaration_sha256": sha256_json(
+            {"id": SCENARIO_ID, "seed": SEED, "declaration": _declaration()}
+        ),
+        "planning_scene_revision": PLANNING_SCENE_REVISION,
+        "planning_scene_revision_digest": PLANNING_SCENE_REVISION_DIGEST,
+        "planning_scene_owned_ids": json.dumps(PLANNING_SCENE_OWNED_IDS),
+        "planning_scene_target_source_id": PLANNING_SCENE_TARGET_SOURCE_ID,
+        "planning_scene_target_handoff": PLANNING_SCENE_TARGET_HANDOFF,
+        "integrated_mapping": public_integrated_mapping(),
+        "integrated_sha256": sha256_json(public_integrated_mapping()),
+        "model_fingerprint": MODEL_FINGERPRINT,
+        "provider_manifest_sha256": PROVIDER_MANIFEST_SHA256,
+    }
+
+
+def test_real_scenario_report_validates() -> None:
+    """A canonical report built from the real scenario passes validate_report
+    with launch-shaped expected values (owned ids as a JSON-array wire string)."""
+    report = build_canonical_report(
+        scenario_id=SCENARIO_ID,
+        seed=SEED,
+        declaration=_declaration(),
+        planning_scene=_planning_scene(),
+        integrated=public_integrated_mapping(),
+        operations=[
+            {"operation": "set_simulation_state", "accepted": True, "state": 1, "boundary": "PHYSICS_READY"}
+        ],
+        model_fingerprint=MODEL_FINGERPRINT,
+        provider_manifest_sha256=PROVIDER_MANIFEST_SHA256,
+        final_simulation_state=FINAL_SIMULATION_STATE,
+    )
+    # The report planning-scene must derive the real owned ids in order.
+    assert report["planning_scene"]["owned_ids"] == PLANNING_SCENE_OWNED_IDS
+    data = serialize_report(report)
+    parsed = parse_canonical_report(data)
+    validation = validate_report(parsed, _launch_shaped_expected())
+    assert validation["ready"] is True, validation["reasons"]
+
+
+def test_real_scenario_report_mutations_rejected() -> None:
+    """Mutating each field/digest in a real-scenario report is rejected."""
+    def build():
+        return build_canonical_report(
+            scenario_id=SCENARIO_ID,
+            seed=SEED,
+            declaration=_declaration(),
+            planning_scene=_planning_scene(),
+            integrated=public_integrated_mapping(),
+            operations=[
+                {"operation": "set_simulation_state", "accepted": True, "state": 1, "boundary": "PHYSICS_READY"}
+            ],
+            model_fingerprint=MODEL_FINGERPRINT,
+            provider_manifest_sha256=PROVIDER_MANIFEST_SHA256,
+            final_simulation_state=FINAL_SIMULATION_STATE,
+        )
+
+    expected = _launch_shaped_expected()
+    base = build()
+    assert validate_report(base, expected)["ready"] is True
+
+    mutations = {
+        "scenario id": (("scenario", "id"), "wrong-scenario"),
+        "seed": (("scenario", "seed"), 99),
+        "planning_scene revision": (("planning_scene", "revision"), "wrong-revision"),
+        "planning_scene owned ids": (("planning_scene", "owned_ids"), ["sim_fixture/foreign"]),
+        "planning_scene target": (("planning_scene", "target_source_id"), "sim_fixture/foreign"),
+        "integrated execution_profile": (("integrated", "execution_profile"), "hardware"),
+        "scenario_declaration digest": (("identities", "scenario_declaration_sha256"), "9" * 64),
+        "planning_scene digest": (("identities", "planning_scene_sha256"), "9" * 64),
+        "integrated digest": (("identities", "integrated_sha256"), "9" * 64),
+        "model fingerprint": (("identities", "model_fingerprint"), "9" * 64),
+        "provider digest": (("identities", "provider_manifest_sha256"), "9" * 64),
+    }
+    for label, (path, value) in mutations.items():
+        mutated = copy.deepcopy(base)
+        node = mutated
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+        validation = validate_report(mutated, expected)
+        assert validation["ready"] is False, "mutation {!r} was not rejected".format(label)
+
+
+def test_public_report_schema_matches_production() -> None:
+    """The public report has the eight exact top-level keys, the one-key
+    integrated mapping, and self-consistent identities digest (production
+    parse_scenario_status_json compatibility)."""
+    report = build_canonical_report(
+        scenario_id=SCENARIO_ID,
+        seed=SEED,
+        declaration=_declaration(),
+        planning_scene=_planning_scene(),
+        integrated=public_integrated_mapping(),
+        operations=[
+            {"operation": "set_simulation_state", "accepted": True, "state": 1, "boundary": "PHYSICS_READY"}
+        ],
+        model_fingerprint=MODEL_FINGERPRINT,
+        provider_manifest_sha256=PROVIDER_MANIFEST_SHA256,
+    )
+    assert set(report) == {
+        "schema_version",
+        "report_revision",
+        "scenario",
+        "planning_scene",
+        "integrated",
+        "identities",
+        "operations",
+        "final_simulation_state",
+    }
+    assert report["integrated"] == {"execution_profile": "sim_ompl"}
+    assert report["integrated"]["execution_profile"] == "sim_ompl"
+    assert report["identities"]["integrated_sha256"] == sha256_json(
+        {"execution_profile": "sim_ompl"}
+    )
+    assert report["identities"]["planning_scene_sha256"] == sha256_json(
+        report["planning_scene"]
+    )
+    assert report["identities"]["scenario_declaration_sha256"] == sha256_json(
+        report["scenario"]
+    )
+    # Final operation carries the exact identities and PHYSICS_READY boundary.
+    last = report["operations"][-1]
+    assert last["boundary"] == "PHYSICS_READY"
+    assert last["state"] == 1
+    for key in (
+        "scenario_id",
+        "seed",
+        "scenario_declaration_sha256",
+        "planning_scene_sha256",
+        "integrated_sha256",
+        "model_fingerprint",
+        "provider_manifest_sha256",
+    ):
+        assert last[key] == report["identities"][key]
+
+
+def test_public_vs_runtime_mapping_distinct() -> None:
+    """The public report integrated mapping is distinct from the full runtime
+    readiness contract; the runtime digest is carried separately."""
+    public = public_integrated_mapping()
+    runtime = build_integrated_mapping()
+    assert set(public) == {"execution_profile"}
+    assert "execution_profile" not in runtime
+    assert sha256_json(public) != sha256_json(runtime)

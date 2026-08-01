@@ -9,12 +9,14 @@ Task 2 exact production overlay contract.  The AST walker needs no ROS Humble
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 from typing import Mapping
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
 LAUNCH_PATH = ROOT / "ros2_ws/src/tinker_sim_bridge/launch/integrated_ompl_manipulation.launch.py"
 MANIP_LAUNCH_PATH = ROOT / "ros2_ws/src/tinker_sim_bridge/launch/manipulation.launch.py"
 PROVIDER_MANIFEST_PATH = ROOT / "ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json"
