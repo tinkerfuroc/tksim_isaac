@@ -78,6 +78,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Probe parameter parsing now compares against the real Humble
+  `rcl_interfaces.msg.ParameterType` constants (`PARAMETER_STRING` /
+  `PARAMETER_BOOL`) instead of non-existent `ParameterValue.PARAMETER_*`
+  attributes, so the live probe can actually read `robot_description` and
+  `use_sim_time` from a real `GetParameters.Response`; wrong-type/missing-value
+  mutations fail closed and recover on the next fresh response (covered by
+  node tests that feed genuine `ParameterValue` objects through the production
+  `_step_parameters` extraction path).
+- Successful `GetParameters`/`ListControllers` evidence is no longer latched
+  forever: `step_service` re-polls both services on a bounded wall-clock TTL
+  (30 s default) and revokes the success latch once the evidence expires, so a
+  controller_manager restart, renamed/inactive broadcaster, or changed
+  `robot_description` is re-verified on a bounded cadence and cannot be masked by
+  stale attribution/description evidence.  The probe treats stale parameter
+  evidence as unavailable and reports typed FAIL until a fresh response arrives.
+- `step_service` now tracks an in-flight request deadline and, on timeout,
+  abandons the future, resets the client, and retries on a bounded cadence
+  without busy-looping or leaking a client; an old generation can never satisfy a
+  new request (`succeeded_at` / `started_at` tracked per state).
+- `_endpoint_label_from_info` normalizes a root-namespace publisher to
+  `/name` (no `//name`), matching the pure attribution helpers; the standalone
+  exact `/joint_state_broadcaster` branch is now reachable in the probe (a
+  controller-manager-hosted publisher still requires fresh exact active
+  controller proof).
 - Probe constructor no longer shadows rclpy's internal `Node._parameters`
   parameter store: the `joint_state_probe` service-state attributes are now
   `_parameters_state` / `_controllers_state`, so the installed probe constructs

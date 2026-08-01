@@ -278,6 +278,13 @@ JOINT_STATE_MAX_TRANSPORT_NS = 2_000_000_000
 # signature of a wall-clock-vs-sim-clock domain mismatch.
 JOINT_STATE_CLOCK_DOMAIN_THRESHOLD_NS = 1_000_000_000_000_000
 JOINT_STATE_DEFAULT_WATCHDOG_S = 15.0
+# Successful ``GetParameters``/``ListControllers`` evidence is re-polled after
+# this wall-clock TTL so a controller_manager restart or parameter change cannot
+# be masked by latched evidence.  An in-flight request older than
+# ``JOINT_STATE_SERVICE_TIMEOUT_S`` is abandoned and the client reset so the
+# probe retries on a bounded cadence instead of waiting forever.
+JOINT_STATE_SERVICE_TTL_S = 30.0
+JOINT_STATE_SERVICE_TIMEOUT_S = 5.0
 _EXPECTED_ARM_COMMAND_INTERFACES = ("position", "velocity")
 _EXPECTED_ARM_STATE_INTERFACES = ("position", "velocity", "effort")
 _EXPECTED_DRIVE_STATE_INTERFACES = ("position", "velocity", "effort")
@@ -805,24 +812,53 @@ def step_service(
     request,
     extract,
     reset_client,
+    now_s: float | None = None,
+    ttl_s: float | None = None,
+    timeout_s: float | None = None,
 ) -> dict[str, object]:
     """Advance one bounded, recoverable async ROS service request.
 
     *state* carries ``client``, ``future``, ``error``, ``pending``,
-    ``succeeded``, and ``result`` keys and is mutated in place (the same dict is
-    returned for convenience).  The step never raises: discovery-pending and
-    in-flight requests leave the state unchanged (the caller publishes FAIL that
-    tick), while a completed-with-exception or malformed response records an
-    error, resets the client via *reset_client*, and retries on the next step.
-    A successful *extract* marks the request succeeded with its result.
+    ``succeeded``, and ``result`` keys (plus ``succeeded_at`` and ``started_at``)
+    and is mutated in place (the same dict is returned for convenience).  The
+    step never raises: discovery-pending and in-flight requests leave the state
+    unchanged (the caller publishes FAIL that tick), while a completed-with-
+    exception or malformed response records an error, resets the client via
+    *reset_client*, and retries on the next step.  A successful *extract* marks
+    the request succeeded with its result.
+
+    *now_s* is an explicit monotonic-clock input (seconds) so the freshness/TTL
+    and timeout logic is deterministic in tests; it defaults to
+    ``time.monotonic()``.  When *ttl_s* is given, a successful result expires
+    once ``now_s - succeeded_at > ttl_s``: the success latch is revoked (so the
+    caller publishes FAIL until a fresh response arrives) and the service is
+    re-polled, which is how a controller_manager restart or parameter change is
+    re-verified on a bounded cadence.  When *timeout_s* is given, an in-flight
+    request older than the deadline is abandoned, the client reset via
+    *reset_client*, and the request retried on the next step without leaking a
+    client or keeping a stale future.
     """
+    now = time.monotonic() if now_s is None else now_s
     if state.get("succeeded"):
-        return state
+        succeeded_at = state.get("succeeded_at")
+        if (
+            ttl_s is not None
+            and succeeded_at is not None
+            and now - succeeded_at > ttl_s
+        ):
+            # Successful evidence is stale: revoke the latch so it cannot
+            # contribute readiness until a fresh successful response arrives.
+            state["succeeded"] = False
+            state["result"] = None
+            state["succeeded_at"] = None
+        else:
+            return state
     client = state.get("client")
     if client is None:
         client = create_client()
         state["client"] = client
         state["future"] = None
+        state["started_at"] = None
     future = state.get("future")
     if future is None:
         if not client.service_is_ready():
@@ -830,11 +866,27 @@ def step_service(
             return state
         state["pending"] = None
         state["future"] = client.call_async(request(client))
+        state["started_at"] = now
         return state
     if not future.done():
+        started_at = state.get("started_at")
+        if (
+            timeout_s is not None
+            and started_at is not None
+            and now - started_at > timeout_s
+        ):
+            state["error"] = "service request timed out after {:.1f} s".format(
+                timeout_s
+            )
+            state["pending"] = None
+            state["future"] = None
+            state["started_at"] = None
+            reset_client(state)
+            return state
         state["pending"] = "request in flight"
         return state
     state["pending"] = None
+    state["started_at"] = None
     try:
         response = future.result()
     except Exception as exc:  # noqa: BLE001 - transient service failures must recover
@@ -856,6 +908,7 @@ def step_service(
     state["error"] = None
     state["succeeded"] = True
     state["result"] = result
+    state["succeeded_at"] = now
     return state
 
 
