@@ -10,5 +10,7 @@ source "${project_root}/.ros-vendor/humble/local_setup.bash"
 source "${workspace}/install/setup.bash"
 set -u
 cd "${project_root}/ros2_ws"
-exec colcon build --symlink-install --packages-select \
-  tinker_sim_interfaces tinker_sim_bridge
+# Build memory safety: bound colcon package workers and the compiler job/load.
+export MAKEFLAGS="${MAKEFLAGS:--j2 -l2}"
+exec colcon build --symlink-install --parallel-workers 2 \
+  --packages-select tinker_sim_interfaces tinker_sim_bridge
