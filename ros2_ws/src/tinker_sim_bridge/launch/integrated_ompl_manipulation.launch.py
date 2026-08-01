@@ -43,6 +43,10 @@ from tinker_sim_bridge.integrated_readiness import (
     public_integrated_mapping,
     sha256_json,
 )
+from tinker_sim_bridge.scenario_resolver import (
+    ScenarioResolutionError,
+    resolve_scenario_file,
+)
 
 _PRODUCTION_PACKAGE = "mobile_bringup"
 _PRODUCTION_LAUNCH = "manipulation_planning_task_only.launch.py"
@@ -105,6 +109,11 @@ def _resolve(context):
     scenario = LaunchConfiguration("scenario").perform(context)
     if not scenario or "/" in scenario or "\\" in scenario or scenario in {".", ".."}:
         raise RuntimeError(f"unsafe scenario id: {scenario!r}")
+    share = Path(FindPackageShare("tinker_sim_bridge").perform(context))
+    try:
+        scenario_file = resolve_scenario_file(root, scenario, share)
+    except ScenarioResolutionError as exc:
+        raise RuntimeError(str(exc)) from exc
     seed_value = LaunchConfiguration("seed").perform(context)
     if not seed_value.isdigit():
         raise RuntimeError(f"seed must be a nonnegative integer; got {seed_value!r}")
@@ -152,9 +161,6 @@ def _resolve(context):
     if not isinstance(recorded, str) or recorded != canonical_self_hash:
         raise RuntimeError("provider manifest recorded sha256 does not match its canonical self-hash")
 
-    scenario_file = root / "simulation/scenarios" / f"{scenario}.json"
-    if not scenario_file.is_file():
-        raise RuntimeError(f"scenario not found: {scenario_file}")
     raw_scenario = json.loads(scenario_file.read_text(encoding="utf-8"))
     if not isinstance(raw_scenario, dict):
         raise RuntimeError("scenario declaration must be a JSON object")
@@ -213,7 +219,6 @@ def _resolve(context):
 
     resolved_artifact = resolve_current_artifact(root)
     robot_description = topic_control_description(resolved_artifact.robot_urdf)
-    share = Path(FindPackageShare("tinker_sim_bridge").perform(context))
     python_env = {"PYTHONPATH": str(root / "simulation") + os.pathsep + os.environ.get("PYTHONPATH", "")}
 
     scenario_arguments = [

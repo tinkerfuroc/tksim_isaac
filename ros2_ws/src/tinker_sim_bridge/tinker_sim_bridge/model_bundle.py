@@ -158,6 +158,27 @@ def build_manifest(
     return manifest
 
 
+def stable_manifest_evidence(manifest: Mapping[str, object]) -> dict[str, object]:
+    """Return the deterministic model-bundle projection used for load-bearing hashing.
+
+    Each artifact entry carries an absolute host-specific ``path`` (its
+    ``sha256`` is what the bundle actually depends on).  This projection drops
+    the artifact ``path`` fields so the canonical JSON SHA-256 is
+    byte-reproducible on a clean checkout from the committed artifact inputs.
+    """
+    return {
+        "schema_version": manifest["schema_version"],
+        "producer": manifest["producer"],
+        "artifacts": {
+            name: {"sha256": entry["sha256"]}
+            for name, entry in manifest["artifacts"].items()
+        },
+        "normalization": manifest["normalization"],
+        "contract": manifest["contract"],
+        "structural_fingerprint": manifest["structural_fingerprint"],
+    }
+
+
 def resolve_simulator_full_urdf(project_root: Path | str) -> Path:
     """Resolve the selected canonical Tinker 2 ``robot.urdf`` through current.json.
 

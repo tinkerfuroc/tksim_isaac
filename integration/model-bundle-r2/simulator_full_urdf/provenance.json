@@ -1,0 +1,21 @@
+{
+ "schema_version": 1,
+ "canonical_source_evidence": {
+  "path": "integration/model-bundle-r2/simulator_full_urdf/source-tinker-full.urdf",
+  "sha256": "1e4aae81d4fa3b90dbdcaeab4aa86e4cfc647243b297202d56c7597589239504",
+  "source_repo_path": "/home/tinker/tk25_ws/src/tk26_sim",
+  "source_relative_path": "_generated/tinker_full.full.urdf",
+  "source_commit": "18296c0140efcfd20935a05b258f10bf9153bf94"
+ },
+ "canonicalizer": {
+  "algorithm": "tinker2-urdf-canonical-v1",
+  "source_commit": "8a4e72465cb90e980632f205eb5c60684008d649",
+  "source_path": "tools/tinker_sim_deploy/workspace.py",
+  "output_sha256": "3e2361635c296defa9821bc00e89840506eaa57c27d8b8187b4bdb4e78c05fe6"
+ },
+ "selected_artifact": {
+  "path_relative": "artifacts/robot/tinker2/36ac0317025d20a5/robot.urdf",
+  "sha256": "3e2361635c296defa9821bc00e89840506eaa57c27d8b8187b4bdb4e78c05fe6"
+ },
+ "note": "The selected canonical simulator full URDF is the byte-exact output of the v1 URDF canonicalizer (tools/tinker_sim_deploy/workspace.py at the recorded simulator commit) applied to the recorded source URDF. The source-evidence copy is committed so the derivation is reproducible on a clean checkout without the gitignored artifacts/ tree. Regeneration must reproduce output_sha256 byte-for-byte."
+}

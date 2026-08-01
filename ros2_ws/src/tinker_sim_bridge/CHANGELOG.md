@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Task 8 fix round 1: make OMPL acceptance evidence reproducible)
+
+- The provenance suite now recomputes the production-overlay evidence from
+  immutable production git objects (`git show <recorded-commit>:<path>`), never
+  from contract literals alone: the exact ordered 18 `DeclareLaunchArgument`
+  names, literal-false `sim_ompl` compatibility booleans, literal-true task
+  parameters, the six `strict_sim_inputs` keys, the production import/node/
+  executable/controller allow-lists (from `launch_contract_helpers.py`,
+  including `re`/`importlib`/`rviz2`), the `pick_and_place/object_mesh` handoff,
+  and the smoke action-client scope.
+- `production_overlay.provider_allowlist` is split into
+  `production_allowlists` (exact production-enforced lists) and
+  `simulator_overlay_provider_set` (derived from the committed provider
+  manifest), removing the previously mixed/scope-confused hand-synthesized list.
+- The model-bundle acceptance evidence is reproducible on a clean checkout:
+  `model_bundle` gains `source_evidence` (committed simulator full-URDF source +
+  provenance descriptor under `integration/model-bundle-r2/simulator_full_urdf/`),
+  `production_source_commits`, `stable_manifest_sha256`, and
+  `preflight_report.stable_sha256` (deterministic projections excluding
+  host-absolute paths and `elapsed_ms`).  The provenance tests reconstruct the
+  manifest/preflight into a temporary directory from committed inputs and fail
+  (never skip) when required source evidence is absent.
+- `model_preflight.stable_preflight_evidence` and
+  `model_bundle.stable_manifest_evidence` expose the deterministic projections.
+- `tinker_sim_bridge.scenario_resolver` adds a ROS-free, deterministic
+  package-share fallback for qualification scenarios (rejecting byte
+  disagreement), wired into `launch/integrated_ompl_manipulation.launch.py`.
+- `setup.py` registers `integration/ompl-overlay-contract.json` (via a tracked
+  source symlink) and the three qualification scenarios under
+  `share/tinker_sim_bridge/{integration,scenarios}/`; the provenance suite
+  verifies installed bytes equal canonical source bytes.
+- The focused provenance invocation is documented with
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` (the ROS `launch_pytest` plugin otherwise
+  fails collection on the unavailable `lark` module).  The pre-existing pinned-uv
+  environment failure remains and is not masked.
+
 ### Added (Task 8: OMPL overlay acceptance contract)
 
 - `tests/test_provenance.py` extended (not replaced) with a deterministic

@@ -288,12 +288,26 @@ The contract records, with exact values:
 - **Source locks.**  Both repository-local source-lock files are Task 9 only;
   Task 8 does not create or modify either.
 
-`tests/test_provenance.py` recomputes every derived hash/contract from the
-real source and artifacts and fails on mutations (including raw-colcon text,
-provider-manifest drift, wrong compatibility booleans, dirty-policy
-violations, and premature source-lock inclusion).  The pre-existing uv
-environment provenance failure (installed `uv 0.12.0` vs pinned `uv 0.10.8`)
-remains an environment failure, not a code failure.
+`tests/test_provenance.py` recomputes every derived hash/contract from
+immutable git objects and committed source and fails on mutations (including
+argument order/count, literal compatibility booleans, strict-sim keys,
+production import/node/executable allow-lists, simulator provider set, handoff,
+model-bundle source evidence, stale current selection, and premature
+source-lock inclusion).  The pre-existing uv environment provenance failure
+(installed `uv 0.12.0` vs pinned `uv 0.10.8`) remains an environment failure,
+not a code failure.
+
+The focused provenance invocation on this host requires the ROS `launch_pytest`
+plugin autoload to be disabled, otherwise pytest collection fails with
+`ModuleNotFoundError: No module named 'lark'`:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv/bin/python -m pytest -q tests/test_provenance.py
+```
+
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` is documented in the root `README.md` and the
+bridge `README.md` verification blocks as the reproducible invocation; it does
+not hide the pre-existing pinned-uv failure.
 
 ## Deferred work and status
 

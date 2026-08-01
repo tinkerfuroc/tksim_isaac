@@ -77,6 +77,26 @@ def write_report(report_path: Path | str, result: Mapping[str, object]) -> Path:
     return report_path
 
 
+def stable_preflight_evidence(result: Mapping[str, object]) -> dict[str, object]:
+    """Return the deterministic preflight projection used for load-bearing hashing.
+
+    The raw report embeds a wall-clock ``elapsed_ms`` and the absolute
+    ``model_bundle_manifest`` path, and each check ``detail`` string may embed
+    host-absolute artifact paths; none of those are reproducible on a clean
+    checkout.  This projection keeps only the stable fields and reduces each
+    check to its ``name``/``ok`` pair, so its canonical JSON SHA-256 is
+    byte-reproducible from committed inputs.
+    """
+    checks = result.get("checks")
+    return {
+        "schema_version": result["schema_version"],
+        "status": result["status"],
+        "ready": result["ready"],
+        "structural_fingerprint": result.get("structural_fingerprint"),
+        "checks": [{"name": check["name"], "ok": check["ok"]} for check in checks] if isinstance(checks, list) else [],
+    }
+
+
 def _result(
     status: str,
     checks: list[dict[str, object]],
