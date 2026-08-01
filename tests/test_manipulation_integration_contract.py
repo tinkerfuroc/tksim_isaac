@@ -1,10 +1,50 @@
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "ros2_ws/src/tinker_sim_bridge"
+
+
+def test_checked_in_xacro_contains_state_only_drive_joint() -> None:
+    xacro = (BRIDGE / "config/tinker_topic_control.ros2_control.xacro").read_text(
+        encoding="utf-8"
+    )
+    root = ET.fromstring(xacro)
+    namespace = {"xacro": "http://www.ros.org/wiki/xacro"}
+    macro = root.find("xacro:macro", namespace)
+    assert macro is not None
+    control = macro.find("ros2_control")
+    assert control is not None
+    drives = [joint for joint in control.findall("joint") if joint.get("name") == "drive_joint"]
+    assert len(drives) == 1
+    drive = drives[0]
+    assert [item.get("name") for item in drive.findall("command_interface")] == []
+    assert [item.get("name") for item in drive.findall("state_interface")] == [
+        "position",
+        "velocity",
+        "effort",
+    ]
+
+
+def test_manipulation_launch_uses_shared_runtime_controller_description() -> None:
+    launch = (BRIDGE / "launch/manipulation.launch.py").read_text(encoding="utf-8")
+    assert "from tinker_sim_deploy.runtime import resolve_current_artifact, topic_control_description" in launch
+    assert "robot_description = topic_control_description(resolved_artifact.robot_urdf)" in launch
+    assert "_topic_control_description" not in launch
+
+
+def test_traj_controller_keeps_seven_arm_joints() -> None:
+    controllers = (BRIDGE / "config/controllers.yaml").read_text(encoding="utf-8")
+    assert "joints: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]" in controllers
+    assert "drive_joint" not in controllers
+
+
+def test_gripper_command_path_remains_controller_gripper_commands() -> None:
+    gateway = (BRIDGE / "tinker_sim_bridge/command_gateway.py").read_text(encoding="utf-8")
+    assert '"/sim/controller/gripper_commands"' in gateway
 
 
 def test_runner_preserves_logical_ids_and_stable_namespace_contract() -> None:

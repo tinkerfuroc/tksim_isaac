@@ -44,6 +44,7 @@ setup(
             "controller_reconciler = tinker_sim_bridge.controller_reconciler:main",
             "gripper_facade = tinker_sim_bridge.gripper_facade:main",
             "initial_pose = tinker_sim_bridge.initial_pose:main",
+            "joint_state_probe = tinker_sim_bridge.joint_state_probe:main",
             "model_bundle = tinker_sim_bridge.model_bundle:main",
             "model_limits = tinker_sim_bridge.model_limits:main",
             "model_preflight = tinker_sim_bridge.model_preflight:main",

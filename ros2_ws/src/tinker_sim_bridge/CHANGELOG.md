@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Integrated eight-joint state contract: `drive_joint` is now state-only
+  (`position`/`velocity`/`effort`, zero command interfaces) in both the checked-in
+  `config/tinker_topic_control.ros2_control.xacro` and the live controller
+  description produced by `tools/tinker_sim_deploy/runtime.py:
+  topic_control_description`, so the `robot_description` supplied to
+  `controller_manager` and `robot_state_publisher` carries the same state-only
+  joint.  `xarm7_traj_controller` keeps the seven arm joints and the gripper
+  command path stays `/sim/controller/gripper_commands`.
+- Pure ROS-free contract helpers in `contract_guard.py`:
+  `evaluate_joint_state_sample` (exact eight names, cardinality one, source
+  `joint_state_broadcaster`, nonzero stamp, finite arrays, bounded age),
+  `evaluate_integrated_cardinality` (graph publisher cardinality/source),
+  `evaluate_robot_description_contract`, `evaluate_xacro_contract`, and
+  `evaluate_joint_state_evidence_pair` (compares checked-in xacro and live
+  `robot_description` evidence).  All return complete `ready`/`reasons`/
+  `observed` mappings with no global clock or implicit topic name.
+- ROS Humble live probe executable `joint_state_probe`: reads the
+  `/controller_manager` `robot_description` parameter, parses the checked-in
+  xacro, subscribes to `/joint_states`, reads `/joint_states` publisher graph
+  metadata, evaluates the pure contract helpers, and publishes compact JSON on
+  `/sim/status/joint_state_contract` (latched, reliable).  Registers the
+  console script and declares `ament_index_python` + `rcl_interfaces` exec
+  dependencies.
+
 - Canonical manipulation model-bundle producer (`model_bundle`) and bounded
   preflight validator (`model_preflight`), with pure ROS-free
   `model_contract` semantics matching the production `xarm_moveit_config`
@@ -29,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `test_runtime_transformer_is_shared_and_arm_only` updated to the eight-joint
+  contract: the live transformer now emits exactly one state-only `drive_joint`
+  alongside `joint1`..`joint7`, verified through the complete real robot URDF.
 - Preflight artifact-identity gate now fails closed: every fully-ready report
   contains a successful `artifact_identity` check, derived from the explicit
   project root, the manifest simulator artifact path, or the environment, and
