@@ -236,6 +236,102 @@ through the authoritative Task 3 resolver (it skips only when the gitignored
 artifact tree is not provisioned).  Probe-node behavior under the Humble Python
 3.10 runtime is covered by `tests/test_joint_state_probe_node.py`.
 
+## Atomic fixture PlanningScene adapter (Task 5)
+
+`fixture_planning_scene` is the live Humble node that installs the public
+qualification fixtures into the MoveIt PlanningScene as exactly one atomic
+replacement diff.  The fixture namespace is exclusively `sim_fixture/*`; the
+task-owned handoff is exactly `pick_and_place/object_mesh`; no other PlanningScene
+namespace is removed or replaced.  The three public qualification scenarios
+(`qualification-moveit-plan-joint`, `qualification-moveit-plan-pose`,
+`qualification-moveit-plan-blocked`) share the same pedestal and public-target
+identity; the blocked scenario adds `sim_fixture/plan_blocker` while retaining
+the same target source/handoff.
+
+### ROS-free contract (`fixture_contract.py`)
+
+`fixture_contract.py` is import-time ROS-free and defines the typed helpers:
+
+- `revision_digest(planning_scene)` — deterministic canonical digest over the
+  full `planning_scene` declaration (excluding its own `revision_digest` key).
+- `parse_required_fixture_owned_ids(value)` — parses the declared task-owned
+  `sim_fixture/*` ids from a comma/JSON parameter, rejecting foreign or
+  duplicate ids.
+- `build_atomic_revision_diff(*, desired_objects, existing_ids)` — returns one
+  `PlanningSceneDiffPlan`: every desired `sim_fixture/*` object as an ADD and
+  every stale existing `sim_fixture/*` id as a REMOVE; foreign-namespace ids
+  are never touched.  `apply_request` is exactly one canonical JSON-able
+  PlanningScene diff.
+- `confirm_fixture_revision(*, service_result, scene_ids, status,
+  expected_revision, expected_digest, expected_owned_ids)` — fail-closed
+  readback/status confirmation covering owned-id presence, no foreign
+  `sim_fixture/*` leakage, and canonical status consistency (schema version,
+  ready state, owner, revision, digest, owned ids, target identity, monotonic
+  sequence, finite `published_at`, descriptor digest).
+
+The immutable data types `CollisionObjectSpec`, `PlanningSceneDiffPlan`, and
+`Confirmation` carry every field the node and tests consume.
+
+`fixture_planning_scene.py` (also ROS-free) bridges a scenario `planning_scene`
+declaration into ADD specs (`fixture_to_specs`), the declared-order owned ids
+(`fixture_owned_ids`), the shared fixture descriptor (`fixture_descriptor` +
+`fixture_descriptor_sha256`), and the canonical shared fixture-status mapping
+(`canonical_fixture_status`).  Diagnostic regions enter the collision-body set
+only when explicitly marked `enter_collision_bodies: true`.
+
+### Scenario schema
+
+Scenario schema version 2 gains an optional `planning_scene` object (no parallel
+scenario format).  Strict validation requires a nonempty revision, a canonical
+matching `revision_digest`, frame `base_link`, unique `sim_fixture/*` ids, finite
+poses, positive primitive dimensions, hashed absolute/declared mesh assets, a
+declared `target_source_id`, and the exact scalar `target_handoff` of
+`pick_and_place/object_mesh`.
+
+### Live node
+
+`fixture_planning_scene_node.FixturePlanningScene` gates on the staged
+`/sim/ready/physics` Trigger service, waits boundedly for `/apply_planning_scene`
+and `/get_planning_scene`, pre-reads the current scene to discover stale
+`sim_fixture/*` ids, applies exactly one atomic diff, reads the scene back,
+confirms readback/status, and only then serves `/sim/ready/fixture`
+(`std_srvs/srv/Trigger`).  While alive it publishes a reliable transient-local
+5 Hz compact JSON heartbeat on `/sim/status/planning_scene_fixture`
+(`std_msgs/msg/String`) with exactly: `schema_version=1`, `state`, `scenario`,
+`owner="sim_fixture"`, `revision`, `revision_digest`, monotonic `sequence`,
+finite `published_at`, declared-order `owned_ids`, `target_source_id`, scalar
+`target_handoff="pick_and_place/object_mesh"`, and `fixture_descriptor_sha256`.
+Any service failure, malformed readback, status mismatch, or deadline exhaustion
+fails closed to `state="FIXTURE_FAILED"` and the ready service returns failure.
+
+The fixture adapter never owns task objects: the downstream hardening
+reconciler receives the full SRDF-derived eight-link touch set
+(`xarm_gripper_base_link`, `left_outer_knuckle`, `left_finger`,
+`left_inner_knuckle`, `right_inner_knuckle`, `right_outer_knuckle`,
+`right_finger`, `link_tcp`) from the validated model contract, and creates the
+canonical task-owned object from the Pick goal's `object_points` using the
+declared `target_source_id` and `target_handoff` as the shared identity.
+
+Run:
+
+```bash
+ros2 run tinker_sim_bridge fixture_planning_scene \
+  --ros-args -p scenario_file:=$PWD/simulation/scenarios/qualification-moveit-plan-joint.json
+```
+
+### Tests
+
+```bash
+cd /home/tinker/tinker-sim/6.0.1
+PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
+  ./.venv/bin/python -m pytest -q tests/test_fixture_planning_scene.py \
+  tests/test_scenario_runner.py
+```
+
+Pure contract/scenario tests run under the simulator Python 3.12 venv; the node
+is imported only in the Humble Python 3.10 tests through a local import after
+sourcing system ROS.
+
 ## Deployment gateways
 
 The remaining bridge nodes implement hardware-parity gateways and controllers

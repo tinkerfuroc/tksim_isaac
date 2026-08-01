@@ -1,0 +1,98 @@
+{
+  "schema_version": 2,
+  "id": "qualification-moveit-plan-pose",
+  "qualification_gate": "moveit-plan-pose",
+  "seed": 7,
+  "world": {
+    "mode": "current"
+  },
+  "robot": {
+    "id": "tinker2",
+    "initial_pose": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "actors": [],
+  "objects": [],
+  "events": [
+    {
+      "at_sim_time": 0.0,
+      "event": "spawn_once_while_paused"
+    }
+  ],
+  "postconditions": [
+    {
+      "name": "fixture ready",
+      "path": "planning_scene_fixture.state",
+      "operator": "equals",
+      "value": "FIXTURE_READY"
+    },
+    {
+      "name": "fixture revision",
+      "path": "planning_scene_fixture.revision",
+      "operator": "equals",
+      "value": "2026-08-01-moveit-qualification-pose"
+    }
+  ],
+  "planning_scene": {
+    "revision": "2026-08-01-moveit-qualification-pose",
+    "frame_id": "base_link",
+    "target_source_id": "sim_fixture/public_target",
+    "target_handoff": "pick_and_place/object_mesh",
+    "objects": [
+      {
+        "id": "sim_fixture/pedestal",
+        "class": "static",
+        "primitive": {
+          "type": "box",
+          "dimensions": [
+            0.7,
+            0.7,
+            0.85
+          ]
+        },
+        "pose": {
+          "xyz": [
+            0.55,
+            0.0,
+            0.425
+          ],
+          "quaternion_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        }
+      },
+      {
+        "id": "sim_fixture/public_target",
+        "class": "target",
+        "primitive": {
+          "type": "box",
+          "dimensions": [
+            0.08,
+            0.08,
+            0.08
+          ]
+        },
+        "pose": {
+          "xyz": [
+            0.45,
+            0.2,
+            0.89
+          ],
+          "quaternion_xyzw": [
+            0.0,
+            0.0,
+            0.382683,
+            0.92388
+          ]
+        }
+      }
+    ],
+    "revision_digest": "fb2abd517a6c6d2f5d34ec099f3e62a245a968e52cd3223bb5ac911d5382af67"
+  }
+}

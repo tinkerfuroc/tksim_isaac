@@ -124,3 +124,34 @@ def test_spawn_failure_is_not_retried() -> None:
         runner.execute([operation])
 
     assert calls == 1
+
+
+def test_planning_scene_scenario_compiles_without_extra_spawn_operations() -> None:
+    """A schema-2 scenario with an optional planning_scene compiles cleanly.
+
+    The fixture PlanningScene is applied by the dedicated
+    ``fixture_planning_scene`` node, so the standard scenario runner must not
+    synthesize additional spawn operations from ``planning_scene`` and must
+    carry the scenario id/seed into the final PLAYING boundary.
+    """
+    from tinker_sim_core.orchestration import standard_operations
+    from tinker_sim_core.scenario import load_named_scenario
+
+    root = Path(__file__).resolve().parents[1]
+    scenario = load_named_scenario(
+        root, "qualification-moveit-plan-blocked"
+    )
+    assert scenario.planning_scene is not None
+    operations = standard_operations(root, scenario, seed=7)
+    kinds = [operation.kind for operation in operations]
+    assert kinds == [
+        "reset_spawned",
+        "set_simulation_state",
+        "set_simulation_state",
+    ]
+    assert all("spawn_entity" not in kind for kind in kinds)
+    final_state = operations[-1].payload
+    assert final_state["state"] == 1
+    assert final_state["boundary"] == "PHYSICS_READY"
+    assert final_state["scenario"] == "qualification-moveit-plan-blocked"
+    assert final_state["seed"] == 7
