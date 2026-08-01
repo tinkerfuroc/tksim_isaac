@@ -21,17 +21,29 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 from tf2_msgs.msg import TFMessage
+from tf2_ros import (
+    Buffer,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
+    TransformListener,
+)
 
 from .contract_guard import JOINT_STATE_SERVICE_TIMEOUT_S, JOINT_STATE_SERVICE_TTL_S, step_service
 from .integrated_readiness import (
     INTEGRATED_ACTIONS,
     INTEGRATED_JOINT_STATE_NAMES,
+    INTEGRATED_PUBLISHERS,
     INTEGRATED_SERVICES,
     INTEGRATED_TOUCH_LINKS,
+    TF_CHILD,
+    TF_PARENT,
     evaluate_integrated_readiness,
+    normalize_qos_value,
     parse_canonical_report,
     sha256_bytes,
     sha256_json,
@@ -58,6 +70,18 @@ def _endpoint_label(info: object) -> str:
     return "/" + name
 
 
+def _qos_profile_of(info: object) -> dict[str, object] | None:
+    """Normalize a Humble ``PublishersInfo.qos_profile`` into comparable fields."""
+    profile = getattr(info, "qos_profile", None)
+    if profile is None:
+        return None
+    return {
+        "reliability": normalize_qos_value(getattr(profile, "reliability", "")),
+        "durability": normalize_qos_value(getattr(profile, "durability", "")),
+        "depth": int(getattr(profile, "depth", 0)),
+    }
+
+
 def _bool_value(message) -> bool | None:
     value = getattr(message, "data", None)
     if isinstance(value, bool):
@@ -76,12 +100,14 @@ class IntegratedReadiness(Node):
         node_name: str | None = None,
         context=None,
         parameter_overrides=None,
+        create_status_publisher: bool = True,
     ) -> None:
         super().__init__(
             node_name or "integrated_readiness",
             context=context,
             parameter_overrides=parameter_overrides or [],
         )
+        self._create_status_publisher = create_status_publisher
         try:
             self._initialize()
         except Exception:
@@ -108,7 +134,9 @@ class IntegratedReadiness(Node):
         self.declare_parameter("planning_scene_target_source_id", "")
         self.declare_parameter("planning_scene_target_handoff", "")
         self.declare_parameter("integrated_mapping", "{}")
+        self.declare_parameter("public_integrated_mapping", "")
         self.declare_parameter("integrated_sha256", "")
+        self.declare_parameter("runtime_contract_sha256", "")
         self.declare_parameter("model_fingerprint", "")
         self.declare_parameter("fail_exit_s", 0.0)
         period = float(self.get_parameter("check_period_s").value)
@@ -120,8 +148,6 @@ class IntegratedReadiness(Node):
             raise ValueError("startup_timeout_s must be positive")
         self._started = time.monotonic()
         self._fail_exit_s = float(self.get_parameter("fail_exit_s").value)
-        self._contract = self._build_contract()
-
         self._report_path = str(self.get_parameter("report_path").value)
         self._physics_ready_path = str(self.get_parameter("physics_ready_path").value)
         self._provider_manifest_path = str(
@@ -130,6 +156,7 @@ class IntegratedReadiness(Node):
         self._model_bundle_manifest = str(
             self.get_parameter("model_bundle_manifest").value
         )
+        self._contract = self._build_contract()
 
         self._joint_sample: JointState | None = None
         self._joint_received_at = 0.0
@@ -144,10 +171,17 @@ class IntegratedReadiness(Node):
         self._fixture_status: Mapping[str, object] | None = None
         self._fixture_received_at = 0.0
         self._fixture_last_sequence: int | None = None
-        self._tf_seen = False
+        self._tf_observed: Mapping[str, object] | None = None
         self._controller_entries: list[tuple[str, str]] = []
         self._controllers_state: dict[str, object] = {}
         self._service_group = ReentrantCallbackGroup()
+
+        # A tf2 buffer + transform listener composes the real multi-hop chain
+        # (dynamic joints on /tf plus the fixed joint_tcp on /tf_static) rather
+        # than requiring a direct base_link -> link_tcp edge that RSP never
+        # publishes.  TransformListener subscribes to both /tf and /tf_static.
+        self._tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=False)
 
         self._model_preflight = self._run_model_preflight()
         self._provider_evidence = self._read_provider_manifest()
@@ -158,12 +192,13 @@ class IntegratedReadiness(Node):
         self._last_reasons: list[str] = []
         self._fail_since = None
 
-        status_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        self._publisher = self.create_publisher(String, _STATUS_TOPIC, status_qos)
+        if self._create_status_publisher:
+            status_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self._publisher = self.create_publisher(String, _STATUS_TOPIC, status_qos)
         self._fixture_sub_qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -176,11 +211,6 @@ class IntegratedReadiness(Node):
         )
         self._bool_sub_qos = QoSProfile(
             depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
-        self._tf_sub_qos = QoSProfile(
-            depth=100,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
@@ -201,9 +231,6 @@ class IntegratedReadiness(Node):
             "/sim/status/planning_scene_fixture",
             self._on_fixture_status,
             self._fixture_sub_qos,
-        )
-        self.create_subscription(
-            TFMessage, "/tf", self._on_tf, self._tf_sub_qos
         )
         self.create_timer(period, self._check)
 
@@ -226,6 +253,19 @@ class IntegratedReadiness(Node):
             raise ValueError("planning_scene_owned_ids parameter is not valid JSON") from exc
         if not isinstance(owned_ids, list):
             raise ValueError("planning_scene_owned_ids parameter must be a JSON array")
+        # The public report's integrated field is the production-canonical
+        # one-key mapping used for report validation; the full runtime contract
+        # (``integrated_mapping``) drives the readiness evaluator.
+        public_raw = str(self.get_parameter("public_integrated_mapping").value)
+        if public_raw and public_raw.strip():
+            try:
+                public_integrated = json.loads(public_raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError("public_integrated_mapping parameter is not valid JSON") from exc
+            if not isinstance(public_integrated, dict):
+                raise ValueError("public_integrated_mapping parameter must be a JSON object")
+        else:
+            public_integrated = integrated
         return {
             "schema_version": 1,
             "report_revision": "integrated-manipulation-v1",
@@ -248,7 +288,11 @@ class IntegratedReadiness(Node):
                 self.get_parameter("planning_scene_target_handoff").value
             ),
             "integrated_mapping": integrated,
+            "public_integrated_mapping": public_integrated,
             "integrated_sha256": str(self.get_parameter("integrated_sha256").value),
+            "runtime_contract_sha256": str(
+                self.get_parameter("runtime_contract_sha256").value
+            ),
             "model_fingerprint": str(self.get_parameter("model_fingerprint").value),
             "provider_manifest_path": self._provider_manifest_path,
             "provider_manifest_sha256": str(
@@ -256,13 +300,14 @@ class IntegratedReadiness(Node):
             ),
             "actions": INTEGRATED_ACTIONS,
             "services": INTEGRATED_SERVICES,
+            "publishers": INTEGRATED_PUBLISHERS,
             "controller_resources": {
                 "joint_state_broadcaster": "active",
                 "xarm7_traj_controller": "active",
             },
             "joint_names": list(INTEGRATED_JOINT_STATE_NAMES),
-            "tf_parent": "base_link",
-            "tf_child": "link_tcp",
+            "tf_parent": TF_PARENT,
+            "tf_child": TF_CHILD,
             "touch_links": list(INTEGRATED_TOUCH_LINKS),
         }
 
@@ -304,14 +349,6 @@ class IntegratedReadiness(Node):
         if isinstance(parsed, dict):
             self._fixture_status = parsed
             self._fixture_received_at = time.monotonic()
-
-    def _on_tf(self, message: TFMessage) -> None:
-        for transform in message.transforms:
-            if (
-                transform.header.frame_id == "base_link"
-                and transform.child_frame_id == "link_tcp"
-            ):
-                self._tf_seen = True
 
     # ------------------------------------------------------------------
     # File evidence
@@ -396,6 +433,7 @@ class IntegratedReadiness(Node):
             "canonical_self_hash": canonical_self_hash,
             "recorded_sha256": recorded,
             "bytes_sha256": raw_bytes_hash,
+            "manifest": raw,
         }
 
     def _read_shared_report(self) -> dict[str, object]:
@@ -462,7 +500,9 @@ class IntegratedReadiness(Node):
                 by_node = self.get_service_names_and_types_by_node(node_name, node_namespace)
             except Exception:  # noqa: BLE001 - transient graph reads must not crash
                 continue
-            for service_name, types in by_node.items():
+            # Humble rclpy returns a list of (service_name, types) pairs, not a
+            # mapping.
+            for service_name, types in by_node:
                 servers.setdefault(service_name, []).append((label, list(types)))
         return servers
 
@@ -476,7 +516,7 @@ class IntegratedReadiness(Node):
                 by_node = self.get_service_names_and_types_by_node(node_name, node_namespace)
             except Exception:  # noqa: BLE001
                 continue
-            result[label] = {name: list(types) for name, types in by_node.items()}
+            result[label] = {name: list(types) for name, types in by_node}
         return result
 
     def _probe_actions(self) -> dict[str, object]:
@@ -489,11 +529,14 @@ class IntegratedReadiness(Node):
             goal_servers = servers.get(goal_service, [])
             result_servers = servers.get(result_service, [])
             goal_labels = sorted({label for label, _types in goal_servers})
+            goal_types = sorted({t for _label, tlist in goal_servers for t in tlist})
             expected_source = spec["source"]
             if expected_source.startswith("controller_resource:"):
                 # A controller-manager-hosted action server has no dedicated
                 # node identity; the exact logical-resource literal is the
                 # source proof while observed_sources records the serving node.
+                # Type/cardinality are proven from the live goal-service graph
+                # and the typed active xarm7_traj_controller resource evidence.
                 source = expected_source if len(goal_servers) == 1 else ""
                 source_ok = len(goal_servers) == 1
             else:
@@ -506,6 +549,7 @@ class IntegratedReadiness(Node):
                 "sources": goal_labels,
                 "observed_sources": goal_labels,
                 "type": action_type,
+                "observed_types": goal_types,
                 "result_service_present": len(result_servers) >= 1,
                 "source_ok": source_ok,
                 "ready": count == 1 and source_ok and len(result_servers) >= 1,
@@ -705,8 +749,10 @@ class IntegratedReadiness(Node):
         source: str = "",
         count: int = 0,
         sources: list[str] | None = None,
-        durability: str = "",
-        reliability: str = "",
+        observed_qos: Mapping[str, object] | None = None,
+        expected_durability: str | None = None,
+        expected_reliability: str | None = None,
+        expected_depth: int | None = None,
     ) -> dict[str, object]:
         now = time.monotonic()
         reasons: list[str] = []
@@ -726,6 +772,37 @@ class IntegratedReadiness(Node):
             reasons.append("publisher count is {}, expected 1".format(count))
         if sources and source and source not in sources:
             reasons.append("publisher source {!r} not in observed {!r}".format(source, sources))
+        qos = observed_qos or {}
+        if expected_durability is not None:
+            observed_dur = normalize_qos_value(qos.get("durability", ""))
+            if observed_dur != normalize_qos_value(expected_durability):
+                reasons.append(
+                    "publisher durability {!r} != expected {!r}".format(
+                        observed_dur, expected_durability
+                    )
+                )
+        if expected_reliability is not None:
+            observed_rel = normalize_qos_value(qos.get("reliability", ""))
+            if observed_rel != normalize_qos_value(expected_reliability):
+                reasons.append(
+                    "publisher reliability {!r} != expected {!r}".format(
+                        observed_rel, expected_reliability
+                    )
+                )
+        if expected_depth is not None:
+            try:
+                depth_value = int(qos.get("depth", 0))
+            except (TypeError, ValueError):
+                depth_value = 0
+            # Humble publisher info never reports depth (always 0), so depth is
+            # compared only when actually reported; reliability/durability are
+            # reported and compared strictly above.
+            if depth_value > 0 and depth_value != int(expected_depth):
+                reasons.append(
+                    "publisher depth {!r} != expected {!r}".format(
+                        qos.get("depth"), expected_depth
+                    )
+                )
         return {
             "ready": not reasons,
             "reasons": reasons,
@@ -736,16 +813,50 @@ class IntegratedReadiness(Node):
             "source": source,
             "observed_sources": sources or [],
             "count": count,
-            "durability": durability,
-            "reliability": reliability,
+            "qos": dict(qos),
             "min_samples": min_samples,
             "received_samples": samples,
         }
 
     def _tf_evidence(self) -> dict[str, object]:
-        if not self._tf_seen:
-            return {"ready": False, "reasons": ["base_link -> link_tcp transform not observed"], "parent": "base_link", "child": "link_tcp", "exists": False}
-        return {"ready": True, "reasons": [], "parent": "base_link", "child": "link_tcp", "exists": True}
+        """Compose the real multi-hop TF chain via the tf2 buffer.
+
+        RSP publishes one transform per joint (dynamic joints on ``/tf`` and the
+        fixed ``joint_tcp`` on ``/tf_static``); ``base_link -> link_tcp`` is
+        multi-hop.  A composed lookup through ``TransformListener`` (which
+        consumes both ``/tf`` and ``/tf_static``) proves the chain.  The
+        transform's sim-time header stamp is recorded; no incompatible
+        wall/sim/monotonic clock comparison is performed.
+        """
+        now = time.monotonic()
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                TF_PARENT, TF_CHILD, Time()
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException) as exc:
+            self._tf_observed = {
+                "ready": False,
+                "reasons": [
+                    "base_link -> link_tcp composed lookup failed: {}".format(exc)
+                ],
+                "parent": TF_PARENT,
+                "child": TF_CHILD,
+                "exists": False,
+                "lookup_at_s": now,
+            }
+            return dict(self._tf_observed)
+        stamp = transform.header.stamp
+        stamp_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        self._tf_observed = {
+            "ready": stamp_ns != 0,
+            "reasons": [] if stamp_ns != 0 else ["base_link -> link_tcp transform has zero stamp"],
+            "parent": str(transform.header.frame_id),
+            "child": str(transform.child_frame_id),
+            "exists": True,
+            "stamp_ns": stamp_ns,
+            "lookup_at_s": now,
+        }
+        return dict(self._tf_observed)
 
     def _fixture_evidence(self) -> dict[str, object]:
         status = self._fixture_status
@@ -794,7 +905,52 @@ class IntegratedReadiness(Node):
         }
 
     def _provider_manifest_evidence(self) -> dict[str, object]:
-        return dict(self._provider_evidence)
+        evidence = dict(self._provider_evidence)
+        manifest = evidence.get("manifest")
+        if not isinstance(manifest, dict):
+            # Re-read the parsed manifest for the live-agreement comparison.
+            manifest = self._provider_manifest_parsed()
+        evidence["manifest"] = manifest
+        evidence["observed_nodes"] = [
+            _endpoint_label(
+                type("Info", (), {"node_name": name, "node_namespace": namespace})()
+            )
+            for name, namespace in self.get_node_names_and_namespaces()
+        ]
+        metadata = self._publisher_metadata()
+        evidence["observed_publishers"] = sorted(
+            topic for topic, entry in metadata.items() if entry.get("count", 0) > 0
+        )
+        evidence["observed_controllers"] = {
+            name: state for name, state in self._controller_entries
+        }
+        return evidence
+
+    def _provider_manifest_parsed(self) -> dict[str, object]:
+        if not self._provider_manifest_path:
+            return {}
+        try:
+            raw = json.loads(Path(self._provider_manifest_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _publisher_metadata(self) -> dict[str, object]:
+        """Probe every typed publisher endpoint for count/source/type/QoS."""
+        observed: dict[str, object] = {}
+        for topic in INTEGRATED_PUBLISHERS:
+            publishers = self.get_publishers_info_by_topic(topic)
+            labels = [_endpoint_label(info) for info in publishers]
+            types = sorted({str(getattr(info, "topic_type", "")) for info in publishers})
+            qos = _qos_profile_of(publishers[0]) if publishers else None
+            observed[topic] = {
+                "count": len(publishers),
+                "source": labels[0] if len(labels) == 1 else labels,
+                "sources": labels,
+                "types": types,
+                "qos": qos,
+            }
+        return observed
 
     def _semantic_model_evidence(self) -> dict[str, object]:
         preflight = self._model_preflight
@@ -813,15 +969,20 @@ class IntegratedReadiness(Node):
         }
 
     def _collision_evidence(self) -> dict[str, object]:
+        publishers = self.get_publishers_info_by_topic("/sim/safety/collision")
         return self._bool_evidence(
             self._collision,
             self._collision_received_at,
             max_age_s=_SAFETY_MAX_AGE_S,
             expected_value=False,
             samples=self._collision_samples,
-            source="/tinker_sim_safety_supervisor",
-            count=len(self.get_publishers_info_by_topic("/sim/safety/collision")),
-            sources=[_endpoint_label(info) for info in self.get_publishers_info_by_topic("/sim/safety/collision")],
+            source="/tinker_isaac_gateway",
+            count=len(publishers),
+            sources=[_endpoint_label(info) for info in publishers],
+            observed_qos=_qos_profile_of(publishers[0]) if publishers else None,
+            expected_durability="TRANSIENT_LOCAL",
+            expected_reliability="RELIABLE",
+            expected_depth=1,
         )
 
     def _mapping_evidence(self) -> dict[str, object]:
@@ -849,6 +1010,18 @@ class IntegratedReadiness(Node):
             reasons.append("shared report model_fingerprint does not match contract")
         if observed["provider_manifest_sha256"] != expected.get("provider_manifest_sha256"):
             reasons.append("shared report provider_manifest_sha256 does not match contract")
+        # The full runtime readiness contract is carried separately; recompute
+        # its digest from the unchanged mapping and compare it to the expected
+        # runtime digest supplied by the launch.
+        runtime_expected = expected.get("runtime_contract_sha256", "")
+        runtime_actual = sha256_json(expected.get("integrated_mapping", {}))
+        observed["runtime_contract_sha256"] = runtime_actual
+        if runtime_expected and runtime_actual != runtime_expected:
+            reasons.append(
+                "runtime contract mapping sha256 {!r} does not match expected {!r}".format(
+                    runtime_actual, runtime_expected
+                )
+            )
         return {"ready": not reasons, "reasons": reasons, "observed": observed}
 
     # ------------------------------------------------------------------
@@ -859,6 +1032,7 @@ class IntegratedReadiness(Node):
         self._step_list_controllers()
         graph_services = self._graph_services()
         graph_actions = self._probe_actions()
+        publisher_metadata = self._publisher_metadata()
         services: dict[str, object] = {}
         for endpoint, entry in graph_services.items():
             services[endpoint] = entry
@@ -870,26 +1044,7 @@ class IntegratedReadiness(Node):
             "source": arm_service.get("source", ""),
             "type": arm_service.get("type", ""),
         }
-        joint_publishers = self.get_publishers_info_by_topic("/joint_states")
-        joint_qos = None
-        if joint_publishers:
-            profile = getattr(joint_publishers[0], "qos_profile", None)
-            if profile is not None:
-                joint_qos = {
-                    "reliability": str(getattr(profile, "reliability", "")),
-                    "durability": str(getattr(profile, "durability", "")),
-                    "depth": int(getattr(profile, "depth", 0)),
-                }
         operator_publishers = self.get_publishers_info_by_topic("/sim/safety/operator")
-        operator_qos = None
-        if operator_publishers:
-            profile = getattr(operator_publishers[0], "qos_profile", None)
-            if profile is not None:
-                operator_qos = {
-                    "reliability": str(getattr(profile, "reliability", "")),
-                    "durability": str(getattr(profile, "durability", "")),
-                    "depth": int(getattr(profile, "depth", 0)),
-                }
         safety_publishers = self.get_publishers_info_by_topic("/sim/hardware/safety_stop")
         safety_sources = [_endpoint_label(info) for info in safety_publishers]
         snapshot: dict[str, object] = {
@@ -897,7 +1052,7 @@ class IntegratedReadiness(Node):
             "shared_report": self._report_evidence,
             "joint_states": {
                 **self._joint_evidence(),
-                "qos": joint_qos,
+                "qos": publisher_metadata.get("/joint_states", {}).get("qos"),
             },
             "tf": self._tf_evidence(),
             "controller_resources": self._controller_evidence(),
@@ -910,8 +1065,10 @@ class IntegratedReadiness(Node):
                 source="/tinker_integrated_gate_executor",
                 count=len(operator_publishers),
                 sources=[_endpoint_label(info) for info in operator_publishers],
-                durability="TRANSIENT_LOCAL",
-                reliability="RELIABLE",
+                observed_qos=publisher_metadata.get("/sim/safety/operator", {}).get("qos"),
+                expected_durability="TRANSIENT_LOCAL",
+                expected_reliability="RELIABLE",
+                expected_depth=1,
             ),
             "safety_stop": self._bool_evidence(
                 self._safety_stop,
@@ -923,13 +1080,16 @@ class IntegratedReadiness(Node):
                 source="/tinker_sim_safety_supervisor",
                 count=len(safety_publishers),
                 sources=safety_sources,
-                durability="TRANSIENT_LOCAL",
-                reliability="RELIABLE",
+                observed_qos=publisher_metadata.get("/sim/hardware/safety_stop", {}).get("qos"),
+                expected_durability="TRANSIENT_LOCAL",
+                expected_reliability="RELIABLE",
+                expected_depth=1,
             ),
             "actions": graph_actions,
             "services": services,
             "arm_joint_service": arm_evidence,
             "fixture_status": self._fixture_evidence(),
+            "publishers": publisher_metadata,
             "mapping_agreement": self._mapping_evidence(),
             "provider_manifest": self._provider_manifest_evidence(),
             "semantic_model": self._semantic_model_evidence(),
@@ -958,9 +1118,10 @@ class IntegratedReadiness(Node):
             "evidence": report.evidence,
         }
         self._last_status = status
-        message = String()
-        message.data = json.dumps(status, sort_keys=True, separators=(",", ":"))
-        self._publisher.publish(message)
+        if self._create_status_publisher:
+            message = String()
+            message.data = json.dumps(status, sort_keys=True, separators=(",", ":"))
+            self._publisher.publish(message)
         if not report.ready:
             self.get_logger().warning(
                 "integrated readiness fail: {}".format(

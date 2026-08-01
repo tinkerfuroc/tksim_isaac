@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -155,3 +157,89 @@ def test_planning_scene_scenario_compiles_without_extra_spawn_operations() -> No
     assert final_state["boundary"] == "PHYSICS_READY"
     assert final_state["scenario"] == "qualification-moveit-plan-blocked"
     assert final_state["seed"] == 7
+
+
+class _FakeResultsNode:
+    """A minimal stand-in for the real ScenarioRunner graph node.
+
+    ``main()`` builds the legacy/canonical report from ``execute(operations)``;
+    the fake node returns canned results and records construction arguments.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def execute(self, operations):
+        del operations
+        return [
+            {"operation": "reset_spawned", "accepted": True},
+            {
+                "operation": "set_simulation_state",
+                "accepted": True,
+                "state": 1,
+                "boundary": "PHYSICS_READY",
+            },
+        ]
+
+    def destroy_node(self) -> None:
+        return None
+
+
+def _patch_rclpy_and_runner(monkeypatch):
+    import rclpy
+
+    monkeypatch.setattr(scenario_runner.rclpy, "init", lambda args=None: None)
+    monkeypatch.setattr(scenario_runner.rclpy, "ok", lambda: False)
+    monkeypatch.setattr(
+        scenario_runner.rclpy.utilities, "remove_ros_args", lambda args: args
+    )
+    monkeypatch.setattr(scenario_runner, "ScenarioRunner", _FakeResultsNode)
+
+
+def _legacy_argv(tmp_path, *, report: str | None) -> list[str]:
+    argv = [
+        "tinker_sim_scenario_runner",
+        "--root", str(ROOT),
+        "--scenario", "qualification-moveit-plan-joint",
+        "--seed", "7",
+        "--timeout", "20",
+    ]
+    if report is not None:
+        argv += ["--report", str(tmp_path / "scenario-runner.json")]
+    return argv
+
+
+def test_legacy_path_without_report_prints_previous_shape(capsys, monkeypatch, tmp_path) -> None:
+    """The non-overlay branch prints the exact previous report shape and does not
+    require a --report file."""
+    _patch_rclpy_and_runner(monkeypatch)
+    scenario_runner.main(_legacy_argv(tmp_path, report=None))
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report["schema_version"] == 1
+    assert report["scenario"] == "qualification-moveit-plan-joint"
+    assert report["seed"] == 7
+    assert report["control_api"] == "simulation_interfaces"
+    assert report["custom_control_services"] is False
+    assert report["operations"][-1]["boundary"] == "PHYSICS_READY"
+    assert not (tmp_path / "scenario-runner.json").exists()
+
+
+def test_legacy_path_with_report_writes_atomic_previous_shape(capsys, monkeypatch, tmp_path) -> None:
+    """The non-overlay branch honors --report with the exact previous report
+    shape, written atomically to the requested path."""
+    _patch_rclpy_and_runner(monkeypatch)
+    scenario_runner.main(_legacy_argv(tmp_path, report="scenario-runner.json"))
+    captured = capsys.readouterr()
+    printed = json.loads(captured.out)
+    written = json.loads((tmp_path / "scenario-runner.json").read_text(encoding="utf-8"))
+    assert written == printed
+    assert written["schema_version"] == 1
+    assert written["scenario"] == "qualification-moveit-plan-joint"
+    assert written["seed"] == 7
+    assert written["control_api"] == "simulation_interfaces"
+    assert written["custom_control_services"] is False
+    assert written["operations"][-1]["boundary"] == "PHYSICS_READY"
+    # No canonical compact report keys leak into the legacy payload.
+    assert "report_revision" not in written
+    assert "integrated" not in written
