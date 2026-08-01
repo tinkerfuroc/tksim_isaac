@@ -32,6 +32,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/sim/status/joint_state_contract` (latched, reliable).  Registers the
   console script and declares `ament_index_python` + `rcl_interfaces` exec
   dependencies.
+- Probe fail-closed hardening: `evaluate_probe_verdict` aggregates evidence with
+  sample readiness unconditional (no sample / stale / later loss → FAIL, and a
+  latched PASS is replaced by the current failure status); `step_service`
+  provides a bounded recoverable async service state machine for both the
+  `GetParameters` and `ListControllers` calls (exception / malformed / pending →
+  publish FAIL and retry); `derive_logical_joint_state_publishers` proves the
+  publisher source through `/controller_manager/list_controllers` (exactly one
+  active `joint_state_broadcaster`) instead of relabeling any controller-manager
+  publisher; `evaluate_clock_domain` verifies probe/controller `use_sim_time`
+  agreement plus active nonzero `/clock`; `evaluate_sample_freshness` adds a
+  wall-clock sample watchdog; and `evaluate_joint_state_sample` records a
+  probable `use_sim_time` clock-domain-mismatch reason for epoch-scale
+  header/now differences.  Probe status is serialized with compact canonical
+  separators.
+- Real selected production artifact contract test
+  (`test_real_selected_artifact_state_only_drive_joint_contract`) resolves
+  `current.json` through the authoritative Task 3 resolver and feeds the actual
+  `robot.urdf` bytes through `topic_control_description` and the contract
+  evaluators (skips only when the gitignored artifact tree is absent); synthetic
+  fixtures remain only for negative/unit cases.
+- Probe-node tests under the Humble Python 3.10 runtime
+  (`tests/test_joint_state_probe_node.py`): no sample → FAIL, fresh sample →
+  PASS, prior PASS then lost/stale sample or graph/controller failure → FAIL,
+  latched PASS replaced by current FAIL, clock-domain mismatch, and transient
+  service failure publication.
 
 - Canonical manipulation model-bundle producer (`model_bundle`) and bounded
   preflight validator (`model_preflight`), with pure ROS-free
@@ -53,6 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Probe constructor no longer shadows rclpy's internal `Node._parameters`
+  parameter store: the `joint_state_probe` service-state attributes are now
+  `_parameters_state` / `_controllers_state`, so the installed probe constructs
+  cleanly instead of exiting with `ParameterNotDeclaredException('xacro_path')`
+  after its `declare_parameter` calls were silently clobbered mid-`__init__`
+  (caught by the clean-environment `use_sim_time:=true` installed probe smoke).
 - `test_runtime_transformer_is_shared_and_arm_only` updated to the eight-joint
   contract: the live transformer now emits exactly one state-only `drive_joint`
   alongside `joint1`..`joint7`, verified through the complete real robot URDF.
