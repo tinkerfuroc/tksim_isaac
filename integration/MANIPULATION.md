@@ -308,10 +308,22 @@ seam (`git clone` of the tracked tree) collects the exact 64-node
 deleted/added test fails even at a preserved count) and executes it under a
 machine-readable JUnit XML, requiring total=64, failures=0, errors=0, skipped=4,
 the exact four host-runtime diagnostic skips, and their reason categories.  The
-reconstructed `tools/tinker_sim_deploy` resolver is materialized from immutable
-git objects at the recorded simulator implementation identity (never the live
-working tree), and the fixture status field contract is asserted against an
-independent 12-field literal.  The pre-existing uv environment provenance failure
+collection/JUnit acceptance checks are factored into one deterministic validator
+applied to both the real clone output and realistic mutated fixtures (delete one
+node, rename+add substitution, an unrelated skip, a removed expected skip, a
+wrong skip reason, a duplicate testcase, a failure/error count, multiple
+suites), and the JUnit structure is tightened to exactly one `<testsuite>` with
+64 unique `<testcase>` entries.  The reconstructed `tools/tinker_sim_deploy`
+resolver is materialized from immutable git objects at the recorded simulator
+implementation identity (never the live working tree).  Because the test module
+pre-imports `tinker_sim_deploy` from the live checkout, the pinned-resolver
+proof runs in a fresh isolated subprocess (`-I`, no inherited module cache)
+that records the loaded `tinker_sim_deploy.runtime.__file__` from the
+materialized temp root and runs the real Task 3 preflight, with a temp decoy
+working-tree package proving the pinned path wins precedence (positive) and is
+load-bearing (negative); no test writes a tracked active-checkout file.  The
+fixture status field contract is asserted against an independent 12-field
+literal.  The pre-existing uv environment provenance failure
 (installed `uv 0.12.0` vs pinned `uv 0.10.8`) remains an environment failure,
 not a code failure.
 

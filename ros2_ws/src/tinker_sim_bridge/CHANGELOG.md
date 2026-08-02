@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Task 8 fix round 4: isolate pinned-resolver verification)
+
+- The pinned-resolver independence proof is now executed in a fresh isolated
+  subprocess (`python -I`, no inherited `tinker_sim_deploy*` module cache, no
+  `PYTHONPATH`/user-site contamination).  The parent test module pre-imports
+  `tinker_sim_deploy` from the live working tree, so Python's module cache
+  masked the earlier in-process dirty live-tree probe; the previous claim that
+  "a dirty live-tree resolver edit is proven not to affect the reconstruction"
+  has been replaced by a module-origin proof.  The child loads
+  `tinker_sim_deploy.runtime` from the materialized temp root, records its
+  resolved `__file__`, runs the real unmodified Task 3 preflight, and emits one
+  machine-readable JSON (ready / 16 checks / `artifact_identity` / exact stable
+  preflight hash / loaded module paths); a temp decoy working-tree package with
+  a sentinel `runtime.py` proves the pinned path wins path precedence
+  (positive) and is load-bearing (negative, the decoy is detected and fails).
+  No test writes a tracked active-checkout file.
+- The clean-checkout seam's collection/JUnit acceptance checks are factored
+  into one deterministic `_check_collection_acceptance` validator applied to
+  both the real clone output and realistic mutated fixtures (delete one node,
+  rename/delete+add while preserving count, an unrelated skip, a removed
+  expected skip, a wrong skip reason, a duplicate testcase, a failure/error
+  count, and multiple suites), so the negative assertions exercise the exact
+  acceptance code path rather than direct set comparisons.
+- The JUnit structure validation is tightened: exactly one `<testsuite>`
+  (multiple suites are rejected rather than summed), exact suite counters, 64
+  unique `<testcase>` children, and no unexpected `failure`/`error`/`xfailure`
+  child statuses, while the canonical 64-node set/hash is unchanged.
+
 ### Added (Task 8 fix round 3: lock clean-checkout acceptance coverage)
 
 - The clean-checkout regression seam now locks the exact executed suite and
@@ -22,8 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The reconstructed Task 3 project root now materializes its
   `tools/tinker_sim_deploy` resolver from immutable git objects at the recorded
   simulator implementation identity (`git ls-tree` + `git show <commit>:<path>`),
-  never from the live working tree; a dirty live-tree resolver edit is proven
-  not to affect the reconstruction, and a pinned-blob mismatch/missing file
+  never from the live working tree; the pinned-blob mismatch/missing file
   fails closed.
 - `fixture_contract.status_publication.fields` is asserted against an
   independently documented 12-field literal (canonical order/encoding), with the

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import importlib
 import json
@@ -265,6 +266,201 @@ def _node_set_sha(node_ids: list[str]) -> str:
     return hashlib.sha256(_canonical_json(sorted(node_ids))).hexdigest()
 
 
+def _check_collection_acceptance(collected: list[str], tree: ET.ElementTree) -> None:
+    """Deterministic clean-checkout acceptance validator (fix round 4).
+
+    This is the *single* validator used by the clean-checkout seam for the real
+    clone output AND by the inline mutation cases, so a negative assertion always
+    exercises the exact code path applied to real output (never a direct set
+    comparison).  It raises :class:`AssertionError` with a specific message on
+    any deviation from the locked contract:
+
+    - exactly ``_TASK8_CLASS_TEST_COUNT`` collected node IDs and the canonical
+      ``_TASK8_CLASS_NODE_SET_SHA`` (delete / rename+add substitution fails);
+    - JUnit root is ``<testsuites>``/``<testsuite>`` with exactly ONE
+      ``<testsuite>`` (multiple suites are rejected rather than summed);
+    - suite counters ``tests``/``failures``/``errors``/``skipped`` match;
+    - exactly ``_TASK8_CLASS_TEST_COUNT`` direct ``<testcase>`` children with
+      unique names (no duplicate/nested-testcase ambiguity);
+    - no unexpected ``failure``/``error``/``xfailure`` child statuses;
+    - the exact ``_TASK8_CLEAN_CHECKOUT_SKIPS`` identities with the expected
+      reason category substrings.
+    """
+    # -- collection gate --
+    if len(collected) != _TASK8_CLASS_TEST_COUNT:
+        raise AssertionError(
+            "Task8 class must collect exactly {} tests, found {}".format(
+                _TASK8_CLASS_TEST_COUNT, len(collected)
+            )
+        )
+    node_sha = _node_set_sha(sorted(collected))
+    if node_sha != _TASK8_CLASS_NODE_SET_SHA:
+        raise AssertionError(
+            "Task8 collected-node set changed (sha {} != locked {}); update the "
+            "locked hash only if the class change is intentional".format(
+                node_sha, _TASK8_CLASS_NODE_SET_SHA
+            )
+        )
+    # -- JUnit root / exactly one suite (non-xdist) --
+    root = tree.getroot()
+    if root.tag not in ("testsuites", "testsuite"):
+        raise AssertionError("unexpected JUnit root element {!r}".format(root.tag))
+    suites = [s for s in tree.iter("testsuite")]
+    if len(suites) != 1:
+        raise AssertionError(
+            "exactly one <testsuite> required (non-xdist invocation), found {}".format(
+                len(suites)
+            )
+        )
+    suite = suites[0]
+    # -- suite counters --
+    counters = {k: int(suite.attrib[k]) for k in ("tests", "failures", "errors", "skipped")}
+    if counters["tests"] != _TASK8_CLASS_TEST_COUNT:
+        raise AssertionError(
+            "testsuite tests={} != {}".format(counters["tests"], _TASK8_CLASS_TEST_COUNT)
+        )
+    if counters["failures"] != 0 or counters["errors"] != 0:
+        raise AssertionError(
+            "testsuite failures/errors must be zero, got {}".format(counters)
+        )
+    if counters["skipped"] != len(_TASK8_CLEAN_CHECKOUT_SKIPS):
+        raise AssertionError(
+            "testsuite skipped={} != {}".format(
+                counters["skipped"], len(_TASK8_CLEAN_CHECKOUT_SKIPS)
+            )
+        )
+    # -- direct testcase children: exact count, unique names, no status surprises --
+    cases = [c for c in suite if c.tag == "testcase"]
+    names = [c.attrib.get("name", "") for c in cases]
+    if len(cases) != _TASK8_CLASS_TEST_COUNT:
+        raise AssertionError(
+            "testsuite must contain {} direct <testcase> elements, found {}".format(
+                _TASK8_CLASS_TEST_COUNT, len(cases)
+            )
+        )
+    if len(set(names)) != len(names):
+        raise AssertionError("duplicate testcase names must be rejected: {}".format(names))
+    for case in cases:
+        unexpected = [ch.tag for ch in case if ch.tag in ("failure", "error", "xfailure")]
+        if unexpected:
+            raise AssertionError(
+                "unexpected status children {} on testcase {!r}".format(
+                    unexpected, case.attrib.get("name")
+                )
+            )
+    # -- exact skip identities + reason categories --
+    skip_details: dict[str, str] = {}
+    for case in cases:
+        skip_node = case.find("skipped")
+        if skip_node is not None:
+            skip_details[case.attrib["name"]] = skip_node.attrib.get("message", "")
+    if set(skip_details) != set(_TASK8_CLEAN_CHECKOUT_SKIPS):
+        raise AssertionError(
+            "skip set differs from the locked set: {}".format(sorted(skip_details))
+        )
+    for name, reason in skip_details.items():
+        if _TASK8_CLEAN_CHECKOUT_SKIPS[name] not in reason:
+            raise AssertionError(
+                "skip {!r} must carry the expected reason category, got {!r}".format(
+                    name, reason
+                )
+            )
+
+
+def _resolver_probe_script() -> str:
+    """Source of the fresh isolated child that proves the pinned-resolver proof.
+
+    Run with ``sys.executable -I`` so no ``tinker_sim_deploy*`` module cache is
+    inherited and no ``PYTHONPATH``/user-site contamination leaks in.  The child
+    explicitly constructs ``sys.path`` (pinned materialized ``tools`` first,
+    then the decoy working-tree package, then the minimum bridge dependency),
+    asserts ``tinker_sim_deploy`` is not pre-loaded, imports
+    ``tinker_sim_deploy.runtime`` and records its resolved ``__file__``, then
+    runs the real unmodified Task 3 ``preflight_manifest`` against the
+    reconstructed root and emits exactly one machine-readable JSON object on
+    stdout.  Any failure emits ``{"ok": false, ...}`` and exits non-zero.
+    """
+    return r'''
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+
+def _emit(payload: dict[str, object]) -> int:
+    json.dump(payload, sys.stdout, sort_keys=True, separators=(",", ":"))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return 0 if payload.get("ok") else 1
+
+
+def _main() -> int:
+    root = Path(sys.argv[1])
+    manifest = Path(sys.argv[2])
+    bridge = Path(sys.argv[3])
+    decoy_tools = Path(sys.argv[4])
+    mode = sys.argv[5]
+    if "tinker_sim_deploy" in sys.modules:
+        return _emit({
+            "ok": False,
+            "mode": mode,
+            "error": "tinker_sim_deploy is already loaded in the fresh child",
+        })
+    if mode == "positive":
+        # Pinned materialized path FIRST; the decoy working-tree package is
+        # later on sys.path so any import of tinker_sim_deploy must resolve to
+        # the pinned bytes (the decoy sentinel would fail loudly if reached).
+        sys.path = [str(root / "tools"), str(decoy_tools), str(bridge)] + sys.path
+    elif mode == "negative":
+        # Reverse/remove the pinned path: only the broken decoy resolver is
+        # visible, so the child must fail and prove the positive is load-bearing.
+        sys.path = [str(decoy_tools), str(bridge)] + sys.path
+    else:
+        return _emit({"ok": False, "mode": mode, "error": "unknown mode"})
+    try:
+        import tinker_sim_deploy.runtime as runtime
+        module_file = str(Path(runtime.__file__).resolve())
+
+        from tinker_sim_bridge.model_preflight import (
+            preflight_manifest,
+            stable_preflight_evidence,
+        )
+        result = preflight_manifest(manifest, timeout=30.0, project_root=root)
+        stable = stable_preflight_evidence(result)
+        stable_sha = hashlib.sha256(
+            json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        identity_checks = [c for c in result["checks"] if c["name"] == "artifact_identity"]
+        return _emit({
+            "ok": True,
+            "mode": mode,
+            "ready": bool(result["ready"]),
+            "check_count": len(result["checks"]),
+            "check_names": [c["name"] for c in result["checks"]],
+            "artifact_identity_ok": bool(identity_checks[0]["ok"]) if identity_checks else None,
+            "stable_preflight_sha256": stable_sha,
+            "module_file": module_file,
+            "module_in_root": module_file.startswith(str(Path(root).resolve())),
+            "loaded_modules": {
+                name: str(Path(mod.__file__).resolve())
+                for name, mod in sorted(sys.modules.items())
+                if (name == "tinker_sim_deploy" or name.startswith("tinker_sim_deploy."))
+                and getattr(mod, "__file__", None)
+            },
+        })
+    except Exception as exc:
+        return _emit({
+            "ok": False,
+            "mode": mode,
+            "error": "{}: {}".format(type(exc).__name__, exc),
+        })
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
+'''
+
+
 class ProvenanceTest(unittest.TestCase):
     def test_checked_in_release_inputs_match_manifest(self) -> None:
         manifest = verify(Config.load(ROOT), require_python=True)
@@ -272,7 +468,7 @@ class ProvenanceTest(unittest.TestCase):
 
 
 class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
-    """Task 8: deterministic acceptance-contract provenance (fix rounds 1-3).
+    """Task 8: deterministic acceptance-contract provenance (fix rounds 1-4).
 
     These assertions recompute every derived hash/contract from immutable git
     objects (``git show <recorded-commit>:<path>``) and committed simulator
@@ -581,6 +777,127 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
             out = deploy_dir / relative
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(blob)
+
+    def _make_decoy_resolver(self, target: Path) -> Path:
+        """Materialize a temporary decoy working-tree resolver package.
+
+        The decoy is a full materialized ``tools/tinker_sim_deploy`` whose
+        ``runtime.py`` is replaced by a sentinel that raises on import, so any
+        use of the decoy fails loudly instead of silently reproducing the pinned
+        evidence.  It lives in a temp directory (never the active checkout) and
+        proves the pinned path wins path precedence and is load-bearing.
+        """
+        self._materialize_tinker_sim_deploy(target)
+        runtime = target / "tools/tinker_sim_deploy/runtime.py"
+        runtime.write_text(
+            "raise RuntimeError('decoy resolver engaged: the pinned materialized resolver must win')\n"
+        )
+        return target / "tools"
+
+    def _run_resolver_probe(
+        self,
+        recon_root: Path,
+        manifest_path: Path,
+        decoy_tools: Path,
+        mode: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the fresh isolated pinned-resolver probe in a child interpreter.
+
+        Uses ``sys.executable -I`` so the child has no inherited
+        ``tinker_sim_deploy*`` module cache and no ``PYTHONPATH``/user-site
+        contamination.  stdout carries exactly one JSON result; stderr and
+        non-zero exits are propagated to the caller for actionable diagnostics.
+        No tracked active-checkout file is ever written.
+        """
+        with tempfile.TemporaryDirectory(prefix="mb-probe-") as pdir:
+            script = Path(pdir) / "probe.py"
+            script.write_text(_resolver_probe_script())
+            env = os.environ.copy()
+            env.pop("TINKER_SIM_ROOT", None)
+            env.pop("PYTHONPATH", None)
+            return subprocess.run(
+                [
+                    sys.executable, "-I", str(script),
+                    str(recon_root), str(manifest_path), str(self.BRIDGE_DIR),
+                    str(decoy_tools), mode,
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+
+    def _prove_pinned_resolver_in_fresh_subprocess(
+        self, root: dict[str, object], data: dict[str, object]
+    ) -> None:
+        """Fix-round-4 pinned-resolver proof, executed in a fresh subprocess.
+
+        The parent process pre-imports ``tinker_sim_deploy`` from the live
+        working tree, so in-process ``sys.path`` surgery cannot prove the
+        reconstructed preflight executes the pinned materialized resolver (the
+        module cache masks it).  A fresh ``-I`` child with an empty
+        ``tinker_sim_deploy`` cache, the materialized root's ``tools`` first on
+        ``sys.path``, and a temp decoy working-tree package later on the path:
+
+        - **positive**: the child loads ``tinker_sim_deploy.runtime`` from the
+          materialized root (never the active checkout), runs the real Task 3
+          preflight, and emits ready/16-check/exact-stable-hash JSON that the
+          parent validates;
+        - **negative**: with the pinned path removed only the decoy (broken)
+          resolver is visible, so the child fails and proves the positive is
+          load-bearing.
+
+        The active checkout's tracked files are never modified.
+        """
+        with tempfile.TemporaryDirectory(prefix="mb-decoy-") as dtmp:
+            decoy_tools = self._make_decoy_resolver(Path(dtmp))
+            recon_root = Path(root["tmp"])
+            manifest_path = Path(root["manifest_path"])
+            positive = self._run_resolver_probe(
+                recon_root, manifest_path, decoy_tools, "positive"
+            )
+            self.assertEqual(
+                positive.returncode, 0,
+                "positive pinned-resolver probe must succeed in the fresh child:\n"
+                + positive.stdout + positive.stderr,
+            )
+            payload = json.loads(positive.stdout)
+            self.assertTrue(payload["ok"], payload)
+            self.assertTrue(payload["ready"], payload)
+            self.assertEqual(payload["check_count"], data["check_count"])
+            self.assertEqual(payload["check_names"], data["check_names"])
+            self.assertTrue(payload["artifact_identity_ok"], payload)
+            self.assertEqual(payload["stable_preflight_sha256"], data["stable_sha256"])
+            module_file = Path(payload["module_file"])
+            self.assertTrue(
+                module_file.is_relative_to(recon_root),
+                "resolver must load from the materialized root, got {}".format(module_file),
+            )
+            self.assertFalse(
+                module_file.is_relative_to(ROOT),
+                "resolver must never load from the active checkout, got {}".format(module_file),
+            )
+            loaded = payload["loaded_modules"]
+            self.assertIn("tinker_sim_deploy.runtime", loaded)
+            # Every tinker_sim_deploy module loaded in the fresh child must come
+            # from the materialized reconstructed root, never the active checkout.
+            for name, mod_path in loaded.items():
+                self.assertTrue(
+                    Path(mod_path).is_relative_to(recon_root),
+                    "module {} must come from the materialized root, got {}".format(name, mod_path),
+                )
+            negative = self._run_resolver_probe(
+                recon_root, manifest_path, decoy_tools, "negative"
+            )
+            self.assertNotEqual(
+                negative.returncode, 0,
+                "negative pinned-resolver probe must fail (decoy detected):\n"
+                + negative.stdout + negative.stderr,
+            )
+            self.assertIn(
+                "decoy", negative.stdout + negative.stderr,
+                "negative probe must surface the decoy sentinel diagnostic",
+            )
 
     def _reconstruct_project_root(self, tmpdir: Path) -> dict[str, object]:
         """Reconstruct a self-contained Task 3-compatible project root.
@@ -1154,38 +1471,24 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
                 self.assertFalse(stale_identity["ok"])
             finally:
                 current_path.write_bytes(original_current)
-        # Pinned-resolver independence: a dirty live-tree edit to the shared
-        # resolver must NOT flow into the reconstruction (immutable git objects).
-        sim_identity = str(
-            self._load_contract()["repositories"]["simulator"]["implementation_identity"]
-        )
-        live_runtime = ROOT / "tools/tinker_sim_deploy/runtime.py"
-        backup = live_runtime.read_bytes()
-        try:
-            live_runtime.write_bytes(b"# dirty local edit must not reach reconstruction\n")
-            with tempfile.TemporaryDirectory(prefix="mb-indep-") as tmp2:
-                root2 = self._reconstruct_project_root(Path(tmp2))
-                pinned_runtime = _git_blob(
-                    ROOT, sim_identity, "tools/tinker_sim_deploy/runtime.py"
-                )
-                self.assertEqual(
-                    (Path(tmp2) / "tools/tinker_sim_deploy/runtime.py").read_bytes(),
-                    pinned_runtime,
-                    "reconstruction must materialize the pinned resolver bytes, not the live tree",
-                )
-                result2 = preflight_manifest(
-                    root2["manifest_path"], timeout=30.0, project_root=root2["tmp"]
-                )
-                self.assertTrue(result2["ready"])
-                self.assertEqual(
-                    _sha256_json(stable_preflight_evidence(result2)),
-                    data["stable_sha256"],
-                )
-        finally:
-            live_runtime.write_bytes(backup)
+            # Pinned-resolver independence is proven in a FRESH ISOLATED
+            # SUBPROCESS (fix round 4).  The parent process pre-imports
+            # ``tinker_sim_deploy`` from the live working tree, so in-process
+            # ``sys.path`` surgery -- and therefore the previous dirty live-tree
+            # edit probe -- is masked by Python's module cache and cannot prove
+            # the reconstruction executes the pinned materialized resolver.  A
+            # fresh ``-I`` child with no inherited ``tinker_sim_deploy`` cache
+            # loads the resolver from the materialized temp root; a temp decoy
+            # working-tree package proves the pinned path wins path precedence
+            # (positive) and is load-bearing (negative).  The active checkout's
+            # tracked files are never written.
+            self._prove_pinned_resolver_in_fresh_subprocess(root, data)
         # Pinned-blob mismatch/missing fails closed: a nonexistent path at the
         # recorded identity raises, and a wrong-but-real pin materializes bytes
         # that differ from the recorded resolver (a changed pin is detected).
+        sim_identity = str(
+            self._load_contract()["repositories"]["simulator"]["implementation_identity"]
+        )
         with self.assertRaises(AssertionError):
             _git_blob(ROOT, sim_identity, "tools/tinker_sim_deploy/definitely-not-a-file.py")
         with tempfile.TemporaryDirectory(prefix="mb-bogus-") as tmp3:
@@ -1795,8 +2098,13 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
         total=64, failures=0, errors=0, skipped=4, the exact four legitimate
         host-runtime diagnostic skips, and their reason categories -- so a
         deleted test, an accidental broad skip, or a collection/import error
-        all fail closed.  A changed node-set hash or changed skip set is
-        rejected by the inline mutation self-check below.
+        all fail closed.  Both the collection gate and the JUnit structure are
+        validated by the single deterministic ``_check_collection_acceptance``
+        helper (fix round 4), and realistic mutated fixtures are fed through
+        that same validator and must each be rejected: delete one node, a
+        rename/delete+add substitution, an unrelated skip, a removed expected
+        skip, a wrong skip reason, a duplicate testcase, a failure/error count,
+        and multiple suites.
 
         Uses a temporary ``git clone`` (a temporary checkout/copy); never
         mutates the active checkout.  The nested invocation is skipped via
@@ -1843,15 +2151,6 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
                 for line in collection.stdout.decode(errors="replace").splitlines()
                 if line.strip().startswith("tests/test_provenance.py::Task8OMPLOverlayProvenanceTest::")
             ]
-            self.assertEqual(
-                len(collected), _TASK8_CLASS_TEST_COUNT,
-                "Task8 class must collect exactly {} tests in the clean checkout".format(_TASK8_CLASS_TEST_COUNT),
-            )
-            collected_sorted = sorted(collected)
-            self.assertEqual(
-                _node_set_sha(collected_sorted), _TASK8_CLASS_NODE_SET_SHA,
-                "Task8 collected-node set changed; update the locked hash only if the class change is intentional",
-            )
             # 2. Machine-readable execution: JUnit XML, not tail parsing.
             junit = Path(tmp) / "junit.xml"
             result = subprocess.run(
@@ -1873,51 +2172,77 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
                 + result.stderr.decode(errors="replace"),
             )
             tree = ET.parse(str(junit))
-            # pytest emits <testsuites> containing <testsuite> element(s); the
-            # counts live on the <testsuite> child, so aggregate across them.
-            total = sum(int(s.attrib["tests"]) for s in tree.iter("testsuite"))
-            failures = sum(int(s.attrib["failures"]) for s in tree.iter("testsuite"))
-            errors = sum(int(s.attrib["errors"]) for s in tree.iter("testsuite"))
-            skipped = sum(int(s.attrib["skipped"]) for s in tree.iter("testsuite"))
-            self.assertEqual(
-                total, _TASK8_CLASS_TEST_COUNT,
-                "exactly {} tests must execute in the clean checkout, found {}".format(_TASK8_CLASS_TEST_COUNT, total),
+            # 3. The deterministic acceptance validator locks the collection gate
+            # (exact 64 node IDs + canonical node-set SHA-256, so delete and
+            # rename+add substitutions both fail), the JUnit structure (exactly
+            # one <testsuite>, suite counters, 64 unique <testcase> children, no
+            # unexpected failure/error/xfail statuses), and the exact four
+            # host-runtime diagnostic skip identities with their reason
+            # categories.  The SAME validator is used on the real clone output
+            # here and on the mutated fixtures in step 4, so the negative
+            # assertions exercise the exact acceptance code path.
+            _check_collection_acceptance(collected, tree)
+            # 4. Inline mutation cases feed realistic mutated fixtures through
+            # the same validator and must each be rejected (not trivially-true
+            # direct set comparisons): delete one node; rename/delete+add while
+            # preserving count; add an unrelated skip; remove an expected skip;
+            # wrong skip reason; duplicate testcase; failure/error count;
+            # multiple suites.
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(collected[:-1], tree)
+            renamed = list(collected)
+            renamed[0] = (
+                "tests/test_provenance.py::Task8OMPLOverlayProvenanceTest::test_fabricated_renamed_node"
             )
-            self.assertEqual(failures, 0, "zero failures required in the clean checkout")
-            self.assertEqual(errors, 0, "zero errors required in the clean checkout")
-            self.assertEqual(
-                skipped, 4,
-                "exactly the 4 legitimate host diagnostics may skip, found {}".format(skipped),
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(renamed, tree)
+            # c) broaden a passing test into an unrelated skip (count preserved).
+            tree_extra_skip = copy.deepcopy(tree)
+            passing_case = next(
+                c for s in tree_extra_skip.iter("testsuite")
+                for c in s if c.tag == "testcase" and c.find("skipped") is None
             )
-            # 3. Exact skip set + reason categories (not merely a numeric count).
-            skip_details: dict[str, str] = {}
-            for case in tree.iter("testcase"):
-                skip_node = case.find("skipped")
-                if skip_node is not None:
-                    skip_details[case.attrib["name"]] = skip_node.attrib.get("message", "")
-            self.assertEqual(set(skip_details), set(_TASK8_CLEAN_CHECKOUT_SKIPS))
-            for name, reason in skip_details.items():
-                self.assertIn(
-                    _TASK8_CLEAN_CHECKOUT_SKIPS[name], reason,
-                    "skip {!r} must carry the expected reason category".format(name),
-                )
-            # 4. Inline mutation self-check: a deleted test, an extra skip, or a
-            # missing legitimate skip must each change the locked node-set hash
-            # or skip set and therefore be rejected.
-            self.assertNotEqual(
-                _node_set_sha(collected_sorted[:-1]), _TASK8_CLASS_NODE_SET_SHA,
-                "a deleted test must change the locked node-set hash",
+            passing_case.append(
+                ET.Element("skipped", {"message": "unrelated broadened skip"})
             )
-            self.assertNotEqual(
-                set(skip_details) | {"test_top_level_evidence_stable_hashes_reproducible"},
-                _TASK8_CLEAN_CHECKOUT_SKIPS,
-                "a test broadened into a skip must change the locked skip set",
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(collected, tree_extra_skip)
+            # d) remove one legitimate diagnostic skip.
+            tree_removed_skip = copy.deepcopy(tree)
+            removed_case = next(
+                c for s in tree_removed_skip.iter("testsuite")
+                for c in s if c.tag == "testcase" and c.find("skipped") is not None
             )
-            self.assertNotEqual(
-                set(skip_details) - {"test_installed_package_data_byte_identity"},
-                _TASK8_CLEAN_CHECKOUT_SKIPS,
-                "a removed legitimate diagnostic skip must change the locked skip set",
-            )
+            removed_case.remove(removed_case.find("skipped"))
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(collected, tree_removed_skip)
+            # e) wrong skip reason on one diagnostic.
+            tree_wrong_reason = copy.deepcopy(tree)
+            for s in tree_wrong_reason.iter("testsuite"):
+                for c in s:
+                    if c.tag == "testcase":
+                        skip_node = c.find("skipped")
+                        if skip_node is not None:
+                            skip_node.set("message", "a completely unrelated skip reason")
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(collected, tree_wrong_reason)
+            # f) duplicate testcase element.
+            tree_dup = copy.deepcopy(tree)
+            suite_el = next(iter(tree_dup.iter("testsuite")))
+            suite_el.append(copy.deepcopy(next(c for c in suite_el if c.tag == "testcase")))
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(collected, tree_dup)
+            # g) failure/error count.
+            tree_failure = copy.deepcopy(tree)
+            next(iter(tree_failure.iter("testsuite"))).set("failures", "1")
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(collected, tree_failure)
+            # h) multiple suites must be rejected, not summed.
+            tree_multi = copy.deepcopy(tree)
+            testsuites_el = next(iter(tree_multi.iter("testsuites")))
+            testsuites_el.append(copy.deepcopy(next(iter(tree_multi.iter("testsuite")))))
+            with self.assertRaises(AssertionError):
+                _check_collection_acceptance(collected, tree_multi)
 
     def _assert_installed_byte_identity(self, install: Path) -> None:
         pairs = [

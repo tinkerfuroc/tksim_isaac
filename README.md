@@ -345,12 +345,27 @@ References:
   reconstructed Task 3 resolver (`tools/tinker_sim_deploy`) is now materialized
   from immutable git objects at the recorded simulator implementation identity
   (never copied from the live working tree, so local edits cannot influence
-  acceptance); a dirty live-tree resolver edit is proven not to affect the
-  reconstructed preflight, and a pinned-blob mismatch/missing file fails closed.
-  The fixture status field contract is asserted against an independent 12-field
+  acceptance), and a pinned-blob mismatch/missing file fails closed.  The
+  fixture status field contract is asserted against an independent 12-field
   literal (not re-derived from the source function), and a stale
   `current.json` selector is proven to fail the preflight `artifact_identity`
   check.  The fix-1 baseline is documented as 2 failed + 1 skipped.
+- 2026-08-02 (fix round 4): Isolated the pinned-resolver verification.  Because
+  the test module pre-imports `tinker_sim_deploy` from the live working tree,
+  Python's module cache masked the earlier in-process dirty live-tree probe
+  (the proof did not actually execute the pinned materialized resolver).  The
+  reconstruction proof now runs in a fresh isolated subprocess (`-I`, no
+  inherited `tinker_sim_deploy*` cache) that loads `tinker_sim_deploy.runtime`
+  from the materialized temp root, records its resolved `__file__`, runs the
+  real Task 3 preflight, and emits one machine-readable JSON with
+  ready/16-check/exact-stable-hash evidence; a temp decoy working-tree package
+  proves the pinned path wins path precedence (positive) and is load-bearing
+  (negative).  No test writes a tracked active-checkout file.  The clean-checkout
+  seam's collection/JUnit acceptance checks are factored into one deterministic
+  validator used by both the real clone output and realistic mutated fixtures
+  (delete, rename+add, unrelated skip, removed skip, wrong reason, duplicate
+  testcase, failure/error count, multiple suites), and the JUnit structure is
+  tightened to exactly one `<testsuite>` with 64 unique `<testcase>` entries.
 - 2026-08-02 (fix round 1): Made the OMPL-overlay acceptance evidence
   reproducible.  The production-overlay scope is split into the exact production
   allow-lists (from `launch_contract_helpers.py`, including
