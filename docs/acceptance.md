@@ -165,6 +165,13 @@ lock.
   untracked manifest is exactly `[]` (SHA-256 of the canonical compact list
   bytes `b"[]"` =
   `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`).
+- `authorization.commit` is `null` by design: no earlier authorization commit
+  exists. The uniquely resolved schema-transition commit
+  (`ab8cf7e...`) is itself the pre-attempt authorization, so `null` does not
+  mean unauthenticated — authorization is derived from the resolved transition,
+  not from a prior separate authorization commit. The phase is
+  `task-9b-simulator-repository-lock-only` and the report ledger path is
+  `.superpowers/sdd/2026-07-29-simulator-ompl-moveit-overlay/task-9-simulator-report.md`.
 - The exact capture argv arrays, each run under `LC_ALL=C`:
   `["env", "LC_ALL=C", "git", "status", "--porcelain=v1", "-z",
   "--untracked-files=all"]` and
@@ -193,16 +200,45 @@ closed.
 - **Status/diff bytes.** Observation runs the exact recorded argv and compares
   raw bytes; any Git, configuration, or version drift that changes the bytes
   fails closed.
+- **Staged changes fail closed.** The status capture runs
+  `git status --porcelain=v1 -z --untracked-files=all`, whose raw porcelain
+  payload covers the staged (index) column in addition to unstaged and
+  untracked entries, whereas `git diff --binary --no-ext-diff` is unstaged-only.
+  Clean mode requires the status bytes, the diff bytes, and the untracked
+  manifest all to be exact empty, so any staged path — even one whose unstaged
+  diff alone would be empty — fails the policy comparison.
 
 ### Policy commit resolution (schema transition)
 
+Despite the common enum `policy_commit_resolution="commit_containing_policy_path"`,
+resolution is machine-checkable and deterministic. The simulator resolution
+algorithm is:
+
+1. `required_fields` = the exact set `{"repository", "implementation_head",
+   "policy_commit_resolution"}`.
+2. Enumerate every commit `c` that touches `integration/source-locks.json` in
+   checked-out history, i.e. the set `git log --format=%H -- <policy_path>`.
+3. A commit `c` is the schema-transition commit iff its policy blob
+   `git show c:<policy_path>` contains all three `required_fields` AND its
+   first-parent policy blob `git show c^:<policy_path>` lacks at least one.
+   A root commit (no parent) can never qualify because it has no first-parent
+   blob.
+4. The resolved transition must be unique: exactly one such commit exists in
+   checked-out history, namely `ab8cf7e9645b1e019aba81e2c7923177ba13d1ac`.
+5. The resolved transition must satisfy: first parent == `implementation_head`
+   (`490f907831d9f6f06242e0d151ac014547973d6e`), and it is an ancestor of the
+   checked-out HEAD (it need not remain HEAD after a later docs-only review
+   fix).
+
 `integration/source-locks.json` pre-existed this OMPL authorization: it was
-introduced at the 6.0.1 baseline commit `63913b1` with the deployment-workspace
-lock fields only. A raw path-history count therefore equals two after this lock
-commit and must never be misread as a false count of one. The unique policy
-commit is the **schema-transition commit** that introduces the repository-local
-OMPL authorization fields (`repository`, `implementation_head`,
-`policy_commit_resolution`) and whose parent blob lacks them. Verification
+introduced at the 6.0.1 baseline commit `63913b1` (a root commit) with the
+deployment-workspace lock fields only. The raw path history after this lock
+commit is therefore exactly 2 and the schema-transition count is exactly 1 — the
+raw count must never be misread as a false count of one. The raw path history
+count is 2 at lock time and may only remain unchanged: any later policy-path
+touch/rewrite is rejection.
+
+The transition's blob identity is load-bearing. Verification additionally
 requires the conjunction:
 
 - exactly one commit in checked-out history introduces the OMPL authorization
@@ -212,7 +248,12 @@ requires the conjunction:
   (`490f907831d9f6f06242e0d151ac014547973d6e`);
 - the resolved commit is an ancestor of the checked-out HEAD (it need not remain
   HEAD after a later docs-only review fix);
-- the `HEAD:<policy_path>` blob equals the working-tree policy blob;
+- the three-way blob identity holds: bytes of
+  `git show <transition_commit>:<policy_path>` equal bytes of
+  `git show HEAD:<policy_path>` equal the working-tree policy bytes. Any later
+  committed policy rewrite therefore fails closed even if it retains the same
+  fields; a docs-only commit that leaves the policy bytes untouched remains
+  allowed;
 - repository/root/path fields match the simulator repository;
 - duplicate, later rewrite, cross-repository, missing, ambiguous, or
   self-referential records fail.
@@ -225,6 +266,10 @@ Later qualification must:
   missing, duplicate, ambiguous, cross-repository, or self-referential records;
 - resolve the unique schema-transition commit and require its first parent to
   equal `implementation_head`;
+- assert the three-way blob identity
+  (`<transition>:<policy_path>` == `HEAD:<policy_path>` == working-tree bytes)
+  and the exact raw path-history count of 2 unchanged from lock time, rejecting
+  any later policy-path touch or rewrite;
 - compare current `status`, `diff`, and untracked bytes byte-for-byte against
   this policy, reproducing the exact capture argv and normalization above;
 - treat this policy as pre-attempt authorization only: qualification may observe
