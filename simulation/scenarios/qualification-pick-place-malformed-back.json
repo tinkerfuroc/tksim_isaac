@@ -38,6 +38,30 @@
           1.0
         ]
       }
+    },
+    {
+      "id": "qualification_place_pedestal",
+      "class_name": "static_pedestal",
+      "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
+      "asset_sha256": "c4a5e9812224a217bdba21ab81c679fac6c107c3501263a43335c3c0695a8e19",
+      "fixed": true,
+      "role": "support",
+      "owner": "sim_fixture",
+      "region": "place-region",
+      "planning_scene_id": "sim_fixture/place_pedestal",
+      "pose": {
+        "xyz": [
+          0.85,
+          0.0,
+          0.0
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
     }
   ],
   "objects": [
@@ -133,7 +157,32 @@
           "xyz": [
             0.65,
             0.0,
+            0.64
+          ],
+          "quaternion_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        }
+      },
+      {
+        "id": "sim_fixture/place_pedestal",
+        "class": "static",
+        "primitive": {
+          "type": "box",
+          "dimensions": [
+            0.12,
+            0.12,
             0.6
+          ]
+        },
+        "pose": {
+          "xyz": [
+            0.85,
+            0.0,
+            0.3
           ],
           "quaternion_xyzw": [
             0.0,
@@ -144,12 +193,12 @@
         }
       }
     ],
-    "revision_digest": "3afe7f1e1210a29c31364fabd6a955991a30cf5aaf9183c98503f2412d002a9b"
+    "revision_digest": "40750837c2d462bb2a8fc25f9cf5ed46e48284df93298a1e59f591dff8672f10"
   },
   "integrated": {
     "stage": "E",
     "fixture_revision": "qualification-v1",
-    "fixture_digest": "3afe7f1e1210a29c31364fabd6a955991a30cf5aaf9183c98503f2412d002a9b",
+    "fixture_digest": "40750837c2d462bb2a8fc25f9cf5ed46e48284df93298a1e59f591dff8672f10",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {
@@ -163,7 +212,8 @@
     "expected_scene": {
       "owned_ids": [
         "sim_fixture/pedestal",
-        "sim_fixture/qualification_cube"
+        "sim_fixture/qualification_cube",
+        "sim_fixture/place_pedestal"
       ],
       "attached_ids": [],
       "task_target_id": "pick_and_place/object_mesh"

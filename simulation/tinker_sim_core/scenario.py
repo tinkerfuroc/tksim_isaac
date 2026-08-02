@@ -53,7 +53,7 @@ class ScenarioDefinition:
             _validate_planning_scene(planning_scene, path)
         integrated = raw.get("integrated")
         if integrated is not None:
-            _validate_integrated(integrated, path)
+            _validate_integrated(integrated, path, scenario_id)
         declaration = {
             key: value for key, value in raw.items() if key not in {"id", "seed"}
         }
@@ -266,7 +266,23 @@ def _validate_planning_scene(planning_scene: Mapping[str, Any], path: Path) -> N
             raise ValueError(f"{path}: diagnostic {record.get('id')} enter_collision_bodies must be a boolean")
 
 
-def _validate_integrated(integrated: Mapping[str, Any], path: Path) -> None:
+def _finite_list(value: Any, label: str, path: Path, *, length: int | None = None) -> list[float]:
+    """Return *value* as a list of finite numbers, optionally of exact length."""
+    if not isinstance(value, list):
+        raise ValueError(f"{path}: {label} must be an array")
+    if length is not None and len(value) != length:
+        raise ValueError(f"{path}: {label} must contain exactly {length} numbers")
+    result: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"{path}: {label} entries must be finite numbers")
+        if not math.isfinite(float(item)):
+            raise ValueError(f"{path}: {label} entries must be finite")
+        result.append(float(item))
+    return result
+
+
+def _validate_integrated(integrated: Mapping[str, Any], path: Path, scenario_id: str) -> None:
     """Validate the Task 1 integrated qualification mapping, fail-closed.
 
     The mapping is the full immutable per-scenario runtime contract bound by the
@@ -274,6 +290,15 @@ def _validate_integrated(integrated: Mapping[str, Any], path: Path) -> None:
     carries only the one-key ``{"execution_profile": "sim_ompl"}`` public mapping;
     the full mapping here is preserved in the scenario declaration and separate
     readiness/executor evidence.
+
+    Cross-field hardening (Task 1 fix round 1): positive polarity requires
+    ``expected_negative`` to be null; negative polarity requires a complete
+    race/timeout/forbidden-after-terminal contract; ``goal``,
+    ``expected_scene``, and ``expected_physical`` shapes are validated; and a
+    present ``back_positions`` vector is exactly seven finite elements except
+    the explicitly identified ``qualification-pick-place-malformed-back``
+    negative, whose vector is exactly six and whose required predicates contain
+    ``goal_rejected_pre_send``.
     """
     if not isinstance(integrated, dict):
         raise ValueError(f"{path}: integrated must be an object")
@@ -300,6 +325,15 @@ def _validate_integrated(integrated: Mapping[str, Any], path: Path) -> None:
             f"{path}: integrated.acceptance.polarity must be a non-empty string"
         )
     expected_negative = integrated.get("expected_negative")
+    if polarity == "positive" and expected_negative is not None:
+        raise ValueError(
+            f"{path}: positive polarity requires expected_negative to be null"
+        )
+    if polarity == "negative" and expected_negative is None:
+        raise ValueError(
+            f"{path}: negative polarity requires a complete expected_negative mapping"
+        )
+    required_predicates: list[Any] | None = None
     if expected_negative is not None:
         if not isinstance(expected_negative, dict):
             raise ValueError(
@@ -335,6 +369,54 @@ def _validate_integrated(integrated: Mapping[str, Any], path: Path) -> None:
             raise ValueError(
                 f"{path}: integrated.expected_negative.forbidden must be a non-empty array"
             )
+    # Goal shape: target_object_id, target_source_id, and place_region are
+    # required; scenario-specific approach/target-TCP keys are additive and
+    # validated when present.
+    goal = integrated.get("goal")
+    if not isinstance(goal, dict):
+        raise ValueError(f"{path}: integrated.goal must be an object")
+    for goal_key in ("target_object_id", "target_source_id"):
+        if not isinstance(goal.get(goal_key), str) or not goal.get(goal_key):
+            raise ValueError(f"{path}: integrated.goal.{goal_key} must be a non-empty string")
+    place_region = goal.get("place_region")
+    if place_region is not None and (not isinstance(place_region, str) or not place_region):
+        raise ValueError(f"{path}: integrated.goal.place_region must be a non-empty string or null")
+    if "approach" in goal and (not isinstance(goal["approach"], str) or not goal["approach"]):
+        raise ValueError(f"{path}: integrated.goal.approach must be a non-empty string")
+    if "target_tcp_xyz" in goal:
+        _finite_list(goal["target_tcp_xyz"], "integrated.goal.target_tcp_xyz", path, length=3)
+    # Expected scene shape.
+    expected_scene = integrated.get("expected_scene")
+    if not isinstance(expected_scene, dict):
+        raise ValueError(f"{path}: integrated.expected_scene must be an object")
+    owned_ids = expected_scene.get("owned_ids")
+    if not isinstance(owned_ids, list) or not owned_ids or not all(
+        isinstance(value, str) and value for value in owned_ids
+    ):
+        raise ValueError(
+            f"{path}: integrated.expected_scene.owned_ids must be a non-empty array of strings"
+        )
+    if not isinstance(expected_scene.get("attached_ids"), list):
+        raise ValueError(f"{path}: integrated.expected_scene.attached_ids must be an array")
+    if not isinstance(expected_scene.get("task_target_id"), str) or not expected_scene.get("task_target_id"):
+        raise ValueError(
+            f"{path}: integrated.expected_scene.task_target_id must be a non-empty string"
+        )
+    if not isinstance(integrated.get("expected_physical"), list):
+        raise ValueError(f"{path}: integrated.expected_physical must be an array")
+    # back_positions: exactly seven finite elements, except the explicitly
+    # identified malformed-back negative (exactly six + goal_rejected_pre_send).
+    back_positions = integrated.get("back_positions")
+    if back_positions is not None:
+        if scenario_id == "qualification-pick-place-malformed-back":
+            _finite_list(back_positions, "integrated.back_positions", path, length=6)
+            if required_predicates is not None and "goal_rejected_pre_send" not in required_predicates:
+                raise ValueError(
+                    f"{path}: malformed-back requires expected_negative.required to contain "
+                    "goal_rejected_pre_send"
+                )
+        else:
+            _finite_list(back_positions, "integrated.back_positions", path, length=7)
     forbidden_endpoints = integrated.get("forbidden_endpoints")
     if not isinstance(forbidden_endpoints, list):
         raise ValueError(f"{path}: integrated.forbidden_endpoints must be an array")

@@ -127,7 +127,11 @@ class QualificationFixtureTest(unittest.TestCase):
         scenario = load_named_scenario(ROOT, "qualification-pick-place-positive")
         actors = {str(record["id"]): record for record in scenario.actors}
         records = {str(record["id"]): record for record in scenario.objects}
-        self.assertEqual(set(actors), {"qualification_pedestal"})
+        # F2: the place-support pedestal is a declared static actor in every
+        # E-stage scenario.
+        self.assertEqual(
+            set(actors), {"qualification_pedestal", "qualification_place_pedestal"}
+        )
         self.assertEqual(set(records), {"qualification_cube"})
 
         pedestal = actors["qualification_pedestal"]
@@ -138,8 +142,21 @@ class QualificationFixtureTest(unittest.TestCase):
             "simulation/assets/primitives/qualification-pedestal.usda",
         )
         self.assertEqual(pedestal["role"], "support")
+        self.assertEqual(pedestal["region"], "source-region")
         self.assertEqual(pedestal["planning_scene_id"], "sim_fixture/pedestal")
         self.assertEqual(pedestal["pose"]["xyz"], [0.65, 0.0, 0.0])
+
+        place_pedestal = actors["qualification_place_pedestal"]
+        self.assertEqual(place_pedestal["class_name"], "static_pedestal")
+        self.assertTrue(place_pedestal["fixed"])
+        self.assertEqual(
+            place_pedestal["asset_uri"],
+            "simulation/assets/primitives/qualification-pedestal.usda",
+        )
+        self.assertEqual(place_pedestal["role"], "support")
+        self.assertEqual(place_pedestal["region"], "place-region")
+        self.assertEqual(place_pedestal["planning_scene_id"], "sim_fixture/place_pedestal")
+        self.assertEqual(place_pedestal["pose"]["xyz"], [0.85, 0.0, 0.0])
 
         cube = records["qualification_cube"]
         self.assertEqual(cube["class_name"], "dynamic_cube")
@@ -148,7 +165,14 @@ class QualificationFixtureTest(unittest.TestCase):
         self.assertEqual(cube["asset_uri"], "simulation/assets/primitives/task-object.usda")
         self.assertEqual(cube["role"], "pick-target")
         self.assertEqual(cube["planning_scene_id"], "sim_fixture/qualification_cube")
+        # F1: physical root is bottom-origin; the PlanningScene center is the
+        # cube at z 0.64 (root + half-extent 0.04).
         self.assertEqual(cube["pose"]["xyz"], [0.65, 0.0, self.CUBE_ROOT_Z])
+        ps_cube = next(
+            obj for obj in scenario.planning_scene["objects"]
+            if obj["id"] == "sim_fixture/qualification_cube"
+        )
+        self.assertEqual(ps_cube["pose"]["xyz"], [0.65, 0.0, 0.64])
 
         operations = standard_operations(ROOT, scenario, 7)
         spawns = {
@@ -156,7 +180,10 @@ class QualificationFixtureTest(unittest.TestCase):
             for operation in operations
             if operation.kind == "spawn_entity"
         }
-        self.assertEqual(set(spawns), {"qualification_pedestal", "qualification_cube"})
+        self.assertEqual(
+            set(spawns),
+            {"qualification_pedestal", "qualification_place_pedestal", "qualification_cube"},
+        )
         final_state = operations[-1].payload
         self.assertEqual(final_state["state"], 1)
         self.assertEqual(final_state["boundary"], "PHYSICS_READY")
@@ -204,15 +231,57 @@ class QualificationFixtureTest(unittest.TestCase):
         positive_ids = [obj["id"] for obj in positive["planning_scene"]["objects"]]
         blocked_ids = [obj["id"] for obj in blocked["planning_scene"]["objects"]]
         occupied_ids = [obj["id"] for obj in occupied["planning_scene"]["objects"]]
-        self.assertEqual(positive_ids, ["sim_fixture/pedestal", "sim_fixture/qualification_cube"])
+        # F1/F2: the declared order is pedestal, cube, place_pedestal, then the
+        # scenario-specific obstacle/occupant.
+        self.assertEqual(
+            positive_ids,
+            [
+                "sim_fixture/pedestal",
+                "sim_fixture/qualification_cube",
+                "sim_fixture/place_pedestal",
+            ],
+        )
         self.assertEqual(
             blocked_ids,
-            ["sim_fixture/pedestal", "sim_fixture/qualification_cube", "sim_fixture/plan_blocker"],
+            [
+                "sim_fixture/pedestal",
+                "sim_fixture/qualification_cube",
+                "sim_fixture/place_pedestal",
+                "sim_fixture/plan_blocker",
+            ],
         )
         self.assertEqual(
             occupied_ids,
-            ["sim_fixture/pedestal", "sim_fixture/qualification_cube", "sim_fixture/place_occupant"],
+            [
+                "sim_fixture/pedestal",
+                "sim_fixture/qualification_cube",
+                "sim_fixture/place_pedestal",
+                "sim_fixture/place_occupant",
+            ],
         )
+        # F3: the blocker physically rests at root z 0.70 with its PlanningScene
+        # center at 0.85 (0.30 m cube half-height), covering the target TCP.
+        blocker_ps = next(
+            obj for obj in blocked["planning_scene"]["objects"]
+            if obj["id"] == "sim_fixture/plan_blocker"
+        )
+        self.assertEqual(blocker_ps["pose"]["xyz"], [0.65, 0.0, 0.85])
+        blocker_obj = next(
+            obj for obj in blocked["objects"]
+            if obj["id"] == "qualification_plan_blocker"
+        )
+        self.assertEqual(blocker_obj["pose"]["xyz"], [0.65, 0.0, 0.70])
+        # F1: the occupant rests on the place support; its PS center is 0.64.
+        occupant_ps = next(
+            obj for obj in occupied["planning_scene"]["objects"]
+            if obj["id"] == "sim_fixture/place_occupant"
+        )
+        self.assertEqual(occupant_ps["pose"]["xyz"], [0.85, 0.0, 0.64])
+        occupant_obj = next(
+            obj for obj in occupied["objects"]
+            if obj["id"] == "qualification_place_occupant"
+        )
+        self.assertEqual(occupant_obj["pose"]["xyz"], [0.85, 0.0, 0.60])
 
 
 if __name__ == "__main__":

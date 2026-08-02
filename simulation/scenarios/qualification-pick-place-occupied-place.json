@@ -38,6 +38,30 @@
           1.0
         ]
       }
+    },
+    {
+      "id": "qualification_place_pedestal",
+      "class_name": "static_pedestal",
+      "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
+      "asset_sha256": "c4a5e9812224a217bdba21ab81c679fac6c107c3501263a43335c3c0695a8e19",
+      "fixed": true,
+      "role": "support",
+      "owner": "sim_fixture",
+      "region": "place-region",
+      "planning_scene_id": "sim_fixture/place_pedestal",
+      "pose": {
+        "xyz": [
+          0.85,
+          0.0,
+          0.0
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
     }
   ],
   "objects": [
@@ -81,7 +105,7 @@
         "xyz": [
           0.85,
           0.0,
-          0.64
+          0.6
         ],
         "quaternion_xyzw": [
           0.0,
@@ -158,7 +182,32 @@
           "xyz": [
             0.65,
             0.0,
+            0.64
+          ],
+          "quaternion_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        }
+      },
+      {
+        "id": "sim_fixture/place_pedestal",
+        "class": "static",
+        "primitive": {
+          "type": "box",
+          "dimensions": [
+            0.12,
+            0.12,
             0.6
+          ]
+        },
+        "pose": {
+          "xyz": [
+            0.85,
+            0.0,
+            0.3
           ],
           "quaternion_xyzw": [
             0.0,
@@ -194,12 +243,12 @@
         }
       }
     ],
-    "revision_digest": "fb30f65d2378355095084c343cbe23ca057ff4fd659716f2c7b6758a528c7589"
+    "revision_digest": "71ef17e58c7c2cae81e83b406d7e16bfc90c3a8799b4a79aec3d42c158506295"
   },
   "integrated": {
     "stage": "E",
     "fixture_revision": "qualification-v1",
-    "fixture_digest": "fb30f65d2378355095084c343cbe23ca057ff4fd659716f2c7b6758a528c7589",
+    "fixture_digest": "71ef17e58c7c2cae81e83b406d7e16bfc90c3a8799b4a79aec3d42c158506295",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {
@@ -214,6 +263,7 @@
       "owned_ids": [
         "sim_fixture/pedestal",
         "sim_fixture/qualification_cube",
+        "sim_fixture/place_pedestal",
         "sim_fixture/place_occupant"
       ],
       "attached_ids": [],

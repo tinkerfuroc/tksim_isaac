@@ -260,15 +260,27 @@ scenarios (`qualification-moveit-plan-joint`, `qualification-moveit-plan-pose`,
 identity; the blocked scenario adds `sim_fixture/plan_blocker` while retaining
 the same target source/handoff.  The D-stage execute scenarios
 (`qualification-moveit-execute-*`, `-cartesian-retreat`, `-gripper`, `-cancel`,
-`-safety`) reuse the same fixture geometry.  The E-stage pick-place scenarios
-(`qualification-pick-place-*`) target `sim_fixture/qualification_cube`; the
-negative variants add only their own obstacle (`sim_fixture/plan_blocker`) or
-occupant (`sim_fixture/place_occupant`).  Every scenario carries a
-schema-v3-validated `integrated` mapping (`execution_profile` `sim_ompl`, stage,
-`physics_truth` authority, acceptance polarity, race policy, and terminal
-policy); the public `scenario-runner.json` report carries only the one-key
-`integrated` mapping `{"execution_profile": "sim_ompl"}`, and the full
-per-scenario mapping is bound by the scenario declaration SHA-256.
+`-safety`) reuse the same fixture geometry and declare no spawned physical task
+object (they exercise arm/gripper execution against the declared fixtures
+only).  The E-stage pick-place scenarios (`qualification-pick-place-*`) target
+`sim_fixture/qualification_cube` and declare a source pedestal
+(`sim_fixture/pedestal`) plus a place-support pedestal
+(`sim_fixture/place_pedestal`) whose top (z 0.60) supports the placement object
+bottom; the negative variants add only their own obstacle
+(`sim_fixture/plan_blocker`) or occupant (`sim_fixture/place_occupant`).  Fix
+round 1 aligned the physical (bottom-origin) roots with the PlanningScene
+(center-origin) poses: the 0.08 m cube physical root is z 0.60 and its
+PlanningScene center is z 0.64 (root + committed asset center offset 0.04); the
+blocked-approach blocker physically rests at root z 0.70 with its PlanningScene
+center at z 0.85 so the declared top-down target TCP z 0.72 lies inside the
+blocker without initial target contact.  Every scenario is scenario-v2 and the
+scenario-v2 loader validates its `integrated` mapping (`execution_profile`
+`sim_ompl`, stage, `physics_truth` authority, acceptance polarity, race policy,
+and terminal policy); schema-v3 applies to the qualification config
+`simulation/qualification/integrated-ompl.json`.  The public
+`scenario-runner.json` report carries only the one-key `integrated` mapping
+`{"execution_profile": "sim_ompl"}`, and the full per-scenario mapping is bound
+by the scenario declaration SHA-256.
 
 ### ROS-free contract (`fixture_contract.py`)
 
