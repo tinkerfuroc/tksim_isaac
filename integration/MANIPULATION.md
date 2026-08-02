@@ -467,6 +467,38 @@ manipulation core is qualified.
   expanded to 43 tests; pure suite to 68; journal suite to 184.  No
   package-installed path changed, so no build is required.
 
+- 2026-08-02 (integrated qualification Task 4 fix round 3): Sealed Gate-C
+  artifact/scene-state consistency across the residual review findings.
+  `run_gate_c_plan_only` now finalizes transactionally: the graph is validated
+  through `PlanningSceneJournal.finalize(status, graph, json_path=None)` before
+  any durable output, non-journal artifacts are written first, and the
+  successful `planning-scene.json` is deferred until every other required
+  artifact is durable.  Any post-provisional-pass write failure invokes
+  `_downgrade_persisted_evidence`, which rewrites `integrated-execution.json`
+  fail-dominantly, appends `row_kind="final"` corrective rows to the JSONL
+  lifecycle files (provisional/raw rows carry `row_kind="lifecycle"`), and
+  writes a canonical failure `planning-scene.json`; `planner_status` stays
+  available as diagnostic history while every authoritative `status` is
+  fail-dominant.  A valid PlanningScene callback now atomically caches the new
+  scene and clears the invalid latch; acquisition requires a valid observation
+  whose `scene_sequence` is after the last invalid one (`_scene_invalid_sequence`),
+  so invalid messages never erase the last valid cached scene yet acquisition
+  stays fail-closed while invalid is newest.  The callback boundary catches the
+  expected malformed-message exception set
+  (AttributeError/IndexError/KeyError/TypeError/ValueError) without swallowing
+  process-control exceptions.  `fixture-ready` now binds to the exact declared
+  geometry and pose, not IDs only: `expected_fixture_geometry_digest` derives a
+  deterministic projection (bridge helpers `fixture_to_specs`/`spec_geometry`/
+  `readback_geometry`/`geometry_signature_sha256`) covering exact ordered owned
+  IDs, geometry/dimensions, frame, and poses, and `_fixture_scene_error` rejects
+  stale pose, wrong dimensions/frame, and duplicate IDs.  The blocked scenario
+  now passes only on an allowlisted planning-stage non-success code *with* an
+  empty planned trajectory; an allowlisted code plus a non-empty trajectory is
+  `contradictory-nonempty-trajectory` and fails.  This entry supersedes the
+  fix-round-2 "Humble suite expanded to 43 tests" count with the fresh 44-test
+  baseline at `d911692` before fix round 3; post-fix counts are Humble 58, pure
+  70, journal 184.  No package-installed path changed, so no build is required.
+
 - 2026-08-02 (integrated qualification Task 3 fix round 1): Bound PlanningScene
   evidence semantics.  `validation/planning_scene_journal.py` closes the
   public-path false passes: `record_diff` now requires a genuine world-to-

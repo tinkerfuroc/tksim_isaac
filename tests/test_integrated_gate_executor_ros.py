@@ -528,6 +528,24 @@ def _unknown_error_result():
     return result
 
 
+def _non_success_with_trajectory_result():
+    """An allowlisted planning non-success code (NO_IK_SOLUTION=5) carrying a
+    contradictory non-empty planned trajectory (F3.4)."""
+    from moveit_msgs.action import MoveGroup
+    from moveit_msgs.msg import MoveItErrorCodes, RobotTrajectory
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    result = MoveGroup.Result()
+    result.error_code = MoveItErrorCodes()
+    result.error_code.val = 5  # NO_IK_SOLUTION (planner non-success)
+    result.planned_trajectory = RobotTrajectory()
+    result.planned_trajectory.joint_trajectory = JointTrajectory()
+    point = JointTrajectoryPoint()
+    point.positions = list(Q_OUTBOUND)
+    result.planned_trajectory.joint_trajectory.points.append(point)
+    return result
+
+
 def _mutated_invalid_graph():
     """A graph whose planning-scene topic type is corrupted so projection fails."""
     from test_integrated_gate_executor import _observed_graph_double
@@ -538,7 +556,12 @@ def _mutated_invalid_graph():
 
 
 def _scene_with_ids(executor, contract, object_ids) -> None:
-    """Feed a PlanningScene containing exactly *object_ids* through the callback."""
+    """Feed a PlanningScene containing exactly *object_ids* through the callback.
+
+    The objects carry IDs only (no geometry), so any scene whose owned IDs do not
+    match the declared fixture contract is rejected on the ID projection before
+    the F3.3 geometry projection is consulted.
+    """
     from moveit_msgs.msg import AllowedCollisionMatrix, CollisionObject, PlanningScene, RobotState
 
     scene = PlanningScene()
@@ -552,21 +575,82 @@ def _scene_with_ids(executor, contract, object_ids) -> None:
     assert executor._latest_planning_scene is not None
 
 
-def _synthetic_scene(executor, contract) -> None:
-    from moveit_msgs.msg import AllowedCollisionMatrix, CollisionObject, PlanningScene, RobotState
-    from std_msgs.msg import String
+class _MalformedScene:
+    """A wrong-shaped PlanningScene input (no ``world``) that raises
+    ``AttributeError`` at normalization time — F3.2 must contain it."""
 
-    from test_integrated_gate_executor import _canonical_fixture_payload
 
+def _declaration_records(declaration):
+    """Ordered records the fixture adapter turns into collision bodies."""
+    records = list(declaration.get("objects", []))
+    for record in declaration.get("diagnostic_objects", []):
+        if record.get("enter_collision_bodies") is True:
+            records.append(record)
+    return records
+
+
+def _collision_object_from_record(record, frame_id, *, mutate=None):
+    """Build a real CollisionObject from a declared fixture record."""
+    from geometry_msgs.msg import Pose
+    from moveit_msgs.msg import CollisionObject
+    from shape_msgs.msg import SolidPrimitive
+
+    shape_types = {
+        "box": SolidPrimitive.BOX,
+        "sphere": SolidPrimitive.SPHERE,
+        "cylinder": SolidPrimitive.CYLINDER,
+    }
+    obj = CollisionObject()
+    obj.id = str(record["id"])
+    obj.header.frame_id = frame_id
+    if "primitive" in record:
+        primitive = record["primitive"]
+        sp = SolidPrimitive()
+        sp.type = shape_types[primitive["type"]]
+        sp.dimensions = [float(value) for value in primitive["dimensions"]]
+        obj.primitives.append(sp)
+    pose = record.get("pose", {})
+    p = Pose()
+    xyz = pose.get("xyz", [0.0, 0.0, 0.0])
+    quat = pose.get("quaternion_xyzw", [0.0, 0.0, 0.0, 1.0])
+    p.position.x = float(xyz[0])
+    p.position.y = float(xyz[1])
+    p.position.z = float(xyz[2])
+    p.orientation.x = float(quat[0])
+    p.orientation.y = float(quat[1])
+    p.orientation.z = float(quat[2])
+    p.orientation.w = float(quat[3])
+    obj.primitive_poses.append(p)
+    if mutate is not None:
+        mutate(obj)
+    return obj
+
+
+def _scene_from_declaration(executor, contract, *, mutate=None) -> None:
+    """Feed a PlanningScene carrying the declared fixture geometry (optionally
+    mutated per-object) through the callback."""
+    from moveit_msgs.msg import AllowedCollisionMatrix, PlanningScene, RobotState
+
+    declaration = contract["planning_scene_declaration"]
+    frame_id = declaration["frame_id"]
+    by_id = {str(record["id"]): record for record in _declaration_records(declaration)}
     scene = PlanningScene()
-    for object_id in list(fixture_owned_ids(contract["planning_scene_declaration"])):
-        collision_object = CollisionObject()
-        collision_object.id = object_id
-        scene.world.collision_objects.append(collision_object)
+    for object_id in fixture_owned_ids(declaration):
+        scene.world.collision_objects.append(
+            _collision_object_from_record(by_id[str(object_id)], frame_id, mutate=mutate)
+        )
     scene.allowed_collision_matrix = AllowedCollisionMatrix()
     scene.robot_state = RobotState()
     executor._make_scene_callback("/planning_scene")(scene)
     assert executor._latest_planning_scene is not None
+
+
+def _synthetic_scene(executor, contract) -> None:
+    from std_msgs.msg import String
+
+    from test_integrated_gate_executor import _canonical_fixture_payload
+
+    _scene_from_declaration(executor, contract)
     payload = String()
     payload.data = _canonical_fixture_payload(contract)
     executor._on_fixture_payload(payload)
@@ -1157,11 +1241,12 @@ def test_executor_scene_timeout_sends_zero_goals(tmp_path):
         (["sim_fixture/pedestal", "sim_fixture/qualification_cube"], "must equal"),
         (["sim_fixture/qualification_cube", "sim_fixture/pedestal", "sim_fixture/place_pedestal"], "must equal"),
         (["sim_fixture/pedestal", "sim_fixture/qualification_cube", "sim_fixture/place_pedestal", "sim_fixture/extra"], "must equal"),
+        (["sim_fixture/pedestal", "sim_fixture/pedestal", "sim_fixture/qualification_cube", "sim_fixture/place_pedestal"], "must equal"),
     ],
 )
 def test_executor_fixture_scene_mismatch_rejected_before_goal(tmp_path, ids, match):
-    """F2.6: missing/extra/reordered/duplicate fixture scenes are rejected before
-    any goal send; the attempt is evidence-invalid."""
+    """F2.6/F3.3: empty/missing/reordered/extra/duplicate fixture scenes are
+    rejected before any goal send; the attempt is evidence-invalid."""
     from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
 
     executor, contract = _make_executor(
@@ -1284,5 +1369,357 @@ def test_executor_acceptance_timeout_does_not_claim_server_cancel(tmp_path):
         assert (tmp_path / "integrated-execution.json").stat().st_size > 0
         exec_json = json.loads((tmp_path / "integrated-execution.json").read_text(encoding="utf-8"))
         assert exec_json["status"] == "evidence-invalid"
+    finally:
+        executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 3 (F3.1): no persisted artifact may retain a pass after a late
+# artifact failure
+# --------------------------------------------------------------------------- #
+
+def _jsonl_rows(path):
+    if not Path(path).exists():
+        return []
+    return [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+def test_executor_artifact_write_failure_downgrades_planning_scene_pass(tmp_path):
+    """F3.1: an artifact output failure after a valid graph + successful planner/
+    journal processing downgrades every status-bearing artifact to
+    evidence-invalid; the raw planner pass is preserved as planner_status only."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+
+        # Force a failure at the early JSONL write position: the first
+        # integrated-execution.jsonl row is durable with the provisional pass,
+        # then the write of the remaining artifacts raises.
+        def failing_write(scenario_id, spec, goal, record, readiness, graph_status):
+            executor._append_jsonl(
+                tmp_path / "integrated-execution.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": "integrated-manipulation-v1",
+                    "scenario_id": scenario_id,
+                    "event": "gate-c-plan-only",
+                    "status": record.get("status"),
+                    "planner_status": record.get("planner_status"),
+                    "diagnostic_only": True,
+                    "execute_trajectory_goal_sent": False,
+                    "isaac_joint_commands_published": False,
+                    "timestamp": 0.0,
+                },
+            )
+            raise OSError("simulated jsonl write failure")
+
+        executor._write_artifacts = failing_write
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "artifact-write-failed"
+        assert record["planner_status"] == "diagnostic-pass"
+
+        ps_json = json.loads((tmp_path / "planning-scene.json").read_text(encoding="utf-8"))
+        assert ps_json["status"] == "evidence-invalid"
+        exec_json = json.loads((tmp_path / "integrated-execution.json").read_text(encoding="utf-8"))
+        assert exec_json["status"] == "evidence-invalid"
+        assert exec_json["planner_status"] == "diagnostic-pass"
+        rows = _jsonl_rows(tmp_path / "integrated-execution.jsonl")
+        assert rows[-1]["status"] == "evidence-invalid"
+        assert rows[-1]["row_kind"] == "final"
+        assert not any(
+            row.get("row_kind") == "final" and row["status"] == "diagnostic-pass"
+            for row in rows
+        )
+        moveit_rows = _jsonl_rows(tmp_path / "moveit-plans.jsonl")
+        assert moveit_rows and moveit_rows[-1]["status"] == "evidence-invalid"
+        assert moveit_rows[-1]["row_kind"] == "final"
+    finally:
+        executor.shutdown()
+
+
+def test_executor_late_final_summary_failure_downgrades_evidence(tmp_path):
+    """F3.1: a failure at the late final-summary boundary (integrated-execution.json)
+    after all JSONL rows are durable still leaves every status-bearing artifact
+    evidence-invalid with planner_status preserved."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+
+        calls = {"n": 0}
+        original_write_json_atomic = executor._write_json_atomic
+
+        def flaky_write_json_atomic(path, value):
+            if Path(path).name == "integrated-execution.json" and calls["n"] == 0:
+                calls["n"] += 1
+                raise OSError("simulated final-summary write failure")
+            calls["n"] += 1
+            return original_write_json_atomic(path, value)
+
+        executor._write_json_atomic = flaky_write_json_atomic
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "artifact-write-failed"
+        assert record["planner_status"] == "diagnostic-pass"
+
+        exec_json = json.loads((tmp_path / "integrated-execution.json").read_text(encoding="utf-8"))
+        assert exec_json["status"] == "evidence-invalid"
+        assert exec_json["planner_status"] == "diagnostic-pass"
+        rows = _jsonl_rows(tmp_path / "integrated-execution.jsonl")
+        assert rows[-1]["status"] == "evidence-invalid"
+        assert rows[-1]["row_kind"] == "final"
+        ps_json = json.loads((tmp_path / "planning-scene.json").read_text(encoding="utf-8"))
+        assert ps_json["status"] == "evidence-invalid"
+    finally:
+        executor.shutdown()
+
+
+def test_executor_journal_finalize_write_failure_downgrades_evidence(tmp_path):
+    """F3.1: the successful final journal artifact is deferred until all other
+    required artifacts are durable; if the planning-scene.json write itself fails
+    after the other artifacts carried a provisional pass, everything is downgraded
+    to evidence-invalid and planning-scene.json ends as a failure artifact."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+
+        original_finalize = executor.journal.finalize
+
+        def flaky_finalize(status, *, graph=None, json_path=None):
+            if json_path is not None:
+                raise OSError("simulated planning-scene.json write failure")
+            return original_finalize(status, graph=graph, json_path=None)
+
+        executor.journal.finalize = flaky_finalize
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "artifact-write-failed"
+        assert record["planner_status"] == "diagnostic-pass"
+
+        exec_json = json.loads((tmp_path / "integrated-execution.json").read_text(encoding="utf-8"))
+        assert exec_json["status"] == "evidence-invalid"
+        rows = _jsonl_rows(tmp_path / "integrated-execution.jsonl")
+        assert rows[-1]["status"] == "evidence-invalid"
+        assert rows[-1]["row_kind"] == "final"
+        ps_json = json.loads((tmp_path / "planning-scene.json").read_text(encoding="utf-8"))
+        assert ps_json["status"] == "evidence-invalid"
+        assert "planning-scene.json write failure" in ps_json.get("reason", "")
+    finally:
+        executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 3 (F3.2): valid PlanningScene data clears transient invalid state
+# --------------------------------------------------------------------------- #
+
+def test_executor_valid_then_invalid_scene_fails_closed(tmp_path):
+    """F3.2: after a valid scene is cached, a newer invalid message makes the
+    cached observation stale; acquisition fails closed and sends zero goals."""
+    from test_integrated_gate_executor import _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(tmp_path, join_key_provider=_join_key_provider())
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        client = _FakeMoveClient(
+            server_ready=True,
+            goal_handle=_FakeGoalHandle(accepted=True, result=_success_result()),
+            send_ready_at=0.0,
+        )
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        assert executor._planning_scene_invalid is False
+        executor._make_scene_callback("/planning_scene")(_MalformedScene())
+        assert executor._planning_scene_invalid is True
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "planning-scene-invalid"
+        assert client.sent_goals == []
+    finally:
+        executor.shutdown()
+
+
+def test_executor_invalid_then_valid_scene_recovers_and_sends(tmp_path):
+    """F3.2: a valid scene received after an invalid one clears the latch and the
+    attempt can send a goal."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        executor._make_scene_callback("/planning_scene")(_MalformedScene())
+        assert executor._planning_scene_invalid is True
+        _synthetic_scene(executor, contract)
+        assert executor._planning_scene_invalid is False
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "diagnostic-pass"
+        assert len(client.sent_goals) == 1
+    finally:
+        executor.shutdown()
+
+
+def test_executor_valid_invalid_valid_across_attempts_clears_latch(tmp_path):
+    """F3.2: a transient invalid scene between two valid ones latches fail-closed
+    for the intervening attempt, then a later valid scene clears the latch so the
+    next attempt can acquire and proceed."""
+    executor, contract = _make_executor(tmp_path)
+    try:
+        _synthetic_scene(executor, contract)
+        assert executor._acquire_scene("qualification-moveit-plan-joint") is None
+        executor._make_scene_callback("/planning_scene")(_MalformedScene())
+        error = executor._acquire_scene("qualification-moveit-plan-joint")
+        assert error["reason_code"] == "planning-scene-invalid"
+        _synthetic_scene(executor, contract)
+        assert executor._planning_scene_invalid is False
+        assert executor._acquire_scene("qualification-moveit-plan-joint") is None
+    finally:
+        executor.shutdown()
+
+
+def test_executor_wrong_shaped_scene_attribute_error_does_not_escape(tmp_path):
+    """F3.2: a wrong-shaped message raising AttributeError is contained by the
+    callback boundary; it latches invalid without escaping or erasing the last
+    valid cached scene."""
+    executor, contract = _make_executor(tmp_path)
+    try:
+        _synthetic_scene(executor, contract)
+        previous = executor._latest_planning_scene
+        executor._make_scene_callback("/planning_scene")(_MalformedScene())
+        assert executor._planning_scene_invalid is True
+        assert executor._latest_planning_scene is previous
+    finally:
+        executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 3 (F3.3): fixture-ready binds exact declared geometry and pose
+# --------------------------------------------------------------------------- #
+
+def test_executor_fixture_scene_geometry_binds_declared_pose_and_shape(tmp_path):
+    """F3.3: a full scene carrying the declared primitive geometry and poses is
+    fixture-ready; the projection digest binds the exact declared geometry, not
+    only the owned-ID set."""
+    from validation.integrated_gate_executor import expected_fixture_geometry_digest
+
+    executor, contract = _make_executor(tmp_path)
+    try:
+        declaration = contract["planning_scene_declaration"]
+        _scene_from_declaration(executor, contract)
+        scene = executor._latest_planning_scene
+        assert scene["owned_ids"] == list(fixture_owned_ids(declaration))
+        assert scene.get("fixture_geometry_digest") == expected_fixture_geometry_digest(declaration)
+        assert executor._fixture_scene_error(scene) is None
+    finally:
+        executor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("mutation_name", "mutate"),
+    [
+        ("stale pose", lambda obj: setattr(obj.primitive_poses[0].position, "x", obj.primitive_poses[0].position.x + 0.05)),
+        ("wrong dimensions", lambda obj: setattr(obj.primitives[0], "dimensions", [d + (0.1 if i == 2 else 0.0) for i, d in enumerate(obj.primitives[0].dimensions)])),
+        ("wrong frame", lambda obj: setattr(obj.header, "frame_id", "world")),
+    ],
+)
+def test_executor_fixture_scene_geometry_mutation_rejected(tmp_path, mutation_name, mutate):
+    """F3.3: stale pose, wrong primitive dimensions, and wrong frame each break
+    the fixture geometry projection and are rejected before fixture-ready."""
+    executor, contract = _make_executor(tmp_path)
+    try:
+        _scene_from_declaration(executor, contract, mutate=mutate)
+        scene = executor._latest_planning_scene
+        error = executor._fixture_scene_error(scene)
+        assert error is not None, mutation_name
+        assert "geometry" in error, mutation_name
+    finally:
+        executor.shutdown()
+
+
+def test_executor_fixture_scene_duplicate_id_rejected(tmp_path):
+    """F3.3: a duplicate fixture-owned id in the received scene is rejected
+    before fixture-ready (duplicate ids can never match the exact declared list)."""
+    executor, contract = _make_executor(tmp_path)
+    try:
+        declaration = contract["planning_scene_declaration"]
+        ids = list(fixture_owned_ids(declaration))
+        ids.append(ids[0])
+        _scene_with_ids(executor, contract, ids)
+        scene = executor._latest_planning_scene
+        error = executor._fixture_scene_error(scene)
+        assert error is not None
+        assert "owned_ids must equal" in error
+    finally:
+        executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 3 (F3.4): blocked planning failure cannot pass with a contradictory
+# non-empty trajectory
+# --------------------------------------------------------------------------- #
+
+def test_executor_blocked_allowlisted_code_with_nonempty_trajectory_is_failure(tmp_path):
+    """F3.4: an allowlisted planning non-success code with a contradictory
+    non-empty trajectory is diagnostic-fail with an explicit contradiction
+    classification, never a blocked pass."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        scenario_id="qualification-moveit-plan-blocked",
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_non_success_with_trajectory_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-blocked")
+        assert record["status"] == "diagnostic-fail"
+        assert record["error_code_classification"] == "contradictory-nonempty-trajectory"
+        assert record["error_code"] == 5
+        assert record["nonempty_plan"] is True
+        assert record["planner_status"] == "diagnostic-fail"
     finally:
         executor.shutdown()

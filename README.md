@@ -424,6 +424,45 @@ References:
   suite expanded to 43 tests; pure suite to 68; journal suite to 184.  No build
   is required because no package-installed path changed.
 
+- 2026-08-02 (integrated qualification Task 4 fix round 3): Sealed Gate-C
+  artifact/scene-state consistency across the residual review findings.
+  Artifact finalization is now transactional: `run_gate_c_plan_only` validates
+  the graph through `PlanningSceneJournal.finalize(status, graph, json_path=None)`
+  before any durable output, writes the non-journal artifacts first, and defers
+  the successful `planning-scene.json` until every other required artifact is
+  durable.  Any post-provisional-pass write/serialization/fsync/existence
+  failure now invokes `_downgrade_persisted_evidence`, which rewrites
+  `integrated-execution.json` fail-dominantly, appends `row_kind="final"`
+  corrective rows to the JSONL lifecycle files (whose provisional/raw planner
+  rows carry `row_kind="lifecycle"` so a consumer cannot mistake an early row
+  for a completed pass), and writes a canonical failure `planning-scene.json`.
+  `planner_status="diagnostic-pass"` remains available as diagnostic history
+  while every authoritative `status` field is fail-dominant, and the
+  `PlanningSceneJournal.finalize_failure` protection is unchanged.  Scene
+  acquisition is no longer latch-permanent: a successfully normalized valid
+  PlanningScene callback atomically caches the new scene and clears the invalid
+  flag (recording `_scene_invalid_sequence` on failure), and acquisition
+  requires a valid observation whose `scene_sequence` is after the last invalid
+  one, so an invalid message never erases the last valid cached scene yet
+  acquisition stays fail-closed while invalid is the newest observation.  The
+  callback boundary catches the complete expected malformed-message exception
+  set (AttributeError/IndexError/KeyError/TypeError/ValueError) without
+  swallowing process-control exceptions.  `fixture-ready` now binds to the
+  exact declared geometry and pose, not IDs only: `expected_fixture_geometry_digest`
+  derives a deterministic projection via the bridge canonicalization helpers
+  `fixture_to_specs`/`spec_geometry`/`readback_geometry`/`geometry_signature_sha256`
+  covering the scenario-owned objects' exact ordered IDs, primitive geometry and
+  dimensions, frame, and poses, and `_fixture_scene_error` compares the received
+  scene's projected digest to the declaration, rejecting stale pose, wrong
+  geometry/dimensions/frame, and duplicate IDs.  The blocked scenario now
+  requires both an allowlisted planning-stage non-success code and an empty
+  planned trajectory; an allowlisted code with a non-empty trajectory is
+  classified `contradictory-nonempty-trajectory` and fails.  This entry
+  supersedes the fix-round-2 "Humble suite expanded to 43 tests" count with the
+  fresh 44-test baseline measured at `d911692` before fix round 3; the post-fix
+  counts are Humble 58, pure 70, journal 184.  No build is required because no
+  package-installed path changed.
+
 - 2026-08-02 (integrated qualification Task 3 fix round 1): Bound the
   PlanningScene evidence semantics against the adversarial review findings.
   `validation/planning_scene_journal.py` now makes the public path fail closed:
