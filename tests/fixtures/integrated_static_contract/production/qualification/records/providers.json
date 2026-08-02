@@ -1,8 +1,0 @@
-{
-  "provider_counts": {
-    "controller_manager": 1,
-    "command_gateway": 1,
-    "scenario_runner": 1,
-    "xarm7_traj_controller": 1
-  }
-}

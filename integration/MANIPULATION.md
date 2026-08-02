@@ -363,6 +363,35 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 2 fix round 1): Bound Gate B to
+  real artifacts.  `validation/integrated_static_contracts.py` dropped the
+  fabricated `qualification/records/*` layer and inspects every production
+  source as an immutable Git blob at the production `implementation_head`
+  from the produced source-lock manifest: SRDF `_xarm7_macro.srdf.xacro`
+  (ordered `xarm_gripper` members, `link_tcp` end-effector parent),
+  `config/xarm7` and `config/xarm_gripper` `controllers.yaml`, the pick_and_place
+  C++ runtime (`motion_runtime_.shutdown`, `executor_thread_.join`, no
+  `.detach()`, result-field writes against the real `.action` schemas),
+  `clean_planning_scene` SimOmpl early return with task-owned hardware cleanup,
+  collision-aware `execute_lift(ctx, true, ...)`, and
+  `request.avoid_collisions = avoid_collisions` forwarding.  The model bundle
+  is recomputed (`structural_fingerprint`, artifact SHA-256,
+  `production_source_commits`), `fixture-ownership` inspects exactly the 17
+  configured C/D/E scenarios deriving owned ids from `planning_scene.objects`,
+  and transport-contract reads the sibling `typed_contract.runtime_contract_sha256`
+  (never nested in the public report) and recomputes the full runtime mapping.
+  `source_lock_manifest.py` adds closed schemas, lock-commit scope
+  (`{policy_path, docs/acceptance.md}`), qualification HEAD exact match,
+  authorization report/commit checks, canonical repository-relative policy
+  paths, required ISO `started_at`, and a stable output-freshness boolean.
+  The static checker emits atomic fsync+`os.replace` evidence
+  (`static-contract.json`, `model-fingerprint.json`, `source-identities.json`)
+  and propagates `evidence-invalid` / `verified-fail` / `verified-pass` per F4.
+  Real-root post-fix: the observer is `evidence-invalid` only because the
+  future qualification-tooling policy is intentionally absent; eight of the
+  nine static checks pass against the real simulator/production roots and only
+  `source-identities` fails on that absent policy.
+
 - 2026-08-02 (integrated qualification Task 2): Added the offline Gate B
   static-contract closure.  `validation/source_lock_manifest.py` is the
   canonical three-policy source-lock observer

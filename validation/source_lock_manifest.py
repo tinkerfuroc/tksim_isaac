@@ -77,6 +77,41 @@ ROLE_REPOSITORY = {
     ROLE_QUALIFICATION_TOOLING: "simulator",
 }
 
+# Closed schemas (fix round 1 / F3.4): unknown top-level policy keys and unknown
+# authorization keys are rejected fail-closed.  The allowlist is the union of
+# the two current real policies' ancillary fields.
+ALLOWED_POLICY_KEYS = frozenset(
+    {
+        "authorization",
+        "capture_commands",
+        "diff_bytes",
+        "diff_sha256",
+        "implementation_head",
+        "implementation_tree_policy",
+        "isaacsim_ros_workspaces",
+        "mode",
+        "policy_commit_resolution",
+        "policy_path",
+        "repository",
+        "root",
+        "schema_version",
+        "status_bytes",
+        "status_sha256",
+        "tinker_cumotion",
+        "tinker_isaac_ros_common",
+        "untracked_manifest",
+        "untracked_manifest_sha256",
+        "workspace_policy",
+    }
+)
+ALLOWED_AUTHORIZATION_KEYS = frozenset({"commit", "phase", "report_path"})
+
+# A lock-only commit may change only the policy path plus the review-clean
+# acceptance doc (both historical locks ``ab8cf7e`` and ``1e248262`` changed
+# exactly ``docs/acceptance.md`` alongside the policy).  Anything else is a
+# bundled source/config payload and fails closed.
+LOCK_ALLOWED_EXTRA_PATH = "docs/acceptance.md"
+
 AUTHORIZATION_FIELDS = ("repository", "implementation_head", "policy_commit_resolution")
 
 STATUS_PASS = "verified-pass"
@@ -209,8 +244,11 @@ def _validate_policy_schema(
     policy_root = Path(str(policy.get("root", ""))).resolve()
     if policy_root != root.resolve():
         reasons.append("root mismatch: {!r} != {!r}".format(str(policy.get("root")), str(root.resolve())))
-    if str(policy.get("policy_path")) != rel_path:
-        reasons.append("policy_path mismatch: {!r} != {!r}".format(policy.get("policy_path"), rel_path))
+    policy_path_norm = _normalize_posix(policy.get("policy_path"))
+    if policy_path_norm != rel_path:
+        reasons.append(
+            "policy_path mismatch: {!r} != {!r}".format(policy.get("policy_path"), rel_path)
+        )
     implementation_head = policy.get("implementation_head")
     if not isinstance(implementation_head, str) or not HEX40.fullmatch(implementation_head):
         reasons.append("implementation_head must match 40-hex")
@@ -232,10 +270,25 @@ def _validate_policy_schema(
                 _decode_bytes_record(policy[field], field=field, policy_path=policy_path)
             except SourceLockError as error:
                 reasons.append(str(error))
+    # Closed schema (F3.4): reject unknown top-level keys.
+    unknown = set(policy.keys()) - ALLOWED_POLICY_KEYS
+    if unknown:
+        reasons.append(
+            "unknown top-level policy keys rejected fail-closed: {}".format(
+                ", ".join(sorted(unknown))
+            )
+        )
     authorization = policy.get("authorization")
     if not isinstance(authorization, dict):
         reasons.append("authorization must be an object")
     else:
+        unknown_auth = set(authorization.keys()) - ALLOWED_AUTHORIZATION_KEYS
+        if unknown_auth:
+            reasons.append(
+                "unknown authorization keys rejected fail-closed: {}".format(
+                    ", ".join(sorted(unknown_auth))
+                )
+            )
         commit = authorization.get("commit")
         if commit is not None and not (isinstance(commit, str) and HEX40.fullmatch(commit)):
             reasons.append("authorization.commit must be 40-hex or null")
@@ -385,6 +438,18 @@ def _untracked_manifest(
     return entries, manifest_sha
 
 
+def _normalize_posix(value: object) -> str:
+    """Return a canonical repository-relative POSIX path string."""
+    if not isinstance(value, str):
+        return ""
+    raw = Path(value)
+    if raw.is_absolute():
+        # The policy records repository-relative paths; strip any accidental
+        # repository prefix so absolute/relative CLI args compare equal.
+        return str(raw)
+    return raw.as_posix()
+
+
 def _coerce_attempt_start(attempt_started_at: datetime | None) -> datetime | None:
     if attempt_started_at is None:
         return None
@@ -395,6 +460,23 @@ def _coerce_attempt_start(attempt_started_at: datetime | None) -> datetime | Non
     except (OverflowError, OSError, ValueError):
         return None
     return attempt_started_at
+
+
+def _resolved_commit_scope(
+    root: Path, resolved: str, rel_path: str
+) -> tuple[bool, list[str]]:
+    """Verify the resolved lock-only commit changes only ``{policy_path,
+    docs/acceptance.md}`` (policy required).  A lock commit carrying
+    source/config/test payload fails closed (F3.1)."""
+    raw = _git_bytes(root, "show", "--name-only", "--format=", resolved)
+    changed = {
+        line.strip() for line in raw.decode("utf-8", errors="replace").splitlines() if line.strip()
+    }
+    allowed = {rel_path, LOCK_ALLOWED_EXTRA_PATH}
+    extra = sorted(changed - allowed)
+    if rel_path not in changed:
+        extra.append("<policy path {} not changed>".format(rel_path))
+    return (not extra, extra)
 
 
 def _observe_repository(
@@ -412,7 +494,7 @@ def _observe_repository(
     record: dict[str, Any] = {
         "repository": role,
         "root": str(root_path),
-        "policy_path": str(policy_arg_path),
+        "policy_path": None,
         "head": None,
         "implementation_head": None,
         "resolved_policy_commit": None,
@@ -423,16 +505,19 @@ def _observe_repository(
         "reasons": [],
     }
 
-    # Relative path recorded inside the policy (always repository-relative).
+    # Relative path recorded inside the policy (always repository-relative,
+    # canonical POSIX form).
     if policy_arg_path.is_absolute():
         try:
-            rel_path = str(policy_path.relative_to(root_path))
+            rel_path = policy_path.resolve().relative_to(root_path)
         except ValueError:
             record["reasons"].append("policy path is outside the repository root")
             record["status"] = STATUS_FAIL
             return record
+        rel_path = rel_path.as_posix()
     else:
-        rel_path = str(policy_arg_path)
+        rel_path = policy_arg_path.as_posix()
+    record["policy_path"] = rel_path
 
     policy = _read_policy_json(policy_path)
     if policy is None:
@@ -498,6 +583,20 @@ def _observe_repository(
     record["checks"]["blob_resolved_equals_working"] = blob_resolved_equals_working
     record["checks"]["blob_head_equals_working"] = blob_head_equals_working
 
+    # F3.1 lock-only scope: the resolved commit may change only the policy path
+    # plus docs/acceptance.md (policy required).
+    scope_ok, scope_extra = _resolved_commit_scope(root_path, resolved, rel_path)
+    record["checks"]["lock_commit_scope"] = scope_ok
+    record["checks"]["lock_commit_scope_extra"] = scope_extra
+
+    # F3.2 qualification current HEAD: for qualification_tooling only the
+    # checked-out HEAD must exactly equal the resolved qualification lock commit.
+    head_matches_resolved = head == resolved
+    record["checks"]["qualification_head_matches_resolved"] = head_matches_resolved
+    qualification_head_ok = (
+        role != ROLE_QUALIFICATION_TOOLING or head_matches_resolved
+    )
+
     resolution_ok = bool(
         history_ok
         and parent_matches
@@ -505,6 +604,8 @@ def _observe_repository(
         and blob_resolved_equals_head
         and blob_resolved_equals_working
         and blob_head_equals_working
+        and scope_ok
+        and qualification_head_ok
     )
     if not resolution_ok:
         record["status"] = STATUS_FAIL
@@ -520,6 +621,17 @@ def _observe_repository(
         if not blob_resolved_equals_head or not blob_resolved_equals_working or not blob_head_equals_working:
             record["reasons"].append(
                 "blob identity disagreement across resolved commit / HEAD / working file"
+            )
+        if not scope_ok:
+            record["reasons"].append(
+                "resolved lock commit changes non-lock paths: {}".format(
+                    ", ".join(scope_extra)
+                )
+            )
+        if not qualification_head_ok:
+            record["reasons"].append(
+                "qualification_tooling checked-out HEAD must exactly equal the "
+                "resolved qualification lock commit"
             )
         return record
 
@@ -628,6 +740,75 @@ def _observe_repository(
         record["reasons"].append("working policy file does not predate the attempt")
         return record
 
+    # F3.3 authorization report: normalize within the repository, require a
+    # regular existing file that predates the attempt.  A non-null
+    # authorization.commit must be a real 40-hex commit, an ancestor of the
+    # resolved lock commit, and predate the attempt.
+    authorization = policy.get("authorization")
+    report_ok = True
+    if isinstance(authorization, dict):
+        report_path_raw = authorization.get("report_path")
+        if isinstance(report_path_raw, str) and report_path_raw:
+            report_rel = Path(report_path_raw)
+            report_full = (
+                report_rel if report_rel.is_absolute() else root_path / report_rel
+            )
+            try:
+                report_st = os.stat(report_full)
+            except OSError:
+                report_st = None
+            record["checks"]["authorization_report_present"] = report_st is not None
+            record["checks"]["authorization_report_regular"] = bool(
+                report_st is not None and stat.S_ISREG(report_st.st_mode)
+            )
+            record["checks"]["authorization_report_predates_attempt"] = bool(
+                report_st is not None and report_st.st_mtime < attempt_epoch
+            )
+            if report_st is None:
+                record["reasons"].append(
+                    "authorization report does not exist: {!r}".format(report_path_raw)
+                )
+                report_ok = False
+            elif not stat.S_ISREG(report_st.st_mode):
+                record["reasons"].append(
+                    "authorization report is not a regular file: {!r}".format(report_path_raw)
+                )
+                report_ok = False
+            elif report_st.st_mtime >= attempt_epoch:
+                record["reasons"].append(
+                    "authorization report does not predate the attempt: {!r}".format(report_path_raw)
+                )
+                report_ok = False
+        commit = authorization.get("commit")
+        if commit is not None:
+            if not isinstance(commit, str) or not HEX40.fullmatch(commit):
+                record["reasons"].append(
+                    "authorization.commit must be 40-hex or null"
+                )
+                report_ok = False
+            else:
+                is_ancestor = _git_is_ancestor(root_path, commit, resolved)
+                auth_commit_time = _git_commit_time(root_path, commit)
+                auth_commit_predates = (
+                    auth_commit_time is not None and auth_commit_time < attempt_epoch
+                )
+                record["checks"]["authorization_commit_ancestor_of_resolved"] = is_ancestor
+                record["checks"]["authorization_commit_predates_attempt"] = auth_commit_predates
+                if not is_ancestor:
+                    record["reasons"].append(
+                        "authorization.commit is not an ancestor of the resolved lock commit"
+                    )
+                    report_ok = False
+                if not auth_commit_predates:
+                    record["reasons"].append(
+                        "authorization.commit does not predate the attempt"
+                    )
+                    report_ok = False
+    record["checks"]["authorization_report"] = report_ok
+    if not report_ok:
+        record["status"] = STATUS_FAIL
+        return record
+
     record["status"] = STATUS_PASS
     return record
 
@@ -693,20 +874,22 @@ def capture_manifest(
     }
     manifest.update(records)
 
-    # The output manifest must postdate the attempt start (freshness).
+    # The output manifest must postdate the attempt start (freshness).  F3.7:
+    # the artifact is written atomically, its real filesystem mtime is observed
+    # from the written file, and only a stable boolean/status is persisted --
+    # no stale embedded exact ``output_mtime`` timestamp is claimed.
     output_path = Path(output)
     _atomic_write_fsync_json(output_path, manifest)
     try:
         output_mtime = os.stat(output_path).st_mtime
     except OSError:
         output_mtime = None
-    manifest["output_mtime"] = output_mtime
     output_postdates = output_mtime is not None and output_mtime > attempt.timestamp()
     manifest["output_predates_attempt"] = not output_postdates
     if status == STATUS_PASS and not output_postdates:
         manifest["status"] = STATUS_INVALID
         manifest["reasons"] = ["output manifest does not postdate the attempt start"]
-    # Rewrite so the recorded output mtime/status are themselves observed.
+    # Rewrite with the stable boolean/status; no timestamp is embedded.
     _atomic_write_fsync_json(output_path, manifest)
     return manifest
 
@@ -748,17 +931,23 @@ def _read_attempt_start_file(path: str | Path) -> datetime:
             "attempt-start file is not finite JSON: {} ({})".format(attempt_path, error)
         )
     started = raw.get("started_at") if isinstance(raw, dict) else None
-    if isinstance(started, str):
-        try:
-            parsed = datetime.fromisoformat(started)
-        except ValueError as error:
-            raise SourceLockError("attempt-start started_at is not ISO: {}".format(error))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-    # Fall back to file mtime as an aware UTC timestamp.
-    mtime = attempt_path.stat().st_mtime
-    return datetime.fromtimestamp(mtime, tz=timezone.utc)
+    # F3.6: a finite ISO ``started_at`` is required; the weak file-mtime fallback
+    # is removed.  A naive timestamp is normalized to UTC (still finite/aware).
+    if not isinstance(started, str):
+        raise SourceLockError(
+            "attempt-start file must contain a finite ISO started_at string"
+        )
+    try:
+        parsed = datetime.fromisoformat(started)
+    except ValueError as error:
+        raise SourceLockError("attempt-start started_at is not ISO: {}".format(error))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        _ = parsed.timestamp()
+    except (OverflowError, OSError, ValueError) as error:
+        raise SourceLockError("attempt-start started_at is not finite: {}".format(error))
+    return parsed
 
 
 def capture_source_lock_manifest(argv: Sequence[str] | None = None) -> int:
