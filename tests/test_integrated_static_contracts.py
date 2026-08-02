@@ -49,6 +49,7 @@ from integrated_static_contracts import (  # noqa: E402
     PROD_XARM7_CONTROLLERS_REL,
     RUNTIME_MAPPING_KEYS,
     TOUCH_LINKS,
+    _bind_bundle_artifact,
     validate_static_contracts,
 )
 
@@ -539,6 +540,22 @@ def _scenario_declaration_sha(sid: str, raw: Mapping[str, Any]) -> str:
     return _sha256({"id": sid, "seed": raw.get("seed"), "declaration": decl})
 
 
+def _overlay_artifact_workspace_path(key: str, bundle_artifact: Mapping[str, Any], production_root: Path) -> str:
+    """Build the overlay workspace-relative path for a bundle artifact.
+
+    Simulator-local artifacts keep their declared ``outputs/``/``artifacts/``
+    relative path.  A production-source artifact (currently ``kinematics`` in
+    the fixture) is recorded as ``src/<repo_dir>/<recorded path_relative>``,
+    matching the F3.3 strict identity the checker requires.
+    """
+    rel = bundle_artifact.get("path_relative")
+    if key in ("joint_limits", "simulator_full_urdf"):
+        return rel
+    if key == "kinematics":
+        return "src/{}/{}".format(Path(production_root).name, rel)
+    return rel
+
+
 def _build_overlay_contract(simulator_root: Path, production_root: Path, impl_head: str) -> dict[str, Any]:
     scenarios: dict[str, Any] = {}
     for sid in SCENARIO_OWNED:
@@ -605,7 +622,13 @@ def _build_overlay_contract(simulator_root: Path, production_root: Path, impl_he
         "model_bundle": {
             "structural_fingerprint": bundle["structural_fingerprint"],
             "manifest_sha256": _sha256_bytes((simulator_root / "outputs/ompl-overlay/model-bundle-r2/model-bundle.json").read_bytes()),
-            "artifacts": {key: {"path_relative": value.get("path_relative"), "sha256": value["sha256"]} for key, value in bundle.get("artifacts", {}).items()},
+            "artifacts": {
+                key: {
+                    "path_relative": _overlay_artifact_workspace_path(key, value, production_root),
+                    "sha256": value["sha256"],
+                }
+                for key, value in bundle.get("artifacts", {}).items()
+            },
             "production_source_commits": {
                 "arm_joint_limits": {"commit": impl_head, "path_relative": "src/xarm_ros2/xarm_moveit_config/config/xarm7/joint_limits.yaml", "repo_path": str(production_root), "sha256": _sha256_bytes(DEFAULT_JOINT_LIMITS_XARM7.encode("utf-8"))},
                 "gripper_joint_limits": {"commit": impl_head, "path_relative": "src/xarm_ros2/xarm_moveit_config/config/xarm_gripper/joint_limits.yaml", "repo_path": str(production_root), "sha256": _sha256_bytes(DEFAULT_JOINT_LIMITS_GRIPPER.encode("utf-8"))},
@@ -662,7 +685,7 @@ def provider_executables(provider: Mapping[str, Any]) -> list[str]:
     return sorted(executables)
 
 
-def _build_model_bundle(production_root: Path, impl_head: str) -> dict[str, Any]:
+def _build_model_bundle(simulator_root: Path, production_root: Path, impl_head: str) -> dict[str, Any]:
     contract = {
         "planning_frame": "base_link",
         "tcp_link": "link_tcp",
@@ -676,14 +699,30 @@ def _build_model_bundle(production_root: Path, impl_head: str) -> dict[str, Any]
         "end_effector": {"group": "xarm_gripper", "parent_link": "link_tcp"},
         "kinematics": {"xarm7": {"base_link": "base_link", "tip_link": "link_tcp", "kinematics_solver": "kdl_kinematics_plugin/KDLKinematicsPlugin"}},
     }
+    kinematics_rel = "src/xarm_ros2/xarm_moveit_config/config/xarm7/kinematics.yaml"
+    joint_limits_rel = "outputs/ompl-overlay/model-bundle-r2/joint_limits.yaml"
+    full_urdf_rel = "artifacts/robot/tinker2/36ac0317025d20a5/robot.urdf"
     return {
         "schema_version": 1,
         "producer": {"name": "tinker_sim_bridge.model_bundle", "version": "1"},
         "structural_fingerprint": _sha256(contract),
         "contract": contract,
         "artifacts": {
-            "joint_limits": {"path_relative": "outputs/ompl-overlay/model-bundle-r2/joint_limits.yaml", "sha256": _sha256_bytes(b"fixture joint limits\n")},
-            "simulator_full_urdf": {"path_relative": "artifacts/robot/tinker2/36ac0317025d20a5/robot.urdf", "sha256": _sha256_bytes(b"fixture full urdf\n")},
+            "joint_limits": {
+                "path_relative": joint_limits_rel,
+                "path": str(simulator_root / joint_limits_rel),
+                "sha256": _sha256_bytes(b"fixture joint limits\n"),
+            },
+            "kinematics": {
+                "path_relative": kinematics_rel,
+                "path": str(production_root / kinematics_rel),
+                "sha256": _sha256_bytes(DEFAULT_KINEMATICS.encode("utf-8")),
+            },
+            "simulator_full_urdf": {
+                "path_relative": full_urdf_rel,
+                "path": str(simulator_root / full_urdf_rel),
+                "sha256": _sha256_bytes(b"fixture full urdf\n"),
+            },
         },
         "normalization": {
             "groups": {"arm": "xarm7", "gripper": "xarm_gripper"},
@@ -693,7 +732,7 @@ def _build_model_bundle(production_root: Path, impl_head: str) -> dict[str, Any]
         "production_source_commits": {
             "arm_joint_limits": {"commit": impl_head, "path_relative": "src/xarm_ros2/xarm_moveit_config/config/xarm7/joint_limits.yaml", "repo_path": str(production_root), "sha256": _sha256_bytes(DEFAULT_JOINT_LIMITS_XARM7.encode("utf-8"))},
             "gripper_joint_limits": {"commit": impl_head, "path_relative": "src/xarm_ros2/xarm_moveit_config/config/xarm_gripper/joint_limits.yaml", "repo_path": str(production_root), "sha256": _sha256_bytes(DEFAULT_JOINT_LIMITS_GRIPPER.encode("utf-8"))},
-            "kinematics": {"commit": impl_head, "path_relative": "src/xarm_ros2/xarm_moveit_config/config/xarm7/kinematics.yaml", "repo_path": str(production_root), "sha256": _sha256_bytes(DEFAULT_KINEMATICS.encode("utf-8"))},
+            "kinematics": {"commit": impl_head, "path_relative": kinematics_rel, "repo_path": str(production_root), "sha256": _sha256_bytes(DEFAULT_KINEMATICS.encode("utf-8"))},
         },
     }
 
@@ -809,7 +848,7 @@ def make_static_contract_fixture(
         simulator_root / "ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json", provider
     )
 
-    bundle = _build_model_bundle(production_root, impl_head)
+    bundle = _build_model_bundle(simulator_root, production_root, impl_head)
     if bundle_overrides:
         bundle.update(bundle_overrides)
         if "contract" in bundle_overrides:
@@ -1123,6 +1162,172 @@ def test_overlay_source_commit_working_tree_drift_ignored(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# F3.3 source-key + path + digest artifact identity
+# ---------------------------------------------------------------------------
+def _f33_source_entry(prod_root: Path, rel: str, content: bytes) -> dict[str, Any]:
+    return {
+        "commit": "a" * 40,
+        "path_relative": rel,
+        "repo_path": str(prod_root),
+        "sha256": _sha256_bytes(content),
+    }
+
+
+def test_bundle_artifact_source_key_binding_passes(tmp_path):
+    """A source-bound artifact with matching key, bundle/overlay path identity
+    and digest binds cleanly."""
+    sim_root = tmp_path / "sim"
+    prod_root = tmp_path / "prod"
+    sim_root.mkdir()
+    prod_root.mkdir()
+    rel = "src/xarm_ros2/config/xarm7/kinematics.yaml"
+    content = b"kinematics content\n"
+    digest = _sha256_bytes(content)
+    verified = {"kinematics": _f33_source_entry(prod_root, rel, content)}
+    artifact = {"path": str(prod_root / rel), "path_relative": rel, "sha256": digest}
+    overlay = {"kinematics": {"path_relative": "src/{}/{}".format(prod_root.name, rel), "sha256": digest}}
+    assert _bind_bundle_artifact("kinematics", artifact, overlay, verified, sim_root) == []
+
+
+def test_bundle_artifact_simulator_local_binding_passes(tmp_path):
+    """A simulator-local artifact under outputs/ with agreeing bundle path and
+    bytes binds cleanly."""
+    sim_root = tmp_path / "sim"
+    sim_root.mkdir()
+    rel = "outputs/ompl-overlay/model-bundle-r2/joint_limits.yaml"
+    content = b"fixture joint limits\n"
+    (sim_root / rel).parent.mkdir(parents=True, exist_ok=True)
+    (sim_root / rel).write_bytes(content)
+    digest = _sha256_bytes(content)
+    artifact = {"path": str(sim_root / rel), "path_relative": rel, "sha256": digest}
+    overlay = {"joint_limits": {"path_relative": rel, "sha256": digest}}
+    assert _bind_bundle_artifact("joint_limits", artifact, overlay, {}, sim_root) == []
+
+
+def test_bundle_artifact_same_digest_wrong_source_key_fails(tmp_path):
+    """An artifact whose recorded digest matches a *different* verified source
+    entry must not bind by digest alone; the same-key source record must carry
+    the digest."""
+    sim_root = tmp_path / "sim"
+    prod_root = tmp_path / "prod"
+    sim_root.mkdir()
+    prod_root.mkdir()
+    content_a = b"kinematics content\n"
+    content_b = b"planning srdf content\n"
+    digest_a = _sha256_bytes(content_a)
+    digest_b = _sha256_bytes(content_b)
+    verified = {
+        "kinematics": _f33_source_entry(prod_root, "src/xarm_ros2/config/xarm7/kinematics.yaml", content_b),
+        "planning_srdf": _f33_source_entry(prod_root, "src/cumotion_description/config/xarm7.srdf", content_a),
+    }
+    artifact = {
+        "path": str(prod_root / "src/xarm_ros2/config/xarm7/kinematics.yaml"),
+        "path_relative": "src/xarm_ros2/config/xarm7/kinematics.yaml",
+        "sha256": digest_a,
+    }
+    overlay = {
+        "kinematics": {
+            "path_relative": "src/{}/src/xarm_ros2/config/xarm7/kinematics.yaml".format(prod_root.name),
+            "sha256": digest_a,
+        }
+    }
+    reasons = _bind_bundle_artifact("kinematics", artifact, overlay, verified, sim_root)
+    assert reasons
+    assert any("sha256 differs from its source-commit record" in r for r in reasons)
+
+
+def test_bundle_artifact_wrong_source_path_fails(tmp_path):
+    """A verified source record whose path_relative does not agree with the
+    bundle/overlay path identity fails."""
+    sim_root = tmp_path / "sim"
+    prod_root = tmp_path / "prod"
+    sim_root.mkdir()
+    prod_root.mkdir()
+    content = b"kinematics content\n"
+    digest = _sha256_bytes(content)
+    verified = {"kinematics": _f33_source_entry(prod_root, "src/wrong/kinematics.yaml", content)}
+    artifact = {
+        "path": str(prod_root / "src/xarm_ros2/config/xarm7/kinematics.yaml"),
+        "path_relative": "src/xarm_ros2/config/xarm7/kinematics.yaml",
+        "sha256": digest,
+    }
+    overlay = {
+        "kinematics": {
+            "path_relative": "src/{}/src/xarm_ros2/config/xarm7/kinematics.yaml".format(prod_root.name),
+            "sha256": digest,
+        }
+    }
+    reasons = _bind_bundle_artifact("kinematics", artifact, overlay, verified, sim_root)
+    assert reasons
+    assert any("does not match the recorded source path" in r for r in reasons)
+
+
+def test_bundle_artifact_wrong_bundle_absolute_path_fails(tmp_path):
+    """A bundle absolute path that does not equal <repo_path>/<path_relative>
+    fails without reading any working bytes."""
+    sim_root = tmp_path / "sim"
+    prod_root = tmp_path / "prod"
+    sim_root.mkdir()
+    prod_root.mkdir()
+    rel = "src/xarm_ros2/config/xarm7/kinematics.yaml"
+    content = b"kinematics content\n"
+    digest = _sha256_bytes(content)
+    verified = {"kinematics": _f33_source_entry(prod_root, rel, content)}
+    artifact = {"path": str(tmp_path / "elsewhere.yaml"), "path_relative": rel, "sha256": digest}
+    overlay = {
+        "kinematics": {
+            "path_relative": "src/{}/{}".format(prod_root.name, rel),
+            "sha256": digest,
+        }
+    }
+    reasons = _bind_bundle_artifact("kinematics", artifact, overlay, verified, sim_root)
+    assert reasons
+    assert any("bundle path does not match the recorded source path" in r for r in reasons)
+
+
+def test_bundle_artifact_wrong_overlay_workspace_path_fails(tmp_path):
+    """An overlay workspace-relative path that is not
+    src/<recorded repo dir>/<path_relative> fails."""
+    sim_root = tmp_path / "sim"
+    prod_root = tmp_path / "prod"
+    sim_root.mkdir()
+    prod_root.mkdir()
+    rel = "src/xarm_ros2/config/xarm7/kinematics.yaml"
+    content = b"kinematics content\n"
+    digest = _sha256_bytes(content)
+    verified = {"kinematics": _f33_source_entry(prod_root, rel, content)}
+    artifact = {"path": str(prod_root / rel), "path_relative": rel, "sha256": digest}
+    overlay = {"kinematics": {"path_relative": "src/wrong_repo/" + rel, "sha256": digest}}
+    reasons = _bind_bundle_artifact("kinematics", artifact, overlay, verified, sim_root)
+    assert reasons
+    assert any("overlay workspace path does not match" in r for r in reasons)
+
+
+def test_bundle_artifact_shadow_simulator_file_fails(tmp_path):
+    """A matching-bytes file at an undeclared simulator path must not reclassify
+    a source-bound artifact as simulator-local; the bundle path must still equal
+    the recorded production source path."""
+    sim_root = tmp_path / "sim"
+    prod_root = tmp_path / "prod"
+    sim_root.mkdir()
+    prod_root.mkdir()
+    rel = "src/xarm_ros2/config/xarm7/kinematics.yaml"
+    content = b"kinematics content\n"
+    digest = _sha256_bytes(content)
+    verified = {"kinematics": _f33_source_entry(prod_root, rel, content)}
+    # A shadow file with the same bytes exists under the simulator root at the
+    # undeclared (non-outputs/artifacts) path.
+    shadow_rel = "src/{}/{}".format(prod_root.name, rel)
+    (sim_root / shadow_rel).parent.mkdir(parents=True, exist_ok=True)
+    (sim_root / shadow_rel).write_bytes(content)
+    artifact = {"path": str(sim_root / shadow_rel), "path_relative": shadow_rel, "sha256": digest}
+    overlay = {"kinematics": {"path_relative": shadow_rel, "sha256": digest}}
+    reasons = _bind_bundle_artifact("kinematics", artifact, overlay, verified, sim_root)
+    assert reasons
+    assert any("bundle path does not match the recorded source path" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
 # F1/F2 controller mapping mutations
 # ---------------------------------------------------------------------------
 def test_controller_endpoint_wrong_fails(tmp_path):
@@ -1390,6 +1595,134 @@ def test_detach_string_literal_spoof_passes(tmp_path):
     assert mutated != DEFAULT_ACTION_RUNTIME_CPP
     report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_RUNTIME_CPP_REL: mutated})
     assert _check(report, "action-lifecycle").passed
+
+
+# ---------------------------------------------------------------------------
+# F3.1 aggregate profile-branch binding: no last-match decoy
+# ---------------------------------------------------------------------------
+_SIM_LIFT_FALSE_BLOCK = (
+    "  if (profile == ExecutionProfile::SimOmpl) {\n"
+    "    result = backend.execute_lift(ctx, false, post_close_stage, timeout);\n"
+    "    if (!result.ok()) return result;\n"
+    "  }\n"
+)
+_SIM_LIFT_TRUE_BLOCK = (
+    "  if (profile == ExecutionProfile::SimOmpl) {\n"
+    "    result = backend.execute_lift(ctx, true, post_close_stage, timeout);\n"
+    "    if (!result.ok()) return result;\n"
+    "  }\n"
+)
+_HW_LIFT_TRUE_BLOCK = (
+    "  if (profile == ExecutionProfile::Hardware) {\n"
+    "    result = backend.execute_lift(ctx, true, post_close_stage, timeout);\n"
+    "    if (!result.ok()) return result;\n"
+    "  }\n"
+)
+_RECONCILE_LINE = "  result = attachments.reconcile(ctx, state, request, std::chrono::steady_clock::now() + timeout);\n"
+
+
+def test_sim_violating_then_valid_decoy_fails(tmp_path):
+    """A violating (collision-disabled) Sim lift block followed by a valid
+    Sim decoy must fail: both blocks execute for the Sim profile."""
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace(
+        _RECONCILE_LINE, _RECONCILE_LINE + _SIM_LIFT_FALSE_BLOCK
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("exactly one SimOmpl lift block" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_sim_valid_then_violating_decoy_fails(tmp_path):
+    """A valid Sim lift block followed by a violating Sim decoy must fail."""
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace(
+        _SIM_LIFT_TRUE_BLOCK, _SIM_LIFT_TRUE_BLOCK + _SIM_LIFT_FALSE_BLOCK
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("exactly one SimOmpl lift block" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_duplicate_hardware_wrong_polarity_fails(tmp_path):
+    """A second Hardware lift block with a collision-aware call must fail."""
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace(
+        _RECONCILE_LINE, _RECONCILE_LINE + _HW_LIFT_TRUE_BLOCK
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("exactly one Hardware lift block" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_unguarded_lift_call_outside_profile_blocks_fails(tmp_path):
+    """A top-level execute_lift call outside either accepted profile lift block
+    must fail structural containment."""
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace(
+        "  StageResult result;\n",
+        "  StageResult result;\n  backend.execute_lift(ctx, false, post_close_stage, timeout);\n",
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("not contained by an accepted profile lift block" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_duplicate_obstruction_guard_fails(tmp_path):
+    """A second SimOmpl obstruction guard must fail the exactly-one rule."""
+    guard2 = (
+        "  if (profile == ExecutionProfile::SimOmpl && !close_result.confirms_obstruction()) {\n"
+        '    return {ResultStatus::PostconditionFailed, close_result.stage_result.stage, "dup"};\n'
+        "  }\n"
+    )
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace("  StageResult result;\n", "  StageResult result;\n" + guard2)
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("exactly one SimOmpl obstruction guard" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+# ---------------------------------------------------------------------------
+# F3.2 assignment-form result-field writes
+# ---------------------------------------------------------------------------
+def test_builder_decoy_prefix_field_not_write_fails(tmp_path):
+    """A differently-named member (result->stage_value) must not satisfy the
+    exact `result->stage =` write contract."""
+    mutated = DEFAULT_ACTION_EXECUTION_CPP.replace("result->stage =", "result->stage_value =")
+    assert mutated != DEFAULT_ACTION_EXECUTION_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_EXECUTION_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("result->stage" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_builder_decoy_suffix_field_not_write_fails(tmp_path):
+    """A suffix-decoy member (result->pre_stage) must not satisfy the exact
+    `result->stage =` write contract."""
+    mutated = DEFAULT_ACTION_EXECUTION_CPP.replace("result->stage =", "result->pre_stage =")
+    assert mutated != DEFAULT_ACTION_EXECUTION_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_EXECUTION_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("result->stage" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_builder_read_only_exact_field_not_write_fails(tmp_path):
+    """A read of the exact field (consume(result->status);) must not satisfy the
+    write contract."""
+    mutated = DEFAULT_ACTION_EXECUTION_CPP.replace(
+        "  result->status = static_cast<int16_t>(status);\n",
+        "  (void)consume(result->status);\n",
+    )
+    assert mutated != DEFAULT_ACTION_EXECUTION_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_EXECUTION_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("result->status" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_builder_comparison_exact_field_not_write_fails(tmp_path):
+    """A comparison (result->status == 0) must not satisfy the write contract."""
+    mutated = DEFAULT_ACTION_EXECUTION_CPP.replace(
+        "  result->status = static_cast<int16_t>(status);\n",
+        "  (void)(result->status == 0);\n",
+    )
+    assert mutated != DEFAULT_ACTION_EXECUTION_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_EXECUTION_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("result->status" in reason for reason in _check(report, "action-lifecycle").reasons)
 
 
 # ---------------------------------------------------------------------------
