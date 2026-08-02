@@ -363,6 +363,41 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 5, pre-review fix round 1 — "make
+  Gate D runtime truthful"): Hardened the Stage-D lifecycle and evidence path
+  against the real Humble rclpy action API.  `shutdown()` now explicitly destroys
+  every owned rclpy `ActionClient` (private `_owned_action_clients` collection,
+  kept apart from the mutable public map) before node/context teardown, removing
+  the action waitable/C-handle leak that was the leading in-process suspect for
+  the coordinator's full-suite SIGSEGV; repeated construct/shutdown and partial
+  constructor failure destroy clients exactly once.  Cancellation requires the
+  exact live ExecuteTrajectory `ClientGoalHandle`, exactly one
+  `cancel_goal_async()` on it, the real-shape `CancelGoal.Response`
+  (`return_code == ERROR_NONE`, `goals_canceling == [execute_goal_id]`), terminal
+  CANCELED (5) for both the ExecuteTrajectory result and the joined FJT
+  controller goal, and bounded quiescence; raw UUIDs, rejected/unknown/terminated/
+  empty/extra/malformed/timed-out responses, and SUCCEEDED/ABORTED terminals fail
+  closed.  Safety requires provider evidence to validate and join to a fresh
+  current-window status entry; provider exceptions, no-provider, stale, wrong
+  UUID/digest/source/endpoint/status-cache, and prior-ABORTED-cache entries fail
+  closed.  FJT/status and joint-state evidence is windowed to the current attempt
+  with receipt baselines and bounded wait helpers (joined EXECUTING motion
+  trigger, joined terminal status, quiescence, `safety_stop_frames` consecutive
+  fresh bounded frames, post-clear `safety_position_creep_rad` stability);
+  accepted ExecuteTrajectory goals are cleaned up on timeout/exception.  All six
+  D handlers route success and failure through one fail-dominant artifact path
+  writing `integrated-execution.jsonl/.json`, `moveit-plans.jsonl` (explicit
+  `plan_applicable=false`/`planner_status=null` for the non-MoveIt retreat/
+  gripper handlers), `controller-results.jsonl`, visual-capture rows, and
+  `goals/<scenario_id>.json`; required write failures downgrade every
+  authoritative artifact.  `run_cartesian_retreat` requires an explicit fresh
+  non-empty `base_link` PointCloud2 provider passed into
+  `CartesianMove.Goal.env_points` before `collision_checking=true`.  Humble suite
+  expanded to 109 tests (red/green lifecycle, cancel/safety fail-closed matrices,
+  windowed-evidence helpers, timeout cleanup, artifact/journal failure injection,
+  retreat env-cloud validation, execute-pose, visual chronology).  No build is
+  required.
+
 - 2026-08-02 (integrated qualification Task 5): Extended the same
   `validation/integrated_gate_executor.py` with the Stage-D execution
   interruption gates.  A closed ROS-free `stage_d_dispatch` validates exactly

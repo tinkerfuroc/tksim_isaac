@@ -314,6 +314,62 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 5, pre-review fix round 1 — "make
+  Gate D runtime truthful"): Hardened the Stage-D lifecycle and evidence path
+  against the real Humble rclpy action API.  F1.1 — the executor keeps a private
+  `_owned_action_clients` collection of every real rclpy `ActionClient`, separate
+  from the mutable public client map that tests may replace with fakes, and
+  `shutdown()` now destroys every owned ActionClient exactly once (removing its
+  waitable and C handle) before the node and private-context teardown, clearing
+  lifecycle members so GC cannot double-finalize; a partial-constructor failure
+  destroys already-created clients before node/context cleanup, and repeated
+  construct/shutdown stays supported (this removes the leading in-process suspect
+  for the coordinator's order-dependent full-suite SIGSEGV).  F1.2 — a cancel
+  pass is impossible without the exact live ExecuteTrajectory `ClientGoalHandle`;
+  raw UUID kwargs never substitute; `cancel_goal_async()` is called exactly once
+  on that handle and requires the real-shape `CancelGoal.Response` contract
+  (`return_code == ERROR_NONE` and `goals_canceling == [execute_goal_id]`), the
+  ExecuteTrajectory result must be terminal CANCELED (5), and the joined FJT
+  controller goal must reach CANCELED (5) with bounded quiescence — SUCCEEDED/
+  ABORTED/unknown/empty/extra/malformed/exceptional/timed-out responses fail
+  closed.  F1.3 — safety requires the `fjt_transaction_provider` evidence to
+  validate (endpoint/UUID/digest/source/sequence/timestamp/status) and join to a
+  fresh status-topic entry inside the current attempt window; provider exception,
+  no-provider, stale, wrong-UUID/digest/source/endpoint/status-cache, and
+  prior-ABORTED-cache entries fail closed (never swallowed, never an unrelated
+  cached ABORTED goal).  F1.4 — FJT/status and joint-state evidence is windowed
+  to the current attempt with internal receipt baselines; bounded spin/wait
+  helpers cover the joined EXECUTING motion trigger, joined terminal status,
+  no-active-goal quiescence, `safety_stop_frames` consecutive fresh bounded joint
+  frames, and bounded post-clear stability using `safety_position_creep_rad`.
+  F1.5 — an accepted ExecuteTrajectory goal that times out or fails early is
+  cleaned up via bounded cancellation on the exact handle, recording the cleanup
+  outcome without ever claiming cancel success unless the F1.2 contract was met.
+  F1.6 — all six D handlers (execute joint/pose, cancel, safety, retreat,
+  gripper) route success and failure through one fail-dominant
+  `_finalize_d_attempt`/`_write_d_artifacts` path writing the complete
+  authoritative set (`integrated-execution.jsonl/.json`,
+  `moveit-plans.jsonl` with an explicit `plan_applicable=false`/
+  `planner_status=null` for the non-MoveIt retreat/gripper handlers,
+  `controller-results.jsonl`, truthful visual-capture-request rows, and
+  scenario-specific `goals/<scenario_id>.json`); required goal/JSONL write
+  failures propagate into the Task-4 transactional downgrade, and every D journal
+  snapshot return is checked at its event boundary.  F1.7 — `run_cartesian_retreat`
+  requires an explicit fresh `environment_cloud_provider` returning a real
+  non-empty finite `base_link` `sensor_msgs/msg/PointCloud2`; that exact cloud is
+  passed into `CartesianMove.Goal.env_points` and only then is
+  `collision_checking` recorded true; missing/empty/malformed/stale/wrong-frame/
+  provider-exception/serialization-failure fails closed before goal send.  F1.8 —
+  Gate-C journal bytes and public policy are unchanged; D visual captures use
+  real before/after chronology; real-shape `GetResultService.Response`
+  (`status`/`result`) and `CancelGoal.Response` (`return_code`/`goals_canceling`)
+  test doubles replace the legacy handle-conflation model; `execute_timeout_s`
+  is in the test config.  Humble suite expanded to 109 tests (lifecycle destroy
+  spies + repeated real-context stress, cancel/safety fail-closed matrices,
+  windowed-evidence helper tests, timeout cleanup, goal-artifact/journal
+  fail-dominant injection, retreat env-cloud validation, execute-pose coverage,
+  visual chronology); the pure suite stays 97 tests.  No build is required.
+
 - 2026-08-02 (integrated qualification Task 5): Added the Stage-D execution
   interruption gates to the same ROS-lazy executor.  A closed ROS-free
   `stage_d_dispatch` validates exactly the six Stage-D scenarios
