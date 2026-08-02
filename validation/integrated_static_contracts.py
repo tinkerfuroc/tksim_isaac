@@ -91,6 +91,7 @@ PROD_GRIPPER_CONTROLLERS_REL = "src/xarm_ros2/xarm_moveit_config/config/xarm_gri
 PROD_LAUNCH_REL = "src/mobile_bringup/launch/manipulation_planning_task_only.launch.py"
 PROD_PICK_AND_PLACE_CPP_REL = "src/pick_and_place/src/pick_and_place.cpp"
 PROD_ACTION_EXECUTION_CPP_REL = "src/pick_and_place/src/action_execution.cpp"
+PROD_ACTION_RUNTIME_CPP_REL = "src/pick_and_place/src/action_runtime.cpp"
 PROD_PACKAGE_UTILS_CPP_REL = "src/pick_and_place/src/package_utils.cpp"
 PROD_SCENE_OWNERSHIP_CPP_REL = "src/pick_and_place/src/scene_ownership.cpp"
 PROD_GRASP_NODE_HPP_REL = "src/pick_and_place/include/grasp_node.hpp"
@@ -98,6 +99,7 @@ PROD_ACTION_DIR_REL = "src/tinker_arm_msgs/action"
 PROD_CPP_PATHS = (
     PROD_PICK_AND_PLACE_CPP_REL,
     PROD_ACTION_EXECUTION_CPP_REL,
+    PROD_ACTION_RUNTIME_CPP_REL,
     PROD_PACKAGE_UTILS_CPP_REL,
     PROD_SCENE_OWNERSHIP_CPP_REL,
     PROD_GRASP_NODE_HPP_REL,
@@ -109,6 +111,15 @@ ACTION_SCHEMA_FILES = (
     "JointMove.action",
     "Fold.action",
 )
+# Each task result builder must write the fields declared by its corresponding
+# .action result schema (F2.1 result builders).
+BUILDER_SCHEMA = {
+    "make_pick_result": "Pick.action",
+    "make_place_result": "Place.action",
+    "make_cartesian_result": "CartesianMove.action",
+    "make_joint_result": "JointMove.action",
+    "make_fold_result": "Fold.action",
+}
 
 # Simulator-side artifact paths.
 MODEL_BUNDLE_REL = "outputs/ompl-overlay/model-bundle-r2/model-bundle.json"
@@ -223,50 +234,278 @@ def _git_show_text(repo_root: Path, commit: str, rel_path: str) -> str | None:
         return None
 
 
-def _strip_cpp_comments(text: str) -> str:
-    """Remove // and /* */ comments while preserving newlines and strings."""
-    out: list[str] = []
-    i = 0
+# ---------------------------------------------------------------------------
+# deliberate-scope C++ lexical/structural layer (fix round 2 / F2.1)
+#
+# These helpers are intentionally NOT a general C++ compiler.  They are just
+# enough to prove the load-bearing production contracts listed in the fix
+# brief: comments and every literal body (ordinary strings, character literals,
+# raw strings) are blanked, ``#if 0`` dead regions are removed, actual function
+# definitions are located by qualified name and brace-matched, and ``if``
+# branches are extracted by their real condition and brace structure.  A
+# required semantic token that appears only inside a literal or a dead block
+# never satisfies a check.
+# ---------------------------------------------------------------------------
+def _cpp_match(text: str, open_idx: int, open_ch: str, close_ch: str) -> int | None:
+    """Return the index of the matching close char, or None if unterminated."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _cpp_raw_string_prefix(text: str, i: int) -> tuple[str, int] | None:
+    """Return ``(delimiter, index_of_open_paren)`` if a raw string begins at i.
+
+    Only a standalone ``[u8]R`` token (not an identifier suffix) is treated as
+    a raw-string prefix; the preceding character must not be an identifier char.
+    """
+    if i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_"):
+        return None
+    for prefix in ("u8R", "uR", "UR", "LR", "R"):
+        if text.startswith(prefix + '"', i):
+            j = i + len(prefix) + 1
+            delim_start = j
+            while j < len(text) and text[j] != "(":
+                ch = text[j]
+                if ch in " \t\n\r\\":
+                    return None
+                j += 1
+            if j >= len(text):
+                return None
+            delim = text[delim_start:j]
+            if len(delim) > 16:
+                return None
+            return delim, j
+    return None
+
+
+def _cpp_mask_literals(text: str) -> str:
+    """Blank comments and all literal bodies with spaces (newlines preserved).
+
+    The returned string is the same length as the input so brace/newline/offset
+    positions are preserved.  Literal content cannot satisfy a semantic check.
+    """
+    out = list(text)
     n = len(text)
+    i = 0
     while i < n:
-        ch = text[i]
+        c = text[i]
         nxt = text[i + 1] if i + 1 < n else ""
-        if ch == "/" and nxt == "/":
-            while i < n and text[i] != "\n":
-                i += 1
+        if c == "/" and nxt == "/":
+            j = i
+            while j < n and text[j] != "\n":
+                j += 1
+            for k in range(i, j):
+                out[k] = " "
+            i = j
             continue
-        if ch == "/" and nxt == "*":
-            i += 2
-            while i < n:
-                if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
-                    i += 2
+        if c == "/" and nxt == "*":
+            j = i + 2
+            while j + 1 < n and not (text[j] == "*" and text[j + 1] == "/"):
+                j += 1
+            end = min(j + 2, n)
+            for k in range(i, end):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = end
+            continue
+        raw = _cpp_raw_string_prefix(text, i)
+        if raw is not None:
+            delim, open_paren = raw
+            close = ")" + delim + '"'
+            end = text.find(close, open_paren + 1)
+            if end < 0:
+                end = n
+            else:
+                end += len(close)
+            for k in range(i, end):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = end
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
                     break
-                if text[i] == "\n":
-                    out.append("\n")
-                i += 1
+                j += 1
+            for k in range(i, min(j, n)):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = j
             continue
-        out.append(ch)
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "'":
+                    j += 1
+                    break
+                j += 1
+            for k in range(i, min(j, n)):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
         i += 1
     return "".join(out)
 
 
-def _function_body(text: str, name: str) -> str | None:
-    """Return the brace-matched body of the first ``<name>`` function/method."""
-    idx = text.find(name)
-    if idx < 0:
-        return None
-    open_idx = text.find("{", idx)
-    if open_idx < 0:
-        return None
-    depth = 0
-    for i in range(open_idx, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[open_idx : i + 1]
-    return text[open_idx:]
+_IF0_RE = re.compile(r"#\s*if\s*\(?\s*0\b")
+_PP_CONDITIONAL_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
+
+
+def _cpp_strip_preprocessor_dead(text: str) -> str:
+    """Blank ``#if 0`` dead regions while preserving newlines and offsets.
+
+    Nested ``#if`` directives are tracked.  Directive lines (``#if``/``#ifdef``/
+    ``#ifndef``/``#elif``/``#else``/``#endif``) are intentionally left intact so
+    that :func:`_cpp_has_preprocessor_conditional` can reject any load-bearing
+    body carrying a conditional-preprocessor anchor; only the *content* of a
+    provably-dead ``#if 0`` region is blanked so it cannot satisfy a check.
+    """
+    lines = text.splitlines(keepends=True)
+    out = list(lines)
+    stack: list[tuple[str, bool]] = []  # (kind, seen_else); kind in {"if0", "if"}
+    for i, line in enumerate(lines):
+        content = line[:-1] if line.endswith("\n") else line
+        stripped = content.lstrip()
+        if not stripped.startswith("#"):
+            if any(kind == "if0" and not seen_else for kind, seen_else in stack):
+                out[i] = (" " * len(content)) + ("\n" if line.endswith("\n") else "")
+            continue
+        directive = stripped[1:].strip()
+        keyword = directive.split()[0] if directive else ""
+        if keyword in ("if", "ifdef", "ifndef"):
+            is_if0 = keyword == "if" and bool(_IF0_RE.match(stripped))
+            stack.append(("if0" if is_if0 else "if", False))
+            # directive line left intact: _cpp_has_preprocessor_conditional sees it
+        elif keyword in ("else", "elif"):
+            if stack:
+                kind, seen_else = stack[-1]
+                if kind == "if0" and not seen_else:
+                    stack[-1] = ("if0", True)
+            # directive line left intact
+        elif keyword == "endif":
+            if stack:
+                stack.pop()
+            # directive line left intact
+    return "".join(out)
+
+
+def _cpp_sanitize(text: str) -> str:
+    """Return C++ with comments/literals blanked and ``#if 0`` dead regions
+    removed, preserving braces/newlines/offsets (F2.1.1)."""
+    return _cpp_strip_preprocessor_dead(_cpp_mask_literals(text))
+
+
+def _cpp_has_preprocessor_conditional(body: str) -> bool:
+    """True if a load-bearing body still carries an ``#if``/``#ifdef``/
+    ``#ifndef``/``#elif``/``#else``/``#endif`` directive (dead-code anchors must
+    not satisfy a check, F2.1.2)."""
+    for line in body.splitlines():
+        if _PP_CONDITIONAL_RE.match(line):
+            return True
+    return False
+
+
+def _cpp_skip_after_paren(text: str, close: int) -> int:
+    """Skip whitespace and trailing function specifiers after a ')' to reach the
+    opening '{' of a definition (e.g. ``) noexcept {``)."""
+    j = close + 1
+    while j < len(text):
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        if j >= len(text):
+            break
+        for keyword in ("noexcept", "override", "final", "const", "volatile"):
+            if text.startswith(keyword, j):
+                tail = j + len(keyword)
+                if tail >= len(text) or not (text[tail].isalnum() or text[tail] == "_"):
+                    j = tail
+                    break
+        else:
+            if text[j : j + 2] == "&&":
+                j += 2
+            elif text[j] == "&":
+                j += 1
+            else:
+                break
+    return j
+
+
+def _cpp_find_function(text: str, qualified_name: str) -> str | None:
+    """Return the brace-matched body of the single actual definition of the
+    named function/method, or None if missing/ambiguous/unterminated (F2.1.3).
+
+    The definition is located by its signature: the qualified name, a ``(``,
+    a paren-balanced parameter list, and a ``{`` (after any ``noexcept`` etc.).
+    A call site ends in ``;`` and is never mistaken for a definition.
+    """
+    candidates: list[str] = []
+    start = 0
+    while True:
+        idx = text.find(qualified_name, start)
+        if idx < 0:
+            break
+        before = text[idx - 1] if idx > 0 else ""
+        if before.isalnum() or before == "_" or before == "." or before == ">":
+            start = idx + len(qualified_name)
+            continue
+        after = idx + len(qualified_name)
+        if after >= len(text) or text[after] != "(":
+            start = after
+            continue
+        close = _cpp_match(text, after, "(", ")")
+        if close is None:
+            start = after
+            continue
+        j = _cpp_skip_after_paren(text, close)
+        if j < len(text) and text[j] == "{":
+            body_end = _cpp_match(text, j, "{", "}")
+            if body_end is not None:
+                candidates.append(text[j:body_end])
+                start = body_end + 1
+                continue
+            start = j + 1
+        else:
+            start = close + 1
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _cpp_if_blocks(body: str) -> list[dict[str, str]]:
+    """Return ``[{'condition': str, 'body': str}]`` for every braced ``if``
+    block in the function body (any nesting depth), extracted by actual
+    condition and brace structure (F2.1.4)."""
+    blocks: list[dict[str, str]] = []
+    for match in re.finditer(r"\bif\s*\(", body):
+        open_paren = match.end() - 1
+        close_paren = _cpp_match(body, open_paren, "(", ")")
+        if close_paren is None:
+            continue
+        condition = body[open_paren + 1 : close_paren]
+        j = close_paren + 1
+        while j < len(body) and body[j] in " \t\r\n":
+            j += 1
+        if j < len(body) and body[j] == "{":
+            close_brace = _cpp_match(body, j, "{", "}")
+            if close_brace is not None:
+                blocks.append({"condition": condition, "body": body[j:close_brace]})
+    return blocks
 
 
 def _revision_digest(planning_scene: Mapping[str, Any]) -> str:
@@ -292,9 +531,9 @@ def _fixture_owned_ids(planning_scene: Mapping[str, Any]) -> list[str]:
 def _normalize_repo_relative(root: Path, raw_path: str) -> str | None:
     """Normalize a policy/config path to repository-relative POSIX form.
 
-    Traversal or cross-root absolute paths fail (return None).  Relative paths
-    are canonicalized; absolute paths must start with the resolved repository
-    root.
+    ``..`` traversal is rejected *before* any filtering (F2.4.3); cross-root
+    absolute paths fail.  Relative paths are canonicalized; absolute paths must
+    start with the resolved repository root.
     """
     path = Path(raw_path)
     if path.is_absolute():
@@ -302,13 +541,12 @@ def _normalize_repo_relative(root: Path, raw_path: str) -> str | None:
             rel = path.resolve().relative_to(root.resolve())
         except ValueError:
             return None
-        parts = [part for part in rel.parts if part not in ("", ".", "..")]
+        parts = rel.parts
     else:
-        parts = [part for part in path.parts if part not in ("", ".", "..")]
-    normalized = "/".join(parts)
+        parts = path.parts
     if ".." in parts:
         return None
-    return normalized
+    return "/".join(part for part in parts if part not in ("", "."))
 
 
 def _parse_srdf_gripper(text: str) -> tuple[list[str], str | None, list[str]]:
@@ -369,23 +607,43 @@ def _parse_controllers_yaml(text: str) -> dict[str, dict[str, object]]:
 
 
 def _parse_action_result_fields(text: str) -> list[str]:
-    """Extract the declared result field names from a ROS2 .action file."""
-    fields: list[str] = []
-    in_result = False
+    """Extract the declared result field names from a ROS2 .action file.
+
+    The file is split on ``---`` section separators; the Result section is the
+    one whose header comment contains ``Result``, or (when there is no explicit
+    header) the second section in the Goal/Result/Feedback order.
+    """
+    sections: list[list[str]] = []
+    current: list[str] = []
     for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            if "Result" in stripped:
-                in_result = True
-            continue
-        if in_result:
-            if stripped.startswith("---"):
-                break
-            if not stripped:
+        if line.strip() == "---":
+            sections.append(current)
+            current = []
+        else:
+            current.append(line)
+    sections.append(current)
+
+    result_section: list[str] | None = None
+    for section in sections:
+        if any("#" in line and "Result" in line for line in section):
+            result_section = section
+            break
+    if result_section is None and len(sections) >= 2:
+        result_section = sections[1]
+
+    fields: list[str] = []
+    seen: set[str] = set()
+    if result_section:
+        for line in result_section:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
                 continue
             parts = stripped.split()
-            if len(parts) >= 2 and parts[1].startswith(("_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z")):
-                fields.append(parts[1].rstrip(";"))
+            if len(parts) >= 2 and parts[1].rstrip(";").isidentifier():
+                name = parts[1].rstrip(";")
+                if name not in seen:
+                    fields.append(name)
+                    seen.add(name)
     return fields
 
 
@@ -446,6 +704,149 @@ def _collect_domain_values(config: Mapping[str, Any], overlay: Mapping[str, Any]
                 if "domain" in key.lower():
                     values.append(value)
     return values
+
+
+# ---------------------------------------------------------------------------
+# F2.2 authoritative production source-commit binding
+# ---------------------------------------------------------------------------
+def _verify_overlay_source_commits(
+    overlay: Mapping[str, Any],
+    production_root: Path,
+    impl_head: str | None,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """Verify every ``model_bundle.production_source_commits`` entry from the
+    authoritative overlay contract against immutable Git blobs.
+
+    Returns ``(reasons, verified_entries)``.  Each entry must name a real
+    40-hex commit that exists in the exact recorded ``repo_path`` repository,
+    whose ``path_relative`` blob exists at that commit with the recorded
+    SHA-256.  Entries bound to the manipulation repository must additionally be
+    an ancestor of the manifest production ``implementation_head``.  External
+    model-source repositories (e.g. ``tk25_basic``) are accepted only via their
+    exact recorded commit/blob/hash -- never the current working bytes.  No
+    malformed entry is silently skipped (F2.2).
+    """
+    reasons: list[str] = []
+    model_bundle = overlay.get("model_bundle")
+    if not isinstance(model_bundle, dict):
+        reasons.append("overlay model_bundle is missing")
+        return reasons, {}
+    source_commits = model_bundle.get("production_source_commits")
+    if not isinstance(source_commits, dict) or not source_commits:
+        reasons.append(
+            "overlay model_bundle.production_source_commits must be a non-empty object"
+        )
+        return reasons, {}
+
+    production_resolved = Path(production_root).resolve()
+    verified: dict[str, dict[str, Any]] = {}
+    for key, entry in source_commits.items():
+        if not isinstance(entry, dict):
+            reasons.append("production source {!r} entry must be an object".format(key))
+            continue
+        commit = entry.get("commit")
+        path_rel = entry.get("path_relative")
+        recorded = entry.get("sha256")
+        repo_path = entry.get("repo_path")
+        if not isinstance(commit, str) or not HEX40.fullmatch(commit):
+            reasons.append("production source {!r} commit must be 40-hex".format(key))
+            continue
+        if not isinstance(path_rel, str) or not path_rel:
+            reasons.append("production source {!r} path_relative is missing".format(key))
+            continue
+        if not isinstance(recorded, str) or not HEX64.fullmatch(recorded):
+            reasons.append("production source {!r} sha256 must be 64-hex and not all-zero".format(key))
+            continue
+        repo = Path(repo_path) if isinstance(repo_path, str) else None
+        if repo is None or not repo.is_dir():
+            reasons.append("production source {!r} repo_path is not a real repository directory".format(key))
+            continue
+        repo = repo.resolve()
+        if not _git_commit_exists(repo, commit):
+            reasons.append(
+                "production source {!r} commit {!r} does not exist in {!r}".format(
+                    key, commit, str(repo)
+                )
+            )
+            continue
+        blob = _git_show_bytes(repo, commit, path_rel)
+        if blob is None:
+            reasons.append(
+                "production source {!r} blob {!r}@{!r} not found in {!r}".format(
+                    key, path_rel, commit, str(repo)
+                )
+            )
+            continue
+        if _sha256_bytes(blob) != recorded:
+            reasons.append("production source {!r} sha256 mismatch at {!r}".format(key, path_rel))
+            continue
+        if impl_head is not None and repo == production_resolved:
+            if not _git_is_ancestor(repo, commit, impl_head):
+                reasons.append(
+                    "production source {!r} commit is not an ancestor of the implementation head".format(key)
+                )
+                continue
+        verified[key] = dict(entry)
+    return reasons, verified
+
+
+def _bind_bundle_artifact(
+    key: str,
+    artifact: Mapping[str, Any],
+    overlay_artifacts: Mapping[str, Any],
+    verified_source_commits: Mapping[str, dict[str, Any]],
+    simulator_root: Path,
+) -> list[str]:
+    """Bind one model-bundle artifact to verified immutable bytes (F2.2).
+
+    A simulator-local artifact (under ``outputs/`` or ``artifacts/`` of the
+    simulator root) is hashed from those exact bytes.  A production/external
+    source artifact is bound to a verified immutable source-commit record with
+    the same digest.  An arbitrary working-tree path is never hashed.
+    """
+    reasons: list[str] = []
+    recorded = artifact.get("sha256")
+    if not isinstance(recorded, str) or not HEX64.fullmatch(recorded):
+        return ["model artifact {!r} must have 64-hex sha256".format(key)]
+    overlay_artifact = overlay_artifacts.get(key)
+    if not isinstance(overlay_artifact, dict):
+        return ["overlay model_bundle.artifacts is missing {!r}".format(key)]
+    if overlay_artifact.get("sha256") != recorded:
+        return [
+            "model artifact {!r} sha256 differs from the overlay contract record".format(key)
+        ]
+
+    path_rel = artifact.get("path_relative")
+    if not isinstance(path_rel, str) or not path_rel:
+        path_rel = overlay_artifact.get("path_relative")
+    if isinstance(path_rel, str) and path_rel:
+        raw = Path(path_rel)
+        # Simulator-local artifact: hash the exact simulator bytes.
+        if raw.is_absolute():
+            try:
+                raw.relative_to(simulator_root.resolve())
+                sim_relative = raw.resolve().relative_to(simulator_root.resolve())
+            except ValueError:
+                sim_relative = None
+        else:
+            sim_relative = None
+            if (simulator_root / raw).is_file():
+                sim_relative = raw
+        if sim_relative is not None:
+            actual = _sha256_bytes((simulator_root / sim_relative).read_bytes())
+            if actual != recorded:
+                reasons.append("model artifact {!r} sha256 mismatch (simulator-local)".format(key))
+            return reasons
+
+    # Production/external source artifact: bind to a verified immutable
+    # source-commit record carrying the same digest/path identity.
+    for entry in verified_source_commits.values():
+        if entry.get("sha256") == recorded:
+            return reasons
+    reasons.append(
+        "model artifact {!r} has no verified immutable source-commit binding".format(key)
+    )
+    return reasons
 
 
 # ---------------------------------------------------------------------------
@@ -522,59 +923,45 @@ def _check_model_fingerprint(
                 if recorded != structural:
                     reasons.append("model bundle fingerprint differs from the overlay contract record")
 
+        # F2.2: the authoritative production source commits live in the overlay
+        # contract (the real bundle's root production_source_commits is null).
+        # Verify every entry against immutable Git blobs, then bind each bundle
+        # artifact to either the exact simulator-local bytes or a verified
+        # immutable source-commit record -- never the working tree.
+        overlay_artifacts: dict[str, Any] = {}
+        source_reasons: list[str] = []
+        verified_sources: dict[str, dict[str, Any]] = {}
+        if overlay is not None:
+            bundle_record = overlay.get("model_bundle")
+            if isinstance(bundle_record, dict):
+                overlay_artifacts = (
+                    bundle_record.get("artifacts")
+                    if isinstance(bundle_record.get("artifacts"), dict)
+                    else {}
+                )
+                source_reasons, verified_sources = _verify_overlay_source_commits(
+                    overlay, production_root, impl_head
+                )
+        else:
+            source_reasons = ["overlay contract is unavailable; cannot bind production source commits"]
+        reasons.extend(source_reasons)
+
         artifacts = bundle.get("artifacts")
         if isinstance(artifacts, dict):
             for key, artifact in artifacts.items():
                 if not isinstance(artifact, dict):
                     reasons.append("model artifact {!r} must be an object".format(key))
                     continue
-                recorded = artifact.get("sha256")
-                if not isinstance(recorded, str) or not HEX64.fullmatch(recorded):
-                    reasons.append("model artifact {!r} must have 64-hex sha256".format(key))
-                    continue
-                path_rel = artifact.get("path_relative")
-                abs_path = artifact.get("path")
-                candidates: list[Path] = []
-                if isinstance(path_rel, str):
-                    candidates.append(simulator_root / path_rel)
-                    candidates.append(production_root / path_rel)
-                if isinstance(abs_path, str):
-                    candidates.append(Path(abs_path))
-                matched = False
-                for candidate in candidates:
-                    if candidate.is_file():
-                        matched = True
-                        if _sha256_bytes(candidate.read_bytes()) != recorded:
-                            reasons.append("model artifact {!r} sha256 mismatch: recorded {!r}".format(key, recorded))
-                        break
-                if not matched and candidates:
-                    reasons.append("model artifact {!r} file not found for hash binding".format(key))
-
-        source_commits = bundle.get("production_source_commits")
-        if isinstance(source_commits, dict):
-            for key, entry in source_commits.items():
-                if not isinstance(entry, dict):
-                    continue
-                commit = entry.get("commit")
-                path_rel = entry.get("path_relative")
-                recorded = entry.get("sha256")
-                repo_path = entry.get("repo_path")
-                if not isinstance(commit, str) or not HEX40.fullmatch(commit):
-                    reasons.append("production source {!r} commit must be 40-hex".format(key))
-                    continue
-                if not isinstance(path_rel, str) or not isinstance(recorded, str) or not HEX64.fullmatch(recorded):
-                    reasons.append("production source {!r} must have path_relative and 64-hex sha256".format(key))
-                    continue
-                repo = production_root
-                if isinstance(repo_path, str) and Path(repo_path).is_dir():
-                    repo = Path(repo_path)
-                blob = _git_show_bytes(repo, commit, path_rel)
-                if blob is None:
-                    reasons.append(
-                        "production source {!r} blob {!r}@{!r} not found in {!r}".format(key, path_rel, commit, str(repo))
+                reasons.extend(
+                    _bind_bundle_artifact(
+                        key,
+                        artifact,
+                        overlay_artifacts,
+                        verified_sources,
+                        simulator_root,
                     )
-                elif _sha256_bytes(blob) != recorded:
-                    reasons.append("production source {!r} sha256 mismatch at {!r}".format(key, path_rel))
+                )
+        details["verified_source_commits"] = sorted(verified_sources)
 
     if impl_head is None or not HEX40.fullmatch(impl_head):
         reasons.append("production implementation_head is unavailable/invalid; cannot inspect immutable SRDF")
@@ -838,6 +1225,20 @@ def _check_fixture_ownership(
         if not isinstance(overlay_scenarios, dict):
             reasons.append("overlay contract scenarios map is missing")
 
+    # F2.3: the overlay scenario key set must equal the configured C/D/E set
+    # exactly.  A configured id absent from the overlay and an overlay extra
+    # that is not configured both fail before per-scenario comparison.
+    if isinstance(overlay_scenarios, dict):
+        configured_set = set(unique)
+        overlay_set = set(overlay_scenarios)
+        if configured_set != overlay_set:
+            missing = sorted(configured_set - overlay_set)
+            extra = sorted(overlay_set - configured_set)
+            reasons.append(
+                "overlay scenario set must equal the configured C/D/E set exactly "
+                "(missing: {}; extra: {})".format(missing, extra)
+            )
+
     for sid in unique:
         path = simulator_root / SCENARIO_DIR_REL / (sid + ".json")
         raw = _read_json(path)
@@ -909,6 +1310,54 @@ def _check_fixture_ownership(
     return StaticCheck(name="fixture-ownership", passed=passed, details=details, reasons=tuple(reasons))
 
 
+# ---------------------------------------------------------------------------
+# F2.1 structural C++ bindings
+# ---------------------------------------------------------------------------
+def _bind_destructor(sanitized_pick: str, reasons: list[str]) -> None:
+    """Bind the actual ``GraspNode::~GraspNode`` destructor body (F2.1): the
+    bounded deadline, ``motion_runtime_.shutdown(...)``, the joined
+    ``executor_thread_``, and the state-validity client reset.  Required tokens
+    in another function do not count."""
+    body = _cpp_find_function(sanitized_pick, "GraspNode::~GraspNode")
+    if body is None:
+        reasons.append("GraspNode::~GraspNode() definition must be present in the executable C++ structure")
+        return
+    if _cpp_has_preprocessor_conditional(body):
+        reasons.append("GraspNode::~GraspNode() body must not contain conditional-preprocessor directives")
+        return
+    if "shutdown_deadline" not in body and "std::chrono::seconds(5)" not in body:
+        reasons.append("GraspNode destructor must establish a bounded shutdown deadline")
+    if "motion_runtime_.shutdown(" not in body:
+        reasons.append("GraspNode destructor must call motion_runtime_.shutdown(...)")
+    if "executor_thread_.joinable()" not in body or "executor_thread_.join()" not in body:
+        reasons.append("GraspNode destructor must join the executor thread")
+    if "check_state_validity_client_.reset()" not in body:
+        reasons.append("GraspNode destructor must reset the state-validity client")
+
+
+def _bind_managed_runtime(sanitized_runtime: str, reasons: list[str]) -> None:
+    """Bind the managed MotionRuntime (F2.1): a real joined worker in its
+    defining coordinator path and a joined coordinator in the runtime
+    destructor, with bounded shutdown.  ``#if 0``/literal content never
+    satisfies a token."""
+    if "transaction->worker = std::thread(" not in sanitized_runtime:
+        reasons.append("MotionRuntime must spawn the transaction worker as a managed std::thread")
+    coord_body = _cpp_find_function(sanitized_runtime, "coordinator_main")
+    if coord_body is None:
+        reasons.append("coordinator_main() definition must be present in the executable C++ structure")
+    else:
+        if "transaction->worker.joinable()" not in coord_body or "transaction->worker.join()" not in coord_body:
+            reasons.append("coordinator_main() must join the transaction worker thread")
+    dtor_body = _cpp_find_function(sanitized_runtime, "~MotionRuntime")
+    if dtor_body is None:
+        reasons.append("MotionRuntime destructor must be present in the executable C++ structure")
+    else:
+        if "coordinator_.joinable()" not in dtor_body or "coordinator_.join()" not in dtor_body:
+            reasons.append("MotionRuntime destructor must join the coordinator thread")
+        if "shutdown(" not in dtor_body:
+            reasons.append("MotionRuntime destructor must call shutdown(...)")
+
+
 def _check_action_lifecycle(
     *,
     production_root: Path,
@@ -922,34 +1371,26 @@ def _check_action_lifecycle(
         reasons.append("production implementation_head is unavailable/invalid; cannot inspect C++ lifecycle")
         return StaticCheck(name="action-lifecycle", passed=False, details=details, reasons=tuple(reasons))
 
-    all_cpp: list[str] = []
-    cpp_texts: dict[str, str] = {}
+    sanitized_cpp: dict[str, str] = {}
     for rel in PROD_CPP_PATHS:
         text = _git_show_text(production_root, impl_head, rel)
         if text is None:
             reasons.append("immutable production C++ missing: " + rel)
             continue
-        cpp_texts[rel] = text
-        all_cpp.append(_strip_cpp_comments(text))
+        sanitized_cpp[rel] = _cpp_sanitize(text)
 
-    if all_cpp:
-        if ".detach()" in "\n".join(all_cpp):
+    if sanitized_cpp:
+        combined = "\n".join(sanitized_cpp.values())
+        if ".detach()" in combined:
             reasons.append("action lifecycle uses a detached thread (must be managed)")
-        combined = "\n".join(all_cpp)
-        if "motion_runtime_.shutdown(" not in combined:
-            reasons.append("action lifecycle must call motion_runtime_.shutdown(...)")
-        if "executor_thread_.join()" not in combined:
-            reasons.append("action lifecycle must join the executor thread")
-        if "executor_thread_.joinable()" not in combined and "executor_thread_.join()" in combined:
-            # guarded join present elsewhere; the joinable guard is preferred
-            pass
-        pick = cpp_texts.get(PROD_PICK_AND_PLACE_CPP_REL, "")
-        stripped_pick = _strip_cpp_comments(pick)
-        if "motion_runtime_.shutdown(" not in stripped_pick:
-            reasons.append("bounded runtime shutdown must appear in the executable C++ structure")
-        if "executor_thread_.join()" not in stripped_pick:
-            reasons.append("executor thread must be joined in the executable C++ structure")
-        details["cpp_inspected"] = list(cpp_texts.keys())
+        details["cpp_inspected"] = list(sanitized_cpp.keys())
+
+        pick = sanitized_cpp.get(PROD_PICK_AND_PLACE_CPP_REL, "")
+        if pick:
+            _bind_destructor(pick, reasons)
+        runtime = sanitized_cpp.get(PROD_ACTION_RUNTIME_CPP_REL, "")
+        if runtime:
+            _bind_managed_runtime(runtime, reasons)
 
     action_fields: dict[str, list[str]] = {}
     for schema in ACTION_SCHEMA_FILES:
@@ -961,18 +1402,23 @@ def _check_action_lifecycle(
         action_fields[schema] = _parse_action_result_fields(text)
     details["action_result_fields"] = action_fields
 
-    result_src = _git_show_text(production_root, impl_head, PROD_ACTION_EXECUTION_CPP_REL)
+    result_src = sanitized_cpp.get(PROD_ACTION_EXECUTION_CPP_REL)
     if result_src is None:
         reasons.append("immutable production action_execution.cpp missing")
     else:
-        stripped = _strip_cpp_comments(result_src)
-        required_common = ("result->stage", "result->status", "result->error_msg")
-        for field in required_common:
-            if field not in stripped:
-                reasons.append("action result contract missing required field write: " + field)
-        for schema, fields in action_fields.items():
-            if "success" in fields and "result->success" not in stripped:
-                reasons.append("action {!r} schema requires result->success write".format(schema))
+        for builder, schema_name in BUILDER_SCHEMA.items():
+            body = _cpp_find_function(result_src, builder)
+            if body is None:
+                reasons.append("result builder {}() definition must be present in the executable C++ structure".format(builder))
+                continue
+            if _cpp_has_preprocessor_conditional(body):
+                reasons.append("{}() body must not contain conditional-preprocessor directives".format(builder))
+                continue
+            for field in action_fields.get(schema_name, []):
+                if "result->{}".format(field) not in body:
+                    reasons.append(
+                        "result builder {!r} must write result->{} (per {})".format(builder, field, schema_name)
+                    )
 
     if overlay is not None:
         production_overlay = overlay.get("production_overlay")
@@ -983,6 +1429,53 @@ def _check_action_lifecycle(
 
     passed = not reasons
     return StaticCheck(name="action-lifecycle", passed=passed, details=details, reasons=tuple(reasons))
+
+
+def _bind_run_post_close_pick(sanitized_ownership: str, reasons: list[str]) -> None:
+    """Bind ``run_post_close_pick`` branch ownership (F2.1): the SimOmpl
+    obstruction guard must call ``confirms_obstruction()`` in its own condition;
+    the ``ExecutionProfile::Hardware`` block must call collision-disabled
+    ``execute_lift(ctx, false, ...)`` and no true lift; the SimOmpl lift block
+    must call collision-aware ``execute_lift(ctx, true, ...)`` and no false lift.
+    A true/false swap must fail."""
+    body = _cpp_find_function(sanitized_ownership, "run_post_close_pick")
+    if body is None:
+        reasons.append("run_post_close_pick() definition must be present in the executable C++ structure")
+        return
+    if _cpp_has_preprocessor_conditional(body):
+        reasons.append("run_post_close_pick() body must not contain conditional-preprocessor directives")
+        return
+    guard = None
+    hardware = None
+    sim_lift = None
+    for block in _cpp_if_blocks(body):
+        condition = block["condition"]
+        if "ExecutionProfile::SimOmpl" in condition:
+            if "confirms_obstruction" in condition:
+                guard = block
+            elif "execute_lift" in block["body"]:
+                sim_lift = block
+        if "ExecutionProfile::Hardware" in condition:
+            hardware = block
+    if guard is None:
+        reasons.append("SimOmpl post-close must gate on close_result.confirms_obstruction() in its own condition")
+    else:
+        if "confirms_obstruction()" not in guard["condition"]:
+            reasons.append("SimOmpl obstruction guard must call close_result.confirms_obstruction()")
+    if hardware is None:
+        reasons.append("hardware compatibility branch must be guarded by ExecutionProfile::Hardware")
+    else:
+        if "execute_lift(ctx, false," not in hardware["body"]:
+            reasons.append("hardware branch must call collision-disabled execute_lift(ctx, false, ...)")
+        if "execute_lift(ctx, true," in hardware["body"]:
+            reasons.append("hardware branch must not call collision-aware execute_lift(ctx, true, ...)")
+    if sim_lift is None:
+        reasons.append("SimOmpl post-close branch must call collision-aware execute_lift(ctx, true, ...)")
+    else:
+        if "execute_lift(ctx, true," not in sim_lift["body"]:
+            reasons.append("SimOmpl post-close branch must call collision-aware execute_lift(ctx, true, ...)")
+        if "execute_lift(ctx, false," in sim_lift["body"]:
+            reasons.append("SimOmpl post-close branch must not call collision-disabled execute_lift(ctx, false, ...)")
 
 
 def _check_scene_and_collision_safety(
@@ -1002,48 +1495,52 @@ def _check_scene_and_collision_safety(
     if utils is None:
         reasons.append("immutable production package_utils.cpp missing")
     else:
-        stripped = _strip_cpp_comments(utils)
-        body = _function_body(stripped, "clean_planning_scene")
+        sanitized_utils = _cpp_sanitize(utils)
+        body = _cpp_find_function(sanitized_utils, "GraspNode::clean_planning_scene")
         if body is None:
-            reasons.append("clean_planning_scene() must be present in the executable C++ structure")
+            reasons.append("GraspNode::clean_planning_scene() definition must be present in the executable C++ structure")
         else:
-            sim_idx = body.find("ExecutionProfile::SimOmpl")
-            ret_idx = body.find("return", sim_idx) if sim_idx >= 0 else -1
-            apply_idx = body.find("applyPlanningScene")
-            # The SimOmpl guard must return before the hardware applyPlanningScene cleanup.
-            if sim_idx < 0:
+            if _cpp_has_preprocessor_conditional(body):
+                reasons.append("clean_planning_scene() body must not contain conditional-preprocessor directives")
+            sim_block = None
+            for block in _cpp_if_blocks(body):
+                if "ExecutionProfile::SimOmpl" in block["condition"]:
+                    sim_block = block
+                    break
+            if sim_block is None:
                 reasons.append("clean_planning_scene() must gate on ExecutionProfile::SimOmpl")
-            if ret_idx < 0:
-                reasons.append("clean_planning_scene() must return early on the SimOmpl branch")
-            if sim_idx >= 0 and ret_idx > sim_idx and apply_idx >= 0 and apply_idx < ret_idx:
-                reasons.append("clean_planning_scene() must not run the hardware scene cleanup on the SimOmpl branch")
-        if "task_cleanup_remove_ids(" not in stripped:
-            reasons.append("hardware scene cleanup must route through task-owned task_cleanup_remove_ids()")
+            else:
+                sim_body = sim_block["body"]
+                if "return;" not in sim_body:
+                    reasons.append("clean_planning_scene() SimOmpl block must contain a real return;")
+                if "task_cleanup_remove_ids(" in sim_body or "applyPlanningScene(" in sim_body:
+                    reasons.append("clean_planning_scene() must not run the hardware scene cleanup on the SimOmpl branch")
+            if "task_cleanup_remove_ids(" not in body:
+                reasons.append("hardware scene cleanup must route through task-owned task_cleanup_remove_ids()")
+            if "applyPlanningScene(" not in body:
+                reasons.append("hardware scene cleanup must call applyPlanningScene(...)")
         details["clean_planning_scene"] = body is not None
 
     ownership = _git_show_text(production_root, impl_head, PROD_SCENE_OWNERSHIP_CPP_REL)
     if ownership is None:
         reasons.append("immutable production scene_ownership.cpp missing")
     else:
-        stripped = _strip_cpp_comments(ownership)
-        if "execute_lift(ctx, true," not in stripped:
-            reasons.append("SimOmpl post-close branch must call collision-aware execute_lift(ctx, true, ...)")
-        if "execute_lift(ctx, false," not in stripped:
-            reasons.append("hardware compatibility branch must call collision-disabled execute_lift(ctx, false, ...)")
-        if "confirms_obstruction()" not in stripped:
-            reasons.append("SimOmpl post-close must require close_result.confirms_obstruction()")
-        details["execute_lift_branches"] = {
-            "sim_collision_aware": "execute_lift(ctx, true," in stripped,
-            "hardware_compat": "execute_lift(ctx, false," in stripped,
-        }
+        sanitized_ownership = _cpp_sanitize(ownership)
+        _bind_run_post_close_pick(sanitized_ownership, reasons)
 
     pick = _git_show_text(production_root, impl_head, PROD_PICK_AND_PLACE_CPP_REL)
     if pick is None:
         reasons.append("immutable production pick_and_place.cpp missing")
     else:
-        stripped = _strip_cpp_comments(pick)
-        if "request.avoid_collisions = avoid_collisions;" not in stripped:
-            reasons.append("move_straight must forward avoid_collisions to request.avoid_collisions")
+        sanitized_pick = _cpp_sanitize(pick)
+        body = _cpp_find_function(sanitized_pick, "GraspNode::move_straight")
+        if body is None:
+            reasons.append("GraspNode::move_straight() definition must be present in the executable C++ structure")
+        else:
+            if _cpp_has_preprocessor_conditional(body):
+                reasons.append("move_straight() body must not contain conditional-preprocessor directives")
+            if "request.avoid_collisions = avoid_collisions;" not in body:
+                reasons.append("move_straight must forward avoid_collisions to request.avoid_collisions")
 
     if overlay is not None:
         production_overlay = overlay.get("production_overlay")
@@ -1137,32 +1634,17 @@ def _check_source_identities(
             if isinstance(prod_impl, str) and HEX40.fullmatch(prod_impl):
                 if not _git_commit_exists(production_root, prod_impl):
                     reasons.append("production implementation_head is not a real commit in the production repository")
-                # F1.5 pinned prerequisite: production source commits bound as
-                # ancestors of the implementation identity.
+                # F2.2 pinned prerequisite: the authoritative overlay production
+                # source-commit mapping must be non-empty, structurally complete,
+                # and every entry content-verified against immutable Git blobs.
+                # The same verified mapping drives the model artifact binding, so
+                # this is never vacuous and never merely ``commit == impl_head``.
                 if overlay is not None:
-                    model_bundle = overlay.get("model_bundle")
-                    if isinstance(model_bundle, dict):
-                        source_commits = model_bundle.get("production_source_commits")
-                        if isinstance(source_commits, dict):
-                            for key, entry in source_commits.items():
-                                if not isinstance(entry, dict):
-                                    continue
-                                commit = entry.get("commit")
-                                repo_path = entry.get("repo_path")
-                                if not isinstance(commit, str) or not HEX40.fullmatch(commit):
-                                    continue
-                                repo = production_root
-                                if isinstance(repo_path, str) and Path(repo_path).is_dir():
-                                    repo = Path(repo_path)
-                                if str(repo.resolve()) == str(production_root.resolve()):
-                                    if not _git_is_ancestor(repo, commit, prod_impl):
-                                        reasons.append(
-                                            "production source {!r} commit is not an ancestor of the implementation head".format(key)
-                                        )
-                                elif _git_commit_exists(repo, commit) is False and repo.exists():
-                                    reasons.append(
-                                        "production source {!r} commit is not resolvable in {!r}".format(key, str(repo))
-                                    )
+                    source_reasons, _verified = _verify_overlay_source_commits(
+                        overlay, production_root, prod_impl
+                    )
+                    reasons.extend(source_reasons)
+                    details["pinned_source_commits"] = sorted(_verified)
     passed = not reasons
     return StaticCheck(name="source-identities", passed=passed, details=details, reasons=tuple(reasons))
 

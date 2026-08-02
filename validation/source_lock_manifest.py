@@ -49,6 +49,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -244,7 +245,7 @@ def _validate_policy_schema(
     policy_root = Path(str(policy.get("root", ""))).resolve()
     if policy_root != root.resolve():
         reasons.append("root mismatch: {!r} != {!r}".format(str(policy.get("root")), str(root.resolve())))
-    policy_path_norm = _normalize_posix(policy.get("policy_path"))
+    policy_path_norm = _normalize_posix(policy.get("policy_path"), root=root)
     if policy_path_norm != rel_path:
         reasons.append(
             "policy_path mismatch: {!r} != {!r}".format(policy.get("policy_path"), rel_path)
@@ -260,6 +261,13 @@ def _validate_policy_schema(
     mode = policy.get("mode")
     if mode not in {"clean", "authorized_dirty"}:
         reasons.append("mode must be clean or authorized_dirty")
+    elif role == ROLE_QUALIFICATION_TOOLING and mode != "clean":
+        # F2.4.1: the future qualification-tooling policy must be created from a
+        # pristine checkout only; an authorized-dirty qualification policy fails
+        # even if it is internally self-consistent.
+        reasons.append(
+            "qualification_tooling mode must be clean (authorized_dirty is not allowed)"
+        )
     for field in ("status_sha256", "diff_sha256", "untracked_manifest_sha256"):
         digest = policy.get(field)
         if not isinstance(digest, str) or not HEX64.fullmatch(digest):
@@ -438,16 +446,31 @@ def _untracked_manifest(
     return entries, manifest_sha
 
 
-def _normalize_posix(value: object) -> str:
-    """Return a canonical repository-relative POSIX path string."""
+def _normalize_posix(value: object, root: Path | None = None) -> str:
+    """Return a canonical repository-relative POSIX path string (F2.4.3).
+
+    ``..`` traversal is rejected before any filtering.  An absolute path is
+    converted to canonical repository-relative form when *root* is supplied;
+    without a root an absolute path is returned as-is (comparisons against a
+    recorded relative path then fail closed as a mismatch).
+    """
     if not isinstance(value, str):
         return ""
     raw = Path(value)
     if raw.is_absolute():
-        # The policy records repository-relative paths; strip any accidental
-        # repository prefix so absolute/relative CLI args compare equal.
-        return str(raw)
-    return raw.as_posix()
+        if root is not None:
+            try:
+                rel = raw.resolve().relative_to(root.resolve())
+            except ValueError:
+                return ""
+            parts = rel.parts
+        else:
+            return raw.as_posix()
+    else:
+        parts = raw.parts
+    if ".." in parts:
+        return ""
+    return "/".join(part for part in parts if part not in ("", "."))
 
 
 def _coerce_attempt_start(attempt_started_at: datetime | None) -> datetime | None:
@@ -741,22 +764,36 @@ def _observe_repository(
         return record
 
     # F3.3 authorization report: normalize within the repository, require a
-    # regular existing file that predates the attempt.  A non-null
-    # authorization.commit must be a real 40-hex commit, an ancestor of the
-    # resolved lock commit, and predate the attempt.
+    # regular existing file that predates the attempt.  F2.4.2 containment:
+    # an absolute or relative report_path must resolve (following symlinks /
+    # canonicalization) to a regular file inside the repository root; any
+    # escape -- absolute path outside the repo, or a symlink pointing out --
+    # fails closed.  A non-null authorization.commit must be a real 40-hex
+    # commit, an ancestor of the resolved lock commit, and predate the attempt.
     authorization = policy.get("authorization")
     report_ok = True
     if isinstance(authorization, dict):
         report_path_raw = authorization.get("report_path")
         if isinstance(report_path_raw, str) and report_path_raw:
-            report_rel = Path(report_path_raw)
-            report_full = (
-                report_rel if report_rel.is_absolute() else root_path / report_rel
+            report_candidate = (
+                Path(report_path_raw)
+                if Path(report_path_raw).is_absolute()
+                else root_path / report_path_raw
             )
+            root_resolved = root_path.resolve()
+            report_full = report_candidate.resolve()
             try:
-                report_st = os.stat(report_full)
-            except OSError:
-                report_st = None
+                report_full.relative_to(root_resolved)
+                report_inside = True
+            except ValueError:
+                report_inside = False
+            record["checks"]["authorization_report_contained"] = report_inside
+            report_st = None
+            if report_inside:
+                try:
+                    report_st = os.stat(report_full)
+                except OSError:
+                    report_st = None
             record["checks"]["authorization_report_present"] = report_st is not None
             record["checks"]["authorization_report_regular"] = bool(
                 report_st is not None and stat.S_ISREG(report_st.st_mode)
@@ -764,7 +801,13 @@ def _observe_repository(
             record["checks"]["authorization_report_predates_attempt"] = bool(
                 report_st is not None and report_st.st_mtime < attempt_epoch
             )
-            if report_st is None:
+            if not report_inside:
+                record["reasons"].append(
+                    "authorization report resolves outside the repository root: "
+                    "{!r}".format(report_path_raw)
+                )
+                report_ok = False
+            elif report_st is None:
                 record["reasons"].append(
                     "authorization report does not exist: {!r}".format(report_path_raw)
                 )
@@ -874,22 +917,20 @@ def capture_manifest(
     }
     manifest.update(records)
 
-    # The output manifest must postdate the attempt start (freshness).  F3.7:
-    # the artifact is written atomically, its real filesystem mtime is observed
-    # from the written file, and only a stable boolean/status is persisted --
-    # no stale embedded exact ``output_mtime`` timestamp is claimed.
+    # The output manifest must postdate the attempt start (freshness).  F2.4.5:
+    # a finite observation/generated timestamp is taken *before* the single
+    # final atomic write, compared against the attempt start to set
+    # ``output_predates_attempt`` and the aggregate status, then the manifest is
+    # written/fsynced/replaced exactly once.  No two-valid-file crash window and
+    # no stale boolean from an earlier write.  A future attempt time therefore
+    # yields a single atomic evidence-invalid artifact.
     output_path = Path(output)
-    _atomic_write_fsync_json(output_path, manifest)
-    try:
-        output_mtime = os.stat(output_path).st_mtime
-    except OSError:
-        output_mtime = None
-    output_postdates = output_mtime is not None and output_mtime > attempt.timestamp()
+    generated_ts = time.time()
+    output_postdates = generated_ts > attempt.timestamp()
     manifest["output_predates_attempt"] = not output_postdates
     if status == STATUS_PASS and not output_postdates:
         manifest["status"] = STATUS_INVALID
         manifest["reasons"] = ["output manifest does not postdate the attempt start"]
-    # Rewrite with the stable boolean/status; no timestamp is embedded.
     _atomic_write_fsync_json(output_path, manifest)
     return manifest
 
@@ -919,7 +960,8 @@ def _atomic_write_fsync_json(path: Path, value: Mapping[str, Any]) -> None:
 def _read_attempt_start_file(path: str | Path) -> datetime:
     """Read an atomically created ``attempt-start.json`` into an aware datetime.
 
-    Prefers a finite ``started_at`` ISO field; falls back to file mtime.
+    A finite ``started_at`` ISO field is required; there is no file-mtime
+    fallback.
     """
     attempt_path = Path(path)
     if not attempt_path.is_file():

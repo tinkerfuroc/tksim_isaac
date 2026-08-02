@@ -188,18 +188,41 @@ def _policy_document(
     mode: str,
     implementation_head: str,
     authorization_commit: str | None = None,
+    report_path: str | None = None,
+    report_symlink_target: str | None = None,
 ) -> dict[str, object]:
     # F3.3: the authorization report must exist as a regular file that predates
     # the attempt.  The real repos gitignore their .superpowers sidecars; the
     # fixture mirrors that so the report is not an untracked evidence surface.
-    report_rel = ".superpowers/fixture-lock-report.md"
-    report_path = root / report_rel
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    ignore = report_path.parent / ".gitignore"
-    ignore.write_text("*\n", encoding="utf-8")
-    report_path.write_text("fixture authorization report\n", encoding="utf-8")
-    past = datetime(2026, 7, 1, tzinfo=timezone.utc).timestamp()
-    os.utime(report_path, (past, past))
+    # F2.4.2: ``report_path`` records an arbitrary authorization.report_path
+    # (default the fixture sidecar).  A symlink target may be supplied to
+    # exercise the canonical-escape containment rule; the report file is only
+    # created when it actually resolves inside the repository root.
+    report_rel = report_path if report_path is not None else ".superpowers/fixture-lock-report.md"
+    report_target = root / report_rel
+    try:
+        report_target.resolve().relative_to(root.resolve())
+        contained = True
+    except ValueError:
+        contained = False
+    if report_symlink_target is not None:
+        # Create the symlink regardless of where it points; it is the escape
+        # surface the F2.4.2 containment rule must reject.
+        report_target.parent.mkdir(parents=True, exist_ok=True)
+        ignore = report_target.parent / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text("*\n", encoding="utf-8")
+        if report_target.exists() or report_target.is_symlink():
+            report_target.unlink()
+        os.symlink(report_symlink_target, report_target)
+    elif contained:
+        report_target.parent.mkdir(parents=True, exist_ok=True)
+        ignore = report_target.parent / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text("*\n", encoding="utf-8")
+        report_target.write_text("fixture authorization report\n", encoding="utf-8")
+        past = datetime(2026, 7, 1, tzinfo=timezone.utc).timestamp()
+        os.utime(report_target, (past, past))
 
     evidence = _capture_evidence(root)
     return {
@@ -269,6 +292,10 @@ def create_git_fixture_repositories(
     overlay_lock_extra_paths: tuple[str, ...] = (),
     production_lock_extra_paths: tuple[str, ...] = (),
     production_authorization_commit: str | None = None,
+    production_mode: str | None = None,
+    qualification_mode: str | None = None,
+    production_report_path: str | None = None,
+    production_report_symlink_target: str | None = None,
 ) -> None:
     """Build both repositories with realistic lock-only history.
 
@@ -281,6 +308,16 @@ def create_git_fixture_repositories(
     that is NOT an ancestor of the production lock commit; any other non-None
     value is used verbatim (``"impl"`` = the production implementation head, a
     valid ancestor).  ``None`` keeps ``authorization.commit: null``.
+
+    ``production_mode`` / ``qualification_mode`` override the mode recorded for
+    the production and qualification-tooling policies independently (F2.4.1:
+    the simulator repository is shared, so the qualification policy may be
+    clean only when the simulator repo itself is clean).
+
+    ``production_report_path`` / ``production_report_symlink_target`` override
+    the production policy's ``authorization.report_path`` (F2.4.2 containment):
+    the recorded path must resolve to a regular file inside the repository, so
+    an absolute external path or a symlink escaping the repo fails closed.
     """
     _git_init(simulator_root)
     _git_init(production_root)
@@ -334,7 +371,7 @@ def create_git_fixture_repositories(
             repository="simulator",
             root=simulator_root,
             policy_rel="integration/integrated-qualification-source-lock.json",
-            mode=mode,
+            mode=qualification_mode or mode,
             implementation_head=qualification_impl_head,
         )
         _commit_policy(
@@ -369,14 +406,17 @@ def create_git_fixture_repositories(
     else:
         production_auth_commit = production_authorization_commit
 
-    if mode == "authorized_dirty":
+    prod_mode = production_mode or mode
+    if prod_mode == "authorized_dirty":
         _apply_dirty_state(production_root)
     production_policy = _policy_document(
         repository="production",
         root=production_root,
         policy_rel="integration/source-locks.json",
-        mode=mode,
+        mode=prod_mode,
         implementation_head=production_impl_head,
+        report_path=production_report_path,
+        report_symlink_target=production_report_symlink_target,
         authorization_commit=production_auth_commit,
     )
     if "docs/acceptance.md" in production_lock_extra_paths:
@@ -467,6 +507,10 @@ def make_source_lock_fixture(
     overlay_lock_extra_paths: tuple[str, ...] = (),
     production_lock_extra_paths: tuple[str, ...] = (),
     production_authorization_commit: str | None = None,
+    production_mode: str | None = None,
+    qualification_mode: str | None = None,
+    production_report_path: str | None = None,
+    production_report_symlink_target: str | None = None,
 ) -> SourceLockFixture:
     simulator_root = (tmp_path / "simulator").resolve()
     production_root = (tmp_path / "production").resolve()
@@ -485,6 +529,10 @@ def make_source_lock_fixture(
         overlay_lock_extra_paths=overlay_lock_extra_paths,
         production_lock_extra_paths=production_lock_extra_paths,
         production_authorization_commit=production_authorization_commit,
+        production_mode=production_mode,
+        qualification_mode=qualification_mode,
+        production_report_path=production_report_path,
+        production_report_symlink_target=production_report_symlink_target,
     )
     write_authorization_policy(
         simulator_policy_path,
@@ -498,7 +546,7 @@ def make_source_lock_fixture(
         production_policy_path,
         repository="production",
         root=production_root,
-        mode=mode,
+        mode=production_mode or mode,
         policy_after_attempt=policy_after_attempt,
         attempt_started_at=attempt_started_at,
     )
@@ -507,7 +555,7 @@ def make_source_lock_fixture(
             qualification_policy_path,
             repository="simulator",
             root=simulator_root,
-            mode=mode,
+            mode=qualification_mode or mode,
             policy_after_attempt=policy_after_attempt,
             attempt_started_at=attempt_started_at,
         )
@@ -555,7 +603,11 @@ def test_three_policy_verified_pass_clean(tmp_path):
 
 
 def test_three_policy_verified_pass_authorized_dirty(tmp_path):
-    fixture = make_source_lock_fixture(tmp_path, mode="authorized_dirty")
+    """Authorized-dirty is honoured where the role allows it: the production
+    repository may be authorized-dirty, while the shared simulator repository
+    stays clean so both simulator roles (overlay + qualification) pass.  F2.4.1:
+    the qualification role itself must never be authorized-dirty."""
+    fixture = make_source_lock_fixture(tmp_path, mode="clean", production_mode="authorized_dirty")
     observed = _run_capture(fixture)
     assert observed["status"] == "verified-pass"
     for role in ROLES:
@@ -564,14 +616,25 @@ def test_three_policy_verified_pass_authorized_dirty(tmp_path):
         assert observed[role]["diff_match"] is True
         assert observed[role]["untracked_match"] is True
         assert observed[role]["index_match"] is True
-        assert observed[role]["observed_clean"] is False
-        # Exact dirty entries: regular, executable, symlink.
-        paths = {entry["path"] for entry in observed[role]["untracked_manifest"]}
-        assert "untracked/regular.txt" in paths
-        assert "untracked/run.sh" in paths
-        assert "untracked/link" in paths
-        kinds = {entry["kind"] for entry in observed[role]["untracked_manifest"]}
-        assert kinds == {"regular", "symlink"}
+    assert observed["production"]["observed_clean"] is False
+    assert observed["simulator_overlay"]["observed_clean"] is True
+    assert observed["qualification_tooling"]["observed_clean"] is True
+    # Exact dirty entries: regular, executable, symlink (production repo only).
+    paths = {entry["path"] for entry in observed["production"]["untracked_manifest"]}
+    assert "untracked/regular.txt" in paths
+    assert "untracked/run.sh" in paths
+    assert "untracked/link" in paths
+    kinds = {entry["kind"] for entry in observed["production"]["untracked_manifest"]}
+    assert kinds == {"regular", "symlink"}
+
+
+def test_qualification_authorized_dirty_fails(tmp_path):
+    """F2.4.1: an authorized-dirty qualification-tooling policy fails closed even
+    when it is internally self-consistent."""
+    fixture = make_source_lock_fixture(tmp_path, mode="authorized_dirty", qualification_mode="authorized_dirty")
+    observed = _run_capture(fixture)
+    assert observed["qualification_tooling"]["status"] == "verified-fail"
+    assert any("mode must be clean" in reason for reason in observed["qualification_tooling"]["reasons"])
 
 
 def test_absent_qualification_policy_is_evidence_invalid(tmp_path):
@@ -823,6 +886,43 @@ def test_late_authorization_report_fails(tmp_path):
     assert observed["production"]["checks"]["authorization_report_predates_attempt"] is False
 
 
+def test_authorization_report_absolute_escape_fails(tmp_path):
+    """F2.4.2: an absolute authorization.report_path that resolves outside the
+    repository root fails closed (containment), even when the file exists."""
+    outside = tmp_path / "outside-report.md"
+    outside.write_text("outside authorization report\n", encoding="utf-8")
+    past = datetime(2026, 7, 1, tzinfo=timezone.utc).timestamp()
+    os.utime(outside, (past, past))
+    fixture = make_source_lock_fixture(tmp_path, mode="clean", production_report_path=str(outside))
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert observed["production"]["status"] == "verified-fail"
+    assert observed["production"]["checks"]["authorization_report_contained"] is False
+    assert any(
+        "outside the repository root" in reason for reason in observed["production"]["reasons"]
+    )
+
+
+def test_authorization_report_symlink_escape_fails(tmp_path):
+    """F2.4.2: a report_path that is a symlink inside the repo but resolves
+    (canonically) outside the repository root fails containment."""
+    outside = tmp_path / "outside-target.md"
+    outside.write_text("outside target\n", encoding="utf-8")
+    fixture = make_source_lock_fixture(
+        tmp_path,
+        mode="clean",
+        production_report_path=".superpowers/escape-link.md",
+        production_report_symlink_target=str(outside),
+    )
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert observed["production"]["status"] == "verified-fail"
+    assert observed["production"]["checks"]["authorization_report_contained"] is False
+    assert any(
+        "outside the repository root" in reason for reason in observed["production"]["reasons"]
+    )
+
+
 def test_bogus_authorization_commit_fails(tmp_path):
     """A non-null authorization.commit that is not an ancestor of the resolved
     lock commit is rejected (F3.3).  The diverged side commit is created at
@@ -923,6 +1023,29 @@ def test_output_predating_attempt_is_evidence_invalid(tmp_path):
     # future attempt start.
     import os as _os
     assert _os.stat(fixture.output).st_mtime < future_attempt.timestamp()
+
+
+def test_output_single_atomic_write_mtime_agrees(tmp_path):
+    """F2.4.5: the manifest is written/fsynced/replaced exactly once.  The
+    persisted ``output_predates_attempt`` boolean (from a single pre-write
+    timestamp) agrees with the final file's real mtime relation, and no temp
+    files survive."""
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    result = capture_source_lock_manifest(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        simulator_policy_path=fixture.simulator_policy_path,
+        production_policy_path=fixture.production_policy_path,
+        qualification_policy_path=fixture.qualification_policy_path,
+        attempt_started_at=fixture.attempt_started_at,
+        output=fixture.output,
+    )
+    assert result["status"] == "verified-pass"
+    assert result["output_predates_attempt"] is False
+    # Independent filesystem relation: the final artifact postdates the attempt.
+    assert os.stat(fixture.output).st_mtime > fixture.attempt_started_at.timestamp()
+    leftovers = [p.name for p in fixture.output.parent.iterdir() if ".tmp" in p.name or p.name.endswith("~")]
+    assert leftovers == []
 
 
 def test_attempt_start_requires_iso_started_at(tmp_path):
