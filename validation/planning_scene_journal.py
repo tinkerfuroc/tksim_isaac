@@ -153,13 +153,22 @@ REQUIRED_SERVICES: dict[str, str] = {
     "/apply_planning_scene": "moveit_msgs/srv/ApplyPlanningScene",
 }
 
-# Required QoS.  Topics are reliable + transient-local + depth 1; services are
-# reliable + volatile.
-TOPIC_QOS: dict[str, object] = {
+# Required QoS (F2.3).  The two PlanningScene topics mirror the stock MoveIt2
+# Humble ``PlanningSceneMonitor::startPublishingPlanningScene`` publisher's plain
+# depth-100 ``rclcpp::QoS`` (RELIABLE + VOLATILE).  The fixture status topic
+# remains reliable + transient-local + depth 1.  Services are reliable + volatile.
+PLANNING_SCENE_TOPIC_QOS: dict[str, object] = {
+    "reliability": "RELIABLE",
+    "durability": "VOLATILE",
+    "depth": 100,
+}
+FIXTURE_TOPIC_QOS: dict[str, object] = {
     "reliability": "RELIABLE",
     "durability": "TRANSIENT_LOCAL",
     "depth": 1,
 }
+#: Backward-compatible alias retained for the fixture-status topic claim.
+TOPIC_QOS: dict[str, object] = dict(FIXTURE_TOPIC_QOS)
 SERVICE_QOS: dict[str, object] = {
     "reliability": "RELIABLE",
     "durability": "VOLATILE",
@@ -192,7 +201,9 @@ __all__ = [
     "FIXTURE_PUBLISHER_NODE",
     "FIXTURE_TOPIC",
     "FIXTURE_TOPIC_TYPE",
+    "FIXTURE_TOPIC_QOS",
     "PHYSICS_FORBIDDEN_KEYS",
+    "PLANNING_SCENE_TOPIC_QOS",
     "POSITIVE_ORDER",
     "SNAPSHOT_FORBIDDEN_TRANSITION_EVENTS",
     "RECORDER_NODE",
@@ -453,17 +464,21 @@ def _validate_topic_entry(
         raise ValueError(f"topic {name} evidence must be a mapping")
     if entry.get("type") != expected_type:
         raise ValueError(f"topic {name} has wrong type {entry.get('type')!r}; expected {expected_type}")
+    qos = FIXTURE_TOPIC_QOS if fixture else PLANNING_SCENE_TOPIC_QOS
+    qos_label = (
+        "reliable + transient-local + depth 1"
+        if fixture
+        else "reliable + volatile + depth 100"
+    )
     for side in ("requested_qos", "offered_qos"):
-        if not _qos_matches(entry.get(side), TOPIC_QOS):
-            raise ValueError(
-                f"topic {name} {side} QoS must be reliable + transient-local + depth 1"
-            )
+        if not _qos_matches(entry.get(side), qos):
+            raise ValueError(f"topic {name} {side} QoS must be {qos_label}")
     publishers = _validate_endpoints(f"topic {name} publishers", entry.get("publishers"))
     subscribers = _validate_endpoints(f"topic {name} subscribers", entry.get("subscribers"))
     normalized: dict[str, object] = {
         "type": expected_type,
-        "requested_qos": dict(TOPIC_QOS),
-        "offered_qos": dict(TOPIC_QOS),
+        "requested_qos": dict(qos),
+        "offered_qos": dict(qos),
         "publishers": publishers,
         "subscribers": subscribers,
     }
@@ -508,7 +523,8 @@ def validate_graph_evidence(graph: object) -> dict[str, object]:
     and ``/get_planning_scene``, ``/apply_planning_scene`` services), the
     recorder identity (``node_name="/tinker_integrated_gate_executor"``,
     ``namespace="/"``, ``remap_table={}``), real endpoint/provider metadata,
-    topic QoS reliable + transient-local + depth 1, service QoS reliable +
+    PlanningScene topic QoS reliable + volatile + depth 100 (stock MoveIt2 Humble),
+    fixture topic QoS reliable + transient-local + depth 1, service QoS reliable +
     volatile, and the exact canonical fixture-status payload with scalar
     ``target_handoff="pick_and_place/object_mesh"`` from exactly one publisher
     ``/fixture_planning_scene``.  The returned normalized graph is the evidence
@@ -621,6 +637,11 @@ class PlanningSceneJournal:
         self.jsonl_path = Path(jsonl_path) if jsonl_path is not None else None
         self._records: list[dict[str, object]] = []
         self._last_scene: dict[str, object] | None = None
+
+    @property
+    def record_count(self) -> int:
+        """Number of durably recorded journal records (owned-journal introspection)."""
+        return len(self._records)
 
     def _normalize(self, scene: object) -> dict[str, object]:
         """Validate and coerce a scene snapshot before any mutation."""
@@ -923,6 +944,42 @@ class PlanningSceneJournal:
             "events": events,
             "records": copy.deepcopy(self._records),
             "graph": copy.deepcopy(validated_graph),
+        }
+        if json_path is not None:
+            _atomic_write_json(final, json_path)
+        return final
+
+    def finalize_failure(
+        self,
+        reason: str,
+        *,
+        graph_diagnosis: str,
+        json_path: str | Path | None = None,
+    ) -> dict[str, object]:
+        """Emit a canonical failure artifact when finalization cannot validate (F2.1).
+
+        Does not pretend graph validation passed.  Records ``status="evidence-invalid"``,
+        the failure *reason*, an invalid/unavailable *graph_diagnosis* string, the
+        existing journal records, and an empty ``graph`` evidence mapping.  When
+        *json_path* is given the finite JSON is written atomically through
+        temp-file + file fsync + ``os.replace`` + directory fsync with no temp
+        residue.  A failed write never replaces an existing final artifact.
+        """
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("finalize_failure reason must be a nonempty string")
+        if not isinstance(graph_diagnosis, str) or not graph_diagnosis:
+            raise ValueError("finalize_failure graph_diagnosis must be a nonempty string")
+        if not self._records:
+            raise ValueError("cannot finalize an empty PlanningScene journal")
+        final = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "evidence-invalid",
+            "authority": "physics_truth",
+            "reason": reason,
+            "graph_diagnosis": graph_diagnosis,
+            "events": [str(record["event"]) for record in self._records],
+            "records": copy.deepcopy(self._records),
+            "graph": {},
         }
         if json_path is not None:
             _atomic_write_json(final, json_path)
