@@ -43,6 +43,7 @@ Payload content never substitutes for graph ownership.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -123,9 +124,21 @@ PHYSICS_FORBIDDEN_KEYS: frozenset[str] = frozenset({
     "xyz",
 })
 
+# Fixture ownership namespace; teardown alone may additionally remove fixture
+# objects, never arbitrary foreign namespaces.
+FIXTURE_NAMESPACE_PREFIX = "sim_fixture/"
+
 # Recorder identity required by validate_graph_evidence.
 RECORDER_NODE = "/tinker_integrated_gate_executor"
 RECORDER_NAMESPACE = "/"
+
+# Transition/change labels that cannot truthfully be represented by a snapshot
+# (which reuses the prior scene identity without a PlanningScene diff).
+SNAPSHOT_FORBIDDEN_TRANSITION_EVENTS: frozenset[str] = frozenset({
+    "scene-attach",
+    "scene-detach",
+    "task-cleanup",
+})
 
 # Observed topic/service interface sets with exact projected types.
 REQUIRED_TOPICS: dict[str, str] = {
@@ -175,11 +188,13 @@ __all__ = [
     "CANONICAL_TARGET_HANDOFF",
     "CANONICAL_TOUCH_LINKS",
     "DIGEST",
+    "FIXTURE_NAMESPACE_PREFIX",
     "FIXTURE_PUBLISHER_NODE",
     "FIXTURE_TOPIC",
     "FIXTURE_TOPIC_TYPE",
     "PHYSICS_FORBIDDEN_KEYS",
     "POSITIVE_ORDER",
+    "SNAPSHOT_FORBIDDEN_TRANSITION_EVENTS",
     "RECORDER_NODE",
     "RECORDER_NAMESPACE",
     "REQUIRED_SERVICES",
@@ -327,9 +342,23 @@ def _atomic_write_json(value: object, path: Path) -> None:
 
 
 def _qos_matches(qos: object, expected: Mapping[str, object]) -> bool:
+    """Require the exact expected key set and exact scalar types.
+
+    ``depth`` must be a non-boolean integer equal to the expected value, so
+    ``True == 1`` and extra ``history``/unknown keys are rejected.
+    """
     if not isinstance(qos, Mapping):
         return False
-    return all(qos.get(key) == value for key, value in expected.items())
+    if set(qos) != set(expected):
+        return False
+    for key, expected_value in expected.items():
+        value = qos.get(key)
+        if key == "depth":
+            if isinstance(value, bool) or not isinstance(value, int) or value != expected_value:
+                return False
+        elif value != expected_value:
+            return False
+    return True
 
 
 def _validate_endpoints(label: str, endpoints: object) -> list[dict[str, str]]:
@@ -364,6 +393,10 @@ def _validate_fixture_payload(payload: object) -> dict[str, object]:
     The payload is the raw ``std_msgs/msg/String`` data: it must be the canonical
     compact sorted-key JSON encoding of exactly the canonical fixture-status
     field set, with scalar ``target_handoff="pick_and_place/object_mesh"``.
+    Field types are exact (never string-coerced): ``published_at`` is a finite
+    non-negative non-boolean numeric, ``sequence`` is a non-negative non-boolean
+    integer, and ``owned_ids`` is an ordered unique ``sim_fixture/*`` string
+    list.  Returns a deep copy of the parsed payload.
     """
     if not isinstance(payload, str) or not payload:
         raise ValueError("fixture payload must be a nonempty canonical compact JSON string")
@@ -378,8 +411,8 @@ def _validate_fixture_payload(payload: object) -> dict[str, object]:
         raise ValueError("fixture payload must be the canonical compact fixture-status encoding")
     if set(parsed) != FIXTURE_STATUS_KEYS:
         raise ValueError("fixture payload must be the exact canonical fixture-status field set")
-    if parsed.get("schema_version") != 1:
-        raise ValueError("fixture payload schema_version must be 1")
+    if isinstance(parsed.get("schema_version"), bool) or parsed.get("schema_version") != 1:
+        raise ValueError("fixture payload schema_version must be the integer 1")
     if parsed.get("owner") != "sim_fixture":
         raise ValueError("fixture payload owner must be sim_fixture")
     if parsed.get("target_handoff") != CANONICAL_TARGET_HANDOFF:
@@ -394,20 +427,23 @@ def _validate_fixture_payload(payload: object) -> dict[str, object]:
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
         raise ValueError("fixture payload sequence must be a non-negative integer")
     published_at = parsed.get("published_at")
-    if isinstance(published_at, bool):
-        raise ValueError("fixture payload published_at must be finite non-negative")
-    try:
-        published = float(published_at)
-    except (TypeError, ValueError):
-        raise ValueError("fixture payload published_at must be finite non-negative")
-    if not math.isfinite(published) or published < 0.0:
-        raise ValueError("fixture payload published_at must be finite non-negative")
+    if isinstance(published_at, bool) or not isinstance(published_at, (int, float)):
+        raise ValueError("fixture payload published_at must be a finite non-negative number")
+    if not math.isfinite(float(published_at)) or float(published_at) < 0.0:
+        raise ValueError("fixture payload published_at must be a finite non-negative number")
     owned_ids = parsed.get("owned_ids")
-    if not isinstance(owned_ids, list) or not all(
-        isinstance(value, str) and value for value in owned_ids
-    ):
+    if not isinstance(owned_ids, list):
         raise ValueError("fixture payload owned_ids must be a list of nonempty strings")
-    return dict(parsed)
+    seen: set[str] = set()
+    for value in owned_ids:
+        if not isinstance(value, str) or not value:
+            raise ValueError("fixture payload owned_ids must be a list of nonempty strings")
+        if not value.startswith(FIXTURE_NAMESPACE_PREFIX):
+            raise ValueError(f"fixture payload owned_ids entry must be under {FIXTURE_NAMESPACE_PREFIX}")
+        if value in seen:
+            raise ValueError(f"fixture payload owned_ids contains a duplicate: {value}")
+        seen.add(value)
+    return copy.deepcopy(parsed)
 
 
 def _validate_topic_entry(
@@ -426,8 +462,8 @@ def _validate_topic_entry(
     subscribers = _validate_endpoints(f"topic {name} subscribers", entry.get("subscribers"))
     normalized: dict[str, object] = {
         "type": expected_type,
-        "requested_qos": TOPIC_QOS,
-        "offered_qos": TOPIC_QOS,
+        "requested_qos": dict(TOPIC_QOS),
+        "offered_qos": dict(TOPIC_QOS),
         "publishers": publishers,
         "subscribers": subscribers,
     }
@@ -436,7 +472,12 @@ def _validate_topic_entry(
             raise ValueError(f"topic {name} must have exactly one publisher")
         if publishers[0]["node"] != FIXTURE_PUBLISHER_NODE:
             raise ValueError(f"topic {name} publisher must be {FIXTURE_PUBLISHER_NODE}")
-        normalized["payload"] = _validate_fixture_payload(entry.get("payload"))
+        raw_payload = entry.get("payload")
+        parsed = _validate_fixture_payload(raw_payload)
+        # Retain the exact validated canonical compact string as the payload
+        # evidence; parsed data is retained separately under payload_parsed.
+        normalized["payload"] = raw_payload
+        normalized["payload_parsed"] = parsed
     return normalized
 
 
@@ -452,8 +493,8 @@ def _validate_service_entry(name: str, entry: object, expected_type: str) -> dic
     clients = _validate_endpoints(f"service {name} clients", entry.get("clients"))
     return {
         "type": expected_type,
-        "requested_qos": SERVICE_QOS,
-        "offered_qos": SERVICE_QOS,
+        "requested_qos": dict(SERVICE_QOS),
+        "offered_qos": dict(SERVICE_QOS),
         "servers": servers,
         "clients": clients,
     }
@@ -491,30 +532,43 @@ def validate_graph_evidence(graph: object) -> dict[str, object]:
     if not isinstance(services, Mapping):
         raise ValueError("graph evidence must include a services mapping")
 
+    expected_topic_keys = set(REQUIRED_TOPICS) | {FIXTURE_TOPIC}
+    if set(topics) != expected_topic_keys:
+        raise ValueError(
+            f"graph evidence topics must be exactly {sorted(expected_topic_keys)}"
+        )
+    expected_service_keys = set(REQUIRED_SERVICES)
+    if set(services) != expected_service_keys:
+        raise ValueError(
+            f"graph evidence services must be exactly {sorted(expected_service_keys)}"
+        )
+
     normalized_topics: dict[str, dict[str, object]] = {}
     for name, expected_type in REQUIRED_TOPICS.items():
-        if name not in topics:
-            raise ValueError(f"graph evidence missing required topic {name}")
         normalized_topics[name] = _validate_topic_entry(name, topics[name], expected_type)
-    if FIXTURE_TOPIC not in topics:
-        raise ValueError(f"graph evidence missing required topic {FIXTURE_TOPIC}")
     normalized_topics[FIXTURE_TOPIC] = _validate_topic_entry(
         FIXTURE_TOPIC, topics[FIXTURE_TOPIC], FIXTURE_TOPIC_TYPE, fixture=True
     )
 
     normalized_services: dict[str, dict[str, object]] = {}
     for name, expected_type in REQUIRED_SERVICES.items():
-        if name not in services:
-            raise ValueError(f"graph evidence missing required service {name}")
         normalized_services[name] = _validate_service_entry(name, services[name], expected_type)
 
-    return {
+    # Require the recorder node among the topic subscribers and service clients.
+    for name in sorted(expected_topic_keys):
+        if not any(endpoint["node"] == RECORDER_NODE for endpoint in normalized_topics[name]["subscribers"]):
+            raise ValueError(f"topic {name} must be subscribed by {RECORDER_NODE}")
+    for name in sorted(expected_service_keys):
+        if not any(endpoint["node"] == RECORDER_NODE for endpoint in normalized_services[name]["clients"]):
+            raise ValueError(f"service {name} must be called by {RECORDER_NODE}")
+
+    return copy.deepcopy({
         "node_name": RECORDER_NODE,
         "namespace": RECORDER_NAMESPACE,
         "remap_table": {},
         "topics": normalized_topics,
         "services": normalized_services,
-    }
+    })
 
 
 class PlanningSceneJournal:
@@ -603,16 +657,29 @@ class PlanningSceneJournal:
         attached_links = scene["attached_links"]
         if not isinstance(attached_links, Mapping):
             raise ValueError("attached_links must be a mapping")
-        normalized["attached_links"] = {
-            str(key): str(value) for key, value in attached_links.items()
-        }
+        normalized_attached_links: dict[str, str] = {}
+        for key, value in attached_links.items():
+            if not isinstance(key, str) or not isinstance(value, str) or not value:
+                raise ValueError("attached_links entries must be nonempty strings")
+            normalized_attached_links[key] = value
+        normalized["attached_links"] = normalized_attached_links
+
         touch_links = scene["touch_links"]
         if not isinstance(touch_links, Mapping):
             raise ValueError("touch_links must be a mapping")
-        normalized["touch_links"] = {
-            str(key): [str(value) for value in values]
-            for key, values in touch_links.items()
-        }
+        normalized_touch_links: dict[str, list[str]] = {}
+        for key, values in touch_links.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("touch_links keys must be nonempty strings")
+            if not isinstance(values, (list, tuple)):
+                raise ValueError(f"touch_links for {key} must be a sequence of link names")
+            link_values: list[str] = []
+            for value in values:
+                if not isinstance(value, str) or not value:
+                    raise ValueError(f"touch_links for {key} must contain nonempty strings")
+                link_values.append(value)
+            normalized_touch_links[key] = link_values
+        normalized["touch_links"] = normalized_touch_links
 
         if set(normalized["owned_ids"]) & set(normalized["attached_ids"]):
             raise ValueError("an object cannot be both world and attached")
@@ -640,6 +707,78 @@ class PlanningSceneJournal:
                     raise ValueError(f"attached object {object_id} has wrong touch links")
         return normalized
 
+    def _validate_transition(
+        self,
+        before: Mapping[str, object] | None,
+        after: Mapping[str, object],
+        expected: str,
+    ) -> None:
+        """Validate that a transition event label is true of the recorded scenes.
+
+        ``before`` is ``None`` for the first accepted record; the direct
+        diagnostic case is then preserved only when the event and content are
+        self-consistent.  Scene attachment remains diagnostic only — these checks
+        prove journal/scene consistency, not physical contact.
+        """
+        target = self.target_object_id
+        after_world = set(after["owned_ids"])
+        after_attached = set(after["attached_ids"])
+        if expected == "scene-attach":
+            if target not in after_attached or target in after_world:
+                raise ValueError("scene-attach must attach the exact target object")
+            if after["attached_links"].get(target) != self.expected_attach_link:
+                raise ValueError(f"attached object {target} has wrong attach link")
+            if tuple(after["touch_links"].get(target, ())) != self.expected_touch_links:
+                raise ValueError(f"attached object {target} has wrong touch links")
+            if before is not None:
+                before_world = set(before["owned_ids"])
+                before_attached = set(before["attached_ids"])
+                if target not in before_world or target in before_attached:
+                    raise ValueError(
+                        "scene-attach target must be in the world and not attached before attaching"
+                    )
+        elif expected == "scene-detach":
+            if target not in after_world or target in after_attached:
+                raise ValueError("scene-detach must return the exact target object to the world")
+            if before is not None:
+                before_world = set(before["owned_ids"])
+                before_attached = set(before["attached_ids"])
+                if target not in before_attached or target in before_world:
+                    raise ValueError(
+                        "scene-detach target must be attached and absent from the world before detaching"
+                    )
+        elif expected == "task-cleanup":
+            return  # removal ownership is enforced by _validate_removal
+        else:
+            raise ValueError(f"unknown PlanningScene transition: {expected}")
+
+    def _validate_removal(
+        self,
+        before: Mapping[str, object],
+        after: Mapping[str, object],
+        event: str,
+    ) -> None:
+        """Compare consecutive world+attached ID sets and gate every removal.
+
+        ``task-cleanup`` may remove only ``pick_and_place/*`` objects; ``teardown``
+        may additionally remove ``sim_fixture/*`` objects; no other event may
+        silently remove fixture/foreign objects merely by using another label.
+        """
+        before_ids = set(before["owned_ids"]) | set(before["attached_ids"])
+        after_ids = set(after["owned_ids"]) | set(after["attached_ids"])
+        removed = before_ids - after_ids
+        if not removed:
+            return
+        if event == "teardown":
+            allowed = lambda object_id: object_id.startswith(self.task_namespace) or object_id.startswith(
+                FIXTURE_NAMESPACE_PREFIX
+            )
+        else:
+            allowed = lambda object_id: object_id.startswith(self.task_namespace)
+        foreign = sorted(object_id for object_id in removed if not allowed(object_id))
+        if foreign:
+            raise PermissionError(f"event {event} removed foreign objects: {foreign}")
+
     def _append(
         self,
         event: str,
@@ -648,67 +787,80 @@ class PlanningSceneJournal:
         frame_index: int,
         timestamp: float,
     ) -> dict[str, object]:
-        """Validate, durably append one canonical JSONL record, then store it."""
+        """Independently validate, durably append one canonical JSONL record, then store it."""
         if not isinstance(event, str) or not event or event in self.forbidden_events:
             raise ValueError(f"forbidden or empty PlanningScene event: {event}")
         frame_index = _non_negative_int(frame_index, "frame_index")
         timestamp = _finite_non_negative(timestamp, "timestamp")
+        # Defense in depth (F1.7): re-validate the full scene independent of the
+        # caller path so direct/private calls enforce the same invariants.
+        validated = self._normalize(scene)
         if self._records:
             previous = self._records[-1]
             if frame_index <= int(previous["frame_index"]) or timestamp <= float(previous["timestamp"]):
                 raise ValueError("journal frame_index and timestamp must be monotonic")
-        for field in ("scene_revision_digest", "acm_digest", "robot_state_digest"):
-            _validate_digest(scene.get(field), field)
         record = {
             "event": event,
             "journal_sequence": len(self._records) + 1,
             "frame_index": frame_index,
             "timestamp": timestamp,
-            "scene_sequence": int(scene["scene_sequence"]),
-            "scene_timestamp": float(scene["scene_timestamp"]),
-            "scene_revision_digest": str(scene["scene_revision_digest"]),
-            "owned_ids": list(scene["owned_ids"]),
-            "attached_ids": list(scene["attached_ids"]),
-            "attached_links": dict(scene["attached_links"]),
-            "touch_links": {key: list(value) for key, value in scene["touch_links"].items()},
-            "fixture_revision": str(scene["fixture_revision"]),
-            "acm_digest": str(scene["acm_digest"]),
-            "robot_state_digest": str(scene["robot_state_digest"]),
-            "source": str(scene["source"]),
+            "scene_sequence": validated["scene_sequence"],
+            "scene_timestamp": validated["scene_timestamp"],
+            "scene_revision_digest": validated["scene_revision_digest"],
+            "owned_ids": list(validated["owned_ids"]),
+            "attached_ids": list(validated["attached_ids"]),
+            "attached_links": dict(validated["attached_links"]),
+            "touch_links": {key: list(value) for key, value in validated["touch_links"].items()},
+            "fixture_revision": validated["fixture_revision"],
+            "acm_digest": validated["acm_digest"],
+            "robot_state_digest": validated["robot_state_digest"],
+            "source": validated["source"],
         }
         if self.jsonl_path is not None:
+            if self._records == []:
+                if self.jsonl_path.exists() and self.jsonl_path.stat().st_size > 0:
+                    raise ValueError(f"jsonl path already contains records: {self.jsonl_path}")
             with self.jsonl_path.open("a", encoding="utf-8") as stream:
                 stream.write(_canonical_json_bytes(record).decode("utf-8") + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
         self._records.append(record)
-        return dict(record)
+        return copy.deepcopy(record)
 
     def snapshot(self, event: str, *, frame_index: int, timestamp: float) -> dict[str, object]:
-        """Append a new journal/join identity retaining the prior scene identity."""
+        """Append a new journal/join identity retaining the prior scene identity.
+
+        Transition/change labels that require a real PlanningScene diff
+        (``scene-attach``, ``scene-detach``, ``task-cleanup``) are rejected.
+        """
         if self._last_scene is None:
             raise RuntimeError("cannot snapshot before the first scene diff")
+        if event in SNAPSHOT_FORBIDDEN_TRANSITION_EVENTS:
+            raise ValueError(
+                f"event {event} requires a PlanningScene diff and cannot be snapshotted"
+            )
         return self._append(event, self._last_scene, frame_index=frame_index, timestamp=timestamp)
 
     def record_diff(self, event: str, scene: object) -> dict[str, object]:
-        """Validate and append a scene diff, then update ``_last_scene``."""
+        """Validate and append a scene diff, then update ``_last_scene``.
+
+        Every diff compares consecutive world+attached ID sets (removals are
+        gated per event), and attach/detach/task-cleanup labels are validated
+        against the scene content before any append.
+        """
+        if not isinstance(event, str) or not event or event in self.forbidden_events:
+            raise ValueError(f"forbidden or empty PlanningScene event: {event}")
         normalized = self._normalize(scene)
-        if self._last_scene is not None:
+        before = self._last_scene
+        if before is not None:
             if (
-                normalized["scene_sequence"] <= int(self._last_scene["scene_sequence"])
-                or normalized["scene_timestamp"] <= float(self._last_scene["scene_timestamp"])
+                normalized["scene_sequence"] <= int(before["scene_sequence"])
+                or normalized["scene_timestamp"] <= float(before["scene_timestamp"])
             ):
                 raise ValueError("PlanningScene sequence and timestamp must be monotonic")
-            if event == "task-cleanup":
-                before_ids = set(self._last_scene["owned_ids"]) | set(self._last_scene["attached_ids"])
-                after_ids = set(normalized["owned_ids"]) | set(normalized["attached_ids"])
-                removed = before_ids - after_ids
-                foreign = sorted(
-                    object_id for object_id in removed
-                    if not object_id.startswith(self.task_namespace)
-                )
-                if foreign:
-                    raise PermissionError(f"task cleanup removed foreign objects: {foreign}")
+            self._validate_removal(before, normalized, event)
+        if event in ("scene-attach", "scene-detach", "task-cleanup"):
+            self._validate_transition(before, normalized, event)
         record = self._append(
             event,
             normalized,
@@ -732,32 +884,8 @@ class PlanningSceneJournal:
             raise ValueError("transition sequence must increase")
         if float(after_scene["scene_timestamp"]) <= float(before_scene["scene_timestamp"]):
             raise ValueError("transition timestamp must increase")
-        before_world = set(before_scene["owned_ids"])
-        before_attached = set(before_scene["attached_ids"])
-        after_world = set(after_scene["owned_ids"])
-        after_attached = set(after_scene["attached_ids"])
-        if expected == "scene-attach":
-            if self.target_object_id not in after_attached or self.target_object_id in after_world:
-                raise ValueError("scene-attach must attach the exact target object")
-            if self.target_object_id in before_attached:
-                raise ValueError("scene-attach target was already attached")
-        elif expected == "scene-detach":
-            if (
-                self.target_object_id not in before_attached
-                or self.target_object_id in after_attached
-                or self.target_object_id not in after_world
-            ):
-                raise ValueError("scene-detach must return the exact target object to the world")
-        elif expected == "task-cleanup":
-            removed = (before_world | before_attached) - (after_world | after_attached)
-            foreign = sorted(
-                object_id for object_id in removed
-                if not object_id.startswith(self.task_namespace)
-            )
-            if foreign:
-                raise PermissionError(f"task cleanup removed foreign objects: {foreign}")
-        else:
-            raise ValueError(f"unknown PlanningScene transition: {expected}")
+        self._validate_transition(before_scene, after_scene, expected)
+        self._validate_removal(before_scene, after_scene, expected)
 
     def finalize(
         self,
@@ -776,16 +904,15 @@ class PlanningSceneJournal:
         """
         if not isinstance(status, str) or not status:
             raise ValueError("finalize status must be a nonempty string")
+        if not self._records:
+            raise ValueError("cannot finalize an empty PlanningScene journal")
         events = [str(record["event"]) for record in self._records]
-        cursor = -1
-        for required in self.required_event_order:
-            matches = [index for index, event in enumerate(events) if event == required]
-            if len(matches) != 1 or matches[0] <= cursor:
-                raise ValueError(f"required event order violated at {required}: {events}")
-            cursor = matches[0]
-        if self.required_event_order and self.required_event_order[-1] == "teardown":
-            if not events or events[-1] != "teardown":
-                raise ValueError("teardown must be the final PlanningScene event")
+        if self.required_event_order:
+            expected = list(self.required_event_order)
+            if events != expected:
+                raise ValueError(
+                    f"required event order violated: {events} must equal {expected} exactly"
+                )
         validated_graph: dict[str, object] = {}
         if graph is not None:
             validated_graph = validate_graph_evidence(graph)
@@ -794,8 +921,8 @@ class PlanningSceneJournal:
             "status": status,
             "authority": "physics_truth",
             "events": events,
-            "records": list(self._records),
-            "graph": validated_graph,
+            "records": copy.deepcopy(self._records),
+            "graph": copy.deepcopy(validated_graph),
         }
         if json_path is not None:
             _atomic_write_json(final, json_path)

@@ -363,6 +363,28 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 3 fix round 1): Bound PlanningScene
+  evidence semantics.  `validation/planning_scene_journal.py` closes the
+  public-path false passes: `record_diff` now requires a genuine world-to-
+  attached / attached-to-world transition for the exact target at
+  `scene-attach` / `scene-detach` (shared `_validate_transition` also used by
+  `assert_transition`), `snapshot` rejects `scene-attach` / `scene-detach` /
+  `task-cleanup`, and every diff gates object removal (only `task-cleanup` may
+  remove `pick_and_place/*`; `teardown` alone may additionally remove
+  `sim_fixture/*`).  `finalize` rejects an empty journal and, with a declared
+  required order, requires exact event-list equality (extra/duplicate/
+  out-of-order/spurious-teardown fail).  Returned records and final
+  records/graph are deep-copied so caller mutation cannot diverge JSONL from
+  final JSON, and a pre-existing non-empty JSONL path fails closed before the
+  first append.  `validate_graph_evidence` requires the exact topic/service key
+  sets, the recorder node among topic subscribers and service clients, exact QoS
+  key sets with a non-boolean integer `depth`, and exact (never string-coerced)
+  fixture payload field types with ordered unique `sim_fixture/*` owned ids,
+  retaining the exact canonical compact payload string as evidence.  Nested
+  scene types are strict (`ValueError`, no coercion), and `_append` independently
+  re-validates the full scene.  `tests/test_planning_scene_journal.py` grew to
+  181 tests.
+
 - 2026-08-02 (integrated qualification Task 3): Added the stable PlanningScene
   journal for the integrated OMPL qualification.
   `validation/planning_scene_journal.py` is the ROS-free pure record/transition

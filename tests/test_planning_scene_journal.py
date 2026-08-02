@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
 from planning_scene_journal import (  # noqa: E402
     DIGEST,
     POSITIVE_ORDER,
+    RECORDER_NODE,
     PlanningSceneJournal,
     load_model_touch_contract,
     validate_graph_evidence,
@@ -335,7 +336,7 @@ def test_scene_identity_and_frame_join_key_are_recorded_separately():
 def test_finalize_rejects_missing_or_out_of_order_required_events():
     journal = _journal(required_event_order=POSITIVE_ORDER)
     journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
-    journal.snapshot("scene-attach", frame_index=2, timestamp=2.0)
+    journal.snapshot("before-pick", frame_index=2, timestamp=2.0)
     with pytest.raises(ValueError, match="required event order"):
         journal.finalize("diagnostic-pass")
 
@@ -652,7 +653,8 @@ def test_valid_graph_evidence_passes_and_is_retained():
     assert set(validated["services"]) == {"/get_planning_scene", "/apply_planning_scene"}
     fixture = validated["topics"]["/sim/status/planning_scene_fixture"]
     assert fixture["publishers"] == [{"node": "/fixture_planning_scene", "node_namespace": "/"}]
-    assert fixture["payload"]["target_handoff"] == TARGET_HANDOFF
+    assert fixture["payload"] == _fixture_status_payload()  # exact canonical string retained
+    assert fixture["payload_parsed"]["target_handoff"] == TARGET_HANDOFF
 
 
 def test_graph_missing_topic_rejected():
@@ -889,7 +891,8 @@ def test_finalize_with_graph_retains_evidence(tmp_path):
     final_path = tmp_path / "planning-scene.json"
     final = journal.finalize("diagnostic-pass", graph=_valid_graph(), json_path=final_path)
     assert final["graph"]["node_name"] == "/tinker_integrated_gate_executor"
-    assert final["graph"]["topics"]["/sim/status/planning_scene_fixture"]["payload"]["target_handoff"] == TARGET_HANDOFF
+    assert final["graph"]["topics"]["/sim/status/planning_scene_fixture"]["payload"] == _fixture_status_payload()
+    assert final["graph"]["topics"]["/sim/status/planning_scene_fixture"]["payload_parsed"]["target_handoff"] == TARGET_HANDOFF
     written = json.loads(final_path.read_text(encoding="utf-8"))
     assert written == final
 
@@ -939,11 +942,20 @@ def test_rejected_finalize_does_not_change_jsonl(tmp_path):
 
 def test_positive_order_exact_once(tmp_path):
     journal = _journal(required_event_order=POSITIVE_ORDER, jsonl_path=tmp_path / "p.jsonl")
-    for seq, event in enumerate(POSITIVE_ORDER, start=1):
-        journal.record_diff(event, _scene(seq, float(seq), world=("sim_fixture/table",)))
+    world = ("sim_fixture/table", "pick_and_place/object_mesh")
+    attached_world = ("sim_fixture/table",)
+    target = ("pick_and_place/object_mesh",)
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=world))
+    journal.record_diff("before-pick", _scene(2, 2.0, world=world))
+    for seq, event in enumerate(("scene-attach", "lift-complete", "transport", "before-release"), start=3):
+        journal.record_diff(event, _scene(seq, float(seq), world=attached_world, attached=target))
+    for seq, event in enumerate(("scene-detach", "released-settled", "teardown"), start=7):
+        journal.record_diff(event, _scene(seq, float(seq), world=world))
     final = journal.finalize("diagnostic-pass", json_path=tmp_path / "planning-scene.json")
     assert final["events"] == list(POSITIVE_ORDER)
     assert final["records"][-1]["event"] == "teardown"
+    assert final["records"][2]["attached_ids"] == ["pick_and_place/object_mesh"]
+    assert final["records"][6]["owned_ids"] == ["sim_fixture/table", "pick_and_place/object_mesh"]
 
 
 def test_duplicate_required_event_rejected():
@@ -955,26 +967,36 @@ def test_duplicate_required_event_rejected():
 
 def test_teardown_not_final_rejected():
     journal = _journal(required_event_order=POSITIVE_ORDER)
-    for seq, event in enumerate(POSITIVE_ORDER, start=1):
-        journal.record_diff(event, _scene(seq, float(seq), world=("sim_fixture/table",)))
+    world = ("sim_fixture/table", "pick_and_place/object_mesh")
+    attached_world = ("sim_fixture/table",)
+    target = ("pick_and_place/object_mesh",)
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=world))
+    journal.record_diff("before-pick", _scene(2, 2.0, world=world))
+    for seq, event in enumerate(("scene-attach", "lift-complete", "transport", "before-release"), start=3):
+        journal.record_diff(event, _scene(seq, float(seq), world=attached_world, attached=target))
+    for seq, event in enumerate(("scene-detach", "released-settled", "teardown"), start=7):
+        journal.record_diff(event, _scene(seq, float(seq), world=world))
     journal.snapshot("after-teardown", frame_index=100, timestamp=100.0)
-    with pytest.raises(ValueError, match="teardown"):
+    with pytest.raises(ValueError, match="required event order"):
         journal.finalize("diagnostic-pass")
 
 
 def test_negative_prefix_without_teardown_is_allowed():
     prefix = ("fixture-ready", "before-pick", "scene-attach", "lift-complete", "transport")
     journal = _journal(required_event_order=prefix)
-    for seq, event in enumerate(prefix, start=1):
-        journal.record_diff(event, _scene(seq, float(seq), world=("sim_fixture/table",)))
+    world = ("sim_fixture/table", "pick_and_place/object_mesh")
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=world))
+    journal.record_diff("before-pick", _scene(2, 2.0, world=world))
+    for seq, event in enumerate(("scene-attach", "lift-complete", "transport"), start=3):
+        journal.record_diff(event, _scene(seq, float(seq), world=("sim_fixture/table",), attached=("pick_and_place/object_mesh",)))
     final = journal.finalize("diagnostic-pass")
     assert final["events"] == list(prefix)
 
 
 def test_out_of_order_required_events_rejected():
     journal = _journal(required_event_order=("fixture-ready", "before-pick", "scene-attach"))
-    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
-    journal.record_diff("scene-attach", _scene(2, 2.0, world=("sim_fixture/table",)))
+    journal.record_diff("before-pick", _scene(1, 1.0, world=("pick_and_place/object_mesh",)))
+    journal.record_diff("scene-attach", _scene(2, 2.0, world=(), attached=("pick_and_place/object_mesh",)))
     with pytest.raises(ValueError, match="required event order"):
         journal.finalize("diagnostic-pass")
 
@@ -1010,3 +1032,379 @@ def test_attached_object_without_link_mapping_rejected():
     with pytest.raises(ValueError, match="no attach link"):
         journal.record_diff("scene-attach", scene)
     assert journal._records == []
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 (F1.1): event labels must be true of the recorded scene
+# --------------------------------------------------------------------------- #
+
+
+def test_public_attach_requires_target_actually_attached():
+    journal = _journal()
+    journal.record_diff("before-pick", _scene(1, 1.0, world=("pick_and_place/object_mesh",)))
+    bad = _scene(2, 2.0, world=("pick_and_place/object_mesh",))
+    with pytest.raises(ValueError, match="scene-attach"):
+        journal.record_diff("scene-attach", bad)
+    assert [r["event"] for r in journal._records] == ["before-pick"]
+
+
+def test_public_attach_rejects_target_still_in_world():
+    journal = _journal()
+    journal.record_diff("before-pick", _scene(1, 1.0, world=("pick_and_place/object_mesh", "sim_fixture/table")))
+    bad = _scene(2, 2.0, world=("pick_and_place/object_mesh", "sim_fixture/table"), attached=("pick_and_place/object_mesh",))
+    with pytest.raises(ValueError, match="both world and attached"):
+        journal.record_diff("scene-attach", bad)
+    assert len(journal._records) == 1
+
+
+def test_public_attach_rejects_already_attached_target():
+    journal = _journal()
+    journal.record_diff("scene-attach", _scene(1, 1.0, attached=("pick_and_place/object_mesh",)))
+    again = _scene(2, 2.0, world=(), attached=("pick_and_place/object_mesh",))
+    with pytest.raises(ValueError, match="scene-attach"):
+        journal.record_diff("scene-attach", again)
+    assert len(journal._records) == 1
+
+
+def test_public_detach_requires_prior_attach():
+    journal = _journal()
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("pick_and_place/object_mesh",)))
+    detach = _scene(2, 2.0, world=("pick_and_place/object_mesh",))
+    with pytest.raises(ValueError, match="scene-detach"):
+        journal.record_diff("scene-detach", detach)
+    assert len(journal._records) == 1
+
+
+def test_public_detach_requires_target_in_world():
+    journal = _journal()
+    journal.record_diff("scene-attach", _scene(1, 1.0, attached=("pick_and_place/object_mesh",)))
+    vanished = _scene(2, 2.0, world=())
+    with pytest.raises(ValueError, match="scene-detach"):
+        journal.record_diff("scene-detach", vanished)
+    assert len(journal._records) == 1
+
+
+@pytest.mark.parametrize("event", ["scene-attach", "scene-detach", "task-cleanup"])
+def test_snapshot_rejects_transition_labels(event):
+    journal = _journal()
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    with pytest.raises(ValueError, match="requires a PlanningScene diff"):
+        journal.snapshot(event, frame_index=2, timestamp=2.0)
+    assert len(journal._records) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 (F1.2): returned evidence must not alias stored journal state
+# --------------------------------------------------------------------------- #
+
+
+def test_returned_record_mutation_is_isolated(tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    journal = _journal(jsonl_path=jsonl)
+    r = journal.record_diff(
+        "fixture-ready",
+        _scene(1, 1.0, world=("sim_fixture/table", "pick_and_place/object_mesh")),
+    )
+    r["owned_ids"].append("injected/object")
+    r["attached_ids"].append("injected/attached")
+    r["attached_links"]["injected/attached"] = "link_tcp"
+    r["touch_links"]["injected/attached"] = list(MODEL_TOUCH_LINKS)
+    stored = journal._records[0]
+    assert stored["owned_ids"] == ["sim_fixture/table", "pick_and_place/object_mesh"]
+    assert stored["attached_ids"] == []
+    assert "injected/attached" not in stored["attached_links"]
+    assert "injected/attached" not in stored["touch_links"]
+    assert jsonl.read_text(encoding="utf-8") == json.dumps(stored, sort_keys=True, separators=(",", ":")) + "\n"
+    final_path = tmp_path / "planning-scene.json"
+    final = journal.finalize("diagnostic-pass", json_path=final_path)
+    assert "injected/object" not in final["records"][0]["owned_ids"]
+    written = json.loads(final_path.read_text(encoding="utf-8"))
+    assert "injected/object" not in written["records"][0]["owned_ids"]
+
+
+def test_snapshot_result_mutation_is_isolated(tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    journal = _journal(jsonl_path=jsonl)
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    s = journal.snapshot("before-pick", frame_index=2, timestamp=2.0)
+    s["owned_ids"].append("injected/object")
+    assert journal._records[1]["owned_ids"] == ["sim_fixture/table"]
+    assert jsonl.read_text(encoding="utf-8").count("\n") == 2
+
+
+def test_finalize_records_are_deep_copied(tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    journal = _journal(jsonl_path=jsonl)
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    final = journal.finalize("diagnostic-pass")
+    stored_owned = list(journal._records[0]["owned_ids"])
+    final["records"][0]["owned_ids"].append("injected/object")
+    final["records"][0]["attached_links"]["injected"] = "link_tcp"
+    assert journal._records[0]["owned_ids"] == stored_owned
+    assert "injected" not in journal._records[0]["attached_links"]
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 (F1.3): finalization rejects empty/extra/duplicate/spurious
+# --------------------------------------------------------------------------- #
+
+
+def test_finalize_rejects_empty_journal():
+    journal = _journal()
+    with pytest.raises(ValueError, match="empty"):
+        journal.finalize("diagnostic-pass")
+
+
+def test_finalize_rejects_extra_event():
+    journal = _journal(required_event_order=("fixture-ready", "before-pick"))
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    journal.record_diff("before-pick", _scene(2, 2.0, world=("sim_fixture/table",)))
+    journal.record_diff("spurious-event", _scene(3, 3.0, world=("sim_fixture/table",)))
+    with pytest.raises(ValueError, match="required event order"):
+        journal.finalize("diagnostic-pass")
+
+
+def test_finalize_rejects_spurious_negative_teardown():
+    prefix = ("fixture-ready", "before-pick", "transport")
+    journal = _journal(required_event_order=prefix)
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    journal.record_diff("before-pick", _scene(2, 2.0, world=("sim_fixture/table",)))
+    journal.record_diff("teardown", _scene(3, 3.0, world=("sim_fixture/table",)))
+    with pytest.raises(ValueError, match="required event order"):
+        journal.finalize("diagnostic-pass")
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 (F1.4): object disappearance cannot bypass ownership by relabeling
+# --------------------------------------------------------------------------- #
+
+
+def test_fixture_disappearance_under_ordinary_label_rejected():
+    journal = _journal()
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table", "sim_fixture/shelf")))
+    after = _scene(2, 2.0, world=("sim_fixture/table",))
+    with pytest.raises(PermissionError, match="sim_fixture/shelf"):
+        journal.record_diff("before-pick", after)
+    assert len(journal._records) == 1
+
+
+def test_other_node_disappearance_under_ordinary_label_rejected():
+    journal = _journal()
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("other_node/keep", "pick_and_place/temp")))
+    after = _scene(2, 2.0, world=("pick_and_place/temp",))
+    with pytest.raises(PermissionError, match="other_node/keep"):
+        journal.record_diff("scene-update", after)
+    assert len(journal._records) == 1
+
+
+def test_teardown_may_remove_fixture_objects():
+    journal = _journal()
+    before = _scene(1, 1.0, world=("sim_fixture/table", "sim_fixture/shelf"))
+    after = _scene(2, 2.0, world=())
+    journal.record_diff("fixture-ready", before)
+    journal.record_diff("teardown", after)
+    assert journal.finalize("diagnostic-pass")["records"][-1]["owned_ids"] == []
+
+
+def test_teardown_cannot_remove_other_node_objects():
+    journal = _journal()
+    before = _scene(1, 1.0, world=("sim_fixture/table", "other_node/keep"))
+    after = _scene(2, 2.0, world=("sim_fixture/table",))
+    journal.record_diff("fixture-ready", before)
+    with pytest.raises(PermissionError, match="other_node/keep"):
+        journal.record_diff("teardown", after)
+    assert len(journal._records) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 (F1.5): no append onto stale JSONL
+# --------------------------------------------------------------------------- #
+
+
+def test_existing_nonempty_jsonl_rejected(tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    jsonl.write_text('{"stale": true}\n', encoding="utf-8")
+    before = jsonl.read_bytes()
+    journal = _journal(jsonl_path=jsonl)
+    with pytest.raises(ValueError, match="already contains"):
+        journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    assert journal._records == []
+    assert jsonl.read_bytes() == before
+
+
+def test_zero_length_jsonl_accepted(tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    jsonl.write_text("", encoding="utf-8")
+    journal = _journal(jsonl_path=jsonl)
+    record = journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    assert record["journal_sequence"] == 1
+    assert jsonl.read_text(encoding="utf-8").count("\n") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 (F1.6): close graph and payload strictness gaps
+# --------------------------------------------------------------------------- #
+
+
+def _set_payload(graph, **changes):
+    status = json.loads(graph["topics"]["/sim/status/planning_scene_fixture"]["payload"])
+    status.update(changes)
+    graph["topics"]["/sim/status/planning_scene_fixture"]["payload"] = json.dumps(
+        status, sort_keys=True, separators=(",", ":")
+    )
+
+
+def test_graph_extra_topic_rejected():
+    graph = _valid_graph()
+    graph["topics"]["/extra/topic"] = {
+        "type": "std_msgs/msg/String",
+        "requested_qos": {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1},
+        "offered_qos": {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1},
+        "publishers": [{"node": "/x"}],
+        "subscribers": [{"node": "/tinker_integrated_gate_executor"}],
+    }
+    with pytest.raises(ValueError, match="topics"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_extra_service_rejected():
+    graph = _valid_graph()
+    graph["services"]["/extra/service"] = {
+        "type": "std_srvs/srv/Trigger",
+        "requested_qos": {"reliability": "RELIABLE", "durability": "VOLATILE"},
+        "offered_qos": {"reliability": "RELIABLE", "durability": "VOLATILE"},
+        "servers": [{"node": "/x"}],
+        "clients": [{"node": "/tinker_integrated_gate_executor"}],
+    }
+    with pytest.raises(ValueError, match="services"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_recorder_absent_from_subscribers_rejected():
+    graph = _valid_graph()
+    graph["topics"]["/planning_scene"]["subscribers"] = [{"node": "/someone_else", "node_namespace": "/"}]
+    with pytest.raises(ValueError, match="subscribe"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_recorder_absent_from_clients_rejected():
+    graph = _valid_graph()
+    graph["services"]["/get_planning_scene"]["clients"] = [{"node": "/someone_else", "node_namespace": "/"}]
+    with pytest.raises(ValueError, match="called by"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_boolean_depth_rejected():
+    graph = _valid_graph()
+    graph["topics"]["/planning_scene"]["requested_qos"]["depth"] = True
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_extra_qos_key_rejected():
+    graph = _valid_graph()
+    graph["topics"]["/planning_scene"]["requested_qos"]["history"] = "KEEP_ALL"
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_payload_string_published_at_rejected():
+    graph = _valid_graph()
+    _set_payload(graph, published_at="7.5")
+    with pytest.raises(ValueError, match="published_at"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_payload_boolean_sequence_rejected():
+    graph = _valid_graph()
+    _set_payload(graph, sequence=True)
+    with pytest.raises(ValueError, match="sequence"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_payload_duplicate_owned_ids_rejected():
+    graph = _valid_graph()
+    _set_payload(graph, owned_ids=["sim_fixture/a", "sim_fixture/a"])
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_payload_non_fixture_owned_id_rejected():
+    graph = _valid_graph()
+    _set_payload(graph, owned_ids=["other_node/thing"])
+    with pytest.raises(ValueError, match="sim_fixture"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_input_mutation_after_validation_is_isolated():
+    graph = _valid_graph()
+    validated = validate_graph_evidence(graph)
+    graph["topics"]["/planning_scene"]["requested_qos"]["depth"] = 99
+    graph["topics"]["/sim/status/planning_scene_fixture"]["payload"] = "[]"
+    graph["topics"]["/planning_scene"]["subscribers"][0]["node"] = "/someone_else"
+    assert validated["topics"]["/planning_scene"]["requested_qos"]["depth"] == 1
+    assert validated["topics"]["/sim/status/planning_scene_fixture"]["payload"] == _fixture_status_payload()
+    assert validated["topics"]["/planning_scene"]["subscribers"][0]["node"] == RECORDER_NODE
+
+
+def test_validated_graph_output_mutation_does_not_affect_module_constants():
+    validated = validate_graph_evidence(_valid_graph())
+    validated["topics"]["/planning_scene"]["requested_qos"]["depth"] = 50
+    validated["topics"]["/planning_scene"]["subscribers"][0]["node"] = "/someone_else"
+    again = validate_graph_evidence(_valid_graph())
+    assert again["topics"]["/planning_scene"]["requested_qos"]["depth"] == 1
+    assert again["topics"]["/planning_scene"]["subscribers"][0]["node"] == RECORDER_NODE
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 (F1.7): strict nested scene types and _append() defense in depth
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("scene_sequence", True),
+        ("scene_sequence", -1),
+        ("frame_index", False),
+        ("frame_index", -3),
+        ("scene_timestamp", math.inf),
+        ("scene_timestamp", math.nan),
+        ("scene_timestamp", -1.0),
+        ("timestamp", math.inf),
+        ("timestamp", float("nan")),
+        ("timestamp", -0.5),
+    ],
+)
+def test_append_direct_rejects_invalid_numerics(field, value, tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    journal = _journal(jsonl_path=jsonl)
+    scene = _scene(1, 1.0, world=("sim_fixture/table",))
+    scene[field] = value
+    with pytest.raises(ValueError):
+        journal._append("fixture-ready", scene, frame_index=1, timestamp=1.0)
+    assert journal._records == []
+    assert journal._last_scene is None
+    assert not jsonl.exists()
+
+
+def test_append_direct_rejects_malformed_touch_links(tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    journal = _journal(jsonl_path=jsonl)
+    scene = _scene(1, 1.0, world=("sim_fixture/table",))
+    scene["touch_links"] = {"pick_and_place/object_mesh": 42}
+    with pytest.raises(ValueError, match="touch_links"):
+        journal._append("fixture-ready", scene, frame_index=1, timestamp=1.0)
+    assert journal._records == []
+    assert not jsonl.exists()
+
+
+def test_append_direct_rejects_malformed_attached_links(tmp_path):
+    jsonl = tmp_path / "planning-scene.jsonl"
+    journal = _journal(jsonl_path=jsonl)
+    scene = _scene(1, 1.0, world=("sim_fixture/table",))
+    scene["attached_links"] = {"pick_and_place/object_mesh": 7}
+    with pytest.raises(ValueError, match="attached_links"):
+        journal._append("fixture-ready", scene, frame_index=1, timestamp=1.0)
+    assert journal._records == []
+    assert not jsonl.exists()
