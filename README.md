@@ -314,6 +314,30 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 3 fix round 1): Bound the
+  PlanningScene evidence semantics against the adversarial review findings.
+  `validation/planning_scene_journal.py` now makes the public path fail closed:
+  `record_diff` validates a real world-to-attached / attached-to-world
+  transition for the exact target at `scene-attach` / `scene-detach` through a
+  shared transition validator (also used by `assert_transition`), and
+  `snapshot` rejects the transition labels `scene-attach`, `scene-detach`, and
+  `task-cleanup` that cannot truthfully be represented without a scene diff.
+  Object disappearance is gated for every diff, not just `task-cleanup`;
+  `teardown` alone may additionally remove `sim_fixture/*`.  `finalize` rejects
+  an empty journal and, when a required event order is declared, requires the
+  recorded events to equal it exactly (rejecting extra, duplicate, out-of-order,
+  and spurious negative-teardown events).  Returned records and final
+  records/graph are deep-copied so caller mutation can never diverge the JSONL
+  from final JSON.  Appending onto a pre-existing non-empty JSONL path fails
+  closed.  Graph validation requires the exact topic/service key sets, the
+  recorder node among topic subscribers and service clients, exact QoS key sets
+  with a non-boolean integer `depth`, and exact (never string-coerced) fixture
+  payload field types with unique `sim_fixture/*` owned ids; the exact canonical
+  compact fixture payload string is retained as the payload evidence.  Nested
+  scene types are strict (`ValueError`, no `str()` coercion, no uncaught
+  `TypeError`), and `_append` independently re-validates the full scene.  The
+  focused suite grew to 181 tests.
+
 - 2026-08-02 (integrated qualification Task 3): Added the stable, durable
   PlanningScene journal consumed by the later executor/verifier/evidence tasks.
   `validation/planning_scene_journal.py` is the ROS-free pure record/transition
