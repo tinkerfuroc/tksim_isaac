@@ -48,9 +48,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
 
+from tinker_sim_bridge.fixture_contract import (  # noqa: E402
+    geometry_signature_sha256,
+    readback_geometry,
+    spec_geometry,
+)
 from tinker_sim_bridge.fixture_planning_scene import (  # noqa: E402
     fixture_descriptor_sha256,
     fixture_owned_ids,
+    fixture_to_specs,
+    load_mesh_asset,
 )
 from tinker_sim_bridge.integrated_readiness import (  # noqa: E402
     build_canonical_report,
@@ -273,6 +280,19 @@ JOURNAL_SERVICE_QOS: Mapping[str, object] = {
 MOVEIT_SUCCESS_CODE = 1
 MOVEIT_PLANNING_NON_SUCCESS_CODES: frozenset[int] = frozenset({-1, -2, 5})
 
+#: Complete expected malformed-message exception set contained at the
+#: PlanningScene callback boundary (F3.2): attribute/type/value and
+#: serialization failures that arise from wrong-shaped input.  Process-control
+#: exceptions (KeyboardInterrupt/SystemExit) and unrelated fatal errors are
+#: never swallowed.
+_SCENE_CALLBACK_EXCEPTIONS: tuple[type[Exception], ...] = (
+    AttributeError,
+    IndexError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
+
 #: Journal/evidence artifact names written per attempt.
 ARTIFACT_JSONL_FILES: tuple[str, ...] = (
     "integrated-execution.jsonl",
@@ -399,6 +419,35 @@ def _scenario_fixture_ids(scenario: Mapping[str, object]) -> list[str]:
     if declaration:
         return list(fixture_owned_ids(declaration))
     return list(_as_mapping(scenario.get("planning_scene")).get("owned_ids", ()))
+
+
+def _resolve_declared_mesh(mesh: Mapping[str, object]):
+    """Resolve a declared mesh asset to (vertices, triangles) through the bridge."""
+    return load_mesh_asset(mesh, project_root=ROOT)
+
+
+def expected_fixture_geometry_digest(
+    declaration: Mapping[str, object], *, resolve_mesh=None
+) -> str:
+    """Return the deterministic fixture-owned geometry projection digest (F3.3).
+
+    The projection is the declared-order owned collision-body geometry in the
+    same canonical descriptor form the bridge's ``readback_geometry`` produces
+    for a received MoveIt ``CollisionObject``: frame, primitive type +
+    dimensions + poses (and, for mesh fixtures, resolved vertices + triangles).
+    The digest is ``geometry_signature_sha256`` over exactly those ordered
+    descriptors, so it binds the exact declared IDs, order, frame, geometry, and
+    pose — never unrelated full-scene serialization (robot state / ACM).
+
+    Mesh fixtures require *resolve_mesh* (a callable mapping a
+    ``{"uri", "sha256", "scale"}`` declaration to ``(vertices, triangles)``);
+    the executor supplies the bridge asset resolver by default.
+    """
+    if resolve_mesh is None:
+        resolve_mesh = _resolve_declared_mesh
+    specs = fixture_to_specs(declaration)
+    descriptors = [spec_geometry(spec, resolve_mesh=resolve_mesh) for spec in specs]
+    return geometry_signature_sha256(descriptors)
 
 
 def expected_physics_ready_report(
@@ -1477,6 +1526,7 @@ class IntegratedGateExecutor:
 
         self._latest_planning_scene: dict[str, object] | None = None
         self._planning_scene_invalid = False
+        self._scene_invalid_sequence: int | None = None
         self._fixture_payload: str | None = None
         self._fixture_payload_invalid = False
         self._latest_joint_state: Any = None
@@ -1568,11 +1618,17 @@ class IntegratedGateExecutor:
     def _make_scene_callback(self, source: str):
         def callback(message: Any) -> None:
             try:
-                self._latest_planning_scene = self._normalize_planning_scene(
-                    message, source=source
-                )
-            except (ValueError, TypeError):
+                normalized = self._normalize_planning_scene(message, source=source)
+            except _SCENE_CALLBACK_EXCEPTIONS:
+                # F3.2: a transient malformed message latches fail-closed but
+                # never erases the last valid cached scene; a later valid
+                # callback clears the latch.
                 self._planning_scene_invalid = True
+                self._scene_invalid_sequence = self._scene_sequence
+            else:
+                self._latest_planning_scene = normalized
+                self._planning_scene_invalid = False
+                self._scene_invalid_sequence = None
 
         return callback
 
@@ -1606,6 +1662,7 @@ class IntegratedGateExecutor:
             str(attached_object.object.id): [str(link) for link in attached_object.touch_links]
             for attached_object in attached
         }
+        fixture_digest, fixture_geometry = self._fixture_geometry_projection(message)
         return {
             "scene_sequence": self._scene_sequence,
             "scene_timestamp": float(time.monotonic()),
@@ -1614,11 +1671,63 @@ class IntegratedGateExecutor:
             "attached_links": attached_links,
             "touch_links": touch_links,
             "fixture_revision": self.fixture_revision,
+            "fixture_geometry_digest": fixture_digest,
+            "fixture_geometry": fixture_geometry,
             "scene_revision_digest": self._digest(ros["serialize_message"](message)),
             "acm_digest": self._digest(ros["serialize_message"](message.allowed_collision_matrix)),
             "robot_state_digest": self._digest(ros["serialize_message"](message.robot_state)),
             "source": source,
         }
+
+    def _fixture_declaration(self) -> Mapping[str, object]:
+        return _as_mapping(
+            self.scenario.get("planning_scene_declaration")
+            or self.scenario.get("planning_scene")
+        )
+
+    def _expected_fixture_geometry_digest(self) -> str | None:
+        declaration = self._fixture_declaration()
+        if not declaration:
+            return None
+        try:
+            return expected_fixture_geometry_digest(declaration)
+        except Exception:
+            return None
+
+    def _fixture_geometry_projection(
+        self, message: Any
+    ) -> tuple[str, list[dict[str, object]]]:
+        """F3.3: canonical fixture-owned geometry projection of the received scene.
+
+        Extracts, in declared owned-ID order, the canonical bridge geometry
+        descriptor for every scenario-owned collision object present in the
+        message.  A missing or geometry-less owned object yields an empty
+        descriptor so the digest cannot accidentally match; the projection never
+        includes foreign objects or unrelated full-scene serialization (robot
+        state / ACM).  Returns ``(digest, ordered_descriptors)``.
+        """
+        expected_ids = list(fixture_owned_ids(self._fixture_declaration()))
+        by_id: dict[str, dict[str, object]] = {}
+        for collision_object in message.world.collision_objects:
+            object_id = str(getattr(collision_object, "id", ""))
+            if object_id not in expected_ids:
+                continue
+            try:
+                by_id[object_id] = dict(readback_geometry(collision_object))
+            except Exception:
+                # A geometry-less/malformed owned object can never match the
+                # declared projection; record an empty descriptor so the digest
+                # differs instead of failing normalization.
+                by_id[object_id] = {
+                    "id": object_id,
+                    "frame_id": "",
+                    "primitives": [],
+                    "primitive_poses": [],
+                    "meshes": [],
+                    "mesh_poses": [],
+                }
+        ordered = [by_id[object_id] for object_id in expected_ids if object_id in by_id]
+        return geometry_signature_sha256(ordered), ordered
 
     @staticmethod
     def _digest(data: bytes) -> str:
@@ -1892,16 +2001,24 @@ class IntegratedGateExecutor:
         expectation = spec.get("expectation")
         success = bool(error_value == MOVEIT_SUCCESS_CODE)
         if expectation == "non-success":
-            # F2.4: the blocked scenario only passes on an explicit planning-stage
-            # non-success after a valid request; unknown/request-level codes never
-            # pass.  The exact classification is recorded.
-            passed = error_value in MOVEIT_PLANNING_NON_SUCCESS_CODES
+            # F2.4/F3.4: the blocked scenario only passes on an explicit
+            # planning-stage non-success after a valid request AND an empty
+            # planned trajectory; unknown/request-level codes never pass, and an
+            # allowlisted code with a contradictory non-empty trajectory is an
+            # explicit contradiction, never a pass.
             if error_value == MOVEIT_SUCCESS_CODE:
                 classification = "unexpected-success"
-            elif passed:
-                classification = "planning-non-success"
+                passed = False
+            elif error_value in MOVEIT_PLANNING_NON_SUCCESS_CODES:
+                if nonempty_plan:
+                    classification = "contradictory-nonempty-trajectory"
+                    passed = False
+                else:
+                    classification = "planning-non-success"
+                    passed = True
             else:
                 classification = "request-level-or-unknown"
+                passed = False
         else:
             passed = success and nonempty_plan
             classification = (
@@ -2053,6 +2170,7 @@ class IntegratedGateExecutor:
             )
             graph_status = "unavailable"
             journal_finalize_error: str | None = None
+            projection = None
             try:
                 graph = self._graph_observation()
                 if graph is None:
@@ -2061,11 +2179,10 @@ class IntegratedGateExecutor:
                     fixture_payload=self._fixture_payload_for_graph(),
                     observed_graph=graph,
                 )
-                self.journal.finalize(
-                    final_status,
-                    graph=projection,
-                    json_path=self.attempt_dir / "planning-scene.json",
-                )
+                # F3.1: validate the graph BEFORE any artifact write (no durable
+                # output yet), so a pass is never provisionally persisted before
+                # the graph evidence is known to be valid.
+                self.journal.finalize(final_status, graph=projection, json_path=None)
                 graph_status = "validated"
             except Exception as exc:
                 journal_finalize_error = str(exc)
@@ -2095,24 +2212,37 @@ class IntegratedGateExecutor:
                     else "evidence-invalid"
                 )
 
-            # F2.1: final artifact output failure must downgrade, never leave a pass.
+            # F3.1: transactional finalization/write order.  All non-journal
+            # artifacts are made durable first; the successful final journal
+            # artifact (planning-scene.json) is deferred until every other
+            # required artifact is durable.  If ANY required write fails after a
+            # provisional planner/journal pass, every already-created
+            # status-bearing artifact is downgraded to evidence-invalid (atomic
+            # summaries rewritten, corrective ``row_kind="final"`` rows appended
+            # to the JSONL lifecycle streams, and planning-scene.json written as
+            # a failure artifact), so no persisted artifact retains a pass.
             try:
                 self._write_artifacts(scenario_id, spec, goal, record, readiness, graph_status)
+                if graph_status == "validated":
+                    self.journal.finalize(
+                        final_status,
+                        graph=projection,
+                        json_path=self.attempt_dir / "planning-scene.json",
+                    )
             except Exception as exc:
+                downgraded_from = record.get("status")
                 record["status"] = "evidence-invalid"
                 record["reason_code"] = "artifact-write-failed"
                 record["artifact_error"] = str(exc)
-                try:
-                    self._write_fail_dominant_execution_json(
-                        scenario_id,
-                        record,
-                        readiness,
-                        graph_status,
-                        planner_status=planner_status,
-                        reason="artifact final output failed",
-                    )
-                except Exception:
-                    pass
+                self._downgrade_persisted_evidence(
+                    scenario_id,
+                    record,
+                    readiness,
+                    graph_status,
+                    planner_status,
+                    downgraded_from=downgraded_from,
+                    goal_kind=spec.get("kind"),
+                )
             return record
         except Exception as exc:  # F2.2: no expected runtime failure escapes the API.
             if fixture_ready_recorded:
@@ -2124,27 +2254,35 @@ class IntegratedGateExecutor:
             )
 
     def _acquire_scene(self, scenario_id: str) -> dict[str, object] | None:
-        """F2.5: bounded pre-goal scene acquisition through the private spinner."""
+        """F2.5/F3.2: bounded pre-goal scene acquisition through the private spinner.
+
+        Acquisition requires a valid observation received after the last
+        normalization failure (proved by ``scene_sequence`` exceeding the last
+        invalid sequence), so a stale pre-invalid cached scene is never used.
+        When the newest observation is invalid the executor spins up to the
+        finite timeout to try to recover with a newer valid scene; timeout with
+        no valid-after-invalid observation fails closed with zero goals.
+        """
+        timeout_s = float(self._thresholds().get("scene_acquire_timeout_s", 5.0))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._planning_scene_invalid:
+                scene = self._latest_planning_scene
+                if scene is not None and (
+                    self._scene_invalid_sequence is None
+                    or int(scene["scene_sequence"]) > self._scene_invalid_sequence
+                ):
+                    return None
+            self._spin_once()
         if self._planning_scene_invalid:
             return self._evidence_invalid(
                 scenario_id,
                 "planning-scene-invalid",
-                ["a cached PlanningScene failed normalization before fixture-ready"],
+                [
+                    "a received PlanningScene failed normalization and no valid "
+                    "scene arrived after it within the acquisition timeout"
+                ],
             )
-        if self._latest_planning_scene is not None:
-            return None
-        timeout_s = float(self._thresholds().get("scene_acquire_timeout_s", 5.0))
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            self._spin_once()
-            if self._planning_scene_invalid:
-                return self._evidence_invalid(
-                    scenario_id,
-                    "planning-scene-invalid",
-                    ["a received PlanningScene failed normalization during scene acquisition"],
-                )
-            if self._latest_planning_scene is not None:
-                return None
         return self._evidence_invalid(
             scenario_id,
             "no-planning-scene",
@@ -2152,7 +2290,14 @@ class IntegratedGateExecutor:
         )
 
     def _fixture_scene_error(self, scene: Mapping[str, object]) -> str | None:
-        """F2.6: return a reason when *scene* does not match the fixture contract."""
+        """F2.6/F3.3: return a reason when *scene* does not match the fixture contract.
+
+        Beyond the exact ordered owned-ID set and empty attached set, the scene
+        must carry the exact declared fixture geometry projection digest
+        (primitive/mesh geometry, dimensions/scales, frame, and poses), so a
+        stale full scene with the same IDs but an old cube pose is never
+        labeled fixture-ready.
+        """
         declaration = _as_mapping(
             self.scenario.get("planning_scene_declaration") or self.scenario.get("planning_scene")
         )
@@ -2166,6 +2311,13 @@ class IntegratedGateExecutor:
         attached_ids = list(scene.get("attached_ids", []))
         if attached_ids:
             return f"fixture-ready scene must not carry attached objects: {attached_ids}"
+        expected_digest = self._expected_fixture_geometry_digest()
+        observed_digest = scene.get("fixture_geometry_digest")
+        if expected_digest is None or observed_digest != expected_digest:
+            return (
+                "fixture-ready scene geometry/pose must match the declared fixture "
+                f"projection: scene {observed_digest} != declared {expected_digest}"
+            )
         return None
 
     def _append_visual_request(
@@ -2361,6 +2513,91 @@ class IntegratedGateExecutor:
             },
         )
 
+    def _downgrade_persisted_evidence(
+        self,
+        scenario_id: str,
+        record: Mapping[str, object],
+        readiness: Mapping[str, object],
+        graph_status: str,
+        planner_status: str | None,
+        *,
+        downgraded_from: object,
+        goal_kind: object,
+    ) -> None:
+        """F3.1: after an artifact write fails post-provisional-pass, downgrade
+        every already-created status-bearing artifact to evidence-invalid.
+
+        Rewrites the atomic execution summary fail-dominantly, appends a
+        corrective ``row_kind="final"`` row to each JSONL lifecycle stream so an
+        early provisional row can never be mistaken for a completed pass, and
+        writes planning-scene.json as a canonical failure artifact.  Every step
+        is individually contained so no downgrade failure can escape the API.
+        """
+        try:
+            self._write_fail_dominant_execution_json(
+                scenario_id,
+                record,
+                readiness,
+                graph_status,
+                planner_status=planner_status,
+                reason=str(record.get("artifact_error") or "artifact final output failed"),
+            )
+        except Exception:
+            pass
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "integrated-execution.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "event": "gate-c-plan-only",
+                    "status": "evidence-invalid",
+                    "reason_code": record.get("reason_code"),
+                    "planner_status": planner_status,
+                    "row_kind": "final",
+                    "downgraded_from": downgraded_from,
+                    "error": record.get("artifact_error"),
+                    "diagnostic_only": True,
+                    "execute_trajectory_goal_sent": False,
+                    "isaac_joint_commands_published": False,
+                    "timestamp": float(time.monotonic()),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "moveit-plans.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "goal_kind": goal_kind,
+                    "status": "evidence-invalid",
+                    "planner_status": planner_status,
+                    "row_kind": "final",
+                    "downgraded_from": downgraded_from,
+                    "error_code": record.get("error_code"),
+                    "error_code_classification": record.get("error_code_classification"),
+                    "nonempty_plan": record.get("nonempty_plan"),
+                    "goal_digest": record.get("goal_digest"),
+                    "trajectory_digest": record.get("trajectory_digest"),
+                    "error": record.get("artifact_error"),
+                    "diagnostic_only": True,
+                },
+            )
+        except Exception:
+            pass
+        try:
+            if self.journal.record_count > 0:
+                self._finalize_failure_artifact(
+                    str(record.get("artifact_error") or "artifact final output failed"),
+                    graph_status,
+                )
+        except Exception:
+            pass
+
     def _write_artifacts(
         self,
         scenario_id: str,
@@ -2381,6 +2618,7 @@ class IntegratedGateExecutor:
                 "status": record.get("status"),
                 "reason_code": record.get("reason_code"),
                 "planner_status": record.get("planner_status"),
+                "row_kind": "lifecycle",
                 "diagnostic_only": True,
                 "readiness": {
                     "ready": readiness.get("ready", False),
@@ -2401,6 +2639,7 @@ class IntegratedGateExecutor:
                 "goal_kind": spec.get("kind"),
                 "status": record.get("status"),
                 "planner_status": record.get("planner_status"),
+                "row_kind": "lifecycle",
                 "error_code": record.get("error_code"),
                 "error_code_classification": record.get("error_code_classification"),
                 "nonempty_plan": record.get("nonempty_plan"),
@@ -2580,6 +2819,7 @@ __all__ = [
     "build_pose_move_group_goal",
     "deterministic_cube_cloud",
     "evaluate_executor_readiness",
+    "expected_fixture_geometry_digest",
     "expected_physics_ready_report",
     "stage_c_dispatch",
     "validate_physics_ready_snapshot",

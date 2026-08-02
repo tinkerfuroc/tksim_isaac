@@ -1023,3 +1023,74 @@ def test_gate_c_forbidden_events_block_manipulation_events(tmp_path):
         journal.record_diff(
             "scene-attach", {**_valid_scene(declaration), "frame_index": 0, "timestamp": 0.0}
         )
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 3 (F3.3): pure fixture geometry projection digest
+# --------------------------------------------------------------------------- #
+
+def test_expected_fixture_geometry_digest_is_deterministic_and_mutation_sensitive():
+    """F3.3: the pure fixture geometry projection digest is deterministic over
+    the declared owned geometry (ordered IDs, pose, primitive dimensions, frame)
+    and changes on every material mutation, binding the exact declared contract
+    rather than only the owned-ID set."""
+    from validation.integrated_gate_executor import expected_fixture_geometry_digest
+
+    contract = scenario_report_contract("qualification-moveit-plan-joint")
+    declaration = contract["planning_scene_declaration"]
+    digest = expected_fixture_geometry_digest(declaration)
+    assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+    assert expected_fixture_geometry_digest(declaration) == digest
+
+    stale_pose = copy.deepcopy(declaration)
+    stale_pose["objects"][0]["pose"]["xyz"][0] += 0.05
+    assert expected_fixture_geometry_digest(stale_pose) != digest
+
+    wrong_dimensions = copy.deepcopy(declaration)
+    wrong_dimensions["objects"][0]["primitive"]["dimensions"][2] += 0.1
+    assert expected_fixture_geometry_digest(wrong_dimensions) != digest
+
+    wrong_frame = copy.deepcopy(declaration)
+    wrong_frame["frame_id"] = "world"
+    assert expected_fixture_geometry_digest(wrong_frame) != digest
+
+    reordered = copy.deepcopy(declaration)
+    reordered["objects"] = list(reversed(reordered["objects"]))
+    assert expected_fixture_geometry_digest(reordered) != digest
+
+    duplicate = copy.deepcopy(declaration)
+    duplicate["objects"].append(copy.deepcopy(duplicate["objects"][0]))
+    assert expected_fixture_geometry_digest(duplicate) != digest
+
+    extra = copy.deepcopy(declaration)
+    extra["objects"].append(
+        {
+            "class": "static",
+            "id": "sim_fixture/extra",
+            "pose": {"quaternion_xyzw": [0.0, 0.0, 0.0, 1.0], "xyz": [0.1, 0.1, 0.1]},
+            "primitive": {"dimensions": [0.05, 0.05, 0.05], "type": "box"},
+        }
+    )
+    assert expected_fixture_geometry_digest(extra) != digest
+
+
+def test_expected_fixture_geometry_digest_matches_owned_id_order_for_stage_c():
+    """F3.3: every Stage-C declaration yields a deterministic digest whose
+    ordered descriptor list aligns with ``fixture_owned_ids``."""
+    from validation.integrated_gate_executor import expected_fixture_geometry_digest
+
+    from tinker_sim_bridge.fixture_contract import (
+        geometry_signature_sha256,
+        spec_geometry,
+    )
+    from tinker_sim_bridge.fixture_planning_scene import fixture_to_specs
+
+    for scenario_name in STAGE_C_SCENARIOS:
+        contract = scenario_report_contract(scenario_name)
+        declaration = contract["planning_scene_declaration"]
+        specs = fixture_to_specs(declaration)
+        ordered = [spec_geometry(spec) for spec in specs]
+        assert [descriptor["id"] for descriptor in ordered] == list(
+            fixture_owned_ids(declaration)
+        )
+        assert expected_fixture_geometry_digest(declaration) == geometry_signature_sha256(ordered)
