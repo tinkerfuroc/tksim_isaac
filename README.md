@@ -314,6 +314,39 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 2 fix round 1): Bound Gate B to
+  real artifacts.  `validation/integrated_static_contracts.py` no longer reads
+  the fabricated `qualification/records/*` layer: every production source
+  (SRDF `_xarm7_macro.srdf.xacro`, `config/xarm7` and `config/xarm_gripper`
+  `controllers.yaml`, the pick_and_place C++ runtime and result writers, the
+  `.action` schemas, and the selected launch) is inspected as an immutable Git
+  blob at the production `implementation_head` from the produced source-lock
+  manifest.  The model-fingerprint check recomputes
+  `structural_fingerprint == sha256(canonical bundle contract)`, binds every
+  recorded model artifact SHA-256 and the `production_source_commits` blobs,
+  and proves the ordered `xarm_gripper` members plus `link_tcp` end-effector
+  parent.  `fixture-ownership` inspects exactly the 17 configured scenarios
+  (C/D/E) and derives owned ids from `planning_scene.objects` in declared
+  order versus `integrated.expected_scene.owned_ids`.  The transport-contract
+  check reads `typed_contract.runtime_contract_sha256` from its sibling
+  location, recomputes the canonical full runtime mapping, and preserves the
+  exact public one-key mapping.  Provider checks recompute the
+  `provider_manifest_sha256` canonical self-hash and raw bytes and reconcile
+  the provider executable set with the overlay.  `source_lock_manifest.py`
+  gained closed policy/authorization schemas, the resolved lock-commit scope
+  rule (`{policy_path, docs/acceptance.md}`), the qualification HEAD exact-match
+  requirement, authorization report existence/predate plus bogus/valid
+  authorization-commit checks, canonical repository-relative `policy_path`,
+  required ISO `started_at`, and a stable output-freshness boolean.  The
+  static checker emits canonical finite JSON with fsync + atomic replace for
+  `static-contract.json`, `model-fingerprint.json`, and
+  `source-identities.json`, and propagates `evidence-invalid` /
+  `verified-fail` / `verified-pass` per F4.  The real-root post-fix Gate B
+  capture remains `evidence-invalid` solely because the future
+  qualification-tooling policy is intentionally absent; eight of the nine
+  static checks pass against the real simulator/production roots and only
+  `source-identities` fails on that absent policy.
+
 - 2026-08-02 (integrated qualification Task 2): Added the offline Gate B
   static-contract closure.  `validation/source_lock_manifest.py` observes the
   three immutable source-lock authorizations

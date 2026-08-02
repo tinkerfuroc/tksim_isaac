@@ -181,8 +181,26 @@ def _capture_evidence(root: Path) -> dict[str, object]:
 
 
 def _policy_document(
-    *, repository: str, root: Path, policy_rel: str, mode: str, implementation_head: str
+    *,
+    repository: str,
+    root: Path,
+    policy_rel: str,
+    mode: str,
+    implementation_head: str,
+    authorization_commit: str | None = None,
 ) -> dict[str, object]:
+    # F3.3: the authorization report must exist as a regular file that predates
+    # the attempt.  The real repos gitignore their .superpowers sidecars; the
+    # fixture mirrors that so the report is not an untracked evidence surface.
+    report_rel = ".superpowers/fixture-lock-report.md"
+    report_path = root / report_rel
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    ignore = report_path.parent / ".gitignore"
+    ignore.write_text("*\n", encoding="utf-8")
+    report_path.write_text("fixture authorization report\n", encoding="utf-8")
+    past = datetime(2026, 7, 1, tzinfo=timezone.utc).timestamp()
+    os.utime(report_path, (past, past))
+
     evidence = _capture_evidence(root)
     return {
         "schema_version": 1,
@@ -199,9 +217,9 @@ def _policy_document(
         "diff_bytes": evidence["diff_bytes"],
         "untracked_manifest": evidence["untracked_manifest"],
         "authorization": {
-            "commit": None,
+            "commit": authorization_commit,
             "phase": "fixture-lock-only",
-            "report_path": ".superpowers/fixture-lock-report.md",
+            "report_path": report_rel,
         },
         "capture_commands": [
             ["env", "LC_ALL=C", "git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -210,9 +228,18 @@ def _policy_document(
     }
 
 
-def _commit_policy(root: Path, policy_path: Path, policy: dict[str, object], message: str) -> None:
+def _commit_policy(
+    root: Path,
+    policy_path: Path,
+    policy: dict[str, object],
+    message: str,
+    *,
+    extra_paths: tuple[str, ...] = (),
+) -> None:
     _write_json_canonical(policy_path, policy)
     _git(root, "add", "--", str(policy_path))
+    for extra in extra_paths:
+        _git(root, "add", "--", extra)
     _git(root, "commit", "-q", "-m", message)
 
 
@@ -239,8 +266,22 @@ def create_git_fixture_repositories(
     *,
     mode: str,
     with_qualification_policy: bool = True,
+    overlay_lock_extra_paths: tuple[str, ...] = (),
+    production_lock_extra_paths: tuple[str, ...] = (),
+    production_authorization_commit: str | None = None,
 ) -> None:
-    """Build both repositories with realistic lock-only history."""
+    """Build both repositories with realistic lock-only history.
+
+    ``*_lock_extra_paths`` lets a test bundle extra paths into a lock-only
+    commit (e.g. ``("docs/acceptance.md",)`` allowed, or ``("src/app.py",)``
+    rejected) to exercise the resolved-commit scope check (F3.1).
+
+    ``production_authorization_commit`` overrides the production policy's
+    ``authorization.commit`` (F3.3): ``"bogus"`` creates a diverged side commit
+    that is NOT an ancestor of the production lock commit; any other non-None
+    value is used verbatim (``"impl"`` = the production implementation head, a
+    valid ancestor).  ``None`` keeps ``authorization.commit: null``.
+    """
     _git_init(simulator_root)
     _git_init(production_root)
 
@@ -251,6 +292,7 @@ def create_git_fixture_repositories(
         "integration/source-locks.json",
         json.dumps({"schema_version": 0, "note": "pre-existing baseline"}),
     )
+    _write(simulator_root, "docs/acceptance.md", "simulator acceptance baseline\n")
     _commit(simulator_root, "chore: establish simulator baseline")
     overlay_impl_head = _git_head(simulator_root)
 
@@ -267,11 +309,18 @@ def create_git_fixture_repositories(
         mode=mode,
         implementation_head=overlay_impl_head,
     )
+    if "docs/acceptance.md" in overlay_lock_extra_paths:
+        (simulator_root / "docs/acceptance.md").write_text(
+            "overlay acceptance doc lock companion\n", encoding="utf-8"
+        )
+    if "src/app.py" in overlay_lock_extra_paths:
+        (simulator_root / "src/app.py").write_text("bundled source payload\n", encoding="utf-8")
     _commit_policy(
         simulator_root,
         simulator_root / "integration/source-locks.json",
         overlay_policy,
         "chore: record simulator OMPL source lock",
+        extra_paths=overlay_lock_extra_paths,
     )
 
     qualification_impl_head = None
@@ -298,8 +347,27 @@ def create_git_fixture_repositories(
     # ---- production ---------------------------------------------------------
     _write(production_root, "README.md", "production fixture\n")
     _write(production_root, "src/mobile_bringup/launch/planning.launch.py", "def production_launch():\n    pass\n")
+    _write(production_root, "docs/acceptance.md", "production acceptance baseline\n")
     _commit(production_root, "feat: production planning task-only launch")
     production_impl_head = _git_head(production_root)
+
+    production_auth_commit: str | None
+    if production_authorization_commit == "bogus":
+        # A diverged side commit that is NOT an ancestor of the eventual
+        # production lock commit.  The working tree is clean here, so the
+        # checkout back to the implementation head restores a clean state.
+        _git(production_root, "checkout", "-q", "-b", "side")
+        _write(production_root, "src/side.py", "diverged side change\n")
+        _commit(production_root, "chore: diverged side commit")
+        side_commit = _git_head(production_root)
+        _git(production_root, "checkout", "-q", production_impl_head)
+        production_auth_commit = side_commit
+    elif production_authorization_commit is None:
+        production_auth_commit = None
+    elif production_authorization_commit == "impl":
+        production_auth_commit = production_impl_head
+    else:
+        production_auth_commit = production_authorization_commit
 
     if mode == "authorized_dirty":
         _apply_dirty_state(production_root)
@@ -309,12 +377,20 @@ def create_git_fixture_repositories(
         policy_rel="integration/source-locks.json",
         mode=mode,
         implementation_head=production_impl_head,
+        authorization_commit=production_auth_commit,
     )
+    if "docs/acceptance.md" in production_lock_extra_paths:
+        (production_root / "docs/acceptance.md").write_text(
+            "production acceptance doc lock companion\n", encoding="utf-8"
+        )
+    if "src/app.py" in production_lock_extra_paths:
+        (production_root / "src/app.py").write_text("bundled source payload\n", encoding="utf-8")
     _commit_policy(
         production_root,
         production_root / "integration/source-locks.json",
         production_policy,
         "chore: record production OMPL source lock",
+        extra_paths=production_lock_extra_paths,
     )
 
 
@@ -388,6 +464,9 @@ def make_source_lock_fixture(
     mode: str = "clean",
     policy_after_attempt: bool = False,
     with_qualification_policy: bool = True,
+    overlay_lock_extra_paths: tuple[str, ...] = (),
+    production_lock_extra_paths: tuple[str, ...] = (),
+    production_authorization_commit: str | None = None,
 ) -> SourceLockFixture:
     simulator_root = (tmp_path / "simulator").resolve()
     production_root = (tmp_path / "production").resolve()
@@ -403,6 +482,9 @@ def make_source_lock_fixture(
         production_root,
         mode=mode,
         with_qualification_policy=with_qualification_policy,
+        overlay_lock_extra_paths=overlay_lock_extra_paths,
+        production_lock_extra_paths=production_lock_extra_paths,
+        production_authorization_commit=production_authorization_commit,
     )
     write_authorization_policy(
         simulator_policy_path,
@@ -532,15 +614,22 @@ def test_policy_lock_only_commits_have_non_self_referential_parents(tmp_path):
 
 
 def test_current_head_cannot_substitute_for_historical_overlay_lock(tmp_path):
-    """A docs descendant moves HEAD past the overlay lock; the observer must
-    still resolve the historical transition commit, never HEAD/HEAD^."""
+    """A docs descendant moves HEAD past the overlay and qualification locks;
+    the observer must still resolve the historical overlay transition commit
+    (ancestor-based), while qualification_tooling requires HEAD == its resolved
+    lock commit and therefore fails closed on the descendant drift (F3.2)."""
     fixture = make_source_lock_fixture(tmp_path, mode="clean")
     _write(fixture.simulator_root, "docs/after.md", "docs after the qualification lock\n")
     _commit(fixture.simulator_root, "docs: harden source lock resolution")
     observed = _run_capture(fixture)
-    assert observed["status"] == "verified-pass"
+    assert observed["status"] == "verified-fail"
+    # The historical overlay lock remains ancestor-based and passes.
+    assert observed["simulator_overlay"]["status"] == "verified-pass"
     assert observed["simulator_overlay"]["head"] != observed["simulator_overlay"]["resolved_policy_commit"]
     assert observed["simulator_overlay"]["checks"]["blob_resolved_equals_head"] is True
+    # qualification_tooling requires HEAD == resolved lock commit.
+    assert observed["qualification_tooling"]["status"] == "verified-fail"
+    assert observed["qualification_tooling"]["checks"]["qualification_head_matches_resolved"] is False
 
 
 def test_dirty_state_cannot_self_authorize_or_change_after_authorization(tmp_path):
@@ -671,3 +760,178 @@ def test_ambiguous_overlay_transition_fails(tmp_path):
     observed = _run_capture(fixture)
     assert observed["status"] == "verified-fail"
     assert observed["simulator_overlay"]["status"] == "verified-fail"
+
+
+# ---------------------------------------------------------------------------
+# fix round 1 / F3 mutation tests
+# ---------------------------------------------------------------------------
+def test_lock_commit_carrying_source_payload_fails(tmp_path):
+    """A lock-only commit that bundles a source path fails the scope check."""
+    fixture = make_source_lock_fixture(
+        tmp_path, mode="clean", production_lock_extra_paths=("src/app.py",)
+    )
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert observed["production"]["status"] == "verified-fail"
+    assert observed["production"]["checks"]["lock_commit_scope"] is False
+    assert any(
+        "non-lock paths" in reason for reason in observed["production"]["reasons"]
+    )
+
+
+def test_lock_commit_carrying_acceptance_doc_passes(tmp_path):
+    """The exact acceptance-doc allowance (docs/acceptance.md) is permitted."""
+    fixture = make_source_lock_fixture(
+        tmp_path, mode="clean",
+        production_lock_extra_paths=("docs/acceptance.md",),
+        overlay_lock_extra_paths=("docs/acceptance.md",),
+    )
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-pass"
+    assert observed["production"]["checks"]["lock_commit_scope"] is True
+    assert observed["simulator_overlay"]["checks"]["lock_commit_scope"] is True
+
+
+def test_qualification_head_descendant_drift_fails(tmp_path):
+    """qualification_tooling requires HEAD == its resolved lock commit."""
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    _write(fixture.simulator_root, "docs/after.md", "post-lock docs\n")
+    _commit(fixture.simulator_root, "docs: after the qualification lock")
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert observed["qualification_tooling"]["status"] == "verified-fail"
+    assert observed["qualification_tooling"]["checks"]["qualification_head_matches_resolved"] is False
+    assert observed["simulator_overlay"]["status"] == "verified-pass"
+
+
+def test_missing_authorization_report_fails(tmp_path):
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    report = fixture.production_root / ".superpowers/fixture-lock-report.md"
+    report.unlink()
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert observed["production"]["checks"]["authorization_report_present"] is False
+
+
+def test_late_authorization_report_fails(tmp_path):
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    report = fixture.production_root / ".superpowers/fixture-lock-report.md"
+    future = fixture.attempt_started_at.timestamp() + 3600.0
+    os.utime(report, (future, future))
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert observed["production"]["checks"]["authorization_report_predates_attempt"] is False
+
+
+def test_bogus_authorization_commit_fails(tmp_path):
+    """A non-null authorization.commit that is not an ancestor of the resolved
+    lock commit is rejected (F3.3).  The diverged side commit is created at
+    fixture-build time so the policy blob at the lock commit carries the bogus
+    value and working/committed bytes stay identical."""
+    fixture = make_source_lock_fixture(
+        tmp_path, mode="clean", production_authorization_commit="bogus"
+    )
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert observed["production"]["status"] == "verified-fail"
+    assert observed["production"]["checks"]["authorization_commit_ancestor_of_resolved"] is False
+    assert any(
+        "not an ancestor" in reason for reason in observed["production"]["reasons"]
+    )
+
+
+def test_valid_authorization_commit_passes(tmp_path):
+    """A non-null authorization.commit that IS an ancestor of the resolved lock
+    commit is accepted (F3.3).  Here it is the production implementation head,
+    so the lock commit's first parent authorizes the locked state."""
+    fixture = make_source_lock_fixture(
+        tmp_path, mode="clean", production_authorization_commit="impl"
+    )
+    policy = _read_json(fixture.production_policy_path)
+    assert policy["authorization"]["commit"] is not None
+    assert len(policy["authorization"]["commit"]) == 40
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-pass"
+    assert observed["production"]["status"] == "verified-pass"
+    assert observed["production"]["checks"]["authorization_commit_ancestor_of_resolved"] is True
+    assert observed["production"]["checks"]["authorization_commit_predates_attempt"] is True
+
+
+def test_unknown_policy_key_rejected(tmp_path):
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    policy_path = fixture.simulator_policy_path
+    policy = _read_json(policy_path)
+    policy["mystery_key"] = True
+    _write_json_canonical(policy_path, policy)
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert any("unknown top-level policy keys" in reason for reason in observed["simulator_overlay"]["reasons"])
+
+
+def test_unknown_authorization_key_rejected(tmp_path):
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    policy_path = fixture.production_policy_path
+    policy = _read_json(policy_path)
+    policy["authorization"]["mystery"] = True
+    _write_json_canonical(policy_path, policy)
+    observed = _run_capture(fixture)
+    assert observed["status"] == "verified-fail"
+    assert any("unknown authorization keys" in reason for reason in observed["production"]["reasons"])
+
+
+def test_relative_policy_path_is_canonicalized(tmp_path):
+    """Absolute/relative CLI arguments produce a canonical repository-relative
+    policy_path so the static source-identity comparison stays stable."""
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    # Run the observer through the library with a relative production policy
+    # path (repository-relative) and confirm the recorded path is canonical.
+    from source_lock_manifest import capture_manifest
+
+    result = capture_manifest(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        simulator_policy=fixture.simulator_policy_path,
+        production_policy="integration/source-locks.json",
+        qualification_policy=fixture.qualification_policy_path,
+        attempt_started_at=fixture.attempt_started_at,
+        output=fixture.output,
+    )
+    assert result["status"] == "verified-pass"
+    assert result["production"]["policy_path"] == "integration/source-locks.json"
+
+
+def test_output_predating_attempt_is_evidence_invalid(tmp_path):
+    """An attempt started in the future makes the produced output manifest
+    predate it -> evidence-invalid even when all repositories pass."""
+    fixture = make_source_lock_fixture(tmp_path, mode="clean")
+    future_attempt = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    result = capture_source_lock_manifest(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        simulator_policy_path=fixture.simulator_policy_path,
+        production_policy_path=fixture.production_policy_path,
+        qualification_policy_path=fixture.qualification_policy_path,
+        attempt_started_at=future_attempt,
+        output=fixture.output,
+    )
+    assert result["status"] == "evidence-invalid"
+    assert result["output_predates_attempt"] is True
+    # All three repositories individually pass; only output freshness fails.
+    for role in ROLES:
+        assert result[role]["status"] == "verified-pass"
+    # Independent filesystem check: the written manifest's mtime predates the
+    # future attempt start.
+    import os as _os
+    assert _os.stat(fixture.output).st_mtime < future_attempt.timestamp()
+
+
+def test_attempt_start_requires_iso_started_at(tmp_path):
+    """The attempt-start reader rejects a missing/non-ISO started_at."""
+    from source_lock_manifest import _read_attempt_start_file, SourceLockError
+    start = tmp_path / "attempt-start.json"
+    start.write_text(json.dumps({"note": "no started_at"}), encoding="utf-8")
+    with pytest.raises(SourceLockError):
+        _read_attempt_start_file(start)
+    start.write_text(json.dumps({"started_at": "not-a-date"}), encoding="utf-8")
+    with pytest.raises(SourceLockError):
+        _read_attempt_start_file(start)
