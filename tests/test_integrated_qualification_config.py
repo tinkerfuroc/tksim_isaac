@@ -60,6 +60,17 @@ ALL_SCENARIOS = (
     "qualification-pick-place-occupied-place",
 )
 
+PICK_PLACE_SCENARIOS = (
+    "qualification-pick-place-positive",
+    "qualification-pick-place-blocked-approach",
+    "qualification-pick-place-unreachable-grasp",
+    "qualification-pick-place-malformed-back",
+    "qualification-pick-place-cancel-approach",
+    "qualification-pick-place-cancel-transport",
+    "qualification-pick-place-safety-transport",
+    "qualification-pick-place-occupied-place",
+)
+
 NEGATIVE_SCENARIOS = {
     "qualification-pick-place-blocked-approach": {
         "required": ["pick_terminal_non_success", "contact_absent", "scene_attach_absent", "lift_m_lt:0.02"],
@@ -104,32 +115,61 @@ FIXTURE_ASSETS = {
         "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
         "asset_sha256": "c4a5e9812224a217bdba21ab81c679fac6c107c3501263a43335c3c0695a8e19",
         "geometry": {"type": "box", "dimensions": [0.12, 0.12, 0.60]},
+        "center_offset_z": 0.30,
     },
     "sim_fixture/qualification_cube": {
         "source_object_id": "qualification_cube",
         "asset_uri": "simulation/assets/primitives/task-object.usda",
         "asset_sha256": "94c6a7a7324fa1de2d5cc0cd258517c619ed219c12f4b7cf538ad3f409ddd010",
         "geometry": {"type": "box", "dimensions": [0.08, 0.08, 0.08]},
+        "center_offset_z": 0.04,
     },
     "sim_fixture/plan_blocker": {
         "source_object_id": "qualification_plan_blocker",
         "asset_uri": "simulation/assets/primitives/obstacle.usda",
         "asset_sha256": "c62ade2971c0846ea8f003e471cd2b056cd86c77dfd290430a1f4ea753996db5",
         "geometry": {"type": "box", "dimensions": [0.30, 0.30, 0.30]},
+        "center_offset_z": 0.15,
     },
     "sim_fixture/place_occupant": {
         "source_object_id": "qualification_place_occupant",
         "asset_uri": "simulation/assets/primitives/task-object.usda",
         "asset_sha256": "94c6a7a7324fa1de2d5cc0cd258517c619ed219c12f4b7cf538ad3f409ddd010",
         "geometry": {"type": "box", "dimensions": [0.08, 0.08, 0.08]},
+        "center_offset_z": 0.04,
+    },
+    "sim_fixture/place_pedestal": {
+        "source_object_id": "qualification_place_pedestal",
+        "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
+        "asset_sha256": "c4a5e9812224a217bdba21ab81c679fac6c107c3501263a43335c3c0695a8e19",
+        "geometry": {"type": "box", "dimensions": [0.12, 0.12, 0.60]},
+        "center_offset_z": 0.30,
     },
 }
 
-
-def canonical_sha256(value):
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+# Independent literal anchor for the canonical public report key sets (Task 1
+# fix round 1): these exact sets are asserted so the serializer and the
+# expected-builder cannot drift together.
+PUBLIC_REPORT_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "report_revision",
+    "scenario",
+    "planning_scene",
+    "integrated",
+    "identities",
+    "operations",
+    "final_simulation_state",
+}
+PUBLIC_REPORT_IDENTITIES_KEYS = {
+    "scenario_id",
+    "seed",
+    "scenario_declaration_sha256",
+    "planning_scene_sha256",
+    "integrated_sha256",
+    "model_fingerprint",
+    "provider_manifest_sha256",
+}
+PUBLIC_INTEGRATED_KEYS = {"execution_profile"}
 
 
 def canonical_report(scenario_name):
@@ -153,25 +193,8 @@ def canonical_report(scenario_name):
 
 def test_positive_report_has_exact_shape_and_external_digest_only():
     report = canonical_report("qualification-pick-place-positive")
-    assert set(report) == {
-        "schema_version",
-        "report_revision",
-        "scenario",
-        "planning_scene",
-        "integrated",
-        "identities",
-        "operations",
-        "final_simulation_state",
-    }
-    assert set(report["identities"]) == {
-        "scenario_id",
-        "seed",
-        "scenario_declaration_sha256",
-        "planning_scene_sha256",
-        "integrated_sha256",
-        "model_fingerprint",
-        "provider_manifest_sha256",
-    }
+    assert set(report) == PUBLIC_REPORT_TOP_LEVEL_KEYS
+    assert set(report["identities"]) == PUBLIC_REPORT_IDENTITIES_KEYS
     assert all(
         DIGEST.fullmatch(value)
         for key, value in report["identities"].items()
@@ -182,6 +205,20 @@ def test_positive_report_has_exact_shape_and_external_digest_only():
     assert report["operations"][-1]["state"] == 1
     assert report["final_simulation_state"] == "STATE_PLAYING"
     assert "scenario_report_sha256" not in report
+
+
+def test_public_report_key_set_literal_anchor():
+    """The serializer and the expected-builder must agree with independent
+    literal key sets (top-level, identities, and the one-key public integrated
+    mapping)."""
+    report = canonical_report("qualification-moveit-plan-joint")
+    assert set(report) == PUBLIC_REPORT_TOP_LEVEL_KEYS
+    assert set(report["identities"]) == PUBLIC_REPORT_IDENTITIES_KEYS
+    assert set(report["integrated"]) == PUBLIC_INTEGRATED_KEYS
+    assert set(public_integrated_mapping()) == PUBLIC_INTEGRATED_KEYS
+    # The full per-scenario mapping is strictly richer than the public one.
+    source = load_test_scenario("qualification-pick-place-positive")
+    assert PUBLIC_INTEGRATED_KEYS < set(source["integrated"])
 
 
 def test_blocked_report_is_scenario_specific():
@@ -262,15 +299,27 @@ def test_fixture_asset_hashes_match_actual_assets():
         assert asset_path.is_file()
         actual = hashlib.sha256(asset_path.read_bytes()).hexdigest()
         assert actual == spec["asset_sha256"], f"{fixture_id} asset sha256 mismatch"
-        # The declared geometry matches the fixture table.
-        ps = json.loads(
-            (SCENARIO_DIR / "qualification-pick-place-positive.json").read_text(encoding="utf-8")
-        )["planning_scene"]
-        by_id = {obj["id"]: obj for obj in ps["objects"]}
-        if fixture_id in by_id:
-            primitive = by_id[fixture_id]["primitive"]
-            assert primitive["type"] == spec["geometry"]["type"]
-            assert primitive["dimensions"] == spec["geometry"]["dimensions"]
+        # The committed asset's internal translate gives the deterministic
+        # bottom-origin center offset used by the parity contract (F1).
+        asset_text = asset_path.read_text(encoding="utf-8")
+        import re as _re
+        translate = _re.search(r"xformOp:translate = \(([^)]*)\)", asset_text)
+        assert translate is not None, f"{spec['asset_uri']} has no translate"
+        z = float(translate.group(1).split(",")[2].strip())
+        assert z == spec["center_offset_z"], (
+            f"{fixture_id} center offset mismatch: asset z={z} expected {spec['center_offset_z']}"
+        )
+        # Every E-stage pick-place scenario that owns the fixture declares its
+        # exact geometry (the C/D-stage pedestal is a separate, larger shape).
+        for name in PICK_PLACE_SCENARIOS:
+            raw = json.loads((SCENARIO_DIR / f"{name}.json").read_text(encoding="utf-8"))
+            by_id = {obj["id"]: obj for obj in raw["planning_scene"]["objects"]}
+            if fixture_id in by_id:
+                primitive = by_id[fixture_id]["primitive"]
+                assert primitive["type"] == spec["geometry"]["type"]
+                assert primitive["dimensions"] == spec["geometry"]["dimensions"], (
+                    f"{name} {fixture_id} geometry does not match fixture table"
+                )
 
 
 def test_each_owned_id_appears_exactly_once_in_planning_scene_objects():
@@ -310,19 +359,65 @@ def test_pick_place_geometry_contract():
         "xyz": [0.0, 0.0, 0.0],
         "rpy": [0.0, 0.0, 0.0],
     }
+    # Bottom-origin root is never reused as a center (F1): the config carries an
+    # explicit center and the deterministic local half-extent.
     assert geometry["object_root_xyz"] == [0.65, 0.0, 0.60]
+    assert geometry["object_center_xyz"] == [0.65, 0.0, 0.64]
+    assert geometry["object_local_center_z"] == 0.04
+    assert geometry["object_half_extent_xyz"] == [0.04, 0.04, 0.04]
     assert geometry["grasp_tcp_xyz"] == [0.65, 0.0, 0.72]
     assert geometry["place_target_point"] == {"frame_id": "base_link", "xyz": [0.85, 0.0, 0.72]}
     assert geometry["place_orientation_xyzw"] == [0.0, 0.0, 0.0, 1.0]
     assert geometry["place_region_center_xyz"] == [0.85, 0.0, 0.64]
+    assert geometry["place_support_root_xyz"] == [0.85, 0.0, 0.0]
+    assert geometry["place_support_center_xyz"] == [0.85, 0.0, 0.30]
+    assert geometry["place_support_dimensions"] == [0.12, 0.12, 0.60]
 
     positive = json.loads(
         (SCENARIO_DIR / "qualification-pick-place-positive.json").read_text(encoding="utf-8")
     )
     ps = positive["planning_scene"]
     cube = next(obj for obj in ps["objects"] if obj["id"] == "sim_fixture/qualification_cube")
-    assert cube["pose"]["xyz"] == geometry["object_root_xyz"]
+    assert cube["pose"]["xyz"] == geometry["object_center_xyz"]
     assert cube["pose"]["quaternion_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+    place_support = next(
+        obj for obj in ps["objects"] if obj["id"] == "sim_fixture/place_pedestal"
+    )
+    assert place_support["pose"]["xyz"] == geometry["place_support_center_xyz"]
+    assert place_support["primitive"]["dimensions"] == geometry["place_support_dimensions"]
+
+
+@pytest.mark.parametrize("scenario_name", (
+    "qualification-pick-place-positive",
+    "qualification-pick-place-blocked-approach",
+    "qualification-pick-place-unreachable-grasp",
+    "qualification-pick-place-malformed-back",
+    "qualification-pick-place-cancel-approach",
+    "qualification-pick-place-cancel-transport",
+    "qualification-pick-place-safety-transport",
+    "qualification-pick-place-occupied-place",
+))
+def test_e_stage_physical_root_to_planning_scene_center_parity(scenario_name):
+    """F1: every top-level physical record with a planning_scene_id maps to its
+    PlanningScene center as physical root + the committed asset center offset."""
+    raw = json.loads((SCENARIO_DIR / f"{scenario_name}.json").read_text(encoding="utf-8"))
+    ps_by_id = {obj["id"]: obj for obj in raw["planning_scene"]["objects"]}
+    physical = []
+    for record in raw.get("actors", []) + raw.get("objects", []):
+        ps_id = record.get("planning_scene_id")
+        if ps_id:
+            physical.append((ps_id, record))
+    assert len(physical) == len(raw["planning_scene"]["objects"])
+    for ps_id, record in physical:
+        spec = FIXTURE_ASSETS[ps_id]
+        root_xyz = record["pose"]["xyz"]
+        center = ps_by_id[ps_id]["pose"]["xyz"]
+        assert center[2] == pytest.approx(root_xyz[2] + spec["center_offset_z"]), (
+            f"{scenario_name} {ps_id}: PS center z {center[2]} != physical root z "
+            f"{root_xyz[2]} + local center {spec['center_offset_z']}"
+        )
+        assert center[0] == pytest.approx(root_xyz[0])
+        assert center[1] == pytest.approx(root_xyz[1])
 
 
 def test_malformed_back_has_six_positions_all_others_follow_strict_seven():
@@ -359,7 +454,17 @@ def test_top_level_spawn_records_carry_full_physical_metadata():
     pedestal = actors["qualification_pedestal"]
     assert pedestal["role"] == "support"
     assert pedestal["owner"] == "sim_fixture"
+    assert pedestal["region"] == "source-region"
     assert pedestal["planning_scene_id"] == "sim_fixture/pedestal"
+    # F2: every E-stage scenario declares the place-support pedestal.
+    place_pedestal = actors["qualification_place_pedestal"]
+    assert place_pedestal["role"] == "support"
+    assert place_pedestal["owner"] == "sim_fixture"
+    assert place_pedestal["region"] == "place-region"
+    assert place_pedestal["fixed"] is True
+    assert place_pedestal["planning_scene_id"] == "sim_fixture/place_pedestal"
+    assert place_pedestal["pose"]["xyz"] == [0.85, 0.0, 0.0]
+    assert place_pedestal["asset_sha256"] == FIXTURE_ASSETS["sim_fixture/place_pedestal"]["asset_sha256"]
 
     occupied = json.loads(
         (SCENARIO_DIR / "qualification-pick-place-occupied-place.json").read_text(encoding="utf-8")
@@ -369,10 +474,96 @@ def test_top_level_spawn_records_carry_full_physical_metadata():
     assert occupant["owner"] == "sim_fixture"
     assert occupant["region"] == "place-region"
     assert occupant["planning_scene_id"] == "sim_fixture/place_occupant"
+    # F1: the occupant physical root rests on the place support top (0.60);
+    # its PlanningScene center is root + half-extent.
+    assert occupant["pose"]["xyz"] == [0.85, 0.0, 0.60]
     occupant_ps = {
         obj["id"]: obj for obj in occupied["planning_scene"]["objects"]
     }["sim_fixture/place_occupant"]
     assert occupant_ps["pose"]["xyz"] == [0.85, 0.0, 0.64]
+
+
+def test_place_support_top_matches_placement_object_bottom():
+    """F2: place support top == placement-object bottom == 0.60, and the place
+    center/TCP target relation is achievable from the declared support."""
+    for name in (
+        "qualification-pick-place-positive",
+        "qualification-pick-place-occupied-place",
+    ):
+        raw = json.loads((SCENARIO_DIR / f"{name}.json").read_text(encoding="utf-8"))
+        ps = {obj["id"]: obj for obj in raw["planning_scene"]["objects"]}
+        support = ps["sim_fixture/place_pedestal"]
+        support_center_z = support["pose"]["xyz"][2]
+        support_half_z = support["primitive"]["dimensions"][2] / 2.0
+        # Support top (center + half-height) == placement-object bottom == 0.60.
+        assert support_center_z + support_half_z == pytest.approx(0.60)
+        # Occupant bottom (center - half-extent) rests exactly on the support.
+        for ps_id in ("sim_fixture/qualification_cube", "sim_fixture/place_occupant"):
+            if ps_id in ps:
+                obj_center_z = ps[ps_id]["pose"]["xyz"][2]
+                obj_half_z = ps[ps_id]["primitive"]["dimensions"][2] / 2.0
+                assert obj_center_z - obj_half_z == pytest.approx(0.60)
+        # Place target TCP is achievable above the place region center.
+        config = json.loads((QUALIFICATION_DIR / "integrated-ompl.json").read_text(encoding="utf-8"))
+        geometry = config["geometry_contract"]
+        assert geometry["place_region_center_xyz"][2] - geometry["place_target_point"]["xyz"][2] == pytest.approx(-0.08)
+
+
+def test_blocked_approach_geometry_deterministically_rejects_before_contact():
+    """F3: the blocker covers the declared target TCP without initial contact."""
+    raw = json.loads(
+        (SCENARIO_DIR / "qualification-pick-place-blocked-approach.json").read_text(encoding="utf-8")
+    )
+    ps = {obj["id"]: obj for obj in raw["planning_scene"]["objects"]}
+    blocker = ps["sim_fixture/plan_blocker"]
+    cube = ps["sim_fixture/qualification_cube"]
+    blocker_center = blocker["pose"]["xyz"]
+    blocker_dims = blocker["primitive"]["dimensions"]
+    blocker_half_z = blocker_dims[2] / 2.0
+    blocker_bottom = blocker_center[2] - blocker_half_z
+    blocker_top = blocker_center[2] + blocker_half_z
+    cube_half_z = cube["primitive"]["dimensions"][2] / 2.0
+    cube_top = cube["pose"]["xyz"][2] + cube_half_z
+    # No initial 3D overlap: blocker bottom clears the cube top by 0.02 m.
+    assert blocker_bottom == pytest.approx(0.70)
+    assert cube_top == pytest.approx(0.68)
+    assert blocker_bottom - cube_top == pytest.approx(0.02)
+    # Target TCP lies inside the blocker volume.
+    target_tcp_xyz = raw["integrated"]["goal"]["target_tcp_xyz"]
+    assert target_tcp_xyz == [0.65, 0.0, 0.72]
+    assert blocker_bottom < target_tcp_xyz[2] < blocker_top
+    assert target_tcp_xyz[0] == pytest.approx(blocker_center[0])
+    # Explicit top-down approach/target contract for Task 4.
+    assert raw["integrated"]["goal"]["approach"] == "top-down"
+    # Expected negative remains pre-contact/non-success.
+    expected_negative = raw["integrated"]["expected_negative"]
+    assert "contact_absent" in expected_negative["required"]
+    assert "pick_terminal_non_success" in expected_negative["required"]
+    assert expected_negative["forbidden"] == [
+        "gripper_close", "scene_attach", "release", "place_goal_sent"
+    ]
+
+
+def test_d_stage_requires_no_spawned_task_object():
+    """F4: D-stage execute scenarios declare no spawned physical task object;
+    they exercise arm/gripper execution against the declared fixtures only."""
+    for name in (
+        "qualification-moveit-execute-joint",
+        "qualification-moveit-execute-pose",
+        "qualification-moveit-cartesian-retreat",
+        "qualification-moveit-gripper",
+        "qualification-moveit-cancel",
+        "qualification-moveit-safety",
+    ):
+        raw = json.loads((SCENARIO_DIR / f"{name}.json").read_text(encoding="utf-8"))
+        assert raw["actors"] == []
+        assert raw["objects"] == []
+        assert raw["integrated"]["stage"] == "D"
+        # Execution predicates describe arm/gripper behavior only; no spawned
+        # pick-target is required.
+        expected_physical = raw["integrated"]["expected_physical"]
+        assert isinstance(expected_physical, list) and expected_physical
+        assert all("object" not in predicate for predicate in expected_physical)
 
 
 def test_report_has_no_legacy_alias_or_self_digest():

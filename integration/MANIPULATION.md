@@ -279,10 +279,16 @@ The contract records, with exact values:
   execute scenarios, and eight E pick-place scenarios) with their
   declaration/revision/digest/owned-ID/descriptor identities.  The plan-only
   and execute scenarios target `sim_fixture/public_target`; the pick-place
-  scenarios target `sim_fixture/qualification_cube`.  Each scenario carries a
-  schema-v3-validated `integrated` mapping; the public report carries only the
-  one-key `{"execution_profile": "sim_ompl"}` mapping and the full per-scenario
-  mapping is bound by the scenario declaration SHA-256.
+  scenarios target `sim_fixture/qualification_cube` and declare the source
+  pedestal plus a place-support pedestal (`sim_fixture/place_pedestal`, top z
+  0.60).  Each scenario is scenario-v2 and its scenario-v2 loader validates the
+  `integrated` mapping; schema-v3 applies to the qualification config.  Fix
+  round 1 aligned physical bottom-origin roots with PlanningScene center-origin
+  poses (cube root z 0.60 / center z 0.64; blocker root z 0.70 / center z 0.85)
+  so the declared target TCP is covered without initial target contact.  The
+  public report carries only the one-key `{"execution_profile": "sim_ompl"}`
+  mapping and the full per-scenario mapping is bound by the scenario declaration
+  SHA-256.
 - **Evidence.**  Task 6 runtime/public-report separation and Task 7 plan-only
   joint/pose/blocked plus zero-command evidence and the exact blocked-mode
   MoveIt failure-code allowlist.

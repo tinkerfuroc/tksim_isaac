@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (Task 1 fix round 1: align integrated fixture geometry)
+
+- Aligned the physical (bottom-origin USD) roots with the PlanningScene
+  (center-origin) poses for all eight E-stage pick-place scenarios: the 0.08 m
+  cube physical root stays at z 0.60 while its PlanningScene center is now z
+  0.64 (root + committed asset center offset 0.04); the occupied-place occupant
+  physical root is now z 0.60 with its PlanningScene center at z 0.64; the
+  pedestal root/center z 0.0/0.30 are unchanged.
+- Added the declared physical + PlanningScene place-support pedestal
+  (`qualification_place_pedestal` / `sim_fixture/place_pedestal`) to every
+  E-stage scenario: fixed, owner `sim_fixture`, role `support`, region
+  `place-region`, physical root `[0.85, 0.0, 0.0]`, PlanningScene box center
+  `[0.85, 0.0, 0.30]`, dimensions `[0.12, 0.12, 0.60]`, reusing the exact
+  qualification-pedestal asset bytes/hash.  The owned-id declared order is
+  pedestal, cube, place_pedestal, then the scenario-specific obstacle/occupant.
+- Reworked the blocked-approach blocker so it deterministically rejects before
+  contact: physical root `[0.65, 0.0, 0.70]`, PlanningScene center
+  `[0.65, 0.0, 0.85]` for the exact 0.30 m cube, leaving 0.02 m clearance above
+  the source cube top 0.68 while the declared target TCP z 0.72 lies inside the
+  blocker.  The blocked-approach integrated goal now carries an explicit
+  `approach: "top-down"` and `target_tcp_xyz` contract for Task 4.
+- The qualification config `simulation/qualification/integrated-ompl.json`
+  geometry contract now distinguishes the bottom-origin `object_root_xyz`
+  (0.60) from the explicit `object_center_xyz` (0.64) and carries the
+  deterministic `object_local_center_z` / `object_half_extent_xyz` and the
+  place-support root/center/dimensions.
+- Hardened `ScenarioDefinition._validate_integrated` cross-field checks:
+  positive polarity requires `expected_negative` null; negative requires a
+  complete race/timeout/forbidden-after-terminal contract; goal,
+  expected_scene, and expected_physical shapes are validated; a present
+  `back_positions` vector is exactly seven finite elements except the
+  explicitly identified malformed-back negative (exactly six, required
+  predicate `goal_rejected_pre_send`).
+- Recomputed every affected immutable identity: E-stage planning-scene
+  revision digests, fixture descriptor hashes, scenario declaration hashes,
+  and the `ompl-overlay-contract.json` scenario identities/owned-ids.
+- Added tests: physical-root to PlanningScene-center parity, place-support top
+  == placement-object bottom, blocked-approach deterministic-rejection
+  geometry, public-report literal key-set anchor, and D-stage no-spawned-task
+  object documentation; removed the unused `canonical_sha256` helper.
+
 ### Added (Task 1: integrated OMPL scenario matrix)
 
 - Adds the schema-v3 integrated config `simulation/qualification/integrated-ompl.json`
