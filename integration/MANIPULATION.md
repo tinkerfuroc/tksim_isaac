@@ -363,6 +363,49 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 3): Added the stable PlanningScene
+  journal for the integrated OMPL qualification.
+  `validation/planning_scene_journal.py` is the ROS-free pure record/transition
+  journal consumed by the later executor/verifier/evidence tasks.  It writes an
+  append-only canonical compact `planning-scene.jsonl` (flush + fsync before the
+  in-memory record becomes visible) and an atomic canonical final
+  `planning-scene.json` (temp-file + file fsync + `os.replace` + directory
+  fsync, no temp residue; a failed finalize never replaces an existing
+  artifact).  `load_model_touch_contract` loads the attach/TCP link `link_tcp`,
+  the ordered eight-link SRDF touch set, and handoff
+  `pick_and_place/object_mesh` verbatim from
+  `integration/ompl-overlay-contract.json`, failing closed on
+  missing/malformed/non-eight/duplicate/permuted contract values.
+  `validate_graph_evidence` validates the Task-4-supplied graph projection:
+  recorder identity `node_name="/tinker_integrated_gate_executor"`,
+  `namespace="/"`, `remap_table={}`, the `/planning_scene` and
+  `/monitored_planning_scene` topics (`moveit_msgs/msg/PlanningScene`, reliable +
+  transient-local, depth 1), `/get_planning_scene` and `/apply_planning_scene`
+  services (`moveit_msgs/srv/GetPlanningScene` /
+  `moveit_msgs/srv/ApplyPlanningScene`, reliable + volatile), real
+  endpoint/provider metadata, and the `/sim/status/planning_scene_fixture`
+  topic (`std_msgs/msg/String`, exactly one `/fixture_planning_scene` publisher,
+  reliable + transient-local, depth 1) whose payload is independently validated
+  as the exact canonical compact fixture-status JSON with scalar
+  `target_handoff="pick_and_place/object_mesh"`; payload content never
+  substitutes for graph ownership.  Records carry distinct journal
+  (`journal_sequence`), raw/evaluator join (`frame_index`, `timestamp`), and
+  diagnostic scene (`scene_sequence`, `scene_timestamp`,
+  `scene_revision_digest`) identities; every digest matches
+  `^(?!0{64}$)[0-9a-f]{64}$`.  Scene state remains diagnostic consistency
+  evidence, never physical authority — no contact/force/object-pose/
+  evaluator/physical-verdict fields are stored.  Positive event order is
+  `fixture-ready → before-pick → scene-attach → lift-complete → transport →
+  before-release → scene-detach → released-settled → teardown`; negative
+  scenarios finalize a shorter required prefix, and duplicate/missing/
+  out-of-order/forbidden events fail.  `tests/test_planning_scene_journal.py`
+  provides 137 focused tests (brief cases plus adversarial coverage for each
+  digest field, `_last_scene` rollback, bool/negative/nonfinite numerics,
+  duplicate IDs, recursive physics-key leakage, model-contract drift, graph
+  type/QoS/source/cardinality/remap/payload mismatch, JSONL/final durability
+  and no temp residue, positive/negative order, duplicate/forbidden events, and
+  attach/detach/cleanup ownership).
+
 - 2026-08-02 (integrated qualification Task 2 fix round 3): Closed the residual
   semantic false-passes.  `validation/integrated_static_contracts.py`
   `_bind_run_post_close_pick` aggregates every SimOmpl/Hardware profile block
