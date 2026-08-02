@@ -292,14 +292,27 @@ The contract records, with exact values:
 immutable git objects and committed source and fails on mutations (including
 argument order/count, literal compatibility booleans, strict-sim keys,
 production import/node/executable allow-lists, simulator provider set, handoff,
-model-bundle source evidence, stale current selection, and premature
-source-lock inclusion).  The pre-existing uv environment provenance failure
+Task 7 action-client scope, task-range boundary/commits, fixture status
+publication, artifact path policy, model-bundle source evidence, top-level
+stable hashes, stale current selection, and premature source-lock inclusion).
+The static acceptance evidence is clean-checkout reproducible: the 16-check
+preflight runs the real `preflight_manifest` against a self-contained
+reconstructed Task 3-compatible project root (committed source + pinned git
+objects + a legacy `current.json` selecting the reproduced canonical URDF),
+requiring `ready=true`, all 16 checks, and the stable preflight hash with no
+gitignored `outputs/`/`artifacts/` dependency.  The real `current.json` is a
+separate provisioned-host runtime-readiness diagnostic (stale selection fails;
+absent selection is reported `not_provisioned`).  A clean-checkout regression
+seam (`git clone` of the tracked tree) requires every static test to pass with
+no gitignored trees.  The pre-existing uv environment provenance failure
 (installed `uv 0.12.0` vs pinned `uv 0.10.8`) remains an environment failure,
 not a code failure.
 
-The focused provenance invocation on this host requires the ROS `launch_pytest`
-plugin autoload to be disabled, otherwise pytest collection fails with
-`ModuleNotFoundError: No module named 'lark'`:
+The focused provenance invocation uses `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` as the
+defensive reproducible form (ROS plugin discovery may auto-load the Humble
+`launch_pytest` plugin, which can fail collection with
+`ModuleNotFoundError: No module named 'lark'` on hosts that do not provide that
+dependency):
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv/bin/python -m pytest -q tests/test_provenance.py

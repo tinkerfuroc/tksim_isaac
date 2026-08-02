@@ -286,10 +286,12 @@ uv lock --check
 ./scripts/build-humble-overlay
 ```
 
-The focused OMPL-overlay provenance suite runs under the simulator venv.  On
-this host the ROS Humble `launch_pytest` plugin otherwise auto-loads and fails
-collection with `ModuleNotFoundError: No module named 'lark'`, so the
-reproducible invocation disables plugin autoload:
+The focused OMPL-overlay provenance suite runs under the simulator venv.  ROS
+plugin discovery may auto-load the Humble `launch_pytest` plugin, which can fail
+collection with `ModuleNotFoundError: No module named 'lark'` on hosts that do
+not provide that dependency; disabling plugin autoload is the defensive
+reproducible invocation (it does not claim collection necessarily fails on any
+specific host):
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv/bin/python -m pytest -q tests/test_provenance.py
@@ -312,6 +314,27 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (fix round 2): Separated static and runtime OMPL acceptance
+  evidence.  The 16-check preflight is now self-contained: the real unmodified
+  `preflight_manifest` runs against a reconstructed Task 3-compatible project
+  root (committed source + pinned git objects + a legacy `current.json` selector
+  pointing at the reproduced canonical URDF), so `ready=true` and the stable
+  preflight hash reproduce with no gitignored `outputs/`/`artifacts/`
+  dependency.  The real `current.json` is a separate provisioned-host runtime
+  readiness diagnostic (stale selection fails; absent selection is reported
+  `not_provisioned`, not a static failure).  Top-level `evidence.preflight` now
+  carries the load-bearing `stable_manifest_sha256`/`stable_preflight_sha256`
+  and nests the raw hashes under `host_snapshot`.  Task 7 action-client scope is
+  AST-grounded in pinned Task 7 source (exactly one MoveGroup client on
+  `/move_action`); task_range boundary subjects + exact Task 3-7 commit list are
+  recorded and recomputed; fixture status publication is recomputed from Task 5
+  source; every artifact `path_relative` follows the recorded source policy; a
+  temporary copy-install/wheel test proves the symlinked contract + scenarios
+  install as real byte-identical files; the pinned v1 canonicalizer is loaded by
+  deterministic temporary-package materialization (no `exec` string surgery);
+  joint-limit acceptance is semantic + toolchain-aware; and a clean-checkout
+  regression seam (`git clone` of the tracked tree) requires every static test to
+  pass with no gitignored trees.
 - 2026-08-02 (fix round 1): Made the OMPL-overlay acceptance evidence
   reproducible.  The production-overlay scope is split into the exact production
   allow-lists (from `launch_contract_helpers.py`, including

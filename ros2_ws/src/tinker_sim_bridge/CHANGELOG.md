@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Task 8 fix round 2: separate static and runtime OMPL evidence)
+
+- The 16-check preflight is now self-contained on a clean checkout: the
+  provenance suite reconstructs a Task 3-compatible project root (committed
+  source + pinned git objects + a legacy `artifacts/robot/tinker2/<id>/`
+  `current.json` selector pointing at the reproduced canonical URDF + a
+  self-contained `tools/tinker_sim_deploy`) and runs the real unmodified
+  `preflight_manifest` against it, requiring `ready=true`, all 16 checks
+  including `artifact_identity`, and the stable preflight hash with no
+  gitignored `outputs/`/`artifacts/` dependency.
+- The real `artifacts/robot/tinker2/current.json` is a separate
+  provisioned-host runtime-readiness diagnostic: when present it must select
+  bytes equal to the reproducible derivation (stale selection fails); when
+  absent the host is reported `not_provisioned` as a typed skip reason, not a
+  static acceptance failure.
+- Top-level `evidence.preflight` in the acceptance contract now carries the
+  load-bearing `stable_manifest_sha256` / `stable_preflight_sha256`; the raw
+  host-scoped hashes are nested under `evidence.preflight.host_snapshot` with a
+  stated non-reproducible scope.
+- Task 7 action-client scope is AST-grounded in pinned Task 7 source at the
+  recorded simulator implementation identity (exactly one `ActionClient`
+  construction on `MOVE_ACTION="/move_action"`, no execute-trajectory /
+  controller / task client).
+- `repositories.simulator.task_range` records `boundary_subjects` (Task 3
+  canonical-model-bundle producer -> Task 7 OMPL-smoke adjudication) and the
+  exact ordered 13-commit list; the suite recomputes both and rejects any other
+  13-commit pair.
+- `fixture_contract.status_publication` fields/topic/type/source/QoS/rate are
+  recomputed from the Task 5 source and constants.
+- Every model artifact `path_relative` is verified against the recorded
+  source/`production_source_commits`/`source_evidence`/outputs policy.
+- The provisioned-manifest cross-check and the real installed-prefix check emit
+  explicit non-provisioned / build-command skip reasons instead of silently
+  passing; the mandatory reconstruction and a new temporary copy-install/wheel
+  test carry the portable gates.
+- The pinned v1 canonicalizer is loaded by deterministic temporary-package
+  materialization (no `exec` source-text surgery).
+- Joint-limit acceptance is semantic and toolchain-aware:
+  `model_bundle.joint_limits_semantic_sha256` is the format-independent identity
+  over the canonical semantic mapping, while the raw YAML bytes remain a
+  toolchain-scoped runtime artifact hash with the serialization policy recorded.
+- A clean-checkout regression seam (`git clone` of the tracked tree) requires
+  every Task 8 static test to pass with no gitignored trees (nested invocation
+  skipped via `T8_SEAM_ACTIVE`).
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` is documented as the defensive reproducible
+  invocation (plugin discovery may auto-load `launch_pytest`, which can fail on
+  hosts without `lark`), not a claim that collection fails on this exact host.
+
 ### Added (Task 8 fix round 1: make OMPL acceptance evidence reproducible)
 
 - The provenance suite now recomputes the production-overlay evidence from
