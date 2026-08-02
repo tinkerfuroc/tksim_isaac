@@ -145,3 +145,98 @@ or authorize cuMotion; live qualification remains a separate gate.
   a code failure.  The focused invocation uses `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
   (ROS plugin discovery may auto-load `launch_pytest`, which can fail on hosts
   without the `lark` module; this is the defensive reproducible invocation).
+
+## Simulator repository-local source lock (Task 9)
+
+This section accompanies `integration/source-locks.json` in the simulator
+repository at `/home/tinker/tinker-sim/6.0.1`. Together they form the simulator
+repository-local authorization policy for the post-implementation OMPL source
+lock.
+
+### What this policy records
+
+- The implementation parent (`implementation_head`) is the exact commit
+  `490f907831d9f6f06242e0d151ac014547973d6e`, the simulator HEAD immediately
+  before this lock-only commit.
+- `mode` is `"clean"`: at lock time the tracked tree was clean, so the captured
+  `status_bytes` and `diff_bytes` are both empty
+  (`{"encoding": "base64", "data": ""}`, SHA-256 of `b""` =
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`) and the
+  untracked manifest is exactly `[]` (SHA-256 of the canonical compact list
+  bytes `b"[]"` =
+  `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`).
+- The exact capture argv arrays, each run under `LC_ALL=C`:
+  `["env", "LC_ALL=C", "git", "status", "--porcelain=v1", "-z",
+  "--untracked-files=all"]` and
+  `["env", "LC_ALL=C", "git", "diff", "--binary", "--no-ext-diff"]`.
+- The policy commit is derived by resolution, never embedded: a Git commit
+  cannot embed its own object ID, so the policy records `implementation_head`
+  and `policy_commit_resolution = "commit_containing_policy_path"`. The actual
+  resolved hash is verified after commit and recorded in the Task 9 simulator
+  report ledger, never inside the policy file.
+
+### Evidence normalization contract
+
+Observation and qualification must reproduce these conventions exactly or fail
+closed.
+
+- **Git mode normalization.** `untracked_manifest[].mode` uses canonical Git
+  index mode semantics: regular file with owner-executable clear = `100644`,
+  owner-executable set = `100755`, symlink = `120000`; directories and devices
+  are rejected. Regular-file bytes are read without following symlinks; a
+  symlink's target text is hashed as bytes. A host mode such as `100664`
+  (group-writable) normalizes to `100644`.
+- **Untracked manifest digest.** `untracked_manifest_sha256` is SHA-256 over the
+  UTF-8 bytes of the entire manifest list serialized as compact sorted-key JSON
+  (`json.dumps(manifest, sort_keys=True, separators=(",", ":"))`) with no
+  trailing newline. For clean mode the exact list is `[]`.
+- **Status/diff bytes.** Observation runs the exact recorded argv and compares
+  raw bytes; any Git, configuration, or version drift that changes the bytes
+  fails closed.
+
+### Policy commit resolution (schema transition)
+
+`integration/source-locks.json` pre-existed this OMPL authorization: it was
+introduced at the 6.0.1 baseline commit `63913b1` with the deployment-workspace
+lock fields only. A raw path-history count therefore equals two after this lock
+commit and must never be misread as a false count of one. The unique policy
+commit is the **schema-transition commit** that introduces the repository-local
+OMPL authorization fields (`repository`, `implementation_head`,
+`policy_commit_resolution`) and whose parent blob lacks them. Verification
+requires the conjunction:
+
+- exactly one commit in checked-out history introduces the OMPL authorization
+  schema for `integration/source-locks.json` (blob/schema transition, not raw
+  path-touch count);
+- that commit's first parent equals `implementation_head`
+  (`490f907831d9f6f06242e0d151ac014547973d6e`);
+- the resolved commit is an ancestor of the checked-out HEAD (it need not remain
+  HEAD after a later docs-only review fix);
+- the `HEAD:<policy_path>` blob equals the working-tree policy blob;
+- repository/root/path fields match the simulator repository;
+- duplicate, later rewrite, cross-repository, missing, ambiguous, or
+  self-referential records fail.
+
+### Qualification contract
+
+Later qualification must:
+
+- load exactly one simulator policy (`integration/source-locks.json`) and reject
+  missing, duplicate, ambiguous, cross-repository, or self-referential records;
+- resolve the unique schema-transition commit and require its first parent to
+  equal `implementation_head`;
+- compare current `status`, `diff`, and untracked bytes byte-for-byte against
+  this policy, reproducing the exact capture argv and normalization above;
+- treat this policy as pre-attempt authorization only: qualification may observe
+  it but must never create or update it.
+
+### Scope and limits
+
+- The pre-existing deployment-workspace locks (`schema_version`,
+  `workspace_policy`, `isaacsim_ros_workspaces`, `tinker_cumotion`,
+  `tinker_isaac_ros_common`) are preserved with their scalar values unchanged
+  and remain separate from the OMPL repository authorization.
+- This lock records state only; it does not modify any unrelated tracked or
+  untracked path.
+- Live OMPL remains unproven by this lock.
+- cuMotion remains unauthorized by this lock.
