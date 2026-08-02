@@ -183,6 +183,7 @@ CARTESIAN_MOVE_ENDPOINT = "/cartesian_move_action"
 
 #: ``moveit_msgs/action/ExecuteTrajectory`` terminal action status ints
 #: (``action_msgs/msg/GoalStatus``).  Unknown/malformed statuses never pass.
+EXECUTE_STATUS_EXECUTING = 2
 EXECUTE_STATUS_SUCCEEDED = 4
 EXECUTE_STATUS_CANCELED = 5
 EXECUTE_STATUS_ABORTED = 6
@@ -1966,8 +1967,28 @@ class IntegratedGateExecutor:
         self.operator_publisher = self.node.create_publisher(
             self.ros["Bool"], OPERATOR_TOPIC, _operator_qos(self.ros)
         )
-        self._create_clients()
-        self._create_subscriptions()
+        # F1.1: private collection of every real owned ActionClient, kept apart
+        # from the mutable public map that tests may replace with fakes.  Must
+        # exist before ``_create_clients`` so the constructor can track each
+        # real client and a partial-constructor failure can destroy them.
+        self._owned_action_clients: list[Any] = []
+        try:
+            self._create_clients()
+            self._create_subscriptions()
+        except Exception:
+            # F1.1: partial constructor failure must destroy the already-created
+            # action clients before node/context cleanup so no waitable leaks.
+            self._destroy_owned_action_clients()
+            try:
+                self.node.destroy_node()
+            except Exception:
+                pass
+            try:
+                self.ros["rclpy"].shutdown(context=self.context)
+            except Exception:
+                pass
+            self._context_initialized = False
+            raise
 
         # Journal ownership (F1.3): default to a real PlanningSceneJournal.
         if journal is not None:
@@ -1994,8 +2015,10 @@ class IntegratedGateExecutor:
         self._fixture_payload_invalid = False
         self._latest_joint_state: Any = None
         self._latest_safety_stop: Any = None
-        self._joint_velocity_frames: list[list[float]] = []
+        self._joint_velocity_frames: list[dict[str, object]] = []
         self._fjt_status_cache: list[dict[str, object]] = []
+        self._fjt_receipt_sequence = 0
+        self._joint_receipt_sequence = 0
         self._scene_sequence = 0
         self._last_join_key: tuple[int, float] | None = None
 
@@ -2035,9 +2058,9 @@ class IntegratedGateExecutor:
                 raise RuntimeError(
                     f"missing imported action class {action_class_name} for {name}"
                 )
-            self._action_clients[name] = ros["ActionClient"](
-                self.node, action_class, name
-            )
+            client = ros["ActionClient"](self.node, action_class, name)
+            self._action_clients[name] = client
+            self._owned_action_clients.append(client)
         self._service_clients: dict[str, Any] = {}
         for name, service_type in REQUIRED_SERVICES.items():
             message_type = _service_type_to_ros(service_type, ros)
@@ -2123,7 +2146,15 @@ class IntegratedGateExecutor:
         self._latest_joint_state = message
         frame = self._arm_velocity_frame(message)
         if frame is not None:
-            self._joint_velocity_frames.append(frame)
+            self._joint_receipt_sequence += 1
+            self._joint_velocity_frames.append(
+                {
+                    "seq": self._joint_receipt_sequence,
+                    "received_mono": float(time.monotonic()),
+                    "velocities": frame,
+                    "positions": self._arm_position_frame(message),
+                }
+            )
             limit = int(self._thresholds().get("safety_stop_frames", 5))
             if limit < 1:
                 limit = 1
@@ -2140,6 +2171,17 @@ class IntegratedGateExecutor:
             return [float(by_name[f"joint{index}"]) for index in range(1, 8)]
         except (KeyError, TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _arm_position_frame(message: Any) -> list[float]:
+        """Extract the seven arm-joint positions from a JointState (0s absent)."""
+        names = list(getattr(message, "name", ()))
+        positions = list(getattr(message, "position", ()))
+        by_name = dict(zip(names, positions))
+        try:
+            return [float(by_name[f"joint{index}"]) for index in range(1, 8)]
+        except (KeyError, TypeError, ValueError):
+            return [0.0] * 7
 
     def _on_safety_stop(self, message: Any) -> None:
         self._latest_safety_stop = message
@@ -2162,8 +2204,14 @@ class IntegratedGateExecutor:
             status = getattr(status_entry, "status", None)
             if goal_uuid is None or isinstance(status, bool) or not isinstance(status, int):
                 continue
+            self._fjt_receipt_sequence += 1
             self._fjt_status_cache.append(
-                {"goal_uuid": goal_uuid, "status": int(status), "received": float(time.monotonic())}
+                {
+                    "goal_uuid": goal_uuid,
+                    "status": int(status),
+                    "received_mono": float(time.monotonic()),
+                    "seq": self._fjt_receipt_sequence,
+                }
             )
         if len(self._fjt_status_cache) > FJT_STATUS_CACHE_LIMIT:
             del self._fjt_status_cache[: len(self._fjt_status_cache) - FJT_STATUS_CACHE_LIMIT]
@@ -2173,6 +2221,281 @@ class IntegratedGateExecutor:
 
     def _newest_fjt_status(self) -> dict[str, object] | None:
         return self._fjt_status_cache[-1] if self._fjt_status_cache else None
+
+    def _seed_fjt_status(self, goal_uuid: str, status: int, *, seq: int | None = None) -> None:
+        """Seed one FJT status-topic entry (test/offline path)."""
+        self._fjt_receipt_sequence += 1
+        self._fjt_status_cache.append(
+            {
+                "goal_uuid": goal_uuid,
+                "status": int(status),
+                "received_mono": float(time.monotonic()),
+                "seq": seq if seq is not None else self._fjt_receipt_sequence,
+            }
+        )
+        if len(self._fjt_status_cache) > FJT_STATUS_CACHE_LIMIT:
+            del self._fjt_status_cache[: len(self._fjt_status_cache) - FJT_STATUS_CACHE_LIMIT]
+
+    def _seed_joint_frame(
+        self, velocities: Sequence[float], *, positions: Sequence[float] | None = None
+    ) -> None:
+        """Seed one joint-state velocity frame (test/offline path)."""
+        self._joint_receipt_sequence += 1
+        self._joint_velocity_frames.append(
+            {
+                "seq": self._joint_receipt_sequence,
+                "received_mono": float(time.monotonic()),
+                "velocities": [float(value) for value in velocities],
+                "positions": [float(value) for value in positions] if positions is not None else [0.0] * 7,
+            }
+        )
+        limit = int(self._thresholds().get("safety_stop_frames", 5))
+        if limit < 1:
+            limit = 1
+        if len(self._joint_velocity_frames) > limit:
+            del self._joint_velocity_frames[: len(self._joint_velocity_frames) - limit]
+
+    # -- windowed, fresh, bounded evidence helpers (F1.4) --------------------
+
+    def _d_baseline(self) -> dict[str, object]:
+        """Capture the current stream receipt positions at execution start."""
+        return {
+            "fjt_seq": self._fjt_receipt_sequence,
+            "joint_seq": self._joint_receipt_sequence,
+            "start_mono": float(time.monotonic()),
+        }
+
+    def _fresh_fjt_entries(
+        self, baseline: Mapping[str, object], goal_uuid: object | None = None
+    ) -> list[dict[str, object]]:
+        """FJT status entries received after *baseline* (optionally for a goal)."""
+        base_seq = int(baseline.get("fjt_seq", 0))
+        entries = [
+            entry for entry in self._fjt_status_cache
+            if isinstance(entry, Mapping) and int(entry.get("seq", 0)) > base_seq
+        ]
+        if goal_uuid is not None:
+            entries = [entry for entry in entries if entry.get("goal_uuid") == goal_uuid]
+        return entries
+
+    def _latest_fresh_joint_frame(
+        self, baseline: Mapping[str, object]
+    ) -> Mapping[str, object] | None:
+        """Newest joint-state frame received after *baseline*, else None."""
+        base_seq = int(baseline.get("joint_seq", 0))
+        for frame in reversed(self._joint_velocity_frames):
+            if isinstance(frame, Mapping) and int(frame.get("seq", 0)) > base_seq:
+                return frame
+        return None
+
+    def _wait_for(self, predicate: Callable[[], bool], timeout_s: object) -> bool:
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            self._spin_once()
+        return False
+
+    def _wait_for_fjt_status(
+        self,
+        goal_uuid: str,
+        target_statuses: Sequence[int],
+        timeout_s: object,
+        *,
+        baseline: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Bounded wait for a fresh joined FJT entry in *target_statuses*."""
+        wanted = set(int(status) for status in target_statuses)
+
+        def _seen() -> dict[str, object] | None:
+            for entry in reversed(self._fresh_fjt_entries(baseline, goal_uuid)):
+                if int(entry.get("status", -1)) in wanted:
+                    return entry
+            return None
+
+        return self._wait_for(lambda: _seen() is not None, timeout_s) and _seen() or None
+
+    def _wait_for_fjt_executing(
+        self,
+        goal_uuid: str,
+        timeout_s: object,
+        *,
+        baseline: Mapping[str, object],
+    ) -> bool:
+        """Bounded wait for the joined FJT goal to reach EXECUTING (2)."""
+        return self._wait_for_fjt_status(goal_uuid, (2,), timeout_s, baseline=baseline) is not None
+
+    def _wait_for_motion_trigger(
+        self,
+        timeout_s: object,
+        *,
+        baseline: Mapping[str, object],
+        threshold: object,
+    ) -> bool:
+        """Bounded wait for a fresh current-attempt joint frame proving motion.
+
+        At least one fresh frame (received after *baseline*) must have some
+        arm-joint absolute velocity above *threshold*; a transaction that never
+        started moving cannot be interrupted.
+        """
+        try:
+            limit = float(threshold)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(limit) or limit < 0.0:
+            return False
+
+        def _moving() -> bool:
+            # Any fresh current-attempt frame proving arm motion satisfies the
+            # trigger; a later stopped frame does not retroactively erase that a
+            # moving transaction was observed.
+            base_seq = int(baseline.get("joint_seq", 0))
+            for frame in reversed(self._joint_velocity_frames):
+                if not isinstance(frame, Mapping) or int(frame.get("seq", 0)) <= base_seq:
+                    break
+                velocities = frame.get("velocities")
+                if not isinstance(velocities, Sequence) or isinstance(velocities, (str, bytes)):
+                    continue
+                if any(
+                    isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    and abs(float(value)) > limit
+                    for value in velocities
+                ):
+                    return True
+            return False
+
+        return self._wait_for(_moving, timeout_s)
+
+    def _wait_for_stopped_frames(
+        self,
+        count: object,
+        timeout_s: object,
+        *,
+        baseline: Mapping[str, object],
+        velocity_limit: object,
+    ) -> list[Mapping[str, object]]:
+        """Bounded wait for *count* consecutive fresh bounded joint frames.
+
+        Every frame must be received after *baseline* and carry all seven
+        arm-joint absolute velocities at or below *velocity_limit*.  Frames are
+        consecutive in the cache (which trims to ``safety_stop_frames``).
+        """
+        try:
+            required = int(count)
+            limit = float(velocity_limit)
+        except (TypeError, ValueError):
+            return []
+        if required < 1 or not math.isfinite(limit) or limit < 0.0:
+            return []
+        base_seq = int(baseline.get("joint_seq", 0))
+
+        def _bounded_run() -> list[Mapping[str, object]]:
+            run: list[Mapping[str, object]] = []
+            for frame in reversed(self._joint_velocity_frames):
+                if not isinstance(frame, Mapping) or int(frame.get("seq", 0)) <= base_seq:
+                    break
+                velocities = frame.get("velocities")
+                if not isinstance(velocities, Sequence) or isinstance(velocities, (str, bytes)):
+                    break
+                if len(velocities) != 7:
+                    break
+                if not all(
+                    isinstance(value, (int, float)) and math.isfinite(float(value)) and abs(float(value)) <= limit
+                    for value in velocities
+                ):
+                    break
+                run.append(frame)
+            return run
+
+        def _ready() -> bool:
+            return len(_bounded_run()) >= required
+
+        self._wait_for(_ready, timeout_s)
+        return _bounded_run()
+
+    def _wait_for_post_clear_stability(
+        self,
+        timeout_s: object,
+        *,
+        baseline: Mapping[str, object],
+        execute_goal_id: str,
+        velocity_limit: object,
+        creep_limit: object,
+    ) -> dict[str, object]:
+        """Bounded post-clear stability observation (F1.4).
+
+        Within the bounded window: no new action/controller goal UUID appears,
+        every fresh joint frame has all velocities bounded, and every arm-joint
+        position remains within *creep_limit* of the clear-time baseline.  The
+        return carries the stability result plus the measured max creep.
+        """
+        try:
+            limit = float(velocity_limit)
+            creep = float(creep_limit)
+        except (TypeError, ValueError):
+            return {"stable": False, "reason": "non-finite thresholds"}
+        if not math.isfinite(limit) or limit < 0.0 or not math.isfinite(creep) or creep < 0.0:
+            return {"stable": False, "reason": "non-finite thresholds"}
+        base_seq = int(baseline.get("joint_seq", 0))
+        clear_positions = list(baseline.get("clear_positions") or [])
+        if len(clear_positions) != 7:
+            return {"stable": False, "reason": "no clear-time position baseline"}
+        max_creep = 0.0
+        seen_uuid: str | None = None
+        terminal = False
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            # No fresh goal UUID beyond the canceled/aborted execute goal.
+            fresh = self._fresh_fjt_entries(baseline)
+            if fresh:
+                for entry in reversed(fresh):
+                    uuid = entry.get("goal_uuid")
+                    status = int(entry.get("status", -1))
+                    if uuid != execute_goal_id:
+                        terminal = True
+                        seen_uuid = str(uuid)
+                        break
+                    if status not in (EXECUTE_STATUS_SUCCEEDED, EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED):
+                        terminal = True
+                        seen_uuid = str(uuid)
+                        break
+                    break  # only newest matters for the no-fresh-goal check
+            frame = self._latest_fresh_joint_frame(baseline)
+            if frame is not None:
+                velocities = frame.get("velocities")
+                positions = frame.get("positions")
+                if not isinstance(velocities, Sequence) or len(velocities) != 7:
+                    terminal = True
+                    seen_uuid = "malformed-velocity-frame"
+                    break
+                if not all(
+                    isinstance(value, (int, float)) and math.isfinite(float(value)) and abs(float(value)) <= limit
+                    for value in velocities
+                ):
+                    terminal = True
+                    seen_uuid = "unbounded-velocity"
+                    break
+                if isinstance(positions, Sequence) and len(positions) == 7:
+                    for index, value in enumerate(positions):
+                        try:
+                            delta = abs(float(value) - float(clear_positions[index]))
+                        except (TypeError, ValueError):
+                            terminal = True
+                            seen_uuid = "non-finite-position"
+                            break
+                        if delta > max_creep:
+                            max_creep = delta
+                        if delta > creep:
+                            terminal = True
+                            seen_uuid = "position-creep"
+                            break
+                    if terminal:
+                        break
+            self._spin_once()
+        if terminal:
+            return {"stable": False, "reason": f"fresh goal or unbounded state: {seen_uuid}", "max_creep": round(max_creep, 6)}
+        return {"stable": True, "reason": None, "max_creep": round(max_creep, 6)}
 
     def _normalize_planning_scene(self, message: Any, *, source: str) -> dict[str, object]:
         ros = self.ros
@@ -2496,6 +2819,129 @@ class IntegratedGateExecutor:
         while not cancel_future.done() and time.monotonic() < cancel_deadline:
             self._spin_once()
         return "completed" if cancel_future.done() else "timed-out"
+
+    def _cancel_execute_goal(
+        self,
+        goal_handle: Any,
+        *,
+        expected_goal_uuid: str,
+        timeout_s: object,
+    ) -> dict[str, object]:
+        """F1.2: call ``cancel_goal_async()`` once and require the accepted shape.
+
+        Humble ``CancelGoal.Response`` carries ``return_code`` and
+        ``goals_canceling`` (a list of ``GoalInfo``).  Acceptance requires
+        ``return_code == ERROR_NONE`` and ``goals_canceling`` containing exactly
+        the ExecuteTrajectory goal UUID.  Rejected/unknown/empty/extra/
+        malformed/exceptional/timed-out responses fail closed.
+        """
+        try:
+            cancel_future = goal_handle.cancel_goal_async()
+        except Exception as exc:
+            return {
+                "response": "failed", "return_code": None, "goals_canceling": [],
+                "error": f"cancel_goal_async raised: {exc}",
+            }
+        cancel_deadline = time.monotonic() + float(timeout_s)
+        while not cancel_future.done() and time.monotonic() < cancel_deadline:
+            self._spin_once()
+        if not cancel_future.done():
+            return {
+                "response": "timed-out", "return_code": None, "goals_canceling": [],
+                "error": "cancel response future did not resolve within the bounded wait",
+            }
+        try:
+            response = cancel_future.result()
+        except Exception as exc:
+            return {
+                "response": "failed", "return_code": None, "goals_canceling": [],
+                "error": f"cancel response future raised: {exc}",
+            }
+        return_code = getattr(response, "return_code", None)
+        goals_canceling = [
+            normalized
+            for normalized in (
+                _normalize_goal_uuid(getattr(goal_info, "goal_id", None))
+                for goal_info in getattr(response, "goals_canceling", [])
+            )
+            if normalized is not None
+        ]
+        if not _strict_int(return_code):
+            return {
+                "response": "unknown", "return_code": return_code,
+                "goals_canceling": goals_canceling,
+                "error": "cancel response return_code is not a strict integer",
+            }
+        if return_code != 0:
+            return {
+                "response": "rejected", "return_code": return_code,
+                "goals_canceling": goals_canceling,
+                "error": f"cancel response return_code {return_code} != ERROR_NONE (0)",
+            }
+        if goals_canceling != [expected_goal_uuid]:
+            return {
+                "response": "rejected", "return_code": return_code,
+                "goals_canceling": goals_canceling,
+                "error": f"cancel response goals_canceling {goals_canceling} != [{expected_goal_uuid}]",
+            }
+        return {
+            "response": "accepted", "return_code": return_code,
+            "goals_canceling": goals_canceling, "error": None,
+        }
+
+    def _cleanup_execute_goal(self, goal_handle: Any, *, timeout_s: object) -> dict[str, object]:
+        """F1.5: bounded cleanup of an accepted ExecuteTrajectory goal.
+
+        Attempts cancellation on the exact handle and waits bounded for the
+        result.  The cleanup outcome is recorded without ever claiming cancel
+        success unless the exact F1.2 cancel-response contract was met.
+        """
+        if goal_handle is None:
+            return {"cleanup": "none", "cleanup_status": "no-handle"}
+        goal_uuid = self._normalize_goal_id(goal_handle) or ""
+        cancel = self._cancel_execute_goal(
+            goal_handle, expected_goal_uuid=goal_uuid, timeout_s=timeout_s
+        )
+        result_status = None
+        try:
+            result_future = goal_handle.get_result_async()
+            result_deadline = time.monotonic() + float(timeout_s)
+            while not result_future.done() and time.monotonic() < result_deadline:
+                self._spin_once()
+            if result_future.done():
+                result_status = getattr(result_future.result(), "status", None)
+        except Exception:
+            result_status = None
+        return {
+            "cleanup": cancel.get("response"),
+            "cleanup_return_code": cancel.get("return_code"),
+            "cleanup_goals_canceling": list(cancel.get("goals_canceling") or []),
+            "cleanup_result_status": result_status,
+            "cleanup_error": cancel.get("error"),
+        }
+
+    def _wait_execute_result_status(
+        self, goal_handle: Any, timeout_s: object
+    ) -> tuple[object, str | None]:
+        """Bounded wait for the ExecuteTrajectory result; return (status, string)."""
+        try:
+            result_future = goal_handle.get_result_async()
+        except Exception as exc:
+            return None, f"get_result_async raised: {exc}"
+        deadline = time.monotonic() + float(timeout_s)
+        while not result_future.done() and time.monotonic() < deadline:
+            self._spin_once()
+        if not result_future.done():
+            return None, "result future did not resolve within the bounded wait"
+        try:
+            response = result_future.result()
+        except Exception as exc:
+            return None, f"result future raised: {exc}"
+        status = getattr(response, "status", None)
+        try:
+            return status, _execute_status_name(status)
+        except ValueError:
+            return status, None
 
     def _classify_plan_only_result(
         self,
@@ -3137,6 +3583,7 @@ class IntegratedGateExecutor:
         provider_evidence: object,
         *,
         expected_trajectory_digest: str | None,
+        baseline: Mapping[str, object] | None = None,
     ) -> tuple[bool, str | None]:
         """Validate injected FJT transaction evidence and join it to status.
 
@@ -3145,9 +3592,9 @@ class IntegratedGateExecutor:
         normalized FJT goal UUID, canonical trajectory digest equal to the
         unchanged ExecuteTrajectory digest, a finite timestamp/sequence, and a
         real observation source).  The provider UUID/status must join to the
-        actual newest status-topic entry.  Missing, stale, mismatched, extra,
-        malformed, or provider-exception evidence makes the attempt
-        ``evidence-invalid``.
+        actual status-topic entry received inside the current execution window
+        (after *baseline*).  Missing, stale, mismatched, extra, malformed, or
+        provider-exception evidence makes the attempt ``evidence-invalid``.
         """
         if not isinstance(provider_evidence, Mapping):
             return False, "fjt_transaction_provider returned a non-mapping"
@@ -3173,9 +3620,12 @@ class IntegratedGateExecutor:
         provider_status = provider_evidence.get("status")
         if isinstance(provider_status, bool) or not isinstance(provider_status, int):
             return False, "fjt evidence status must be an integer"
-        newest = self._newest_fjt_status()
-        if newest is None:
-            return False, "no FJT status-topic entry was observed for this transaction"
+        candidates = self._fjt_status_cache
+        if baseline is not None:
+            candidates = self._fresh_fjt_entries(baseline)
+        if not candidates:
+            return False, "no FJT status-topic entry was observed for this transaction within the current window"
+        newest = candidates[-1]
         if newest.get("goal_uuid") != goal_uuid:
             return False, "fjt evidence goal_uuid does not join to the newest status entry"
         if newest.get("status") != provider_status:
@@ -3288,8 +3738,23 @@ class IntegratedGateExecutor:
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                 )
+            # F1.4: capture the FJT/status and joint-state stream positions at
+            # execution start so every later observation is windowed, fresh, and
+            # bounded to the current attempt.
+            baseline = self._d_baseline()
+            # F1.8/Md5: D visual capture before the first D goal, with real
+            # chronology (never a retroactive request).
+            self._append_visual_request("before", scenario_id, spec)
             event_log.append("execution-start")
-            self._journal_snapshot_d("execution-start")
+            snap = self._journal_snapshot_d("execution-start")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"execution-start journal snapshot rejected: {snap}",
+                    journal_issues=[snap],
+                )
 
             planned_digest_before = self._digest(self.ros["serialize_message"](planned))
             try:
@@ -3320,6 +3785,7 @@ class IntegratedGateExecutor:
             )
             execute_goal_id = exec_outcome.get("execute_goal_id")
             execute_result_status = exec_outcome.get("execute_result_status")
+            execute_handle = exec_outcome.get("goal_handle")
             if (
                 not _valid_goal_uuid(planning_goal_id)
                 or not _valid_goal_uuid(execute_goal_id)
@@ -3330,9 +3796,11 @@ class IntegratedGateExecutor:
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
+                    execute_outcome=exec_outcome,
                     execute_error="plan/execute UUIDs must both be valid and distinct",
                 )
             if execute_result_status != EXECUTE_STATUS_SUCCEEDED:
+                cleanup = self._cleanup_execute_goal(execute_handle, timeout_s=cancel_timeout_s)
                 return self._finalize_d_attempt(
                     scenario_id, spec, plan_outcome, planner_status, "diagnostic-fail",
                     readiness, start_wall, event_log=event_log,
@@ -3340,6 +3808,22 @@ class IntegratedGateExecutor:
                     execute_goal_id=execute_goal_id,
                     execute_outcome=exec_outcome,
                     execute_error="ExecuteTrajectory did not terminate SUCCEEDED",
+                    cleanup=cleanup,
+                )
+            # F1.4/M3: bounded spin for the joined fresh FJT status entry so a
+            # live status-topic arrival cannot race the result future.
+            fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
+            joined = self._wait_for_fjt_status(
+                execute_goal_id, (execute_result_status,), fjt_wait_s, baseline=baseline
+            )
+            if joined is None:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_outcome=exec_outcome,
+                    execute_error="no fresh FJT status entry joined the executed goal within the bounded wait",
                 )
             try:
                 provider_evidence = fjt_transaction_provider()
@@ -3353,7 +3837,9 @@ class IntegratedGateExecutor:
                     execute_error=f"fjt_transaction_provider raised: {exc}",
                 )
             fjt_ok, fjt_reason = self._validate_fjt_evidence(
-                provider_evidence, expected_trajectory_digest=executed_digest_after
+                provider_evidence,
+                expected_trajectory_digest=executed_digest_after,
+                baseline=baseline,
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
@@ -3364,10 +3850,31 @@ class IntegratedGateExecutor:
                     execute_outcome=exec_outcome,
                     execute_error=fjt_reason or "fjt evidence invalid",
                 )
+            self._append_visual_request("after", scenario_id, spec)
             event_log.append("execution-terminal")
-            self._journal_snapshot_d("execution-terminal")
+            snap = self._journal_snapshot_d("execution-terminal")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_outcome=exec_outcome,
+                    execute_error=f"execution-terminal journal snapshot rejected: {snap}",
+                    journal_issues=[snap],
+                )
             event_log.append("teardown")
-            self._journal_snapshot_d("teardown")
+            snap = self._journal_snapshot_d("teardown")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_outcome=exec_outcome,
+                    execute_error=f"teardown journal snapshot rejected: {snap}",
+                    journal_issues=[snap],
+                )
 
             return self._finalize_d_attempt(
                 scenario_id, spec, plan_outcome, planner_status, "diagnostic-pass",
@@ -3377,6 +3884,7 @@ class IntegratedGateExecutor:
                 execute_outcome=exec_outcome,
                 fjt_evidence=provider_evidence,
                 trajectory_digest=executed_digest_after,
+                controller_endpoint=FJT_ENDPOINT,
             )
         except Exception as exc:
             if fixture_ready_recorded:
@@ -3490,89 +3998,268 @@ class IntegratedGateExecutor:
                     scenario_id, "cancel-target-invalid", ["plan and execute UUIDs must differ"]
                 )
 
+            # F1.4: window the current attempt from here.
+            baseline = self._d_baseline()
+            # F1.8/Md5: visual capture before the first D goal.
+            self._append_visual_request("before", scenario_id, spec)
             event_log.append("execution-start")
-            self._journal_snapshot_d("execution-start")
+            snap = self._journal_snapshot_d("execution-start")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"execution-start journal snapshot rejected: {snap}",
+                    journal_issues=[snap],
+                )
 
-            # The long-motion ExecuteTrajectory transaction is supplied by the
-            # provider/target evidence (mid-flight).  Cancel only that exact
-            # ExecuteTrajectory handle; the MoveGroup planning handle was already
-            # completed and is never canceled.
-            goals_canceling = [execute_goal_id]
-            # §7: call ``cancel_goal_async()`` only on the ExecuteTrajectory
-            # handle; never cancel the completed MoveGroup planning handle.
-            cancel_response = "not-applicable"
-            if execute_goal_handle is not None:
-                cancel_response = self._cancel_goal(execute_goal_handle)
-                if cancel_response != "completed":
-                    return self._finalize_d_attempt(
-                        scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                        "diagnostic-pass", "evidence-invalid",
-                        readiness, start_wall, event_log=event_log,
-                        planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
-                        execute_goal_id=execute_goal_id,
-                        execute_error=f"ExecuteTrajectory cancel did not complete: {cancel_response}",
-                        goals_canceling=goals_canceling,
-                    )
+            # F1.2: a cancel pass is impossible without the exact live
+            # ExecuteTrajectory ClientGoalHandle.  Raw UUID kwargs or provider
+            # strings never substitute for a handle, and the completed MoveGroup
+            # planning handle is never canceled.
+            if execute_goal_handle is None:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="cancel requires the exact live ExecuteTrajectory goal handle",
+                    goals_canceling=[execute_goal_id],
+                )
+            handle_uuid = self._normalize_goal_id(execute_goal_handle)
+            if handle_uuid != execute_goal_id:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=(
+                        f"cancel handle goal_id {handle_uuid!r} does not equal the recorded "
+                        f"execute_goal_id {execute_goal_id!r}"
+                    ),
+                    goals_canceling=[execute_goal_id],
+                )
+            if planning_goal_id == execute_goal_id:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="plan and execute UUIDs must differ",
+                    goals_canceling=[execute_goal_id],
+                )
+
+            # F1.4/M4: the transaction must have actually started — FJT
+            # EXECUTING(2) joined and at least one fresh current-attempt joint
+            # frame proves arm motion above threshold.  A transaction that never
+            # started moving cannot be interrupted.
+            fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
+            motion_wait_s = float(self._thresholds().get("motion_trigger_timeout_s", 1.0))
+            motion_limit = float(self._thresholds().get("cancel_motion_velocity_rad_s", 0.005))
+            if not self._wait_for_fjt_executing(execute_goal_id, fjt_wait_s, baseline=baseline):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="cancel motion trigger: FJT goal never reached EXECUTING within the bounded wait",
+                    goals_canceling=[execute_goal_id],
+                )
+            if not self._wait_for_motion_trigger(
+                motion_wait_s, baseline=baseline, threshold=motion_limit
+            ):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="cancel motion trigger: no fresh joint-state frame proved arm motion",
+                    goals_canceling=[execute_goal_id],
+                )
+
+            # F1.2: call ``cancel_goal_async()`` exactly once on the exact
+            # ExecuteTrajectory handle and require the accepted response shape
+            # (return_code == ERROR_NONE and goals_canceling == [execute_goal_id]).
+            cancel_timeout_s = float(
+                timeout_s if timeout_s is not None
+                else self._thresholds().get("cancel_timeout_s", 10.0)
+            )
+            cancel_response = self._cancel_execute_goal(
+                execute_goal_handle, expected_goal_uuid=execute_goal_id, timeout_s=cancel_timeout_s
+            )
+            if cancel_response.get("response") != "accepted":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=(
+                        cancel_response.get("error")
+                        or f"cancel response was {cancel_response.get('response')!r}, not accepted"
+                    ),
+                    goals_canceling=[execute_goal_id],
+                    cancel_response=cancel_response,
+                )
+            goals_canceling = list(cancel_response.get("goals_canceling") or [execute_goal_id])
             event_log.append("cancel-requested")
-            self._journal_snapshot_d("cancel-requested")
+            snap = self._journal_snapshot_d("cancel-requested")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"cancel-requested journal snapshot rejected: {snap}",
+                    journal_issues=[snap], goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                )
 
-            # Quiescence: bounded wait until no active FJT status joins the
-            # canceled controller goal.  The injected FJT evidence must join to
-            # the newest status entry with the canceled UUID.
+            # F1.2: require the ExecuteTrajectory action result terminal CANCELED (5).
+            action_status, action_status_string = self._wait_execute_result_status(
+                execute_goal_handle, cancel_timeout_s
+            )
+            if action_status != EXECUTE_STATUS_CANCELED:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=(
+                        f"ExecuteTrajectory terminal status was {action_status_string!r} "
+                        f"({action_status!r}); cancellation requires CANCELED (5)"
+                    ),
+                    goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
+                )
+            # F1.2: require the joined FJT controller goal to reach CANCELED (5)
+            # within a bounded wait (windowed to the current attempt).
+            fjt_terminal = self._wait_for_fjt_status(
+                execute_goal_id, (EXECUTE_STATUS_CANCELED,), fjt_wait_s, baseline=baseline
+            )
+            if fjt_terminal is None:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="joined FJT controller goal never reached CANCELED within the bounded wait",
+                    goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
+                )
+            # F1.4: bounded quiescence — the canceled goal's newest fresh status
+            # is terminal (no longer active).  Historical pre-terminal entries
+            # (e.g. the EXECUTING trigger) are not treated as active.
+            quiescent = self._wait_for(
+                lambda: (lambda entries: bool(entries) and int(entries[-1].get("status", -1)) in (
+                    EXECUTE_STATUS_SUCCEEDED, EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED
+                ))(self._fresh_fjt_entries(baseline, execute_goal_id)),
+                fjt_wait_s,
+            )
+            if not quiescent:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="FJT controller goal was still active after the cancel result",
+                    goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
+                )
             try:
                 provider_evidence = fjt_transaction_provider()
             except Exception as exc:
                 return self._finalize_d_attempt(
-                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                    "diagnostic-pass", "evidence-invalid",
+                    scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
                     execute_error=f"fjt_transaction_provider raised: {exc}",
                     goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
                 )
             fjt_ok, fjt_reason = self._validate_fjt_evidence(
-                provider_evidence, expected_trajectory_digest=None
+                provider_evidence, expected_trajectory_digest=None, baseline=baseline
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
-                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                    "diagnostic-pass", "evidence-invalid",
+                    scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
                     execute_error=fjt_reason or "fjt evidence invalid",
                     goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
                 )
-            newest = self._newest_fjt_status()
-            active = bool(
-                newest is not None
-                and newest.get("goal_uuid") == execute_goal_id
-                and newest.get("status") not in (EXECUTE_STATUS_SUCCEEDED, EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED)
-            )
-            if active:
+            self._append_visual_request("after", scenario_id, spec)
+            event_log.append("quiescent")
+            snap = self._journal_snapshot_d("quiescent")
+            if snap != "recorded":
                 return self._finalize_d_attempt(
-                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                    "diagnostic-pass", "evidence-invalid",
+                    scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
-                    execute_error="FJT status is still active for the canceled controller goal",
-                    goals_canceling=goals_canceling,
+                    execute_error=f"quiescent journal snapshot rejected: {snap}",
+                    journal_issues=[snap], goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
                 )
-            event_log.append("quiescent")
-            self._journal_snapshot_d("quiescent")
             event_log.append("teardown")
-            self._journal_snapshot_d("teardown")
+            snap = self._journal_snapshot_d("teardown")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"teardown journal snapshot rejected: {snap}",
+                    journal_issues=[snap], goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
+                )
             return self._finalize_d_attempt(
-                scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                "diagnostic-pass", "diagnostic-pass",
+                scenario_id, spec, None, None, "diagnostic-pass",
                 readiness, start_wall, event_log=event_log,
                 planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                 execute_goal_id=execute_goal_id,
                 goals_canceling=goals_canceling,
                 terminal_status="canceled",
                 fjt_evidence=provider_evidence,
+                controller_goal_sent=True,
+                controller_endpoint=FJT_ENDPOINT,
+                plan_applicable=False,
+                cancel_response=cancel_response,
+                execute_outcome={
+                    "execute_result_status": action_status,
+                    "execute_result_status_string": action_status_string,
+                },
             )
         except Exception as exc:
             return self._evidence_invalid_d(
@@ -3666,98 +4353,249 @@ class IntegratedGateExecutor:
                     scenario_id, "safety-target-invalid", ["plan and execute UUIDs must differ"]
                 )
 
+            # F1.4: window the current attempt from here.
+            baseline = self._d_baseline()
+            # F1.8/Md5: visual capture before the first D goal.
+            self._append_visual_request("before", scenario_id, spec)
             event_log.append("execution-start")
-            self._journal_snapshot_d("execution-start")
+            snap = self._journal_snapshot_d("execution-start")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"execution-start journal snapshot rejected: {snap}",
+                    journal_issues=[snap],
+                )
+
+            # F1.4/F1.3: the safety interruption must target a transaction that
+            # actually started — FJT EXECUTING(2) joined and a fresh joint frame
+            # proves arm motion above threshold.
+            fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
+            motion_wait_s = float(self._thresholds().get("motion_trigger_timeout_s", 1.0))
+            motion_limit = float(self._thresholds().get("safety_motion_velocity_rad_s", 0.005))
+            if not self._wait_for_fjt_executing(execute_goal_id, fjt_wait_s, baseline=baseline):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="safety motion trigger: FJT goal never reached EXECUTING within the bounded wait",
+                )
+            if not self._wait_for_motion_trigger(
+                motion_wait_s, baseline=baseline, threshold=motion_limit
+            ):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="safety motion trigger: no fresh joint-state frame proved arm motion",
+                )
 
             # 3. publish operator True.
             try:
                 self.publish_operator(True)
             except Exception as exc:
-                return self._evidence_invalid_d(scenario_id, "operator-publish-failed", [str(exc)])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"operator publish failed: {exc}",
+                )
             # 4. wait bounded for safety-stop True.
             safety_stop_seen = self._wait_for_safety_stop(stop_timeout_s)
             if not safety_stop_seen:
                 return self._finalize_d_attempt(
-                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                    "diagnostic-pass", "evidence-invalid",
+                    scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
                     execute_error="safety-stop True was not observed within the bounded wait",
                 )
             event_log.append("effective-stop")
-            self._journal_snapshot_d("effective-stop")
-
-            # 5. the old ExecuteTrajectory action terminal status is ABORTED or
-            # another explicitly non-success safety-abort result; never success.
-            fjt_evidence = None
-            try:
-                fjt_evidence = fjt_transaction_provider()
-            except Exception:
-                pass
-            fjt_ok, fjt_reason = self._validate_fjt_evidence(
-                fjt_evidence, expected_trajectory_digest=None
-            ) if fjt_evidence is not None else (False, "no fjt evidence")
-            terminal_status = self._safety_terminal_status(fjt_evidence)
-            if terminal_status != "aborted":
+            snap = self._journal_snapshot_d("effective-stop")
+            if snap != "recorded":
                 return self._finalize_d_attempt(
-                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                    "diagnostic-pass", "evidence-invalid",
+                    scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
-                    execute_error="safety did not produce a non-success ABORTED terminal status",
-                    fjt_evidence=fjt_evidence,
+                    execute_error=f"effective-stop journal snapshot rejected: {snap}",
+                    journal_issues=[snap],
                 )
 
-            # 6. safety_stop_frames consecutive fresh joint-state velocity frames.
-            frames = self._safety_velocity_frames()
-            velocity_limit = float(self._thresholds().get("safety_stop_velocity_rad_s", 0.02))
-            required_frames = int(self._thresholds().get("safety_stop_frames", 5))
-            if not _arm_velocity_within_limit(frames, velocity_limit) or len(frames) < required_frames:
+            # F1.3: the old ExecuteTrajectory/FJT transaction must reach ABORTED
+            # (6) after the safety assertion.  The provider evidence and its join
+            # are mandatory; a provider exception/mismatch/stale-cache fails
+            # closed (never swallowed, never an unrelated cached ABORTED goal).
+            aborted_entry = self._wait_for_fjt_status(
+                execute_goal_id, (EXECUTE_STATUS_ABORTED,), fjt_wait_s, baseline=baseline
+            )
+            if aborted_entry is None:
                 return self._finalize_d_attempt(
-                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                    "diagnostic-pass", "evidence-invalid",
+                    scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
-                    execute_error="safety velocity frames were not bounded or were insufficient",
-                    fjt_evidence=fjt_evidence,
+                    execute_error="joined FJT controller goal never reached ABORTED after the safety assertion",
+                )
+            try:
+                provider_evidence = fjt_transaction_provider()
+            except Exception as exc:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"safety fjt_transaction_provider raised: {exc}",
+                )
+            fjt_ok, fjt_reason = self._validate_fjt_evidence(
+                provider_evidence, expected_trajectory_digest=None, baseline=baseline
+            )
+            if not fjt_ok:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=fjt_reason or "safety fjt evidence invalid",
+                    fjt_evidence=provider_evidence,
+                )
+            provider_status = provider_evidence.get("status")
+            if provider_status != EXECUTE_STATUS_ABORTED:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=(
+                        f"safety provider status {provider_status!r} is not ABORTED (6); "
+                        "safety terminal evidence must join the joined fresh ABORTED entry"
+                    ),
+                    fjt_evidence=provider_evidence,
+                )
+
+            # 6. safety_stop_frames consecutive fresh post-stop joint-state
+            # velocity frames, each received after the safety assertion.
+            stop_baseline = self._d_baseline()
+            velocity_limit = float(self._thresholds().get("safety_stop_velocity_rad_s", 0.02))
+            required_frames = int(self._thresholds().get("safety_stop_frames", 5))
+            stop_wait_s = float(self._thresholds().get("safety_stop_frames_wait_s", 1.0))
+            stopped = self._wait_for_stopped_frames(
+                required_frames, stop_wait_s,
+                baseline=stop_baseline, velocity_limit=velocity_limit,
+            )
+            if len(stopped) < required_frames:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=(
+                        f"safety required {required_frames} consecutive fresh bounded "
+                        f"joint-state frames; observed {len(stopped)}"
+                    ),
+                    fjt_evidence=provider_evidence,
                 )
 
             # 7. publish operator False only after the effective-stop predicate.
             try:
                 self.publish_operator(False)
             except Exception as exc:
-                return self._evidence_invalid_d(scenario_id, "operator-clear-publish-failed", [str(exc)])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"operator clear publish failed: {exc}",
+                    fjt_evidence=provider_evidence,
+                )
             event_log.append("operator-clear")
-            self._journal_snapshot_d("operator-clear")
+            snap = self._journal_snapshot_d("operator-clear")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"operator-clear journal snapshot rejected: {snap}",
+                    journal_issues=[snap], fjt_evidence=provider_evidence,
+                )
 
-            # 8. bounded post-clear stability: no fresh action/controller goal UUID.
-            if self._newest_fjt_status() is not None:
-                newest_uuid = self._newest_fjt_status().get("goal_uuid")
-                if newest_uuid != execute_goal_id:
-                    return self._finalize_d_attempt(
-                        scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                        "diagnostic-pass", "evidence-invalid",
-                        readiness, start_wall, event_log=event_log,
-                        planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
-                        execute_goal_id=execute_goal_id,
-                        execute_error="a fresh goal UUID appeared after operator clear",
-                        fjt_evidence=fjt_evidence,
-                    )
+            # F1.4/M2: bounded post-clear stability — no fresh goal UUID, all
+            # velocities bounded, and every arm-joint position within
+            # ``safety_position_creep_rad`` of the clear-time baseline.
+            clear_baseline = self._d_baseline()
+            latest_clear = self._latest_fresh_joint_frame(clear_baseline)
+            if latest_clear is None:
+                latest_clear = self._latest_fresh_joint_frame(baseline)
+            clear_positions = list(latest_clear.get("positions") or []) if latest_clear is not None else []
+            if len(clear_positions) != 7:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="safety could not capture a clear-time joint-position baseline",
+                    fjt_evidence=provider_evidence,
+                )
+            clear_baseline = dict(clear_baseline)
+            clear_baseline["clear_positions"] = clear_positions
+            creep_limit = float(self._thresholds().get("safety_position_creep_rad", 0.005))
+            stability_wait_s = float(self._thresholds().get("safety_stability_wait_s", 1.0))
+            stability = self._wait_for_post_clear_stability(
+                stability_wait_s,
+                baseline=clear_baseline,
+                execute_goal_id=execute_goal_id,
+                velocity_limit=velocity_limit,
+                creep_limit=creep_limit,
+            )
+            if not stability.get("stable"):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"post-clear stability not met: {stability.get('reason')}",
+                    fjt_evidence=provider_evidence,
+                )
+            self._append_visual_request("after", scenario_id, spec)
             event_log.append("quiescent")
-            self._journal_snapshot_d("quiescent")
+            snap = self._journal_snapshot_d("quiescent")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"quiescent journal snapshot rejected: {snap}",
+                    journal_issues=[snap], fjt_evidence=provider_evidence,
+                )
             event_log.append("teardown")
-            self._journal_snapshot_d("teardown")
+            snap = self._journal_snapshot_d("teardown")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"teardown journal snapshot rejected: {snap}",
+                    journal_issues=[snap], fjt_evidence=provider_evidence,
+                )
             return self._finalize_d_attempt(
-                scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
-                "diagnostic-pass", "diagnostic-pass",
+                scenario_id, spec, None, None, "diagnostic-pass",
                 readiness, start_wall, event_log=event_log,
                 planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                 execute_goal_id=execute_goal_id,
                 terminal_status="aborted",
-                fjt_evidence=fjt_evidence,
+                fjt_evidence=provider_evidence,
+                controller_goal_sent=True,
+                controller_endpoint=FJT_ENDPOINT,
+                plan_applicable=False,
+                env_cloud_evidence=None,
             )
         except Exception as exc:
             return self._evidence_invalid_d(
@@ -3797,33 +4635,42 @@ class IntegratedGateExecutor:
         return "unknown"
 
     def _safety_velocity_frames(self) -> list[list[float]]:
-        """Return the cached bounded arm-velocity frames for the effective-stop
-        predicate.
+        """Return the cached arm-velocity lists for the effective-stop predicate.
 
         The live controller streams fresh ``/joint_states`` and the executor
-        caches up to ``safety_stop_frames`` consecutive frames through
+        caches up to ``safety_stop_frames`` consecutive bounded frames through
         :meth:`_on_joint_state`; the effective-stop predicate requires
         ``safety_stop_frames`` consecutive frames with every arm-joint absolute
         velocity bounded.  In the offline/faked Humble suite the test feeds
-        ``JointState`` messages through the callback directly.
+        ``JointState`` messages or seeds frames through the callback directly.
         """
-        return list(self._joint_velocity_frames)
+        return [
+            list(frame.get("velocities")) if isinstance(frame, Mapping) else list(frame)
+            for frame in self._joint_velocity_frames
+            if frame is not None
+        ]
 
     def run_cartesian_retreat(
         self,
         scenario_id: str,
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
+        environment_cloud_provider: Callable[[], object] | None = None,
     ) -> dict[str, object]:
         """Run the Stage-D Cartesian retreat contract.
 
         Uses an injected ``current_tcp_pose_provider`` (never a TF listener
         embedded in this task) returning a fresh finite normalized ``base_link``
-        TCP pose with observation identity/age.  Derives the deterministic
-        ``+Z`` ``RETREAT_DISTANCE_M`` target preserving orientation and sends one
+        TCP pose with observation identity/age.  F1.7: an explicit fresh
+        ``environment_cloud_provider`` must return a real non-empty finite
+        ``base_link`` ``sensor_msgs/msg/PointCloud2`` observation; that exact
+        cloud is passed into ``CartesianMove.Goal.env_points`` and only then is
+        ``collision_checking`` recorded true.  Derives the deterministic ``+Z``
+        ``RETREAT_DISTANCE_M`` target preserving orientation and sends one
         collision-aware ``/cartesian_move_action`` goal.
         """
         start_wall = time.monotonic()
+        fixture_ready_recorded = False
         event_log: list[str] = []
         try:
             try:
@@ -3838,6 +4685,11 @@ class IntegratedGateExecutor:
                 return self._evidence_invalid_d(
                     scenario_id, "no-tcp-pose-provider",
                     ["current_tcp_pose_provider is required before sending a retreat goal"],
+                )
+            if environment_cloud_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-environment-cloud-provider",
+                    ["environment_cloud_provider is required before sending a collision-aware retreat goal"],
                 )
             if self.join_key_provider is None:
                 return self._evidence_invalid_d(scenario_id, "no-join-key", [])
@@ -3864,6 +4716,7 @@ class IntegratedGateExecutor:
                 self.journal.record_diff("fixture-ready", scene)
             except (ValueError, TypeError) as exc:
                 return self._evidence_invalid_d(scenario_id, "journal-fixture-ready-rejected", [str(exc)])
+            fixture_ready_recorded = True
             event_log.append("fixture-ready")
 
             try:
@@ -3885,8 +4738,46 @@ class IntegratedGateExecutor:
             except ValueError as exc:
                 return self._evidence_invalid_d(scenario_id, "retreat-derivation-failed", [str(exc)])
 
+            # F1.7: require a real observed non-empty environment cloud.  A
+            # missing, empty, malformed, stale, wrong-frame, provider-exception,
+            # or serialization-failure cloud fails closed before goal send; no
+            # cloud is ever fabricated in live code.
+            try:
+                cloud = environment_cloud_provider()
+            except Exception as exc:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"environment_cloud_provider raised: {exc}",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                )
+            try:
+                env_cloud_evidence = self._env_cloud_evidence(cloud)
+            except Exception as exc:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"environment cloud invalid: {exc}",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                )
+
+            # F1.8/Md5: visual capture before the first D goal.
+            self._append_visual_request("before", scenario_id, spec)
             event_log.append("retreat-start")
-            self._journal_snapshot_d("retreat-start")
+            snap = self._journal_snapshot_d("retreat-start")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"retreat-start journal snapshot rejected: {snap}",
+                    journal_issues=[snap], plan_applicable=False,
+                    controller_goal_sent=False, controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                )
             from geometry_msgs.msg import Pose
 
             target_pose = Pose()
@@ -3898,27 +4789,67 @@ class IntegratedGateExecutor:
             target_pose.orientation.z = float(target["quaternion_xyzw"][2])
             target_pose.orientation.w = float(target["quaternion_xyzw"][3])
             try:
-                cartesian_goal = build_cartesian_move_goal(target_pose)
+                cartesian_goal = build_cartesian_move_goal(target_pose, env_points=cloud)
             except Exception as exc:
-                return self._evidence_invalid_d(scenario_id, "cartesian-goal-construction-failed", [str(exc)])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"cartesian goal construction failed: {exc}",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
 
             client = self._action_clients["/cartesian_move_action"]
             server_timeout_s = float(self._thresholds().get("action_server_wait_s", 5.0))
             if not self._wait_for_server(client, server_timeout_s):
-                return self._evidence_invalid_d(scenario_id, "cartesian-server-unavailable", [])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error="cartesian server unavailable before send",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
             accept_timeout_s = float(self._thresholds().get("goal_accept_timeout_s", 5.0))
             send_future = client.send_goal_async(cartesian_goal)
             accept_deadline = time.monotonic() + accept_timeout_s
             while not send_future.done() and time.monotonic() < accept_deadline:
                 self._spin_once()
             if not send_future.done():
-                return self._evidence_invalid_d(scenario_id, "cartesian-accept-timeout", [])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error="cartesian goal acceptance timed out",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
             try:
                 goal_handle = send_future.result()
             except Exception as exc:
-                return self._evidence_invalid_d(scenario_id, "cartesian-send-exception", [str(exc)])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"cartesian send future raised: {exc}",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
             if goal_handle is None or not getattr(goal_handle, "accepted", False):
-                return self._evidence_invalid_d(scenario_id, "cartesian-goal-rejected", [])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error="cartesian goal was rejected",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
             retreat_goal_id = self._normalize_goal_id(goal_handle)
             result_timeout_s = float(self._thresholds().get("execute_timeout_s", 120.0))
             result_future = goal_handle.get_result_async()
@@ -3926,91 +4857,143 @@ class IntegratedGateExecutor:
             while not result_future.done() and time.monotonic() < result_deadline:
                 self._spin_once()
             if not result_future.done():
-                return self._evidence_invalid_d(scenario_id, "cartesian-result-timeout", [])
+                # F1.5: an accepted goal must be cleaned up on timeout.
+                cleanup = self._cleanup_execute_goal(goal_handle, timeout_s=result_timeout_s)
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error="cartesian result timed out",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                    cleanup=cleanup,
+                )
             try:
                 result = result_future.result()
             except Exception as exc:
-                return self._evidence_invalid_d(scenario_id, "cartesian-result-exception", [str(exc)])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"cartesian result future raised: {exc}",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
             action_status = getattr(result, "status", None)
             try:
                 status_string = _execute_status_name(action_status)
             except ValueError:
                 status_string = None
             if action_status != EXECUTE_STATUS_SUCCEEDED:
-                return self._evidence_invalid_d(scenario_id, "cartesian-non-success", [])
-
-            event_log.append("retreat-terminal")
-            self._journal_snapshot_d("retreat-terminal")
-            event_log.append("teardown")
-            self._journal_snapshot_d("teardown")
-            self._write_retreat_goal_artifact(scenario_id, source, target, retreat_goal_id)
-            graph_status = self._d_journal_pass(scenario_id=scenario_id)
-            if graph_status != "validated":
-                return self._evidence_invalid_d(
-                    scenario_id, "d-journal-finalize-failed", [graph_status]
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"cartesian action did not succeed: {status_string} ({action_status})",
+                    plan_applicable=False, controller_goal_sent=False,
+                    controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
                 )
-            return {
-                "scenario_id": scenario_id,
-                "handler": "retreat",
-                "stage": "D",
-                "polarity": spec.get("polarity"),
-                "diagnostic_only": True,
-                "physical_verdict": None,
-                "status": "diagnostic-pass",
-                "planner_status": "diagnostic-pass",
-                "execute_trajectory_goal_sent": False,
-                "controller_goal_sent": False,
-                "isaac_joint_commands_published": False,
-                "endpoint": CARTESIAN_MOVE_ENDPOINT,
-                "target_frame": "base_link",
-                "distance_m": RETREAT_DISTANCE_M,
-                "axis": RETREAT_AXIS,
-                "retreat_goal_id": retreat_goal_id,
-                "source_pose": dict(source),
-                "target_pose": target,
-                "collision_checking": True,
-                "command_gateway_bypassed": False,
-                "graph": graph_status,
-                "event_log": event_log,
-                "elapsed_s": round(time.monotonic() - start_wall, 6),
-            }
+
+            self._append_visual_request("after", scenario_id, spec)
+            event_log.append("retreat-terminal")
+            snap = self._journal_snapshot_d("retreat-terminal")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"retreat-terminal journal snapshot rejected: {snap}",
+                    journal_issues=[snap], plan_applicable=False,
+                    controller_goal_sent=False, controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
+            event_log.append("teardown")
+            snap = self._journal_snapshot_d("teardown")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"teardown journal snapshot rejected: {snap}",
+                    journal_issues=[snap], plan_applicable=False,
+                    controller_goal_sent=False, controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                    env_cloud_evidence=env_cloud_evidence,
+                )
+            return self._finalize_d_attempt(
+                scenario_id, spec, None, None, "diagnostic-pass",
+                readiness, start_wall, event_log=event_log,
+                planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                plan_applicable=False,
+                controller_goal_sent=False,
+                controller_endpoint=CARTESIAN_MOVE_ENDPOINT,
+                env_cloud_evidence=env_cloud_evidence,
+                retreat_source=source,
+                retreat_target=target,
+                retreat_goal_id=retreat_goal_id,
+            )
         except Exception as exc:
             return self._evidence_invalid_d(scenario_id, "unexpected-exception", [str(exc)])
 
-    def _write_retreat_goal_artifact(
-        self,
-        scenario_id: str,
-        source: Mapping[str, object],
-        target: Mapping[str, object],
-        retreat_goal_id: object,
-    ) -> None:
+    def _env_cloud_evidence(self, cloud: object) -> dict[str, object]:
+        """F1.7: validate an observed PointCloud2 and return its evidence dict.
+
+        Requires a real non-empty finite ``base_link`` PointCloud2 whose
+        serialization succeeds.  Raises ``ValueError`` on missing/empty/
+        malformed/stale/wrong-frame/unsupported serialization.
+        """
+        if cloud is None:
+            raise ValueError("environment cloud provider returned None")
+        header = getattr(cloud, "header", None)
+        frame_id = getattr(header, "frame_id", None)
+        if frame_id != "base_link":
+            raise ValueError(f"environment cloud frame_id must be base_link, got {frame_id!r}")
+        width = getattr(cloud, "width", 0)
+        height = getattr(cloud, "height", 0)
         try:
-            goal_path = self.attempt_dir / "goals" / f"{scenario_id}.json"
-            goal_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(
-                {
-                    "schema_version": 1,
-                    "report_revision": REPORT_REVISION,
-                    "scenario_id": scenario_id,
-                    "handler": "retreat",
-                    "stage": "D",
-                    "diagnostic_only": True,
-                    "physical_verdict": None,
-                    "endpoint": CARTESIAN_MOVE_ENDPOINT,
-                    "axis": RETREAT_AXIS,
-                    "distance_m": RETREAT_DISTANCE_M,
-                    "target_frame": "base_link",
-                    "source_pose": dict(source),
-                    "target_pose": dict(target),
-                    "retreat_goal_id": retreat_goal_id,
-                    "collision_checking": True,
-                    "command_gateway_bypassed": False,
-                    "isaac_joint_commands_published": False,
-                },
-                goal_path,
-            )
-        except Exception:
-            pass
+            width = int(width)
+            height = int(height)
+        except (TypeError, ValueError):
+            raise ValueError("environment cloud width/height must be integers")
+        if width < 1 or height < 1:
+            raise ValueError(f"environment cloud must be non-empty (width={width}, height={height})")
+        data = getattr(cloud, "data", None)
+        if data is None:
+            raise ValueError("environment cloud data must be a non-empty byte payload")
+        if isinstance(data, (bytes, bytearray)):
+            data_bytes = bytes(data)
+        elif hasattr(data, "tobytes"):
+            data_bytes = bytes(data.tobytes())
+        else:
+            data_bytes = bytes(data)
+        if len(data_bytes) < 1:
+            raise ValueError("environment cloud data must be a non-empty byte payload")
+        point_step = getattr(cloud, "point_step", 0)
+        row_step = getattr(cloud, "row_step", 0)
+        try:
+            point_step = int(point_step)
+            row_step = int(row_step)
+        except (TypeError, ValueError):
+            raise ValueError("environment cloud point_step/row_step must be integers")
+        if point_step < 1 or row_step < 1:
+            raise ValueError("environment cloud point_step/row_step must be positive")
+        try:
+            serialized = self.ros["serialize_message"](cloud)
+        except Exception as exc:
+            raise ValueError(f"environment cloud serialization failed: {exc}")
+        return {
+            "digest": self._digest(serialized),
+            "source": "observed-environment-cloud",
+            "frame_id": frame_id,
+            "width": width,
+            "height": height,
+            "points": int(width * height),
+            "bytes": len(data_bytes),
+            "point_step": point_step,
+            "row_step": row_step,
+        }
 
     def run_gripper_sequence(
         self,
@@ -4025,9 +5008,12 @@ class IntegratedGateExecutor:
 
         Sends open then close (or the reversed order) ``GripperCommand`` goals
         sequentially to ``/xarm_gripper/gripper_action`` with separate bounded
-        acceptance/result deadlines; requires action success for each.
+        acceptance/result deadlines; requires action success for each.  Routes
+        through the fail-dominant D finalization so every attempt writes the
+        complete authoritative artifact set (F1.6/M2).
         """
         start_wall = time.monotonic()
+        fixture_ready_recorded = False
         event_log: list[str] = []
         try:
             try:
@@ -4063,6 +5049,7 @@ class IntegratedGateExecutor:
                 self.journal.record_diff("fixture-ready", scene)
             except (ValueError, TypeError) as exc:
                 return self._evidence_invalid_d(scenario_id, "journal-fixture-ready-rejected", [str(exc)])
+            fixture_ready_recorded = True
             event_log.append("fixture-ready")
 
             commands = (
@@ -4070,10 +5057,20 @@ class IntegratedGateExecutor:
                 if open_first
                 else [("close", gripper_close_position), ("open", gripper_open_position)]
             )
+            # F1.8/Md5: visual capture before the first D goal.
+            self._append_visual_request("before", scenario_id, spec)
             client = self._action_clients["/xarm_gripper/gripper_action"]
             server_timeout_s = float(self._thresholds().get("action_server_wait_s", 5.0))
             if not self._wait_for_server(client, server_timeout_s):
-                return self._evidence_invalid_d(scenario_id, "gripper-server-unavailable", [])
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error="gripper server unavailable before send",
+                    plan_applicable=False, controller_goal_sent=True,
+                    controller_endpoint=GRIPPER_ENDPOINT,
+                    gripper_command_records=[], native_action=True, open_first=open_first,
+                )
             accept_timeout_s = float(self._thresholds().get("goal_accept_timeout_s", 5.0))
             result_timeout_s = float(self._thresholds().get("execute_timeout_s", 120.0))
             command_records: list[dict[str, object]] = []
@@ -4082,19 +5079,55 @@ class IntegratedGateExecutor:
                 try:
                     gripper_goal = build_gripper_goal(position, max_effort=gripper_max_effort)
                 except Exception as exc:
-                    return self._evidence_invalid_d(scenario_id, "gripper-goal-construction-failed", [str(exc)])
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error=f"gripper goal construction failed: {exc}",
+                        plan_applicable=False, controller_goal_sent=True,
+                        controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first,
+                    )
                 send_future = client.send_goal_async(gripper_goal)
                 accept_deadline = time.monotonic() + accept_timeout_s
                 while not send_future.done() and time.monotonic() < accept_deadline:
                     self._spin_once()
                 if not send_future.done():
-                    return self._evidence_invalid_d(scenario_id, "gripper-accept-timeout", [])
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error="gripper goal acceptance timed out",
+                        plan_applicable=False, controller_goal_sent=True,
+                        controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first,
+                    )
                 try:
                     goal_handle = send_future.result()
                 except Exception as exc:
-                    return self._evidence_invalid_d(scenario_id, "gripper-send-exception", [str(exc)])
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error=f"gripper send future raised: {exc}",
+                        plan_applicable=False, controller_goal_sent=True,
+                        controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first,
+                    )
                 if goal_handle is None or not getattr(goal_handle, "accepted", False):
-                    return self._evidence_invalid_d(scenario_id, "gripper-goal-rejected", [])
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error="gripper goal was rejected",
+                        plan_applicable=False, controller_goal_sent=True,
+                        controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first,
+                    )
                 gripper_goal_id = self._normalize_goal_id(goal_handle)
                 goal_uuids.append(gripper_goal_id)
                 result_future = goal_handle.get_result_async()
@@ -4102,18 +5135,47 @@ class IntegratedGateExecutor:
                 while not result_future.done() and time.monotonic() < result_deadline:
                     self._spin_once()
                 if not result_future.done():
-                    return self._evidence_invalid_d(scenario_id, "gripper-result-timeout", [])
+                    # F1.5: an accepted goal must be cleaned up on timeout.
+                    cleanup = self._cleanup_execute_goal(goal_handle, timeout_s=result_timeout_s)
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error=f"gripper {name} result timed out",
+                        plan_applicable=False, controller_goal_sent=True,
+                        controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first, cleanup=cleanup,
+                    )
                 try:
                     result = result_future.result()
                 except Exception as exc:
-                    return self._evidence_invalid_d(scenario_id, "gripper-result-exception", [str(exc)])
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error=f"gripper result future raised: {exc}",
+                        plan_applicable=False, controller_goal_sent=True,
+                        controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first,
+                    )
                 action_status = getattr(result, "status", None)
                 try:
                     status_string = _execute_status_name(action_status)
                 except ValueError:
                     status_string = None
                 if action_status != EXECUTE_STATUS_SUCCEEDED:
-                    return self._evidence_invalid_d(scenario_id, "gripper-non-success", [])
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error=f"gripper {name} did not succeed: {status_string} ({action_status})",
+                        plan_applicable=False, controller_goal_sent=True,
+                        controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first,
+                    )
                 command_records.append(
                     {
                         "command": name,
@@ -4125,65 +5187,46 @@ class IntegratedGateExecutor:
                     }
                 )
                 event_log.append(f"gripper-{name}-terminal")
-                self._journal_snapshot_d(f"gripper-{name}-terminal")
+                snap = self._journal_snapshot_d(f"gripper-{name}-terminal")
+                if snap != "recorded":
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, None, None, "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_error=f"gripper-{name}-terminal journal snapshot rejected: {snap}",
+                        journal_issues=[snap], plan_applicable=False,
+                        controller_goal_sent=True, controller_endpoint=GRIPPER_ENDPOINT,
+                        gripper_command_records=command_records, native_action=True,
+                        open_first=open_first,
+                    )
 
+            self._append_visual_request("after", scenario_id, spec)
             event_log.append("teardown")
-            self._journal_snapshot_d("teardown")
-            self._write_gripper_artifact(scenario_id, command_records)
-            graph_status = self._d_journal_pass(scenario_id=scenario_id)
-            if graph_status != "validated":
-                return self._evidence_invalid_d(
-                    scenario_id, "d-journal-finalize-failed", [graph_status]
+            snap = self._journal_snapshot_d("teardown")
+            if snap != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"teardown journal snapshot rejected: {snap}",
+                    journal_issues=[snap], plan_applicable=False,
+                    controller_goal_sent=True, controller_endpoint=GRIPPER_ENDPOINT,
+                    gripper_command_records=command_records, native_action=True,
+                    open_first=open_first,
                 )
-            return {
-                "scenario_id": scenario_id,
-                "handler": "gripper",
-                "stage": "D",
-                "polarity": spec.get("polarity"),
-                "diagnostic_only": True,
-                "physical_verdict": None,
-                "status": "diagnostic-pass",
-                "planner_status": "diagnostic-pass",
-                "execute_trajectory_goal_sent": False,
-                "controller_goal_sent": True,
-                "isaac_joint_commands_published": False,
-                "endpoint": GRIPPER_ENDPOINT,
-                "commands": [record["command"] for record in command_records],
-                "command_records": command_records,
-                "goal_uuids": goal_uuids,
-                "native_action": True,
-                "open_first": open_first,
-                "graph": graph_status,
-                "event_log": event_log,
-                "elapsed_s": round(time.monotonic() - start_wall, 6),
-            }
+            return self._finalize_d_attempt(
+                scenario_id, spec, None, None, "diagnostic-pass",
+                readiness, start_wall, event_log=event_log,
+                planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
+                plan_applicable=False,
+                controller_goal_sent=True,
+                controller_endpoint=GRIPPER_ENDPOINT,
+                gripper_command_records=command_records,
+                native_action=True,
+                open_first=open_first,
+            )
         except Exception as exc:
             return self._evidence_invalid_d(scenario_id, "unexpected-exception", [str(exc)])
-
-    def _write_gripper_artifact(
-        self, scenario_id: str, command_records: Sequence[Mapping[str, object]]
-    ) -> None:
-        try:
-            goal_path = self.attempt_dir / "goals" / f"{scenario_id}.json"
-            goal_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(
-                {
-                    "schema_version": 1,
-                    "report_revision": REPORT_REVISION,
-                    "scenario_id": scenario_id,
-                    "handler": "gripper",
-                    "stage": "D",
-                    "diagnostic_only": True,
-                    "physical_verdict": None,
-                    "endpoint": GRIPPER_ENDPOINT,
-                    "commands": command_records,
-                    "native_action": True,
-                    "isaac_joint_commands_published": False,
-                },
-                goal_path,
-            )
-        except Exception:
-            pass
 
     def run_pick_place_negative(self, scenario_id: str) -> dict[str, object]:
         """Fail-closed Gate-E negative stub (zero ROS goals sent).
@@ -4198,7 +5241,7 @@ class IntegratedGateExecutor:
         self,
         scenario_id: str,
         spec: Mapping[str, object],
-        plan_outcome: Mapping[str, object],
+        plan_outcome: Mapping[str, object] | None,
         planner_status: object,
         final_status: str,
         readiness: Mapping[str, object],
@@ -4214,6 +5257,19 @@ class IntegratedGateExecutor:
         goals_canceling: Sequence[object] | None = None,
         terminal_status: str | None = None,
         trajectory_digest: str | None = None,
+        plan_applicable: bool = True,
+        controller_goal_sent: bool | None = None,
+        controller_endpoint: str | None = None,
+        cleanup: object = None,
+        journal_issues: Sequence[str] | None = None,
+        env_cloud_evidence: Mapping[str, object] | None = None,
+        retreat_source: object = None,
+        retreat_target: object = None,
+        retreat_goal_id: object = None,
+        gripper_command_records: Sequence[Mapping[str, object]] | None = None,
+        native_action: bool = False,
+        open_first: bool = True,
+        cancel_response: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Fail-dominant D attempt finalization and artifact write.
 
@@ -4279,6 +5335,18 @@ class IntegratedGateExecutor:
         else:
             result_status = None
             result_status_string = None
+        # F1.6: truthful controller/execute traffic flags.  The ExecuteTrajectory
+        # goal is sent only by the split-path execute handler once a valid goal
+        # was accepted; cancel/safety observe a mid-flight execute transaction
+        # (already accepted elsewhere) and never send one.  ``execute_goal_id``
+        # existing in the execute outcome is the truthful sent marker.  The
+        # controller goal is the FJT controller for split-path transactions, the
+        # native gripper controller for gripper, and absent for retreat.
+        execute_trajectory_goal_sent = bool(
+            execute_outcome.get("execute_goal_id") if isinstance(execute_outcome, Mapping) else False
+        )
+        if controller_goal_sent is None:
+            controller_goal_sent = bool(execute_trajectory_goal_sent or goals_canceling)
         record: dict[str, object] = {
             "scenario_id": scenario_id,
             "handler": spec.get("kind"),
@@ -4288,21 +5356,14 @@ class IntegratedGateExecutor:
             "physical_verdict": None,
             "status": final_status,
             "planner_status": planner_status,
-            # The execute goal is sent only by the split-path execute handler
-            # (once a valid ExecuteTrajectory goal was accepted).  Cancel and
-            # safety handlers observe a mid-flight transaction and never send an
-            # execute goal, and an execute attempt that fails before the goal
-            # accept (plan fail / empty plan / construction / digest mismatch /
-            # server-unavailable) never sent it either.  ``execute_goal_id``
-            # existing in the execute outcome is the truthful sent marker.
-            "execute_trajectory_goal_sent": bool(
-                execute_outcome.get("execute_goal_id") if isinstance(execute_outcome, Mapping) else False
-            ),
-            "controller_goal_sent": False,
+            "plan_applicable": bool(plan_applicable),
+            "execute_trajectory_goal_sent": execute_trajectory_goal_sent,
+            "controller_goal_sent": bool(controller_goal_sent),
+            "controller_endpoint": controller_endpoint,
             "planning_goal_id": planning_goal_id,
             "execute_goal_id": execute_goal_id,
             "goals_canceling": list(goals_canceling) if goals_canceling is not None else [],
-            "planned_trajectory_digest": plan_outcome.get("trajectory_digest"),
+            "planned_trajectory_digest": plan_outcome.get("trajectory_digest") if isinstance(plan_outcome, Mapping) else None,
             "executed_trajectory_digest": executed_digest,
             "fjt_goal_digest": trajectory_digest,
             "fjt_goal_uuid": fjt_evidence.get("goal_uuid") if isinstance(fjt_evidence, Mapping) else None,
@@ -4316,6 +5377,37 @@ class IntegratedGateExecutor:
             "graph": graph_status,
             "isaac_joint_commands_published": False,
         }
+        if cleanup is not None:
+            record["cleanup"] = dict(cleanup)
+        if cancel_response is not None:
+            record["cancel_response"] = cancel_response.get("response")
+            record["cancel_return_code"] = cancel_response.get("return_code")
+            record["cancel_goals_canceling"] = list(cancel_response.get("goals_canceling") or [])
+            if cancel_response.get("error"):
+                record["cancel_error"] = cancel_response.get("error")
+        if journal_issues:
+            record["journal_issues"] = list(journal_issues)
+        if env_cloud_evidence is not None:
+            record["env_cloud_evidence"] = dict(env_cloud_evidence)
+        if retreat_source is not None:
+            record["source_pose"] = dict(retreat_source)
+        if retreat_target is not None:
+            record["target_pose"] = dict(retreat_target)
+        if retreat_goal_id is not None:
+            record["retreat_goal_id"] = retreat_goal_id
+            record["endpoint"] = CARTESIAN_MOVE_ENDPOINT
+            record["distance_m"] = RETREAT_DISTANCE_M
+            record["axis"] = RETREAT_AXIS
+            record["collision_checking"] = bool(env_cloud_evidence)
+            record["command_gateway_bypassed"] = False
+        if gripper_command_records is not None:
+            record["commands"] = [item["command"] for item in gripper_command_records]
+            record["command_records"] = list(gripper_command_records)
+            record["goal_uuids"] = [item.get("goal_id") for item in gripper_command_records]
+            record["native_action"] = native_action
+            record["open_first"] = open_first
+            record["endpoint"] = GRIPPER_ENDPOINT
+            record["command_gateway_bypassed"] = False
         if execute_error is not None:
             record["execute_error"] = execute_error
         try:
@@ -4334,7 +5426,15 @@ class IntegratedGateExecutor:
         record: Mapping[str, object],
         readiness: Mapping[str, object],
     ) -> None:
-        """Write the D-stage artifact rows (separate shape; Gate-C bytes unchanged)."""
+        """Write the D-stage artifact rows (separate shape; Gate-C bytes unchanged).
+
+        F1.6: every D handler writes the complete authoritative set —
+        ``integrated-execution.jsonl/.json``, ``moveit-plans.jsonl`` (with an
+        explicit ``plan_applicable`` flag that is false for the non-MoveIt
+        retreat/gripper handlers), ``controller-results.jsonl``, plus the
+        scenario-specific ``goals/<scenario_id>.json`` goal artifact.  A failure
+        in any required write propagates into the fail-dominant downgrade.
+        """
         self._append_jsonl(
             self.attempt_dir / "integrated-execution.jsonl",
             {
@@ -4348,6 +5448,9 @@ class IntegratedGateExecutor:
                 "status": record.get("status"),
                 "reason_code": record.get("reason_code"),
                 "planner_status": record.get("planner_status"),
+                "plan_applicable": record.get("plan_applicable"),
+                "controller_endpoint": record.get("controller_endpoint"),
+                "terminal_status": record.get("terminal_status"),
                 "row_kind": "lifecycle",
                 "diagnostic_only": True,
                 "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
@@ -4365,6 +5468,7 @@ class IntegratedGateExecutor:
                 "goal_kind": spec.get("kind"),
                 "status": record.get("status"),
                 "planner_status": record.get("planner_status"),
+                "plan_applicable": record.get("plan_applicable"),
                 "row_kind": "lifecycle",
                 "planning_goal_id": record.get("planning_goal_id"),
                 "execute_goal_id": record.get("execute_goal_id"),
@@ -4380,12 +5484,14 @@ class IntegratedGateExecutor:
                 "report_revision": REPORT_REVISION,
                 "scenario_id": scenario_id,
                 "controller_goal_sent": record.get("controller_goal_sent"),
+                "controller_endpoint": record.get("controller_endpoint"),
                 "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
                 "execute_result_status": record.get("execute_result_status"),
                 "execute_result_status_string": record.get("execute_result_status_string"),
                 "fjt_goal_uuid": record.get("fjt_goal_uuid"),
                 "fjt_status": record.get("fjt_status"),
                 "fjt_goal_digest": record.get("fjt_goal_digest"),
+                "terminal_status": record.get("terminal_status"),
                 "diagnostic_only": True,
             },
         )
@@ -4403,11 +5509,16 @@ class IntegratedGateExecutor:
                 "status": record.get("status"),
                 "reason_code": record.get("reason_code"),
                 "planner_status": record.get("planner_status"),
+                "plan_applicable": record.get("plan_applicable"),
                 "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
                 "controller_goal_sent": record.get("controller_goal_sent"),
+                "controller_endpoint": record.get("controller_endpoint"),
                 "planning_goal_id": record.get("planning_goal_id"),
                 "execute_goal_id": record.get("execute_goal_id"),
                 "goals_canceling": record.get("goals_canceling"),
+                "cancel_response": record.get("cancel_response"),
+                "cancel_return_code": record.get("cancel_return_code"),
+                "cancel_goals_canceling": record.get("cancel_goals_canceling"),
                 "planned_trajectory_digest": record.get("planned_trajectory_digest"),
                 "executed_trajectory_digest": record.get("executed_trajectory_digest"),
                 "fjt_goal_digest": record.get("fjt_goal_digest"),
@@ -4416,11 +5527,62 @@ class IntegratedGateExecutor:
                 "execute_result_status": record.get("execute_result_status"),
                 "execute_result_status_string": record.get("execute_result_status_string"),
                 "terminal_status": record.get("terminal_status"),
+                "cleanup": record.get("cleanup"),
+                "journal_issues": record.get("journal_issues"),
+                "env_cloud_evidence": record.get("env_cloud_evidence"),
                 "event_log": record.get("event_log"),
                 "elapsed_s": record.get("elapsed_s"),
                 "isaac_joint_commands_published": False,
             },
         )
+        # F1.6: scenario-specific goal artifact for retreat/gripper (the only D
+        # handlers that send a goal without a MoveIt plan).
+        retreat_goal_id = record.get("retreat_goal_id")
+        if retreat_goal_id is not None:
+            goal_path = self.attempt_dir / "goals" / f"{scenario_id}.json"
+            goal_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "handler": "retreat",
+                    "stage": "D",
+                    "diagnostic_only": True,
+                    "physical_verdict": None,
+                    "endpoint": CARTESIAN_MOVE_ENDPOINT,
+                    "axis": RETREAT_AXIS,
+                    "distance_m": RETREAT_DISTANCE_M,
+                    "target_frame": "base_link",
+                    "source_pose": dict(record.get("source_pose") or {}),
+                    "target_pose": dict(record.get("target_pose") or {}),
+                    "retreat_goal_id": retreat_goal_id,
+                    "collision_checking": bool(record.get("env_cloud_evidence")),
+                    "command_gateway_bypassed": False,
+                    "isaac_joint_commands_published": False,
+                },
+                goal_path,
+            )
+        if record.get("command_records") is not None:
+            goal_path = self.attempt_dir / "goals" / f"{scenario_id}.json"
+            goal_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "handler": "gripper",
+                    "stage": "D",
+                    "diagnostic_only": True,
+                    "physical_verdict": None,
+                    "endpoint": GRIPPER_ENDPOINT,
+                    "commands": record.get("command_records"),
+                    "native_action": bool(record.get("native_action")),
+                    "open_first": bool(record.get("open_first")),
+                    "isaac_joint_commands_published": False,
+                },
+                goal_path,
+            )
 
     def _write_d_fail_dominant_execution_json(
         self,
@@ -4962,23 +6124,77 @@ class IntegratedGateExecutor:
 
     # -- teardown ------------------------------------------------------------
 
+    def _destroy_owned_action_clients(self) -> None:
+        """F1.1: destroy every real owned ActionClient exactly once.
+
+        Humble ``Node.destroy_node()`` does not destroy action waitables; only
+        ``ActionClient.destroy()`` removes them from the node waitable set.  The
+        private ``_owned_action_clients`` collection keeps the real clients
+        apart from the mutable ``_action_clients`` map tests may replace with
+        fakes.  Any additional real owned client still present in the current
+        map is destroyed once; test doubles lacking ``destroy`` are skipped.
+        """
+        owned = getattr(self, "_owned_action_clients", None) or []
+        current = getattr(self, "_action_clients", None)
+        destroyable: list[Any] = []
+        for client in owned:
+            if client is not None and all(client is not seen for seen in destroyable):
+                destroyable.append(client)
+        if isinstance(current, dict):
+            for client in current.values():
+                if client is None:
+                    continue
+                if all(client is not seen for seen in destroyable):
+                    destroyable.append(client)
+        for client in destroyable:
+            destroy = getattr(client, "destroy", None)
+            if not callable(destroy):
+                continue
+            try:
+                destroy()
+            except Exception:
+                pass
+        if owned:
+            self._owned_action_clients = []
+        if isinstance(current, dict):
+            self._action_clients = {}
+
     def shutdown(self) -> None:
-        """Idempotently destroy the node and shut down the executor-owned context."""
+        """Idempotently destroy the node and shut down the executor-owned context.
+
+        Order (F1.1): destroy every owned ActionClient (removing its waitable
+        and C handle) before destroying the node and shutting down the private
+        context; then clear lifecycle members so GC cannot double-finalize a
+        destroyed context.  Repeated shutdown and construct→shutdown→construct
+        remain supported.
+        """
         if not self._context_initialized:
             return
-        try:
-            self._spinner.shutdown()
-        except Exception:
-            pass
-        try:
-            self.node.destroy_node()
-        except Exception:
-            pass
-        try:
-            self.ros["rclpy"].shutdown(context=self.context)
-        except Exception:
-            pass
+        self._destroy_owned_action_clients()
+        spinner = getattr(self, "_spinner", None)
+        if spinner is not None:
+            try:
+                spinner.shutdown()
+            except Exception:
+                pass
+        node = getattr(self, "node", None)
+        if node is not None:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+        context = getattr(self, "context", None)
+        if context is not None:
+            try:
+                self.ros["rclpy"].shutdown(context=context)
+            except Exception:
+                pass
         self._context_initialized = False
+        self.node = None
+        self.context = None
+        self._spinner = None
+        self.operator_publisher = None
+        self._service_clients = {}
 
 
 def _service_type_to_ros(service_type: str, ros: Mapping[str, Any]) -> Any:
@@ -5018,6 +6234,7 @@ __all__ = [
     "EARLIER_OPERATION_OPTIONAL_FIELDS",
     "EXECUTE_STATUS_ABORTED",
     "EXECUTE_STATUS_CANCELED",
+    "EXECUTE_STATUS_EXECUTING",
     "EXECUTE_STATUS_SUCCEEDED",
     "EXECUTE_TRAJECTORY_ENDPOINT",
     "FINAL_SIMULATION_STATE",
