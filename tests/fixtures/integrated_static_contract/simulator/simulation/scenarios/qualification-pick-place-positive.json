@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "id": "qualification-pick-place-positive",
+  "qualification_gate": "pick-place-positive",
+  "seed": 7,
+  "planning_scene": {
+    "revision": "2026-08-02-pick-place-positive",
+    "frame_id": "base_link",
+    "target_source_id": "sim_fixture/qualification_cube",
+    "target_handoff": "pick_and_place/object_mesh",
+    "owned_ids": [
+      "sim_fixture/pedestal",
+      "sim_fixture/qualification_cube",
+      "sim_fixture/place_pedestal"
+    ],
+    "objects": [],
+    "revision_digest": "4e3a7ff2d5cc9deda9c96a8b6f1b0f9cbc1fe7f1751db821decdf303e2fc2477"
+  },
+  "integrated": {
+    "execution_profile": "sim_ompl",
+    "stage": "E"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "id": "qualification-moveit-plan-joint",
+  "qualification_gate": "moveit-plan-joint",
+  "seed": 7,
+  "planning_scene": {
+    "revision": "2026-08-02-moveit-plan-joint",
+    "frame_id": "base_link",
+    "target_source_id": "sim_fixture/public_target",
+    "target_handoff": "pick_and_place/object_mesh",
+    "owned_ids": [
+      "sim_fixture/pedestal",
+      "sim_fixture/public_target"
+    ],
+    "objects": [],
+    "revision_digest": "649c792cd0b119de2651a1d27d51cd169567657496371968eba35d70ef68057a"
+  },
+  "integrated": {
+    "execution_profile": "sim_ompl",
+    "stage": "C"
+  }
+}

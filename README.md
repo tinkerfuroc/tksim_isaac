@@ -314,6 +314,22 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 2): Added the offline Gate B
+  static-contract closure.  `validation/source_lock_manifest.py` observes the
+  three immutable source-lock authorizations
+  (`simulator_overlay` / `production` / `qualification_tooling`) with
+  non-self-referential Git-history resolution, exact `LC_ALL=C` raw
+  status/diff/index/untracked evidence, a canonical path-sorted untracked
+  manifest, an atomic fsync+`os.replace` output manifest, and attempt
+  freshness.  `validation/integrated_static_contracts.py` runs the nine
+  semantic static checks (model, controllers, providers, fixture ownership,
+  action lifecycle, scene/collision safety, source identities, transport
+  contract) against the produced three-entry manifest.
+  `simulation/qualification/integrated-ompl.json` now names exactly the three
+  `source_lock_policies`.  The real qualification-tooling policy is
+  intentionally absent during Task 2, so a real-root Gate B capture honestly
+  returns `evidence-invalid` until the post-Task-10 lock-only phase; no
+  existing source-lock policy was created or modified.
 - 2026-08-02 (fix round 2): Separated static and runtime OMPL acceptance
   evidence.  The 16-check preflight is now self-contained: the real unmodified
   `preflight_manifest` runs against a reconstructed Task 3-compatible project
