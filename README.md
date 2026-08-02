@@ -314,6 +314,35 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 4): Added the ROS-lazy Gate-C OMPL
+  plan-only executor.  `validation/integrated_gate_executor.py` is importable
+  under the simulator CPython 3.12 venv without `rclpy` or any generated ROS
+  message; it exposes the exact graph/endpoint/QoS contract, the real
+  multi-operation canonical public report validation
+  (`expected_physics_ready_report` / `validate_physics_ready_snapshot` built
+  through `tinker_sim_bridge.integrated_readiness.build_canonical_report` with
+  the one-key public `{"execution_profile": "sim_ompl"}` mapping and
+  scenario-declaration-bound fixture descriptor digest), the readiness
+  evaluator (`evaluate_executor_readiness`) over the genuine positive-ready
+  baseline, the Task 3 journal graph projection
+  (`build_journal_graph_projection` matching `planning_scene_journal.validate_graph_evidence`),
+  ROS-lazy MoveGroup/Pick/Place/PointCloud2 builders, and the live
+  `IntegratedGateExecutor` node `/tinker_integrated_gate_executor` that sends
+  only plan-only `/move_action` goals (`group_name="xarm7"`, `pipeline_id="ompl"`,
+  `num_planning_attempts=3`, `allowed_planning_time=3.0`,
+  `planning_options.plan_only=True`, `replan=False`), never calls
+  `/execute_trajectory` in Gate C, and never publishes `/isaac_joint_commands`.
+  `validation/manipulation_qualification.py` gains only additive helper
+  exposure (`QualificationProcessHelpers` plus module-level
+  `qualification_ros_tooling_environment` / `qualification_write_json_atomic` /
+  `qualification_new_suite_dir` / `qualification_source_inventory`) with the
+  six-gate `run()` behavior, artifact schema, and command ordering unchanged.
+  `tests/qualification_test_helpers.py` additively returns the complete
+  seven-key `report_identities` and full `planning_scene_declaration`.
+  New suites: `tests/test_integrated_gate_executor.py` (pure, 55 tests) and
+  `tests/test_integrated_gate_executor_ros.py` (Humble generated-message, 13
+  tests).  No build is required because no package-installed path changed.
+
 - 2026-08-02 (integrated qualification Task 3 fix round 1): Bound the
   PlanningScene evidence semantics against the adversarial review findings.
   `validation/planning_scene_journal.py` now makes the public path fail closed:

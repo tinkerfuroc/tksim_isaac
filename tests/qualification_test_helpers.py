@@ -29,6 +29,7 @@ from tinker_sim_bridge.integrated_readiness import (  # noqa: E402
     build_canonical_report,
     planning_scene_mapping,
     public_integrated_mapping,
+    report_identities,
     sha256_json,
 )
 
@@ -44,7 +45,11 @@ def load_test_scenario(scenario_name: str) -> dict[str, Any]:
       ``planning_scene``: the four-key public report planning-scene mapping
       ``planning_scene_declaration``: the full planning-scene declaration
       ``integrated``: the full per-scenario integrated mapping
-      ``report_identities``: ``{scenario_id, seed}`` identity inputs
+      ``report_identities``: the complete seven-key identity mapping produced by
+        ``tinker_sim_bridge.integrated_readiness.report_identities`` over the
+        full planning-scene declaration and the public one-key integrated
+        mapping (so ``integrated_sha256`` is the digest of
+        ``{"execution_profile": "sim_ompl"}``, never the full scenario mapping)
     """
     if not scenario_name or "/" in scenario_name or scenario_name in {".", ".."}:
         raise ValueError(f"unsafe scenario name: {scenario_name!r}")
@@ -70,12 +75,21 @@ def load_test_scenario(scenario_name: str) -> dict[str, Any]:
     integrated = raw.get("integrated")
     if not isinstance(integrated, dict):
         raise ValueError(f"{path}: scenario has no integrated object")
+    identities = report_identities(
+        scenario_id=scenario_name,
+        seed=seed,
+        declaration=declaration,
+        planning_scene=planning_scene_declaration,
+        integrated=public_integrated_mapping(),
+        model_fingerprint=MODEL_FINGERPRINT,
+        provider_manifest_sha256=PROVIDER_MANIFEST_SHA256,
+    )
     return {
         "scenario": scenario_mapping,
         "planning_scene": planning_scene,
         "planning_scene_declaration": planning_scene_declaration,
         "integrated": integrated,
-        "report_identities": {"scenario_id": scenario_name, "seed": seed},
+        "report_identities": dict(identities),
     }
 
 

@@ -3090,6 +3090,143 @@ class QualificationRunner:
         return QualificationResult(manifest.attempt_dir, status, gate_results, exit_codes)
 
 
+class QualificationProcessHelpers:
+    """Task 4 additive thin wrapper around the six-gate runner's process,
+    recorder, and provenance mechanics.
+
+    This is a purely additive exposure for the integrated gate executor and
+    later tasks.  It reuses the existing ``QualificationRunner._start`` /
+    ``_stop`` / ``_env`` / ``_popen`` / ``_snapshot_graph`` / ``_capture``,
+    the module's atomic JSON writer, and the source-inventory/provenance
+    methods without duplicating process ownership or cleanup logic.  The
+    six-gate ``run()`` behavior, artifact schema, and command ordering are
+    unchanged.
+    """
+
+    def __init__(self, runner: QualificationRunner) -> None:
+        if not isinstance(runner, QualificationRunner):
+            raise TypeError("QualificationProcessHelpers requires a QualificationRunner")
+        self.runner = runner
+
+    # -- process ownership ------------------------------------------------
+
+    def start(self, name: str, command: Sequence[str], manifest: QualificationManifest) -> None:
+        """Start a managed process under the runner's ownership/cleanup scope."""
+        self.runner._start(name, command, manifest)
+
+    def stop(self, name: str) -> int | None:
+        """Stop a managed process using the runner's graceful-then-forced teardown."""
+        return self.runner._stop(name)
+
+    @property
+    def popen(self) -> Callable[..., Any]:
+        """The injectable ``subprocess.Popen`` used by the runner."""
+        return self.runner._popen
+
+    @property
+    def command_runner(self) -> Callable[..., Any]:
+        """The injectable ``subprocess.run`` used by the runner."""
+        return self.runner._command_runner
+
+    def env(self, manifest: QualificationManifest, role: str = "humble") -> dict[str, str]:
+        """Build the per-role process environment exactly as the runner does."""
+        return self.runner._env(manifest, role)
+
+    def capture(
+        self, name: str, command: Sequence[str], directory: Path, manifest: QualificationManifest
+    ) -> dict[str, Any]:
+        """Run a ROS observation subprocess and retain the complete result."""
+        return self.runner._capture(name, command, directory, manifest)
+
+    def observe(
+        self, command: Sequence[str], manifest: QualificationManifest, *, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        """Run a ROS observation and return the complete subprocess result."""
+        return self.runner._observe(command, manifest, timeout=timeout)
+
+    def snapshot_graph(self, manifest: QualificationManifest, suffix: str) -> None:
+        """Capture the graph-nodes/topics/command-ownership evidence files."""
+        self.runner._snapshot_graph(manifest, suffix)
+
+    # -- attempt/provenance mechanics --------------------------------------
+
+    def new_attempt_dir(self) -> tuple[str, Path]:
+        """Allocate a fresh attempt directory using the runner's unique naming."""
+        return self.runner._new_attempt_dir()
+
+    def source_inventory(self) -> dict[str, Any]:
+        """Return the runner's complete source/provenance inventory."""
+        return self.runner._source_inventory()
+
+    def write_json_atomic(self, path: Path, value: Mapping[str, Any]) -> None:
+        """Atomically write a JSON mapping via the module's canonical writer."""
+        _write_json_atomic(path, value)
+
+    def ros_tooling_environment(
+        self,
+        *,
+        root: Path = ROOT,
+        dds_profile: str | None = None,
+        domain_id: str | None = None,
+        rmw_implementation: str | None = None,
+    ) -> dict[str, str]:
+        """Return inherited ROS tooling state with the wrapper's DDS policy."""
+        return _ros_tooling_environment(
+            root=root,
+            dds_profile=dds_profile,
+            domain_id=domain_id,
+            rmw_implementation=rmw_implementation,
+        )
+
+
+def qualification_ros_tooling_environment(
+    *,
+    root: Path = ROOT,
+    dds_profile: str | None = None,
+    domain_id: str | None = None,
+    rmw_implementation: str | None = None,
+) -> dict[str, str]:
+    """Task 4 additive: expose the runner's ROS-tooling environment builder."""
+    return _ros_tooling_environment(
+        root=root,
+        dds_profile=dds_profile,
+        domain_id=domain_id,
+        rmw_implementation=rmw_implementation,
+    )
+
+
+def qualification_write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
+    """Task 4 additive: expose the module's atomic JSON writer."""
+    _write_json_atomic(path, value)
+
+
+def qualification_new_suite_dir(attempt_root: Path) -> tuple[str, Path]:
+    """Task 4 additive: expose the suite-directory allocator."""
+    return _new_suite_dir(attempt_root)
+
+
+def qualification_source_inventory(
+    *,
+    root: Path = ROOT,
+    config_path: Path | None = None,
+    scenario_path: Path | None = None,
+) -> dict[str, Any]:
+    """Task 4 additive: source/provenance inventory for an integrated attempt.
+
+    Builds a minimal ``QualificationRunner`` scoped to the caller's config and
+    scenario paths and returns its ``_source_inventory()`` without starting any
+    process.  The returned schema is identical to the six-gate manifest
+    ``sources`` section.
+    """
+    runner = QualificationRunner(
+        root=root,
+        config_path=config_path,
+        scenario_path=scenario_path,
+        gate="all",
+    )
+    return runner._source_inventory()
+
+
 def _new_suite_dir(attempt_root: Path) -> tuple[str, Path]:
     attempt_root.mkdir(parents=True, exist_ok=True)
     for _ in range(20):
