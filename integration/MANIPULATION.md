@@ -363,6 +363,34 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 4): Added the ROS-lazy Gate-C OMPL
+  plan-only executor `validation/integrated_gate_executor.py`.  The module
+  imports cleanly under the simulator CPython 3.12 venv (all `rclpy` /
+  generated-message imports are confined to `_load_ros()` and the ROS-only
+  goal-builder call paths).  It carries the exact action/service/topic graph
+  contract (types, cardinality, real provider nodes, QoS; `/joint_states`
+  reliable/volatile/depth 10, fixture/operator/safety reliable/transient-local/
+  depth 1, `/isaac_joint_commands` observation depth 50), the real
+  multi-operation canonical public report validation over the one-key
+  `{"execution_profile": "sim_ompl"}` integrated mapping with
+  scenario-declaration-bound fixture descriptor digest, the readiness
+  evaluator over the genuine positive-ready baseline, the Task 3 journal graph
+  projection matching `planning_scene_journal.validate_graph_evidence`, and the
+  live `/tinker_integrated_gate_executor` node whose Gate C flow sends only
+  plan-only `/move_action` goals (`group_name="xarm7"`, `pipeline_id="ompl"`,
+  `num_planning_attempts=3`, `allowed_planning_time=3.0`,
+  `planning_options.plan_only=True`, `replan=False`), never calls
+  `/execute_trajectory`, and never publishes `/isaac_joint_commands`; plan-only
+  evidence stays `diagnostic_only=true`.  `validation/manipulation_qualification.py`
+  only exposes additive process/recorder/provenance helpers
+  (`QualificationProcessHelpers` and module-level `qualification_*` wrappers)
+  around its existing mechanics; the six-gate `run()` behavior is unchanged.
+  `tests/qualification_test_helpers.py` additively returns the complete
+  seven-key `report_identities` and the full `planning_scene_declaration`.
+  New `tests/test_integrated_gate_executor.py` (pure, 55 tests) and
+  `tests/test_integrated_gate_executor_ros.py` (Humble generated-message, 13
+  tests).  No package-installed path changed, so no build is required.
+
 - 2026-08-02 (integrated qualification Task 3 fix round 1): Bound PlanningScene
   evidence semantics.  `validation/planning_scene_journal.py` closes the
   public-path false passes: `record_diff` now requires a genuine world-to-
