@@ -129,8 +129,9 @@ PYTHONPATH="$PWD/ros2_ws/src/tinker_sim_bridge:$PWD/simulation" \
 ```
 
 The focused Task 8 provenance suite (deterministic OMPL-overlay acceptance
-contract) is invoked with the ROS `launch_pytest` plugin autoload disabled so
-pytest collection does not fail on the unavailable `lark` dependency:
+contract) uses `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` as the defensive reproducible
+invocation (ROS plugin discovery may auto-load the Humble `launch_pytest`
+plugin, which can fail collection on hosts without the `lark` dependency):
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv/bin/python -m pytest -q \
@@ -562,11 +563,26 @@ contract in the committed `integration/ompl-overlay-contract.json` from the
 real source and artifacts.  It fails on mutations: stale `setup.py`/`package.xml`
 registrations, missing data files, provider-manifest drift, wrong model/current
 artifact, wrong endpoint/type/source/cardinality/QoS, wrong fixture/order/
-handoff, wrong compatibility booleans, raw-colcon text, dirty-policy
-violations, and source-lock files being prematurely included.  The pre-existing
-uv environment provenance failure (installed `uv 0.12.0` vs pinned `uv 0.10.8`)
-is unchanged and is not masked: it is an environment failure, not a code
-failure.
+handoff, wrong compatibility booleans, Task 7 action-client scope, task-range
+boundary/commits, fixture status publication, artifact path policy, top-level
+stable hashes, raw-colcon text, dirty-policy violations, and source-lock files
+being prematurely included.
+
+The static acceptance evidence is clean-checkout reproducible with no
+gitignored `outputs/`/`artifacts/` dependency: the 16-check preflight runs the
+real unmodified `preflight_manifest` against a self-contained reconstructed
+Task 3-compatible project root (committed source + pinned git objects + a
+legacy `current.json` selecting the reproduced canonical URDF), requiring
+`ready=true`, all 16 checks including `artifact_identity`, and the stable
+preflight hash.  The real `artifacts/robot/tinker2/current.json` is a separate
+provisioned-host runtime-readiness diagnostic (stale selection fails; absent
+selection is reported `not_provisioned`).  A temporary copy-install/wheel test
+proves the symlinked acceptance contract and scenarios install as real
+byte-identical files, and a clean-checkout regression seam (`git clone` of the
+tracked tree) requires every static test to pass with no gitignored trees.  The
+pre-existing uv environment provenance failure (installed `uv 0.12.0` vs pinned
+`uv 0.10.8`) is unchanged and is not masked: it is an environment failure, not a
+code failure.
 
 As part of this task the package metadata is completed:
 

@@ -78,14 +78,33 @@ or authorize cuMotion; live qualification remains a separate gate.
   `launch_contract_helpers.py`, while
   `production_overlay.simulator_overlay_provider_set` derives the simulator
   overlay provider packages/executables from the committed provider manifest.
-- The model-bundle acceptance evidence is reproducible on a clean checkout: the
-  canonical simulator full URDF's source and provenance descriptor are
-  committed (`integration/model-bundle-r2/simulator_full_urdf/`), and
-  `model_bundle.stable_manifest_sha256` / `preflight_report.stable_sha256` hash
-  deterministic projections that exclude host-absolute paths and `elapsed_ms`.
+- The static acceptance evidence is reproducible on a clean tracked-only
+  checkout with no gitignored `outputs/`/`artifacts/` dependency:
+  - the canonical simulator full URDF's source and provenance descriptor are
+    committed (`integration/model-bundle-r2/simulator_full_urdf/`), and the
+    v1 canonicalizer is loaded from the pinned git object;
+  - the model bundle, synthesized joint limits, and production artifacts are
+    reconstructed from committed/pinned inputs, and
+    `model_bundle.stable_manifest_sha256` /
+    `model_bundle.preflight_report.stable_sha256` hash deterministic
+    projections that exclude host-absolute paths and `elapsed_ms`;
+  - the 16-check preflight runs the real unmodified `preflight_manifest`
+    against a self-contained reconstructed Task 3-compatible project root
+    (including a legacy `current.json` selecting the reproduced canonical
+    URDF), requiring `ready=true`, all 16 checks including
+    `artifact_identity`, and the stable preflight hash.
+- The real `artifacts/robot/tinker2/current.json` is a separate
+  provisioned-host runtime-readiness diagnostic: when provisioned it must
+  select bytes equal to the reproducible derivation (stale selection fails);
+  when absent the host is reported `not_provisioned` (not runtime-ready) as a
+  typed diagnostic without failing or silently skipping the static suite.
+  Top-level `evidence.preflight` carries the load-bearing
+  `stable_manifest_sha256` / `stable_preflight_sha256` and nests the raw
+  host-scoped hashes under `evidence.preflight.host_snapshot`.
 - The acceptance contract and the three qualification scenarios are installed
   under `share/tinker_sim_bridge/integration/` and
-  `share/tinker_sim_bridge/scenarios/` (byte-identical to source), and the
+  `share/tinker_sim_bridge/scenarios/` (byte-identical to source under both
+  the real colcon prefix and a temporary copy-install/wheel build), and the
   integrated launch resolves a scenario through a deterministic package-share
   fallback, rejecting byte disagreement when both sources exist.
 - Build commands use `tkbuild` and `scripts/build-humble-overlay` only, never
@@ -94,9 +113,13 @@ or authorize cuMotion; live qualification remains a separate gate.
 - `tests/test_provenance.py` recomputes every derived hash/contract from
   immutable git objects and committed source and fails on mutations (argument
   order/count, literal compatibility booleans, strict-sim keys, production
-  import/node/executable allow-lists, simulator provider set, handoff,
-  model-bundle source evidence, stale current selection).  The pre-existing uv
-  environment provenance failure (installed `uv 0.12.0` vs pinned `uv 0.10.8`)
-  is an environment failure, not a code failure.  The focused invocation uses
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` (the ROS `launch_pytest` plugin otherwise
-  fails collection on the unavailable `lark` module).
+  import/node/executable allow-lists, simulator provider set, handoff, Task 7
+  action-client scope, task-range boundary/commits, fixture status
+  publication, artifact path policy, model-bundle source evidence, top-level
+  stable hashes, stale current selection).  A clean-checkout regression seam
+  (`git clone` of the tracked tree) requires every static test to pass with no
+  gitignored trees.  The pre-existing uv environment provenance failure
+  (installed `uv 0.12.0` vs pinned `uv 0.10.8`) is an environment failure, not
+  a code failure.  The focused invocation uses `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
+  (ROS plugin discovery may auto-load `launch_pytest`, which can fail on hosts
+  without the `lark` module; this is the defensive reproducible invocation).
