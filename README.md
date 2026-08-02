@@ -343,6 +343,54 @@ References:
   `tests/test_integrated_gate_executor_ros.py` (Humble generated-message, 13
   tests).  No build is required because no package-installed path changed.
 
+- 2026-08-02 (integrated qualification Task 4 fix round 1): Made the Gate-C
+  executor runnable and Task-4 evidence-complete.  The live
+  `IntegratedGateExecutor` now constructs a valid isolated Humble node: a
+  private `rclpy.context.Context` per executor initialized with the exact
+  `ros_domain_id` in `[0,232]`, `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` required/
+  verified, basename `tinker_integrated_gate_executor` + namespace `/` +
+  `use_global_arguments=False` (FQN `/tinker_integrated_gate_executor`),
+  dict-key (never `getattr`) typed action/service client creation with all nine
+  action and eleven service clients asserted, a context-bound
+  `SingleThreadedExecutor`, idempotent `shutdown()`, and construct -> shutdown ->
+  construct reuse.  The journal recorder now subscribes to the real
+  `moveit_msgs/msg/PlanningScene` type on `/planning_scene` and
+  `/monitored_planning_scene` (reliable/transient-local/depth 1) with a
+  ROS-only normalization helper deriving ordered world/attached/link/touch data,
+  the exact fixture revision, an internal `scene_sequence`/`scene_timestamp`,
+  and SHA-256 digests over ROS serialization of the full scene, ACM, and robot
+  state.  The executor owns a real `PlanningSceneJournal` by default
+  (loaded model touch contract, `pick_and_place/` task namespace,
+  `pick_and_place/object_mesh` target, Stage-C explicit
+  `("fixture-ready", "teardown")` event order, the eight forbidden
+  manipulation events, fresh `planning-scene.jsonl` that fails closed when
+  stale) and records `fixture-ready` via `record_diff` then `teardown` via
+  `snapshot`, finalizing both journal artifacts with the exact observed graph
+  projection.  `build_journal_graph_projection` now requires an explicit
+  `observed_graph` input and fails closed on missing/extra interfaces, wrong
+  type/QoS/source/cardinality, or an absent recorder subscriber/client; the
+  executor requires `join_key_provider`, `readiness_snapshot_provider`, and
+  `graph_observation_provider`, gates every goal on live readiness (config-
+  authoritative operator freshness), and evaluates the three Stage-C scenario
+  readiness baselines (their own revision, owned IDs, and descriptor digest).
+  `run_gate_c_plan_only` dispatches joint/pose/blocked plan-only goals with
+  non-empty-`planned_trajectory` enforcement (blocked expects planner
+  non-success), uses separate bounded deadlines for server availability /
+  acceptance / result / cancellation with `cancel_goal_async()` spun to
+  completion, rejects non-Stage-C/non-plan-only scenarios before goal creation,
+  and writes the complete Task-4 artifact set (`integrated-execution.jsonl/.json`,
+  `moveit-plans.jsonl`, `controller-results.jsonl`, `goals/<scenario_id>.json`,
+  `visual-capture-requests.jsonl`, `planning-scene.jsonl/.json`) with
+  `diagnostic_only=true`, `execute_trajectory_goal_sent=false`, and
+  `isaac_joint_commands_published=false`.  Humble suite expanded to 29 tests
+  (real-class construction, typed subscriptions, scene normalization, stubbed
+  three-scenario flow, nonempty-plan/blocked enforcement, readiness gating,
+  bounded cancellation, repeated construct), and the documented sourced-Humble
+  command FAILS (never skips) without the ROS runtime.  Pure suite expanded to
+  66 tests (Stage-C readiness baselines, dispatch semantics, observed-graph
+  fail-closed mutations, journal lifecycle/stale-jsonl/forbidden events).
+  No build is required because no package-installed path changed.
+
 - 2026-08-02 (integrated qualification Task 3 fix round 1): Bound the
   PlanningScene evidence semantics against the adversarial review findings.
   `validation/planning_scene_journal.py` now makes the public path fail closed:
