@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "producer": {
+    "name": "tinker_sim_bridge.model_bundle",
+    "version": "1"
+  },
+  "structural_fingerprint": "8b1185628f7474a6e44468eaf7fafd3755f417e1dcb7645916d7e24468b8a41b",
+  "contract": {
+    "tcp_link": "link_tcp",
+    "touch_links": [
+      "xarm_gripper_base_link",
+      "left_outer_knuckle",
+      "left_finger",
+      "left_inner_knuckle",
+      "right_inner_knuckle",
+      "right_outer_knuckle",
+      "right_finger",
+      "link_tcp"
+    ],
+    "gripper_joint": "drive_joint",
+    "arm_joints": [
+      "joint1",
+      "joint2",
+      "joint3",
+      "joint4",
+      "joint5",
+      "joint6",
+      "joint7"
+    ]
+  },
+  "normalization": {
+    "groups": {
+      "arm": "xarm7",
+      "gripper": "xarm_gripper"
+    },
+    "ordered_joints": [
+      "joint1",
+      "joint2",
+      "joint3",
+      "joint4",
+      "joint5",
+      "joint6",
+      "joint7",
+      "drive_joint"
+    ],
+    "prefix": ""
+  }
+}

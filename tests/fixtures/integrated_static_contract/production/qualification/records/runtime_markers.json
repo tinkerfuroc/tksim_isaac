@@ -1,0 +1,8 @@
+{
+  "detached_motion_thread": false,
+  "bounded_cancellation": true,
+  "deterministic_shutdown": true,
+  "global_scene_cleanup": false,
+  "lift_collision_checking": true,
+  "hardware_compat_guarded": true
+}

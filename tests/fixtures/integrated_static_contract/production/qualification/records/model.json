@@ -1,0 +1,26 @@
+{
+  "planning_frame": "base_link",
+  "tcp_link": "link_tcp",
+  "arm_group": "xarm7",
+  "gripper_group": "xarm_gripper",
+  "arm_joints": [
+    "joint1",
+    "joint2",
+    "joint3",
+    "joint4",
+    "joint5",
+    "joint6",
+    "joint7"
+  ],
+  "gripper_joint": "drive_joint",
+  "touch_links": [
+    "xarm_gripper_base_link",
+    "left_outer_knuckle",
+    "left_finger",
+    "left_inner_knuckle",
+    "right_inner_knuckle",
+    "right_outer_knuckle",
+    "right_finger",
+    "link_tcp"
+  ]
+}

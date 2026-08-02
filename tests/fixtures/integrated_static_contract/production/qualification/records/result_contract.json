@@ -1,0 +1,14 @@
+{
+  "required": [
+    "stage",
+    "status",
+    "error_msg"
+  ],
+  "present": [
+    "stage",
+    "status",
+    "error_msg",
+    "accepted",
+    "success"
+  ]
+}

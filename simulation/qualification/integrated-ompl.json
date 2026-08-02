@@ -9,8 +9,9 @@
   "core_config": "simulation/qualification/manipulation-core.json",
   "overlay_contract": "integration/ompl-overlay-contract.json",
   "source_lock_policies": {
-    "simulator": "integration/source-locks.json",
-    "production": "/home/tinker/tk25_ws/src/tk25_manipulation/integration/source-locks.json"
+    "simulator_overlay": "integration/source-locks.json",
+    "production": "/home/tinker/tk25_ws/src/tk25_manipulation/integration/source-locks.json",
+    "qualification_tooling": "integration/integrated-qualification-source-lock.json"
   },
   "model": {
     "planning_frame": "base_link",

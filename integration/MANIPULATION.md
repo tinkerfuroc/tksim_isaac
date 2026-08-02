@@ -360,3 +360,23 @@ live manipulation pass to report. MoveIt and cuMotion remain deferred until
 the FJT, safety, gripper/contact, collision, and retention gates are backed by
 raw physics evidence. Vision, decision, and VLA are also deferred until that
 manipulation core is qualified.
+
+## Changelog
+
+- 2026-08-02 (integrated qualification Task 2): Added the offline Gate B
+  static-contract closure.  `validation/source_lock_manifest.py` is the
+  canonical three-policy source-lock observer
+  (`simulator_overlay` / `production` / `qualification_tooling`) with
+  non-self-referential Git-history resolution (the containing/transition commit
+  is resolved from history, never from `HEAD`/`HEAD^` or an in-file
+  `policy_commit`), exact `LC_ALL=C` status/diff/index/untracked evidence,
+  canonical path-sorted untracked manifest, atomic fsync+`os.replace` output,
+  and attempt freshness.  `validation/integrated_static_contracts.py` runs the
+  nine semantic static checks (model fingerprint, controller mapping, selected
+  launch, provider cardinality, fixture ownership, action lifecycle,
+  scene/collision safety, source identities, transport contract) against the
+  produced three-entry manifest.  `simulation/qualification/integrated-ompl.json`
+  now names exactly the three `source_lock_policies`.  The real
+  qualification-tooling policy is intentionally absent during Task 2, so a
+  real-root Gate B capture returns `evidence-invalid` until the post-Task-10
+  lock-only phase; no existing source-lock policy was created or modified.
