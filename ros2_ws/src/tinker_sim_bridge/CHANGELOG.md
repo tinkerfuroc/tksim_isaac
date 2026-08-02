@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Task 1: integrated OMPL scenario matrix)
+
+- Adds the schema-v3 integrated config `simulation/qualification/integrated-ompl.json`
+  (source-lock policies, model, strict seven-value pick-place `back_positions`,
+  geometry contract, thresholds, execution contract with cuMotion disabled, and
+  stages A-F covering all 17 scenarios).
+- Defines the full 17-scenario integrated matrix in `simulation/scenarios/`:
+  the three plan-only C scenarios (`qualification-moveit-plan-joint` /
+  `-pose` / `-blocked`), six D execute scenarios (`qualification-moveit-execute-joint`
+  / `-pose` / `-cartesian-retreat` / `-gripper` / `-cancel` / `-safety`), and
+  eight E pick-place scenarios (`qualification-pick-place-positive`,
+  `-blocked-approach`, `-unreachable-grasp`, `-malformed-back`, `-cancel-approach`,
+  `-cancel-transport`, `-safety-transport`, `-occupied-place`).  The three
+  existing C scenarios retain their prior planning-scene identity, geometry,
+  digests, and semantics; only the schema-v2-validated `integrated` mapping was
+  added to each scenario declaration.
+- `ScenarioDefinition` now loads and validates the `integrated` mapping and the
+  identity-free `declaration`; `standard_operations` carries the immutable
+  `scenario`, `planning_scene`, and `integrated` mappings into the final
+  `PHYSICS_READY` operation; `scenario_runner` builds the canonical report via
+  `build_canonical_report`.
+- The public `scenario-runner.json` report carries exactly the one-key
+  `integrated` mapping `{"execution_profile": "sim_ompl"}` (and its digest); the
+  full per-scenario `integrated` mapping is bound by the scenario declaration
+  SHA-256 and preserved in separate readiness/executor evidence.
+- Registers all 14 new scenario package-share symlinks and `setup.py`
+  `_scenario_sources` entries; the `ompl-overlay-contract.json` scenarios section
+  now lists all 17 scenarios with recomputed declaration digests.
+- Adds the ROS-free shared `tests/qualification_test_helpers.py`
+  (`load_test_scenario`, `expected_physics_ready_report`) and the 50-test
+  `tests/test_integrated_qualification_config.py`; `test_provenance.py` and
+  `test_qualification_fixtures.py` cover the 17-scenario identities and
+  physical spawn/planning-scene contracts.
+
 ### Added (Task 8 fix round 4: isolate pinned-resolver verification)
 
 - The pinned-resolver independence proof is now executed in a fresh isolated

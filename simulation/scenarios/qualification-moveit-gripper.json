@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "id": "qualification-moveit-plan-joint",
-  "qualification_gate": "moveit-plan-joint",
+  "id": "qualification-moveit-gripper",
+  "qualification_gate": "moveit-gripper",
   "seed": 7,
   "world": {
     "mode": "current"
@@ -33,11 +33,11 @@
       "name": "fixture revision",
       "path": "planning_scene_fixture.revision",
       "operator": "equals",
-      "value": "2026-08-01-moveit-qualification-joint"
+      "value": "2026-08-02-moveit-execute-gripper"
     }
   ],
   "planning_scene": {
-    "revision": "2026-08-01-moveit-qualification-joint",
+    "revision": "2026-08-02-moveit-execute-gripper",
     "frame_id": "base_link",
     "target_source_id": "sim_fixture/public_target",
     "target_handoff": "pick_and_place/object_mesh",
@@ -93,12 +93,12 @@
         }
       }
     ],
-    "revision_digest": "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d"
+    "revision_digest": "3ff431fc73f0c3118a31b7b632f3944a3c689bd17839e623f06ef9bf51396451"
   },
   "integrated": {
-    "stage": "C",
-    "fixture_revision": "2026-08-01-moveit-qualification-joint",
-    "fixture_digest": "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d",
+    "stage": "D",
+    "fixture_revision": "2026-08-02-moveit-execute-gripper",
+    "fixture_digest": "3ff431fc73f0c3118a31b7b632f3944a3c689bd17839e623f06ef9bf51396451",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {
@@ -107,7 +107,7 @@
       "place_region": null
     },
     "acceptance": {
-      "polarity": "plan-only"
+      "polarity": "positive"
     },
     "expected_scene": {
       "owned_ids": [
@@ -117,7 +117,10 @@
       "attached_ids": [],
       "task_target_id": "pick_and_place/object_mesh"
     },
-    "expected_physical": [],
+    "expected_physical": [
+      "gripper_travel_predicates",
+      "terminal_success"
+    ],
     "expected_negative": null,
     "forbidden_endpoints": [
       "/isaac_joint_commands"

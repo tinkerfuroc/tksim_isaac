@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "id": "qualification-moveit-plan-joint",
-  "qualification_gate": "moveit-plan-joint",
+  "id": "qualification-moveit-cancel",
+  "qualification_gate": "moveit-cancel",
   "seed": 7,
   "world": {
     "mode": "current"
@@ -33,11 +33,11 @@
       "name": "fixture revision",
       "path": "planning_scene_fixture.revision",
       "operator": "equals",
-      "value": "2026-08-01-moveit-qualification-joint"
+      "value": "2026-08-02-moveit-execute-cancel"
     }
   ],
   "planning_scene": {
-    "revision": "2026-08-01-moveit-qualification-joint",
+    "revision": "2026-08-02-moveit-execute-cancel",
     "frame_id": "base_link",
     "target_source_id": "sim_fixture/public_target",
     "target_handoff": "pick_and_place/object_mesh",
@@ -93,12 +93,12 @@
         }
       }
     ],
-    "revision_digest": "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d"
+    "revision_digest": "7d65de800c7e27f2896815057c6e0ede2bf3a02921f275a2b229be3756f6962b"
   },
   "integrated": {
-    "stage": "C",
-    "fixture_revision": "2026-08-01-moveit-qualification-joint",
-    "fixture_digest": "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d",
+    "stage": "D",
+    "fixture_revision": "2026-08-02-moveit-execute-cancel",
+    "fixture_digest": "7d65de800c7e27f2896815057c6e0ede2bf3a02921f275a2b229be3756f6962b",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {
@@ -107,7 +107,7 @@
       "place_region": null
     },
     "acceptance": {
-      "polarity": "plan-only"
+      "polarity": "cancel"
     },
     "expected_scene": {
       "owned_ids": [
@@ -117,7 +117,11 @@
       "attached_ids": [],
       "task_target_id": "pick_and_place/object_mesh"
     },
-    "expected_physical": [],
+    "expected_physical": [
+      "execute_goal_canceled",
+      "quiescent_after_cancel",
+      "no_later_stage"
+    ],
     "expected_negative": null,
     "forbidden_endpoints": [
       "/isaac_joint_commands"

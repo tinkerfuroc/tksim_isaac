@@ -519,6 +519,20 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
         "qualification-moveit-plan-joint",
         "qualification-moveit-plan-pose",
         "qualification-moveit-plan-blocked",
+        "qualification-moveit-execute-joint",
+        "qualification-moveit-execute-pose",
+        "qualification-moveit-cartesian-retreat",
+        "qualification-moveit-gripper",
+        "qualification-moveit-cancel",
+        "qualification-moveit-safety",
+        "qualification-pick-place-positive",
+        "qualification-pick-place-blocked-approach",
+        "qualification-pick-place-unreachable-grasp",
+        "qualification-pick-place-malformed-back",
+        "qualification-pick-place-cancel-approach",
+        "qualification-pick-place-cancel-transport",
+        "qualification-pick-place-safety-transport",
+        "qualification-pick-place-occupied-place",
     )
 
     # ------------------------------------------------------------------
@@ -1295,21 +1309,23 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
         data = self._load_contract()
         expected = {
             "qualification-moveit-plan-joint": {
-                "decl": "716a0d1845d5d73c5037eeea2baaa89359b5aede44b6a9600355c75bedf2463c",
+                "decl": "a3dab04c7dc7905ea56466b5f0ae9219c3b9250c5fb9c2ce90cf4acdcb0f68eb",
                 "rev": "2026-08-01-moveit-qualification-joint",
                 "rev_digest": "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d",
                 "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
                 "fd": "7f89ab08d2cf74ae0726bb9edc1bfc3cf6e1f6ea7d8c5662760d3551530ab9de",
+                "target": "sim_fixture/public_target",
             },
             "qualification-moveit-plan-pose": {
-                "decl": "8ce9d2d1c992c6c09f16302c3e7d286e787b6e93a104ef379f1a13c7534ca5c2",
+                "decl": "04ade8e7339b9fc3cf72e9b8ae0d0c88325ffbc72332efe55413be184f5579c3",
                 "rev": "2026-08-01-moveit-qualification-pose",
                 "rev_digest": "fb2abd517a6c6d2f5d34ec099f3e62a245a968e52cd3223bb5ac911d5382af67",
                 "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
                 "fd": "de3af2e05493e0fc3a11c8526c84da1065648f7134f996c9a331819c54df84f4",
+                "target": "sim_fixture/public_target",
             },
             "qualification-moveit-plan-blocked": {
-                "decl": "4b6b471d7e89dd568c8ec712c0b7b2ae667e3b3812447daf2f46ace90ed385af",
+                "decl": "3e4f846117131bca8febcd7b09dff4ad0793a8b055fc4efe0c3b6897247b794a",
                 "rev": "2026-08-01-moveit-qualification-blocked",
                 "rev_digest": "d6d25cfe04fa7e641d6140c20431c24a5cd150005d0c7f9c13735402c93281ac",
                 "owned": [
@@ -1318,6 +1334,127 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
                     "sim_fixture/plan_blocker",
                 ],
                 "fd": "d1a1923ceb45394dd70b4248541eac3379a12921d1d244c7d3d5de44157578e4",
+                "target": "sim_fixture/public_target",
+            },
+            "qualification-moveit-execute-joint": {
+                "decl": "5c122da43753ffd3e5c4257525cf9a99d9730558550b0bce8ffe8b6000f59de0",
+                "rev": "2026-08-02-moveit-execute-joint",
+                "rev_digest": "0386a418d3cc1a8ad9d60571544adeb1dce3e835fac86361f2de858c543a2803",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
+                "fd": "09ac8025ef2dde4f66f0d1e3bed6a31a6d747623c75478622f08767285fd947c",
+                "target": "sim_fixture/public_target",
+            },
+            "qualification-moveit-execute-pose": {
+                "decl": "586ad918a9be5b8171a5172461c6b12f17e6e365ff85852c55f01cdd227d7cdd",
+                "rev": "2026-08-02-moveit-execute-pose",
+                "rev_digest": "909614fb232baac5c7481898f9239990a94fe235101a8485ee8af5c212c0db09",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
+                "fd": "e7baa8bfd3c84e994e0ee95b3260d7df5ed0183db2cb5caa52041bc6a380cb67",
+                "target": "sim_fixture/public_target",
+            },
+            "qualification-moveit-cartesian-retreat": {
+                "decl": "477928d8fbecc2fe9286756b02cc3340f5a027b8a18e587ed5b2850924287898",
+                "rev": "2026-08-02-moveit-execute-cartesian-retreat",
+                "rev_digest": "554a5d2234a5a9388b69f2f055f00a4205d3184f62472c774905a148c66c9092",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
+                "fd": "7cd5b1d5d7c90d361c6573b96db1ea2c70a9245c690e82bedd47cb3ebec137d8",
+                "target": "sim_fixture/public_target",
+            },
+            "qualification-moveit-gripper": {
+                "decl": "660a3caf5678aac63ccd23f872adf6da00a1a8386ffe6a399107e1689dda3d1c",
+                "rev": "2026-08-02-moveit-execute-gripper",
+                "rev_digest": "3ff431fc73f0c3118a31b7b632f3944a3c689bd17839e623f06ef9bf51396451",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
+                "fd": "84af8885ff11acfe77970ab9eda086fb69f896e34931cded9bf9a9c5646e5c7b",
+                "target": "sim_fixture/public_target",
+            },
+            "qualification-moveit-cancel": {
+                "decl": "50d004a293e4acdc511dd82499a3e1292786d68d83f722ea9eda31a0a73f8a0b",
+                "rev": "2026-08-02-moveit-execute-cancel",
+                "rev_digest": "7d65de800c7e27f2896815057c6e0ede2bf3a02921f275a2b229be3756f6962b",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
+                "fd": "a22d99cd23b2ba8741edc18371368a2752ace6c79d3e0dd46ce88594812d8887",
+                "target": "sim_fixture/public_target",
+            },
+            "qualification-moveit-safety": {
+                "decl": "c9e6718fb4d6ee6ab7f9b69da15dfc79f4c56eaebada02202f31cae8f6436572",
+                "rev": "2026-08-02-moveit-execute-safety",
+                "rev_digest": "053a1c688870776a610046df70d2e24937af22d24df80254c8eb2267d55eec08",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/public_target"],
+                "fd": "ebed4693c7875192cde1b1a3a9f219da49bac7938d9b0620fe487fca8ab4c96d",
+                "target": "sim_fixture/public_target",
+            },
+            "qualification-pick-place-positive": {
+                "decl": "936f0820d93ce686a37323af6df1d63bdce182f1f412ed7fba161e90ad9ccdcb",
+                "rev": "qualification-v1",
+                "rev_digest": "3afe7f1e1210a29c31364fabd6a955991a30cf5aaf9183c98503f2412d002a9b",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/qualification_cube"],
+                "fd": "a254f2990a2215b8292872f400ee78b0b2c680fa17e8ea360c72b9939d34138c",
+                "target": "sim_fixture/qualification_cube",
+            },
+            "qualification-pick-place-blocked-approach": {
+                "decl": "88b40f1e05c93af767e9c40947c58e420d740ab543c2ddbb56434038f6da0935",
+                "rev": "qualification-v1",
+                "rev_digest": "4bf4696ee23fc7645d4affd05b0baf5ff85d8a229a0f998cb893ff91b0c56f21",
+                "owned": [
+                    "sim_fixture/pedestal",
+                    "sim_fixture/qualification_cube",
+                    "sim_fixture/plan_blocker",
+                ],
+                "fd": "677694785eab24a50f59a8438b09b8d6051865f4e120c46a03caa4e9f956eff9",
+                "target": "sim_fixture/qualification_cube",
+            },
+            "qualification-pick-place-unreachable-grasp": {
+                "decl": "359ce6215ce638087bd54838638542bd17f3dff626b42a0f03ab8890817f15ef",
+                "rev": "qualification-v1",
+                "rev_digest": "4f70567d8a2242de74a5643b10d8b4d030fe9ea6574e13c8224bee3a232f5e09",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/qualification_cube"],
+                "fd": "f32a0610b1be074ba9a8b7290ce01dcd2b608107a4b445bc856381fb9eb24770",
+                "target": "sim_fixture/qualification_cube",
+            },
+            "qualification-pick-place-malformed-back": {
+                "decl": "25d6eb0870f4adbc27f24bc46cdcc5bb01bb8c5fbf661371a4a34094ec8d0d29",
+                "rev": "qualification-v1",
+                "rev_digest": "3afe7f1e1210a29c31364fabd6a955991a30cf5aaf9183c98503f2412d002a9b",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/qualification_cube"],
+                "fd": "a254f2990a2215b8292872f400ee78b0b2c680fa17e8ea360c72b9939d34138c",
+                "target": "sim_fixture/qualification_cube",
+            },
+            "qualification-pick-place-cancel-approach": {
+                "decl": "e317daa41a76b6df8785fe31c6dcba17c2f9aacc1d6a2001cb4cbe1a920b4b8b",
+                "rev": "qualification-v1",
+                "rev_digest": "3afe7f1e1210a29c31364fabd6a955991a30cf5aaf9183c98503f2412d002a9b",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/qualification_cube"],
+                "fd": "a254f2990a2215b8292872f400ee78b0b2c680fa17e8ea360c72b9939d34138c",
+                "target": "sim_fixture/qualification_cube",
+            },
+            "qualification-pick-place-cancel-transport": {
+                "decl": "9662f3bc27a47c51b079f6444e3cd4f2ac679a1710567e17cacb0f9e089a8347",
+                "rev": "qualification-v1",
+                "rev_digest": "3afe7f1e1210a29c31364fabd6a955991a30cf5aaf9183c98503f2412d002a9b",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/qualification_cube"],
+                "fd": "a254f2990a2215b8292872f400ee78b0b2c680fa17e8ea360c72b9939d34138c",
+                "target": "sim_fixture/qualification_cube",
+            },
+            "qualification-pick-place-safety-transport": {
+                "decl": "97b47b64f48c10a154251e80f33f923517b3bddf26bcb5143956b8536fa9f486",
+                "rev": "qualification-v1",
+                "rev_digest": "3afe7f1e1210a29c31364fabd6a955991a30cf5aaf9183c98503f2412d002a9b",
+                "owned": ["sim_fixture/pedestal", "sim_fixture/qualification_cube"],
+                "fd": "a254f2990a2215b8292872f400ee78b0b2c680fa17e8ea360c72b9939d34138c",
+                "target": "sim_fixture/qualification_cube",
+            },
+            "qualification-pick-place-occupied-place": {
+                "decl": "78020660eb64dd9597a293559e462c3062565018254ca0eed8567f88aac24621",
+                "rev": "qualification-v1",
+                "rev_digest": "fb30f65d2378355095084c343cbe23ca057ff4fd659716f2c7b6758a528c7589",
+                "owned": [
+                    "sim_fixture/pedestal",
+                    "sim_fixture/qualification_cube",
+                    "sim_fixture/place_occupant",
+                ],
+                "fd": "2787a6bb062ac15aa0db43b2e0a1cc0e6cd8c72d184e212db5c7d3f95f86038d",
+                "target": "sim_fixture/qualification_cube",
             },
         }
         for sid, exp in expected.items():
@@ -1339,7 +1476,7 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
             self.assertEqual(recorded["planning_scene"]["revision_digest"], exp["rev_digest"])
             self.assertEqual(recorded["planning_scene"]["owned_ids"], exp["owned"])
             self.assertEqual(recorded["planning_scene"]["fixture_descriptor_sha256"], exp["fd"])
-            self.assertEqual(recorded["planning_scene"]["target_source_id"], "sim_fixture/public_target")
+            self.assertEqual(recorded["planning_scene"]["target_source_id"], exp["target"])
             self.assertEqual(
                 recorded["planning_scene"]["target_handoff"], "pick_and_place/object_mesh"
             )

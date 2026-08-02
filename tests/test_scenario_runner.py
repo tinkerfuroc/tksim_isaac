@@ -155,8 +155,18 @@ def test_planning_scene_scenario_compiles_without_extra_spawn_operations() -> No
     final_state = operations[-1].payload
     assert final_state["state"] == 1
     assert final_state["boundary"] == "PHYSICS_READY"
-    assert final_state["scenario"] == "qualification-moveit-plan-blocked"
+    # The final operation carries the immutable scenario mapping plus the
+    # planning-scene and integrated mappings (Task 1), alongside seed.
+    assert final_state["scenario"]["id"] == "qualification-moveit-plan-blocked"
+    assert final_state["scenario"]["seed"] == 7
+    # The identity-free declaration carries the immutable spec (including the
+    # planning-scene and integrated mappings) but never the id/seed identity keys.
+    assert "id" not in final_state["scenario"]["declaration"]
+    assert "seed" not in final_state["scenario"]["declaration"]
+    assert final_state["scenario"]["declaration"]["integrated"]["stage"] == "C"
     assert final_state["seed"] == 7
+    assert final_state["planning_scene"]["revision"] == "2026-08-01-moveit-qualification-blocked"
+    assert final_state["integrated"]["stage"] == "C"
 
 
 class _FakeResultsNode:

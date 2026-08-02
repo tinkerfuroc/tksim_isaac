@@ -274,9 +274,15 @@ The contract records, with exact values:
   is carried separately as `runtime_contract_sha256`.
 - **Fixture/scenario identities.**  Exact `sim_fixture/*` ownership and parser
   encoding, canonical `target_source_id="sim_fixture/public_target"`,
-  `target_handoff="pick_and_place/object_mesh"`, and the three OMPL plan-only
-  scenarios with their declaration/revision/digest/owned-ID/descriptor
-  identities.
+  `target_handoff="pick_and_place/object_mesh"`, and the full Task 1
+  17-scenario integrated matrix (three OMPL plan-only C scenarios, six D
+  execute scenarios, and eight E pick-place scenarios) with their
+  declaration/revision/digest/owned-ID/descriptor identities.  The plan-only
+  and execute scenarios target `sim_fixture/public_target`; the pick-place
+  scenarios target `sim_fixture/qualification_cube`.  Each scenario carries a
+  schema-v3-validated `integrated` mapping; the public report carries only the
+  one-key `{"execution_profile": "sim_ompl"}` mapping and the full per-scenario
+  mapping is bound by the scenario declaration SHA-256.
 - **Evidence.**  Task 6 runtime/public-report separation and Task 7 plan-only
   joint/pose/blocked plus zero-command evidence and the exact blocked-mode
   MoveIt failure-code allowlist.

@@ -2,8 +2,8 @@ from setuptools import find_packages, setup
 
 package_name = "tinker_sim_bridge"
 
-# The canonical OMPL acceptance contract and the three required qualification
-# scenarios live in the simulator checkout (integration/ and simulation/scenarios/),
+# The canonical OMPL acceptance contract and the full 17-scenario integrated
+# matrix live in the simulator checkout (integration/ and simulation/scenarios/),
 # outside the bridge package directory.  They are exposed to the build through
 # tracked source symlinks under integration/ and scenarios/ so the build's
 # ``data_files`` sources stay relative (colcon rejects absolute sources) while
@@ -15,6 +15,20 @@ _scenario_sources = [
         "qualification-moveit-plan-joint.json",
         "qualification-moveit-plan-pose.json",
         "qualification-moveit-plan-blocked.json",
+        "qualification-moveit-execute-joint.json",
+        "qualification-moveit-execute-pose.json",
+        "qualification-moveit-cartesian-retreat.json",
+        "qualification-moveit-gripper.json",
+        "qualification-moveit-cancel.json",
+        "qualification-moveit-safety.json",
+        "qualification-pick-place-positive.json",
+        "qualification-pick-place-blocked-approach.json",
+        "qualification-pick-place-unreachable-grasp.json",
+        "qualification-pick-place-malformed-back.json",
+        "qualification-pick-place-cancel-approach.json",
+        "qualification-pick-place-cancel-transport.json",
+        "qualification-pick-place-safety-transport.json",
+        "qualification-pick-place-occupied-place.json",
     )
 ]
 
