@@ -314,6 +314,30 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 3): Added the stable, durable
+  PlanningScene journal consumed by the later executor/verifier/evidence tasks.
+  `validation/planning_scene_journal.py` is the ROS-free pure record/transition
+  journal: a model-contract loader (`load_model_touch_contract`) anchored to the
+  committed `integration/ompl-overlay-contract.json` (`link_tcp`, the exact
+  ordered eight-link SRDF touch set, and handoff
+  `pick_and_place/object_mesh`, failing closed on drift), transactional
+  validation (a rejected record/event leaves `_records`, `_last_scene`, JSONL
+  bytes, and final JSON bytes unchanged), recursive rejection of forbidden
+  physics fields (contact/force/object-pose/evaluator-metric/physical-verdict),
+  append-only canonical compact sorted-key `planning-scene.jsonl` (flush +
+  fsync before in-memory visibility), atomic final `planning-scene.json`
+  (temp-file + file fsync + `os.replace` + directory fsync, no temp residue),
+  graph-evidence validation (`validate_graph_evidence`) over a Task-4-supplied
+  projection (recorder identity, topic/service types and QoS, real
+  endpoint/provider metadata, exactly one `/fixture_planning_scene` publisher,
+  and the exact canonical compact fixture-status payload with scalar
+  `target_handoff="pick_and_place/object_mesh"`), and positive/negative event
+  ordering with attach/detach/task-cleanup ownership semantics.  The journal
+  records the exact `(frame_index, timestamp)` join key and never claims that
+  scene attachment proves physical contact.  `tests/test_planning_scene_journal.py`
+  covers every brief case plus adversarial digest/rollback/numeric/duplicate/
+  physics-key/contract-drift/graph/durability/order coverage.
+
 - 2026-08-02 (integrated qualification Task 2 fix round 3): Closed the residual
   semantic false-passes.  `validation/integrated_static_contracts.py`
   `_bind_run_post_close_pick` now aggregates every SimOmpl/Hardware profile
