@@ -488,9 +488,11 @@ def _cpp_find_function(text: str, qualified_name: str) -> str | None:
 
 
 def _cpp_if_blocks(body: str) -> list[dict[str, str]]:
-    """Return ``[{'condition': str, 'body': str}]`` for every braced ``if``
-    block in the function body (any nesting depth), extracted by actual
-    condition and brace structure (F2.1.4)."""
+    """Return ``[{'condition': str, 'body': str, 'start': int, 'end': int}]``
+    for every braced ``if`` block in the function body (any nesting depth),
+    extracted by actual condition and brace structure (F2.1.4).  ``start`` /
+    ``end`` are the half-open span of the braced body in *body*, used for
+    structural containment checks (F3.1)."""
     blocks: list[dict[str, str]] = []
     for match in re.finditer(r"\bif\s*\(", body):
         open_paren = match.end() - 1
@@ -504,7 +506,14 @@ def _cpp_if_blocks(body: str) -> list[dict[str, str]]:
         if j < len(body) and body[j] == "{":
             close_brace = _cpp_match(body, j, "{", "}")
             if close_brace is not None:
-                blocks.append({"condition": condition, "body": body[j:close_brace]})
+                blocks.append(
+                    {
+                        "condition": condition,
+                        "body": body[j:close_brace],
+                        "start": j,
+                        "end": close_brace,
+                    }
+                )
     return blocks
 
 
@@ -604,6 +613,24 @@ def _parse_controllers_yaml(text: str) -> dict[str, dict[str, object]]:
         if isinstance(block, dict):
             result[str(name)] = dict(block)
     return result
+
+
+_RESULT_ASSIGN_PATTERNS: dict[str, re.Pattern[str]] = {}
+
+
+def _result_field_assign_pattern(field: str) -> re.Pattern[str]:
+    """Return a cached assignment-form structural regex for a result field.
+
+    Matches ``result-><field> =`` (assignment only, never ``==``, never a
+    differently-named member such as ``result-><field>_value``, never a read).
+    This runs over sanitized executable code, so a masked string/raw-string/
+    comment cannot satisfy the write contract (F3.2).
+    """
+    pattern = _RESULT_ASSIGN_PATTERNS.get(field)
+    if pattern is None:
+        pattern = re.compile(r"\bresult\s*->\s*{}\s*=(?!=)".format(re.escape(field)))
+        _RESULT_ASSIGN_PATTERNS[field] = pattern
+    return pattern
 
 
 def _parse_action_result_fields(text: str) -> list[str]:
@@ -790,6 +817,12 @@ def _verify_overlay_source_commits(
     return reasons, verified
 
 
+# Simulator-local model artifacts must be declared under one of these
+# workspace-relative roots; existence of a matching-bytes file elsewhere under
+# the simulator root never reclassifies an artifact (F3.3).
+SIMULATOR_LOCAL_ARTIFACT_ROOTS = ("outputs", "artifacts")
+
+
 def _bind_bundle_artifact(
     key: str,
     artifact: Mapping[str, Any],
@@ -797,12 +830,22 @@ def _bind_bundle_artifact(
     verified_source_commits: Mapping[str, dict[str, Any]],
     simulator_root: Path,
 ) -> list[str]:
-    """Bind one model-bundle artifact to verified immutable bytes (F2.2).
+    """Bind one model-bundle artifact to verified immutable bytes (F3.3).
 
-    A simulator-local artifact (under ``outputs/`` or ``artifacts/`` of the
-    simulator root) is hashed from those exact bytes.  A production/external
-    source artifact is bound to a verified immutable source-commit record with
-    the same digest.  An arbitrary working-tree path is never hashed.
+    A simulator-local artifact is accepted only when the overlay-declared
+    workspace-relative path sits under an allowed simulator-local root
+    (``outputs/`` or ``artifacts/``), the bundle absolute path agrees with that
+    simulator path, and the simulator bytes hash to the recorded digest.  A
+    shadow file with matching bytes at an undeclared path never reclassifies.
+
+    A production/external source artifact is bound by its semantic source key
+    to the verified immutable source-commit record of the same key: the bundle
+    absolute path must equal ``<recorded repo_path>/<recorded path_relative>``
+    (lexically/resolved, without reading working bytes), the overlay
+    workspace-relative path must equal
+    ``src/<recorded repository directory name>/<recorded path_relative>``, and
+    the recorded SHA-256 must equal the already-verified immutable ``git show``
+    blob digest.  Matching a verified record by digest alone never binds.
     """
     reasons: list[str] = []
     recorded = artifact.get("sha256")
@@ -816,36 +859,76 @@ def _bind_bundle_artifact(
             "model artifact {!r} sha256 differs from the overlay contract record".format(key)
         ]
 
-    path_rel = artifact.get("path_relative")
-    if not isinstance(path_rel, str) or not path_rel:
-        path_rel = overlay_artifact.get("path_relative")
-    if isinstance(path_rel, str) and path_rel:
-        raw = Path(path_rel)
-        # Simulator-local artifact: hash the exact simulator bytes.
-        if raw.is_absolute():
-            try:
-                raw.relative_to(simulator_root.resolve())
-                sim_relative = raw.resolve().relative_to(simulator_root.resolve())
-            except ValueError:
-                sim_relative = None
-        else:
-            sim_relative = None
-            if (simulator_root / raw).is_file():
-                sim_relative = raw
-        if sim_relative is not None:
-            actual = _sha256_bytes((simulator_root / sim_relative).read_bytes())
-            if actual != recorded:
-                reasons.append("model artifact {!r} sha256 mismatch (simulator-local)".format(key))
-            return reasons
+    bundle_path_raw = artifact.get("path") or artifact.get("path_relative")
+    overlay_path_raw = overlay_artifact.get("path_relative")
 
-    # Production/external source artifact: bind to a verified immutable
-    # source-commit record carrying the same digest/path identity.
-    for entry in verified_source_commits.values():
-        if entry.get("sha256") == recorded:
+    # Simulator-local only when the overlay-declared path is under an allowed
+    # root; mere existence under the simulator root never reclassifies.
+    sim_relative: Path | None = None
+    if isinstance(overlay_path_raw, str) and overlay_path_raw:
+        overlay_parts = Path(overlay_path_raw).parts
+        if not Path(overlay_path_raw).is_absolute() and overlay_parts and overlay_parts[0] in SIMULATOR_LOCAL_ARTIFACT_ROOTS:
+            sim_relative = Path(overlay_path_raw)
+
+    if sim_relative is not None:
+        if isinstance(bundle_path_raw, str) and bundle_path_raw:
+            bundle_path = Path(bundle_path_raw)
+            if bundle_path.is_absolute():
+                if bundle_path.resolve() != (simulator_root.resolve() / sim_relative).resolve():
+                    reasons.append(
+                        "model artifact {!r} bundle path does not match the declared simulator-local path".format(key)
+                    )
+                    return reasons
+            elif bundle_path.as_posix() != sim_relative.as_posix():
+                reasons.append(
+                    "model artifact {!r} bundle path does not match the declared simulator-local path".format(key)
+                )
+                return reasons
+        sim_file = simulator_root / sim_relative
+        if not sim_file.is_file():
+            reasons.append(
+                "model artifact {!r} simulator-local file missing: {!r}".format(key, sim_relative.as_posix())
+            )
             return reasons
-    reasons.append(
-        "model artifact {!r} has no verified immutable source-commit binding".format(key)
-    )
+        actual = _sha256_bytes(sim_file.read_bytes())
+        if actual != recorded:
+            reasons.append("model artifact {!r} sha256 mismatch (simulator-local)".format(key))
+        return reasons
+
+    # Non-simulator source artifact: bind by exact source key and path identity.
+    source_entry = verified_source_commits.get(key)
+    if source_entry is None:
+        reasons.append(
+            "model artifact {!r} has no verified immutable source-commit binding under the same source key".format(key)
+        )
+        return reasons
+    if source_entry.get("sha256") != recorded:
+        reasons.append(
+            "model artifact {!r} sha256 differs from its source-commit record digest".format(key)
+        )
+        return reasons
+    repo_path = source_entry.get("repo_path")
+    source_rel = source_entry.get("path_relative")
+    if not isinstance(repo_path, str) or not repo_path or not isinstance(source_rel, str) or not source_rel:
+        reasons.append("model artifact {!r} source-commit binding is malformed".format(key))
+        return reasons
+    if isinstance(bundle_path_raw, str) and bundle_path_raw:
+        bundle_path = Path(bundle_path_raw)
+        if not bundle_path.is_absolute():
+            reasons.append("model artifact {!r} bundle path is not absolute".format(key))
+            return reasons
+        if bundle_path.resolve() != (Path(repo_path).resolve() / source_rel).resolve():
+            reasons.append(
+                "model artifact {!r} bundle path does not match the recorded source path".format(key)
+            )
+            return reasons
+    repo_dir = Path(repo_path).name
+    expected_overlay = "src/{}/{}".format(repo_dir, source_rel)
+    if overlay_path_raw != expected_overlay:
+        reasons.append(
+            "model artifact {!r} overlay workspace path does not match the recorded source path".format(key)
+        )
+        return reasons
     return reasons
 
 
@@ -1415,7 +1498,7 @@ def _check_action_lifecycle(
                 reasons.append("{}() body must not contain conditional-preprocessor directives".format(builder))
                 continue
             for field in action_fields.get(schema_name, []):
-                if "result->{}".format(field) not in body:
+                if _result_field_assign_pattern(field).search(body) is None:
                     reasons.append(
                         "result builder {!r} must write result->{} (per {})".format(builder, field, schema_name)
                     )
@@ -1432,12 +1515,16 @@ def _check_action_lifecycle(
 
 
 def _bind_run_post_close_pick(sanitized_ownership: str, reasons: list[str]) -> None:
-    """Bind ``run_post_close_pick`` branch ownership (F2.1): the SimOmpl
-    obstruction guard must call ``confirms_obstruction()`` in its own condition;
-    the ``ExecutionProfile::Hardware`` block must call collision-disabled
-    ``execute_lift(ctx, false, ...)`` and no true lift; the SimOmpl lift block
-    must call collision-aware ``execute_lift(ctx, true, ...)`` and no false lift.
-    A true/false swap must fail."""
+    """Bind ``run_post_close_pick`` branch ownership (F3.1): aggregate and
+    validate ALL profile blocks/calls -- never only the last match.  The
+    contract requires exactly one SimOmpl obstruction guard (with
+    ``confirms_obstruction()`` in its own condition), exactly one SimOmpl
+    lift-bearing block (collision-aware true lift, no false lift) and exactly
+    one Hardware lift-bearing block (collision-disabled false lift, no true
+    lift).  Every ``execute_lift(...)`` call must be structurally contained by
+    one of the two accepted profile lift blocks; any duplicate profile lift
+    block, duplicate guard, or unguarded lift call fails even when a later
+    decoy block is valid."""
     body = _cpp_find_function(sanitized_ownership, "run_post_close_pick")
     if body is None:
         reasons.append("run_post_close_pick() definition must be present in the executable C++ structure")
@@ -1445,37 +1532,71 @@ def _bind_run_post_close_pick(sanitized_ownership: str, reasons: list[str]) -> N
     if _cpp_has_preprocessor_conditional(body):
         reasons.append("run_post_close_pick() body must not contain conditional-preprocessor directives")
         return
-    guard = None
-    hardware = None
-    sim_lift = None
+
+    guards: list[dict[str, str]] = []
+    sim_lifts: list[dict[str, str]] = []
+    hw_lifts: list[dict[str, str]] = []
     for block in _cpp_if_blocks(body):
         condition = block["condition"]
-        if "ExecutionProfile::SimOmpl" in condition:
-            if "confirms_obstruction" in condition:
-                guard = block
-            elif "execute_lift" in block["body"]:
-                sim_lift = block
-        if "ExecutionProfile::Hardware" in condition:
-            hardware = block
-    if guard is None:
+        has_sim = "ExecutionProfile::SimOmpl" in condition
+        has_hw = "ExecutionProfile::Hardware" in condition
+        has_guard = "confirms_obstruction" in condition
+        has_lift = "execute_lift" in block["body"]
+        if has_sim and has_guard:
+            guards.append(block)
+        elif has_sim and has_lift:
+            sim_lifts.append(block)
+        if has_hw and has_lift:
+            hw_lifts.append(block)
+
+    if not guards:
         reasons.append("SimOmpl post-close must gate on close_result.confirms_obstruction() in its own condition")
+    elif len(guards) > 1:
+        reasons.append(
+            "run_post_close_pick() must contain exactly one SimOmpl obstruction guard (found {})".format(len(guards))
+        )
     else:
-        if "confirms_obstruction()" not in guard["condition"]:
-            reasons.append("SimOmpl obstruction guard must call close_result.confirms_obstruction()")
-    if hardware is None:
-        reasons.append("hardware compatibility branch must be guarded by ExecutionProfile::Hardware")
-    else:
-        if "execute_lift(ctx, false," not in hardware["body"]:
-            reasons.append("hardware branch must call collision-disabled execute_lift(ctx, false, ...)")
-        if "execute_lift(ctx, true," in hardware["body"]:
-            reasons.append("hardware branch must not call collision-aware execute_lift(ctx, true, ...)")
-    if sim_lift is None:
+        if "confirms_obstruction()" not in guards[0]["condition"]:
+            reasons.append("SimOmpl obstruction guard must call close_result.confirms_obstruction() in its own condition")
+
+    if not sim_lifts:
         reasons.append("SimOmpl post-close branch must call collision-aware execute_lift(ctx, true, ...)")
+    elif len(sim_lifts) > 1:
+        reasons.append(
+            "run_post_close_pick() must contain exactly one SimOmpl lift block (found {})".format(len(sim_lifts))
+        )
     else:
-        if "execute_lift(ctx, true," not in sim_lift["body"]:
+        sim = sim_lifts[0]
+        if "execute_lift(ctx, true," not in sim["body"]:
             reasons.append("SimOmpl post-close branch must call collision-aware execute_lift(ctx, true, ...)")
-        if "execute_lift(ctx, false," in sim_lift["body"]:
+        if "execute_lift(ctx, false," in sim["body"]:
             reasons.append("SimOmpl post-close branch must not call collision-disabled execute_lift(ctx, false, ...)")
+
+    if not hw_lifts:
+        reasons.append("hardware compatibility branch must be guarded by ExecutionProfile::Hardware")
+    elif len(hw_lifts) > 1:
+        reasons.append(
+            "run_post_close_pick() must contain exactly one Hardware lift block (found {})".format(len(hw_lifts))
+        )
+    else:
+        hw = hw_lifts[0]
+        if "execute_lift(ctx, false," not in hw["body"]:
+            reasons.append("hardware compatibility branch must call collision-disabled execute_lift(ctx, false, ...)")
+        if "execute_lift(ctx, true," in hw["body"]:
+            reasons.append("hardware compatibility branch must not call collision-aware execute_lift(ctx, true, ...)")
+
+    # F3.1 structural containment: every execute_lift call must lie within one
+    # of the two accepted profile lift blocks.  Only meaningful when exactly one
+    # of each exists (otherwise the count reasons already fail).
+    if len(sim_lifts) == 1 and len(hw_lifts) == 1:
+        accepted = ((sim_lifts[0]["start"], sim_lifts[0]["end"]), (hw_lifts[0]["start"], hw_lifts[0]["end"]))
+        for call in re.finditer(r"execute_lift\s*\(", body):
+            offset = call.start()
+            if not any(start <= offset < end for start, end in accepted):
+                reasons.append(
+                    "execute_lift(...) call in run_post_close_pick() is not contained by an accepted profile lift block"
+                )
+                break
 
 
 def _check_scene_and_collision_safety(

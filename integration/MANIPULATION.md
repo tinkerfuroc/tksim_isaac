@@ -363,6 +363,25 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 2 fix round 3): Closed the residual
+  semantic false-passes.  `validation/integrated_static_contracts.py`
+  `_bind_run_post_close_pick` aggregates every SimOmpl/Hardware profile block
+  and validates the whole set (exactly one obstruction guard, one SimOmpl lift
+  block, one Hardware lift block; per-block polarity; offset-based structural
+  containment of every `execute_lift(...)` call by an accepted profile lift
+  block), so a decoy block after a violating one can no longer pass.  Result
+  builders are checked by the exact assignment form
+  `\bresult\s*->\s*<field>\s*=(?!=)` over sanitized executable code; a
+  differently-named member, a read, or a comparison never satisfies the write
+  contract.  `_bind_bundle_artifact` binds a non-simulator artifact by its
+  semantic source key plus exact path identity (bundle absolute path ==
+  `<repo_path>/<path_relative>`, overlay workspace path ==
+  `src/<repo dir>/<path_relative>`, recorded digest == verified source record);
+  simulator-local acceptance is restricted to the declared overlay path under
+  `outputs/` or `artifacts/`, and a shadow file with matching bytes at an
+  undeclared path never reclassifies.  The Task 2 report records only
+  independently reproduced test evidence.
+
 - 2026-08-02 (integrated qualification Task 2 fix round 2): Strengthened the
   semantic source checks.  `validation/integrated_static_contracts.py` replaces
   the comment-stripped string-presence C++ scans with a deliberately scoped
