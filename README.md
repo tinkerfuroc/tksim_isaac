@@ -314,6 +314,80 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 5): Added the Stage-D execution
+  interruption gates to the same ROS-lazy executor.  A closed ROS-free
+  `stage_d_dispatch` validates exactly the six Stage-D scenarios
+  (`qualification-moveit-execute-joint`, `-execute-pose`, `-cartesian-retreat`,
+  `-gripper`, `-cancel`, `-safety`) for exact id, `integrated.stage == "D"`,
+  `execution_profile == "sim_ompl"`, exact declared polarity (`positive` /
+  `cancel` / `safety`), the exact configured `expected_physical` list, and
+  `forbidden_endpoints == ["/isaac_joint_commands"]`, failing closed before any
+  goal on unknown/C/E-stage/malformed/mutated scenarios.  The mandatory split
+  path (`run_execute_sequence`) sends exactly one OMPL plan-only `/move_action`
+  goal (`xarm7`, `ompl`, attempts 3, allowed time 3.0, `plan_only=True`,
+  `look_around=False`, `replan=False`), requires a non-empty
+  `planned_trajectory`, assigns it unchanged to exactly one
+  `moveit_msgs/action/ExecuteTrajectory.Goal` (`build_execute_trajectory_goal`;
+  canonical ROS-serialized digest unchanged before/after), sends it to
+  `/execute_trajectory`, and records distinct valid 16-byte plan/execute UUIDs.
+  Terminal action statuses use action_msgs constants (SUCCEEDED=4, CANCELED=5,
+  ABORTED=6; unknown/malformed never pass) via `_execute_status_name`.  FJT
+  observation is truthful: only the real
+  `/xarm7_traj_controller/follow_joint_trajectory/_action/status` subscription
+  (`action_msgs/msg/GoalStatusArray`, RELIABLE/TRANSIENT_LOCAL/depth 1) exists —
+  no `_action/goal` topic (the goal travels over the `send_goal` service) — with
+  a bounded cache, and the executor requires an injected
+  `fjt_transaction_provider` returning real controller-transaction evidence
+  (endpoint exactly the FJT endpoint, normalized FJT goal UUID, canonical
+  trajectory digest equal to the unchanged ExecuteTrajectory digest, finite
+  timestamp/sequence, real source) that joins to the newest status entry;
+  missing/stale/mismatched/extra/malformed/provider-exception evidence makes the
+  D attempt `evidence-invalid`.  `run_cancel_sequence` calls
+  `cancel_goal_async()` only on the ExecuteTrajectory `ClientGoalHandle` (never
+  the completed MoveGroup planning handle), records exactly the execution UUID in
+  `goals_canceling`, requires terminal CANCELED (5), requires no active joined
+  FJT status before `quiescent=true`, and never sends a later stage.
+  `run_safety_sequence` publishes operator True via the real
+  `/sim/safety/operator` publisher, waits bounded for safety-stop True, requires
+  the old ExecuteTrajectory terminal status ABORTED (6), requires
+  `safety_stop_frames` consecutive fresh joint-state velocity frames bounded by
+  `safety_stop_velocity_rad_s` (0.02), publishes operator False only after the
+  effective-stop predicate, requires bounded post-clear stability, and sends no
+  replacement/resume goal.  `run_cartesian_retreat` uses an injected
+  `current_tcp_pose_provider` (no embedded TF listener), derives exactly
+  `RETREAT_DISTANCE_M` (0.10 m) along `+Z` in `base_link` preserving orientation
+  (`derive_retreat_target_pose`), and sends one collision-aware
+  `/cartesian_move_action` goal with `command_gateway_bypassed=false` as a
+  routing assertion.  `run_gripper_sequence` sends open (0.0) then close (0.85)
+  `control_msgs/action/GripperCommand` goals to `/xarm_gripper/gripper_action`
+  with max effort 10.0 (`build_gripper_goal`) and `native_action=true`.  A
+  fail-closed `run_pick_place_negative` stub covers the two Gate-E cancellation
+  identities (`cancel-approach`/`cancel-transport`) with `release_stage_started=false`,
+  `released=false`, and zero goals, rejecting all others.  D-stage artifacts use
+  Task 4's transactional/fail-dominant mechanics with a separate D record shape:
+  `diagnostic_only=true`, `physical_verdict=None`, fail-dominant
+  `status`/`planner_status` split, truthful `execute_trajectory_goal_sent` /
+  `controller_goal_sent`, plan/execute/goals-canceling UUIDs, planned/executed/
+  FJT trajectory digests, FJT goal UUID/status, execute result status/string,
+  event log, elapsed, and `isaac_joint_commands_published=false`; required
+  write/finalization failures downgrade every authoritative D artifact.  The
+  journal uses scenario-specific D diagnostic event orders (execute/pose:
+  `fixture-ready → execution-start → execution-terminal → teardown`; retreat:
+  `fixture-ready → retreat-start → retreat-terminal → teardown`; gripper:
+  `fixture-ready → gripper-open-terminal → gripper-close-terminal → teardown`;
+  cancel: `fixture-ready → execution-start → cancel-requested → quiescent →
+  teardown`; safety: `fixture-ready → execution-start → effective-stop →
+  operator-clear → quiescent → teardown`) with the eight Task-4 forbidden
+  manipulation events unchanged, the Task-3 graph projection byte-identical, and
+  no attach/detach/release event in Gate D.  Humble suite expanded to 74 tests
+  (split-path unchanged digest + distinct UUIDs, real FJT status QoS/type, no
+  `_action/goal` subscription, gripper/cartesian goal construction, stubbed
+  execute/cancel/safety/retreat/gripper flows, Gate-E stub zero traffic); the
+  pure suite expanded to 97 tests (Stage-D dispatch mutations, status mapping,
+  UUID normalization, retreat derivation, Gate-E stub, D-vs-C journal order,
+  unchanged graph projection).  No build is required because no
+  package-installed path changed.
+
 - 2026-08-02 (integrated qualification Task 4): Added the ROS-lazy Gate-C OMPL
   plan-only executor.  `validation/integrated_gate_executor.py` is importable
   under the simulator CPython 3.12 venv without `rclpy` or any generated ROS

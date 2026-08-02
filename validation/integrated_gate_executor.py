@@ -40,6 +40,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid as _uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -118,6 +119,103 @@ GATE_C_FORBIDDEN_EVENTS: tuple[str, ...] = (
     "released-settled",
     "task-cleanup",
 )
+#: The eight Task-4 forbidden manipulation events apply unchanged to every D
+#: journal; no attach/detach/release event is ever emitted in Gate D.
+D_FORBIDDEN_EVENTS: tuple[str, ...] = GATE_C_FORBIDDEN_EVENTS
+
+#: Stage D is exactly these six scenarios.
+STAGE_D_SCENARIOS: tuple[str, ...] = (
+    "qualification-moveit-execute-joint",
+    "qualification-moveit-execute-pose",
+    "qualification-moveit-cartesian-retreat",
+    "qualification-moveit-gripper",
+    "qualification-moveit-cancel",
+    "qualification-moveit-safety",
+)
+
+#: D handler kind per exact scenario id.
+STAGE_D_KIND: Mapping[str, str] = {
+    "qualification-moveit-execute-joint": "execute-joint",
+    "qualification-moveit-execute-pose": "execute-pose",
+    "qualification-moveit-cartesian-retreat": "retreat",
+    "qualification-moveit-gripper": "gripper",
+    "qualification-moveit-cancel": "cancel",
+    "qualification-moveit-safety": "safety",
+}
+
+#: Exact declared polarity per D scenario.
+STAGE_D_EXPECTED_POLARITY: Mapping[str, str] = {
+    "qualification-moveit-execute-joint": "positive",
+    "qualification-moveit-execute-pose": "positive",
+    "qualification-moveit-cartesian-retreat": "positive",
+    "qualification-moveit-gripper": "positive",
+    "qualification-moveit-cancel": "cancel",
+    "qualification-moveit-safety": "safety",
+}
+
+#: Exact declared ``expected_physical`` list per D scenario.
+STAGE_D_EXPECTED_PHYSICAL: Mapping[str, tuple[str, ...]] = {
+    "qualification-moveit-execute-joint": ("joint_execution_tracks", "terminal_success"),
+    "qualification-moveit-execute-pose": ("pose_execution_reaches_tcp", "terminal_success"),
+    "qualification-moveit-cartesian-retreat": ("cartesian_retreat_collision_aware", "terminal_success"),
+    "qualification-moveit-gripper": ("gripper_travel_predicates", "terminal_success"),
+    "qualification-moveit-cancel": ("execute_goal_canceled", "quiescent_after_cancel", "no_later_stage"),
+    "qualification-moveit-safety": ("safety_effective_stop", "target_frozen", "no_auto_resume"),
+}
+
+#: Scenario-specific D journal diagnostic event order (Task 3 graph projection
+#: stays unchanged; these labels are diagnostics, not physical truth).
+STAGE_D_REQUIRED_EVENT_ORDER: Mapping[str, tuple[str, ...]] = {
+    "execute-joint": ("fixture-ready", "execution-start", "execution-terminal", "teardown"),
+    "execute-pose": ("fixture-ready", "execution-start", "execution-terminal", "teardown"),
+    "retreat": ("fixture-ready", "retreat-start", "retreat-terminal", "teardown"),
+    "gripper": ("fixture-ready", "gripper-open-terminal", "gripper-close-terminal", "teardown"),
+    "cancel": ("fixture-ready", "execution-start", "cancel-requested", "quiescent", "teardown"),
+    "safety": ("fixture-ready", "execution-start", "effective-stop", "operator-clear", "quiescent", "teardown"),
+}
+
+#: ExecuteTrajectory / FJT split-path endpoints.
+EXECUTE_TRAJECTORY_ENDPOINT = "/execute_trajectory"
+FJT_ENDPOINT = "/xarm7_traj_controller/follow_joint_trajectory"
+FJT_STATUS_TOPIC = "/xarm7_traj_controller/follow_joint_trajectory/_action/status"
+GRIPPER_ENDPOINT = "/xarm_gripper/gripper_action"
+CARTESIAN_MOVE_ENDPOINT = "/cartesian_move_action"
+
+#: ``moveit_msgs/action/ExecuteTrajectory`` terminal action status ints
+#: (``action_msgs/msg/GoalStatus``).  Unknown/malformed statuses never pass.
+EXECUTE_STATUS_SUCCEEDED = 4
+EXECUTE_STATUS_CANCELED = 5
+EXECUTE_STATUS_ABORTED = 6
+_EXECUTE_STATUS_NAMES: Mapping[int, str] = {
+    EXECUTE_STATUS_SUCCEEDED: "succeeded",
+    EXECUTE_STATUS_CANCELED: "canceled",
+    EXECUTE_STATUS_ABORTED: "aborted",
+}
+
+#: Native gripper contract mirrors current production behavior; Task 5
+#: qualification constants (config/scenario files are unchanged).
+GRIPPER_OPEN_POSITION = 0.0
+GRIPPER_CLOSE_POSITION = 0.85
+GRIPPER_MAX_EFFORT = 10.0
+
+#: Cartesian retreat geometry: top-down grasp, exactly ``RETREAT_DISTANCE_M``
+#: along the declared ``base_link`` axis, preserving orientation
+#: (``object_center_z=0.64``, ``grasp_tcp_z=0.72`` contract).
+RETREAT_AXIS = "+z"
+RETREAT_DISTANCE_M = 0.10
+
+#: Bound on the cached FJT status entries retained by the executor.
+FJT_STATUS_CACHE_LIMIT = 64
+
+#: Gate-E negative identities for the fail-closed ``run_pick_place_negative``
+#: stub (later E-stage task replaces the stub; Task 5 never pre-empts Gate E).
+STAGE_E_CANCEL_NEGATIVES: Mapping[str, tuple[str, ...]] = {
+    "qualification-pick-place-cancel-approach": ("approach-start", "cancel"),
+    "cancel-approach": ("approach-start", "cancel"),
+    "qualification-pick-place-cancel-transport": ("approach-start", "lift-complete", "cancel"),
+    "cancel-transport": ("approach-start", "lift-complete", "cancel"),
+}
+
 TASK_NAMESPACE = "pick_and_place/"
 TARGET_OBJECT_ID = "pick_and_place/object_mesh"
 
@@ -1149,6 +1247,283 @@ def stage_c_dispatch(
     }
 
 
+def _normalize_goal_uuid(raw: object) -> str | None:
+    """Normalize a goal-handle UUID to lowercase 16-byte hex, else ``None``.
+
+    rclpy ``ClientGoalHandle.goal_id`` is the 16-byte ``unique_identifier_msgs``
+    bytes; a normalized lowercase hex string is the canonical qualification
+    identity.  Malformed/absent UUIDs never pass a split-path contract.
+    """
+    if isinstance(raw, bool):
+        return None
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            return _uuid.UUID(bytes=bytes(raw)).hex
+        if isinstance(raw, str):
+            return _uuid.UUID(str(raw)).hex
+        candidate = getattr(raw, "uuid", None)
+        if isinstance(candidate, bytes):
+            return _uuid.UUID(bytes=bytes(candidate)).hex
+        if isinstance(candidate, str):
+            return _uuid.UUID(str(candidate)).hex
+        return None
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _valid_goal_uuid(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 32 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _execute_status_name(status: object) -> str:
+    """Map an ``action_msgs/msg/GoalStatus`` int to the canonical string.
+
+    Only the three ExecuteTrajectory terminal statuses are accepted:
+    SUCCEEDED=4, CANCELED=5, ABORTED=6.  Unknown/malformed statuses raise so a
+    caller can never pass on an unapproved result.
+    """
+    if isinstance(status, bool) or not isinstance(status, int):
+        raise ValueError(f"execute status must be an integer, found {status!r}")
+    name = _EXECUTE_STATUS_NAMES.get(status)
+    if name is None:
+        raise ValueError(f"unknown ExecuteTrajectory terminal status: {status}")
+    return name
+
+
+def _arm_velocity_within_limit(frames: object, limit: object) -> bool:
+    """True when every measured frame's arm-joint velocities are bounded.
+
+    Each *frame* is a sequence of absolute arm-joint (``joint1..joint7``)
+    velocities in rad/s.  *limit* is the configured
+    ``safety_stop_velocity_rad_s``.  A frame with non-finite velocity, the wrong
+    arity, or a magnitude above the limit fails the effective-stop predicate.
+    """
+    try:
+        velocity_limit = float(limit)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(velocity_limit) or velocity_limit < 0.0:
+        return False
+    if not isinstance(frames, Sequence) or isinstance(frames, (str, bytes)):
+        return False
+    for frame in frames:
+        if not isinstance(frame, Sequence) or isinstance(frame, (str, bytes)):
+            return False
+        if len(frame) != 7:
+            return False
+        for value in frame:
+            try:
+                magnitude = abs(float(value))
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(magnitude) or magnitude > velocity_limit:
+                return False
+    return True
+
+
+def derive_retreat_target_pose(
+    source_pose: Mapping[str, object],
+    *,
+    distance_m: object,
+    axis: str,
+) -> dict[str, object]:
+    """Derive the deterministic ``base_link`` retreat target from a TCP pose.
+
+    Moves the observed TCP pose exactly *distance_m* along the declared
+    *axis* (``+z`` for the top-down grasp geometry) preserving orientation.
+    Fails closed on missing/wrong-frame/non-finite/invalid-quaternion input so
+    a missing or stale provider can never produce a goal.
+    """
+    xyz = source_pose.get("xyz")
+    quaternion = source_pose.get("quaternion_xyzw")
+    frame_id = source_pose.get("frame_id")
+    if frame_id not in (None, "base_link"):
+        raise ValueError("retreat source pose must use base_link")
+    if not (
+        isinstance(xyz, (list, tuple))
+        and len(xyz) == 3
+        and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in xyz)
+    ):
+        raise ValueError("retreat source pose xyz must be three finite values")
+    if not (
+        isinstance(quaternion, (list, tuple))
+        and len(quaternion) == 4
+        and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in quaternion)
+    ):
+        raise ValueError("retreat source pose quaternion_xyzw must be four finite values")
+    norm = math.sqrt(sum(float(value) ** 2 for value in quaternion))
+    if abs(norm - 1.0) > 1.0e-3:
+        raise ValueError("retreat source quaternion must be normalized within 1e-3")
+    try:
+        distance = float(distance_m)
+    except (TypeError, ValueError):
+        raise ValueError("retreat distance must be a finite number")
+    if not math.isfinite(distance) or distance < 0.0:
+        raise ValueError("retreat distance must be a finite non-negative number")
+    if axis not in ("+x", "-x", "+y", "-y", "+z", "-z"):
+        raise ValueError(f"retreat axis must be one of +x/-x/+y/-y/+z/-z, found {axis!r}")
+    offset = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0),
+              "+z": (0, 0, 1), "-z": (0, 0, -1)}[axis]
+    return {
+        "frame_id": "base_link",
+        "xyz": [
+            float(xyz[0]) + distance * offset[0],
+            float(xyz[1]) + distance * offset[1],
+            float(xyz[2]) + distance * offset[2],
+        ],
+        "quaternion_xyzw": [float(value) for value in quaternion],
+    }
+
+
+def run_pick_place_negative(scenario_id: str) -> dict[str, object]:
+    """Fail-closed Gate-E negative stub for the two cancellation identities.
+
+    Preserves the brief's observable fake contract for later replacement without
+    pre-empting Task 6/Gate E: always records ``release_stage_started=false``,
+    ``released=false``, and zero ROS goals sent.  Rejects all other identities.
+    """
+    if not isinstance(scenario_id, str) or not scenario_id:
+        raise ValueError("scenario_id must be a nonempty string")
+    events = STAGE_E_CANCEL_NEGATIVES.get(scenario_id)
+    if events is None:
+        raise ValueError(f"unsupported Gate-E negative scenario: {scenario_id}")
+    return {
+        "scenario_id": scenario_id,
+        "events": list(events),
+        "release_stage_started": False,
+        "released": False,
+        "goals_sent": 0,
+        "diagnostic_only": True,
+        "isaac_joint_commands_published": False,
+    }
+
+
+def stage_d_dispatch(
+    scenario_id: str,
+    *,
+    scenario: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate a Stage-D scenario and return a ROS-free dispatch spec.
+
+    Requires the exact scenario id, ``integrated.stage == "D"``,
+    ``integrated.execution_profile == "sim_ompl"``, the exact declared polarity
+    (``positive`` / ``cancel`` / ``safety``), the exact configured
+    ``expected_physical`` list for that scenario, and
+    ``forbidden_endpoints == ["/isaac_joint_commands"]``.  Unknown, C/E-stage,
+    malformed, or mutated scenarios fail closed before any goal is created or
+    sent.  Returns the D handler ``kind``, the declared polarity/expected
+    physical list, the seven-joint ``Q_OUTBOUND`` for execute-joint, and the
+    declared ``sim_fixture/public_target`` pose for execute-pose.
+    """
+    if not isinstance(scenario_id, str) or not scenario_id:
+        raise ValueError("scenario_id must be a nonempty string")
+    if scenario.get("id") != scenario_id:
+        raise ValueError("scenario_id does not match the executor scenario mapping")
+    integrated = _as_mapping(scenario.get("integrated"))
+    if integrated.get("stage") != "D":
+        raise ValueError("scenario integrated.stage must be D for Gate D")
+    if integrated.get("execution_profile") != INTEGRATED_EXECUTION_PROFILE:
+        raise ValueError("scenario integrated.execution_profile must be sim_ompl")
+    if scenario_id not in STAGE_D_SCENARIOS:
+        raise ValueError(f"scenario {scenario_id} is not one of the Stage-D scenarios")
+
+    kind = STAGE_D_KIND[scenario_id]
+    expected_polarity = STAGE_D_EXPECTED_POLARITY[scenario_id]
+    acceptance = _as_mapping(integrated.get("acceptance"))
+    declared_polarity = acceptance.get("polarity")
+    if declared_polarity != expected_polarity:
+        raise ValueError(
+            f"scenario integrated.acceptance.polarity must be {expected_polarity!r}, "
+            f"found {declared_polarity!r}"
+        )
+    declared_physical = integrated.get("expected_physical")
+    expected_physical = list(STAGE_D_EXPECTED_PHYSICAL[scenario_id])
+    if not (
+        isinstance(declared_physical, (list, tuple))
+        and not isinstance(declared_physical, (str, bytes))
+        and list(declared_physical) == expected_physical
+    ):
+        raise ValueError(
+            f"scenario integrated.expected_physical must be exactly {expected_physical}, "
+            f"found {declared_physical!r}"
+        )
+    forbidden = integrated.get("forbidden_endpoints")
+    if not (
+        isinstance(forbidden, (list, tuple))
+        and not isinstance(forbidden, (str, bytes))
+        and list(forbidden) == [ISAAC_COMMAND_TOPIC]
+    ):
+        raise ValueError(
+            f"scenario integrated.forbidden_endpoints must be exactly "
+            f"[{ISAAC_COMMAND_TOPIC}], found {forbidden!r}"
+        )
+
+    target_pose: dict[str, object] | None = None
+    if kind == "execute-pose":
+        declaration = _as_mapping(
+            scenario.get("planning_scene_declaration") or scenario.get("planning_scene")
+        )
+        objects = declaration.get("objects")
+        if not isinstance(objects, (list, tuple)):
+            raise ValueError("scenario planning_scene has no objects list")
+        target_source_id = declaration.get("target_source_id")
+        target = next(
+            (
+                record
+                for record in objects
+                if isinstance(record, Mapping) and record.get("id") == target_source_id
+            ),
+            None,
+        )
+        if target is None:
+            raise ValueError("scenario declaration has no target object matching target_source_id")
+        pose = _as_mapping(target.get("pose"))
+        xyz = pose.get("xyz")
+        quaternion = pose.get("quaternion_xyzw")
+        if not (
+            isinstance(xyz, (list, tuple))
+            and len(xyz) == 3
+            and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in xyz)
+        ):
+            raise ValueError("scenario target pose xyz must be three finite values")
+        if not (
+            isinstance(quaternion, (list, tuple))
+            and len(quaternion) == 4
+            and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in quaternion)
+        ):
+            raise ValueError("scenario target pose quaternion_xyzw must be four finite values")
+        norm = math.sqrt(sum(float(value) ** 2 for value in quaternion))
+        if abs(norm - 1.0) > 1.0e-3:
+            raise ValueError("scenario target pose quaternion must be normalized within 1e-3")
+        target_pose = {
+            "xyz": [float(value) for value in xyz],
+            "quaternion_xyzw": [float(value) for value in quaternion],
+        }
+
+    return {
+        "scenario_id": scenario_id,
+        "kind": kind,
+        "polarity": expected_polarity,
+        "expected_physical": expected_physical,
+        "joints": list(Q_OUTBOUND) if kind == "execute-joint" else None,
+        "target_pose": target_pose,
+        "forbidden_endpoints": [ISAAC_COMMAND_TOPIC],
+    }
+
+
+def _d_stage_event_order(scenario: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the scenario-specific D journal event order, else Gate C's."""
+    integrated = _as_mapping(scenario.get("integrated"))
+    if integrated.get("stage") != "D":
+        return GATE_C_REQUIRED_EVENT_ORDER
+    kind = STAGE_D_KIND.get(str(scenario.get("id", "")))
+    if kind is None:
+        return GATE_C_REQUIRED_EVENT_ORDER
+    return STAGE_D_REQUIRED_EVENT_ORDER.get(kind, GATE_C_REQUIRED_EVENT_ORDER)
+
+
 # ---------------------------------------------------------------------------
 # ROS-lazy goal builders (import generated messages only at call time)
 # ---------------------------------------------------------------------------
@@ -1308,6 +1683,83 @@ def build_place_goal(
     return goal
 
 
+def build_execute_trajectory_goal(planned_trajectory):
+    """Construct exactly one ``moveit_msgs/action/ExecuteTrajectory.Goal``.
+
+    The returned ``planned_trajectory`` is assigned directly to
+    ``goal.trajectory`` without mutation/replanning/round-trip reconstruction;
+    the caller records the canonical ROS-serialized trajectory digest before and
+    after assignment and requires them to match.  A ``None`` or empty trajectory
+    fails closed.
+    """
+    from moveit_msgs.action import ExecuteTrajectory
+
+    if planned_trajectory is None:
+        raise ValueError("ExecuteTrajectory goal requires a non-empty planned trajectory")
+    points = getattr(
+        getattr(planned_trajectory, "joint_trajectory", None), "points", None
+    )
+    if not isinstance(points, (list, tuple)) or not points:
+        raise ValueError("ExecuteTrajectory goal requires a non-empty planned trajectory")
+    goal = ExecuteTrajectory.Goal()
+    goal.trajectory = planned_trajectory
+    return goal
+
+
+def build_gripper_goal(position, *, max_effort):
+    """Construct one native ``control_msgs/action/GripperCommand`` goal.
+
+    Task-5 qualification constants: open position ``0.0``, close position
+    ``0.85``, max effort ``10.0``.  A non-finite position/effort fails closed.
+    """
+    from control_msgs.action import GripperCommand
+
+    try:
+        position_value = float(position)
+        effort_value = float(max_effort)
+    except (TypeError, ValueError):
+        raise ValueError("gripper position and max effort must be finite numbers")
+    if not math.isfinite(position_value) or not math.isfinite(effort_value):
+        raise ValueError("gripper position and max effort must be finite numbers")
+    goal = GripperCommand.Goal()
+    goal.command.position = position_value
+    goal.command.max_effort = effort_value
+    return goal
+
+
+def build_cartesian_move_goal(target_pose, *, env_points=None):
+    """Construct one ``tinker_arm_msgs/action/CartesianMove`` goal.
+
+    ``target_pose`` is a ``geometry_msgs/msg/Pose`` in ``base_link``.  The goal
+    carries the collision-aware production path (``env_points`` PointCloud2 when
+    supplied).  A non-``base_link`` header (when a PoseStamped is supplied) or a
+    non-finite target fails closed.
+    """
+    from geometry_msgs.msg import Pose
+    from sensor_msgs.msg import PointCloud2
+    from tinker_arm_msgs.action import CartesianMove
+
+    if target_pose is None:
+        raise ValueError("CartesianMove goal requires a target pose")
+    pose = getattr(target_pose, "pose", target_pose)
+    if getattr(pose, "position", None) is None:
+        raise ValueError("CartesianMove goal requires a real Pose target")
+    _validate_quaternion(pose.orientation)
+    header_frame = getattr(target_pose, "header", None)
+    if header_frame is not None and getattr(header_frame, "frame_id", "base_link") != "base_link":
+        raise ValueError("cartesian retreat target must use base_link")
+    goal = CartesianMove.Goal()
+    if isinstance(target_pose, Pose):
+        goal.target_pose = target_pose
+    else:
+        goal.target_pose = pose
+    # The generated CartesianMove goal requires a PointCloud2 (never None) for
+    # the collision-aware env_points field; an empty cloud is the neutral
+    # default when no environment cloud is supplied.
+    goal.env_points = env_points if env_points is not None else PointCloud2()
+    return goal
+
+
 # ---------------------------------------------------------------------------
 # Live ROS-lazy executor (imported/instantiated only under sourced Humble)
 # ---------------------------------------------------------------------------
@@ -1329,6 +1781,7 @@ def _load_ros() -> dict[str, Any]:
     if configured_rmw is None:
         os.environ["RMW_IMPLEMENTATION"] = RMW_IMPLEMENTATION
     import rclpy
+    from action_msgs.msg import GoalStatusArray
     from control_msgs.action import FollowJointTrajectory, GripperCommand
     from controller_manager_msgs.srv import (
         ConfigureController,
@@ -1391,6 +1844,16 @@ def _joint_state_qos(ros: Mapping[str, Any]) -> Any:
         depth=10,
         reliability=ros["ReliabilityPolicy"].RELIABLE,
         durability=ros["DurabilityPolicy"].VOLATILE,
+    )
+
+
+def _fjt_status_qos(ros: Mapping[str, Any]) -> Any:
+    """Stock Humble action status QoS (``rcl_action/default_qos.h``):
+    RELIABLE / TRANSIENT_LOCAL / depth 1."""
+    return ros["QoSProfile"](
+        depth=1,
+        reliability=ros["ReliabilityPolicy"].RELIABLE,
+        durability=ros["DurabilityPolicy"].TRANSIENT_LOCAL,
     )
 
 
@@ -1519,8 +1982,8 @@ class IntegratedGateExecutor:
                 target_object_id=TARGET_OBJECT_ID,
                 expected_attach_link=contract["link_tcp"],
                 expected_touch_links=contract["touch_links"],
-                required_event_order=GATE_C_REQUIRED_EVENT_ORDER,
-                forbidden_events=GATE_C_FORBIDDEN_EVENTS,
+                required_event_order=_d_stage_event_order(self.scenario),
+                forbidden_events=D_FORBIDDEN_EVENTS,
                 jsonl_path=self.attempt_dir / "planning-scene.jsonl",
             )
 
@@ -1531,6 +1994,8 @@ class IntegratedGateExecutor:
         self._fixture_payload_invalid = False
         self._latest_joint_state: Any = None
         self._latest_safety_stop: Any = None
+        self._joint_velocity_frames: list[list[float]] = []
+        self._fjt_status_cache: list[dict[str, object]] = []
         self._scene_sequence = 0
         self._last_join_key: tuple[int, float] | None = None
 
@@ -1614,6 +2079,18 @@ class IntegratedGateExecutor:
             self._on_safety_stop,
             _fixture_qos(ros),
         )
+        # D-stage FJT status observation.  ROS 2 actions do NOT publish an
+        # ``_action/goal`` topic; the goal travels over the ``send_goal``
+        # service.  Only the real ``_action/status`` subscription exists, with
+        # the stock Humble action status QoS (RELIABLE/TRANSIENT_LOCAL/depth 1).
+        # This subscription stays outside the Task-3 three-topic/two-service
+        # journal graph projection.
+        self.node.create_subscription(
+            ros["GoalStatusArray"],
+            FJT_STATUS_TOPIC,
+            self._on_fjt_status,
+            _fjt_status_qos(ros),
+        )
 
     def _make_scene_callback(self, source: str):
         def callback(message: Any) -> None:
@@ -1644,9 +2121,58 @@ class IntegratedGateExecutor:
 
     def _on_joint_state(self, message: Any) -> None:
         self._latest_joint_state = message
+        frame = self._arm_velocity_frame(message)
+        if frame is not None:
+            self._joint_velocity_frames.append(frame)
+            limit = int(self._thresholds().get("safety_stop_frames", 5))
+            if limit < 1:
+                limit = 1
+            if len(self._joint_velocity_frames) > limit:
+                del self._joint_velocity_frames[: len(self._joint_velocity_frames) - limit]
+
+    @staticmethod
+    def _arm_velocity_frame(message: Any) -> list[float] | None:
+        """Extract the seven arm-joint absolute velocities from a JointState."""
+        names = list(getattr(message, "name", ()))
+        velocities = list(getattr(message, "velocity", ()))
+        by_name = dict(zip(names, velocities))
+        try:
+            return [float(by_name[f"joint{index}"]) for index in range(1, 8)]
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def _on_safety_stop(self, message: Any) -> None:
         self._latest_safety_stop = message
+
+    def _on_fjt_status(self, message: Any) -> None:
+        """Cache bounded, well-formed ``(goal_uuid, status)`` FJT status entries.
+
+        Only well-formed entries with a valid lowercase 16-byte goal UUID and a
+        strict integer status are retained; malformed entries are dropped.  The
+        cache is bounded (the newest ``FJT_STATUS_CACHE_LIMIT`` entries) so a
+        live controller cannot grow memory without bound.
+        """
+        status_list = getattr(message, "status_list", None)
+        if not isinstance(status_list, (list, tuple)):
+            return
+        for status_entry in status_list:
+            goal_info = getattr(status_entry, "goal_info", None)
+            goal_id = getattr(goal_info, "goal_id", None)
+            goal_uuid = _normalize_goal_uuid(goal_id)
+            status = getattr(status_entry, "status", None)
+            if goal_uuid is None or isinstance(status, bool) or not isinstance(status, int):
+                continue
+            self._fjt_status_cache.append(
+                {"goal_uuid": goal_uuid, "status": int(status), "received": float(time.monotonic())}
+            )
+        if len(self._fjt_status_cache) > FJT_STATUS_CACHE_LIMIT:
+            del self._fjt_status_cache[: len(self._fjt_status_cache) - FJT_STATUS_CACHE_LIMIT]
+
+    def _fjt_status_entries(self) -> list[dict[str, object]]:
+        return list(self._fjt_status_cache)
+
+    def _newest_fjt_status(self) -> dict[str, object] | None:
+        return self._fjt_status_cache[-1] if self._fjt_status_cache else None
 
     def _normalize_planning_scene(self, message: Any, *, source: str) -> dict[str, object]:
         ros = self.ros
@@ -2253,6 +2779,1721 @@ class IntegratedGateExecutor:
                 scenario_id, "unexpected-exception", [str(exc)]
             )
 
+    # -- Gate D ---------------------------------------------------------------
+    #
+    # D-stage scenarios reuse Task 4's required attempt paths and transactional
+    # fail-dominant mechanics, with a separate D-stage record shape (never
+    # changing Gate-C bytes).  Every D attempt stays ``diagnostic_only=true``
+    # and ``isaac_joint_commands_published=false``; physical verdicts remain
+    # verifier-owned.
+
+    def _evidence_invalid_d(
+        self, scenario_id: str, reason_code: str, reasons: Sequence[str]
+    ) -> dict[str, object]:
+        """D-stage evidence-invalid record with the D schema and durable rows."""
+        record: dict[str, object] = {
+            "scenario_id": scenario_id,
+            "stage": "D",
+            "diagnostic_only": True,
+            "physical_verdict": None,
+            "status": "evidence-invalid",
+            "reason_code": reason_code,
+            "reasons": list(reasons),
+            "execute_trajectory_goal_sent": False,
+            "controller_goal_sent": False,
+            "isaac_joint_commands_published": False,
+        }
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "integrated-execution.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "event": "gate-d",
+                    "stage": "D",
+                    "status": "evidence-invalid",
+                    "reason_code": reason_code,
+                    "reasons": list(reasons),
+                    "diagnostic_only": True,
+                    "execute_trajectory_goal_sent": False,
+                    "controller_goal_sent": False,
+                    "isaac_joint_commands_published": False,
+                    "timestamp": float(time.monotonic()),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            self._write_json_atomic(
+                self.attempt_dir / "integrated-execution.json",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "stage": "D",
+                    "diagnostic_only": True,
+                    "physical_verdict": None,
+                    "status": "evidence-invalid",
+                    "reason_code": reason_code,
+                    "reasons": list(reasons),
+                    "execute_trajectory_goal_sent": False,
+                    "controller_goal_sent": False,
+                    "isaac_joint_commands_published": False,
+                },
+            )
+        except Exception:
+            pass
+        # Fail-dominant D journal: when the attempt recorded fixture-ready (the
+        # journal holds records), emit the canonical failure planning-scene.json.
+        # A pre-fixture-ready failure leaves the journal empty; finalize_failure
+        # rejects that and the helper swallows it, matching Gate C's no-scene
+        # behavior.
+        self._d_journal_failure(reason=reason_code, graph_diagnosis="D diagnostic journal")
+        return record
+
+    def _d_journal_pass(self, *, scenario_id: str, execute_error: str | None = None) -> str:
+        """Finalize the D journal on the pass path with the observed graph.
+
+        Returns ``"validated"`` on success or ``"invalid: <reason>"``; a failed
+        finalize never leaves a dangling journal and writes the canonical failure
+        planning-scene.json instead (the caller then downgrades the attempt).
+        """
+        try:
+            graph = self._graph_observation()
+            if graph is None:
+                raise ValueError("observed graph evidence is unavailable")
+            projection = build_journal_graph_projection(
+                fixture_payload=self._fixture_payload_for_graph(),
+                observed_graph=graph,
+            )
+            self.journal.finalize(
+                "diagnostic-pass",
+                graph=projection,
+                json_path=self.attempt_dir / "planning-scene.json",
+            )
+            return "validated"
+        except Exception as exc:
+            try:
+                self.journal.finalize_failure(
+                    reason=execute_error or f"D journal finalize failed: {exc}",
+                    graph_diagnosis=f"invalid: {exc}",
+                    json_path=self.attempt_dir / "planning-scene.json",
+                )
+            except Exception:
+                pass
+            return f"invalid: {exc}"
+
+    def _d_journal_failure(self, *, reason: str, graph_diagnosis: str) -> str:
+        """Write the canonical D failure planning-scene.json, returning its status."""
+        try:
+            self.journal.finalize_failure(
+                reason=reason,
+                graph_diagnosis=graph_diagnosis,
+                json_path=self.attempt_dir / "planning-scene.json",
+            )
+            return "written"
+        except Exception as exc:
+            return f"failed: {exc}"
+
+    def _normalize_goal_id(self, goal_handle: Any) -> str | None:
+        return _normalize_goal_uuid(getattr(goal_handle, "goal_id", None))
+
+    def _build_d_goal(self, spec: Mapping[str, object], joints: Sequence[float] | None):
+        kind = spec.get("kind")
+        if kind == "execute-joint":
+            target = (
+                list(joints)
+                if joints is not None
+                else list(spec.get("joints", Q_OUTBOUND))
+            )
+            return build_joint_move_group_goal(target, plan_only=True)
+        pose = self._pose_stamped_from_spec(spec)
+        return build_pose_move_group_goal(pose, plan_only=True)
+
+    def _send_plan_only_retaining_handle(
+        self,
+        scenario_id: str,
+        goal: Any,
+        spec: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Send exactly one plan-only MoveGroup goal retaining handle/UUID/plan.
+
+        Mirrors the Gate-C ``_send_plan_only_goal`` bounded lifecycle but keeps
+        the accepted goal handle, its normalized lowercase planning UUID, and the
+        complete generated ``planned_trajectory`` message for the split path.
+        """
+        thresholds = self._thresholds()
+        client = self._action_clients["/move_action"]
+        server_timeout_s = float(thresholds.get("action_server_wait_s", 5.0))
+        if not self._wait_for_server(client, server_timeout_s):
+            return {
+                "scenario_id": scenario_id,
+                "status": "action-server-unavailable",
+                "reason_code": "action-server-unavailable",
+                "diagnostic_only": True,
+                "error": "/move_action server was not available before send",
+            }
+        accept_timeout_s = float(thresholds.get("goal_accept_timeout_s", 5.0))
+        send_future = client.send_goal_async(goal)
+        accept_deadline = time.monotonic() + accept_timeout_s
+        while not send_future.done() and time.monotonic() < accept_deadline:
+            self._spin_once()
+        if not send_future.done():
+            try:
+                send_future.cancel()
+            except Exception:
+                pass
+            return {
+                "scenario_id": scenario_id,
+                "status": "goal-accept-timeout",
+                "reason_code": "goal-accept-timeout",
+                "diagnostic_only": True,
+                "error": "goal acceptance timed out before a goal handle existed",
+            }
+        try:
+            goal_handle = send_future.result()
+        except Exception as exc:
+            return {
+                "scenario_id": scenario_id,
+                "status": "goal-send-exception",
+                "reason_code": "goal-send-exception",
+                "diagnostic_only": True,
+                "error": f"send_goal future raised: {exc}",
+            }
+        if goal_handle is None or not getattr(goal_handle, "accepted", False):
+            return {
+                "scenario_id": scenario_id,
+                "status": "goal-rejected",
+                "reason_code": "goal-rejected",
+                "diagnostic_only": True,
+                "error": "send_goal returned no accepted goal handle",
+            }
+        planning_goal_id = self._normalize_goal_id(goal_handle)
+        result_timeout_s = float(thresholds.get("plan_result_timeout_s", 10.0))
+        result_future = goal_handle.get_result_async()
+        result_deadline = time.monotonic() + result_timeout_s
+        while not result_future.done() and time.monotonic() < result_deadline:
+            self._spin_once()
+        if not result_future.done():
+            cancel_response = self._cancel_goal(goal_handle)
+            return {
+                "scenario_id": scenario_id,
+                "status": "timeout",
+                "reason_code": "result-timeout",
+                "diagnostic_only": True,
+                "error": "planning result timed out",
+                "cancel_response": cancel_response,
+                "planning_goal_id": planning_goal_id,
+                "goal_handle": goal_handle,
+            }
+        try:
+            result = result_future.result()
+        except Exception as exc:
+            return {
+                "scenario_id": scenario_id,
+                "status": "malformed-result",
+                "reason_code": "malformed-result",
+                "diagnostic_only": True,
+                "error": f"result future raised: {exc}",
+                "planning_goal_id": planning_goal_id,
+                "goal_handle": goal_handle,
+            }
+        if result is None or getattr(result, "result", None) is None:
+            return {
+                "scenario_id": scenario_id,
+                "status": "malformed-result",
+                "reason_code": "malformed-result",
+                "diagnostic_only": True,
+                "error": "result future returned no MoveGroup result",
+                "planning_goal_id": planning_goal_id,
+                "goal_handle": goal_handle,
+            }
+        planned = getattr(getattr(result, "result", None), "planned_trajectory", None)
+        outcome = self._classify_plan_only_result(scenario_id, result, spec)
+        outcome = dict(outcome)
+        outcome["planning_goal_id"] = planning_goal_id
+        outcome["goal_handle"] = goal_handle
+        outcome["planned_trajectory"] = planned
+        return outcome
+
+    def _send_execute_trajectory(
+        self,
+        scenario_id: str,
+        goal: Any,
+        *,
+        result_timeout_s: float,
+        cancel_timeout_s: float,
+        allow_cancel: bool = False,
+    ) -> dict[str, object]:
+        """Send exactly one ExecuteTrajectory goal and wait bounded for result.
+
+        Returns the distinct execution UUID, the terminal action status int and
+        string, and the accepted goal handle.  ``allow_cancel`` permits the
+        caller to cancel the ExecuteTrajectory handle instead of timing out; a
+        cancellation is never proof of controller-side quiescence by itself.
+        """
+        thresholds = self._thresholds()
+        client = self._action_clients["/execute_trajectory"]
+        server_timeout_s = float(thresholds.get("action_server_wait_s", 5.0))
+        if not self._wait_for_server(client, server_timeout_s):
+            return {
+                "scenario_id": scenario_id,
+                "status": "execute-server-unavailable",
+                "reason_code": "execute-server-unavailable",
+                "diagnostic_only": True,
+                "error": "/execute_trajectory server was not available before send",
+            }
+        accept_timeout_s = float(thresholds.get("goal_accept_timeout_s", 5.0))
+        send_future = client.send_goal_async(goal)
+        accept_deadline = time.monotonic() + accept_timeout_s
+        while not send_future.done() and time.monotonic() < accept_deadline:
+            self._spin_once()
+        if not send_future.done():
+            try:
+                send_future.cancel()
+            except Exception:
+                pass
+            return {
+                "scenario_id": scenario_id,
+                "status": "execute-goal-accept-timeout",
+                "reason_code": "execute-goal-accept-timeout",
+                "diagnostic_only": True,
+                "error": "execute goal acceptance timed out before a goal handle existed",
+            }
+        try:
+            goal_handle = send_future.result()
+        except Exception as exc:
+            return {
+                "scenario_id": scenario_id,
+                "status": "execute-goal-send-exception",
+                "reason_code": "execute-goal-send-exception",
+                "diagnostic_only": True,
+                "error": f"execute send_goal future raised: {exc}",
+            }
+        if goal_handle is None or not getattr(goal_handle, "accepted", False):
+            return {
+                "scenario_id": scenario_id,
+                "status": "execute-goal-rejected",
+                "reason_code": "execute-goal-rejected",
+                "diagnostic_only": True,
+                "error": "execute send_goal returned no accepted goal handle",
+            }
+        execute_goal_id = self._normalize_goal_id(goal_handle)
+        result_future = goal_handle.get_result_async()
+        result_deadline = time.monotonic() + float(result_timeout_s)
+        while not result_future.done() and time.monotonic() < result_deadline:
+            self._spin_once()
+        if not result_future.done():
+            if allow_cancel:
+                cancel_response = self._cancel_goal(goal_handle)
+                return {
+                    "scenario_id": scenario_id,
+                    "status": "execute-cancellation-issued",
+                    "reason_code": "execute-cancellation-issued",
+                    "diagnostic_only": True,
+                    "execute_goal_id": execute_goal_id,
+                    "goal_handle": goal_handle,
+                    "cancel_response": cancel_response,
+                }
+            return {
+                "scenario_id": scenario_id,
+                "status": "execute-result-timeout",
+                "reason_code": "execute-result-timeout",
+                "diagnostic_only": True,
+                "execute_goal_id": execute_goal_id,
+                "goal_handle": goal_handle,
+            }
+        try:
+            result = result_future.result()
+        except Exception as exc:
+            return {
+                "scenario_id": scenario_id,
+                "status": "execute-malformed-result",
+                "reason_code": "execute-malformed-result",
+                "diagnostic_only": True,
+                "error": f"execute result future raised: {exc}",
+                "execute_goal_id": execute_goal_id,
+                "goal_handle": goal_handle,
+            }
+        action_status = getattr(result, "status", None)
+        try:
+            status_string = _execute_status_name(action_status)
+        except ValueError:
+            status_string = None
+        return {
+            "scenario_id": scenario_id,
+            "status": "execute-terminal",
+            "reason_code": "execute-terminal",
+            "execute_goal_id": execute_goal_id,
+            "goal_handle": goal_handle,
+            "execute_result_status": action_status,
+            "execute_result_status_string": status_string,
+            "diagnostic_only": True,
+        }
+
+    def _validate_fjt_evidence(
+        self,
+        provider_evidence: object,
+        *,
+        expected_trajectory_digest: str | None,
+    ) -> tuple[bool, str | None]:
+        """Validate injected FJT transaction evidence and join it to status.
+
+        The provider must return real observed controller-transaction evidence
+        (endpoint exactly ``/xarm7_traj_controller/follow_joint_trajectory``,
+        normalized FJT goal UUID, canonical trajectory digest equal to the
+        unchanged ExecuteTrajectory digest, a finite timestamp/sequence, and a
+        real observation source).  The provider UUID/status must join to the
+        actual newest status-topic entry.  Missing, stale, mismatched, extra,
+        malformed, or provider-exception evidence makes the attempt
+        ``evidence-invalid``.
+        """
+        if not isinstance(provider_evidence, Mapping):
+            return False, "fjt_transaction_provider returned a non-mapping"
+        if provider_evidence.get("endpoint") != FJT_ENDPOINT:
+            return False, f"fjt evidence endpoint must be {FJT_ENDPOINT}"
+        goal_uuid = provider_evidence.get("goal_uuid")
+        if not _valid_goal_uuid(goal_uuid):
+            return False, "fjt evidence goal_uuid is not a valid 16-byte hex UUID"
+        digest = provider_evidence.get("trajectory_digest")
+        if not _valid_digest(digest):
+            return False, "fjt evidence trajectory digest must be a valid nonzero digest"
+        if expected_trajectory_digest is not None and digest != expected_trajectory_digest:
+            return False, "fjt evidence trajectory digest does not match the ExecuteTrajectory trajectory"
+        source = provider_evidence.get("source")
+        if not isinstance(source, str) or not source:
+            return False, "fjt evidence source must identify real controller introspection"
+        sequence = provider_evidence.get("sequence")
+        timestamp = provider_evidence.get("timestamp")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            return False, "fjt evidence sequence must be a non-negative integer"
+        if not _finite_number(timestamp):
+            return False, "fjt evidence timestamp must be finite"
+        provider_status = provider_evidence.get("status")
+        if isinstance(provider_status, bool) or not isinstance(provider_status, int):
+            return False, "fjt evidence status must be an integer"
+        newest = self._newest_fjt_status()
+        if newest is None:
+            return False, "no FJT status-topic entry was observed for this transaction"
+        if newest.get("goal_uuid") != goal_uuid:
+            return False, "fjt evidence goal_uuid does not join to the newest status entry"
+        if newest.get("status") != provider_status:
+            return False, "fjt evidence status does not join to the newest status entry"
+        return True, None
+
+    def _journal_snapshot_d(self, event: str) -> str:
+        """Append one D diagnostic journal snapshot, returning the join status."""
+        later_join = self._join_key()
+        if later_join is None:
+            return "no-join-key"
+        try:
+            self.journal.snapshot(
+                event, frame_index=later_join[0], timestamp=later_join[1]
+            )
+            return "recorded"
+        except (ValueError, TypeError) as exc:
+            return f"rejected: {exc}"
+
+    def run_execute_sequence(
+        self,
+        scenario_id: str,
+        *,
+        joints: Sequence[float] | None = None,
+        fjt_transaction_provider: Callable[[], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Run one Stage-D split-path joint/pose execution.
+
+        Mandatory MoveGroup plan-only -> ExecuteTrajectory boundary: exactly one
+        plan-only ``/move_action`` goal, a required non-empty ``planned_trajectory``,
+        exactly one ``/execute_trajectory`` goal whose trajectory is byte-identical
+        to the planned one, distinct valid 16-byte plan/execute UUIDs, and FJT
+        transaction evidence joining to the real status topic.
+        """
+        start_wall = time.monotonic()
+        fixture_ready_recorded = False
+        event_log: list[str] = []
+        try:
+            try:
+                spec = stage_d_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid_d(scenario_id, "scenario-rejected", [str(exc)])
+            if spec["kind"] not in ("execute-joint", "execute-pose"):
+                return self._evidence_invalid_d(
+                    scenario_id, "wrong-handler", [f"D handler is {spec['kind']!r}, not execute"]
+                )
+            if fjt_transaction_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-fjt-provider",
+                    ["fjt_transaction_provider is required before sending any goal"],
+                )
+            if self.join_key_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-join-key",
+                    ["join_key_provider is required before sending any goal"],
+                )
+            readiness = self._readiness()
+            if readiness is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "readiness-unavailable",
+                    ["readiness_snapshot_provider is required before sending any goal"],
+                )
+            if not readiness["ready"]:
+                return self._evidence_invalid_d(scenario_id, "readiness-failed", list(readiness["reasons"]))
+            acquire_error = self._acquire_scene(scenario_id)
+            if acquire_error is not None:
+                return acquire_error
+            join = self._join_key()
+            if join is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-join-key", ["join_key_provider returned no valid key"]
+                )
+            scene = self._journal_scene(join)
+            if scene is None:
+                return self._evidence_invalid_d(scenario_id, "no-planning-scene", [])
+            scene_error = self._fixture_scene_error(scene)
+            if scene_error is not None:
+                return self._evidence_invalid_d(scenario_id, "fixture-scene-mismatch", [scene_error])
+            try:
+                self.journal.record_diff("fixture-ready", scene)
+            except (ValueError, TypeError) as exc:
+                return self._evidence_invalid_d(scenario_id, "journal-fixture-ready-rejected", [str(exc)])
+            fixture_ready_recorded = True
+            event_log.append("fixture-ready")
+
+            try:
+                goal = self._build_d_goal(spec, joints=joints)
+            except Exception as exc:
+                return self._evidence_invalid_d(
+                    scenario_id, "goal-construction-exception", [str(exc)]
+                )
+            plan_outcome = self._send_plan_only_retaining_handle(scenario_id, goal, spec)
+            planner_status = plan_outcome.get("status")
+            planning_goal_id = plan_outcome.get("planning_goal_id")
+            planned = plan_outcome.get("planned_trajectory")
+            if planner_status != "diagnostic-pass":
+                final_status = (
+                    "diagnostic-fail"
+                    if planner_status == "diagnostic-fail"
+                    else "evidence-invalid"
+                )
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, final_status,
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                )
+            if planned is None:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "diagnostic-fail",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                )
+            event_log.append("execution-start")
+            self._journal_snapshot_d("execution-start")
+
+            planned_digest_before = self._digest(self.ros["serialize_message"](planned))
+            try:
+                exec_goal = build_execute_trajectory_goal(planned)
+            except Exception as exc:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error=f"execute goal construction raised: {exc}",
+                )
+            executed_digest_after = self._digest(
+                self.ros["serialize_message"](exec_goal.trajectory)
+            )
+            if executed_digest_after != planned_digest_before:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_error="ExecuteTrajectory trajectory digest differs from the planned trajectory",
+                )
+            execute_timeout_s = float(self._thresholds().get("execute_timeout_s", 120.0))
+            cancel_timeout_s = float(self._thresholds().get("cancel_timeout_s", 10.0))
+            exec_outcome = self._send_execute_trajectory(
+                scenario_id, exec_goal,
+                result_timeout_s=execute_timeout_s,
+                cancel_timeout_s=cancel_timeout_s,
+            )
+            execute_goal_id = exec_outcome.get("execute_goal_id")
+            execute_result_status = exec_outcome.get("execute_result_status")
+            if (
+                not _valid_goal_uuid(planning_goal_id)
+                or not _valid_goal_uuid(execute_goal_id)
+                or planning_goal_id == execute_goal_id
+            ):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="plan/execute UUIDs must both be valid and distinct",
+                )
+            if execute_result_status != EXECUTE_STATUS_SUCCEEDED:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "diagnostic-fail",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_outcome=exec_outcome,
+                    execute_error="ExecuteTrajectory did not terminate SUCCEEDED",
+                )
+            try:
+                provider_evidence = fjt_transaction_provider()
+            except Exception as exc:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_outcome=exec_outcome,
+                    execute_error=f"fjt_transaction_provider raised: {exc}",
+                )
+            fjt_ok, fjt_reason = self._validate_fjt_evidence(
+                provider_evidence, expected_trajectory_digest=executed_digest_after
+            )
+            if not fjt_ok:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_outcome=exec_outcome,
+                    execute_error=fjt_reason or "fjt evidence invalid",
+                )
+            event_log.append("execution-terminal")
+            self._journal_snapshot_d("execution-terminal")
+            event_log.append("teardown")
+            self._journal_snapshot_d("teardown")
+
+            return self._finalize_d_attempt(
+                scenario_id, spec, plan_outcome, planner_status, "diagnostic-pass",
+                readiness, start_wall, event_log=event_log,
+                planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                execute_goal_id=execute_goal_id,
+                execute_outcome=exec_outcome,
+                fjt_evidence=provider_evidence,
+                trajectory_digest=executed_digest_after,
+            )
+        except Exception as exc:
+            if fixture_ready_recorded:
+                return self._evidence_invalid_d(
+                    scenario_id, "unexpected-exception", [str(exc)]
+                )
+            return self._evidence_invalid_d(
+                scenario_id, "unexpected-exception", [str(exc)]
+            )
+
+    def run_cancel_sequence(
+        self,
+        scenario_id: str,
+        *,
+        long_motion_provider: Callable[[], Mapping[str, object]] | None = None,
+        fjt_transaction_provider: Callable[[], Mapping[str, object]] | None = None,
+        planning_goal_id: str | None = None,
+        execute_goal_id: str | None = None,
+        timeout_s: float | None = None,
+        execute_goal_handle: Any = None,
+    ) -> dict[str, object]:
+        """Run the Stage-D cancellation contract.
+
+        Requires an explicit validated long-motion target (via
+        *long_motion_provider* or the supplied plan/execute goal ids); missing
+        target evidence fails closed before goal send.  When the orchestrator or
+        focused test supplies the live ``/execute_trajectory``
+        ``ClientGoalHandle`` via *execute_goal_handle*, ``cancel_goal_async()``
+        is called on exactly that handle (never the completed MoveGroup planning
+        handle).  Requires terminal CANCELED (5), requires controller
+        quiescence, and never sends a later stage.
+        """
+        start_wall = time.monotonic()
+        fixture_ready_recorded = False
+        event_log: list[str] = []
+        try:
+            try:
+                spec = stage_d_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid_d(scenario_id, "scenario-rejected", [str(exc)])
+            if spec["kind"] != "cancel":
+                return self._evidence_invalid_d(
+                    scenario_id, "wrong-handler", [f"D handler is {spec['kind']!r}, not cancel"]
+                )
+            if (
+                long_motion_provider is None
+                and not (_valid_goal_uuid(planning_goal_id) and _valid_goal_uuid(execute_goal_id))
+            ):
+                return self._evidence_invalid_d(
+                    scenario_id, "no-cancel-target",
+                    ["cancel requires an explicit validated long-motion target/provider"],
+                )
+            if fjt_transaction_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-fjt-provider",
+                    ["fjt_transaction_provider is required before sending any goal"],
+                )
+            if self.join_key_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-join-key",
+                    ["join_key_provider is required before sending any goal"],
+                )
+            readiness = self._readiness()
+            if readiness is None or not readiness["ready"]:
+                return self._evidence_invalid_d(
+                    scenario_id,
+                    "readiness-unavailable" if readiness is None else "readiness-failed",
+                    [] if readiness is None else list(readiness["reasons"]),
+                )
+            acquire_error = self._acquire_scene(scenario_id)
+            if acquire_error is not None:
+                return acquire_error
+            join = self._join_key()
+            if join is None:
+                return self._evidence_invalid_d(scenario_id, "no-join-key", [])
+            scene = self._journal_scene(join)
+            if scene is None:
+                return self._evidence_invalid_d(scenario_id, "no-planning-scene", [])
+            scene_error = self._fixture_scene_error(scene)
+            if scene_error is not None:
+                return self._evidence_invalid_d(scenario_id, "fixture-scene-mismatch", [scene_error])
+            try:
+                self.journal.record_diff("fixture-ready", scene)
+            except (ValueError, TypeError) as exc:
+                return self._evidence_invalid_d(scenario_id, "journal-fixture-ready-rejected", [str(exc)])
+            fixture_ready_recorded = True
+            event_log.append("fixture-ready")
+
+            if long_motion_provider is not None:
+                try:
+                    target_evidence = long_motion_provider()
+                except Exception as exc:
+                    return self._evidence_invalid_d(
+                        scenario_id, "cancel-target-provider-raised", [str(exc)]
+                    )
+                if not isinstance(target_evidence, Mapping):
+                    return self._evidence_invalid_d(
+                        scenario_id, "cancel-target-invalid", ["long_motion_provider returned a non-mapping"]
+                    )
+                supplied_plan = _normalize_goal_uuid(target_evidence.get("planning_goal_id"))
+                supplied_exec = _normalize_goal_uuid(target_evidence.get("execute_goal_id"))
+                if not (_valid_goal_uuid(supplied_plan) and _valid_goal_uuid(supplied_exec)):
+                    return self._evidence_invalid_d(
+                        scenario_id, "cancel-target-invalid",
+                        ["long_motion_provider must supply valid plan and execute UUIDs"],
+                    )
+                planning_goal_id = supplied_plan
+                execute_goal_id = supplied_exec
+            if planning_goal_id == execute_goal_id:
+                return self._evidence_invalid_d(
+                    scenario_id, "cancel-target-invalid", ["plan and execute UUIDs must differ"]
+                )
+
+            event_log.append("execution-start")
+            self._journal_snapshot_d("execution-start")
+
+            # The long-motion ExecuteTrajectory transaction is supplied by the
+            # provider/target evidence (mid-flight).  Cancel only that exact
+            # ExecuteTrajectory handle; the MoveGroup planning handle was already
+            # completed and is never canceled.
+            goals_canceling = [execute_goal_id]
+            # §7: call ``cancel_goal_async()`` only on the ExecuteTrajectory
+            # handle; never cancel the completed MoveGroup planning handle.
+            cancel_response = "not-applicable"
+            if execute_goal_handle is not None:
+                cancel_response = self._cancel_goal(execute_goal_handle)
+                if cancel_response != "completed":
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                        "diagnostic-pass", "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_goal_id=execute_goal_id,
+                        execute_error=f"ExecuteTrajectory cancel did not complete: {cancel_response}",
+                        goals_canceling=goals_canceling,
+                    )
+            event_log.append("cancel-requested")
+            self._journal_snapshot_d("cancel-requested")
+
+            # Quiescence: bounded wait until no active FJT status joins the
+            # canceled controller goal.  The injected FJT evidence must join to
+            # the newest status entry with the canceled UUID.
+            try:
+                provider_evidence = fjt_transaction_provider()
+            except Exception as exc:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                    "diagnostic-pass", "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"fjt_transaction_provider raised: {exc}",
+                    goals_canceling=goals_canceling,
+                )
+            fjt_ok, fjt_reason = self._validate_fjt_evidence(
+                provider_evidence, expected_trajectory_digest=None
+            )
+            if not fjt_ok:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                    "diagnostic-pass", "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=fjt_reason or "fjt evidence invalid",
+                    goals_canceling=goals_canceling,
+                )
+            newest = self._newest_fjt_status()
+            active = bool(
+                newest is not None
+                and newest.get("goal_uuid") == execute_goal_id
+                and newest.get("status") not in (EXECUTE_STATUS_SUCCEEDED, EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED)
+            )
+            if active:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                    "diagnostic-pass", "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="FJT status is still active for the canceled controller goal",
+                    goals_canceling=goals_canceling,
+                )
+            event_log.append("quiescent")
+            self._journal_snapshot_d("quiescent")
+            event_log.append("teardown")
+            self._journal_snapshot_d("teardown")
+            return self._finalize_d_attempt(
+                scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                "diagnostic-pass", "diagnostic-pass",
+                readiness, start_wall, event_log=event_log,
+                planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                execute_goal_id=execute_goal_id,
+                goals_canceling=goals_canceling,
+                terminal_status="canceled",
+                fjt_evidence=provider_evidence,
+            )
+        except Exception as exc:
+            return self._evidence_invalid_d(
+                scenario_id, "unexpected-exception", [str(exc)]
+            )
+
+    def run_safety_sequence(
+        self,
+        scenario_id: str,
+        *,
+        long_motion_provider: Callable[[], Mapping[str, object]] | None = None,
+        fjt_transaction_provider: Callable[[], Mapping[str, object]] | None = None,
+        stop_timeout_s: float | None = None,
+    ) -> dict[str, object]:
+        """Run the Stage-D safety interruption contract.
+
+        Uses the executor's real ``/sim/safety/operator`` publisher and the
+        ``/sim/hardware/safety_stop``/``/joint_states`` callbacks: publishes
+        operator ``True``, waits bounded for safety-stop ``True``, requires the
+        old ExecuteTrajectory terminal status ABORTED (6), requires
+        ``safety_stop_frames`` consecutive fresh joint-state velocity frames
+        with every arm-joint absolute velocity bounded, publishes operator
+        ``False`` after the effective-stop predicate, and sends no replacement/
+        resume goal.
+        """
+        start_wall = time.monotonic()
+        fixture_ready_recorded = False
+        event_log: list[str] = []
+        try:
+            try:
+                spec = stage_d_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid_d(scenario_id, "scenario-rejected", [str(exc)])
+            if spec["kind"] != "safety":
+                return self._evidence_invalid_d(
+                    scenario_id, "wrong-handler", [f"D handler is {spec['kind']!r}, not safety"]
+                )
+            if long_motion_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-safety-target",
+                    ["safety requires an explicit validated long-motion target/provider"],
+                )
+            if fjt_transaction_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-fjt-provider",
+                    ["fjt_transaction_provider is required before sending any goal"],
+                )
+            if self.join_key_provider is None:
+                return self._evidence_invalid_d(scenario_id, "no-join-key", [])
+            readiness = self._readiness()
+            if readiness is None or not readiness["ready"]:
+                return self._evidence_invalid_d(
+                    scenario_id,
+                    "readiness-unavailable" if readiness is None else "readiness-failed",
+                    [] if readiness is None else list(readiness["reasons"]),
+                )
+            acquire_error = self._acquire_scene(scenario_id)
+            if acquire_error is not None:
+                return acquire_error
+            join = self._join_key()
+            if join is None:
+                return self._evidence_invalid_d(scenario_id, "no-join-key", [])
+            scene = self._journal_scene(join)
+            if scene is None:
+                return self._evidence_invalid_d(scenario_id, "no-planning-scene", [])
+            scene_error = self._fixture_scene_error(scene)
+            if scene_error is not None:
+                return self._evidence_invalid_d(scenario_id, "fixture-scene-mismatch", [scene_error])
+            try:
+                self.journal.record_diff("fixture-ready", scene)
+            except (ValueError, TypeError) as exc:
+                return self._evidence_invalid_d(scenario_id, "journal-fixture-ready-rejected", [str(exc)])
+            fixture_ready_recorded = True
+            event_log.append("fixture-ready")
+
+            try:
+                target_evidence = long_motion_provider()
+            except Exception as exc:
+                return self._evidence_invalid_d(scenario_id, "safety-target-provider-raised", [str(exc)])
+            if not isinstance(target_evidence, Mapping):
+                return self._evidence_invalid_d(scenario_id, "safety-target-invalid", [])
+            planning_goal_id = _normalize_goal_uuid(target_evidence.get("planning_goal_id"))
+            execute_goal_id = _normalize_goal_uuid(target_evidence.get("execute_goal_id"))
+            if not (_valid_goal_uuid(planning_goal_id) and _valid_goal_uuid(execute_goal_id)):
+                return self._evidence_invalid_d(
+                    scenario_id, "safety-target-invalid",
+                    ["safety target must supply valid plan and execute UUIDs"],
+                )
+            if planning_goal_id == execute_goal_id:
+                return self._evidence_invalid_d(
+                    scenario_id, "safety-target-invalid", ["plan and execute UUIDs must differ"]
+                )
+
+            event_log.append("execution-start")
+            self._journal_snapshot_d("execution-start")
+
+            # 3. publish operator True.
+            try:
+                self.publish_operator(True)
+            except Exception as exc:
+                return self._evidence_invalid_d(scenario_id, "operator-publish-failed", [str(exc)])
+            # 4. wait bounded for safety-stop True.
+            safety_stop_seen = self._wait_for_safety_stop(stop_timeout_s)
+            if not safety_stop_seen:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                    "diagnostic-pass", "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="safety-stop True was not observed within the bounded wait",
+                )
+            event_log.append("effective-stop")
+            self._journal_snapshot_d("effective-stop")
+
+            # 5. the old ExecuteTrajectory action terminal status is ABORTED or
+            # another explicitly non-success safety-abort result; never success.
+            fjt_evidence = None
+            try:
+                fjt_evidence = fjt_transaction_provider()
+            except Exception:
+                pass
+            fjt_ok, fjt_reason = self._validate_fjt_evidence(
+                fjt_evidence, expected_trajectory_digest=None
+            ) if fjt_evidence is not None else (False, "no fjt evidence")
+            terminal_status = self._safety_terminal_status(fjt_evidence)
+            if terminal_status != "aborted":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                    "diagnostic-pass", "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="safety did not produce a non-success ABORTED terminal status",
+                    fjt_evidence=fjt_evidence,
+                )
+
+            # 6. safety_stop_frames consecutive fresh joint-state velocity frames.
+            frames = self._safety_velocity_frames()
+            velocity_limit = float(self._thresholds().get("safety_stop_velocity_rad_s", 0.02))
+            required_frames = int(self._thresholds().get("safety_stop_frames", 5))
+            if not _arm_velocity_within_limit(frames, velocity_limit) or len(frames) < required_frames:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                    "diagnostic-pass", "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="safety velocity frames were not bounded or were insufficient",
+                    fjt_evidence=fjt_evidence,
+                )
+
+            # 7. publish operator False only after the effective-stop predicate.
+            try:
+                self.publish_operator(False)
+            except Exception as exc:
+                return self._evidence_invalid_d(scenario_id, "operator-clear-publish-failed", [str(exc)])
+            event_log.append("operator-clear")
+            self._journal_snapshot_d("operator-clear")
+
+            # 8. bounded post-clear stability: no fresh action/controller goal UUID.
+            if self._newest_fjt_status() is not None:
+                newest_uuid = self._newest_fjt_status().get("goal_uuid")
+                if newest_uuid != execute_goal_id:
+                    return self._finalize_d_attempt(
+                        scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                        "diagnostic-pass", "evidence-invalid",
+                        readiness, start_wall, event_log=event_log,
+                        planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                        execute_goal_id=execute_goal_id,
+                        execute_error="a fresh goal UUID appeared after operator clear",
+                        fjt_evidence=fjt_evidence,
+                    )
+            event_log.append("quiescent")
+            self._journal_snapshot_d("quiescent")
+            event_log.append("teardown")
+            self._journal_snapshot_d("teardown")
+            return self._finalize_d_attempt(
+                scenario_id, spec, {"status": "diagnostic-pass", "diagnostic_only": True},
+                "diagnostic-pass", "diagnostic-pass",
+                readiness, start_wall, event_log=event_log,
+                planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                execute_goal_id=execute_goal_id,
+                terminal_status="aborted",
+                fjt_evidence=fjt_evidence,
+            )
+        except Exception as exc:
+            return self._evidence_invalid_d(
+                scenario_id, "unexpected-exception", [str(exc)]
+            )
+
+    def _wait_for_safety_stop(self, stop_timeout_s: float | None) -> bool:
+        """Bounded spin until the newest safety-stop sample reads True."""
+        timeout_s = float(
+            stop_timeout_s if stop_timeout_s is not None
+            else self._thresholds().get("safety_stop_wait_s", 0.25)
+        )
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            sample = self._latest_safety_stop
+            if sample is not None and bool(getattr(sample, "data", False)) is True:
+                return True
+            self._spin_once()
+        return False
+
+    def _safety_terminal_status(self, fjt_evidence: object) -> str:
+        """Derive the old ExecuteTrajectory safety terminal status, never success."""
+        if isinstance(fjt_evidence, Mapping):
+            status = fjt_evidence.get("status")
+            if isinstance(status, int) and not isinstance(status, bool):
+                try:
+                    return _execute_status_name(status)
+                except ValueError:
+                    return "unknown"
+        newest = self._newest_fjt_status()
+        if newest is not None:
+            status = newest.get("status")
+            try:
+                return _execute_status_name(status)
+            except ValueError:
+                return "unknown"
+        return "unknown"
+
+    def _safety_velocity_frames(self) -> list[list[float]]:
+        """Return the cached bounded arm-velocity frames for the effective-stop
+        predicate.
+
+        The live controller streams fresh ``/joint_states`` and the executor
+        caches up to ``safety_stop_frames`` consecutive frames through
+        :meth:`_on_joint_state`; the effective-stop predicate requires
+        ``safety_stop_frames`` consecutive frames with every arm-joint absolute
+        velocity bounded.  In the offline/faked Humble suite the test feeds
+        ``JointState`` messages through the callback directly.
+        """
+        return list(self._joint_velocity_frames)
+
+    def run_cartesian_retreat(
+        self,
+        scenario_id: str,
+        *,
+        current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Run the Stage-D Cartesian retreat contract.
+
+        Uses an injected ``current_tcp_pose_provider`` (never a TF listener
+        embedded in this task) returning a fresh finite normalized ``base_link``
+        TCP pose with observation identity/age.  Derives the deterministic
+        ``+Z`` ``RETREAT_DISTANCE_M`` target preserving orientation and sends one
+        collision-aware ``/cartesian_move_action`` goal.
+        """
+        start_wall = time.monotonic()
+        event_log: list[str] = []
+        try:
+            try:
+                spec = stage_d_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid_d(scenario_id, "scenario-rejected", [str(exc)])
+            if spec["kind"] != "retreat":
+                return self._evidence_invalid_d(
+                    scenario_id, "wrong-handler", [f"D handler is {spec['kind']!r}, not retreat"]
+                )
+            if current_tcp_pose_provider is None:
+                return self._evidence_invalid_d(
+                    scenario_id, "no-tcp-pose-provider",
+                    ["current_tcp_pose_provider is required before sending a retreat goal"],
+                )
+            if self.join_key_provider is None:
+                return self._evidence_invalid_d(scenario_id, "no-join-key", [])
+            readiness = self._readiness()
+            if readiness is None or not readiness["ready"]:
+                return self._evidence_invalid_d(
+                    scenario_id,
+                    "readiness-unavailable" if readiness is None else "readiness-failed",
+                    [] if readiness is None else list(readiness["reasons"]),
+                )
+            acquire_error = self._acquire_scene(scenario_id)
+            if acquire_error is not None:
+                return acquire_error
+            join = self._join_key()
+            if join is None:
+                return self._evidence_invalid_d(scenario_id, "no-join-key", [])
+            scene = self._journal_scene(join)
+            if scene is None:
+                return self._evidence_invalid_d(scenario_id, "no-planning-scene", [])
+            scene_error = self._fixture_scene_error(scene)
+            if scene_error is not None:
+                return self._evidence_invalid_d(scenario_id, "fixture-scene-mismatch", [scene_error])
+            try:
+                self.journal.record_diff("fixture-ready", scene)
+            except (ValueError, TypeError) as exc:
+                return self._evidence_invalid_d(scenario_id, "journal-fixture-ready-rejected", [str(exc)])
+            event_log.append("fixture-ready")
+
+            try:
+                source = current_tcp_pose_provider()
+            except Exception as exc:
+                return self._evidence_invalid_d(scenario_id, "tcp-pose-provider-raised", [str(exc)])
+            if not isinstance(source, Mapping):
+                return self._evidence_invalid_d(scenario_id, "tcp-pose-invalid", ["provider returned a non-mapping"])
+            identity = source.get("identity")
+            age = source.get("age_s")
+            if not (isinstance(identity, (int, str)) and str(identity)):
+                return self._evidence_invalid_d(scenario_id, "tcp-pose-invalid", ["provider must supply observation identity"])
+            if not _fresh(age, self._thresholds().get("tf_fresh_s", 0.25)):
+                return self._evidence_invalid_d(scenario_id, "tcp-pose-stale", ["provider pose is stale"])
+            try:
+                target = derive_retreat_target_pose(
+                    source, distance_m=RETREAT_DISTANCE_M, axis=RETREAT_AXIS
+                )
+            except ValueError as exc:
+                return self._evidence_invalid_d(scenario_id, "retreat-derivation-failed", [str(exc)])
+
+            event_log.append("retreat-start")
+            self._journal_snapshot_d("retreat-start")
+            from geometry_msgs.msg import Pose
+
+            target_pose = Pose()
+            target_pose.position.x = float(target["xyz"][0])
+            target_pose.position.y = float(target["xyz"][1])
+            target_pose.position.z = float(target["xyz"][2])
+            target_pose.orientation.x = float(target["quaternion_xyzw"][0])
+            target_pose.orientation.y = float(target["quaternion_xyzw"][1])
+            target_pose.orientation.z = float(target["quaternion_xyzw"][2])
+            target_pose.orientation.w = float(target["quaternion_xyzw"][3])
+            try:
+                cartesian_goal = build_cartesian_move_goal(target_pose)
+            except Exception as exc:
+                return self._evidence_invalid_d(scenario_id, "cartesian-goal-construction-failed", [str(exc)])
+
+            client = self._action_clients["/cartesian_move_action"]
+            server_timeout_s = float(self._thresholds().get("action_server_wait_s", 5.0))
+            if not self._wait_for_server(client, server_timeout_s):
+                return self._evidence_invalid_d(scenario_id, "cartesian-server-unavailable", [])
+            accept_timeout_s = float(self._thresholds().get("goal_accept_timeout_s", 5.0))
+            send_future = client.send_goal_async(cartesian_goal)
+            accept_deadline = time.monotonic() + accept_timeout_s
+            while not send_future.done() and time.monotonic() < accept_deadline:
+                self._spin_once()
+            if not send_future.done():
+                return self._evidence_invalid_d(scenario_id, "cartesian-accept-timeout", [])
+            try:
+                goal_handle = send_future.result()
+            except Exception as exc:
+                return self._evidence_invalid_d(scenario_id, "cartesian-send-exception", [str(exc)])
+            if goal_handle is None or not getattr(goal_handle, "accepted", False):
+                return self._evidence_invalid_d(scenario_id, "cartesian-goal-rejected", [])
+            retreat_goal_id = self._normalize_goal_id(goal_handle)
+            result_timeout_s = float(self._thresholds().get("execute_timeout_s", 120.0))
+            result_future = goal_handle.get_result_async()
+            result_deadline = time.monotonic() + result_timeout_s
+            while not result_future.done() and time.monotonic() < result_deadline:
+                self._spin_once()
+            if not result_future.done():
+                return self._evidence_invalid_d(scenario_id, "cartesian-result-timeout", [])
+            try:
+                result = result_future.result()
+            except Exception as exc:
+                return self._evidence_invalid_d(scenario_id, "cartesian-result-exception", [str(exc)])
+            action_status = getattr(result, "status", None)
+            try:
+                status_string = _execute_status_name(action_status)
+            except ValueError:
+                status_string = None
+            if action_status != EXECUTE_STATUS_SUCCEEDED:
+                return self._evidence_invalid_d(scenario_id, "cartesian-non-success", [])
+
+            event_log.append("retreat-terminal")
+            self._journal_snapshot_d("retreat-terminal")
+            event_log.append("teardown")
+            self._journal_snapshot_d("teardown")
+            self._write_retreat_goal_artifact(scenario_id, source, target, retreat_goal_id)
+            graph_status = self._d_journal_pass(scenario_id=scenario_id)
+            if graph_status != "validated":
+                return self._evidence_invalid_d(
+                    scenario_id, "d-journal-finalize-failed", [graph_status]
+                )
+            return {
+                "scenario_id": scenario_id,
+                "handler": "retreat",
+                "stage": "D",
+                "polarity": spec.get("polarity"),
+                "diagnostic_only": True,
+                "physical_verdict": None,
+                "status": "diagnostic-pass",
+                "planner_status": "diagnostic-pass",
+                "execute_trajectory_goal_sent": False,
+                "controller_goal_sent": False,
+                "isaac_joint_commands_published": False,
+                "endpoint": CARTESIAN_MOVE_ENDPOINT,
+                "target_frame": "base_link",
+                "distance_m": RETREAT_DISTANCE_M,
+                "axis": RETREAT_AXIS,
+                "retreat_goal_id": retreat_goal_id,
+                "source_pose": dict(source),
+                "target_pose": target,
+                "collision_checking": True,
+                "command_gateway_bypassed": False,
+                "graph": graph_status,
+                "event_log": event_log,
+                "elapsed_s": round(time.monotonic() - start_wall, 6),
+            }
+        except Exception as exc:
+            return self._evidence_invalid_d(scenario_id, "unexpected-exception", [str(exc)])
+
+    def _write_retreat_goal_artifact(
+        self,
+        scenario_id: str,
+        source: Mapping[str, object],
+        target: Mapping[str, object],
+        retreat_goal_id: object,
+    ) -> None:
+        try:
+            goal_path = self.attempt_dir / "goals" / f"{scenario_id}.json"
+            goal_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "handler": "retreat",
+                    "stage": "D",
+                    "diagnostic_only": True,
+                    "physical_verdict": None,
+                    "endpoint": CARTESIAN_MOVE_ENDPOINT,
+                    "axis": RETREAT_AXIS,
+                    "distance_m": RETREAT_DISTANCE_M,
+                    "target_frame": "base_link",
+                    "source_pose": dict(source),
+                    "target_pose": dict(target),
+                    "retreat_goal_id": retreat_goal_id,
+                    "collision_checking": True,
+                    "command_gateway_bypassed": False,
+                    "isaac_joint_commands_published": False,
+                },
+                goal_path,
+            )
+        except Exception:
+            pass
+
+    def run_gripper_sequence(
+        self,
+        scenario_id: str,
+        *,
+        open_first: bool = True,
+        gripper_open_position: float = GRIPPER_OPEN_POSITION,
+        gripper_close_position: float = GRIPPER_CLOSE_POSITION,
+        gripper_max_effort: float = GRIPPER_MAX_EFFORT,
+    ) -> dict[str, object]:
+        """Run the Stage-D native gripper contract.
+
+        Sends open then close (or the reversed order) ``GripperCommand`` goals
+        sequentially to ``/xarm_gripper/gripper_action`` with separate bounded
+        acceptance/result deadlines; requires action success for each.
+        """
+        start_wall = time.monotonic()
+        event_log: list[str] = []
+        try:
+            try:
+                spec = stage_d_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid_d(scenario_id, "scenario-rejected", [str(exc)])
+            if spec["kind"] != "gripper":
+                return self._evidence_invalid_d(
+                    scenario_id, "wrong-handler", [f"D handler is {spec['kind']!r}, not gripper"]
+                )
+            if self.join_key_provider is None:
+                return self._evidence_invalid_d(scenario_id, "no-join-key", [])
+            readiness = self._readiness()
+            if readiness is None or not readiness["ready"]:
+                return self._evidence_invalid_d(
+                    scenario_id,
+                    "readiness-unavailable" if readiness is None else "readiness-failed",
+                    [] if readiness is None else list(readiness["reasons"]),
+                )
+            acquire_error = self._acquire_scene(scenario_id)
+            if acquire_error is not None:
+                return acquire_error
+            join = self._join_key()
+            if join is None:
+                return self._evidence_invalid_d(scenario_id, "no-join-key", [])
+            scene = self._journal_scene(join)
+            if scene is None:
+                return self._evidence_invalid_d(scenario_id, "no-planning-scene", [])
+            scene_error = self._fixture_scene_error(scene)
+            if scene_error is not None:
+                return self._evidence_invalid_d(scenario_id, "fixture-scene-mismatch", [scene_error])
+            try:
+                self.journal.record_diff("fixture-ready", scene)
+            except (ValueError, TypeError) as exc:
+                return self._evidence_invalid_d(scenario_id, "journal-fixture-ready-rejected", [str(exc)])
+            event_log.append("fixture-ready")
+
+            commands = (
+                [("open", gripper_open_position), ("close", gripper_close_position)]
+                if open_first
+                else [("close", gripper_close_position), ("open", gripper_open_position)]
+            )
+            client = self._action_clients["/xarm_gripper/gripper_action"]
+            server_timeout_s = float(self._thresholds().get("action_server_wait_s", 5.0))
+            if not self._wait_for_server(client, server_timeout_s):
+                return self._evidence_invalid_d(scenario_id, "gripper-server-unavailable", [])
+            accept_timeout_s = float(self._thresholds().get("goal_accept_timeout_s", 5.0))
+            result_timeout_s = float(self._thresholds().get("execute_timeout_s", 120.0))
+            command_records: list[dict[str, object]] = []
+            goal_uuids: list[object] = []
+            for name, position in commands:
+                try:
+                    gripper_goal = build_gripper_goal(position, max_effort=gripper_max_effort)
+                except Exception as exc:
+                    return self._evidence_invalid_d(scenario_id, "gripper-goal-construction-failed", [str(exc)])
+                send_future = client.send_goal_async(gripper_goal)
+                accept_deadline = time.monotonic() + accept_timeout_s
+                while not send_future.done() and time.monotonic() < accept_deadline:
+                    self._spin_once()
+                if not send_future.done():
+                    return self._evidence_invalid_d(scenario_id, "gripper-accept-timeout", [])
+                try:
+                    goal_handle = send_future.result()
+                except Exception as exc:
+                    return self._evidence_invalid_d(scenario_id, "gripper-send-exception", [str(exc)])
+                if goal_handle is None or not getattr(goal_handle, "accepted", False):
+                    return self._evidence_invalid_d(scenario_id, "gripper-goal-rejected", [])
+                gripper_goal_id = self._normalize_goal_id(goal_handle)
+                goal_uuids.append(gripper_goal_id)
+                result_future = goal_handle.get_result_async()
+                result_deadline = time.monotonic() + result_timeout_s
+                while not result_future.done() and time.monotonic() < result_deadline:
+                    self._spin_once()
+                if not result_future.done():
+                    return self._evidence_invalid_d(scenario_id, "gripper-result-timeout", [])
+                try:
+                    result = result_future.result()
+                except Exception as exc:
+                    return self._evidence_invalid_d(scenario_id, "gripper-result-exception", [str(exc)])
+                action_status = getattr(result, "status", None)
+                try:
+                    status_string = _execute_status_name(action_status)
+                except ValueError:
+                    status_string = None
+                if action_status != EXECUTE_STATUS_SUCCEEDED:
+                    return self._evidence_invalid_d(scenario_id, "gripper-non-success", [])
+                command_records.append(
+                    {
+                        "command": name,
+                        "position": position,
+                        "max_effort": gripper_max_effort,
+                        "goal_id": gripper_goal_id,
+                        "status": action_status,
+                        "status_string": status_string,
+                    }
+                )
+                event_log.append(f"gripper-{name}-terminal")
+                self._journal_snapshot_d(f"gripper-{name}-terminal")
+
+            event_log.append("teardown")
+            self._journal_snapshot_d("teardown")
+            self._write_gripper_artifact(scenario_id, command_records)
+            graph_status = self._d_journal_pass(scenario_id=scenario_id)
+            if graph_status != "validated":
+                return self._evidence_invalid_d(
+                    scenario_id, "d-journal-finalize-failed", [graph_status]
+                )
+            return {
+                "scenario_id": scenario_id,
+                "handler": "gripper",
+                "stage": "D",
+                "polarity": spec.get("polarity"),
+                "diagnostic_only": True,
+                "physical_verdict": None,
+                "status": "diagnostic-pass",
+                "planner_status": "diagnostic-pass",
+                "execute_trajectory_goal_sent": False,
+                "controller_goal_sent": True,
+                "isaac_joint_commands_published": False,
+                "endpoint": GRIPPER_ENDPOINT,
+                "commands": [record["command"] for record in command_records],
+                "command_records": command_records,
+                "goal_uuids": goal_uuids,
+                "native_action": True,
+                "open_first": open_first,
+                "graph": graph_status,
+                "event_log": event_log,
+                "elapsed_s": round(time.monotonic() - start_wall, 6),
+            }
+        except Exception as exc:
+            return self._evidence_invalid_d(scenario_id, "unexpected-exception", [str(exc)])
+
+    def _write_gripper_artifact(
+        self, scenario_id: str, command_records: Sequence[Mapping[str, object]]
+    ) -> None:
+        try:
+            goal_path = self.attempt_dir / "goals" / f"{scenario_id}.json"
+            goal_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "handler": "gripper",
+                    "stage": "D",
+                    "diagnostic_only": True,
+                    "physical_verdict": None,
+                    "endpoint": GRIPPER_ENDPOINT,
+                    "commands": command_records,
+                    "native_action": True,
+                    "isaac_joint_commands_published": False,
+                },
+                goal_path,
+            )
+        except Exception:
+            pass
+
+    def run_pick_place_negative(self, scenario_id: str) -> dict[str, object]:
+        """Fail-closed Gate-E negative stub (zero ROS goals sent).
+
+        Preserves the brief's observable fake contract for later replacement
+        without pre-empting Task 6/Gate E.  See the module-level pure
+        :func:`run_pick_place_negative`.
+        """
+        return run_pick_place_negative(scenario_id)
+
+    def _finalize_d_attempt(
+        self,
+        scenario_id: str,
+        spec: Mapping[str, object],
+        plan_outcome: Mapping[str, object],
+        planner_status: object,
+        final_status: str,
+        readiness: Mapping[str, object],
+        start_wall: float,
+        *,
+        event_log: Sequence[str],
+        planning_goal_id: object,
+        fixture_ready_recorded: bool,
+        execute_goal_id: object = None,
+        execute_outcome: Mapping[str, object] | None = None,
+        execute_error: str | None = None,
+        fjt_evidence: object = None,
+        goals_canceling: Sequence[object] | None = None,
+        terminal_status: str | None = None,
+        trajectory_digest: str | None = None,
+    ) -> dict[str, object]:
+        """Fail-dominant D attempt finalization and artifact write.
+
+        The authoritative ``status`` is computed after the transaction outcome
+        *and* every required evidence finalization step.  A pass finalizes the
+        D journal with the real observed-graph projection (Task-3 schema
+        unchanged) and writes ``planning-scene.json``; a failure writes a
+        canonical failure artifact.  Any write failure downgrades every
+        already-created status-bearing D artifact.
+        """
+        # The flow methods record the complete D journal (including teardown)
+        # on the pass path before finalization; a failed attempt records no
+        # teardown and instead writes a canonical failure planning-scene.json.
+        teardown_status = (
+            "recorded"
+            if event_log and list(event_log)[-1] == "teardown"
+            else "not-recorded"
+        )
+        graph_status = "unavailable"
+        if final_status == "diagnostic-pass":
+            try:
+                graph = self._graph_observation()
+                if graph is None:
+                    raise ValueError("observed graph evidence is unavailable")
+                projection = build_journal_graph_projection(
+                    fixture_payload=self._fixture_payload_for_graph(),
+                    observed_graph=graph,
+                )
+                self.journal.finalize(
+                    "diagnostic-pass",
+                    graph=projection,
+                    json_path=self.attempt_dir / "planning-scene.json",
+                )
+                graph_status = "validated"
+            except Exception as exc:
+                final_status = "evidence-invalid"
+                graph_status = f"invalid: {exc}"
+                if fixture_ready_recorded:
+                    try:
+                        self.journal.finalize_failure(
+                            reason=execute_error or f"D journal finalize failed: {exc}",
+                            graph_diagnosis=graph_status,
+                            json_path=self.attempt_dir / "planning-scene.json",
+                        )
+                    except Exception:
+                        pass
+        elif fixture_ready_recorded:
+            try:
+                self.journal.finalize_failure(
+                    reason=execute_error or "D attempt failed",
+                    graph_diagnosis="D diagnostic journal",
+                    json_path=self.attempt_dir / "planning-scene.json",
+                )
+            except Exception:
+                pass
+        executed_digest = trajectory_digest
+        if execute_outcome is not None:
+            result_status = execute_outcome.get("execute_result_status")
+            try:
+                result_status_string = _execute_status_name(result_status)
+            except ValueError:
+                result_status_string = None
+        else:
+            result_status = None
+            result_status_string = None
+        record: dict[str, object] = {
+            "scenario_id": scenario_id,
+            "handler": spec.get("kind"),
+            "stage": "D",
+            "polarity": spec.get("polarity"),
+            "diagnostic_only": True,
+            "physical_verdict": None,
+            "status": final_status,
+            "planner_status": planner_status,
+            # The execute goal is sent only by the split-path execute handler
+            # (once a valid ExecuteTrajectory goal was accepted).  Cancel and
+            # safety handlers observe a mid-flight transaction and never send an
+            # execute goal, and an execute attempt that fails before the goal
+            # accept (plan fail / empty plan / construction / digest mismatch /
+            # server-unavailable) never sent it either.  ``execute_goal_id``
+            # existing in the execute outcome is the truthful sent marker.
+            "execute_trajectory_goal_sent": bool(
+                execute_outcome.get("execute_goal_id") if isinstance(execute_outcome, Mapping) else False
+            ),
+            "controller_goal_sent": False,
+            "planning_goal_id": planning_goal_id,
+            "execute_goal_id": execute_goal_id,
+            "goals_canceling": list(goals_canceling) if goals_canceling is not None else [],
+            "planned_trajectory_digest": plan_outcome.get("trajectory_digest"),
+            "executed_trajectory_digest": executed_digest,
+            "fjt_goal_digest": trajectory_digest,
+            "fjt_goal_uuid": fjt_evidence.get("goal_uuid") if isinstance(fjt_evidence, Mapping) else None,
+            "fjt_status": fjt_evidence.get("status") if isinstance(fjt_evidence, Mapping) else None,
+            "execute_result_status": result_status,
+            "execute_result_status_string": result_status_string,
+            "terminal_status": terminal_status,
+            "event_log": list(event_log),
+            "elapsed_s": round(time.monotonic() - start_wall, 6),
+            "teardown": teardown_status,
+            "graph": graph_status,
+            "isaac_joint_commands_published": False,
+        }
+        if execute_error is not None:
+            record["execute_error"] = execute_error
+        try:
+            self._write_d_artifacts(scenario_id, spec, record, readiness)
+        except Exception as exc:
+            record["status"] = "evidence-invalid"
+            record["reason_code"] = "artifact-write-failed"
+            record["artifact_error"] = str(exc)
+            self._downgrade_persisted_d_evidence(scenario_id, record, readiness, final_status)
+        return record
+
+    def _write_d_artifacts(
+        self,
+        scenario_id: str,
+        spec: Mapping[str, object],
+        record: Mapping[str, object],
+        readiness: Mapping[str, object],
+    ) -> None:
+        """Write the D-stage artifact rows (separate shape; Gate-C bytes unchanged)."""
+        self._append_jsonl(
+            self.attempt_dir / "integrated-execution.jsonl",
+            {
+                "schema_version": 1,
+                "report_revision": REPORT_REVISION,
+                "scenario_id": scenario_id,
+                "event": "gate-d",
+                "stage": "D",
+                "handler": spec.get("kind"),
+                "polarity": spec.get("polarity"),
+                "status": record.get("status"),
+                "reason_code": record.get("reason_code"),
+                "planner_status": record.get("planner_status"),
+                "row_kind": "lifecycle",
+                "diagnostic_only": True,
+                "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                "controller_goal_sent": record.get("controller_goal_sent"),
+                "isaac_joint_commands_published": False,
+                "timestamp": float(time.monotonic()),
+            },
+        )
+        self._append_jsonl(
+            self.attempt_dir / "moveit-plans.jsonl",
+            {
+                "schema_version": 1,
+                "report_revision": REPORT_REVISION,
+                "scenario_id": scenario_id,
+                "goal_kind": spec.get("kind"),
+                "status": record.get("status"),
+                "planner_status": record.get("planner_status"),
+                "row_kind": "lifecycle",
+                "planning_goal_id": record.get("planning_goal_id"),
+                "execute_goal_id": record.get("execute_goal_id"),
+                "trajectory_digest": record.get("planned_trajectory_digest"),
+                "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                "diagnostic_only": True,
+            },
+        )
+        self._append_jsonl(
+            self.attempt_dir / "controller-results.jsonl",
+            {
+                "schema_version": 1,
+                "report_revision": REPORT_REVISION,
+                "scenario_id": scenario_id,
+                "controller_goal_sent": record.get("controller_goal_sent"),
+                "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                "execute_result_status": record.get("execute_result_status"),
+                "execute_result_status_string": record.get("execute_result_status_string"),
+                "fjt_goal_uuid": record.get("fjt_goal_uuid"),
+                "fjt_status": record.get("fjt_status"),
+                "fjt_goal_digest": record.get("fjt_goal_digest"),
+                "diagnostic_only": True,
+            },
+        )
+        self._write_json_atomic(
+            self.attempt_dir / "integrated-execution.json",
+            {
+                "schema_version": 1,
+                "report_revision": REPORT_REVISION,
+                "scenario_id": scenario_id,
+                "stage": "D",
+                "handler": spec.get("kind"),
+                "polarity": spec.get("polarity"),
+                "diagnostic_only": True,
+                "physical_verdict": None,
+                "status": record.get("status"),
+                "reason_code": record.get("reason_code"),
+                "planner_status": record.get("planner_status"),
+                "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                "controller_goal_sent": record.get("controller_goal_sent"),
+                "planning_goal_id": record.get("planning_goal_id"),
+                "execute_goal_id": record.get("execute_goal_id"),
+                "goals_canceling": record.get("goals_canceling"),
+                "planned_trajectory_digest": record.get("planned_trajectory_digest"),
+                "executed_trajectory_digest": record.get("executed_trajectory_digest"),
+                "fjt_goal_digest": record.get("fjt_goal_digest"),
+                "fjt_goal_uuid": record.get("fjt_goal_uuid"),
+                "fjt_status": record.get("fjt_status"),
+                "execute_result_status": record.get("execute_result_status"),
+                "execute_result_status_string": record.get("execute_result_status_string"),
+                "terminal_status": record.get("terminal_status"),
+                "event_log": record.get("event_log"),
+                "elapsed_s": record.get("elapsed_s"),
+                "isaac_joint_commands_published": False,
+            },
+        )
+
+    def _write_d_fail_dominant_execution_json(
+        self,
+        scenario_id: str,
+        record: Mapping[str, object],
+        readiness: Mapping[str, object],
+        *,
+        downgraded_from: object,
+    ) -> None:
+        self._write_json_atomic(
+            self.attempt_dir / "integrated-execution.json",
+            {
+                "schema_version": 1,
+                "report_revision": REPORT_REVISION,
+                "scenario_id": scenario_id,
+                "stage": "D",
+                "diagnostic_only": True,
+                "physical_verdict": None,
+                "status": "evidence-invalid",
+                "reason_code": record.get("reason_code", "artifact-write-failed"),
+                "reasons": [str(record.get("artifact_error") or "D artifact final output failed")],
+                "planner_status": record.get("planner_status"),
+                "readiness": {
+                    "ready": readiness.get("ready", False),
+                    "reasons": readiness.get("reasons", []),
+                },
+                "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                "controller_goal_sent": record.get("controller_goal_sent"),
+                "downgraded_from": downgraded_from,
+                "isaac_joint_commands_published": False,
+            },
+        )
+
+    def _downgrade_persisted_d_evidence(
+        self,
+        scenario_id: str,
+        record: Mapping[str, object],
+        readiness: Mapping[str, object],
+        downgraded_from: object,
+    ) -> None:
+        """F3.1 analog: after a D artifact write failure, downgrade every already
+        created status-bearing D artifact to evidence-invalid."""
+        try:
+            self._write_d_fail_dominant_execution_json(
+                scenario_id, record, readiness, downgraded_from=downgraded_from
+            )
+        except Exception:
+            pass
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "integrated-execution.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "event": "gate-d",
+                    "stage": "D",
+                    "status": "evidence-invalid",
+                    "reason_code": record.get("reason_code"),
+                    "planner_status": record.get("planner_status"),
+                    "row_kind": "final",
+                    "downgraded_from": downgraded_from,
+                    "error": record.get("artifact_error"),
+                    "diagnostic_only": True,
+                    "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                    "controller_goal_sent": record.get("controller_goal_sent"),
+                    "isaac_joint_commands_published": False,
+                    "timestamp": float(time.monotonic()),
+                },
+            )
+        except Exception:
+            pass
+
     def _acquire_scene(self, scenario_id: str) -> dict[str, object] | None:
         """F2.5/F3.2: bounded pre-goal scene acquisition through the private spinner.
 
@@ -2770,16 +5011,29 @@ def _service_type_to_ros(service_type: str, ros: Mapping[str, Any]) -> Any:
 
 __all__ = [
     "ARTIFACT_JSONL_FILES",
+    "CARTESIAN_MOVE_ENDPOINT",
     "CONTROLLER_MANAGER_NODE",
     "DIGEST",
+    "D_FORBIDDEN_EVENTS",
     "EARLIER_OPERATION_OPTIONAL_FIELDS",
+    "EXECUTE_STATUS_ABORTED",
+    "EXECUTE_STATUS_CANCELED",
+    "EXECUTE_STATUS_SUCCEEDED",
+    "EXECUTE_TRAJECTORY_ENDPOINT",
     "FINAL_SIMULATION_STATE",
     "FIXTURE_OWNER",
     "FIXTURE_PUBLISHER_NODE",
     "FIXTURE_TARGET_HANDOFF",
     "FIXTURE_TOPIC",
+    "FJT_ENDPOINT",
+    "FJT_STATUS_CACHE_LIMIT",
+    "FJT_STATUS_TOPIC",
     "GATE_C_FORBIDDEN_EVENTS",
     "GATE_C_REQUIRED_EVENT_ORDER",
+    "GRIPPER_CLOSE_POSITION",
+    "GRIPPER_ENDPOINT",
+    "GRIPPER_MAX_EFFORT",
+    "GRIPPER_OPEN_POSITION",
     "IDENTITY_KEYS",
     "INTEGRATED_EXECUTION_PROFILE",
     "ISAAC_COMMAND_TOPIC",
@@ -2804,23 +5058,37 @@ __all__ = [
     "REQUIRED_ACTIONS",
     "REQUIRED_SERVICES",
     "REQUIRED_TOPICS",
+    "RETREAT_AXIS",
+    "RETREAT_DISTANCE_M",
     "RMW_IMPLEMENTATION",
     "SAFETY_STOP_TOPIC",
     "SAFETY_SUPERVISOR_NODE",
     "SIMULATION_STATE_PLAYING",
     "STAGE_C_SCENARIOS",
+    "STAGE_D_EXPECTED_PHYSICAL",
+    "STAGE_D_EXPECTED_POLARITY",
+    "STAGE_D_KIND",
+    "STAGE_D_REQUIRED_EVENT_ORDER",
+    "STAGE_D_SCENARIOS",
+    "STAGE_E_CANCEL_NEGATIVES",
     "TARGET_OBJECT_ID",
     "TASK_NAMESPACE",
     "IntegratedGateExecutor",
+    "build_cartesian_move_goal",
+    "build_execute_trajectory_goal",
+    "build_gripper_goal",
     "build_joint_move_group_goal",
     "build_journal_graph_projection",
     "build_pick_goal",
     "build_place_goal",
     "build_pose_move_group_goal",
+    "derive_retreat_target_pose",
     "deterministic_cube_cloud",
     "evaluate_executor_readiness",
     "expected_fixture_geometry_digest",
     "expected_physics_ready_report",
+    "run_pick_place_negative",
     "stage_c_dispatch",
+    "stage_d_dispatch",
     "validate_physics_ready_snapshot",
 ]
