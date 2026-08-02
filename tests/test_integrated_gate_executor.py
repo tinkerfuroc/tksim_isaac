@@ -1094,3 +1094,445 @@ def test_expected_fixture_geometry_digest_matches_owned_id_order_for_stage_c():
             fixture_owned_ids(declaration)
         )
         assert expected_fixture_geometry_digest(declaration) == geometry_signature_sha256(ordered)
+
+
+# ---------------------------------------------------------------------------
+# Task 5 (Gate D): fake executor transaction contract, Stage-D dispatch,
+# split-path UUID/status helpers, retreat/gripper constants, D journal order,
+# Gate-E negative stub.
+# ---------------------------------------------------------------------------
+
+
+class FakeIntegratedExecutor:
+    """Task-5 test-local deterministic state-machine double.
+
+    Models only the observable transaction contract; it never pretends to be a
+    ROS client.
+    """
+
+    def run_cancel_sequence(
+        self, *, planning_goal_id: str, execute_goal_id: str, timeout_s: float
+    ) -> dict[str, object]:
+        return {
+            "planning_goal_id": planning_goal_id,
+            "execute_goal_id": execute_goal_id,
+            "goals_canceling": [execute_goal_id],
+            "quiescent": True, "elapsed_s": min(timeout_s, 0.1),
+            "terminal_status": "canceled",
+            "cancel_endpoint": "/execute_trajectory",
+            "move_group_plan_only": True,
+            "events": ["plan-only", "execute-trajectory-start", "cancel-requested", "quiescent", "canceled"],
+        }
+
+    def run_safety_sequence(self, *, goal_id: str, stop_timeout_s: float) -> dict[str, object]:
+        return {
+            "goal_id": goal_id,
+            "events": ["execution-start", "effective-stop", "operator-clear"],
+            "effective_stop": True, "terminal_status": "aborted",
+            "operator_clear": True, "sent_goal_ids": [goal_id], "resumed": False,
+        }
+
+    def run_cartesian_retreat(self, *, target_frame: str, distance_m: float) -> dict[str, object]:
+        return {
+            "endpoint": "/cartesian_move_action", "target_frame": target_frame,
+            "distance_m": distance_m, "collision_checking": True,
+            "command_gateway_bypassed": False,
+        }
+
+    def run_gripper_sequence(self, *, open_first: bool) -> dict[str, object]:
+        return {
+            "endpoint": "/xarm_gripper/gripper_action",
+            "commands": ["open", "close"] if open_first else ["close", "open"],
+            "native_action": True,
+        }
+
+    def run_pick_place_negative(self, scenario: str) -> dict[str, object]:
+        if scenario == "cancel-approach":
+            return {"events": ["approach-start", "cancel"], "release_stage_started": False,
+                    "released": False}
+        if scenario == "cancel-transport":
+            return {"events": ["approach-start", "lift-complete", "cancel"],
+                    "release_stage_started": False, "released": False}
+        raise ValueError(f"unsupported test scenario: {scenario}")
+
+
+@pytest.fixture
+def fake_executor() -> FakeIntegratedExecutor:
+    return FakeIntegratedExecutor()
+
+
+def test_cancel_records_distinct_plan_and_execute_ids(fake_executor):
+    trace = fake_executor.run_cancel_sequence(planning_goal_id="plan-42", execute_goal_id="exec-42", timeout_s=2.0)
+    assert trace["planning_goal_id"] == "plan-42"
+    assert trace["execute_goal_id"] == "exec-42"
+    assert trace["planning_goal_id"] != trace["execute_goal_id"]
+    assert trace["goals_canceling"] == ["exec-42"]
+    assert trace["quiescent"] is True
+    assert trace["elapsed_s"] <= 2.0
+
+
+def test_cancel_sequence_cannot_emit_later_execution_stage(fake_executor):
+    trace = fake_executor.run_cancel_sequence(planning_goal_id="plan-43", execute_goal_id="exec-43", timeout_s=2.0)
+    assert trace["terminal_status"] == "canceled"
+    assert trace["events"][-1] == "canceled"
+    assert "release" not in trace["events"]
+    assert "retreat" not in trace["events"]
+
+
+def test_cancel_targets_execute_trajectory_goal_not_move_group_goal(fake_executor):
+    trace = fake_executor.run_cancel_sequence(planning_goal_id="plan-46", execute_goal_id="exec-46", timeout_s=2.0)
+    assert trace["cancel_endpoint"] == "/execute_trajectory"
+    assert trace["execute_goal_id"] == "exec-46"
+    assert trace["planning_goal_id"] != trace["execute_goal_id"]
+    assert trace["goals_canceling"] == [trace["execute_goal_id"]]
+    assert trace["move_group_plan_only"] is True
+
+
+def test_safety_sequence_waits_effective_stop_before_clear(fake_executor):
+    trace = fake_executor.run_safety_sequence(goal_id="goal-44", stop_timeout_s=2.0)
+    assert trace["events"].index("effective-stop") < trace["events"].index("operator-clear")
+    assert trace["effective_stop"] is True
+    assert trace["terminal_status"] == "aborted"
+
+
+def test_safety_clear_does_not_resend_old_goal(fake_executor):
+    trace = fake_executor.run_safety_sequence(goal_id="goal-45", stop_timeout_s=2.0)
+    assert trace["operator_clear"] is True
+    assert trace["sent_goal_ids"] == ["goal-45"]
+    assert trace["resumed"] is False
+
+
+def test_cartesian_retreat_uses_production_action(fake_executor):
+    trace = fake_executor.run_cartesian_retreat(target_frame="base_link", distance_m=0.10)
+    assert trace["endpoint"] == "/cartesian_move_action"
+    assert trace["collision_checking"] is True
+    assert trace["command_gateway_bypassed"] is False
+
+
+def test_gripper_sequence_uses_native_action(fake_executor):
+    trace = fake_executor.run_gripper_sequence(open_first=True)
+    assert trace["endpoint"] == "/xarm_gripper/gripper_action"
+    assert trace["commands"] == ["open", "close"]
+    assert trace["native_action"] is True
+
+
+# --- Stage-D dispatch contract ---------------------------------------------
+
+STAGE_D_SCENARIO_NAMES = (
+    "qualification-moveit-execute-joint",
+    "qualification-moveit-execute-pose",
+    "qualification-moveit-cartesian-retreat",
+    "qualification-moveit-gripper",
+    "qualification-moveit-cancel",
+    "qualification-moveit-safety",
+)
+
+
+@pytest.mark.parametrize(
+    ("scenario_name", "kind", "polarity"),
+    [
+        ("qualification-moveit-execute-joint", "execute-joint", "positive"),
+        ("qualification-moveit-execute-pose", "execute-pose", "positive"),
+        ("qualification-moveit-cartesian-retreat", "retreat", "positive"),
+        ("qualification-moveit-gripper", "gripper", "positive"),
+        ("qualification-moveit-cancel", "cancel", "cancel"),
+        ("qualification-moveit-safety", "safety", "safety"),
+    ],
+)
+def test_stage_d_dispatch_validates_six_scenarios(scenario_name, kind, polarity):
+    """D1: the six Stage-D scenarios dispatch to the exact handler kind and
+    declared polarity with the exact expected_physical list."""
+    from validation.integrated_gate_executor import (
+        STAGE_D_EXPECTED_PHYSICAL,
+        stage_d_dispatch,
+    )
+
+    contract = scenario_report_contract(scenario_name)
+    spec = stage_d_dispatch(scenario_name, scenario=readiness_scenario(contract))
+    assert spec["scenario_id"] == scenario_name
+    assert spec["kind"] == kind
+    assert spec["polarity"] == polarity
+    assert spec["expected_physical"] == list(STAGE_D_EXPECTED_PHYSICAL[scenario_name])
+    assert spec["forbidden_endpoints"] == ["/isaac_joint_commands"]
+    if kind == "execute-joint":
+        assert spec["joints"] == list(Q_OUTBOUND)
+    elif kind == "execute-pose":
+        xyz = spec["target_pose"]["xyz"]
+        quaternion = spec["target_pose"]["quaternion_xyzw"]
+        assert len(xyz) == 3 and all(math.isfinite(float(value)) for value in xyz)
+        assert len(quaternion) == 4 and all(math.isfinite(float(value)) for value in quaternion)
+        norm = math.sqrt(sum(float(value) ** 2 for value in quaternion))
+        assert abs(norm - 1.0) <= 1.0e-3
+
+
+def test_stage_d_dispatch_rejects_non_d_scenario():
+    """D2: C/E-stage and unknown scenarios fail closed."""
+    from validation.integrated_gate_executor import stage_d_dispatch
+
+    contract = scenario_report_contract("qualification-moveit-plan-joint")
+    with pytest.raises(ValueError, match="stage must be D"):
+        stage_d_dispatch("qualification-moveit-plan-joint", scenario=readiness_scenario(contract))
+    contract = scenario_report_contract("qualification-pick-place-positive")
+    with pytest.raises(ValueError, match="stage must be D"):
+        stage_d_dispatch("qualification-pick-place-positive", scenario=readiness_scenario(contract))
+    with pytest.raises(ValueError, match="scenario_id does not match"):
+        stage_d_dispatch("qualification-moveit-cancel", scenario=readiness_scenario(contract))
+
+
+def test_stage_d_dispatch_rejects_mutated_polarity_and_expected_physical():
+    """D3: mutating polarity or expected_physical fails closed."""
+    from validation.integrated_gate_executor import stage_d_dispatch
+
+    contract = scenario_report_contract("qualification-moveit-cancel")
+    scenario = readiness_scenario(contract)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["acceptance"]["polarity"] = "positive"
+    with pytest.raises(ValueError, match="polarity"):
+        stage_d_dispatch("qualification-moveit-cancel", scenario=mutated)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["expected_physical"] = ["wrong"]
+    with pytest.raises(ValueError, match="expected_physical"):
+        stage_d_dispatch("qualification-moveit-cancel", scenario=mutated)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["forbidden_endpoints"] = ["/other"]
+    with pytest.raises(ValueError, match="forbidden_endpoints"):
+        stage_d_dispatch("qualification-moveit-cancel", scenario=mutated)
+
+
+def test_stage_d_dispatch_rejects_mutated_execution_profile():
+    from validation.integrated_gate_executor import stage_d_dispatch
+
+    contract = scenario_report_contract("qualification-moveit-safety")
+    scenario = readiness_scenario(contract)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["execution_profile"] = "other"
+    with pytest.raises(ValueError, match="execution_profile"):
+        stage_d_dispatch("qualification-moveit-safety", scenario=mutated)
+
+
+# --- Stage-D pure helpers ---------------------------------------------------
+
+def test_execute_status_name_maps_terminal_statuses():
+    """D4: ExecuteTrajectory terminal statuses use action_msgs constants."""
+    from validation.integrated_gate_executor import _execute_status_name
+
+    assert _execute_status_name(4) == "succeeded"
+    assert _execute_status_name(5) == "canceled"
+    assert _execute_status_name(6) == "aborted"
+    for bad in (0, 1, 3, 7, 999, True, "4", None):
+        with pytest.raises(ValueError):
+            _execute_status_name(bad)
+
+
+def test_goal_uuid_normalization_and_validity():
+    """D5: 16-byte UUID normalization and validity."""
+    from validation.integrated_gate_executor import _normalize_goal_uuid, _valid_goal_uuid
+
+    raw = bytes.fromhex("00112233445566778899aabbccddeeff")
+    normalized = _normalize_goal_uuid(raw)
+    assert normalized == "00112233445566778899aabbccddeeff"
+    assert _valid_goal_uuid(normalized)
+    assert _valid_goal_uuid("f" * 32)
+    assert not _valid_goal_uuid("F" * 32)
+    assert not _valid_goal_uuid("f" * 31)
+    assert not _valid_goal_uuid(None)
+    assert not _valid_goal_uuid(123)
+    assert _normalize_goal_uuid("00112233-4455-6677-8899-aabbccddeeff") == "00112233445566778899aabbccddeeff"
+    assert _normalize_goal_uuid(b"short") is None
+    assert _normalize_goal_uuid(None) is None
+    assert _normalize_goal_uuid(True) is None
+
+
+def test_arm_velocity_within_limit_predicate():
+    """D6: effective-stop bounded-velocity predicate."""
+    from validation.integrated_gate_executor import _arm_velocity_within_limit
+
+    bounded = [[0.0] * 7, [0.01, 0.02, 0.0, 0.01, 0.0, 0.0, 0.01], [0.02] * 7]
+    assert _arm_velocity_within_limit(bounded, 0.02) is True
+    assert _arm_velocity_within_limit(bounded, 0.05) is True
+    over = [0.03] * 7
+    assert _arm_velocity_within_limit([bounded[0], over], 0.02) is False
+    assert _arm_velocity_within_limit([[0.0] * 6], 0.02) is False
+    assert _arm_velocity_within_limit([[float("nan")] * 7], 0.02) is False
+    assert _arm_velocity_within_limit(bounded, float("nan")) is False
+    assert _arm_velocity_within_limit("not frames", 0.02) is False
+    assert _arm_velocity_within_limit([], 0.02) is True
+
+
+def test_derive_retreat_target_plus_z_preserves_orientation():
+    """D7: +Z 0.10 m retreat from the observed TCP pose preserves orientation."""
+    from validation.integrated_gate_executor import derive_retreat_target_pose
+
+    source = {
+        "frame_id": "base_link",
+        "xyz": [0.65, 0.0, 0.72],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "identity": 7,
+        "age_s": 0.05,
+    }
+    target = derive_retreat_target_pose(source, distance_m=0.10, axis="+z")
+    assert target["frame_id"] == "base_link"
+    assert target["xyz"] == [0.65, 0.0, 0.82]
+    assert target["quaternion_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+    for bad_axis in ("z", "+w", ""):
+        with pytest.raises(ValueError, match="axis"):
+            derive_retreat_target_pose(source, distance_m=0.10, axis=bad_axis)
+
+
+def test_derive_retreat_target_fails_closed_on_bad_input():
+    from validation.integrated_gate_executor import derive_retreat_target_pose
+
+    for source in (
+        {"frame_id": "world", "xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        {"frame_id": "base_link", "xyz": [0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        {"frame_id": "base_link", "xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 0.0]},
+    ):
+        with pytest.raises(ValueError):
+            derive_retreat_target_pose(source, distance_m=0.10, axis="+z")
+
+
+def test_run_pick_place_negative_is_zero_traffic_fail_closed_stub():
+    """D8: Gate-E negative stub records no release and zero goals for the two
+    cancellation identities, and rejects all others."""
+    from validation.integrated_gate_executor import run_pick_place_negative
+
+    record = run_pick_place_negative("cancel-approach")
+    assert record["events"] == ["approach-start", "cancel"]
+    assert record["release_stage_started"] is False
+    assert record["released"] is False
+    assert record["goals_sent"] == 0
+    record = run_pick_place_negative("qualification-pick-place-cancel-transport")
+    assert record["events"] == ["approach-start", "lift-complete", "cancel"]
+    assert record["release_stage_started"] is False
+    assert record["released"] is False
+    for bad in ("qualification-pick-place-positive", "cancel", "other", ""):
+        with pytest.raises(ValueError):
+            run_pick_place_negative(bad)
+
+
+def test_d_stage_event_order_is_scenario_specific():
+    """D9: D journals use scenario-specific event orders; Gate C stays exact."""
+    from validation.integrated_gate_executor import (
+        GATE_C_REQUIRED_EVENT_ORDER,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+        _d_stage_event_order,
+    )
+
+    assert GATE_C_REQUIRED_EVENT_ORDER == ("fixture-ready", "teardown")
+    assert _d_stage_event_order({"integrated": {"stage": "C"}}) == GATE_C_REQUIRED_EVENT_ORDER
+    joint = _d_stage_event_order(
+        {"id": "qualification-moveit-execute-joint", "integrated": {"stage": "D"}}
+    )
+    assert joint == ("fixture-ready", "execution-start", "execution-terminal", "teardown")
+    cancel = _d_stage_event_order(
+        {"id": "qualification-moveit-cancel", "integrated": {"stage": "D"}}
+    )
+    assert cancel == ("fixture-ready", "execution-start", "cancel-requested", "quiescent", "teardown")
+    safety = _d_stage_event_order(
+        {"id": "qualification-moveit-safety", "integrated": {"stage": "D"}}
+    )
+    assert safety == ("fixture-ready", "execution-start", "effective-stop", "operator-clear", "quiescent", "teardown")
+    assert STAGE_D_REQUIRED_EVENT_ORDER["retreat"] == ("fixture-ready", "retreat-start", "retreat-terminal", "teardown")
+    assert STAGE_D_REQUIRED_EVENT_ORDER["gripper"] == ("fixture-ready", "gripper-open-terminal", "gripper-close-terminal", "teardown")
+
+
+def test_d_journal_rejects_gate_c_only_order(tmp_path):
+    """D10: a D journal rejects a Gate-C-only sequence and vice versa."""
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        GATE_C_REQUIRED_EVENT_ORDER,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+        _d_stage_event_order,
+    )
+
+    from tinker_sim_bridge.fixture_planning_scene import fixture_owned_ids
+
+    contract = scenario_report_contract("qualification-moveit-execute-joint")
+    declaration = contract["planning_scene_declaration"]
+    scene = {
+        **_valid_scene(declaration),
+        "frame_index": 0,
+        "timestamp": 0.0,
+    }
+
+    def _make_journal(required_order, name):
+        from planning_scene_journal import PlanningSceneJournal, load_model_touch_contract
+
+        touch = load_model_touch_contract()
+        return PlanningSceneJournal(
+            fixture_revision=declaration["revision"],
+            task_namespace="pick_and_place/",
+            target_object_id="pick_and_place/object_mesh",
+            expected_attach_link=touch["link_tcp"],
+            expected_touch_links=touch["touch_links"],
+            required_event_order=tuple(required_order),
+            forbidden_events=D_FORBIDDEN_EVENTS,
+            jsonl_path=tmp_path / f"{name}-planning-scene.jsonl",
+        )
+
+    d_order = STAGE_D_REQUIRED_EVENT_ORDER["execute-joint"]
+    # A D journal recording a Gate-C-only sequence must fail finalization.
+    d_journal = _make_journal(d_order, "d")
+    d_journal.record_diff("fixture-ready", scene)
+    d_journal.snapshot("teardown", frame_index=1, timestamp=1.0)
+    with pytest.raises(ValueError, match="required event order"):
+        d_journal.finalize("diagnostic-pass")
+
+    # A Gate-C journal recording a D sequence must fail finalization.
+    c_journal = _make_journal(GATE_C_REQUIRED_EVENT_ORDER, "c")
+    c_journal.record_diff("fixture-ready", {**_valid_scene(declaration), "frame_index": 0, "timestamp": 0.0})
+    c_journal.snapshot("execution-start", frame_index=1, timestamp=1.0)
+    with pytest.raises(ValueError, match="required event order"):
+        c_journal.finalize("diagnostic-pass")
+
+
+def test_d_forbidden_events_match_gate_c_manipulation_events():
+    """D11: the eight forbidden manipulation events apply unchanged to D."""
+    from validation.integrated_gate_executor import D_FORBIDDEN_EVENTS, GATE_C_FORBIDDEN_EVENTS
+
+    assert D_FORBIDDEN_EVENTS == GATE_C_FORBIDDEN_EVENTS
+    assert D_FORBIDDEN_EVENTS == (
+        "before-pick",
+        "scene-attach",
+        "lift-complete",
+        "transport",
+        "before-release",
+        "scene-detach",
+        "released-settled",
+        "task-cleanup",
+    )
+
+
+def test_journal_graph_projection_unchanged_with_fjt_status_subscription():
+    """D12: the Task-3 graph projection shape is unchanged when the executor
+    additionally subscribes to the FJT status topic (the status subscription
+    stays outside the exact three-topic/two-service journal projection)."""
+    from validation.integrated_gate_executor import (
+        FJT_STATUS_TOPIC,
+        build_journal_graph_projection,
+    )
+
+    projection = build_journal_graph_projection(
+        fixture_payload=_canonical_fixture_payload(),
+        observed_graph=_observed_graph_double(),
+    )
+    assert set(projection["topics"]) == {
+        "/planning_scene",
+        "/monitored_planning_scene",
+        "/sim/status/planning_scene_fixture",
+    }
+    assert set(projection["services"]) == {"/get_planning_scene", "/apply_planning_scene"}
+    assert FJT_STATUS_TOPIC not in projection["topics"]
+
+
+def test_stage_d_expected_physical_lists_match_scenario_declarations():
+    """D13: every D scenario's declared expected_physical equals the exact
+    configured list carried by the dispatch spec."""
+    from validation.integrated_gate_executor import STAGE_D_EXPECTED_PHYSICAL, stage_d_dispatch
+
+    for scenario_name in STAGE_D_SCENARIO_NAMES:
+        contract = scenario_report_contract(scenario_name)
+        declared = contract["integrated"].get("expected_physical")
+        spec = stage_d_dispatch(scenario_name, scenario=readiness_scenario(contract))
+        assert list(declared) == spec["expected_physical"]
+        assert list(declared) == list(STAGE_D_EXPECTED_PHYSICAL[scenario_name])

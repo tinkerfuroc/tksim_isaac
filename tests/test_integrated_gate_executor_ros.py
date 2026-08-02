@@ -77,13 +77,30 @@ from tinker_sim_bridge.integrated_readiness import (  # noqa: E402
     public_integrated_mapping,
 )
 from validation.integrated_gate_executor import (  # noqa: E402
+    CARTESIAN_MOVE_ENDPOINT,
+    EXECUTE_STATUS_ABORTED,
+    EXECUTE_STATUS_CANCELED,
+    EXECUTE_STATUS_SUCCEEDED,
+    FJT_ENDPOINT,
+    FJT_STATUS_TOPIC,
+    GRIPPER_CLOSE_POSITION,
+    GRIPPER_ENDPOINT,
+    GRIPPER_MAX_EFFORT,
+    GRIPPER_OPEN_POSITION,
+    RETREAT_AXIS,
+    RETREAT_DISTANCE_M,
     IntegratedGateExecutor,
+    _valid_goal_uuid,
+    build_cartesian_move_goal,
+    build_execute_trajectory_goal,
+    build_gripper_goal,
     build_joint_move_group_goal,
     build_pick_goal,
     build_place_goal,
     build_pose_move_group_goal,
     deterministic_cube_cloud,
     evaluate_executor_readiness,
+    run_pick_place_negative,
     validate_physics_ready_snapshot,
 )
 
@@ -435,12 +452,16 @@ class _FakeGoalHandle:
         result_ready_at=0.0,
         cancel_ready_at=0.0,
         cancel_response="cancelled",
+        goal_id=None,
+        status=None,
     ):
         self.accepted = accepted
         self.result = result
         self._result_ready_at = float(result_ready_at)
         self._cancel_ready_at = float(cancel_ready_at)
         self._cancel_response = cancel_response
+        self.goal_id = goal_id
+        self.status = status
         self.cancel_called = False
 
     def get_result_async(self):
@@ -1721,5 +1742,445 @@ def test_executor_blocked_allowlisted_code_with_nonempty_trajectory_is_failure(t
         assert record["error_code"] == 5
         assert record["nonempty_plan"] is True
         assert record["planner_status"] == "diagnostic-fail"
+    finally:
+        executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Task 5 (Gate D): split-path execute, FJT observation, gripper, Cartesian
+# retreat, cancellation, safety interruption, and the Gate-E negative stub.
+# --------------------------------------------------------------------------- #
+
+def _d_executor(tmp_path, scenario_id):
+    """A D-scenario executor with the standard join/readiness/graph providers."""
+    from test_integrated_gate_executor import (
+        _observed_graph_double,
+        _ready_snapshot_for_contract,
+    )
+
+    executor, contract = _make_executor(
+        tmp_path,
+        scenario_id=scenario_id,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+    return executor, contract
+
+
+def _valid_digest_str():
+    return "a" * 64
+
+
+def _fjt_evidence(goal_uuid, status, *, digest=None):
+    return {
+        "endpoint": FJT_ENDPOINT,
+        "goal_uuid": goal_uuid,
+        "trajectory_digest": digest if digest is not None else _valid_digest_str(),
+        "source": "test-send-goal-service-introspection",
+        "sequence": 1,
+        "timestamp": 1.0,
+        "status": status,
+    }
+
+
+def test_execute_trajectory_goal_constructs_unchanged_goal():
+    from moveit_msgs.action import ExecuteTrajectory
+    from rclpy.serialization import serialize_message
+
+    planned = _success_result().planned_trajectory
+    digest_before = hashlib.sha256(serialize_message(planned)).hexdigest()
+    goal = build_execute_trajectory_goal(planned)
+    assert isinstance(goal, ExecuteTrajectory.Goal)
+    assert goal.trajectory is planned
+    digest_after = hashlib.sha256(serialize_message(goal.trajectory)).hexdigest()
+    assert digest_after == digest_before
+
+
+def test_execute_trajectory_goal_rejects_none_and_empty():
+    with pytest.raises(ValueError, match="non-empty"):
+        build_execute_trajectory_goal(None)
+    with pytest.raises(ValueError, match="non-empty"):
+        build_execute_trajectory_goal(_empty_plan_success_result().planned_trajectory)
+
+
+def test_executor_fjt_status_subscription_uses_stock_action_qos(tmp_path):
+    from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+
+    executor, _ = _make_executor(tmp_path)
+    try:
+        by_topic = {sub.topic_name: sub for sub in executor.node.subscriptions}
+        assert FJT_STATUS_TOPIC in by_topic
+        sub = by_topic[FJT_STATUS_TOPIC]
+        assert sub.msg_type.__name__ == "GoalStatusArray"
+        profile = sub.qos_profile
+        assert profile.depth == 1
+        assert profile.reliability == ReliabilityPolicy.RELIABLE
+        assert profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+    finally:
+        executor.shutdown()
+
+
+def test_executor_has_no_fjt_action_goal_subscription(tmp_path):
+    executor, _ = _make_executor(tmp_path)
+    try:
+        topics = {sub.topic_name for sub in executor.node.subscriptions}
+        assert "/xarm7_traj_controller/follow_joint_trajectory/_action/goal" not in topics
+    finally:
+        executor.shutdown()
+
+
+def test_gripper_goal_constructs_open_close():
+    from control_msgs.action import GripperCommand
+
+    open_goal = build_gripper_goal(GRIPPER_OPEN_POSITION, max_effort=GRIPPER_MAX_EFFORT)
+    close_goal = build_gripper_goal(GRIPPER_CLOSE_POSITION, max_effort=GRIPPER_MAX_EFFORT)
+    assert isinstance(open_goal, GripperCommand.Goal)
+    assert isinstance(close_goal, GripperCommand.Goal)
+    assert open_goal.command.position == 0.0
+    assert close_goal.command.position == 0.85
+    assert open_goal.command.max_effort == 10.0
+    assert close_goal.command.max_effort == 10.0
+
+
+def test_gripper_goal_rejects_non_finite():
+    with pytest.raises(ValueError, match="finite"):
+        build_gripper_goal(float("nan"), max_effort=GRIPPER_MAX_EFFORT)
+    with pytest.raises(ValueError, match="finite"):
+        build_gripper_goal(GRIPPER_OPEN_POSITION, max_effort=float("inf"))
+
+
+def test_cartesian_move_goal_constructs_real_goal():
+    from geometry_msgs.msg import Pose
+    from sensor_msgs.msg import PointCloud2
+    from tinker_arm_msgs.action import CartesianMove
+
+    target = Pose()
+    target.position.z = 0.82
+    target.orientation.w = 1.0
+    goal = build_cartesian_move_goal(target)
+    assert isinstance(goal, CartesianMove.Goal)
+    assert goal.target_pose == target
+    # The generated CartesianMove goal requires a PointCloud2 env_points; an
+    # empty cloud is the neutral collision-aware default.
+    assert isinstance(goal.env_points, PointCloud2)
+
+
+def test_cartesian_move_goal_rejects_wrong_frame_and_zero_quaternion():
+    from geometry_msgs.msg import Pose, PoseStamped
+
+    target = PoseStamped()
+    target.header.frame_id = "world"
+    target.pose.orientation.w = 1.0
+    with pytest.raises(ValueError, match="base_link"):
+        build_cartesian_move_goal(target)
+    pose = Pose()
+    pose.orientation.w = 0.0
+    with pytest.raises(ValueError, match="quaternion"):
+        build_cartesian_move_goal(pose)
+
+
+def test_executor_run_execute_sequence_split_path_pass(tmp_path):
+    import uuid as _uuid
+
+    from rclpy.serialization import serialize_message
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
+    try:
+        planned = _success_result().planned_trajectory
+        plan_uuid = _uuid.uuid4().bytes
+        execute_uuid = _uuid.uuid4().bytes
+        plan_handle = _FakeGoalHandle(
+            accepted=True, result=_success_result(), goal_id=plan_uuid, result_ready_at=0.0
+        )
+        execute_handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=execute_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        move_client = _FakeMoveClient(server_ready=True, goal_handle=plan_handle, send_ready_at=0.0)
+        exec_client = _FakeMoveClient(server_ready=True, goal_handle=execute_handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = move_client
+        executor._action_clients["/execute_trajectory"] = exec_client
+        _synthetic_scene(executor, contract)
+        execute_hex = _uuid.UUID(bytes=execute_uuid).hex
+        executor._fjt_status_cache.append(
+            {"goal_uuid": execute_hex, "status": EXECUTE_STATUS_SUCCEEDED, "received": 1.0}
+        )
+        trajectory_digest = hashlib.sha256(serialize_message(planned)).hexdigest()
+        provider = _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest)
+        record = executor.run_execute_sequence(
+            "qualification-moveit-execute-joint", fjt_transaction_provider=lambda: provider
+        )
+        assert record["status"] == "diagnostic-pass"
+        assert record["execute_trajectory_goal_sent"] is True
+        assert record["controller_goal_sent"] is False
+        assert record["isaac_joint_commands_published"] is False
+        assert _valid_goal_uuid(record["planning_goal_id"])
+        assert _valid_goal_uuid(record["execute_goal_id"])
+        assert record["planning_goal_id"] != record["execute_goal_id"]
+        assert record["execute_goal_id"] == execute_hex
+        assert record["fjt_goal_uuid"] == execute_hex
+        assert record["fjt_status"] == EXECUTE_STATUS_SUCCEEDED
+        assert record["execute_result_status"] == EXECUTE_STATUS_SUCCEEDED
+        assert record["execute_result_status_string"] == "succeeded"
+        assert record["planned_trajectory_digest"] == trajectory_digest
+        assert record["executed_trajectory_digest"] == trajectory_digest
+        assert len(move_client.sent_goals) == 1
+        assert len(exec_client.sent_goals) == 1
+        exec_goal = exec_client.sent_goals[0]
+        # ROS generated messages copy on sub-message assignment; the split-path
+        # contract requires the canonical ROS-serialized trajectory digest to be
+        # unchanged after assignment (no mutation/replanning/round-trip), not
+        # object identity.
+        assert hashlib.sha256(serialize_message(exec_goal.trajectory)).hexdigest() == trajectory_digest
+        assert record["event_log"] == [
+            "fixture-ready", "execution-start", "execution-terminal", "teardown"
+        ]
+        assert (tmp_path / "planning-scene.json").stat().st_size > 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_execute_sequence_missing_provider_fails_closed(tmp_path):
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
+    try:
+        plan_uuid = _uuid.uuid4().bytes
+        plan_handle = _FakeGoalHandle(
+            accepted=True, result=_success_result(), goal_id=plan_uuid, result_ready_at=0.0
+        )
+        move_client = _FakeMoveClient(server_ready=True, goal_handle=plan_handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = move_client
+        _synthetic_scene(executor, contract)
+        record = executor.run_execute_sequence(
+            "qualification-moveit-execute-joint", fjt_transaction_provider=None
+        )
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "no-fjt-provider"
+        assert move_client.sent_goals == []
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_execute_sequence_fjt_mismatch_fails_closed(tmp_path):
+    import uuid as _uuid
+
+    from rclpy.serialization import serialize_message
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
+    try:
+        planned = _success_result().planned_trajectory
+        plan_uuid = _uuid.uuid4().bytes
+        execute_uuid = _uuid.uuid4().bytes
+        plan_handle = _FakeGoalHandle(
+            accepted=True, result=_success_result(), goal_id=plan_uuid, result_ready_at=0.0
+        )
+        execute_handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=execute_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        move_client = _FakeMoveClient(server_ready=True, goal_handle=plan_handle, send_ready_at=0.0)
+        exec_client = _FakeMoveClient(server_ready=True, goal_handle=execute_handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = move_client
+        executor._action_clients["/execute_trajectory"] = exec_client
+        _synthetic_scene(executor, contract)
+        execute_hex = _uuid.UUID(bytes=execute_uuid).hex
+        executor._fjt_status_cache.append(
+            {"goal_uuid": execute_hex, "status": EXECUTE_STATUS_SUCCEEDED, "received": 1.0}
+        )
+        trajectory_digest = hashlib.sha256(serialize_message(planned)).hexdigest()
+        # Provider evidence joins to a different (unknown) UUID -> mismatch.
+        provider = _fjt_evidence("d" * 32, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest)
+        record = executor.run_execute_sequence(
+            "qualification-moveit-execute-joint", fjt_transaction_provider=lambda: provider
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "fjt evidence" in record.get("execute_error", "")
+        assert len(move_client.sent_goals) == 1
+        assert len(exec_client.sent_goals) == 1
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_cancel_sequence_pass(tmp_path):
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cancel")
+    try:
+        plan_uuid = _uuid.uuid4().bytes
+        execute_uuid = _uuid.uuid4().bytes
+        plan_hex = _uuid.UUID(bytes=plan_uuid).hex
+        execute_hex = _uuid.UUID(bytes=execute_uuid).hex
+        _synthetic_scene(executor, contract)
+        executor._fjt_status_cache.append(
+            {"goal_uuid": execute_hex, "status": EXECUTE_STATUS_CANCELED, "received": 1.0}
+        )
+        cancel_handle = _FakeGoalHandle(
+            accepted=True, goal_id=execute_uuid, status=EXECUTE_STATUS_CANCELED,
+            cancel_ready_at=0.0, cancel_response="completed",
+        )
+        provider = _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED)
+        record = executor.run_cancel_sequence(
+            "qualification-moveit-cancel",
+            long_motion_provider=lambda: {
+                "planning_goal_id": plan_hex,
+                "execute_goal_id": execute_hex,
+            },
+            fjt_transaction_provider=lambda: provider,
+            execute_goal_handle=cancel_handle,
+        )
+        assert record["status"] == "diagnostic-pass"
+        assert record["execute_trajectory_goal_sent"] is False
+        assert record["goals_canceling"] == [execute_hex]
+        assert record["terminal_status"] == "canceled"
+        assert record["fjt_goal_uuid"] == execute_hex
+        assert record["fjt_status"] == EXECUTE_STATUS_CANCELED
+        assert cancel_handle.cancel_called is True
+        assert record["event_log"] == [
+            "fixture-ready", "execution-start", "cancel-requested", "quiescent", "teardown"
+        ]
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_safety_sequence_pass(tmp_path):
+    import uuid as _uuid
+
+    from std_msgs.msg import Bool
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-safety")
+    try:
+        plan_uuid = _uuid.uuid4().bytes
+        execute_uuid = _uuid.uuid4().bytes
+        plan_hex = _uuid.UUID(bytes=plan_uuid).hex
+        execute_hex = _uuid.UUID(bytes=execute_uuid).hex
+        _synthetic_scene(executor, contract)
+        stop = Bool()
+        stop.data = True
+        executor._latest_safety_stop = stop
+        executor._joint_velocity_frames = [[0.0] * 7 for _ in range(5)]
+        executor._fjt_status_cache.append(
+            {"goal_uuid": execute_hex, "status": EXECUTE_STATUS_ABORTED, "received": 1.0}
+        )
+        provider = _fjt_evidence(execute_hex, EXECUTE_STATUS_ABORTED)
+        record = executor.run_safety_sequence(
+            "qualification-moveit-safety",
+            long_motion_provider=lambda: {
+                "planning_goal_id": plan_hex,
+                "execute_goal_id": execute_hex,
+            },
+            fjt_transaction_provider=lambda: provider,
+            stop_timeout_s=0.1,
+        )
+        assert record["status"] == "diagnostic-pass"
+        assert record["execute_trajectory_goal_sent"] is False
+        assert record["terminal_status"] == "aborted"
+        assert record["event_log"] == [
+            "fixture-ready", "execution-start", "effective-stop",
+            "operator-clear", "quiescent", "teardown",
+        ]
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_cartesian_retreat_pass(tmp_path):
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cartesian-retreat")
+    try:
+        retreat_uuid = _uuid.uuid4().bytes
+        handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=retreat_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/cartesian_move_action"] = client
+        _synthetic_scene(executor, contract)
+        source = {
+            "frame_id": "base_link",
+            "xyz": [0.2, 0.0, 0.72],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "identity": "tcp-observation-1",
+            "age_s": 0.05,
+        }
+        record = executor.run_cartesian_retreat(
+            "qualification-moveit-cartesian-retreat", current_tcp_pose_provider=lambda: source
+        )
+        assert record["status"] == "diagnostic-pass"
+        assert record["endpoint"] == CARTESIAN_MOVE_ENDPOINT
+        assert record["distance_m"] == pytest.approx(0.10)
+        assert record["axis"] == "+z"
+        assert record["command_gateway_bypassed"] is False
+        assert len(client.sent_goals) == 1
+        target_pose = client.sent_goals[0].target_pose
+        assert target_pose.position.z == pytest.approx(0.82)
+        assert target_pose.position.x == pytest.approx(0.2)
+        assert record["event_log"] == [
+            "fixture-ready", "retreat-start", "retreat-terminal", "teardown"
+        ]
+        assert (tmp_path / "planning-scene.json").stat().st_size > 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_gripper_sequence_pass(tmp_path):
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-gripper")
+    try:
+        open_uuid = _uuid.uuid4().bytes
+        close_uuid = _uuid.uuid4().bytes
+        client = _FakeMoveClient(
+            server_ready=True,
+            goal_handle=None,
+            send_ready_at=0.0,
+        )
+        sent = []
+
+        def _send_goal(goal):
+            handle = _FakeGoalHandle(
+                accepted=True, result=None,
+                goal_id=open_uuid if len(sent) == 0 else close_uuid,
+                status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+            )
+            sent.append(goal)
+            return _FakeFuture(handle, ready_at=0.0)
+
+        client.send_goal_async = _send_goal
+        executor._action_clients["/xarm_gripper/gripper_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gripper_sequence("qualification-moveit-gripper")
+        assert record["status"] == "diagnostic-pass"
+        assert record["endpoint"] == GRIPPER_ENDPOINT
+        assert record["commands"] == ["open", "close"]
+        assert record["native_action"] is True
+        assert record["execute_trajectory_goal_sent"] is False
+        assert record["controller_goal_sent"] is True
+        assert len(sent) == 2
+        assert sent[0].command.position == 0.0
+        assert sent[1].command.position == 0.85
+        assert sent[0].command.max_effort == 10.0
+        assert record["event_log"] == [
+            "fixture-ready", "gripper-open-terminal", "gripper-close-terminal", "teardown"
+        ]
+        assert (tmp_path / "planning-scene.json").stat().st_size > 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_pick_place_negative_stub_zero_traffic(tmp_path):
+    executor, _ = _make_executor(tmp_path)
+    try:
+        approach = executor.run_pick_place_negative("cancel-approach")
+        assert approach["events"] == ["approach-start", "cancel"]
+        assert approach["release_stage_started"] is False
+        assert approach["released"] is False
+        assert approach["goals_sent"] == 0
+        transport = executor.run_pick_place_negative("cancel-transport")
+        assert transport["events"] == ["approach-start", "lift-complete", "cancel"]
+        assert transport["goals_sent"] == 0
+        with pytest.raises(ValueError, match="unsupported"):
+            executor.run_pick_place_negative("qualification-pick-place-positive")
     finally:
         executor.shutdown()
