@@ -119,5 +119,35 @@
       }
     ],
     "revision_digest": "d6d25cfe04fa7e641d6140c20431c24a5cd150005d0c7f9c13735402c93281ac"
+  },
+  "integrated": {
+    "stage": "C",
+    "fixture_revision": "2026-08-01-moveit-qualification-blocked",
+    "fixture_digest": "d6d25cfe04fa7e641d6140c20431c24a5cd150005d0c7f9c13735402c93281ac",
+    "authority": "physics_truth",
+    "execution_profile": "sim_ompl",
+    "goal": {
+      "target_object_id": "pick_and_place/object_mesh",
+      "target_source_id": "sim_fixture/public_target",
+      "place_region": null
+    },
+    "acceptance": {
+      "polarity": "plan-only"
+    },
+    "expected_scene": {
+      "owned_ids": [
+        "sim_fixture/pedestal",
+        "sim_fixture/public_target",
+        "sim_fixture/plan_blocker"
+      ],
+      "attached_ids": [],
+      "task_target_id": "pick_and_place/object_mesh"
+    },
+    "expected_physical": [],
+    "expected_negative": null,
+    "forbidden_endpoints": [
+      "/isaac_joint_commands"
+    ],
+    "terminal_policy": "verified by independent raw-truth replay"
   }
 }

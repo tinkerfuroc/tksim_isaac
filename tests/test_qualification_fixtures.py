@@ -108,6 +108,112 @@ class QualificationFixtureTest(unittest.TestCase):
             pedestal_ids = [record["id"] for record in data["actors"] if record["class_name"] == "static_pedestal"]
             self.assertEqual(pedestal_ids, ["qualification_pedestal"])
 
+    # ------------------------------------------------------------------
+    # Task 1: integrated pick-place scenarios keep the physical spawn records
+    # and the current primitive/mesh planning-scene representation.
+    # ------------------------------------------------------------------
+    PICK_PLACE_SCENARIOS = (
+        "qualification-pick-place-positive",
+        "qualification-pick-place-blocked-approach",
+        "qualification-pick-place-unreachable-grasp",
+        "qualification-pick-place-malformed-back",
+        "qualification-pick-place-cancel-approach",
+        "qualification-pick-place-cancel-transport",
+        "qualification-pick-place-safety-transport",
+        "qualification-pick-place-occupied-place",
+    )
+
+    def test_pick_place_positive_spawns_pedestal_and_cube(self) -> None:
+        scenario = load_named_scenario(ROOT, "qualification-pick-place-positive")
+        actors = {str(record["id"]): record for record in scenario.actors}
+        records = {str(record["id"]): record for record in scenario.objects}
+        self.assertEqual(set(actors), {"qualification_pedestal"})
+        self.assertEqual(set(records), {"qualification_cube"})
+
+        pedestal = actors["qualification_pedestal"]
+        self.assertEqual(pedestal["class_name"], "static_pedestal")
+        self.assertTrue(pedestal["fixed"])
+        self.assertEqual(
+            pedestal["asset_uri"],
+            "simulation/assets/primitives/qualification-pedestal.usda",
+        )
+        self.assertEqual(pedestal["role"], "support")
+        self.assertEqual(pedestal["planning_scene_id"], "sim_fixture/pedestal")
+        self.assertEqual(pedestal["pose"]["xyz"], [0.65, 0.0, 0.0])
+
+        cube = records["qualification_cube"]
+        self.assertEqual(cube["class_name"], "dynamic_cube")
+        self.assertTrue(cube["gravity"])
+        self.assertTrue(cube["collision"])
+        self.assertEqual(cube["asset_uri"], "simulation/assets/primitives/task-object.usda")
+        self.assertEqual(cube["role"], "pick-target")
+        self.assertEqual(cube["planning_scene_id"], "sim_fixture/qualification_cube")
+        self.assertEqual(cube["pose"]["xyz"], [0.65, 0.0, self.CUBE_ROOT_Z])
+
+        operations = standard_operations(ROOT, scenario, 7)
+        spawns = {
+            operation.payload["logical_id"]: operation.payload
+            for operation in operations
+            if operation.kind == "spawn_entity"
+        }
+        self.assertEqual(set(spawns), {"qualification_pedestal", "qualification_cube"})
+        final_state = operations[-1].payload
+        self.assertEqual(final_state["state"], 1)
+        self.assertEqual(final_state["boundary"], "PHYSICS_READY")
+        self.assertEqual(final_state["scenario"]["id"], "qualification-pick-place-positive")
+        self.assertEqual(final_state["scenario"]["seed"], 7)
+        self.assertEqual(final_state["planning_scene"]["revision"], "qualification-v1")
+        self.assertEqual(final_state["integrated"]["stage"], "E")
+
+    def test_pick_place_scenarios_use_primitive_mesh_planning_scene(self) -> None:
+        for name in self.PICK_PLACE_SCENARIOS:
+            path = ROOT / "simulation/scenarios" / f"{name}.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["schema_version"], 2)
+            self.assertIn("integrated", data)
+            planning_scene = data["planning_scene"]
+            self.assertEqual(planning_scene["frame_id"], "base_link")
+            self.assertEqual(
+                planning_scene["target_handoff"], "pick_and_place/object_mesh"
+            )
+            for record in planning_scene["objects"]:
+                self.assertIn("primitive", record)
+                self.assertNotIn("mesh", record)
+                self.assertIn("pose", record)
+                self.assertEqual(len(record["pose"]["xyz"]), 3)
+                self.assertEqual(len(record["pose"]["quaternion_xyzw"]), 4)
+
+    def test_pick_place_blocked_and_occupied_add_only_their_obstacle_or_occupant(
+        self,
+    ) -> None:
+        positive = json.loads(
+            (ROOT / "simulation/scenarios/qualification-pick-place-positive.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        blocked = json.loads(
+            (ROOT / "simulation/scenarios/qualification-pick-place-blocked-approach.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        occupied = json.loads(
+            (ROOT / "simulation/scenarios/qualification-pick-place-occupied-place.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        positive_ids = [obj["id"] for obj in positive["planning_scene"]["objects"]]
+        blocked_ids = [obj["id"] for obj in blocked["planning_scene"]["objects"]]
+        occupied_ids = [obj["id"] for obj in occupied["planning_scene"]["objects"]]
+        self.assertEqual(positive_ids, ["sim_fixture/pedestal", "sim_fixture/qualification_cube"])
+        self.assertEqual(
+            blocked_ids,
+            ["sim_fixture/pedestal", "sim_fixture/qualification_cube", "sim_fixture/plan_blocker"],
+        )
+        self.assertEqual(
+            occupied_ids,
+            ["sim_fixture/pedestal", "sim_fixture/qualification_cube", "sim_fixture/place_occupant"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

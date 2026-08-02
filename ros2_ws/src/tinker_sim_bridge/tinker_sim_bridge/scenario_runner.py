@@ -109,6 +109,39 @@ def write_report_atomic(report: dict[str, object], path: Path) -> bytes:
     return data
 
 
+def build_scenario_report(
+    *,
+    scenario_id: str,
+    seed: int,
+    declaration: dict[str, object],
+    planning_scene: dict[str, object],
+    integrated: dict[str, object],
+    operations: list[dict[str, object]],
+    model_fingerprint: str,
+    provider_manifest_sha256: str,
+) -> dict[str, object]:
+    """Build the canonical public ``scenario-runner.json`` report mapping.
+
+    The public report carries the one-key ``integrated`` mapping exactly as the
+    shipped production canonical parser requires (see
+    :func:`public_integrated_mapping`); the full scenario ``integrated`` mapping
+    is bound separately by the scenario declaration SHA-256 and the readiness
+    runtime contract.  ``operations`` is the executed standard-operation result
+    list; the final ``PHYSICS_READY`` operation carries the report identities.
+    """
+    return build_canonical_report(
+        scenario_id=scenario_id,
+        seed=seed,
+        declaration=declaration,
+        planning_scene=planning_scene,
+        integrated=integrated,
+        operations=operations,
+        model_fingerprint=model_fingerprint,
+        provider_manifest_sha256=provider_manifest_sha256,
+        final_simulation_state=FINAL_SIMULATION_STATE,
+    )
+
+
 class _RetryableServiceError(RuntimeError):
     """A service call failed before the server could accept its result."""
 
@@ -390,7 +423,7 @@ def main(argv: list[str] | None = None) -> None:
                 write_report_atomic(legacy_report, arguments.report)
             print(output)
             return
-        report = build_canonical_report(
+        report = build_scenario_report(
             scenario_id=scenario.scenario_id,
             seed=arguments.seed,
             declaration=declaration,
@@ -399,7 +432,6 @@ def main(argv: list[str] | None = None) -> None:
             operations=results,
             model_fingerprint=arguments.expected_model_fingerprint or "",
             provider_manifest_sha256=arguments.provider_manifest_sha256 or "",
-            final_simulation_state=FINAL_SIMULATION_STATE,
         )
         data = write_report_atomic(report, arguments.report) if arguments.report is not None else serialize_report(report)
         print(data.decode("utf-8"))

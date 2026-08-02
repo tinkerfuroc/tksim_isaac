@@ -252,11 +252,23 @@ artifact tree is not provisioned).  Probe-node behavior under the Humble Python
 qualification fixtures into the MoveIt PlanningScene as exactly one atomic
 replacement diff.  The fixture namespace is exclusively `sim_fixture/*`; the
 task-owned handoff is exactly `pick_and_place/object_mesh`; no other PlanningScene
-namespace is removed or replaced.  The three public qualification scenarios
-(`qualification-moveit-plan-joint`, `qualification-moveit-plan-pose`,
+namespace is removed or replaced.  The integrated qualification matrix (Task 1)
+defines 17 immutable scenarios under `simulation/scenarios/` and the schema-v3
+config `simulation/qualification/integrated-ompl.json`.  The plan-only C-stage
+scenarios (`qualification-moveit-plan-joint`, `qualification-moveit-plan-pose`,
 `qualification-moveit-plan-blocked`) share the same pedestal and public-target
 identity; the blocked scenario adds `sim_fixture/plan_blocker` while retaining
-the same target source/handoff.
+the same target source/handoff.  The D-stage execute scenarios
+(`qualification-moveit-execute-*`, `-cartesian-retreat`, `-gripper`, `-cancel`,
+`-safety`) reuse the same fixture geometry.  The E-stage pick-place scenarios
+(`qualification-pick-place-*`) target `sim_fixture/qualification_cube`; the
+negative variants add only their own obstacle (`sim_fixture/plan_blocker`) or
+occupant (`sim_fixture/place_occupant`).  Every scenario carries a
+schema-v3-validated `integrated` mapping (`execution_profile` `sim_ompl`, stage,
+`physics_truth` authority, acceptance polarity, race policy, and terminal
+policy); the public `scenario-runner.json` report carries only the one-key
+`integrated` mapping `{"execution_profile": "sim_ompl"}`, and the full
+per-scenario mapping is bound by the scenario declaration SHA-256.
 
 ### ROS-free contract (`fixture_contract.py`)
 

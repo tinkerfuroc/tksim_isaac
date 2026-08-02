@@ -63,16 +63,23 @@ def standard_operations(
                 },
             )
         )
+    final_operation: dict[str, Any] = {
+        "state": 1,
+        "boundary": "PHYSICS_READY",
+        "seed": seed,
+    }
+    if scenario.declaration is not None:
+        final_operation["scenario"] = {
+            "id": scenario.scenario_id,
+            "seed": seed,
+            "declaration": dict(scenario.declaration),
+        }
+    if scenario.planning_scene is not None:
+        final_operation["planning_scene"] = dict(scenario.planning_scene)
+    if scenario.integrated is not None:
+        final_operation["integrated"] = dict(scenario.integrated)
     operations.append(
-        ScenarioOperation(
-            "set_simulation_state",
-            {
-                "state": 1,
-                "boundary": "PHYSICS_READY",
-                "scenario": scenario.scenario_id,
-                "seed": seed,
-            },
-        )
+        ScenarioOperation("set_simulation_state", final_operation)
     )
     return tuple(operations)
 

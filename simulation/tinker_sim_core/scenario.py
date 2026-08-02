@@ -15,6 +15,11 @@ _PRIMITIVE_TYPES = {"box", "cylinder", "sphere"}
 # Mesh fixture formats the adapter can parse deterministically.  Any other
 # extension is rejected during scenario validation (no silently-empty meshes).
 _SUPPORTED_MESH_EXTENSIONS = (".stl", ".obj")
+# Canonical integrated qualification identities (Task 1).
+_INTEGRATED_EXECUTION_PROFILE = "sim_ompl"
+_INTEGRATED_STAGES = frozenset({"C", "D", "E", "F"})
+_INTEGRATED_AUTHORITY = "physics_truth"
+_INTEGRATED_RACE_POLICY = "bounded-observable-trigger"
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,8 @@ class ScenarioDefinition:
     dialogue: tuple[Mapping[str, Any], ...]
     postconditions: tuple[Mapping[str, Any], ...]
     planning_scene: Mapping[str, Any] | None = None
+    integrated: Mapping[str, Any] | None = None
+    declaration: Mapping[str, Any] | None = None
 
     @classmethod
     def load(cls, path: Path) -> "ScenarioDefinition":
@@ -44,6 +51,12 @@ class ScenarioDefinition:
         planning_scene = raw.get("planning_scene")
         if planning_scene is not None:
             _validate_planning_scene(planning_scene, path)
+        integrated = raw.get("integrated")
+        if integrated is not None:
+            _validate_integrated(integrated, path)
+        declaration = {
+            key: value for key, value in raw.items() if key not in {"id", "seed"}
+        }
         result = cls(
             schema_version=2,
             scenario_id=scenario_id,
@@ -56,6 +69,8 @@ class ScenarioDefinition:
             dialogue=_records(raw, "dialogue", path),
             postconditions=_records(raw, "postconditions", path, required=True),
             planning_scene=planning_scene,
+            integrated=integrated,
+            declaration=declaration,
         )
         result._validate_identifiers(path)
         return result
@@ -249,6 +264,85 @@ def _validate_planning_scene(planning_scene: Mapping[str, Any], path: Path) -> N
             )
         if record.get("enter_collision_bodies") not in (True, False):
             raise ValueError(f"{path}: diagnostic {record.get('id')} enter_collision_bodies must be a boolean")
+
+
+def _validate_integrated(integrated: Mapping[str, Any], path: Path) -> None:
+    """Validate the Task 1 integrated qualification mapping, fail-closed.
+
+    The mapping is the full immutable per-scenario runtime contract bound by the
+    scenario declaration SHA-256.  The public ``scenario-runner.json`` report
+    carries only the one-key ``{"execution_profile": "sim_ompl"}`` public mapping;
+    the full mapping here is preserved in the scenario declaration and separate
+    readiness/executor evidence.
+    """
+    if not isinstance(integrated, dict):
+        raise ValueError(f"{path}: integrated must be an object")
+    if integrated.get("execution_profile") != _INTEGRATED_EXECUTION_PROFILE:
+        raise ValueError(
+            f"{path}: integrated.execution_profile must be "
+            f"{_INTEGRATED_EXECUTION_PROFILE!r}"
+        )
+    stage = integrated.get("stage")
+    if not isinstance(stage, str) or stage not in _INTEGRATED_STAGES:
+        raise ValueError(
+            f"{path}: integrated.stage must be one of {sorted(_INTEGRATED_STAGES)}"
+        )
+    if integrated.get("authority") != _INTEGRATED_AUTHORITY:
+        raise ValueError(
+            f"{path}: integrated.authority must be {_INTEGRATED_AUTHORITY!r}"
+        )
+    acceptance = integrated.get("acceptance")
+    if not isinstance(acceptance, dict):
+        raise ValueError(f"{path}: integrated.acceptance must be an object")
+    polarity = acceptance.get("polarity")
+    if not isinstance(polarity, str) or not polarity:
+        raise ValueError(
+            f"{path}: integrated.acceptance.polarity must be a non-empty string"
+        )
+    expected_negative = integrated.get("expected_negative")
+    if expected_negative is not None:
+        if not isinstance(expected_negative, dict):
+            raise ValueError(
+                f"{path}: integrated.expected_negative must be an object or null"
+            )
+        if integrated.get("race_policy") != _INTEGRATED_RACE_POLICY:
+            raise ValueError(
+                f"{path}: integrated.race_policy must be "
+                f"{_INTEGRATED_RACE_POLICY!r} when expected_negative is present"
+            )
+        trigger_timeout = integrated.get("trigger_timeout_s")
+        if (
+            isinstance(trigger_timeout, bool)
+            or not isinstance(trigger_timeout, (int, float))
+            or not math.isfinite(float(trigger_timeout))
+            or float(trigger_timeout) <= 0
+        ):
+            raise ValueError(
+                f"{path}: integrated.trigger_timeout_s must be a finite positive number"
+            )
+        forbidden_after_terminal = integrated.get("forbidden_after_terminal")
+        if not isinstance(forbidden_after_terminal, list) or not forbidden_after_terminal:
+            raise ValueError(
+                f"{path}: integrated.forbidden_after_terminal must be a non-empty array"
+            )
+        required_predicates = expected_negative.get("required")
+        forbidden_predicates = expected_negative.get("forbidden")
+        if not isinstance(required_predicates, list) or not required_predicates:
+            raise ValueError(
+                f"{path}: integrated.expected_negative.required must be a non-empty array"
+            )
+        if not isinstance(forbidden_predicates, list) or not forbidden_predicates:
+            raise ValueError(
+                f"{path}: integrated.expected_negative.forbidden must be a non-empty array"
+            )
+    forbidden_endpoints = integrated.get("forbidden_endpoints")
+    if not isinstance(forbidden_endpoints, list):
+        raise ValueError(f"{path}: integrated.forbidden_endpoints must be an array")
+    terminal_policy = integrated.get("terminal_policy")
+    if not isinstance(terminal_policy, str) or not terminal_policy:
+        raise ValueError(
+            f"{path}: integrated.terminal_policy must be a non-empty string"
+        )
 
 
 def _mapping(raw: Mapping[str, Any], key: str, path: Path) -> Mapping[str, Any]:

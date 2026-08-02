@@ -1,0 +1,167 @@
+{
+  "schema_version": 3,
+  "id": "integrated-ompl",
+  "profile": "integrated-ompl",
+  "execution_profile": "sim_ompl",
+  "backend": "isaac",
+  "robot": "tinker2",
+  "seed": 7,
+  "core_config": "simulation/qualification/manipulation-core.json",
+  "overlay_contract": "integration/ompl-overlay-contract.json",
+  "source_lock_policies": {
+    "simulator": "integration/source-locks.json",
+    "production": "/home/tinker/tk25_ws/src/tk25_manipulation/integration/source-locks.json"
+  },
+  "model": {
+    "planning_frame": "base_link",
+    "tcp_link": "link_tcp",
+    "arm_group": "xarm7",
+    "gripper_group": "xarm_gripper",
+    "arm_joints": [
+      "joint1",
+      "joint2",
+      "joint3",
+      "joint4",
+      "joint5",
+      "joint6",
+      "joint7"
+    ],
+    "gripper_joint": "drive_joint",
+    "touch_links": [
+      "xarm_gripper_base_link",
+      "left_outer_knuckle",
+      "left_finger",
+      "left_inner_knuckle",
+      "right_inner_knuckle",
+      "right_outer_knuckle",
+      "right_finger",
+      "link_tcp"
+    ],
+    "touch_links_source": "model_bundle.touch_links"
+  },
+  "pick_place_profiles": {
+    "strict": {
+      "control": "explicit-seven-joint",
+      "back_positions": [
+        0.20,
+        -0.20,
+        0.15,
+        0.30,
+        -0.15,
+        0.20,
+        0.15
+      ]
+    },
+    "compatibility": {
+      "control": "default",
+      "back_positions": []
+    },
+    "positive": {
+      "profile": "strict",
+      "stay": false
+    }
+  },
+  "geometry_contract": {
+    "mount": {
+      "parent": "world",
+      "child": "base_link",
+      "xyz": [0.0, 0.0, 0.0],
+      "rpy": [0.0, 0.0, 0.0]
+    },
+    "object_root_xyz": [0.65, 0.0, 0.60],
+    "grasp_tcp_xyz": [0.65, 0.0, 0.72],
+    "place_target_point": {
+      "frame_id": "base_link",
+      "xyz": [0.85, 0.0, 0.72]
+    },
+    "place_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    "place_region_center_xyz": [0.85, 0.0, 0.64]
+  },
+  "thresholds": {
+    "joint_state_fresh_s": 0.25,
+    "tf_fresh_s": 0.25,
+    "fixture_fresh_s": 0.25,
+    "plan_timeout_s": 15.0,
+    "execute_timeout_s": 120.0,
+    "cancel_timeout_s": 10.0,
+    "safety_stop_velocity_rad_s": 0.02,
+    "safety_stop_frames": 5,
+    "safety_position_creep_rad": 0.005,
+    "joint_final_error_rad": 0.01,
+    "joint_rms_error_rad": 0.05,
+    "tcp_position_error_m": 0.02,
+    "tcp_orientation_error_deg": 5.0,
+    "object_lift_m": 0.10,
+    "object_translation_m": 0.20,
+    "object_drift_m": 0.02,
+    "object_drift_deg": 5.0,
+    "placement_region_radius_m": 0.06,
+    "placement_region_z_tolerance_m": 0.04,
+    "settled_speed_m_s": 0.02,
+    "contact_force_n": 1.0,
+    "scene_timeout_s": 10.0,
+    "numeric_tolerance": 0.000001
+  },
+  "execution_contract": {
+    "cuMotion": false,
+    "provider": "ompl",
+    "forbidden_tokens": [
+      "cuMotion",
+      "cumotion",
+      "AnyGrasp",
+      "start_grasp",
+      "isaac_joint_commands"
+    ]
+  },
+  "stages": {
+    "A": {
+      "required_core_gates": [
+        "free-space-fjt",
+        "safety-stop",
+        "free-gripper",
+        "obstructed-gripper",
+        "arm-collision",
+        "retention"
+      ]
+    },
+    "B": {
+      "offline": true
+    },
+    "C": {
+      "scenarios": [
+        "qualification-moveit-plan-joint",
+        "qualification-moveit-plan-pose",
+        "qualification-moveit-plan-blocked"
+      ]
+    },
+    "D": {
+      "scenarios": [
+        "qualification-moveit-execute-joint",
+        "qualification-moveit-execute-pose",
+        "qualification-moveit-cartesian-retreat",
+        "qualification-moveit-gripper",
+        "qualification-moveit-cancel",
+        "qualification-moveit-safety"
+      ]
+    },
+    "E": {
+      "positive": "qualification-pick-place-positive",
+      "negative": [
+        "qualification-pick-place-blocked-approach",
+        "qualification-pick-place-unreachable-grasp",
+        "qualification-pick-place-malformed-back",
+        "qualification-pick-place-cancel-approach",
+        "qualification-pick-place-cancel-transport",
+        "qualification-pick-place-safety-transport",
+        "qualification-pick-place-occupied-place"
+      ]
+    },
+    "F": {
+      "checksum_algorithm": "sha256",
+      "cameras": [
+        "overview",
+        "manipulation_closeup"
+      ]
+    }
+  }
+}
