@@ -389,6 +389,7 @@ def _test_config() -> dict[str, object]:
             "goal_accept_timeout_s": 0.2,
             "plan_result_timeout_s": 0.2,
             "cancel_timeout_s": 0.2,
+            "scene_acquire_timeout_s": 0.2,
         },
     }
 
@@ -404,10 +405,11 @@ def _join_key_provider():
 
 
 class _FakeFuture:
-    def __init__(self, value=None, *, ready_at=0.0):
+    def __init__(self, value=None, *, ready_at=0.0, exc=None):
         self._value = value
         self._ready_at = time.monotonic() + float(ready_at)
         self._cancelled = False
+        self._exc = exc
 
     def done(self):
         return time.monotonic() >= self._ready_at
@@ -415,6 +417,8 @@ class _FakeFuture:
     def result(self):
         if not self.done():
             raise RuntimeError("future is not done")
+        if self._exc is not None:
+            raise self._exc
         return self._value
 
     def cancel(self):
@@ -448,10 +452,11 @@ class _FakeGoalHandle:
 
 
 class _FakeMoveClient:
-    def __init__(self, *, server_ready=True, goal_handle=None, send_ready_at=0.0):
+    def __init__(self, *, server_ready=True, goal_handle=None, send_ready_at=0.0, send_exc=None):
         self._server_ready = server_ready
         self._goal_handle = goal_handle
         self._send_ready_at = float(send_ready_at)
+        self._send_exc = send_exc
         self.sent_goals = []
 
     def wait_for_server(self, timeout_sec=None):
@@ -459,7 +464,7 @@ class _FakeMoveClient:
 
     def send_goal_async(self, goal):
         self.sent_goals.append(goal)
-        return _FakeFuture(self._goal_handle, ready_at=self._send_ready_at)
+        return _FakeFuture(self._goal_handle, ready_at=self._send_ready_at, exc=self._send_exc)
 
 
 def _success_result():
@@ -499,6 +504,52 @@ def _empty_plan_success_result():
     result.planned_trajectory = RobotTrajectory()
     result.planned_trajectory.joint_trajectory = JointTrajectory()
     return result
+
+
+def _request_error_result():
+    """MoveItErrorCodes.FAILURE (99999): a generic request-level error."""
+    from moveit_msgs.action import MoveGroup
+    from moveit_msgs.msg import MoveItErrorCodes
+
+    result = MoveGroup.Result()
+    result.error_code = MoveItErrorCodes()
+    result.error_code.val = 99999
+    return result
+
+
+def _unknown_error_result():
+    """An unknown/unsupported MoveItErrorCodes value."""
+    from moveit_msgs.action import MoveGroup
+    from moveit_msgs.msg import MoveItErrorCodes
+
+    result = MoveGroup.Result()
+    result.error_code = MoveItErrorCodes()
+    result.error_code.val = 12345
+    return result
+
+
+def _mutated_invalid_graph():
+    """A graph whose planning-scene topic type is corrupted so projection fails."""
+    from test_integrated_gate_executor import _observed_graph_double
+
+    graph = _observed_graph_double()
+    graph["topics"]["/planning_scene"]["type"] = "std_msgs/msg/String"
+    return graph
+
+
+def _scene_with_ids(executor, contract, object_ids) -> None:
+    """Feed a PlanningScene containing exactly *object_ids* through the callback."""
+    from moveit_msgs.msg import AllowedCollisionMatrix, CollisionObject, PlanningScene, RobotState
+
+    scene = PlanningScene()
+    for object_id in object_ids:
+        collision_object = CollisionObject()
+        collision_object.id = object_id
+        scene.world.collision_objects.append(collision_object)
+    scene.allowed_collision_matrix = AllowedCollisionMatrix()
+    scene.robot_state = RobotState()
+    executor._make_scene_callback("/planning_scene")(scene)
+    assert executor._latest_planning_scene is not None
 
 
 def _synthetic_scene(executor, contract) -> None:
@@ -581,6 +632,28 @@ def test_executor_subscriptions_use_real_planning_scene_type(tmp_path):
         assert by_topic["/sim/status/planning_scene_fixture"].msg_type.__name__ == "String"
         assert by_topic["/joint_states"].msg_type.__name__ == "JointState"
         assert by_topic["/sim/hardware/safety_stop"].msg_type.__name__ == "Bool"
+    finally:
+        executor.shutdown()
+
+
+def test_executor_planning_scene_subscription_qos_is_volatile_depth_100(tmp_path):
+    """F2.3: the live subscriptions request the stock MoveIt2 Humble
+    RELIABLE/VOLATILE/depth-100 contract; the fixture topic stays
+    RELIABLE/TRANSIENT_LOCAL/depth 1."""
+    from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+
+    executor, _ = _make_executor(tmp_path)
+    try:
+        by_topic = {sub.topic_name: sub for sub in executor.node.subscriptions}
+        for name in ("/planning_scene", "/monitored_planning_scene"):
+            profile = by_topic[name].qos_profile
+            assert profile.depth == 100
+            assert profile.reliability == ReliabilityPolicy.RELIABLE
+            assert profile.durability == DurabilityPolicy.VOLATILE
+        fixture_profile = by_topic["/sim/status/planning_scene_fixture"].qos_profile
+        assert fixture_profile.depth == 1
+        assert fixture_profile.reliability == ReliabilityPolicy.RELIABLE
+        assert fixture_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
     finally:
         executor.shutdown()
 
@@ -788,7 +861,9 @@ def test_executor_result_timeout_cancels_goal(tmp_path):
         executor._action_clients["/move_action"] = client
         _synthetic_scene(executor, contract)
         record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
-        assert record["status"] == "timeout"
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "result-timeout"
+        assert record["planner_status"] == "timeout"
         assert record["cancel_response"] == "completed"
         assert handle.cancel_called is True
         assert record["execute_trajectory_goal_sent"] is False
@@ -833,7 +908,9 @@ def test_executor_rejected_goal_records_goal_rejected(tmp_path):
         executor._action_clients["/move_action"] = client
         _synthetic_scene(executor, contract)
         record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
-        assert record["status"] == "goal-rejected"
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "goal-rejected"
+        assert record["planner_status"] == "goal-rejected"
         assert record["execute_trajectory_goal_sent"] is False
     finally:
         executor.shutdown()
@@ -853,7 +930,359 @@ def test_executor_action_server_unavailable_fails_closed(tmp_path):
         executor._action_clients["/move_action"] = client
         _synthetic_scene(executor, contract)
         record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
-        assert record["status"] == "action-server-unavailable"
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "action-server-unavailable"
+        assert record["planner_status"] == "action-server-unavailable"
         assert client.sent_goals == []
+    finally:
+        executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 2 (F2.1-F2.8): fail-dominant evidence, QoS, blocked allowlist,
+# self-spin scene acquisition, fixture-scene match, visual chronology
+# --------------------------------------------------------------------------- #
+
+
+def test_executor_graph_unavailable_dominates_plan_pass(tmp_path):
+    """F2.1 (BLOCKER): a successful plan is downgraded to evidence-invalid when
+    graph evidence is unavailable; the raw planner pass is preserved separately
+    and a failure planning-scene.json is always written."""
+    from test_integrated_gate_executor import _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["planner_status"] == "diagnostic-pass"
+        assert "invalid" in record["graph"]
+        exec_json = json.loads((tmp_path / "integrated-execution.json").read_text(encoding="utf-8"))
+        assert exec_json["status"] == "evidence-invalid"
+        assert exec_json["planner_status"] == "diagnostic-pass"
+        assert exec_json["execute_trajectory_goal_sent"] is False
+        assert exec_json["isaac_joint_commands_published"] is False
+        ps_json = json.loads((tmp_path / "planning-scene.json").read_text(encoding="utf-8"))
+        assert ps_json["status"] == "evidence-invalid"
+        assert "observed graph evidence is unavailable" in ps_json["reason"]
+    finally:
+        executor.shutdown()
+
+
+def test_executor_graph_invalid_dominates_plan_pass(tmp_path):
+    """F2.1: an invalid graph projection downgrades a plan pass to evidence-invalid."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        # Corrupt the observed graph so projection validation fails.
+        executor.graph_observation_provider = lambda: _mutated_invalid_graph()
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["planner_status"] == "diagnostic-pass"
+        assert "invalid" in record["graph"]
+        assert (tmp_path / "planning-scene.json").stat().st_size > 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_exceptional_send_future_fails_closed_with_complete_artifacts(tmp_path):
+    """F2.2 (MAJOR): an exceptional send_goal_async future is converted to
+    evidence-invalid with complete attempt artifacts and no pass claim."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        client = _FakeMoveClient(
+            server_ready=True,
+            goal_handle=None,
+            send_ready_at=0.0,
+            send_exc=RuntimeError("send failed hard"),
+        )
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "goal-send-exception"
+        assert record["planner_status"] == "goal-send-exception"
+        for name in (
+            "integrated-execution.jsonl",
+            "moveit-plans.jsonl",
+            "controller-results.jsonl",
+            "visual-capture-requests.jsonl",
+            "planning-scene.jsonl",
+        ):
+            assert (tmp_path / name).exists(), name
+        assert (tmp_path / "integrated-execution.json").stat().st_size > 0
+        assert (tmp_path / "planning-scene.json").stat().st_size > 0
+        exec_json = json.loads((tmp_path / "integrated-execution.json").read_text(encoding="utf-8"))
+        assert exec_json["status"] == "evidence-invalid"
+        assert exec_json["execute_trajectory_goal_sent"] is False
+        assert exec_json["isaac_joint_commands_published"] is False
+        # The send future raised; no accepted goal handle existed, so teardown is
+        # still recorded and the journal has fixture-ready + teardown.
+        assert (tmp_path / "planning-scene.jsonl").stat().st_size > 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_blocked_request_level_error_is_not_pass(tmp_path):
+    """F2.4: a generic request-level MoveItErrorCode must not pass the blocked
+    scenario; the classification is recorded."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        scenario_id="qualification-moveit-plan-blocked",
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_request_error_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-blocked")
+        assert record["status"] == "diagnostic-fail"
+        assert record["error_code_classification"] == "request-level-or-unknown"
+        assert record["error_code"] == 99999
+    finally:
+        executor.shutdown()
+
+
+def test_executor_blocked_unknown_code_is_not_pass(tmp_path):
+    """F2.4: an unknown/unsupported MoveItErrorCode must not pass blocked."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        scenario_id="qualification-moveit-plan-blocked",
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_unknown_error_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-blocked")
+        assert record["status"] == "diagnostic-fail"
+        assert record["error_code_classification"] == "request-level-or-unknown"
+    finally:
+        executor.shutdown()
+
+
+def test_executor_self_spin_acquires_scene(tmp_path):
+    """F2.5: the scene becomes available only through the private spinner."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        # The scene is not yet cached; only the executor's own spin path seeds it.
+        original_spin = executor._spin_once
+
+        def seed_and_spin():
+            _synthetic_scene(executor, contract)
+            original_spin()
+
+        executor._spin_once = seed_and_spin
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "diagnostic-pass"
+        assert len(client.sent_goals) == 1
+    finally:
+        executor.shutdown()
+
+
+def test_executor_scene_timeout_sends_zero_goals(tmp_path):
+    """F2.5: if no scene arrives within the finite timeout, the attempt is
+    evidence-invalid with zero goals sent."""
+    from test_integrated_gate_executor import _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        client = _FakeMoveClient(
+            server_ready=True,
+            goal_handle=_FakeGoalHandle(accepted=True, result=_success_result()),
+            send_ready_at=0.0,
+        )
+        executor._action_clients["/move_action"] = client
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "no-planning-scene"
+        assert client.sent_goals == []
+        assert not (tmp_path / "planning-scene.jsonl").exists() or (tmp_path / "planning-scene.jsonl").stat().st_size == 0
+    finally:
+        executor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("ids", "match"),
+    [
+        ([], "must equal"),
+        (["sim_fixture/pedestal", "sim_fixture/qualification_cube"], "must equal"),
+        (["sim_fixture/qualification_cube", "sim_fixture/pedestal", "sim_fixture/place_pedestal"], "must equal"),
+        (["sim_fixture/pedestal", "sim_fixture/qualification_cube", "sim_fixture/place_pedestal", "sim_fixture/extra"], "must equal"),
+    ],
+)
+def test_executor_fixture_scene_mismatch_rejected_before_goal(tmp_path, ids, match):
+    """F2.6: missing/extra/reordered/duplicate fixture scenes are rejected before
+    any goal send; the attempt is evidence-invalid."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        client = _FakeMoveClient(
+            server_ready=True,
+            goal_handle=_FakeGoalHandle(accepted=True, result=_success_result()),
+            send_ready_at=0.0,
+        )
+        executor._action_clients["/move_action"] = client
+        _scene_with_ids(executor, contract, list(ids))
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "fixture-scene-mismatch"
+        assert match in record["reasons"][0]
+        assert client.sent_goals == []
+    finally:
+        executor.shutdown()
+
+
+def test_executor_fixture_scene_valid_matches(tmp_path):
+    """F2.6: a full scene whose owned_ids match the declaration exactly passes."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "diagnostic-pass"
+        assert len(client.sent_goals) == 1
+    finally:
+        executor.shutdown()
+
+
+def test_executor_visual_before_precedes_goal_send(tmp_path):
+    """F2.7: the `before` visual request is durably flushed before the goal send
+    and `after` appears only in the post-transaction phase."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        handle = _FakeGoalHandle(accepted=True, result=_success_result())
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+
+        phases_at_send: dict[str, list[str]] = {}
+        original_send = client.send_goal_async
+
+        def tracking_send(goal):
+            path = tmp_path / "visual-capture-requests.jsonl"
+            if path.exists():
+                phases_at_send["phases"] = [
+                    json.loads(line)["phase"]
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line
+                ]
+            else:
+                phases_at_send["phases"] = []
+            return original_send(goal)
+
+        client.send_goal_async = tracking_send
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "diagnostic-pass"
+        assert phases_at_send["phases"] == ["before"]
+
+        lines = [
+            json.loads(line)
+            for line in (tmp_path / "visual-capture-requests.jsonl").read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        assert [line["phase"] for line in lines] == ["before", "after"]
+    finally:
+        executor.shutdown()
+
+
+def test_executor_acceptance_timeout_does_not_claim_server_cancel(tmp_path):
+    """F2.8: an unaccepted/indeterminate send future is evidence-invalid and the
+    evidence states that canceling the client future is not proof of server-side
+    cancellation."""
+    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
+
+    executor, contract = _make_executor(
+        tmp_path,
+        join_key_provider=_join_key_provider(),
+        graph_observation_provider=lambda: _observed_graph_double(),
+    )
+    try:
+        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+        client = _FakeMoveClient(
+            server_ready=True,
+            goal_handle=_FakeGoalHandle(accepted=True, result=_success_result()),
+            send_ready_at=10.0,
+        )
+        executor._action_clients["/move_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "goal-accept-timeout"
+        assert "not proof of server-side cancellation" in record["error"]
+        assert record["planner_status"] == "goal-accept-timeout"
+        assert (tmp_path / "integrated-execution.json").stat().st_size > 0
+        exec_json = json.loads((tmp_path / "integrated-execution.json").read_text(encoding="utf-8"))
+        assert exec_json["status"] == "evidence-invalid"
     finally:
         executor.shutdown()

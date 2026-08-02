@@ -391,6 +391,39 @@ References:
   fail-closed mutations, journal lifecycle/stale-jsonl/forbidden events).
   No build is required because no package-installed path changed.
 
+- 2026-08-02 (integrated qualification Task 4 fix round 2): Made Gate-C evidence
+  fail-dominant and aligned PlanningScene QoS with stock MoveIt2 Humble.  The
+  authoritative final status is now computed after the plan outcome *and* every
+  required evidence finalization step; any readiness/journal/graph/
+  finalization/artifact-serialization/existence failure returns and persists
+  `evidence-invalid` in `run_gate_c_plan_only` and `integrated-execution.json`,
+  with the raw planner outcome preserved separately as `planner_status`, and
+  `planning-scene.json` is always produced as a canonical failure artifact via a
+  narrow `PlanningSceneJournal.finalize_failure` extension.  Every expected
+  runtime/DDS/action failure (server wait, goal construction/serialization,
+  `send_goal_async`, send-future spin/result, goal acceptance, result-future
+  spin/result, cancellation, provider calls, artifact finalization) is converted
+  into finite canonical diagnostic records with zero physical claim and exact
+  zero-command/controller flags; once `fixture-ready` exists the executor always
+  attempts teardown journal completion and failed finalization, and no exception
+  escapes the public API.  The `/planning_scene` and `/monitored_planning_scene`
+  subscriptions and the Task-3/4 observed-graph projection now use the stock
+  MoveIt2 Humble RELIABLE/VOLATILE/depth-100 contract (the stale
+  TRANSIENT_LOCAL/depth-1 claim is rejected); `/sim/status/planning_scene_fixture`
+  stays RELIABLE/TRANSIENT_LOCAL/depth 1.  The blocked scenario now only passes
+  on an explicit MoveIt planning-stage non-success allowlist (`PLANNING_FAILED`,
+  `INVALID_MOTION_PLAN`, `NO_IK_SOLUTION`); request-level/unknown codes are
+  `diagnostic-fail` with a recorded `error_code_classification`.  A bounded
+  pre-goal scene-acquisition phase self-spins up to `scene_acquire_timeout_s`,
+  `fixture-ready` requires the scene's ordered owned IDs to match the declared
+  fixture contract (missing/extra/reordered/attached rejected before goal send),
+  the `before` visual-capture request is durably flushed before the goal send and
+  `after` only in the post-transaction phase, acceptance-timeout handling is
+  truthful (canceling a client future is not proof of server-side cancellation),
+  and the executor's atomic write now includes parent-directory fsync.  Humble
+  suite expanded to 43 tests; pure suite to 68; journal suite to 184.  No build
+  is required because no package-installed path changed.
+
 - 2026-08-02 (integrated qualification Task 3 fix round 1): Bound the
   PlanningScene evidence semantics against the adversarial review findings.
   `validation/planning_scene_journal.py` now makes the public path fail closed:

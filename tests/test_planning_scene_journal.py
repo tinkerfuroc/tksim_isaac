@@ -91,7 +91,12 @@ def _journal(*, required_event_order=(), forbidden_events=(), jsonl_path=None):
 
 
 def _valid_graph():
-    """Build a fully valid Task-4-supplied graph projection."""
+    """Build a fully valid Task-4-supplied graph projection.
+
+    The two PlanningScene topics reflect the stock MoveIt2 Humble publisher's
+    RELIABLE/VOLATILE/depth-100 contract; the fixture status topic remains
+    RELIABLE/TRANSIENT_LOCAL/depth 1 (F2.3).
+    """
     return {
         "node_name": "/tinker_integrated_gate_executor",
         "namespace": "/",
@@ -99,15 +104,15 @@ def _valid_graph():
         "topics": {
             "/planning_scene": {
                 "type": "moveit_msgs/msg/PlanningScene",
-                "requested_qos": {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1},
-                "offered_qos": {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1},
+                "requested_qos": {"reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100},
+                "offered_qos": {"reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100},
                 "publishers": [{"node": "/moveit_planning_scene_monitor", "node_namespace": "/"}],
                 "subscribers": [{"node": "/tinker_integrated_gate_executor", "node_namespace": "/"}],
             },
             "/monitored_planning_scene": {
                 "type": "moveit_msgs/msg/PlanningScene",
-                "requested_qos": {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1},
-                "offered_qos": {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1},
+                "requested_qos": {"reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100},
+                "offered_qos": {"reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100},
                 "publishers": [{"node": "/moveit_planning_scene_monitor", "node_namespace": "/"}],
                 "subscribers": [{"node": "/tinker_integrated_gate_executor", "node_namespace": "/"}],
             },
@@ -672,15 +677,41 @@ def test_graph_wrong_topic_type_rejected():
 
 
 def test_graph_wrong_requested_qos_rejected():
+    """F2.3: the stale TRANSIENT_LOCAL/depth-1 PlanningScene claim is rejected."""
     graph = _valid_graph()
-    graph["topics"]["/planning_scene"]["requested_qos"]["durability"] = "VOLATILE"
+    graph["topics"]["/planning_scene"]["requested_qos"]["durability"] = "TRANSIENT_LOCAL"
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(graph)
+    graph = _valid_graph()
+    graph["topics"]["/monitored_planning_scene"]["requested_qos"]["depth"] = 1
     with pytest.raises(ValueError, match="QoS"):
         validate_graph_evidence(graph)
 
 
 def test_graph_wrong_offered_qos_rejected():
+    """F2.3: the stale TRANSIENT_LOCAL/depth-1 offered claim is rejected too."""
+    graph = _valid_graph()
+    graph["topics"]["/planning_scene"]["offered_qos"]["durability"] = "TRANSIENT_LOCAL"
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(graph)
     graph = _valid_graph()
     graph["topics"]["/monitored_planning_scene"]["offered_qos"]["depth"] = 50
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_fixture_keeps_transient_local_depth_1():
+    """F2.3: the fixture status topic stays RELIABLE/TRANSIENT_LOCAL/depth 1."""
+    graph = _valid_graph()
+    validated = validate_graph_evidence(graph)
+    fixture = validated["topics"]["/sim/status/planning_scene_fixture"]
+    assert fixture["requested_qos"] == {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    assert fixture["offered_qos"] == {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    graph["topics"]["/sim/status/planning_scene_fixture"]["requested_qos"]["durability"] = "VOLATILE"
     with pytest.raises(ValueError, match="QoS"):
         validate_graph_evidence(graph)
 
@@ -906,6 +937,40 @@ def test_finalize_rejects_bad_graph_without_writing(tmp_path):
     with pytest.raises(ValueError, match="type"):
         journal.finalize("diagnostic-pass", graph=bad, json_path=final_path)
     assert not final_path.exists()
+
+
+def test_finalize_failure_emits_failure_artifact(tmp_path):
+    """F2.1: the narrow journal extension emits a canonical failure artifact
+    after graph validation/finalization fails, without pretending validation
+    passed and without writing a pass claim."""
+    journal = _journal()
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    final_path = tmp_path / "planning-scene.json"
+    final = journal.finalize_failure(
+        reason="observed graph evidence is unavailable",
+        graph_diagnosis="invalid: observed graph evidence is unavailable",
+        json_path=final_path,
+    )
+    assert final["status"] == "evidence-invalid"
+    assert final["authority"] == "physics_truth"
+    assert final["reason"] == "observed graph evidence is unavailable"
+    assert final["graph_diagnosis"] == "invalid: observed graph evidence is unavailable"
+    assert final["events"] == ["fixture-ready"]
+    assert len(final["records"]) == 1
+    assert final["records"][0]["event"] == "fixture-ready"
+    assert "graph" not in final or final["graph"] == {}
+    written = json.loads(final_path.read_text(encoding="utf-8"))
+    assert written == final
+    assert written["status"] == "evidence-invalid"
+    leftovers = [p for p in tmp_path.iterdir() if ".tmp" in p.name]
+    assert leftovers == []
+
+
+def test_finalize_failure_requires_reason(tmp_path):
+    journal = _journal()
+    journal.record_diff("fixture-ready", _scene(1, 1.0, world=("sim_fixture/table",)))
+    with pytest.raises(ValueError, match="reason"):
+        journal.finalize_failure("", graph_diagnosis="invalid: x", json_path=tmp_path / "p.json")
 
 
 def test_failed_finalize_never_replaces_existing_artifact(tmp_path):
@@ -1342,7 +1407,7 @@ def test_graph_input_mutation_after_validation_is_isolated():
     graph["topics"]["/planning_scene"]["requested_qos"]["depth"] = 99
     graph["topics"]["/sim/status/planning_scene_fixture"]["payload"] = "[]"
     graph["topics"]["/planning_scene"]["subscribers"][0]["node"] = "/someone_else"
-    assert validated["topics"]["/planning_scene"]["requested_qos"]["depth"] == 1
+    assert validated["topics"]["/planning_scene"]["requested_qos"]["depth"] == 100
     assert validated["topics"]["/sim/status/planning_scene_fixture"]["payload"] == _fixture_status_payload()
     assert validated["topics"]["/planning_scene"]["subscribers"][0]["node"] == RECORDER_NODE
 
@@ -1352,7 +1417,7 @@ def test_validated_graph_output_mutation_does_not_affect_module_constants():
     validated["topics"]["/planning_scene"]["requested_qos"]["depth"] = 50
     validated["topics"]["/planning_scene"]["subscribers"][0]["node"] = "/someone_else"
     again = validate_graph_evidence(_valid_graph())
-    assert again["topics"]["/planning_scene"]["requested_qos"]["depth"] == 1
+    assert again["topics"]["/planning_scene"]["requested_qos"]["depth"] == 100
     assert again["topics"]["/planning_scene"]["subscribers"][0]["node"] == RECORDER_NODE
 
 

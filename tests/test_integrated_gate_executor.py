@@ -244,11 +244,17 @@ def _fixture_descriptor_digest(contract: dict[str, object] = POSITIVE_REPORT_CON
 
 
 def _observed_graph_double() -> dict[str, object]:
-    """A valid observed-graph double for the exact three journal topics/services."""
+    """A valid observed-graph double for the exact three journal topics/services.
+
+    The two PlanningScene topics use the stock MoveIt2 Humble
+    RELIABLE/VOLATILE/depth-100 contract; the fixture status topic stays
+    RELIABLE/TRANSIENT_LOCAL/depth 1 (F2.3).
+    """
     recorder = {"node": "/tinker_integrated_gate_executor", "node_namespace": ""}
     move_group = {"node": "/move_group", "node_namespace": ""}
     fixture_publisher = {"node": "/fixture_planning_scene", "node_namespace": ""}
-    topic_qos = {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1}
+    planning_scene_qos = {"reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100}
+    fixture_qos = {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1}
     service_qos = {"reliability": "RELIABLE", "durability": "VOLATILE"}
     return {
         "node_name": "/tinker_integrated_gate_executor",
@@ -257,22 +263,22 @@ def _observed_graph_double() -> dict[str, object]:
         "topics": {
             "/planning_scene": {
                 "type": "moveit_msgs/msg/PlanningScene",
-                "requested_qos": dict(topic_qos),
-                "offered_qos": dict(topic_qos),
+                "requested_qos": dict(planning_scene_qos),
+                "offered_qos": dict(planning_scene_qos),
                 "publishers": [dict(move_group)],
                 "subscribers": [dict(recorder)],
             },
             "/monitored_planning_scene": {
                 "type": "moveit_msgs/msg/PlanningScene",
-                "requested_qos": dict(topic_qos),
-                "offered_qos": dict(topic_qos),
+                "requested_qos": dict(planning_scene_qos),
+                "offered_qos": dict(planning_scene_qos),
                 "publishers": [dict(move_group)],
                 "subscribers": [dict(recorder)],
             },
             "/sim/status/planning_scene_fixture": {
                 "type": "std_msgs/msg/String",
-                "requested_qos": dict(topic_qos),
-                "offered_qos": dict(topic_qos),
+                "requested_qos": dict(fixture_qos),
+                "offered_qos": dict(fixture_qos),
                 "publishers": [dict(fixture_publisher)],
                 "subscribers": [dict(recorder)],
             },
@@ -519,6 +525,45 @@ def test_journal_graph_projection_passes_task3_validator():
     assert normalized["topics"]["/sim/status/planning_scene_fixture"]["payload_parsed"][
         "fixture_descriptor_sha256"
     ] == _fixture_descriptor_digest()
+
+
+def test_planning_scene_topic_qos_contract_is_volatile_depth_100():
+    """F2.3: stock MoveIt2 Humble publishes PlanningScene RELIABLE/VOLATILE/depth 100."""
+    from validation.integrated_gate_executor import (
+        JOURNAL_FIXTURE_TOPIC_QOS,
+        JOURNAL_PLANNING_SCENE_TOPIC_QOS,
+    )
+
+    assert JOURNAL_PLANNING_SCENE_TOPIC_QOS == {
+        "reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100,
+    }
+    assert JOURNAL_FIXTURE_TOPIC_QOS == {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+
+
+def test_journal_graph_projection_rejects_old_transient_local_planning_scene_qos():
+    """F2.3: the stale TRANSIENT_LOCAL/depth-1 PlanningScene claim is rejected."""
+    fixture_payload = _canonical_fixture_payload()
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/planning_scene"]["requested_qos"] = {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    with pytest.raises(ValueError, match="QoS"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/monitored_planning_scene"]["offered_qos"] = {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    with pytest.raises(ValueError, match="QoS"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/planning_scene"]["requested_qos"]["depth"] = 1
+    with pytest.raises(ValueError, match="QoS"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
 
 
 def test_readiness_requires_eight_fresh_joints():

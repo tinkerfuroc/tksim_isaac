@@ -245,15 +245,33 @@ FIXTURE_TARGET_HANDOFF = "pick_and_place/object_mesh"
 
 #: Journal graph projection QoS uses exact uppercase enum strings (Task 3
 #: schema); readiness-snapshot QoS uses the existing lowercase representation.
-JOURNAL_TOPIC_QOS: Mapping[str, object] = {
+#: The two PlanningScene topics mirror the stock MoveIt2 Humble publisher's
+#: plain depth-100 ``rclcpp::QoS`` (RELIABLE + VOLATILE); the fixture status
+#: topic stays RELIABLE/TRANSIENT_LOCAL/depth 1 (F2.3).
+JOURNAL_PLANNING_SCENE_TOPIC_QOS: Mapping[str, object] = {
+    "reliability": "RELIABLE",
+    "durability": "VOLATILE",
+    "depth": 100,
+}
+JOURNAL_FIXTURE_TOPIC_QOS: Mapping[str, object] = {
     "reliability": "RELIABLE",
     "durability": "TRANSIENT_LOCAL",
     "depth": 1,
 }
+#: Backward-compatible alias retained for the fixture-status topic claim.
+JOURNAL_TOPIC_QOS: Mapping[str, object] = dict(JOURNAL_FIXTURE_TOPIC_QOS)
 JOURNAL_SERVICE_QOS: Mapping[str, object] = {
     "reliability": "RELIABLE",
     "durability": "VOLATILE",
 }
+
+#: MoveIt planning-stage non-success codes valid for the blocked diagnostic
+#: (F2.4).  Only codes that unambiguously represent planner/IK non-success after
+#: a valid plan-only request (PLANNING_FAILED=-1, INVALID_MOTION_PLAN=-2,
+#: NO_IK_SOLUTION=5).  Request-level/configuration/timeout/transport errors are
+#: never a blocked pass.
+MOVEIT_SUCCESS_CODE = 1
+MOVEIT_PLANNING_NON_SUCCESS_CODES: frozenset[int] = frozenset({-1, -2, 5})
 
 #: Journal/evidence artifact names written per attempt.
 ARTIFACT_JSONL_FILES: tuple[str, ...] = (
@@ -906,18 +924,18 @@ def _validate_observed_graph(
         entry = _as_mapping(topics.get(name))
         if entry.get("type") != expected_type:
             raise ValueError(f"observed topic {name} has wrong type {entry.get('type')!r}")
-        if not _qos_exact(entry.get("requested_qos"), JOURNAL_TOPIC_QOS):
-            raise ValueError(f"observed topic {name} requested QoS must be RELIABLE/TRANSIENT_LOCAL/depth 1")
-        if not _qos_exact(entry.get("offered_qos"), JOURNAL_TOPIC_QOS):
-            raise ValueError(f"observed topic {name} offered QoS must be RELIABLE/TRANSIENT_LOCAL/depth 1")
+        if not _qos_exact(entry.get("requested_qos"), JOURNAL_PLANNING_SCENE_TOPIC_QOS):
+            raise ValueError(f"observed topic {name} requested QoS must be RELIABLE/VOLATILE/depth 100")
+        if not _qos_exact(entry.get("offered_qos"), JOURNAL_PLANNING_SCENE_TOPIC_QOS):
+            raise ValueError(f"observed topic {name} offered QoS must be RELIABLE/VOLATILE/depth 100")
         publishers = _validate_endpoint_entries(f"observed topic {name} publishers", entry.get("publishers"))
         subscribers = _validate_endpoint_entries(f"observed topic {name} subscribers", entry.get("subscribers"))
         if not any(endpoint["node"] == OPERATOR_NODE for endpoint in subscribers):
             raise ValueError(f"observed topic {name} must be subscribed by {OPERATOR_NODE}")
         normalized_topics[name] = {
             "type": expected_type,
-            "requested_qos": dict(JOURNAL_TOPIC_QOS),
-            "offered_qos": dict(JOURNAL_TOPIC_QOS),
+            "requested_qos": dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS),
+            "offered_qos": dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS),
             "publishers": publishers,
             "subscribers": subscribers,
         }
@@ -925,9 +943,9 @@ def _validate_observed_graph(
     fixture_entry = _as_mapping(topics.get(FIXTURE_TOPIC))
     if fixture_entry.get("type") != "std_msgs/msg/String":
         raise ValueError(f"observed topic {FIXTURE_TOPIC} has wrong type")
-    if not _qos_exact(fixture_entry.get("requested_qos"), JOURNAL_TOPIC_QOS):
+    if not _qos_exact(fixture_entry.get("requested_qos"), JOURNAL_FIXTURE_TOPIC_QOS):
         raise ValueError(f"observed topic {FIXTURE_TOPIC} requested QoS must be RELIABLE/TRANSIENT_LOCAL/depth 1")
-    if not _qos_exact(fixture_entry.get("offered_qos"), JOURNAL_TOPIC_QOS):
+    if not _qos_exact(fixture_entry.get("offered_qos"), JOURNAL_FIXTURE_TOPIC_QOS):
         raise ValueError(f"observed topic {FIXTURE_TOPIC} offered QoS must be RELIABLE/TRANSIENT_LOCAL/depth 1")
     fixture_publishers = _validate_endpoint_entries(
         f"observed topic {FIXTURE_TOPIC} publishers", fixture_entry.get("publishers")
@@ -943,8 +961,8 @@ def _validate_observed_graph(
         raise ValueError(f"observed topic {FIXTURE_TOPIC} must be subscribed by {OPERATOR_NODE}")
     normalized_topics[FIXTURE_TOPIC] = {
         "type": "std_msgs/msg/String",
-        "requested_qos": dict(JOURNAL_TOPIC_QOS),
-        "offered_qos": dict(JOURNAL_TOPIC_QOS),
+        "requested_qos": dict(JOURNAL_FIXTURE_TOPIC_QOS),
+        "offered_qos": dict(JOURNAL_FIXTURE_TOPIC_QOS),
         "publishers": fixture_publishers,
         "subscribers": fixture_subscribers,
     }
@@ -1302,6 +1320,16 @@ def _operator_qos(ros: Mapping[str, Any]) -> Any:
 
 
 def _planning_scene_qos(ros: Mapping[str, Any]) -> Any:
+    """Stock MoveIt2 Humble PlanningScene contract: RELIABLE/VOLATILE/depth 100."""
+    return ros["QoSProfile"](
+        depth=100,
+        reliability=ros["ReliabilityPolicy"].RELIABLE,
+        durability=ros["DurabilityPolicy"].VOLATILE,
+    )
+
+
+def _fixture_qos(ros: Mapping[str, Any]) -> Any:
+    """Fixture/safety/operator status contract: RELIABLE/TRANSIENT_LOCAL/depth 1."""
     return ros["QoSProfile"](
         depth=1,
         reliability=ros["ReliabilityPolicy"].RELIABLE,
@@ -1318,7 +1346,11 @@ def _joint_state_qos(ros: Mapping[str, Any]) -> Any:
 
 
 def _atomic_write_json(value: object, path: Path) -> None:
-    """Write *value* canonically through temp-file + fsync + atomic replace."""
+    """Write *value* canonically through temp-file + fsync + replace + dir fsync.
+
+    Mirrors the strongest repository durability pattern (Task 3 journal) so a
+    pass claim is never exposed before the parent directory entry is durable.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
@@ -1329,6 +1361,15 @@ def _atomic_write_json(value: object, path: Path) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            pass
+        else:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -1509,7 +1550,7 @@ class IntegratedGateExecutor:
             ros["String"],
             FIXTURE_TOPIC,
             self._on_fixture_payload,
-            _planning_scene_qos(ros),
+            _fixture_qos(ros),
         )
         self.node.create_subscription(
             ros["JointState"],
@@ -1521,7 +1562,7 @@ class IntegratedGateExecutor:
             ros["Bool"],
             SAFETY_STOP_TOPIC,
             self._on_safety_stop,
-            _planning_scene_qos(ros),
+            _fixture_qos(ros),
         )
 
     def _make_scene_callback(self, source: str):
@@ -1713,7 +1754,14 @@ class IntegratedGateExecutor:
         goal: Any,
         spec: Mapping[str, object],
     ) -> dict[str, object]:
-        """Send exactly one plan-only goal with bounded, correctly cancelled waits."""
+        """Send exactly one plan-only goal with bounded, correctly cancelled waits.
+
+        F2.2/F2.8: every exceptional completion (server wait, send future,
+        acceptance, result future, cancellation) is converted into a finite
+        canonical diagnostic outcome with a stable reason code.  An unaccepted or
+        indeterminate send future can never pass, and the evidence states that
+        canceling a client future is not proof of server-side cancellation.
+        """
         thresholds = self._thresholds()
         client = self._action_clients["/move_action"]
         server_timeout_s = float(thresholds.get("action_server_wait_s", 5.0))
@@ -1721,6 +1769,7 @@ class IntegratedGateExecutor:
             return {
                 "scenario_id": scenario_id,
                 "status": "action-server-unavailable",
+                "reason_code": "action-server-unavailable",
                 "diagnostic_only": True,
                 "error": "/move_action server was not available before send",
             }
@@ -1731,21 +1780,38 @@ class IntegratedGateExecutor:
         while not send_future.done() and time.monotonic() < accept_deadline:
             self._spin_once()
         if not send_future.done():
+            # F2.8: canceling the client future is a client-side no-op and is not
+            # proof of server-side cancellation; do not claim a cancel.
             try:
                 send_future.cancel()
             except Exception:
                 pass
             return {
                 "scenario_id": scenario_id,
-                "status": "timeout",
+                "status": "goal-accept-timeout",
+                "reason_code": "goal-accept-timeout",
                 "diagnostic_only": True,
-                "error": "goal acceptance timed out before a goal handle existed",
+                "error": (
+                    "goal acceptance timed out before a goal handle existed; "
+                    "canceling the client send future is not proof of server-side cancellation"
+                ),
+                "send_future_cancelled": True,
             }
-        goal_handle = send_future.result()
+        try:
+            goal_handle = send_future.result()
+        except Exception as exc:  # F2.2: an exceptional send completion fails closed.
+            return {
+                "scenario_id": scenario_id,
+                "status": "goal-send-exception",
+                "reason_code": "goal-send-exception",
+                "diagnostic_only": True,
+                "error": f"send_goal future raised: {exc}",
+            }
         if goal_handle is None or not getattr(goal_handle, "accepted", False):
             return {
                 "scenario_id": scenario_id,
                 "status": "goal-rejected",
+                "reason_code": "goal-rejected",
                 "diagnostic_only": True,
                 "error": "send_goal returned no accepted goal handle",
             }
@@ -1760,6 +1826,7 @@ class IntegratedGateExecutor:
             return {
                 "scenario_id": scenario_id,
                 "status": "timeout",
+                "reason_code": "result-timeout",
                 "diagnostic_only": True,
                 "error": "planning result timed out",
                 "cancel_response": cancel_response,
@@ -1770,6 +1837,7 @@ class IntegratedGateExecutor:
             return {
                 "scenario_id": scenario_id,
                 "status": "malformed-result",
+                "reason_code": "malformed-result",
                 "diagnostic_only": True,
                 "error": f"result future raised: {exc}",
             }
@@ -1777,6 +1845,7 @@ class IntegratedGateExecutor:
             return {
                 "scenario_id": scenario_id,
                 "status": "malformed-result",
+                "reason_code": "malformed-result",
                 "diagnostic_only": True,
                 "error": "result future returned no MoveGroup result",
             }
@@ -1806,6 +1875,7 @@ class IntegratedGateExecutor:
             return {
                 "scenario_id": scenario_id,
                 "status": "malformed-result",
+                "reason_code": "malformed-result",
                 "diagnostic_only": True,
                 "error": "MoveGroup result error_code.val is not a strict integer",
             }
@@ -1820,16 +1890,33 @@ class IntegratedGateExecutor:
             self._digest(self.ros["serialize_message"](planned)) if planned is not None else None
         )
         expectation = spec.get("expectation")
-        success = bool(error_value == 1)
+        success = bool(error_value == MOVEIT_SUCCESS_CODE)
         if expectation == "non-success":
-            passed = not success
+            # F2.4: the blocked scenario only passes on an explicit planning-stage
+            # non-success after a valid request; unknown/request-level codes never
+            # pass.  The exact classification is recorded.
+            passed = error_value in MOVEIT_PLANNING_NON_SUCCESS_CODES
+            if error_value == MOVEIT_SUCCESS_CODE:
+                classification = "unexpected-success"
+            elif passed:
+                classification = "planning-non-success"
+            else:
+                classification = "request-level-or-unknown"
         else:
             passed = success and nonempty_plan
+            classification = (
+                "success"
+                if passed
+                else "success-with-empty-plan"
+                if success
+                else "non-success"
+            )
         return {
             "scenario_id": scenario_id,
             "status": "diagnostic-pass" if passed else "diagnostic-fail",
             "diagnostic_only": True,
             "error_code": error_value,
+            "error_code_classification": classification,
             "nonempty_plan": nonempty_plan,
             "trajectory_digest": trajectory_digest,
             "expectation": expectation,
@@ -1840,102 +1927,325 @@ class IntegratedGateExecutor:
     def run_gate_c_plan_only(
         self, scenario_id: str, *, joints: Sequence[float] | None = None
     ) -> dict[str, object]:
-        """Run exactly one plan-only Gate C scenario through ``/move_action``."""
+        """Run exactly one plan-only Gate C scenario through ``/move_action``.
+
+        Fail-dominant (F2.1): the authoritative final status is computed after
+        the plan outcome *and* every required evidence finalization step.  Any
+        readiness, journal event, graph projection, journal finalization, artifact
+        serialization/write, or required-artifact-existence failure makes the
+        public return and ``integrated-execution.json`` status ``evidence-invalid``;
+        no artifact retains a pass claim for that attempt.  The raw planner
+        outcome is preserved separately as ``planner_status``.
+
+        Exceptional completion (F2.2): server wait, goal construction/serialization,
+        ``send_goal_async``, send-future spin/result, goal acceptance, result-future
+        spin/result, cancellation, provider calls, and artifact finalization are all
+        converted into finite canonical diagnostic records with zero physical claim
+        and exact zero-command/controller flags.  Once ``fixture-ready`` exists the
+        executor always attempts teardown journal completion and failed finalization.
+        No expected runtime/DDS/action failure escapes the public API.
+        """
+        fixture_ready_recorded = False
         try:
-            spec = stage_c_dispatch(scenario_id, scenario=self.scenario)
-        except ValueError as exc:
+            try:
+                spec = stage_c_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid(
+                    scenario_id, "scenario-rejected", [str(exc)]
+                )
+
+            if self.join_key_provider is None:
+                return self._evidence_invalid(
+                    scenario_id,
+                    "no-join-key",
+                    ["join_key_provider is required before sending any goal"],
+                )
+            readiness = self._readiness()
+            if readiness is None:
+                return self._evidence_invalid(
+                    scenario_id,
+                    "readiness-unavailable",
+                    ["readiness_snapshot_provider is required before sending any goal"],
+                )
+            if not readiness["ready"]:
+                return self._evidence_invalid(
+                    scenario_id, "readiness-failed", list(readiness["reasons"])
+                )
+
+            # F2.5: bounded self-spin to obtain a current fixture scene.
+            acquire_error = self._acquire_scene(scenario_id)
+            if acquire_error is not None:
+                return acquire_error
+
+            join = self._join_key()
+            if join is None:
+                return self._evidence_invalid(
+                    scenario_id,
+                    "no-join-key",
+                    ["join_key_provider returned no valid strictly-increasing key"],
+                )
+            scene = self._journal_scene(join)
+            if scene is None:
+                return self._evidence_invalid(
+                    scenario_id,
+                    "no-planning-scene",
+                    ["no valid PlanningScene cached before fixture-ready"],
+                )
+            # F2.6: fixture-ready must match the declared fixture contract.
+            scene_error = self._fixture_scene_error(scene)
+            if scene_error is not None:
+                return self._evidence_invalid(
+                    scenario_id, "fixture-scene-mismatch", [scene_error]
+                )
+
+            try:
+                self.journal.record_diff("fixture-ready", scene)
+            except (ValueError, TypeError) as exc:
+                return self._evidence_invalid(
+                    scenario_id, "journal-fixture-ready-rejected", [str(exc)]
+                )
+            fixture_ready_recorded = True
+
+            # F2.7: `before` visual request is durably flushed before the goal send.
+            self._append_visual_request("before", scenario_id, spec)
+
+            try:
+                goal = self._build_goal(spec, joints=joints)
+                goal_digest = self._digest(self.ros["serialize_message"](goal))
+            except Exception as exc:
+                goal = None
+                goal_digest = None
+                outcome = {
+                    "scenario_id": scenario_id,
+                    "status": "goal-construction-exception",
+                    "reason_code": "goal-construction-exception",
+                    "diagnostic_only": True,
+                    "error": f"goal construction/serialization raised: {exc}",
+                }
+            else:
+                outcome = self._send_plan_only_goal(scenario_id, goal, spec)
+
+            teardown_status = "not-recorded"
+            later_join = self._join_key()
+            if later_join is None:
+                teardown_status = "no-join-key"
+            else:
+                try:
+                    self.journal.snapshot(
+                        "teardown", frame_index=later_join[0], timestamp=later_join[1]
+                    )
+                    teardown_status = "recorded"
+                except (ValueError, TypeError) as exc:
+                    teardown_status = f"rejected: {exc}"
+
+            # F2.7: `after` visual request only in the post-transaction phase.
+            self._append_visual_request("after", scenario_id, spec)
+
+            # F2.1: authoritative fail-dominant final status after the plan outcome
+            # and every evidence finalization step.
+            planner_status = outcome.get("status")
+            final_status = (
+                "diagnostic-pass"
+                if planner_status == "diagnostic-pass"
+                else "diagnostic-fail"
+                if planner_status == "diagnostic-fail"
+                else "evidence-invalid"
+            )
+            graph_status = "unavailable"
+            journal_finalize_error: str | None = None
+            try:
+                graph = self._graph_observation()
+                if graph is None:
+                    raise ValueError("observed graph evidence is unavailable")
+                projection = build_journal_graph_projection(
+                    fixture_payload=self._fixture_payload_for_graph(),
+                    observed_graph=graph,
+                )
+                self.journal.finalize(
+                    final_status,
+                    graph=projection,
+                    json_path=self.attempt_dir / "planning-scene.json",
+                )
+                graph_status = "validated"
+            except Exception as exc:
+                journal_finalize_error = str(exc)
+                graph_status = f"invalid: {exc}"
+                final_status = "evidence-invalid"
+                # F2.1: always produce planning-scene.json as a canonical failure
+                # artifact when journal finalization cannot validate the graph.
+                if self.journal.record_count > 0:
+                    self._finalize_failure_artifact(journal_finalize_error, graph_status)
+
+            record = {
+                **outcome,
+                "planner_status": planner_status,
+                "teardown": teardown_status,
+                "graph": graph_status,
+                "goal_digest": goal_digest,
+                "diagnostic_only": True,
+                "execute_trajectory_goal_sent": False,
+                "isaac_joint_commands_published": False,
+            }
+            # F2.1: the fail-dominant status is authoritative in the public record.
+            record["status"] = final_status
+            if final_status == "evidence-invalid" and record.get("reason_code") is None:
+                record["reason_code"] = (
+                    "graph-evidence-invalid"
+                    if journal_finalize_error is not None
+                    else "evidence-invalid"
+                )
+
+            # F2.1: final artifact output failure must downgrade, never leave a pass.
+            try:
+                self._write_artifacts(scenario_id, spec, goal, record, readiness, graph_status)
+            except Exception as exc:
+                record["status"] = "evidence-invalid"
+                record["reason_code"] = "artifact-write-failed"
+                record["artifact_error"] = str(exc)
+                try:
+                    self._write_fail_dominant_execution_json(
+                        scenario_id,
+                        record,
+                        readiness,
+                        graph_status,
+                        planner_status=planner_status,
+                        reason="artifact final output failed",
+                    )
+                except Exception:
+                    pass
+            return record
+        except Exception as exc:  # F2.2: no expected runtime failure escapes the API.
+            if fixture_ready_recorded:
+                return self._evidence_invalid_after_fixture_ready(
+                    scenario_id, exc, spec, readiness
+                )
             return self._evidence_invalid(
-                scenario_id, "scenario-rejected", [str(exc)]
+                scenario_id, "unexpected-exception", [str(exc)]
             )
 
-        if self.join_key_provider is None:
+    def _acquire_scene(self, scenario_id: str) -> dict[str, object] | None:
+        """F2.5: bounded pre-goal scene acquisition through the private spinner."""
+        if self._planning_scene_invalid:
             return self._evidence_invalid(
                 scenario_id,
-                "no-join-key",
-                ["join_key_provider is required before sending any goal"],
+                "planning-scene-invalid",
+                ["a cached PlanningScene failed normalization before fixture-ready"],
             )
-        readiness = self._readiness()
-        if readiness is None:
-            return self._evidence_invalid(
-                scenario_id,
-                "readiness-unavailable",
-                ["readiness_snapshot_provider is required before sending any goal"],
-            )
-        if not readiness["ready"]:
-            return self._evidence_invalid(
-                scenario_id, "readiness-failed", list(readiness["reasons"])
-            )
+        if self._latest_planning_scene is not None:
+            return None
+        timeout_s = float(self._thresholds().get("scene_acquire_timeout_s", 5.0))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self._spin_once()
+            if self._planning_scene_invalid:
+                return self._evidence_invalid(
+                    scenario_id,
+                    "planning-scene-invalid",
+                    ["a received PlanningScene failed normalization during scene acquisition"],
+                )
+            if self._latest_planning_scene is not None:
+                return None
+        return self._evidence_invalid(
+            scenario_id,
+            "no-planning-scene",
+            [f"no valid PlanningScene cached within {timeout_s:.3f}s of self-spin"],
+        )
 
-        join = self._join_key()
-        if join is None:
-            return self._evidence_invalid(
-                scenario_id,
-                "no-join-key",
-                ["join_key_provider returned no valid strictly-increasing key"],
+    def _fixture_scene_error(self, scene: Mapping[str, object]) -> str | None:
+        """F2.6: return a reason when *scene* does not match the fixture contract."""
+        declaration = _as_mapping(
+            self.scenario.get("planning_scene_declaration") or self.scenario.get("planning_scene")
+        )
+        expected_ids = list(fixture_owned_ids(declaration))
+        owned_ids = list(scene.get("owned_ids", []))
+        if owned_ids != expected_ids:
+            return (
+                "fixture-ready owned_ids must equal the declared ordered fixture ids: "
+                f"scene {owned_ids} != declared {expected_ids}"
             )
-        scene = self._journal_scene(join)
-        if scene is None:
-            return self._evidence_invalid(
-                scenario_id,
-                "no-planning-scene",
-                ["no valid PlanningScene cached before fixture-ready"],
-            )
+        attached_ids = list(scene.get("attached_ids", []))
+        if attached_ids:
+            return f"fixture-ready scene must not carry attached objects: {attached_ids}"
+        return None
+
+    def _append_visual_request(
+        self, phase: str, scenario_id: str, spec: Mapping[str, object]
+    ) -> None:
+        """F2.7: durably append one visual-capture request record at the truthful phase."""
+        self._append_jsonl(
+            self.attempt_dir / "visual-capture-requests.jsonl",
+            {
+                "schema_version": 1,
+                "report_revision": REPORT_REVISION,
+                "scenario_id": scenario_id,
+                "phase": phase,
+                "capture": {"kind": "plan-only", "target": spec.get("target_pose")},
+                "diagnostic_only": True,
+            },
+        )
+
+    def _finalize_failure_artifact(self, reason: str, graph_diagnosis: str) -> str:
+        """F2.1: write planning-scene.json as a canonical failure artifact."""
         try:
-            self.journal.record_diff("fixture-ready", scene)
-        except (ValueError, TypeError) as exc:
-            return self._evidence_invalid(
-                scenario_id, "journal-fixture-ready-rejected", [str(exc)]
+            self.journal.finalize_failure(
+                reason=reason,
+                graph_diagnosis=graph_diagnosis,
+                json_path=self.attempt_dir / "planning-scene.json",
             )
+            return "written"
+        except Exception as exc:
+            return f"failed: {exc}"
 
-        goal = self._build_goal(spec, joints=joints)
-        outcome = self._send_plan_only_goal(scenario_id, goal, spec)
-        goal_digest = self._digest(self.ros["serialize_message"](goal))
-
+    def _evidence_invalid_after_fixture_ready(
+        self,
+        scenario_id: str,
+        exc: Exception,
+        spec: Mapping[str, object],
+        readiness: Mapping[str, object],
+    ) -> dict[str, object]:
+        """F2.2: complete evidence for a failure after fixture-ready was recorded."""
         teardown_status = "not-recorded"
         later_join = self._join_key()
-        if later_join is None:
-            teardown_status = "no-join-key"
-        else:
+        if later_join is not None:
             try:
                 self.journal.snapshot(
                     "teardown", frame_index=later_join[0], timestamp=later_join[1]
                 )
                 teardown_status = "recorded"
-            except (ValueError, TypeError) as exc:
-                teardown_status = f"rejected: {exc}"
-
+            except (ValueError, TypeError) as exc2:
+                teardown_status = f"rejected: {exc2}"
+        reason = f"unexpected-exception: {exc}"
         graph_status = "unavailable"
-        final_status = "diagnostic-pass" if outcome.get("status") == "diagnostic-pass" else (
-            "diagnostic-fail" if outcome.get("status") == "diagnostic-fail" else "evidence-invalid"
-        )
-        try:
-            graph = self._graph_observation()
-            if graph is None:
-                raise ValueError("observed graph evidence is unavailable")
-            projection = build_journal_graph_projection(
-                fixture_payload=self._fixture_payload_for_graph(),
-                observed_graph=graph,
-            )
-            self.journal.finalize(
-                final_status,
-                graph=projection,
-                json_path=self.attempt_dir / "planning-scene.json",
-            )
-            graph_status = "validated"
-        except (ValueError, TypeError) as exc:
-            graph_status = f"invalid: {exc}"
-            final_status = "evidence-invalid"
-
+        self._finalize_failure_artifact(reason, graph_status)
         record = {
-            **outcome,
+            "scenario_id": scenario_id,
+            "status": "evidence-invalid",
+            "reason_code": "unexpected-exception",
+            "reasons": [reason],
+            "planner_status": None,
             "teardown": teardown_status,
             "graph": graph_status,
-            "goal_digest": goal_digest,
+            "goal_digest": None,
             "diagnostic_only": True,
             "execute_trajectory_goal_sent": False,
             "isaac_joint_commands_published": False,
         }
-        self._write_artifacts(scenario_id, spec, goal, record, readiness, graph_status)
+        try:
+            self._write_artifacts(scenario_id, spec, None, record, readiness, graph_status)
+        except Exception:
+            # F2.2: artifact output must never escape; fall back to the durable
+            # fail-dominant summary only.
+            try:
+                self._write_fail_dominant_execution_json(
+                    scenario_id,
+                    record,
+                    readiness,
+                    graph_status,
+                    planner_status=None,
+                    reason="artifact output failed after an unexpected exception",
+                )
+            except Exception:
+                pass
         return record
 
     def _fixture_payload_for_graph(self) -> str:
@@ -1966,29 +2276,69 @@ class IntegratedGateExecutor:
             "execute_trajectory_goal_sent": False,
             "isaac_joint_commands_published": False,
         }
-        self._append_jsonl(
-            self.attempt_dir / "integrated-execution.jsonl",
-            {
-                "schema_version": 1,
-                "report_revision": REPORT_REVISION,
-                "scenario_id": scenario_id,
-                "event": "gate-c-plan-only",
-                "status": "evidence-invalid",
-                "reason_code": reason_code,
-                "reasons": list(reasons),
-                "diagnostic_only": True,
-                "timestamp": float(time.monotonic()),
-            },
-        )
-        self._append_jsonl(
-            self.attempt_dir / "controller-results.jsonl",
-            {
-                "scenario_id": scenario_id,
-                "controller_goal_sent": False,
-                "execute_trajectory_goal_sent": False,
-                "diagnostic_only": True,
-            },
-        )
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "integrated-execution.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "event": "gate-c-plan-only",
+                    "status": "evidence-invalid",
+                    "reason_code": reason_code,
+                    "reasons": list(reasons),
+                    "diagnostic_only": True,
+                    "timestamp": float(time.monotonic()),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "controller-results.jsonl",
+                {
+                    "scenario_id": scenario_id,
+                    "controller_goal_sent": False,
+                    "execute_trajectory_goal_sent": False,
+                    "diagnostic_only": True,
+                },
+            )
+        except Exception:
+            pass
+        try:
+            self._write_json_atomic(
+                self.attempt_dir / "integrated-execution.json",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "diagnostic_only": True,
+                    "status": "evidence-invalid",
+                    "reason_code": reason_code,
+                    "reasons": list(reasons),
+                    "execute_trajectory_goal_sent": False,
+                    "isaac_joint_commands_published": False,
+                    "physical_verdict": None,
+                },
+            )
+        except Exception:
+            pass
+        return record
+
+    def _write_json_atomic(self, path: Path, value: Mapping[str, object]) -> None:
+        _atomic_write_json(value, path)
+
+    def _write_fail_dominant_execution_json(
+        self,
+        scenario_id: str,
+        record: Mapping[str, object],
+        readiness: Mapping[str, object],
+        graph_status: str,
+        *,
+        planner_status: str | None,
+        reason: str,
+    ) -> None:
+        """F2.1: durable fail-dominant execution summary when artifact output fails."""
         self._write_json_atomic(
             self.attempt_dir / "integrated-execution.json",
             {
@@ -1997,17 +2347,19 @@ class IntegratedGateExecutor:
                 "scenario_id": scenario_id,
                 "diagnostic_only": True,
                 "status": "evidence-invalid",
-                "reason_code": reason_code,
-                "reasons": list(reasons),
+                "reason_code": record.get("reason_code", "artifact-write-failed"),
+                "reasons": [reason],
+                "planner_status": planner_status,
+                "readiness": {
+                    "ready": readiness.get("ready", False),
+                    "reasons": readiness.get("reasons", []),
+                },
+                "graph": graph_status,
                 "execute_trajectory_goal_sent": False,
                 "isaac_joint_commands_published": False,
                 "physical_verdict": None,
             },
         )
-        return record
-
-    def _write_json_atomic(self, path: Path, value: Mapping[str, object]) -> None:
-        _atomic_write_json(value, path)
 
     def _write_artifacts(
         self,
@@ -2027,6 +2379,8 @@ class IntegratedGateExecutor:
                 "scenario_id": scenario_id,
                 "event": "gate-c-plan-only",
                 "status": record.get("status"),
+                "reason_code": record.get("reason_code"),
+                "planner_status": record.get("planner_status"),
                 "diagnostic_only": True,
                 "readiness": {
                     "ready": readiness.get("ready", False),
@@ -2046,7 +2400,9 @@ class IntegratedGateExecutor:
                 "scenario_id": scenario_id,
                 "goal_kind": spec.get("kind"),
                 "status": record.get("status"),
+                "planner_status": record.get("planner_status"),
                 "error_code": record.get("error_code"),
+                "error_code_classification": record.get("error_code_classification"),
                 "nonempty_plan": record.get("nonempty_plan"),
                 "goal_digest": goal_digest,
                 "trajectory_digest": record.get("trajectory_digest"),
@@ -2083,20 +2439,6 @@ class IntegratedGateExecutor:
             },
             goal_path,
         )
-        for label in ("before", "after"):
-            self._append_jsonl(
-                self.attempt_dir / "visual-capture-requests.jsonl",
-                {
-                    "schema_version": 1,
-                    "scenario_id": scenario_id,
-                    "phase": label,
-                    "capture": {
-                        "kind": "plan-only",
-                        "target": spec.get("target_pose"),
-                    },
-                    "diagnostic_only": True,
-                },
-            )
         self._write_json_atomic(
             self.attempt_dir / "integrated-execution.json",
             {
@@ -2105,6 +2447,8 @@ class IntegratedGateExecutor:
                 "scenario_id": scenario_id,
                 "diagnostic_only": True,
                 "status": record.get("status"),
+                "reason_code": record.get("reason_code"),
+                "planner_status": record.get("planner_status"),
                 "readiness": {
                     "ready": readiness.get("ready", False),
                     "reasons": readiness.get("reasons", []),
@@ -2121,6 +2465,7 @@ class IntegratedGateExecutor:
                 },
                 "result": {
                     "error_code": record.get("error_code"),
+                    "error_code_classification": record.get("error_code_classification"),
                     "nonempty_plan": record.get("nonempty_plan"),
                     "trajectory_digest": record.get("trajectory_digest"),
                 },
@@ -2200,8 +2545,12 @@ __all__ = [
     "INTEGRATED_EXECUTION_PROFILE",
     "ISAAC_COMMAND_TOPIC",
     "JOINT_STATES_TOPIC",
+    "JOURNAL_FIXTURE_TOPIC_QOS",
+    "JOURNAL_PLANNING_SCENE_TOPIC_QOS",
     "JOURNAL_SERVICE_QOS",
     "JOURNAL_TOPIC_QOS",
+    "MOVEIT_PLANNING_NON_SUCCESS_CODES",
+    "MOVEIT_SUCCESS_CODE",
     "MOVE_GROUP_NODE",
     "NODE_BASENAME",
     "OPERATION_KEYS",
