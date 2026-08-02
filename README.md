@@ -335,6 +335,22 @@ References:
   joint-limit acceptance is semantic + toolchain-aware; and a clean-checkout
   regression seam (`git clone` of the tracked tree) requires every static test to
   pass with no gitignored trees.
+- 2026-08-02 (fix round 3): Locked the clean-checkout acceptance coverage.  The
+  regression seam now collects the exact 64-node `Task8OMPLOverlayProvenanceTest`
+  class in the clone (canonical SHA-256 over the sorted node list, so a deleted
+  or added test fails even if the count is preserved) and executes it under a
+  machine-readable JUnit XML, requiring total=64, failures=0, errors=0, skipped=4,
+  the exact four host-runtime diagnostic skip names, and their reason categories —
+  an unrelated static assertion broadened into a skip is rejected.  The
+  reconstructed Task 3 resolver (`tools/tinker_sim_deploy`) is now materialized
+  from immutable git objects at the recorded simulator implementation identity
+  (never copied from the live working tree, so local edits cannot influence
+  acceptance); a dirty live-tree resolver edit is proven not to affect the
+  reconstructed preflight, and a pinned-blob mismatch/missing file fails closed.
+  The fixture status field contract is asserted against an independent 12-field
+  literal (not re-derived from the source function), and a stale
+  `current.json` selector is proven to fail the preflight `artifact_identity`
+  check.  The fix-1 baseline is documented as 2 failed + 1 skipped.
 - 2026-08-02 (fix round 1): Made the OMPL-overlay acceptance evidence
   reproducible.  The production-overlay scope is split into the exact production
   allow-lists (from `launch_contract_helpers.py`, including

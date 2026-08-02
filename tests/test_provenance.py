@@ -5,11 +5,11 @@ import hashlib
 import importlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
@@ -81,6 +81,63 @@ _TASK_RANGE_COMMITS = [
     "5472b5f88b8b2531eac52a585a000ea2f741261a",
     "1b31c5db03df069d474eaa4ea0ba756debfaa234",
     "c72d79dd7ba0442b7fd5708a6689627f6b097ec2",
+]
+
+# ---------------------------------------------------------------------------
+# fix-round-3 locked clean-checkout class identity (immutable)
+# ---------------------------------------------------------------------------
+# The exact pytest node set of Task8OMPLOverlayProvenanceTest (64 tests) is
+# load-bearing: the clean-checkout seam collects the class in a fresh tracked
+# clone and requires exactly these 64 node IDs and this canonical SHA-256 over
+# the JSON-canonical sorted node list.  A deleted test, an added test, or a
+# rename that preserves the count cannot preserve the hash, so silently reduced
+# coverage fails closed.
+_TASK8_CLASS_TEST_COUNT = 64
+_TASK8_CLASS_NODE_SET_SHA = (
+    "0488b3048283d8fb4af3f72d2fdec2e1b83d1215de2bf55f0e714ec48fb99929"
+)
+
+# The only legitimate clean-checkout skips are the four host-runtime /
+# environment diagnostics, keyed by exact test name with the expected reason
+# category (a substring of the real skip message).  Any additional skip, or a
+# legitimate diagnostic broadened into a skip, changes this set and fails.
+_TASK8_CLEAN_CHECKOUT_SKIPS = {
+    "test_clean_checkout_static_acceptance_seam": "nested clean-checkout seam invocation",
+    "test_installed_package_data_byte_identity": "install prefix not present",
+    "test_current_artifact_matches_reproducible_derivation": "host is not provisioned",
+    "test_model_bundle_stable_projection_reproducible": "non-provisioned host",
+}
+
+# The fixture status field contract is asserted against this independently
+# documented 12-field literal (canonical order/encoding), never re-derived from
+# the Task 5 function whose key set it also validates separately.
+_EXPECTED_FIXTURE_STATUS_FIELDS = [
+    "schema_version=1",
+    "state",
+    "scenario",
+    "owner=sim_fixture",
+    "revision",
+    "revision_digest",
+    "monotonic sequence",
+    "finite published_at",
+    "declared-order owned_ids",
+    "target_source_id",
+    "target_handoff=pick_and_place/object_mesh",
+    "fixture_descriptor_sha256",
+]
+_FIXTURE_STATUS_FIELD_KEYS = [
+    "schema_version",
+    "state",
+    "scenario",
+    "owner",
+    "revision",
+    "revision_digest",
+    "sequence",
+    "published_at",
+    "owned_ids",
+    "target_source_id",
+    "target_handoff",
+    "fixture_descriptor_sha256",
 ]
 
 _EXPECTED_18_LAUNCH_ARGS = [
@@ -199,6 +256,15 @@ def _sha256_json(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _node_set_sha(node_ids: list[str]) -> str:
+    """Canonical SHA-256 over the JSON-canonical sorted pytest node list.
+
+    Delete+add substitutions cannot preserve this hash even when the count is
+    unchanged, so the clean-checkout seam can lock the exact executed test set.
+    """
+    return hashlib.sha256(_canonical_json(sorted(node_ids))).hexdigest()
+
+
 class ProvenanceTest(unittest.TestCase):
     def test_checked_in_release_inputs_match_manifest(self) -> None:
         manifest = verify(Config.load(ROOT), require_python=True)
@@ -206,7 +272,7 @@ class ProvenanceTest(unittest.TestCase):
 
 
 class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
-    """Task 8: deterministic acceptance-contract provenance (fix rounds 1-2).
+    """Task 8: deterministic acceptance-contract provenance (fix rounds 1-3).
 
     These assertions recompute every derived hash/contract from immutable git
     objects (``git show <recorded-commit>:<path>``) and committed simulator
@@ -480,6 +546,42 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
             mount=mount,
         )
 
+    def _materialize_tinker_sim_deploy(
+        self, target: Path, commit: str | None = None
+    ) -> None:
+        """Materialize ``tools/tinker_sim_deploy`` into *target* from immutable
+        git objects at the recorded simulator implementation identity.
+
+        The file set is derived from ``git ls-tree`` at the pinned commit and
+        every blob is written with ``git show <commit>:<path>`` -- never read
+        from the live working tree -- so uncommitted local edits to
+        ``tools/tinker_sim_deploy`` cannot influence the reconstructed
+        preflight.  A non-existent commit or an empty file set fails closed.
+        """
+        if commit is None:
+            commit = str(
+                self._load_contract()["repositories"]["simulator"]["implementation_identity"]
+            )
+        listing = self._git(
+            ROOT, "ls-tree", "-r", "--name-only", commit, "tools/tinker_sim_deploy/"
+        )
+        self.assertEqual(
+            listing.returncode, 0, listing.stderr
+        )
+        paths = [p for p in listing.stdout.split() if p]
+        self.assertGreater(
+            len(paths), 0,
+            "pinned tools/tinker_sim_deploy file set must not be empty at {}".format(commit),
+        )
+        deploy_dir = target / "tools" / "tinker_sim_deploy"
+        deploy_dir.mkdir(parents=True, exist_ok=True)
+        for path in paths:
+            blob = _git_blob(ROOT, commit, path)
+            relative = path[len("tools/tinker_sim_deploy/"):]
+            out = deploy_dir / relative
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(blob)
+
     def _reconstruct_project_root(self, tmpdir: Path) -> dict[str, object]:
         """Reconstruct a self-contained Task 3-compatible project root.
 
@@ -515,11 +617,10 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
             "artifact_id": artifact_id,
             "manifest": "artifacts/robot/tinker2/{}/manifest.json".format(artifact_id),
         }).decode("utf-8"))
-        shutil.copytree(
-            ROOT / "tools/tinker_sim_deploy",
-            tmpdir / "tools/tinker_sim_deploy",
-            dirs_exist_ok=True,
-        )
+        # The shared resolver is materialized from immutable git objects at the
+        # recorded simulator implementation identity -- never copied from the
+        # live working tree -- so local edits cannot influence acceptance.
+        self._materialize_tinker_sim_deploy(tmpdir)
         manifest = build_manifest(
             simulator_full_urdf=artifacts["simulator_full_urdf"],
             planning_urdf=artifacts["planning_urdf"],
@@ -1032,6 +1133,73 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
             )
             self.assertNotIn("elapsed_ms", stable_preflight_evidence(result))
             self.assertNotIn("model_bundle_manifest", stable_preflight_evidence(result))
+            # Stale-selector fail-closed: a provisioned selector that points at a
+            # stale/missing artifact must make the preflight not-ready and the
+            # artifact_identity check fail (never ready).
+            current_path = Path(tmp) / "artifacts/robot/tinker2/current.json"
+            original_current = current_path.read_bytes()
+            try:
+                stale_id = "deadbeef00000000"
+                current_path.write_bytes(_canonical_json({
+                    "artifact_id": stale_id,
+                    "manifest": "artifacts/robot/tinker2/{}/manifest.json".format(stale_id),
+                }))
+                stale = preflight_manifest(
+                    root["manifest_path"], timeout=30.0, project_root=Path(tmp)
+                )
+                self.assertFalse(stale["ready"])
+                stale_identity = next(
+                    c for c in stale["checks"] if c["name"] == "artifact_identity"
+                )
+                self.assertFalse(stale_identity["ok"])
+            finally:
+                current_path.write_bytes(original_current)
+        # Pinned-resolver independence: a dirty live-tree edit to the shared
+        # resolver must NOT flow into the reconstruction (immutable git objects).
+        sim_identity = str(
+            self._load_contract()["repositories"]["simulator"]["implementation_identity"]
+        )
+        live_runtime = ROOT / "tools/tinker_sim_deploy/runtime.py"
+        backup = live_runtime.read_bytes()
+        try:
+            live_runtime.write_bytes(b"# dirty local edit must not reach reconstruction\n")
+            with tempfile.TemporaryDirectory(prefix="mb-indep-") as tmp2:
+                root2 = self._reconstruct_project_root(Path(tmp2))
+                pinned_runtime = _git_blob(
+                    ROOT, sim_identity, "tools/tinker_sim_deploy/runtime.py"
+                )
+                self.assertEqual(
+                    (Path(tmp2) / "tools/tinker_sim_deploy/runtime.py").read_bytes(),
+                    pinned_runtime,
+                    "reconstruction must materialize the pinned resolver bytes, not the live tree",
+                )
+                result2 = preflight_manifest(
+                    root2["manifest_path"], timeout=30.0, project_root=root2["tmp"]
+                )
+                self.assertTrue(result2["ready"])
+                self.assertEqual(
+                    _sha256_json(stable_preflight_evidence(result2)),
+                    data["stable_sha256"],
+                )
+        finally:
+            live_runtime.write_bytes(backup)
+        # Pinned-blob mismatch/missing fails closed: a nonexistent path at the
+        # recorded identity raises, and a wrong-but-real pin materializes bytes
+        # that differ from the recorded resolver (a changed pin is detected).
+        with self.assertRaises(AssertionError):
+            _git_blob(ROOT, sim_identity, "tools/tinker_sim_deploy/definitely-not-a-file.py")
+        with tempfile.TemporaryDirectory(prefix="mb-bogus-") as tmp3:
+            with self.assertRaises(AssertionError):
+                self._materialize_tinker_sim_deploy(Path(tmp3), commit="0" * 40)
+        with tempfile.TemporaryDirectory(prefix="mb-mispin-") as tmp4:
+            self._materialize_tinker_sim_deploy(
+                Path(tmp4), commit="1b31c5db03df069d474eaa4ea0ba756debfaa234"
+            )
+            self.assertNotEqual(
+                (Path(tmp4) / "tools/tinker_sim_deploy/runtime.py").read_bytes(),
+                _git_blob(ROOT, sim_identity, "tools/tinker_sim_deploy/runtime.py"),
+                "a wrong pin must not silently reproduce the recorded resolver bytes",
+            )
 
     def test_current_artifact_matches_reproducible_derivation(self) -> None:
         # Provisioned-host selector guard: when the real current.json exists, it
@@ -1325,24 +1493,15 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
             descriptor_sha256="0" * 64,
             state="FIXTURE_READY",
         )
-        # fields describe the exact canonical status key set + constant values.
-        expected_fields: list[str] = []
-        for key in status:
-            if key == "schema_version":
-                expected_fields.append("schema_version=1")
-            elif key == "owner":
-                expected_fields.append("owner=sim_fixture")
-            elif key == "target_handoff":
-                expected_fields.append("target_handoff=pick_and_place/object_mesh")
-            elif key == "sequence":
-                expected_fields.append("monotonic sequence")
-            elif key == "published_at":
-                expected_fields.append("finite published_at")
-            elif key == "owned_ids":
-                expected_fields.append("declared-order owned_ids")
-            else:
-                expected_fields.append(str(key))
-        self.assertEqual(list(data["fields"]), expected_fields)
+        # The contract field list is asserted against the independently
+        # documented 12-field literal (canonical order/encoding), NOT re-derived
+        # from the function output, so a coordinated source+contract change to
+        # the key set is detected.
+        self.assertEqual(list(data["fields"]), _EXPECTED_FIXTURE_STATUS_FIELDS)
+        # Source-shape validation: the Task 5 function must itself emit exactly
+        # this key set in this order, so a source change fails even if the
+        # contract changed in lockstep.
+        self.assertEqual(list(status), _FIXTURE_STATUS_FIELD_KEYS)
         self.assertEqual(status["schema_version"], 1)
         self.assertEqual(status["owner"], "sim_fixture")
         # topic/type/source/qos/rate grounded in the Task 5 node source + launch.
@@ -1627,8 +1786,17 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
 
     def test_clean_checkout_static_acceptance_seam(self) -> None:
         """Clean-checkout regression seam: a fresh tracked-only clone (no
-        gitignored outputs/artifacts/install) must pass every Task 8 static test
-        apart from the independently known uv environment test (not selected).
+        gitignored outputs/artifacts/install) must run the exact Task 8 class.
+
+        The seam locks the *executed suite and skip set*, not just the exit
+        code: it collects the class in the clone and requires exactly the 64
+        canonical node IDs (canonical SHA-256 over the sorted node list), then
+        executes the class under a machine-readable pytest JUnit XML and asserts
+        total=64, failures=0, errors=0, skipped=4, the exact four legitimate
+        host-runtime diagnostic skips, and their reason categories -- so a
+        deleted test, an accidental broad skip, or a collection/import error
+        all fail closed.  A changed node-set hash or changed skip set is
+        rejected by the inline mutation self-check below.
 
         Uses a temporary ``git clone`` (a temporary checkout/copy); never
         mutates the active checkout.  The nested invocation is skipped via
@@ -1650,9 +1818,46 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
             env = os.environ.copy()
             env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
             env["T8_SEAM_ACTIVE"] = "1"
+            # 1. Collection gate: exactly the canonical 64-node class, in the
+            # clone.  A deleted/renamed/added test, or a collection/import
+            # error, fails here (collection errors exit non-zero and the count
+            # + node-set hash are asserted, not just the exit code).
+            collection = subprocess.run(
+                [
+                    sys.executable, "-m", "pytest", "--collect-only", "-q",
+                    "-p", "no:cacheprovider",
+                    "tests/test_provenance.py::Task8OMPLOverlayProvenanceTest",
+                ],
+                cwd=str(root),
+                env=env,
+                capture_output=True,
+            )
+            self.assertEqual(
+                collection.returncode, 0,
+                "collection failed in the clean checkout:\n"
+                + collection.stdout.decode(errors="replace")
+                + collection.stderr.decode(errors="replace"),
+            )
+            collected = [
+                line.strip()
+                for line in collection.stdout.decode(errors="replace").splitlines()
+                if line.strip().startswith("tests/test_provenance.py::Task8OMPLOverlayProvenanceTest::")
+            ]
+            self.assertEqual(
+                len(collected), _TASK8_CLASS_TEST_COUNT,
+                "Task8 class must collect exactly {} tests in the clean checkout".format(_TASK8_CLASS_TEST_COUNT),
+            )
+            collected_sorted = sorted(collected)
+            self.assertEqual(
+                _node_set_sha(collected_sorted), _TASK8_CLASS_NODE_SET_SHA,
+                "Task8 collected-node set changed; update the locked hash only if the class change is intentional",
+            )
+            # 2. Machine-readable execution: JUnit XML, not tail parsing.
+            junit = Path(tmp) / "junit.xml"
             result = subprocess.run(
                 [
                     sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                    "--junitxml={}".format(junit),
                     "tests/test_provenance.py::Task8OMPLOverlayProvenanceTest",
                 ],
                 cwd=str(root),
@@ -1666,6 +1871,52 @@ class Task8OMPLOverlayProvenanceTest(unittest.TestCase):
                 "runtime diagnostics may skip.\n"
                 + result.stdout.decode(errors="replace")
                 + result.stderr.decode(errors="replace"),
+            )
+            tree = ET.parse(str(junit))
+            # pytest emits <testsuites> containing <testsuite> element(s); the
+            # counts live on the <testsuite> child, so aggregate across them.
+            total = sum(int(s.attrib["tests"]) for s in tree.iter("testsuite"))
+            failures = sum(int(s.attrib["failures"]) for s in tree.iter("testsuite"))
+            errors = sum(int(s.attrib["errors"]) for s in tree.iter("testsuite"))
+            skipped = sum(int(s.attrib["skipped"]) for s in tree.iter("testsuite"))
+            self.assertEqual(
+                total, _TASK8_CLASS_TEST_COUNT,
+                "exactly {} tests must execute in the clean checkout, found {}".format(_TASK8_CLASS_TEST_COUNT, total),
+            )
+            self.assertEqual(failures, 0, "zero failures required in the clean checkout")
+            self.assertEqual(errors, 0, "zero errors required in the clean checkout")
+            self.assertEqual(
+                skipped, 4,
+                "exactly the 4 legitimate host diagnostics may skip, found {}".format(skipped),
+            )
+            # 3. Exact skip set + reason categories (not merely a numeric count).
+            skip_details: dict[str, str] = {}
+            for case in tree.iter("testcase"):
+                skip_node = case.find("skipped")
+                if skip_node is not None:
+                    skip_details[case.attrib["name"]] = skip_node.attrib.get("message", "")
+            self.assertEqual(set(skip_details), set(_TASK8_CLEAN_CHECKOUT_SKIPS))
+            for name, reason in skip_details.items():
+                self.assertIn(
+                    _TASK8_CLEAN_CHECKOUT_SKIPS[name], reason,
+                    "skip {!r} must carry the expected reason category".format(name),
+                )
+            # 4. Inline mutation self-check: a deleted test, an extra skip, or a
+            # missing legitimate skip must each change the locked node-set hash
+            # or skip set and therefore be rejected.
+            self.assertNotEqual(
+                _node_set_sha(collected_sorted[:-1]), _TASK8_CLASS_NODE_SET_SHA,
+                "a deleted test must change the locked node-set hash",
+            )
+            self.assertNotEqual(
+                set(skip_details) | {"test_top_level_evidence_stable_hashes_reproducible"},
+                _TASK8_CLEAN_CHECKOUT_SKIPS,
+                "a test broadened into a skip must change the locked skip set",
+            )
+            self.assertNotEqual(
+                set(skip_details) - {"test_installed_package_data_byte_identity"},
+                _TASK8_CLEAN_CHECKOUT_SKIPS,
+                "a removed legitimate diagnostic skip must change the locked skip set",
             )
 
     def _assert_installed_byte_identity(self, install: Path) -> None:
