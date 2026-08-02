@@ -25,6 +25,7 @@ import ast
 import copy
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -45,13 +46,16 @@ from tinker_sim_bridge.fixture_planning_scene import (  # noqa: E402
 )
 from tinker_sim_bridge.integrated_readiness import public_integrated_mapping  # noqa: E402
 from validation.integrated_gate_executor import (  # noqa: E402
+    Q_OUTBOUND,
     REQUIRED_ACTIONS,
     REQUIRED_SERVICES,
     REQUIRED_TOPICS,
+    STAGE_C_SCENARIOS,
     _REQUIRED_ENDPOINT_SOURCES,
     build_journal_graph_projection,
     evaluate_executor_readiness,
     expected_physics_ready_report,
+    stage_c_dispatch,
     validate_physics_ready_snapshot,
 )
 
@@ -239,31 +243,91 @@ def _fixture_descriptor_digest(contract: dict[str, object] = POSITIVE_REPORT_CON
     return fixture_descriptor_sha256(contract["planning_scene_declaration"])
 
 
-def ready_executor_snapshot() -> dict[str, object]:
-    """A genuine passing readiness baseline before mutation tests begin."""
+def _observed_graph_double() -> dict[str, object]:
+    """A valid observed-graph double for the exact three journal topics/services."""
+    recorder = {"node": "/tinker_integrated_gate_executor", "node_namespace": ""}
+    move_group = {"node": "/move_group", "node_namespace": ""}
+    fixture_publisher = {"node": "/fixture_planning_scene", "node_namespace": ""}
+    topic_qos = {"reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1}
+    service_qos = {"reliability": "RELIABLE", "durability": "VOLATILE"}
+    return {
+        "node_name": "/tinker_integrated_gate_executor",
+        "namespace": "/",
+        "remap_table": {},
+        "topics": {
+            "/planning_scene": {
+                "type": "moveit_msgs/msg/PlanningScene",
+                "requested_qos": dict(topic_qos),
+                "offered_qos": dict(topic_qos),
+                "publishers": [dict(move_group)],
+                "subscribers": [dict(recorder)],
+            },
+            "/monitored_planning_scene": {
+                "type": "moveit_msgs/msg/PlanningScene",
+                "requested_qos": dict(topic_qos),
+                "offered_qos": dict(topic_qos),
+                "publishers": [dict(move_group)],
+                "subscribers": [dict(recorder)],
+            },
+            "/sim/status/planning_scene_fixture": {
+                "type": "std_msgs/msg/String",
+                "requested_qos": dict(topic_qos),
+                "offered_qos": dict(topic_qos),
+                "publishers": [dict(fixture_publisher)],
+                "subscribers": [dict(recorder)],
+            },
+        },
+        "services": {
+            "/get_planning_scene": {
+                "type": "moveit_msgs/srv/GetPlanningScene",
+                "requested_qos": dict(service_qos),
+                "offered_qos": dict(service_qos),
+                "servers": [dict(move_group)],
+                "clients": [dict(recorder)],
+            },
+            "/apply_planning_scene": {
+                "type": "moveit_msgs/srv/ApplyPlanningScene",
+                "requested_qos": dict(service_qos),
+                "offered_qos": dict(service_qos),
+                "servers": [dict(move_group)],
+                "clients": [dict(recorder)],
+            },
+        },
+    }
+
+
+def _ready_snapshot_for_contract(contract: dict[str, object]) -> dict[str, object]:
+    """A genuine passing readiness baseline derived from any scenario contract."""
     joints = [f"joint{i}" for i in range(1, 8)] + ["drive_joint"]
-    fixture_ids = list(fixture_owned_ids(POSITIVE_REPORT_CONTRACT["planning_scene_declaration"]))
-    declaration = POSITIVE_REPORT_CONTRACT["planning_scene_declaration"]
-    fixture_descriptor_sha256_value = _fixture_descriptor_digest()
-    fixture_payload = _canonical_fixture_payload()
+    scenario_mapping = contract["scenario_mapping"]
+    identities = contract["identities"]
+    declaration = contract["planning_scene_declaration"]
+    scenario_id = scenario_mapping["id"]
+    seed = scenario_mapping["seed"]
+    fixture_ids = list(fixture_owned_ids(declaration))
+    fixture_digest = _fixture_descriptor_digest(contract)
+    fixture_payload = _canonical_fixture_payload(contract)
+    report_bytes = canonical_report_bytes(contract)
+    digest_fields = {
+        "scenario_declaration_sha256": identities["scenario_declaration_sha256"],
+        "planning_scene_sha256": identities["planning_scene_sha256"],
+        "integrated_sha256": identities["integrated_sha256"],
+        "model_fingerprint": identities["model_fingerprint"],
+        "provider_manifest_sha256": identities["provider_manifest_sha256"],
+    }
     return {
         "scenario": {
             "state": "PHYSICS_READY", "report_verified": True,
-            "scenario": "qualification-pick-place-positive",
-            "scenario_id": "qualification-pick-place-positive", "seed": 7,
-            "scenario_declaration_sha256": PUBLIC_DECLARATION_DIGEST,
+            "scenario": scenario_id, "scenario_id": scenario_id, "seed": seed,
+            **dict(digest_fields),
             "planning_scene_revision": declaration["revision"],
-            "planning_scene_sha256": PLANNING_SCENE_SHA256,
-            "integrated_sha256": INTEGRATED_SHA256,
-            "model_fingerprint": MODEL_FINGERPRINT,
-            "provider_manifest_sha256": PROVIDER_MANIFEST_SHA256,
             "final_simulation_state": "STATE_PLAYING",
             "boundary": "PHYSICS_READY",
-            "scenario_report_sha256": hashlib.sha256(canonical_report_bytes()).hexdigest(),
+            "scenario_report_sha256": hashlib.sha256(report_bytes).hexdigest(),
             "planning_scene": {
                 "state": "declared", "owner": "sim_fixture",
                 "revision": declaration["revision"],
-                "revision_digest": FIXTURE_REVISION_DIGEST,
+                "revision_digest": declaration["revision_digest"],
                 "owned_ids": fixture_ids,
                 "target_source_id": declaration["target_source_id"],
                 "target_handoff": "pick_and_place/object_mesh",
@@ -272,16 +336,12 @@ def ready_executor_snapshot() -> dict[str, object]:
             "operations": [
                 {
                     "state": 1, "boundary": "PHYSICS_READY",
-                    "scenario_id": "qualification-pick-place-positive", "seed": 7,
-                    "scenario_declaration_sha256": PUBLIC_DECLARATION_DIGEST,
-                    "planning_scene_sha256": PLANNING_SCENE_SHA256,
-                    "integrated_sha256": INTEGRATED_SHA256,
-                    "model_fingerprint": MODEL_FINGERPRINT,
-                    "provider_manifest_sha256": PROVIDER_MANIFEST_SHA256,
+                    "scenario_id": scenario_id, "seed": seed,
+                    **dict(digest_fields),
                 }
             ],
         },
-        "scenario_report_bytes": canonical_report_bytes(),
+        "scenario_report_bytes": report_bytes,
         "model": {"fingerprint_match": True, "fingerprint": MODEL_FINGERPRINT},
         "provider_manifest_sha256": PROVIDER_MANIFEST_SHA256,
         "tf": {"complete": True, "age_s": 0.05},
@@ -361,15 +421,15 @@ def ready_executor_snapshot() -> dict[str, object]:
         },
         "fixture": {
             "schema_version": 1, "state": "FIXTURE_READY",
-            "scenario": "qualification-pick-place-positive",
+            "scenario": scenario_id,
             "owner": "sim_fixture", "revision": declaration["revision"],
-            "revision_digest": FIXTURE_REVISION_DIGEST,
+            "revision_digest": declaration["revision_digest"],
             "owned_ids": fixture_ids,
             "target_source_id": declaration["target_source_id"],
             "target_handoff": "pick_and_place/object_mesh",
             "sequence": 2, "previous_sequence": 1, "sample_count": 2,
             "published_at": 1.0, "age_s": 0.05,
-            "fixture_descriptor_sha256": fixture_descriptor_sha256_value,
+            "fixture_descriptor_sha256": fixture_digest,
         },
         "planning_scene": {
             "owned_ids": fixture_ids,
@@ -377,6 +437,11 @@ def ready_executor_snapshot() -> dict[str, object]:
         },
         "robot_in_collision": False,
     }
+
+
+def ready_executor_snapshot() -> dict[str, object]:
+    """A genuine passing readiness baseline before mutation tests begin."""
+    return _ready_snapshot_for_contract(POSITIVE_REPORT_CONTRACT)
 
 
 def readiness_scenario(contract: dict[str, object] = POSITIVE_REPORT_CONTRACT) -> dict[str, object]:
@@ -437,7 +502,10 @@ def test_endpoint_source_and_cardinality_contract_uses_real_providers():
 def test_journal_graph_projection_passes_task3_validator():
     from planning_scene_journal import validate_graph_evidence
 
-    projection = build_journal_graph_projection(fixture_payload=_canonical_fixture_payload())
+    projection = build_journal_graph_projection(
+        fixture_payload=_canonical_fixture_payload(),
+        observed_graph=_observed_graph_double(),
+    )
     normalized = validate_graph_evidence(projection)
     assert normalized["node_name"] == "/tinker_integrated_gate_executor"
     assert normalized["namespace"] == "/"
@@ -692,3 +760,221 @@ def test_qualification_process_helpers_expose_additive_mechanics(tmp_path):
     assert environment["ROS_DOMAIN_ID"] == "7"
     assert environment["RMW_IMPLEMENTATION"] == "rmw_fastrtps_cpp"
     assert "AMENT_PREFIX_PATH" in environment
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 additions: Stage-C readiness baselines, dispatch semantics,
+# observed-graph fail-closed projection, and Task-3 journal ownership.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("scenario_name", STAGE_C_SCENARIOS)
+def test_stage_c_readiness_baseline_is_ready(scenario_name):
+    """F1.5: every Stage-C scenario has a passing scenario-specific readiness
+    baseline with its own revision, owned IDs, and descriptor digest."""
+    contract = scenario_report_contract(scenario_name)
+    snapshot = _ready_snapshot_for_contract(contract)
+    result = evaluate_executor_readiness(snapshot, _config(), readiness_scenario(contract))
+    assert result["ready"] is True
+    assert result["reasons"] == []
+    declaration = contract["planning_scene_declaration"]
+    assert snapshot["fixture"]["revision"] == declaration["revision"]
+    assert snapshot["fixture"]["revision_digest"] == declaration["revision_digest"]
+    assert snapshot["fixture"]["fixture_descriptor_sha256"] == _fixture_descriptor_digest(contract)
+    assert snapshot["fixture"]["owned_ids"] == list(fixture_owned_ids(declaration))
+
+
+@pytest.mark.parametrize(
+    ("scenario_name", "kind", "expectation"),
+    [
+        ("qualification-moveit-plan-joint", "joint", "success"),
+        ("qualification-moveit-plan-pose", "pose", "success"),
+        ("qualification-moveit-plan-blocked", "blocked", "non-success"),
+    ],
+)
+def test_stage_c_dispatch_validates_three_scenarios(scenario_name, kind, expectation):
+    """F1.6: the three Stage-C plan-only scenarios dispatch to the exact goal
+    kind and expected diagnostic polarity."""
+    contract = scenario_report_contract(scenario_name)
+    spec = stage_c_dispatch(scenario_name, scenario=readiness_scenario(contract))
+    assert spec["scenario_id"] == scenario_name
+    assert spec["kind"] == kind
+    assert spec["expectation"] == expectation
+    if kind == "joint":
+        assert spec["joints"] == list(Q_OUTBOUND)
+    else:
+        xyz = spec["target_pose"]["xyz"]
+        quaternion = spec["target_pose"]["quaternion_xyzw"]
+        assert len(xyz) == 3 and all(math.isfinite(float(value)) for value in xyz)
+        assert len(quaternion) == 4 and all(math.isfinite(float(value)) for value in quaternion)
+        norm = math.sqrt(sum(float(value) ** 2 for value in quaternion))
+        assert abs(norm - 1.0) <= 1.0e-3
+
+
+def test_stage_c_dispatch_rejects_non_c_scenario():
+    contract = scenario_report_contract("qualification-pick-place-positive")
+    with pytest.raises(ValueError, match="stage must be C"):
+        stage_c_dispatch(
+            "qualification-pick-place-positive", scenario=readiness_scenario(contract)
+        )
+    with pytest.raises(ValueError, match="scenario_id does not match"):
+        stage_c_dispatch(
+            "qualification-moveit-plan-pose", scenario=readiness_scenario(contract)
+        )
+
+
+def test_journal_graph_projection_fails_closed_on_observed_graph_mutations():
+    """F1.4: mutations of the observed input (never a pre-fabricated projection)
+    fail closed with the specific reason."""
+    fixture_payload = _canonical_fixture_payload()
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/planning_scene"]["subscribers"] = [
+        {"node": "/other", "node_namespace": ""}
+    ]
+    with pytest.raises(ValueError, match="subscribed"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/extra"] = dict(graph["topics"]["/planning_scene"])
+    with pytest.raises(ValueError, match="topics must be exactly"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/planning_scene"]["type"] = "std_msgs/msg/String"
+    with pytest.raises(ValueError, match="wrong type"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/planning_scene"]["requested_qos"]["depth"] = 2
+    with pytest.raises(ValueError, match="QoS"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/sim/status/planning_scene_fixture"]["publishers"].append(
+        {"node": "/other", "node_namespace": ""}
+    )
+    with pytest.raises(ValueError, match="exactly one publisher"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["services"]["/get_planning_scene"]["clients"] = [
+        {"node": "/other", "node_namespace": ""}
+    ]
+    with pytest.raises(ValueError, match="called by"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["node_name"] = "/wrong"
+    with pytest.raises(ValueError, match="node_name"):
+        build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+
+def _journal_for_contract(tmp_path: Path, contract: dict[str, object]):
+    from planning_scene_journal import PlanningSceneJournal, load_model_touch_contract
+
+    from validation.integrated_gate_executor import (
+        GATE_C_REQUIRED_EVENT_ORDER,
+        GATE_C_FORBIDDEN_EVENTS,
+        TARGET_OBJECT_ID,
+        TASK_NAMESPACE,
+    )
+
+    declaration = contract["planning_scene_declaration"]
+    touch = load_model_touch_contract()
+    journal = PlanningSceneJournal(
+        fixture_revision=declaration["revision"],
+        task_namespace=TASK_NAMESPACE,
+        target_object_id=TARGET_OBJECT_ID,
+        expected_attach_link=touch["link_tcp"],
+        expected_touch_links=touch["touch_links"],
+        required_event_order=GATE_C_REQUIRED_EVENT_ORDER,
+        forbidden_events=GATE_C_FORBIDDEN_EVENTS,
+        jsonl_path=tmp_path / "planning-scene.jsonl",
+    )
+    return journal, declaration
+
+
+def _valid_scene(declaration: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "scene_sequence": 1,
+        "scene_timestamp": 1.0,
+        "owned_ids": list(fixture_owned_ids(declaration)),
+        "attached_ids": [],
+        "attached_links": {},
+        "touch_links": {},
+        "fixture_revision": declaration["revision"],
+        "scene_revision_digest": "a" * 64,
+        "acm_digest": "b" * 64,
+        "robot_state_digest": "c" * 64,
+        "source": "/planning_scene",
+    }
+
+
+def test_journal_lifecycle_fixture_ready_then_teardown_finalizes(tmp_path):
+    """F1.3: the Stage-C explicit journal lifecycle writes both journal artifacts
+    and retains the validated graph projection with a diagnostic authority."""
+    from planning_scene_journal import validate_graph_evidence
+
+    from validation.integrated_gate_executor import build_journal_graph_projection
+
+    contract = scenario_report_contract("qualification-moveit-plan-joint")
+    journal, declaration = _journal_for_contract(tmp_path, contract)
+    journal.record_diff(
+        "fixture-ready", {**_valid_scene(declaration), "frame_index": 0, "timestamp": 0.0}
+    )
+    journal.snapshot("teardown", frame_index=1, timestamp=1.0)
+    projection = build_journal_graph_projection(
+        fixture_payload=_canonical_fixture_payload(contract),
+        observed_graph=_observed_graph_double(),
+    )
+    assert validate_graph_evidence(projection)["node_name"] == "/tinker_integrated_gate_executor"
+    final = journal.finalize(
+        "diagnostic-pass", graph=projection, json_path=tmp_path / "planning-scene.json"
+    )
+    assert final["status"] == "diagnostic-pass"
+    assert final["authority"] == "physics_truth"
+    assert final["events"] == ["fixture-ready", "teardown"]
+    assert final["graph"]["topics"]["/sim/status/planning_scene_fixture"]["payload_parsed"][
+        "fixture_descriptor_sha256"
+    ] == _fixture_descriptor_digest(contract)
+    assert (tmp_path / "planning-scene.jsonl").exists()
+    assert (tmp_path / "planning-scene.json").stat().st_size > 0
+
+
+def test_stale_nonempty_jsonl_fails_closed_before_any_record(tmp_path):
+    """F1.3: a pre-existing non-empty jsonl fails closed at the first append."""
+    jsonl = tmp_path / "planning-scene.jsonl"
+    jsonl.write_text('{"stale": true}\n', encoding="utf-8")
+    contract = scenario_report_contract("qualification-moveit-plan-joint")
+    journal, declaration = _journal_for_contract(tmp_path, contract)
+    with pytest.raises(ValueError, match="already contains records"):
+        journal.record_diff(
+            "fixture-ready", {**_valid_scene(declaration), "frame_index": 0, "timestamp": 0.0}
+        )
+
+
+def test_gate_c_forbidden_events_block_manipulation_events(tmp_path):
+    """F1.3: Gate C derives an explicit Stage-C journal contract; no explicit
+    Stage-C run may emit attach/detach/manipulation events."""
+    from validation.integrated_gate_executor import (
+        GATE_C_FORBIDDEN_EVENTS,
+        GATE_C_REQUIRED_EVENT_ORDER,
+    )
+
+    assert GATE_C_REQUIRED_EVENT_ORDER == ("fixture-ready", "teardown")
+    assert GATE_C_FORBIDDEN_EVENTS == (
+        "before-pick",
+        "scene-attach",
+        "lift-complete",
+        "transport",
+        "before-release",
+        "scene-detach",
+        "released-settled",
+        "task-cleanup",
+    )
+    contract = scenario_report_contract("qualification-moveit-plan-joint")
+    journal, declaration = _journal_for_contract(tmp_path, contract)
+    with pytest.raises(ValueError, match="forbidden"):
+        journal.record_diff(
+            "scene-attach", {**_valid_scene(declaration), "frame_index": 0, "timestamp": 0.0}
+        )
