@@ -363,6 +363,37 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 2 fix round 2): Strengthened the
+  semantic source checks.  `validation/integrated_static_contracts.py` replaces
+  the comment-stripped string-presence C++ scans with a deliberately scoped
+  lexical/structural layer: literals (string/char/raw-string) and comments are
+  sanitized while braces/newlines are preserved, conditional-preprocessor
+  directives inside each load-bearing function body are rejected (dead-code
+  anchors cannot satisfy a check), and each inspected function is located by
+  its actual signature and brace-matched.  `run_post_close_pick` binds
+  `execute_lift(ctx, true/false, ...)` to its own Sim/Hardware `ExecutionProfile`
+  branch; `GraspNode::~GraspNode` binds the bounded deadline,
+  `motion_runtime_.shutdown`, the `executor_thread_` join and the
+  state-validity client reset to the destructor body; `coordinator_main` binds
+  the joined worker; `GraspNode::move_straight` binds
+  `request.avoid_collisions = avoid_collisions`; and each task result builder
+  must write exactly its `.action` result schema fields.  The overlay
+  `model_bundle.production_source_commits` is content-verified against
+  immutable Git blobs (commit existence, blob digest, manipulation ancestry vs
+  `implementation_head`; external `tk25_basic` via exact recorded commit/blob
+  only) and drives the model-artifact binding and the pinned-prerequisite
+  source-identity check, so working-tree drift never affects an immutable
+  `git show` result.  `fixture-ownership` requires the overlay `scenarios` set
+  to equal the configured C/D/E set exactly (missing or extra fails).
+  `validation/source_lock_manifest.py` closes the observer gaps:
+  `qualification_tooling` requires clean mode with empty
+  status/diff/index/untracked evidence, `authorization.report_path` must
+  resolve to a regular file inside the repository (absolute/symlink escape
+  fails), `_normalize_posix` rejects `..` and canonicalizes absolute
+  repository-relative paths, the stale mtime-fallback docstring is removed,
+  and the output manifest is written/fsynced/replaced exactly once from a
+  single pre-write timestamp (no two-valid-file crash window).
+
 - 2026-08-02 (integrated qualification Task 2 fix round 1): Bound Gate B to
   real artifacts.  `validation/integrated_static_contracts.py` dropped the
   fabricated `qualification/records/*` layer and inspects every production

@@ -314,6 +314,34 @@ References:
 
 ## Changelog
 
+- 2026-08-02 (integrated qualification Task 2 fix round 2): Strengthened the
+  semantic source checks.  `validation/integrated_static_contracts.py` replaces
+  comment-stripped string-presence C++ scans with a deliberately scoped
+  lexical/structural layer: comments, string/character and raw-string literals
+  are sanitized (preserving braces/newlines), conditional-preprocessor
+  directives inside load-bearing function bodies are rejected (so `#if 0` /
+  `#ifdef` dead-code anchors cannot satisfy a check), and each inspected
+  function (result builders, `GraspNode::~GraspNode`,
+  `GraspNode::clean_planning_scene`, `GraspNode::move_straight`,
+  `run_post_close_pick`, `coordinator_main`, `~MotionRuntime`) is located by
+  its actual signature and brace-matched.  The Sim/Hardware `execute_lift`
+  boolean is bound to its own `ExecutionProfile` branch, the destructor
+  deadline/shutdown/join/state-validity reset are bound to the destructor body,
+  and each task result builder must write exactly its `.action` schema fields.
+  The authoritative overlay `model_bundle.production_source_commits` is bound
+  to immutable Git blobs (40-hex commit existence, blob digest, manipulation
+  ancestry vs `implementation_head`; external `tk25_basic` via exact recorded
+  commit/blob only) and drives both the model-artifact binding and the
+  pinned-prerequisite source-identity check.  `fixture-ownership` now requires
+  the overlay `scenarios` key set to equal the configured C/D/E set exactly.
+  `source_lock_manifest.py` closes the observer gaps: qualification-tooling
+  requires clean mode with empty evidence, `authorization.report_path` must
+  resolve (no symlink/canonical escape) to a regular file inside the
+  repository, `_normalize_posix` rejects `..` and canonicalizes absolute
+  repository paths, the stale mtime-fallback docstring is removed, and the
+  output manifest is written/fsynced/replaced exactly once from a single
+  pre-write timestamp.
+
 - 2026-08-02 (integrated qualification Task 2 fix round 1): Bound Gate B to
   real artifacts.  `validation/integrated_static_contracts.py` no longer reads
   the fabricated `qualification/records/*` layer: every production source

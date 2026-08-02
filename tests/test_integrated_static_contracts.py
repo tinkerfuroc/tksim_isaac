@@ -38,6 +38,8 @@ from integrated_static_contracts import (  # noqa: E402
     ARM_JOINTS,
     GRIPPER_JOINT,
     PROD_ACTION_DIR_REL,
+    PROD_ACTION_EXECUTION_CPP_REL,
+    PROD_ACTION_RUNTIME_CPP_REL,
     PROD_GRIPPER_CONTROLLERS_REL,
     PROD_LAUNCH_REL,
     PROD_PACKAGE_UTILS_CPP_REL,
@@ -241,6 +243,16 @@ void GraspNode::shutdown_teardown() {
   if (executor_thread_.joinable()) executor_thread_.join();
 }
 
+// The destructor establishes a bounded deadline, shuts the runtime down, joins
+// the executor thread and resets the state-validity client in this exact body.
+GraspNode::~GraspNode() {
+  const auto shutdown_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  motion_runtime_.shutdown(shutdown_deadline);
+  if (executor_thread_.joinable()) executor_thread_.join();
+  check_state_validity_client_.reset();
+}
+
 // Straight slide forwards the avoid_collisions boolean to the typed request.
 StageResult GraspNode::move_straight(TransactionContext &ctx, const geometry_msgs::msg::Pose &target_pose,
                                      bool avoid_collisions, int16_t stage, std::chrono::milliseconds timeout) {
@@ -261,6 +273,63 @@ void write_task_result(Result *result, ResultStatus status, int16_t stage, std::
   result->status = static_cast<int16_t>(status);
   result->stage = status == ResultStatus::Success ? 0 : stage;
   result->error_msg = std::move(message);
+}
+
+// Each task builder writes exactly the fields its .action result schema
+// declares.  A write in a different builder never satisfies another builder's
+// required fields (F2.1).
+void make_pick_result(Result *result, ResultStatus status, int16_t stage, std::string message) {
+  result->stage = status == ResultStatus::Success ? 0 : stage;
+  result->status = static_cast<int16_t>(status);
+  result->error_msg = std::move(message);
+}
+
+void make_place_result(Result *result, ResultStatus status, int16_t stage, std::string message) {
+  result->status = static_cast<int16_t>(status);
+  result->error_msg = std::move(message);
+  result->stage = status == ResultStatus::Success ? 0 : stage;
+}
+
+void make_cartesian_result(Result *result, ResultStatus status, int16_t stage, std::string message) {
+  result->success = status == ResultStatus::Success;
+  result->stage = status == ResultStatus::Success ? 0 : stage;
+  result->status = static_cast<int16_t>(status);
+  result->error_msg = std::move(message);
+}
+
+void make_joint_result(Result *result, ResultStatus status, int16_t stage, std::string message) {
+  result->success = status == ResultStatus::Success;
+  result->stage = status == ResultStatus::Success ? 0 : stage;
+  result->status = static_cast<int16_t>(status);
+  result->error_msg = std::move(message);
+}
+
+void make_fold_result(Result *result, ResultStatus status, int16_t stage, std::string message) {
+  result->success = status == ResultStatus::Success;
+  result->stage = status == ResultStatus::Success ? 0 : stage;
+  result->status = static_cast<int16_t>(status);
+  result->error_msg = std::move(message);
+}
+"""
+
+DEFAULT_ACTION_RUNTIME_CPP = """#include <chrono>
+#include <thread>
+
+// The coordinator spawns a managed worker per transaction and joins it; the
+// runtime destructor joins the coordinator with a bounded shutdown.  No
+// detached thread is ever used.
+void coordinator_main(MotionRuntime *runtime) {
+  for (;;) {
+    Transaction *transaction = runtime->next_transaction();
+    if (transaction == nullptr) break;
+    transaction->worker = std::thread([transaction]() { transaction->run(); });
+    if (transaction->worker.joinable()) transaction->worker.join();
+  }
+}
+
+MotionRuntime::~MotionRuntime() {
+  if (coordinator_.joinable()) coordinator_.join();
+  shutdown(std::chrono::seconds(3));
 }
 """
 
@@ -415,7 +484,8 @@ PRODUCTION_FILES: dict[str, str] = {
     PROD_GRIPPER_CONTROLLERS_REL: DEFAULT_GRIPPER_CONTROLLERS,
     PROD_LAUNCH_REL: DEFAULT_LAUNCH,
     PROD_PICK_AND_PLACE_CPP_REL: DEFAULT_PICK_AND_PLACE_CPP,
-    "src/pick_and_place/src/action_execution.cpp": DEFAULT_ACTION_EXECUTION_CPP,
+    PROD_ACTION_EXECUTION_CPP_REL: DEFAULT_ACTION_EXECUTION_CPP,
+    PROD_ACTION_RUNTIME_CPP_REL: DEFAULT_ACTION_RUNTIME_CPP,
     PROD_PACKAGE_UTILS_CPP_REL: DEFAULT_PACKAGE_UTILS_CPP,
     PROD_SCENE_OWNERSHIP_CPP_REL: DEFAULT_SCENE_OWNERSHIP_CPP,
     "src/pick_and_place/include/grasp_node.hpp": DEFAULT_GRASP_NODE_HPP,
@@ -927,6 +997,132 @@ def test_bundle_touch_links_permutation_fails(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# F2.2 authoritative overlay source-commit binding mutations
+# ---------------------------------------------------------------------------
+def test_overlay_source_commits_empty_fails(tmp_path):
+    report, fixture = _run_static_fixture(tmp_path)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    overlay["model_bundle"]["production_source_commits"] = {}
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "model-fingerprint").passed
+    assert any("non-empty" in reason for reason in _check(report, "model-fingerprint").reasons)
+
+
+def test_overlay_source_commit_malformed_entry_fails(tmp_path):
+    report, fixture = _run_static_fixture(tmp_path)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    del overlay["model_bundle"]["production_source_commits"]["arm_joint_limits"]["sha256"]
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "model-fingerprint").passed
+    assert any("sha256" in reason for reason in _check(report, "model-fingerprint").reasons)
+
+
+def test_overlay_source_commit_wrong_digest_fails(tmp_path):
+    report, fixture = _run_static_fixture(tmp_path)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    overlay["model_bundle"]["production_source_commits"]["arm_joint_limits"]["sha256"] = "f" * 64
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "model-fingerprint").passed
+    assert any("sha256 mismatch" in reason for reason in _check(report, "model-fingerprint").reasons)
+
+
+def test_overlay_source_commit_missing_blob_fails(tmp_path):
+    report, fixture = _run_static_fixture(tmp_path)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    overlay["model_bundle"]["production_source_commits"]["arm_joint_limits"]["path_relative"] = (
+        "src/xarm_ros2/xarm_moveit_config/config/xarm7/nonexistent.yaml"
+    )
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "model-fingerprint").passed
+    assert any("not found" in reason for reason in _check(report, "model-fingerprint").reasons)
+
+
+def test_overlay_source_commit_wrong_repo_fails(tmp_path):
+    report, fixture = _run_static_fixture(tmp_path)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    overlay["model_bundle"]["production_source_commits"]["arm_joint_limits"]["repo_path"] = str(
+        fixture.simulator_root
+    )
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "model-fingerprint").passed
+    assert any("does not exist" in reason for reason in _check(report, "model-fingerprint").reasons)
+
+
+def test_overlay_source_commit_non_ancestor_fails(tmp_path):
+    """A real commit that exists in the production repo but is not an ancestor
+    of the manifest implementation head fails the pinned-ancestry check."""
+    report, fixture = _run_static_fixture(tmp_path)
+    prod = fixture.production_root
+    _git(prod, "checkout", "-q", "--orphan", "fixture-orphan")
+    _write(prod, "README.md", "orphan drift\n")
+    _git(prod, "add", "-A")
+    proc = _git(prod, "commit", "-q", "-m", "chore: orphan non-ancestor commit")
+    assert proc.returncode == 0, proc.stderr
+    orphan = _git_head(prod)
+    _git(prod, "checkout", "-q", "-f", fixture.impl_head)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    overlay["model_bundle"]["production_source_commits"]["arm_joint_limits"]["commit"] = orphan
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "model-fingerprint").passed
+    assert any("not an ancestor" in reason for reason in _check(report, "model-fingerprint").reasons)
+
+
+def test_overlay_source_commit_working_tree_drift_ignored(tmp_path):
+    """F2.2: production working-tree drift must NOT affect an immutable
+    ``git show <commit>:<path>`` binding.  The check still passes."""
+    report, fixture = _run_static_fixture(tmp_path)
+    _write(
+        fixture.production_root,
+        "src/xarm_ros2/xarm_moveit_config/config/xarm7/joint_limits.yaml",
+        "# drifted working copy, never committed\n",
+    )
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert _check(report, "model-fingerprint").passed
+    assert _check(report, "source-identities").passed
+
+
+# ---------------------------------------------------------------------------
 # F1/F2 controller mapping mutations
 # ---------------------------------------------------------------------------
 def test_controller_endpoint_wrong_fails(tmp_path):
@@ -959,7 +1155,9 @@ def test_detached_thread_fails(tmp_path):
 
 
 def test_missing_runtime_shutdown_fails(tmp_path):
-    mutated = DEFAULT_PICK_AND_PLACE_CPP.replace("(void)motion_runtime_.shutdown(std::chrono::seconds(3));", "")
+    # The destructor body must call motion_runtime_.shutdown(...); removing it
+    # from the actual destructor (not a helper) fails the structural binding.
+    mutated = DEFAULT_PICK_AND_PLACE_CPP.replace("  motion_runtime_.shutdown(shutdown_deadline);\n", "")
     assert mutated != DEFAULT_PICK_AND_PLACE_CPP
     report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_PICK_AND_PLACE_CPP_REL: mutated})
     assert any("motion_runtime_.shutdown" in reason for reason in _check(report, "action-lifecycle").reasons)
@@ -1018,6 +1216,183 @@ def test_missing_obstruction_gate_fails(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# F2.1 structural C++ mutation coverage (branch swap / spoof / move)
+# ---------------------------------------------------------------------------
+def test_sim_hw_execute_lift_branch_swap_fails(tmp_path):
+    """Swapping collision-aware/collision-disabled lift across the Sim/Hardware
+    branches must fail (the Sim branch is now collision-disabled)."""
+    marker_hw = "__SWAP_HW__"
+    marker_sim = "__SWAP_SIM__"
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP
+    mutated = mutated.replace(
+        "result = backend.execute_lift(ctx, false, post_close_stage, timeout);", marker_hw
+    )
+    mutated = mutated.replace(
+        "result = backend.execute_lift(ctx, true, post_close_stage, timeout);", marker_sim
+    )
+    mutated = mutated.replace(
+        marker_hw, "result = backend.execute_lift(ctx, true, post_close_stage, timeout);"
+    )
+    mutated = mutated.replace(
+        marker_sim, "result = backend.execute_lift(ctx, false, post_close_stage, timeout);"
+    )
+    assert "backend.execute_lift(ctx, true, post_close_stage, timeout);" in mutated
+    assert "backend.execute_lift(ctx, false, post_close_stage, timeout);" in mutated
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("must not call collision-aware" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+    assert any("must not call collision-disabled" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_sim_lift_string_literal_spoof_fails(tmp_path):
+    """A string literal carrying the execute_lift token must not satisfy the
+    SimOmpl lift binding (literals are sanitized)."""
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace(
+        "result = backend.execute_lift(ctx, true, post_close_stage, timeout);",
+        'const char *spoof = "result = backend.execute_lift(ctx, true, post_close_stage, timeout);";',
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("must call collision-aware execute_lift" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_sim_lift_raw_string_spoof_fails(tmp_path):
+    """A raw string literal carrying the execute_lift token must not satisfy the
+    SimOmpl lift binding."""
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace(
+        "result = backend.execute_lift(ctx, true, post_close_stage, timeout);",
+        'const char *spoof = R"(result = backend.execute_lift(ctx, true, post_close_stage, timeout);)";',
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("must call collision-aware execute_lift" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_sim_lift_if0_spoof_fails(tmp_path):
+    """Parking the required execute_lift(ctx, true, ...) call inside a dead
+    #if 0 block must not satisfy the SimOmpl lift binding."""
+    mutated = DEFAULT_SCENE_OWNERSHIP_CPP.replace(
+        "result = backend.execute_lift(ctx, true, post_close_stage, timeout);",
+        "#if 0\nresult = backend.execute_lift(ctx, true, post_close_stage, timeout);\n#endif",
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_SCENE_OWNERSHIP_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("must not contain conditional-preprocessor" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_clean_planning_scene_string_spoof_fails(tmp_path):
+    """A 'return' string literal before the hardware cleanup in the Sim branch
+    must not satisfy the early-return binding (it is sanitized)."""
+    mutated = DEFAULT_PACKAGE_UTILS_CPP.replace(
+        "    return;\n",
+        '    ROS_INFO("sim return early");\n    applyPlanningScene(planning_scene_msg);\n',
+    )
+    assert mutated != DEFAULT_PACKAGE_UTILS_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_PACKAGE_UTILS_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+
+
+def test_clean_planning_scene_if0_spoof_fails(tmp_path):
+    """A dead #if 0 block carrying the SimOmpl early return must not satisfy the
+    early-return binding (the whole load-bearing body is rejected)."""
+    mutated = DEFAULT_PACKAGE_UTILS_CPP.replace(
+        "  if (execution_profile_ == ExecutionProfile::SimOmpl) {\n    if (keepout_enabled_.load()) apply_floor_keepout(true);\n    return;\n  }\n",
+        "  #if 0\n  if (execution_profile_ == ExecutionProfile::SimOmpl) {\n    return;\n  }\n  #endif\n",
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_PACKAGE_UTILS_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+
+
+def test_move_straight_required_assignment_moved_fails(tmp_path):
+    """The avoid_collisions assignment must live in GraspNode::move_straight's
+    own body; moving it to a helper function must not satisfy the binding."""
+    mutated = DEFAULT_PICK_AND_PLACE_CPP.replace(
+        "  request.avoid_collisions = avoid_collisions;\n",
+        "  forward_avoid_collisions(request, avoid_collisions);\n",
+    ) + """
+void forward_avoid_collisions(moveit_msgs::srv::GetCartesianPath::Request &request, bool avoid_collisions) {
+  request.avoid_collisions = avoid_collisions;
+}
+"""
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_PICK_AND_PLACE_CPP_REL: mutated})
+    assert not _check(report, "scene-and-collision-safety").passed
+    assert any("avoid_collisions" in reason for reason in _check(report, "scene-and-collision-safety").reasons)
+
+
+def test_missing_destructor_state_validity_reset_fails(tmp_path):
+    """The destructor body must reset the state-validity client; removing that
+    reset from the actual destructor fails the structural binding."""
+    mutated = DEFAULT_PICK_AND_PLACE_CPP.replace("  check_state_validity_client_.reset();\n", "")
+    assert mutated != DEFAULT_PICK_AND_PLACE_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_PICK_AND_PLACE_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("state-validity client" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_destructor_shutdown_string_spoof_fails(tmp_path):
+    """The destructor's motion_runtime_.shutdown(...) must be executable code;
+    a string literal in the destructor body must not satisfy the binding."""
+    mutated = DEFAULT_PICK_AND_PLACE_CPP.replace(
+        "  motion_runtime_.shutdown(shutdown_deadline);\n",
+        '  const char *spoof = "motion_runtime_.shutdown(shutdown_deadline);";\n',
+    )
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_PICK_AND_PLACE_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("motion_runtime_.shutdown" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_builder_missing_required_field_fails(tmp_path):
+    """One builder missing a required result field fails its schema binding
+    (the write in a different builder does not count)."""
+    mutated = DEFAULT_ACTION_EXECUTION_CPP.replace(
+        "void make_fold_result(Result *result, ResultStatus status, int16_t stage, std::string message) {\n  result->success = status == ResultStatus::Success;\n  result->stage = status == ResultStatus::Success ? 0 : stage;\n  result->status = static_cast<int16_t>(status);\n  result->error_msg = std::move(message);\n}",
+        "void make_fold_result(Result *result, ResultStatus status, int16_t stage, std::string message) {\n  result->success = status == ResultStatus::Success;\n  result->status = static_cast<int16_t>(status);\n}",
+    )
+    assert mutated != DEFAULT_ACTION_EXECUTION_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_EXECUTION_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("make_fold_result" in reason and "error_msg" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_builder_required_field_moved_to_helper_fails(tmp_path):
+    """A required result-field write moved out of the builder into a shared
+    helper must not satisfy the builder's schema binding."""
+    mutated = DEFAULT_ACTION_EXECUTION_CPP.replace(
+        "void make_cartesian_result(Result *result, ResultStatus status, int16_t stage, std::string message) {\n  result->success = status == ResultStatus::Success;\n  result->stage = status == ResultStatus::Success ? 0 : stage;\n  result->status = static_cast<int16_t>(status);\n  result->error_msg = std::move(message);\n}",
+        "void make_cartesian_result(Result *result, ResultStatus status, int16_t stage, std::string message) {\n  write_task_result(result, status, stage, std::move(message));\n}",
+    )
+    assert mutated != DEFAULT_ACTION_EXECUTION_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_EXECUTION_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("make_cartesian_result" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_missing_coordinator_worker_join_fails(tmp_path):
+    """The coordinator must join the per-transaction worker; dropping the join
+    from coordinator_main fails the managed-runtime binding."""
+    mutated = DEFAULT_ACTION_RUNTIME_CPP.replace(
+        "    if (transaction->worker.joinable()) transaction->worker.join();\n",
+        "    (void)transaction;\n",
+    )
+    assert mutated != DEFAULT_ACTION_RUNTIME_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_RUNTIME_CPP_REL: mutated})
+    assert not _check(report, "action-lifecycle").passed
+    assert any("coordinator_main" in reason for reason in _check(report, "action-lifecycle").reasons)
+
+
+def test_detach_string_literal_spoof_passes(tmp_path):
+    """A .detach() inside a string literal is sanitized and must NOT trip the
+    forbidden-token scan (literals cannot satisfy or trigger semantic checks)."""
+    mutated = DEFAULT_ACTION_RUNTIME_CPP.replace(
+        "    if (transaction->worker.joinable()) transaction->worker.join();\n",
+        '    const char *spoof = "std::thread().detach();";\n    if (transaction->worker.joinable()) transaction->worker.join();\n',
+    )
+    assert mutated != DEFAULT_ACTION_RUNTIME_CPP
+    report, _ = _run_static_fixture(tmp_path, production_file_overrides={PROD_ACTION_RUNTIME_CPP_REL: mutated})
+    assert _check(report, "action-lifecycle").passed
+
+
+# ---------------------------------------------------------------------------
 # F2 fixture ownership mutations
 # ---------------------------------------------------------------------------
 def test_non_integrated_scenario_coexists_without_failure(tmp_path):
@@ -1056,6 +1431,50 @@ def test_extra_configured_scenario_fails(tmp_path):
         config=config,
     )
     assert any("exactly 17" in reason for reason in _check(report, "fixture-ownership").reasons)
+
+
+def test_overlay_scenario_set_missing_fails(tmp_path):
+    """F2.3: a configured C/D/E scenario absent from the overlay scenarios map
+    fails the exact set symmetry."""
+    report, fixture = _run_static_fixture(tmp_path)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    del overlay["scenarios"]["qualification-pick-place-positive"]
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "fixture-ownership").passed
+    assert any("missing:" in reason for reason in _check(report, "fixture-ownership").reasons)
+
+
+def test_overlay_scenario_set_extra_fails(tmp_path):
+    """F2.3: an overlay scenario entry that is not configured fails the exact
+    set symmetry before per-scenario comparison."""
+    report, fixture = _run_static_fixture(tmp_path)
+    overlay = _read_json(fixture.simulator_root / "integration/ompl-overlay-contract.json")
+    overlay["scenarios"]["qualification-overlay-extra"] = {
+        "scenario_declaration_sha256": "0" * 64,
+        "planning_scene": {
+            "owned_ids": ["sim_fixture/extra"],
+            "revision": "extra-revision",
+            "revision_digest": "1" * 64,
+            "frame_id": "base_link",
+            "target_source_id": "sim_fixture/extra",
+            "target_handoff": "pick_and_place/object_mesh",
+        },
+    }
+    _write_json_canonical(fixture.simulator_root / "integration/ompl-overlay-contract.json", overlay)
+    report = validate_static_contracts(
+        simulator_root=fixture.simulator_root,
+        production_root=fixture.production_root,
+        source_lock_manifest=fixture.source_lock_manifest,
+        config=fixture.config,
+    )
+    assert not _check(report, "fixture-ownership").passed
+    assert any("extra:" in reason for reason in _check(report, "fixture-ownership").reasons)
 
 
 def test_ownership_drift_fails(tmp_path):
