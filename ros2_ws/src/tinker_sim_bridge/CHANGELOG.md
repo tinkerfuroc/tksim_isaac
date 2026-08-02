@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Task 8 fix round 3: lock clean-checkout acceptance coverage)
+
+- The clean-checkout regression seam now locks the exact executed suite and
+  skip set, not just the exit code: it collects the exact 64-node
+  `Task8OMPLOverlayProvenanceTest` class in the clone (canonical SHA-256 over
+  the JSON-canonical sorted node list, so a deleted/added test fails even when
+  the count is preserved) and executes it under a machine-readable pytest JUnit
+  XML, asserting total=64, failures=0, errors=0, skipped=4, the exact four
+  host-runtime diagnostic skip names, and their reason categories — an
+  unrelated static assertion broadened into a skip is rejected.  An inline
+  mutation self-check demonstrates a changed node-set hash or skip set is
+  rejected.
+- The reconstructed Task 3 project root now materializes its
+  `tools/tinker_sim_deploy` resolver from immutable git objects at the recorded
+  simulator implementation identity (`git ls-tree` + `git show <commit>:<path>`),
+  never from the live working tree; a dirty live-tree resolver edit is proven
+  not to affect the reconstruction, and a pinned-blob mismatch/missing file
+  fails closed.
+- `fixture_contract.status_publication.fields` is asserted against an
+  independently documented 12-field literal (canonical order/encoding), with the
+  Task 5 function's own key set validated separately so a coordinated
+  source+contract key-set change fails.
+- A stale `current.json` selector is proven to fail the reconstructed preflight
+  `artifact_identity` check (absent selector -> `not_provisioned`; present/
+  matching -> pass; present/stale -> fail).
+
 ### Added (Task 8 fix round 2: separate static and runtime OMPL evidence)
 
 - The 16-check preflight is now self-contained on a clean checkout: the

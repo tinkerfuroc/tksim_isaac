@@ -579,7 +579,14 @@ provisioned-host runtime-readiness diagnostic (stale selection fails; absent
 selection is reported `not_provisioned`).  A temporary copy-install/wheel test
 proves the symlinked acceptance contract and scenarios install as real
 byte-identical files, and a clean-checkout regression seam (`git clone` of the
-tracked tree) requires every static test to pass with no gitignored trees.  The
+tracked tree) collects the exact 64-node `Task8OMPLOverlayProvenanceTest` class
+(canonical node-set SHA-256, so a deleted/added test fails even at a preserved
+count) and executes it under a machine-readable JUnit XML, requiring total=64,
+failures=0, errors=0, skipped=4, the exact four host-runtime diagnostic skips,
+and their reason categories.  The reconstructed `tools/tinker_sim_deploy`
+resolver is materialized from immutable git objects at the recorded simulator
+implementation identity (never the live working tree), and the fixture status
+field contract is asserted against an independent 12-field literal.  The
 pre-existing uv environment provenance failure (installed `uv 0.12.0` vs pinned
 `uv 0.10.8`) is unchanged and is not masked: it is an environment failure, not a
 code failure.

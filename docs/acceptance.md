@@ -117,8 +117,17 @@ or authorize cuMotion; live qualification remains a separate gate.
   action-client scope, task-range boundary/commits, fixture status
   publication, artifact path policy, model-bundle source evidence, top-level
   stable hashes, stale current selection).  A clean-checkout regression seam
-  (`git clone` of the tracked tree) requires every static test to pass with no
-  gitignored trees.  The pre-existing uv environment provenance failure
+  (`git clone` of the tracked tree) collects the exact 64-node
+  `Task8OMPLOverlayProvenanceTest` class (canonical node-set SHA-256, so a
+  deleted/added test fails even at a preserved count) and executes it under a
+  machine-readable JUnit XML, requiring total=64, failures=0, errors=0,
+  skipped=4, the exact four host-runtime diagnostic skips, and their reason
+  categories — a static assertion broadened into a skip is rejected.  The
+  reconstructed `tools/tinker_sim_deploy` resolver is materialized from
+  immutable git objects at the recorded simulator implementation identity
+  (never the live working tree), and the fixture status field contract is
+  asserted against an independent 12-field literal.  The pre-existing uv
+  environment provenance failure
   (installed `uv 0.12.0` vs pinned `uv 0.10.8`) is an environment failure, not
   a code failure.  The focused invocation uses `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
   (ROS plugin discovery may auto-load `launch_pytest`, which can fail on hosts
