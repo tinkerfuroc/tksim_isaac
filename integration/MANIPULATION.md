@@ -363,6 +363,31 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 5 —
+  "harden final trajectory digest test"): Closed the last remaining D-side
+  digest-padding flake path in the sourced-Humble acceptance suite.
+  `test_executor_execute_uuid_mismatch_cleans_up_accepted_handle` is the only
+  `run_execute_sequence` caller that reached the executor's own planned/
+  executed CDR-digest comparison (`planned_digest_before` vs
+  `executed_digest_after` in `run_execute_sequence`) without the F4.2
+  deterministic serializer seam; it now installs the same test-local
+  `_install_deterministic_serialize` seam so the canonical planned trajectory is
+  serialized exactly once at setup and that byte/digest snapshot is reused for
+  every digest computed inside the run window (plan, executed, FJT-join) and the
+  provider's FJT evidence.  The test's UUID-mismatch purpose is preserved
+  verbatim: the accepted ExecuteTrajectory handle has an invalid/UUID-identity
+  mismatch, exactly one bounded cleanup attempt is made, and the final
+  `execute_error` is the UUID reason — never a digest mismatch.  The actual
+  sent `ExecuteTrajectory.Goal.trajectory` is now asserted semantically
+  field-by-field against the setup snapshot
+  (`_robot_trajectories_equivalent`).  A complete caller audit confirms every
+  `run_execute_sequence` call in the Humble module is either seam-hardened or
+  provably returns before the digest comparison (`fjt_transaction_provider is
+  None` and `_acquire_scene` no-planning-scene negatives fail closed with zero
+  goals, so they cannot reach the digest line).  Production serializer/digest
+  code is unchanged, the digest checks are not weakened, and the raw serialized
+  bytes are never altered, so Gate D/E runtime semantics are unaffected.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 4 —
   "preserve Gate E downgrade truth"): Preserved controller truth through the E
   fail-dominant downgrade path and eliminated the load-sensitive rclpy CDR-
