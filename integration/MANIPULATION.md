@@ -363,6 +363,57 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 3 —
+  "make Gate E temporal evidence deterministic"): Made the flagship Gate-E
+  temporal proofs deterministic and sealed the fresh-replay and controller-truth
+  gaps, preserving every review-clean F1/F2 behavior.  F3.1 — every flagship
+  ordering/race/negative test is now event-driven: `threading.Event` barriers
+  gate the approach/transport/Place evidence injections strictly after the
+  executor's observable state (goal acceptance + baseline capture, lift latch,
+  Place baseline, exact Place cancel terminal) and the delayed Pick-result future
+  is Event-released only after the transport latch; fixed `threading.Timer`
+  offsets and `time.sleep` event-order margins are gone, and the "late"
+  receipt-window negatives pin the FJT `received_mono` strictly beyond the 2.0 s
+  boundary.  F3.2 — occupied-place requires a STRICTLY fresh post-cancel
+  PlanningScene observation (sequence strictly greater than the pre-cancel
+  baseline AND receipt time after the exact cancel terminal); timeout, unchanged
+  sequence, malformed/provider-error newer scene, or detached target is
+  `evidence-invalid`, with baseline/post-cancel sequence, receipt delta,
+  attachment state, and reason recorded in the trigger and durable artifacts.
+  F3.3 — controller traffic is derived ONLY from observed FJT evidence:
+  `controller_goal_sent` is true only when an actual FJT transaction/status/UUID
+  was observed, `controller_endpoint` is None when no FJT was observed, no-goal
+  cleanup is `None` (never `{}`), and accepting/canceling a task goal or
+  attempting task-goal cleanup never implies a controller goal; the truth is
+  preserved consistently in returned records, `integrated-execution.jsonl/.json`,
+  `controller-results.jsonl`, `moveit-plans.jsonl`, and goal artifacts.  F3.4 —
+  the dead reason-collapsing `_e_post_grasp_lift_m()` helper is deleted (the
+  detailed provider reason map stays in `_e_prepare`).  Humble suite 160, pure
+  suite 126.
+
+  **Live orchestrator latency obligations (Task 8/10).**  Gate E intentionally
+  fails `evidence-invalid` when a live MoveIt/supervisor latency exceeds these
+  fixed budgets; Task 8/10 live evidence decides whether a later reviewed config
+  change is needed (Task 6 changes no thresholds):
+
+  - `E_FJT_CORRELATION_TIMEOUT_S == 2.0` bounds every FJT receipt window
+    (approach vs goal-acceptance baseline, transport vs lift-latch boundary,
+    Place target-motion vs Place acceptance baseline).  The executor polls the
+    injected FJT status stream at ~spin frequency; the live controller's
+    ExecuteTrajectory status must reach the FJT status topic within 2.0 s of the
+    corresponding task boundary or the attempt fails closed.  The observed FJT
+    `goal_uuid` is recorded as evidence and is never claimed to equal the
+    internal Pick/Place `ExecuteTrajectory` goal UUID.
+  - The safety-stop observation window (`safety_stop_wait_s`) bounds how long
+    the executor waits for the operator assert publication to produce an
+    effective stop before the safety-transport run fails closed.
+  - The fresh post-cancel PlanningScene obligation requires the scene stream
+    (or a fresh-scene service seam) to publish a STRICTLY newer scene after the
+    exact Place cancel terminal; the executor waits `post_cancel_scene_wait_s`
+    (default 2.0 s).  The live orchestrator must ensure the scene stream keeps
+    publishing after a cancel so the post-cancel attachment re-observation is a
+    genuinely fresh observation, not the last cached pre-cancel scene.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 2 —
   "seal Gate E runtime contracts"): Resolved the full F2.1-F2.8 consolidated
   findings.  F2.1 — Gate E now preserves the 10 cm physical threshold: every E

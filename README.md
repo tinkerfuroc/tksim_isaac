@@ -314,6 +314,45 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 3 —
+  "make Gate E temporal evidence deterministic"): Resolved the F3.1-F3.5
+  consolidated findings in the Stage-E path, preserving every review-clean
+  F1/F2 behavior.  F3.1 — every flagship E ordering/race/negative proof is now
+  event-driven: `threading.Event` barriers gate the approach/transport/Place
+  evidence injections strictly after the executor's corresponding observable
+  state (goal acceptance + baseline capture, lift latch, Place baseline, exact
+  Place cancel terminal), and the delayed Pick-result future is Event-released
+  only after the transport latch.  Fixed `threading.Timer` offsets and
+  `time.sleep` event-order margins are gone; the runner-level receipt-window
+  "late" negatives pin the FJT `received_mono` strictly beyond the 2.0 s
+  `E_FJT_CORRELATION_TIMEOUT_S` boundary and the settled-post-result negative
+  seeds the transport FJT only after the bounded wait returns.  F3.2 —
+  occupied-place now requires a STRICTLY fresh post-cancel PlanningScene
+  observation: the runner records the pre-cancel `scene_sequence` + receipt,
+  boundedly waits for a valid scene with `scene_sequence` strictly greater than
+  the baseline AND a receipt time after the exact cancel terminal, and only that
+  fresh scene may establish `post_cancel_target_attached=true`.  Timeout,
+  unchanged sequence, malformed/provider-error newer scene, or detached target
+  is `evidence-invalid`; baseline/post-cancel sequence, receipt delta,
+  attachment state, and reason are recorded in the trigger and durable
+  artifacts.  F3.3 — controller traffic is derived ONLY from observed FJT
+  evidence: `controller_goal_sent` is true only when an actual FJT
+  transaction/status/UUID was observed, `controller_endpoint` is None when no
+  FJT was observed, no-goal cleanup is `None` (never `{}`), and accepting/
+  canceling a task goal or attempting task-goal cleanup never implies a
+  controller goal.  The truth is preserved consistently in returned records,
+  `integrated-execution.jsonl/.json`, `controller-results.jsonl`,
+  `moveit-plans.jsonl`, and goal artifacts.  F3.4 — the dead reason-collapsing
+  `_e_post_grasp_lift_m()` helper is deleted (the detailed provider reason map
+  stays in `_e_prepare`), and `integration/MANIPULATION.md` now carries the
+  live-orchestrator latency obligation for `E_FJT_CORRELATION_TIMEOUT_S=2.0`,
+  the safety-stop observation window, and fresh post-cancel PlanningScene
+  publication/service latency.  Humble suite grows to 160 tests (pure suite
+  stays 126); every ordering/race negative is barrier-bounded, and the full
+  sourced-Humble suite passes 10 consecutive fresh clean processes with the
+  flagship temporal subset passing 20 consecutive clean iterations.  No build
+  or live run is required.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 2 —
   "seal Gate E runtime contracts"): Resolved the full F2.1-F2.8 consolidated
   SPEC/QUALITY findings in the Stage-E path.  F2.1 — the 10 cm physical
