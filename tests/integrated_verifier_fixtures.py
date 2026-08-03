@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 from qualification_test_helpers import load_test_scenario  # noqa: E402
 from validation.integrated_gate_executor import (  # noqa: E402
     EXECUTE_STATUS_CANCELED,
+    EXECUTE_STATUS_SUCCEEDED,
     FJT_ENDPOINT,
     GRIPPER_ENDPOINT,
     Q_OUTBOUND,
@@ -342,15 +343,34 @@ def _state_at(
             state["command_joints"] = [0.0] * 7 + [0.0]
         return state
     if kind == "cancel":
+        # F2.1: the pass fixture carries a production-real deceleration ramp
+        # after cancel-requested, settling to rest exactly at quiescent with at
+        # least two settled tail frames (quiescent-1 velocity 0.0025, quiescent
+        # velocity 0), not an instant freeze at the cancel frame.
         start = fi.get("execution-start", 20)
         cancel = fi.get("cancel-requested", 40)
-        if cancel <= index:
-            # Frozen at the cancel position; zero velocity.
-            state["joints"] = [0.12, -0.12, 0.10, 0.20, -0.10, 0.12, 0.10, 0.0]
-            state["command_joints"] = [0.12, -0.12, 0.10, 0.20, -0.10, 0.12, 0.10, 0.0]
+        quiescent = fi.get("quiescent", 60)
+        base = [0.12, -0.12, 0.10, 0.20, -0.10, 0.12, 0.10]
+        if index >= quiescent:
+            # Settled at the braking endpoint; zero velocity.
+            n = max(1, quiescent - cancel)
+            disp = 0.05 * (1.0 / PHYSICS_HZ) * n * 0.5
+            joints = [round(value + disp, 6) for value in base]
+            state["joints"] = joints + [0.0]
+            state["command_joints"] = base + [0.0]
+        elif index >= cancel:
+            # Linear deceleration ramp from the cancel peak to rest at quiescent.
+            n = max(1, quiescent - cancel)
+            frac = _clamp((index - cancel) / n, 0.0, 1.0)
+            velocity = round(0.05 * (1.0 - frac), 6)
+            disp = 0.05 * (1.0 / PHYSICS_HZ) * n * (frac - 0.5 * frac * frac)
+            joints = [round(value + disp, 6) for value in base]
+            state["joints"] = joints + [0.0]
+            state["command_joints"] = base + [0.0]
+            state["velocities"] = [velocity] * 7 + [0.0]
         elif index >= start:
             frac = _clamp((index - start) / max(1, cancel - start), 0.0, 1.0)
-            joints = [round(value * frac, 6) for value in (0.12, -0.12, 0.10, 0.20, -0.10, 0.12, 0.10)]
+            joints = [round(value * frac, 6) for value in base]
             state["joints"] = joints + [0.0]
             state["command_joints"] = joints + [0.0]
             state["velocities"] = [0.05] * 7 + [0.0]
@@ -447,6 +467,19 @@ def _e_state_at(kind: str, fi: Mapping[str, int], index: int) -> dict[str, Any]:
         state["contacts"] = _fingers_contacts()
     else:
         state["contacts"] = []
+
+    # F2.1: E cancel-transport carries a production-real arm deceleration ramp
+    # after cancel-requested, settling to rest exactly at quiescent (at least
+    # two settled tail frames).  The joint-velocity profile mirrors the D cancel
+    # ramp; only no_post_cancel_stage observes joint velocity, so no other
+    # cancel-transport predicate is affected.
+    if kind == "cancel-transport":
+        cancel = fi.get("cancel-requested")
+        quiescent = fi.get("quiescent")
+        if cancel is not None and quiescent is not None and cancel <= index < quiescent:
+            frac = _clamp((index - cancel) / max(1, quiescent - cancel), 0.0, 1.0)
+            velocity = round(0.05 * (1.0 - frac), 6)
+            state["velocities"] = [velocity] * 7 + [0.0]
     return state
 
 
@@ -1562,7 +1595,9 @@ def _apply_overrides(
                     frame["robot"]["joint_positions"] = joints
                     frame["robot"]["joint_velocities"] = [0.02] * 8
 
-    # post_clear_resume=True (E safety-transport): motion after operator-clear.
+    # post_clear_resume=True (E safety-transport): a NEW command target/goal
+    # after operator-clear, with measured motion (F2.1 item 5).  Merely
+    # observing the pre-existing command's deceleration is not a resume.
     if overrides.get("post_clear_resume") is True:
         clear_key = next(
             (int(record["frame_index"]) for record in journal if record["event"] == "operator-clear"),
@@ -1572,6 +1607,11 @@ def _apply_overrides(
             for frame in raw:
                 if int(frame["frame_index"]) <= clear_key:
                     continue
+                targets = frame.get("command_targets", {})
+                positions = list(targets.get("joint_positions", [0.0] * 8))
+                if len(positions) >= 8:
+                    positions[0] += 0.02
+                    targets["joint_positions"] = positions
                 joints = list(frame["robot"]["joint_positions"])
                 if len(joints) >= 8:
                     joints[0] += 0.02
@@ -1751,6 +1791,170 @@ def _apply_overrides(
                         joints[0] += 0.05
                         frame["robot"]["joint_positions"] = joints
                         frame["robot"]["joint_velocities"] = [0.05] * 8
+
+    # --- Fix-round 2 fault injections (F2.1-F2.5) ----------------------------
+
+    # cancel_ramp_not_settled=True: the braking ramp does NOT settle by
+    # quiescent (tail velocity stays above safety_stop_velocity_rad_s) -> the
+    # terminal-quiescence tail fails on D cancel / E cancel-transport (F2.1).
+    if overrides.get("cancel_ramp_not_settled") is True:
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        if quiescent_key is not None:
+            for frame in raw:
+                if int(frame["frame_index"]) == quiescent_key:
+                    frame["robot"]["joint_velocities"] = [0.05] * 8
+
+    # cancel_target_change=True: a NEW command target/goal appears midway
+    # between cancel and quiescent -> the subwindow target-stability check fails
+    # even though the velocity later settles (F2.1 item 3).
+    if overrides.get("cancel_target_change") is True:
+        cancel_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "cancel-requested"),
+            None,
+        )
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        if cancel_key is not None and quiescent_key is not None:
+            midpoint = (cancel_key + quiescent_key) // 2
+            for frame in raw:
+                if int(frame["frame_index"]) < midpoint:
+                    continue
+                targets = frame.get("command_targets", {})
+                positions = list(targets.get("joint_positions", [0.0] * 8))
+                if len(positions) >= 8:
+                    positions[0] += 0.05
+                    targets["joint_positions"] = positions
+
+    # safety_braking_ramp=True (D safety): a small production-real deceleration
+    # ramp after effective-stop that stays within safety_position_creep_rad.
+    # Determines truthfully whether the existing safety contract passes (F2.1
+    # item 6) — do not silently weaken the creep bound.
+    if overrides.get("safety_braking_ramp") is True:
+        effective_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "effective-stop"),
+            None,
+        )
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        if effective_key is not None and quiescent_key is not None:
+            n = max(1, quiescent_key - effective_key)
+            for frame in raw:
+                idx = int(frame["frame_index"])
+                if effective_key <= idx < quiescent_key:
+                    frac = _clamp((idx - effective_key) / n, 0.0, 1.0)
+                    velocity = round(0.05 * (1.0 - frac), 6)
+                    frame["robot"]["joint_velocities"] = [velocity] * 8
+                    joints = list(frame["robot"]["joint_positions"])
+                    if len(joints) >= 8:
+                        joints[0] += round(0.004 * frac, 6)
+                        frame["robot"]["joint_positions"] = joints
+
+    # safety_braking_ramp_large=True (D safety): the same ramp with a position
+    # drift above safety_position_creep_rad -> target_frozen fails truthfully.
+    if overrides.get("safety_braking_ramp_large") is True:
+        effective_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "effective-stop"),
+            None,
+        )
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        if effective_key is not None and quiescent_key is not None:
+            n = max(1, quiescent_key - effective_key)
+            for frame in raw:
+                idx = int(frame["frame_index"])
+                if effective_key <= idx < quiescent_key:
+                    frac = _clamp((idx - effective_key) / n, 0.0, 1.0)
+                    velocity = round(0.05 * (1.0 - frac), 6)
+                    frame["robot"]["joint_velocities"] = [velocity] * 8
+                    joints = list(frame["robot"]["joint_positions"])
+                    if len(joints) >= 8:
+                        joints[0] += round(0.012 * frac, 6)
+                        frame["robot"]["joint_positions"] = joints
+
+    # safety_transport_ramp=True (E safety-transport): a production-real braking
+    # ramp from the transport velocity down to rest at quiescent.  The
+    # terminal-quiescence tail (no_post_clear_resume) settles and does NOT
+    # false-fail on the ramp, while the strict safety_stop_frames
+    # velocity_below_stop_limit truthfully fails because the velocity at
+    # effective-stop (0.05) is above safety_stop_velocity_rad_s.
+    if overrides.get("safety_transport_ramp") is True:
+        effective_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "effective-stop"),
+            None,
+        )
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        transport_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "transport"),
+            None,
+        )
+        if effective_key is not None and quiescent_key is not None:
+            n = max(1, quiescent_key - effective_key)
+            for frame in raw:
+                idx = int(frame["frame_index"])
+                if transport_key is not None and transport_key <= idx < effective_key:
+                    frame["robot"]["joint_velocities"] = [0.05] * 8
+                elif effective_key <= idx < quiescent_key:
+                    frac = _clamp((idx - effective_key) / n, 0.0, 1.0)
+                    velocity = round(0.05 * (1.0 - frac), 6)
+                    frame["robot"]["joint_velocities"] = [velocity] * 8
+
+    # safety_terminal_success=True (D safety): terminal claims success while a
+    # physical safety stop occurred -> safety_terminal_non_success fails.
+    if overrides.get("safety_terminal_success") is True:
+        exec_json["terminal_status"] = "succeeded"
+        exec_json["execute_result_status"] = EXECUTE_STATUS_SUCCEEDED
+        exec_json["execute_result_status_string"] = "succeeded"
+        for row in controller_out:
+            row["terminal_status"] = "succeeded"
+            row["execute_result_status"] = EXECUTE_STATUS_SUCCEEDED
+            row["execute_result_status_string"] = "succeeded"
+
+    # safety_terminal_contradiction=True (D safety): terminal_status claims
+    # success but the GoalStatus is ABORTED -> evidence-invalid (F2.3).
+    if overrides.get("safety_terminal_contradiction") is True:
+        exec_json["terminal_status"] = "succeeded"
+        exec_json["execute_result_status"] = 6
+        exec_json["execute_result_status_string"] = "aborted"
+        for row in controller_out:
+            row["terminal_status"] = "succeeded"
+            row["execute_result_status"] = 6
+            row["execute_result_status_string"] = "aborted"
+
+    # env_cloud_taint=True: env_cloud_evidence.source carries a forbidden token
+    # (unpaired) -> fails because it carries the token, not because it is absent
+    # from the endpoint-provider node allowlist (F2.2).
+    if overrides.get("env_cloud_taint") is True:
+        if isinstance(exec_json.get("env_cloud_evidence"), Mapping):
+            exec_json["env_cloud_evidence"]["source"] = "cuMotion-provider"
+
+    # goal_kind_taint=True: goal_kind (a committed provider/goal field) carries
+    # a forbidden token (F2.2) -> evidence-invalid.
+    if overrides.get("goal_kind_taint") is True:
+        exec_json["goal_kind"] = "cuMotion-grasp"
+        for row in plans_out:
+            row["goal_kind"] = "cuMotion-grasp"
+        for row in exec_jsonl:
+            row["goal_kind"] = "cuMotion-grasp"
+
+    # pipeline_ompl_uppercase=True: pipeline_id case variant (F2.2).  Exact
+    # lowercase ``"ompl"`` is canonical identity strictness, deliberately not
+    # normalized; the case variant is evidence-invalid.
+    if overrides.get("pipeline_ompl_uppercase") is True:
+        exec_json.setdefault("goal", {})["pipeline_id"] = "OMPL"
+        for row in plans_out:
+            row["pipeline_id"] = "OMPL"
 
     # Return every artifact so override mutations reach the written files.
     return raw, sync_evaluator(), journal_out, exec_jsonl, exec_json, plans_out, controller_out

@@ -245,18 +245,33 @@ _ARM_CONTACT_BODIES = tuple(f"link{index}" for index in range(1, 8))
 _GRASP_CONTACT_BODIES = ("left_finger", "right_finger", "link_tcp")
 _ROBOT_CONTACT_BODIES = frozenset(_ARM_CONTACT_BODIES) | frozenset(_GRASP_CONTACT_BODIES)
 
-#: Production raw-truth object id candidates for the task target.  The backend
-#: emits the full ``sim_fixture/`` namespace (``_expected_scenario_objects``
-#: uses ``record["id"]`` verbatim); the core ``_object`` helper defaults to the
-#: bare ``qualification_cube`` id.  Resolve either form so live E attempts and
-#: the synthetic fixtures both verify.
-_OBJECT_ID_CANDIDATES = ("sim_fixture/qualification_cube", "qualification_cube")
+#: Raw backend-emitted object id for the task target.  The backend
+#: ``_expected_scenario_objects`` uses ``record["id"]`` verbatim and every E
+#: scenario declares the bare ``qualification_cube`` id (``sim_fixture/`` is the
+#: planning-scene declaration domain, not the raw physics domain).  Only the
+#: bare id is accepted as raw measured target identity (F2.5).
+_OBJECT_ID_CANDIDATES = ("qualification_cube",)
+
+#: Committed semantic provenance values that are not endpoint provider metadata
+#: (F1.3/F2.2).  ``env_cloud_evidence.source == "observed-environment-cloud"``
+#: is the executor's real environment-cloud provenance; it must never be
+#: treated as a forbidden provider token, but any other source value carrying a
+#: forbidden token is rejected.
+_SEMANTIC_SOURCE_PROVENANCE = frozenset({"observed-environment-cloud"})
 
 #: Provider/goal selection fields whose values must never carry a forbidden
-#: token (F1.6).  Deliberately narrow: semantic free-text fields such as
-#: environment-cloud provenance stay out of the scan.
+#: token (F1.6/F2.2).  ``goal_kind`` is persisted by the committed executor in
+#: moveit-plans rows and summaries.  Deliberately narrow: semantic free-text
+#: fields such as environment-cloud provenance stay out of the scan.
 _PROVIDER_KEYS = frozenset(
-    {"pipeline_id", "provider", "execution_profile", "planner_id", "planner_name"}
+    {
+        "pipeline_id",
+        "provider",
+        "execution_profile",
+        "planner_id",
+        "planner_name",
+        "goal_kind",
+    }
 )
 
 
@@ -286,10 +301,11 @@ def _as_timestamp(value: Any, name: str) -> float:
 
 
 def _object_pose_target(frame: Mapping[str, Any]) -> tuple[list[float], list[float], list[float]] | None:
-    """Return the task-target object pose, resolving either id form.
+    """Return the task-target object pose (raw backend id ``qualification_cube``).
 
-    Mirrors ``manipulation_gate_verifier._object_pose`` but accepts the
-    production ``sim_fixture/`` id.  Returns None when the target is absent.
+    Mirrors ``manipulation_gate_verifier._object_pose``.  ``sim_fixture/...``
+    belongs to the planning-scene diagnostic domain and is never a raw object id
+    (F2.5).  Returns None when the target is absent.
     """
     for object_id in _OBJECT_ID_CANDIDATES:
         obj = _object(frame, object_id)
@@ -308,11 +324,6 @@ def _object_pose_target(frame: Mapping[str, Any]) -> tuple[list[float], list[flo
         )
         return position, orientation, velocity
     return None
-
-
-def _target_in_object_ids(object_id: str) -> bool:
-    """True when an object id refers to the qualification cube (either form)."""
-    return object_id in _OBJECT_ID_CANDIDATES
 
 
 def _canonical_json(value: Any) -> str:
@@ -611,13 +622,27 @@ def _integrated_endpoint_validator(
                     reasons.append(
                         f"endpoint {endpoint!r} contains a forbidden token"
                     )
-            # Provider/goal field taint (F1.6).
+            # Provider/goal field taint (F1.6/F2.2).
             for provider in provider_values:
                 if _tainted(provider):
                     reasons.append(
                         f"provider field {provider!r} contains a forbidden token"
                     )
+            # Source/provenance values are scanned for forbidden tokens too,
+            # EXCEPT the committed semantic provenance values that are not
+            # endpoint provider metadata (F2.2).  A source value carrying a
+            # forbidden token fails because it carries the token, not because it
+            # is absent from the endpoint-provider node allowlist.
+            for source in source_values:
+                if source in _SEMANTIC_SOURCE_PROVENANCE:
+                    continue
+                if _tainted(source):
+                    reasons.append(
+                        f"source field {source!r} contains a forbidden token"
+                    )
             # A persisted pipeline_id must be the integrated ompl planner.
+            # F2.2: exact lowercase ``"ompl"`` is canonical identity strictness,
+            # deliberately not normalized; case variants are evidence-invalid.
             for pipeline in pipeline_values:
                 if pipeline != "ompl":
                     reasons.append(
@@ -1259,6 +1284,62 @@ def _max_target_delta(records: Sequence[Mapping[str, Any]]) -> float:
     return maximum
 
 
+def _terminal_quiescence_tail(
+    ctx: Mapping[str, Any],
+    *,
+    end_event: str = "quiescent",
+    tail_size: int = 2,
+) -> list[Mapping[str, Any]]:
+    """Bounded terminal-quiescence tail ending at/including the ``end_event`` key.
+
+    F2.1: terminal quiescence is proven from this bounded tail, never from
+    max-over-the-whole-window (which would reject the arm's real deceleration
+    ramp after ``cancel-requested`` / ``operator-clear``).  Requires at least
+    ``tail_size`` consecutive fresh raw physics frames ending at/including the
+    ``end_event`` join key; missing tail samples are evidence-invalid, not an
+    assumed pass.  The exact frame order/timestamps come from the authoritative
+    window records (already bounded at the Table-1 terminal anchor, so
+    post-terminal drain is structurally excluded).
+    """
+    keys = ctx["event_keys"]
+    if end_event not in keys:
+        raise EvidenceError(
+            f"journal has no {end_event} key for the terminal-quiescence tail"
+        )
+    end_ts = keys[end_event][1]
+    candidates = [
+        record
+        for record in ctx["window_records"]
+        if _record_timestamp(record) <= end_ts
+    ]
+    if len(candidates) < tail_size:
+        raise EvidenceError(
+            f"terminal-quiescence tail needs {tail_size} raw frames ending at "
+            f"{end_event}; got {len(candidates)}"
+        )
+    tail = candidates[-tail_size:]
+    for first, second in zip(tail, tail[1:]):
+        if int(second["frame_index"]) != int(first["frame_index"]) + 1:
+            raise EvidenceError(
+                "terminal-quiescence tail is not consecutive raw frames"
+            )
+    return tail
+
+
+def _terminal_quiescence(
+    ctx: Mapping[str, Any],
+    *,
+    end_event: str = "quiescent",
+) -> tuple[list[Mapping[str, Any]], float, float]:
+    """Resolve the terminal-quiescence tail into (parsed, max_speed, target_delta)."""
+    tail = _terminal_quiescence_tail(ctx, end_event=end_event)
+    tail_parsed = [
+        ctx["parsed_by_frame"][_as_index(r["frame_index"], "tail.frame_index")]
+        for r in tail
+    ]
+    return tail_parsed, _max_arm_speed(tail_parsed), _max_target_delta(tail_parsed)
+
+
 def _gate_d_cancel_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     thresholds = ctx["thresholds"]
     tolerance = thresholds["numeric_tolerance"]
@@ -1277,23 +1358,34 @@ def _gate_d_cancel_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
                  "terminal_status": summary.get("terminal_status")},
         reasons=() if canceled else ("execute goal was not canceled",),
     )
-    # F1.7: every scenario-owned temporal predicate reads only its exact
+    # F1.7/F2.1: every scenario-owned temporal predicate reads only its exact
     # observation subwindow [cancel-requested, quiescent]; motion after
     # quiescent (post-terminal drain before teardown) is never admitted.
+    # Terminal quiescence is proven from a bounded tail ending at the quiescent
+    # join key (at least two consecutive settled frames).  The arm's real
+    # deceleration ramp inside the observation window is allowed — only the tail
+    # must be at rest.  A NEW command target/goal anywhere in the subwindow
+    # (even if the velocity later settles) fails closed.
     sub = _subwindow(ctx, "cancel-requested", "quiescent")
     sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
-    max_speed = _max_arm_speed(sub_parsed) if sub_parsed else 0.0
-    max_target = _max_target_delta(sub_parsed) if sub_parsed else 0.0
+    sub_target = _max_target_delta(sub_parsed)
+    tail_parsed, tail_speed, tail_target = _terminal_quiescence(ctx, end_event="quiescent")
     quiescent_passed = (
-        bool(sub_parsed) and max_speed <= thresholds["safety_stop_velocity_rad_s"]
-        and max_target <= tolerance
+        tail_speed <= thresholds["safety_stop_velocity_rad_s"]
+        and sub_target <= tolerance
     )
     quiescent_check = _mk_check(
         "quiescent_after_cancel",
         quiescent_passed,
-        metrics={"max_joint_speed_rad_s": max_speed, "max_target_delta_rad": max_target},
-        reasons=() if quiescent_passed else ("arm not quiescent after cancel",),
-        frames=[int(p["frame_index"]) for p in sub_parsed],
+        metrics={
+            "tail_joint_speed_rad_s": tail_speed,
+            "subwindow_target_delta_rad": sub_target,
+            "tail_frame_count": len(tail_parsed),
+        },
+        reasons=() if quiescent_passed else (
+            "arm not quiescent at the cancel tail or a new command target appeared",
+        ),
+        frames=[int(p["frame_index"]) for p in tail_parsed],
     )
     keys = ctx["event_keys"]
     cancel_key = keys.get("cancel-requested", (0, 0))
@@ -1302,12 +1394,22 @@ def _gate_d_cancel_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
         for event in keys
         if keys[event][0] > cancel_key[0]
     )
-    no_later_passed = not later_stage
+    # F2.1 item 4: no_later_stage forbids later journal stages AND requires the
+    # same terminal-quiescence tail (rest + no new command target in the
+    # subwindow); it never requires <= numeric_tolerance velocity over the
+    # entire braking interval.
+    no_later_passed = (not later_stage) and quiescent_passed
     no_later_check = _mk_check(
         "no_later_stage",
         no_later_passed,
-        metrics={"later_stage": later_stage},
-        reasons=() if no_later_passed else ("cancel was followed by a later stage",),
+        metrics={
+            "later_stage": later_stage,
+            "tail_joint_speed_rad_s": tail_speed,
+            "subwindow_target_delta_rad": sub_target,
+        },
+        reasons=() if no_later_passed else (
+            "cancel was followed by a later stage or the cancel tail is not quiescent",
+        ),
     )
     return [cancel_check, quiescent_check, no_later_check]
 
@@ -1391,7 +1493,20 @@ def _gate_d_safety_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
         metrics={"auto_resume": auto_resume},
         reasons=() if not auto_resume else ("arm auto-resumed after operator-clear",),
     )
-    return [stop_check, frozen_check, no_resume_check]
+
+    # F2.3: the safety terminal must be a consistent non-success across every
+    # present real status domain (GoalStatus + task Result kept separate).
+    # ``_terminal_non_success`` raises EvidenceError on a contradictory pair
+    # (-> evidence-invalid); a terminal claiming success fails the safety check.
+    safety_terminal_ok = _terminal_non_success(summary)
+    terminal_check = _mk_check(
+        "safety_terminal_non_success",
+        safety_terminal_ok,
+        metrics={"terminal_status": summary.get("terminal_status"),
+                 "execute_result_status": summary.get("execute_result_status")},
+        reasons=() if safety_terminal_ok else ("safety terminal was success",),
+    )
+    return [stop_check, frozen_check, no_resume_check, terminal_check]
 
 
 # --- Gate E positive ------------------------------------------------------ #
@@ -1747,12 +1862,14 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
         return _mk_check(token, passed, metrics={"scene_attach": attach_key, "cancel": cancel_key},
                          reasons=() if passed else ("scene-attach did not precede cancel",))
     if token == "no_post_cancel_stage":
-        # F1.7: the check reads only the [cancel-requested, quiescent] subwindow.
-        # Journal events after cancel-requested are scanned for later-stage
-        # leaks; fresh motion is scanned strictly inside the subwindow.  Motion
-        # after quiescent (post-terminal drain) is never admitted.
+        # F1.7/F2.1: the check reads only the [cancel-requested, quiescent]
+        # subwindow.  Journal events after cancel-requested are scanned for
+        # later-stage leaks; terminal quiescence is proven from the bounded tail
+        # ending at quiescent, so the arm's real deceleration ramp inside the
+        # window is allowed.  A NEW command target/goal in the subwindow fails
+        # closed even if the velocity later settles.  Motion after quiescent
+        # (post-terminal drain) is never admitted.
         cancel_key = keys.get("cancel-requested")
-        quiescent_key = keys.get("quiescent")
         forbidden_after = ("place-goal-accepted", "scene-detach", "released-settled")
         later = [
             event
@@ -1761,10 +1878,17 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
         ]
         sub = _subwindow(ctx, "cancel-requested", "quiescent")
         sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
-        motion = _max_arm_speed(sub_parsed) if sub_parsed else 0.0
-        passed = not later and motion <= tolerance
-        return _mk_check(token, passed, metrics={"later_events": later, "subwindow_motion_rad_s": motion},
-                         reasons=() if passed else ("post-cancel stage observed",))
+        sub_target = _max_target_delta(sub_parsed)
+        tail_parsed, tail_speed, tail_target = _terminal_quiescence(ctx, end_event="quiescent")
+        tail_ok = (
+            tail_speed <= thresholds["safety_stop_velocity_rad_s"]
+            and sub_target <= tolerance
+        )
+        passed = not later and tail_ok
+        return _mk_check(token, passed, metrics={"later_events": later,
+                                                 "tail_joint_speed_rad_s": tail_speed,
+                                                 "subwindow_target_delta_rad": sub_target},
+                         reasons=() if passed else ("post-cancel stage or non-quiescent cancel tail observed",))
     if token == "safety_observed_during_transport":
         transport_key = keys.get("transport")
         clear_key = keys.get("operator-clear")
@@ -1801,16 +1925,26 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
         return _mk_check(token, passed, metrics={"max_joint_speed_rad_s": max_speed},
                          reasons=() if passed else ("velocity above stop limit",))
     if token == "no_post_clear_resume":
-        # F1.7: the check reads only the [operator-clear, quiescent] subwindow.
-        # Motion after quiescent (post-terminal drain) is never admitted.
+        # F1.7/F2.1 item 5: the check reads only the [operator-clear, quiescent]
+        # subwindow.  Motion between clear and quiescence is only a candidate
+        # resume when it is a NEW target/goal — the pre-existing command's
+        # deceleration is not a resume.  Require no target change and terminal
+        # quiescence at the tail; motion after quiescent is never admitted.
         sub = _subwindow(ctx, "operator-clear", "quiescent")
         if not sub:
             return _mk_check(token, False, metrics={}, reasons=("no operator-clear/quiescent keys",))
         sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
-        motion = _max_arm_speed(sub_parsed) if sub_parsed else 0.0
-        passed = motion <= tolerance
-        return _mk_check(token, passed, metrics={"post_clear_motion_rad_s": motion},
-                         reasons=() if passed else ("motion resumed after operator-clear",))
+        target_change = _max_target_delta(sub_parsed)
+        tail_parsed, tail_speed, tail_target = _terminal_quiescence(ctx, end_event="quiescent")
+        tail_ok = (
+            tail_speed <= thresholds["safety_stop_velocity_rad_s"]
+            and tail_target <= tolerance
+        )
+        passed = target_change <= tolerance and tail_ok
+        return _mk_check(token, passed, metrics={"post_clear_target_delta_rad": target_change,
+                                                 "tail_joint_speed_rad_s": tail_speed,
+                                                 "tail_target_delta_rad": tail_target},
+                         reasons=() if passed else ("new target or non-quiescent tail after operator-clear",))
     if token == "pick_physical_retained":
         sub = _subwindow(ctx, "place-goal-accepted", "quiescent")
         sub_parsed = [ctx["parsed_by_frame"][int(r["frame_index"])] for r in sub]
@@ -1907,14 +2041,25 @@ def _forbidden_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[st
         return _mk_check(token, not value, metrics={"observed": value},
                          reasons=() if not value else (f"forbidden {token} observed",))
     if token == "post_clear_resume":
-        # F1.7: reads only the [operator-clear, quiescent] subwindow.
+        # F1.7/F2.1 item 5: reads only the [operator-clear, quiescent] subwindow.
+        # A candidate resume is a NEW target/goal between clear and quiescence,
+        # not the pre-existing command's deceleration.  Also require terminal
+        # quiescence at the tail.
         sub = _subwindow(ctx, "operator-clear", "quiescent")
-        motion = False
+        target_change = 0.0
         if sub:
             sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
-            motion = _max_arm_speed(sub_parsed) > tolerance
-        return _mk_check(token, not motion, metrics={"post_clear_motion": motion},
-                         reasons=() if not motion else ("forbidden post-clear resume observed",))
+            target_change = _max_target_delta(sub_parsed)
+        tail_parsed, tail_speed, tail_target = _terminal_quiescence(ctx, end_event="quiescent")
+        tail_ok = (
+            tail_speed <= thresholds["safety_stop_velocity_rad_s"]
+            and tail_target <= tolerance
+        )
+        resume = target_change > tolerance
+        passed = not resume and tail_ok
+        return _mk_check(token, passed, metrics={"post_clear_target_delta_rad": target_change,
+                                                 "tail_joint_speed_rad_s": tail_speed},
+                         reasons=() if passed else ("forbidden post-clear resume (new target) observed",))
     if token == "target_region_settled":
         region = ctx["region_center"]
         final_radial = 1.0e9
@@ -2000,6 +2145,26 @@ def _threshold_map(config: Mapping[str, Any]) -> dict[str, float]:
     return result
 
 
+def _invalid_bundle_verdict(
+    attempt_dir: Path,
+    *,
+    attempt_id: str,
+    gate: str,
+    error: Any,
+) -> dict[str, Any]:
+    """Atomically write and return an evidence-invalid verdict for a bundle/shape failure.
+
+    F2.4: malformed/missing bundle structures, bool/string/list/null seed,
+    missing integrated mapping, and malformed report identities must return and
+    write ``evidence-invalid`` (never traceback).  A stable fallback gate/attempt
+    identity is used when the scenario identity itself cannot be trusted.
+    """
+    verdict = _base_verdict(attempt_id, gate, "", "")
+    verdict["errors"].append(str(error))
+    _atomic_write_json(attempt_dir / VERDICT_FILENAME, verdict)
+    return verdict
+
+
 def verify_integrated_attempt(
     *,
     scenario: Mapping[str, Any],
@@ -2015,25 +2180,52 @@ def verify_integrated_attempt(
     ``gate-verdict.json`` and returns the verdict mapping.
     """
     attempt_dir = Path(attempt_dir)
-    scenario_id = str(scenario["scenario"]["id"])
-    seed = int(scenario["scenario"]["seed"])
-    integrated = scenario.get("integrated")
-    if not isinstance(integrated, Mapping):
-        raise EvidenceError("scenario bundle has no integrated mapping")
+    # F2.4: resolve a stable fallback identity BEFORE trusting any scenario
+    # field.  Malformed bundle structures fail closed below, never traceback.
+    fallback_attempt = attempt_dir.name
+    fallback_gate = attempt_dir.name
+    try:
+        scenario_map = scenario.get("scenario") if isinstance(scenario, Mapping) else None
+        if not isinstance(scenario_map, Mapping):
+            raise EvidenceError("scenario bundle has no scenario.scenario mapping")
+        scenario_id = str(scenario_map.get("id", ""))
+        if not scenario_id:
+            raise EvidenceError("scenario.scenario.id is missing or empty")
+        seed = _as_int(scenario_map.get("seed", None), "scenario.scenario.seed")
+        integrated = scenario.get("integrated")
+        if not isinstance(integrated, Mapping):
+            raise EvidenceError("scenario bundle has no integrated mapping")
+    except EvidenceError as error:
+        return _invalid_bundle_verdict(
+            attempt_dir,
+            attempt_id=fallback_attempt,
+            gate=fallback_gate,
+            error=error,
+        )
     stage = str(integrated.get("stage", ""))
     polarity_raw = integrated.get("acceptance", {})
     polarity = str(polarity_raw.get("polarity", "")) if isinstance(polarity_raw, Mapping) else ""
 
-    # report_identities, when present, must be consistent (diagnostic only).
-    report_identities = scenario.get("report_identities")
-    if isinstance(report_identities, Mapping):
-        if str(report_identities.get("scenario_id", "")) != scenario_id:
-            raise EvidenceError("report_identities.scenario_id does not match scenario id")
-        identity_seed = _as_int(
-            report_identities.get("seed", None), "report_identities.seed"
+    # F2.4: report_identities, when present, must be consistent (diagnostic
+    # only).  A malformed identity (bad seed type, mismatch) fails closed with a
+    # durable evidence-invalid verdict, never a traceback.
+    try:
+        report_identities = scenario.get("report_identities")
+        if isinstance(report_identities, Mapping):
+            if str(report_identities.get("scenario_id", "")) != scenario_id:
+                raise EvidenceError("report_identities.scenario_id does not match scenario id")
+            identity_seed = _as_int(
+                report_identities.get("seed", None), "report_identities.seed"
+            )
+            if identity_seed != seed:
+                raise EvidenceError("report_identities.seed does not match scenario seed")
+    except EvidenceError as error:
+        return _invalid_bundle_verdict(
+            attempt_dir,
+            attempt_id=attempt_dir.name,
+            gate=scenario_id,
+            error=error,
         )
-        if identity_seed != seed:
-            raise EvidenceError("report_identities.seed does not match scenario seed")
 
     manifest_path = attempt_dir / "manifest.json"
     manifest_present = manifest_path.is_file()
@@ -2420,9 +2612,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
     scenario_arg = args.scenario
     attempt_dir = Path(args.attempt_dir)
     config_path = Path(args.config)
-    # F1.9: scenario/config resolution is part of the fail-closed boundary.
+    # F1.9/F2.4: scenario/config resolution is part of the fail-closed boundary.
     # A mismatched filename/id (or any EvidenceError during bundle/config
-    # normalization) yields evidence-invalid exit code 2, never a traceback.
+    # normalization) yields a durable evidence-invalid ``gate-verdict.json`` and
+    # exit code 2, never a traceback.  A stable fallback gate is used when the
+    # scenario identity itself cannot be trusted.
+    fallback_gate = attempt_dir.name
+    expected_id: str | None = None
     try:
         raw_path = Path(scenario_arg)
         if raw_path.is_file():
@@ -2435,22 +2631,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
         scenario = _scenario_bundle_from_declaration(raw, expected_id=expected_id)
         config = _read_json(config_path)
     except EvidenceError as error:
-        print(json.dumps({"schema_version": SCHEMA_VERSION,
-                          "attempt_id": attempt_dir.name,
-                          "gate": expected_id,
-                          "stage": "",
-                          "polarity": "",
-                          "status": "evidence-invalid",
-                          "pass": False,
-                          "verified": False,
-                          "authority": "physics_truth.jsonl",
-                          "action_results_diagnostic_only": True,
-                          "checks": [],
-                          "metrics": {},
-                          "errors": [str(error)],
-                          "execution_sources": ["integrated-execution.jsonl",
-                                                "integrated-execution.json"]},
-                         sort_keys=True, indent=2))
+        verdict = _base_verdict(attempt_dir.name, expected_id or fallback_gate, "", "")
+        verdict["errors"].append(str(error))
+        _atomic_write_json(attempt_dir / VERDICT_FILENAME, verdict)
+        print(json.dumps(verdict, sort_keys=True, indent=2))
         return 2
     verdict = verify_integrated_attempt(
         scenario=scenario,
