@@ -314,6 +314,53 @@ References:
 
 ## Changelog
 
+- 2026-08-03 (integrated qualification Task 5, formal-review fix round 2 —
+  "seal Gate D evidence streams"): Resolved the formal SPEC/QUALITY residual
+  findings F2.1-F2.7 in the Stage-D evidence path.  F2.1 — a D artifact-write
+  downgrade now appends a final corrective row (`row_kind="final"`,
+  `status="evidence-invalid"`) to ALL THREE status streams
+  (`integrated-execution.jsonl`, `moveit-plans.jsonl`, `controller-results.jsonl`),
+  preserving `planner_status`, `plan_applicable`, handler/action endpoint,
+  UUID/digest/controller fields, `downgraded_from`, and the stable artifact
+  error; no corrective row ever claims pass, and a failed corrective append is
+  contained so the authoritative atomic summary stays fail-dominant.  F2.2 —
+  `run_gripper_sequence(open_first=False)` (close→open) selects the close-first
+  journal order `fixture-ready → gripper-close-terminal → gripper-open-terminal
+  → teardown` via a fresh journal rebuild before its first record; an
+  in-progress/nonempty journal is never mutated and the attempt fails closed
+  with `journal-order-rebuild-refused`.  F2.3 — D scene-acquisition failures
+  (`no-planning-scene`, `planning-scene-invalid`) route through the D evidence
+  helper with `stage=D`, `event=gate-d`, the D handler label, and the D
+  controller/artifact schema (never a Gate-C `gate-c-plan-only` record); Gate-C
+  callers and bytes are unchanged.  F2.4 — a split-path execute whose accepted
+  ExecuteTrajectory handle has an invalid/identical/non-normalizable UUID is
+  cleaned up with exactly one bounded cancellation attempt before the evidence
+  is finalized invalid, and the cleanup outcome is recorded without claiming a
+  successful cancel unless the exact CancelGoal contract is met.  F2.5 —
+  `_env_cloud_evidence` now requires structural PointCloud2 self-consistency:
+  `row_step >= width*point_step` (valid row padding allowed) and
+  `len(data) == row_step*height` (truncated and oversized buffers both rejected),
+  plus a usable x/y/z FLOAT32 field layout when fields are advertised
+  (unadvertised bytes are consumed as opaque payload and documented); invalid
+  evidence fails closed before any action goal.  F2.6 — both MoveGroup builders
+  explicitly pin `goal.planning_options.look_around = False`, the dead
+  fail-open helpers `_safety_terminal_status` / `_safety_velocity_frames` and
+  the unused `_d_journal_pass` are deleted, and `_wait_for_fjt_status` captures
+  its matched entry in a single predicate result (no second lookup).  F2.7 —
+  `controller_goal_sent` is pinned to the exact FJT semantic (a
+  `follow_joint_trajectory` controller goal); retreat/gripper traffic is
+  surfaced through explicit `action_goal_sent`/`action_endpoint` plus
+  `cartesian_goal_sent`/`gripper_goal_sent` fields in `controller-results.jsonl`
+  without pretending it was an FJT goal, and D visual-capture requests use
+  `capture.kind="gate-d-diagnostic"` while Gate-C bytes keep `plan-only`.
+  Humble suite expanded to 125 tests (all-stream corrective rows for
+  execute/retreat/gripper, close-first pass and order-replacement guard,
+  D-labeled scene-acquisition failures, accepted-UUID cleanup, truncated/
+  oversized/undersized-row-step/valid-padded-row cloud structural probes,
+  look_around pin, dead-helper removal, and execute/retreat/gripper action
+  semantics artifacts); the pure suite stays 97 tests.  Red/green: 18 tests
+  fail against the pre-fix base and pass at the fix.  No build is required.
+
 - 2026-08-02 (integrated qualification Task 5, pre-review fix round 1 — "make
   Gate D runtime truthful"): Hardened the Stage-D lifecycle and evidence path
   against the real Humble rclpy action API.  F1.1 — the executor keeps a private

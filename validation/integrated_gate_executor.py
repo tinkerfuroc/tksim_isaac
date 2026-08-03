@@ -174,6 +174,16 @@ STAGE_D_REQUIRED_EVENT_ORDER: Mapping[str, tuple[str, ...]] = {
     "safety": ("fixture-ready", "execution-start", "effective-stop", "operator-clear", "quiescent", "teardown"),
 }
 
+#: F2.2: journal diagnostic event order for ``run_gripper_sequence(open_first=False)``
+#: (close→open).  The public ``open_first`` contract advertises both orders, so a
+#: close-first attempt must use this order rather than the open-first default.
+GRIPPER_CLOSE_FIRST_EVENT_ORDER: tuple[str, ...] = (
+    "fixture-ready",
+    "gripper-close-terminal",
+    "gripper-open-terminal",
+    "teardown",
+)
+
 #: ExecuteTrajectory / FJT split-path endpoints.
 EXECUTE_TRAJECTORY_ENDPOINT = "/execute_trajectory"
 FJT_ENDPOINT = "/xarm7_traj_controller/follow_joint_trajectory"
@@ -1555,6 +1565,9 @@ def build_joint_move_group_goal(
     goal.request.goal_constraints = [constraints]
     goal.planning_options.plan_only = bool(plan_only)
     goal.planning_options.replan = False
+    # F2.6: pin the exact MoveGroup planning contract explicitly; never rely on
+    # the moveit_msgs PlanningOptions.look_around default.
+    goal.planning_options.look_around = False
     return goal
 
 
@@ -1596,6 +1609,9 @@ def build_pose_move_group_goal(pose, *, plan_only: bool):
     ]
     goal.planning_options.plan_only = bool(plan_only)
     goal.planning_options.replan = False
+    # F2.6: pin the exact MoveGroup planning contract explicitly; never rely on
+    # the moveit_msgs PlanningOptions.look_around default.
+    goal.planning_options.look_around = False
     return goal
 
 
@@ -1994,18 +2010,8 @@ class IntegratedGateExecutor:
         if journal is not None:
             self.journal = journal
         else:
-            from planning_scene_journal import PlanningSceneJournal, load_model_touch_contract
-
-            contract = load_model_touch_contract()
-            self.journal = PlanningSceneJournal(
-                fixture_revision=self.fixture_revision,
-                task_namespace=TASK_NAMESPACE,
-                target_object_id=TARGET_OBJECT_ID,
-                expected_attach_link=contract["link_tcp"],
-                expected_touch_links=contract["touch_links"],
-                required_event_order=_d_stage_event_order(self.scenario),
-                forbidden_events=D_FORBIDDEN_EVENTS,
-                jsonl_path=self.attempt_dir / "planning-scene.jsonl",
+            self.journal = self._build_d_journal(
+                required_event_order=_d_stage_event_order(self.scenario)
             )
 
         self._latest_planning_scene: dict[str, object] | None = None
@@ -2047,6 +2053,44 @@ class IntegratedGateExecutor:
             path = self.attempt_dir / name
             if path.exists() and path.stat().st_size > 0:
                 raise ValueError(f"{name} already contains records: {path}")
+
+    def _build_d_journal(self, *, required_event_order: Sequence[str]):
+        """F2.2: construct a fresh D ``PlanningSceneJournal`` with the given order."""
+        from planning_scene_journal import PlanningSceneJournal, load_model_touch_contract
+
+        contract = load_model_touch_contract()
+        return PlanningSceneJournal(
+            fixture_revision=self.fixture_revision,
+            task_namespace=TASK_NAMESPACE,
+            target_object_id=TARGET_OBJECT_ID,
+            expected_attach_link=contract["link_tcp"],
+            expected_touch_links=contract["touch_links"],
+            required_event_order=required_event_order,
+            forbidden_events=D_FORBIDDEN_EVENTS,
+            jsonl_path=self.attempt_dir / "planning-scene.jsonl",
+        )
+
+    def _rebuild_gripper_journal_close_first(self) -> str:
+        """F2.2: select the close-first gripper journal contract before any record.
+
+        ``run_gripper_sequence(open_first=False)`` needs a journal whose required
+        event order matches ``fixture-ready → gripper-close-terminal →
+        gripper-open-terminal → teardown``.  The journal is only rebuilt while it
+        is still fresh (zero durable records and an empty/absent jsonl path); an
+        in-progress journal is never mutated — the attempt fails closed.
+        """
+        journal = getattr(self, "journal", None)
+        if journal is not None and getattr(journal, "record_count", 0) > 0:
+            return "refused: journal already holds records"
+        jsonl_path = getattr(journal, "jsonl_path", None) if journal is not None else None
+        if jsonl_path is not None:
+            path = Path(jsonl_path)
+            if path.exists() and path.stat().st_size > 0:
+                return "refused: planning-scene.jsonl already holds records"
+        self.journal = self._build_d_journal(
+            required_event_order=GRIPPER_CLOSE_FIRST_EVENT_ORDER
+        )
+        return "rebuilt"
 
     def _create_clients(self) -> None:
         ros = self.ros
@@ -2304,16 +2348,27 @@ class IntegratedGateExecutor:
         *,
         baseline: Mapping[str, object],
     ) -> dict[str, object] | None:
-        """Bounded wait for a fresh joined FJT entry in *target_statuses*."""
-        wanted = set(int(status) for status in target_statuses)
+        """Bounded wait for a fresh joined FJT entry in *target_statuses*.
 
-        def _seen() -> dict[str, object] | None:
+        F2.6: the matching entry is captured once inside the predicate so cache
+        trimming cannot produce an inconsistent second lookup (the pre-fix
+        ``and _seen() or None`` idiom could return None if the bounded cache
+        trimmed between the predicate check and the re-scan).
+        """
+        wanted = set(int(status) for status in target_statuses)
+        captured: dict[str, object] | None = None
+
+        def _seen() -> bool:
+            nonlocal captured
             for entry in reversed(self._fresh_fjt_entries(baseline, goal_uuid)):
                 if int(entry.get("status", -1)) in wanted:
-                    return entry
-            return None
+                    captured = entry
+                    return True
+            return False
 
-        return self._wait_for(lambda: _seen() is not None, timeout_s) and _seen() or None
+        if not self._wait_for(_seen, timeout_s):
+            return None
+        return captured
 
     def _wait_for_fjt_executing(
         self,
@@ -3234,9 +3289,20 @@ class IntegratedGateExecutor:
     # verifier-owned.
 
     def _evidence_invalid_d(
-        self, scenario_id: str, reason_code: str, reasons: Sequence[str]
+        self,
+        scenario_id: str,
+        reason_code: str,
+        reasons: Sequence[str],
+        *,
+        handler: str | None = None,
     ) -> dict[str, object]:
-        """D-stage evidence-invalid record with the D schema and durable rows."""
+        """D-stage evidence-invalid record with the D schema and durable rows.
+
+        F2.3: the D handler label is carried when known (scene-acquisition
+        failures route through ``_acquire_scene(d_handler=...)``) so the record
+        and the durable ``event=gate-d`` row identify the D handler, never a
+        Gate-C shape.
+        """
         record: dict[str, object] = {
             "scenario_id": scenario_id,
             "stage": "D",
@@ -3249,24 +3315,29 @@ class IntegratedGateExecutor:
             "controller_goal_sent": False,
             "isaac_joint_commands_published": False,
         }
+        if handler is not None:
+            record["handler"] = handler
         try:
+            row: dict[str, object] = {
+                "schema_version": 1,
+                "report_revision": REPORT_REVISION,
+                "scenario_id": scenario_id,
+                "event": "gate-d",
+                "stage": "D",
+                "status": "evidence-invalid",
+                "reason_code": reason_code,
+                "reasons": list(reasons),
+                "diagnostic_only": True,
+                "execute_trajectory_goal_sent": False,
+                "controller_goal_sent": False,
+                "isaac_joint_commands_published": False,
+                "timestamp": float(time.monotonic()),
+            }
+            if handler is not None:
+                row["handler"] = handler
             self._append_jsonl(
                 self.attempt_dir / "integrated-execution.jsonl",
-                {
-                    "schema_version": 1,
-                    "report_revision": REPORT_REVISION,
-                    "scenario_id": scenario_id,
-                    "event": "gate-d",
-                    "stage": "D",
-                    "status": "evidence-invalid",
-                    "reason_code": reason_code,
-                    "reasons": list(reasons),
-                    "diagnostic_only": True,
-                    "execute_trajectory_goal_sent": False,
-                    "controller_goal_sent": False,
-                    "isaac_joint_commands_published": False,
-                    "timestamp": float(time.monotonic()),
-                },
+                row,
             )
         except Exception:
             pass
@@ -3297,38 +3368,6 @@ class IntegratedGateExecutor:
         # behavior.
         self._d_journal_failure(reason=reason_code, graph_diagnosis="D diagnostic journal")
         return record
-
-    def _d_journal_pass(self, *, scenario_id: str, execute_error: str | None = None) -> str:
-        """Finalize the D journal on the pass path with the observed graph.
-
-        Returns ``"validated"`` on success or ``"invalid: <reason>"``; a failed
-        finalize never leaves a dangling journal and writes the canonical failure
-        planning-scene.json instead (the caller then downgrades the attempt).
-        """
-        try:
-            graph = self._graph_observation()
-            if graph is None:
-                raise ValueError("observed graph evidence is unavailable")
-            projection = build_journal_graph_projection(
-                fixture_payload=self._fixture_payload_for_graph(),
-                observed_graph=graph,
-            )
-            self.journal.finalize(
-                "diagnostic-pass",
-                graph=projection,
-                json_path=self.attempt_dir / "planning-scene.json",
-            )
-            return "validated"
-        except Exception as exc:
-            try:
-                self.journal.finalize_failure(
-                    reason=execute_error or f"D journal finalize failed: {exc}",
-                    graph_diagnosis=f"invalid: {exc}",
-                    json_path=self.attempt_dir / "planning-scene.json",
-                )
-            except Exception:
-                pass
-            return f"invalid: {exc}"
 
     def _d_journal_failure(self, *, reason: str, graph_diagnosis: str) -> str:
         """Write the canonical D failure planning-scene.json, returning its status."""
@@ -3690,7 +3729,7 @@ class IntegratedGateExecutor:
                 )
             if not readiness["ready"]:
                 return self._evidence_invalid_d(scenario_id, "readiness-failed", list(readiness["reasons"]))
-            acquire_error = self._acquire_scene(scenario_id)
+            acquire_error = self._acquire_scene(scenario_id, d_handler=spec.get("kind"))
             if acquire_error is not None:
                 return acquire_error
             join = self._join_key()
@@ -3744,7 +3783,7 @@ class IntegratedGateExecutor:
             baseline = self._d_baseline()
             # F1.8/Md5: D visual capture before the first D goal, with real
             # chronology (never a retroactive request).
-            self._append_visual_request("before", scenario_id, spec)
+            self._append_visual_request("before", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("execution-start")
             snap = self._journal_snapshot_d("execution-start")
             if snap != "recorded":
@@ -3791,6 +3830,14 @@ class IntegratedGateExecutor:
                 or not _valid_goal_uuid(execute_goal_id)
                 or planning_goal_id == execute_goal_id
             ):
+                # F2.4: an accepted ExecuteTrajectory handle must be cleaned up
+                # (bounded cancel) before rejecting its UUID evidence, so an
+                # accepted goal is never left running on an identity failure.
+                uuid_cleanup = None
+                if execute_handle is not None and getattr(execute_handle, "accepted", False):
+                    uuid_cleanup = self._cleanup_execute_goal(
+                        execute_handle, timeout_s=cancel_timeout_s
+                    )
                 return self._finalize_d_attempt(
                     scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
@@ -3798,6 +3845,7 @@ class IntegratedGateExecutor:
                     execute_goal_id=execute_goal_id,
                     execute_outcome=exec_outcome,
                     execute_error="plan/execute UUIDs must both be valid and distinct",
+                    cleanup=uuid_cleanup,
                 )
             if execute_result_status != EXECUTE_STATUS_SUCCEEDED:
                 cleanup = self._cleanup_execute_goal(execute_handle, timeout_s=cancel_timeout_s)
@@ -3850,7 +3898,7 @@ class IntegratedGateExecutor:
                     execute_outcome=exec_outcome,
                     execute_error=fjt_reason or "fjt evidence invalid",
                 )
-            self._append_visual_request("after", scenario_id, spec)
+            self._append_visual_request("after", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("execution-terminal")
             snap = self._journal_snapshot_d("execution-terminal")
             if snap != "recorded":
@@ -3954,7 +4002,7 @@ class IntegratedGateExecutor:
                     "readiness-unavailable" if readiness is None else "readiness-failed",
                     [] if readiness is None else list(readiness["reasons"]),
                 )
-            acquire_error = self._acquire_scene(scenario_id)
+            acquire_error = self._acquire_scene(scenario_id, d_handler=spec.get("kind"))
             if acquire_error is not None:
                 return acquire_error
             join = self._join_key()
@@ -4001,7 +4049,7 @@ class IntegratedGateExecutor:
             # F1.4: window the current attempt from here.
             baseline = self._d_baseline()
             # F1.8/Md5: visual capture before the first D goal.
-            self._append_visual_request("before", scenario_id, spec)
+            self._append_visual_request("before", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("execution-start")
             snap = self._journal_snapshot_d("execution-start")
             if snap != "recorded":
@@ -4211,7 +4259,7 @@ class IntegratedGateExecutor:
                         "execute_result_status_string": action_status_string,
                     },
                 )
-            self._append_visual_request("after", scenario_id, spec)
+            self._append_visual_request("after", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("quiescent")
             snap = self._journal_snapshot_d("quiescent")
             if snap != "recorded":
@@ -4316,7 +4364,7 @@ class IntegratedGateExecutor:
                     "readiness-unavailable" if readiness is None else "readiness-failed",
                     [] if readiness is None else list(readiness["reasons"]),
                 )
-            acquire_error = self._acquire_scene(scenario_id)
+            acquire_error = self._acquire_scene(scenario_id, d_handler=spec.get("kind"))
             if acquire_error is not None:
                 return acquire_error
             join = self._join_key()
@@ -4356,7 +4404,7 @@ class IntegratedGateExecutor:
             # F1.4: window the current attempt from here.
             baseline = self._d_baseline()
             # F1.8/Md5: visual capture before the first D goal.
-            self._append_visual_request("before", scenario_id, spec)
+            self._append_visual_request("before", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("execution-start")
             snap = self._journal_snapshot_d("execution-start")
             if snap != "recorded":
@@ -4562,7 +4610,7 @@ class IntegratedGateExecutor:
                     execute_error=f"post-clear stability not met: {stability.get('reason')}",
                     fjt_evidence=provider_evidence,
                 )
-            self._append_visual_request("after", scenario_id, spec)
+            self._append_visual_request("after", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("quiescent")
             snap = self._journal_snapshot_d("quiescent")
             if snap != "recorded":
@@ -4616,40 +4664,6 @@ class IntegratedGateExecutor:
             self._spin_once()
         return False
 
-    def _safety_terminal_status(self, fjt_evidence: object) -> str:
-        """Derive the old ExecuteTrajectory safety terminal status, never success."""
-        if isinstance(fjt_evidence, Mapping):
-            status = fjt_evidence.get("status")
-            if isinstance(status, int) and not isinstance(status, bool):
-                try:
-                    return _execute_status_name(status)
-                except ValueError:
-                    return "unknown"
-        newest = self._newest_fjt_status()
-        if newest is not None:
-            status = newest.get("status")
-            try:
-                return _execute_status_name(status)
-            except ValueError:
-                return "unknown"
-        return "unknown"
-
-    def _safety_velocity_frames(self) -> list[list[float]]:
-        """Return the cached arm-velocity lists for the effective-stop predicate.
-
-        The live controller streams fresh ``/joint_states`` and the executor
-        caches up to ``safety_stop_frames`` consecutive bounded frames through
-        :meth:`_on_joint_state`; the effective-stop predicate requires
-        ``safety_stop_frames`` consecutive frames with every arm-joint absolute
-        velocity bounded.  In the offline/faked Humble suite the test feeds
-        ``JointState`` messages or seeds frames through the callback directly.
-        """
-        return [
-            list(frame.get("velocities")) if isinstance(frame, Mapping) else list(frame)
-            for frame in self._joint_velocity_frames
-            if frame is not None
-        ]
-
     def run_cartesian_retreat(
         self,
         scenario_id: str,
@@ -4700,7 +4714,7 @@ class IntegratedGateExecutor:
                     "readiness-unavailable" if readiness is None else "readiness-failed",
                     [] if readiness is None else list(readiness["reasons"]),
                 )
-            acquire_error = self._acquire_scene(scenario_id)
+            acquire_error = self._acquire_scene(scenario_id, d_handler=spec.get("kind"))
             if acquire_error is not None:
                 return acquire_error
             join = self._join_key()
@@ -4766,7 +4780,7 @@ class IntegratedGateExecutor:
                 )
 
             # F1.8/Md5: visual capture before the first D goal.
-            self._append_visual_request("before", scenario_id, spec)
+            self._append_visual_request("before", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("retreat-start")
             snap = self._journal_snapshot_d("retreat-start")
             if snap != "recorded":
@@ -4897,7 +4911,7 @@ class IntegratedGateExecutor:
                     env_cloud_evidence=env_cloud_evidence,
                 )
 
-            self._append_visual_request("after", scenario_id, spec)
+            self._append_visual_request("after", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("retreat-terminal")
             snap = self._journal_snapshot_d("retreat-terminal")
             if snap != "recorded":
@@ -4979,6 +4993,59 @@ class IntegratedGateExecutor:
             raise ValueError("environment cloud point_step/row_step must be integers")
         if point_step < 1 or row_step < 1:
             raise ValueError("environment cloud point_step/row_step must be positive")
+        # F2.5: the buffer must be structurally self-consistent — every row is
+        # at least width*point_step bytes wide (allowing valid row padding) and
+        # the byte payload is exactly row_step*height bytes (rejecting both
+        # truncated and oversized buffers, so a mid-stream trailing-scan frame
+        # is never misread as a complete cloud).
+        if row_step < width * point_step:
+            raise ValueError(
+                f"environment cloud row_step {row_step} must be >= width*point_step "
+                f"({width}*{point_step}={width * point_step})"
+            )
+        if len(data_bytes) != row_step * height:
+            raise ValueError(
+                f"environment cloud data length {len(data_bytes)} must equal "
+                f"row_step*height ({row_step}*{height}={row_step * height})"
+            )
+        # F2.5: when point fields are advertised, they must expose a usable
+        # x/y/z FLOAT32 layout; an unadvertised field list (or an absent list)
+        # is consumed as opaque bytes for the digest/structural evidence only.
+        point_layout: str | dict[str, object]
+        fields = getattr(cloud, "fields", None)
+        if fields is None or len(fields) == 0:
+            point_layout = "opaque-bytes"
+        else:
+            from sensor_msgs.msg import PointField
+
+            x_offset = y_offset = z_offset = None
+            layout_ok = True
+            for field in fields:
+                name = getattr(field, "name", None)
+                if name not in ("x", "y", "z"):
+                    continue
+                dtype = getattr(field, "datatype", None)
+                count = int(getattr(field, "count", 0))
+                if int(dtype) != int(PointField.FLOAT32) or count != 1:
+                    layout_ok = False
+                offset = getattr(field, "offset", None)
+                if name == "x":
+                    x_offset = offset
+                elif name == "y":
+                    y_offset = offset
+                else:  # z
+                    z_offset = offset
+            if not (layout_ok and x_offset is not None and y_offset is not None and z_offset is not None):
+                raise ValueError(
+                    "environment cloud fields must expose a usable x/y/z FLOAT32 layout"
+                )
+            point_layout = {
+                "x_offset": x_offset,
+                "y_offset": y_offset,
+                "z_offset": z_offset,
+                "datatype": "float32",
+                "count": 1,
+            }
         try:
             serialized = self.ros["serialize_message"](cloud)
         except Exception as exc:
@@ -4993,6 +5060,7 @@ class IntegratedGateExecutor:
             "bytes": len(data_bytes),
             "point_step": point_step,
             "row_step": row_step,
+            "point_layout": point_layout,
         }
 
     def run_gripper_sequence(
@@ -5033,7 +5101,7 @@ class IntegratedGateExecutor:
                     "readiness-unavailable" if readiness is None else "readiness-failed",
                     [] if readiness is None else list(readiness["reasons"]),
                 )
-            acquire_error = self._acquire_scene(scenario_id)
+            acquire_error = self._acquire_scene(scenario_id, d_handler=spec.get("kind"))
             if acquire_error is not None:
                 return acquire_error
             join = self._join_key()
@@ -5045,6 +5113,15 @@ class IntegratedGateExecutor:
             scene_error = self._fixture_scene_error(scene)
             if scene_error is not None:
                 return self._evidence_invalid_d(scenario_id, "fixture-scene-mismatch", [scene_error])
+            # F2.2: a close-first attempt needs the close-first journal contract.
+            # The journal is rebuilt only while still fresh (zero records); an
+            # in-progress journal is never mutated and the attempt fails closed.
+            if not open_first:
+                rebuild = self._rebuild_gripper_journal_close_first()
+                if rebuild != "rebuilt":
+                    return self._evidence_invalid_d(
+                        scenario_id, "journal-order-rebuild-refused", [rebuild]
+                    )
             try:
                 self.journal.record_diff("fixture-ready", scene)
             except (ValueError, TypeError) as exc:
@@ -5058,7 +5135,7 @@ class IntegratedGateExecutor:
                 else [("close", gripper_close_position), ("open", gripper_open_position)]
             )
             # F1.8/Md5: visual capture before the first D goal.
-            self._append_visual_request("before", scenario_id, spec)
+            self._append_visual_request("before", scenario_id, spec, kind="gate-d-diagnostic")
             client = self._action_clients["/xarm_gripper/gripper_action"]
             server_timeout_s = float(self._thresholds().get("action_server_wait_s", 5.0))
             if not self._wait_for_server(client, server_timeout_s):
@@ -5067,7 +5144,7 @@ class IntegratedGateExecutor:
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                     execute_error="gripper server unavailable before send",
-                    plan_applicable=False, controller_goal_sent=True,
+                    plan_applicable=False, controller_goal_sent=False,
                     controller_endpoint=GRIPPER_ENDPOINT,
                     gripper_command_records=[], native_action=True, open_first=open_first,
                 )
@@ -5084,7 +5161,7 @@ class IntegratedGateExecutor:
                         readiness, start_wall, event_log=event_log,
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error=f"gripper goal construction failed: {exc}",
-                        plan_applicable=False, controller_goal_sent=True,
+                        plan_applicable=False, controller_goal_sent=False,
                         controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first,
@@ -5099,7 +5176,7 @@ class IntegratedGateExecutor:
                         readiness, start_wall, event_log=event_log,
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error="gripper goal acceptance timed out",
-                        plan_applicable=False, controller_goal_sent=True,
+                        plan_applicable=False, controller_goal_sent=False,
                         controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first,
@@ -5112,7 +5189,7 @@ class IntegratedGateExecutor:
                         readiness, start_wall, event_log=event_log,
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error=f"gripper send future raised: {exc}",
-                        plan_applicable=False, controller_goal_sent=True,
+                        plan_applicable=False, controller_goal_sent=False,
                         controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first,
@@ -5123,7 +5200,7 @@ class IntegratedGateExecutor:
                         readiness, start_wall, event_log=event_log,
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error="gripper goal was rejected",
-                        plan_applicable=False, controller_goal_sent=True,
+                        plan_applicable=False, controller_goal_sent=False,
                         controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first,
@@ -5142,7 +5219,7 @@ class IntegratedGateExecutor:
                         readiness, start_wall, event_log=event_log,
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error=f"gripper {name} result timed out",
-                        plan_applicable=False, controller_goal_sent=True,
+                        plan_applicable=False, controller_goal_sent=False,
                         controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first, cleanup=cleanup,
@@ -5155,7 +5232,7 @@ class IntegratedGateExecutor:
                         readiness, start_wall, event_log=event_log,
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error=f"gripper result future raised: {exc}",
-                        plan_applicable=False, controller_goal_sent=True,
+                        plan_applicable=False, controller_goal_sent=False,
                         controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first,
@@ -5171,7 +5248,7 @@ class IntegratedGateExecutor:
                         readiness, start_wall, event_log=event_log,
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error=f"gripper {name} did not succeed: {status_string} ({action_status})",
-                        plan_applicable=False, controller_goal_sent=True,
+                        plan_applicable=False, controller_goal_sent=False,
                         controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first,
@@ -5195,12 +5272,12 @@ class IntegratedGateExecutor:
                         planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                         execute_error=f"gripper-{name}-terminal journal snapshot rejected: {snap}",
                         journal_issues=[snap], plan_applicable=False,
-                        controller_goal_sent=True, controller_endpoint=GRIPPER_ENDPOINT,
+                        controller_goal_sent=False, controller_endpoint=GRIPPER_ENDPOINT,
                         gripper_command_records=command_records, native_action=True,
                         open_first=open_first,
                     )
 
-            self._append_visual_request("after", scenario_id, spec)
+            self._append_visual_request("after", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("teardown")
             snap = self._journal_snapshot_d("teardown")
             if snap != "recorded":
@@ -5210,7 +5287,7 @@ class IntegratedGateExecutor:
                     planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                     execute_error=f"teardown journal snapshot rejected: {snap}",
                     journal_issues=[snap], plan_applicable=False,
-                    controller_goal_sent=True, controller_endpoint=GRIPPER_ENDPOINT,
+                    controller_goal_sent=False, controller_endpoint=GRIPPER_ENDPOINT,
                     gripper_command_records=command_records, native_action=True,
                     open_first=open_first,
                 )
@@ -5219,7 +5296,7 @@ class IntegratedGateExecutor:
                 readiness, start_wall, event_log=event_log,
                 planning_goal_id=None, fixture_ready_recorded=fixture_ready_recorded,
                 plan_applicable=False,
-                controller_goal_sent=True,
+                controller_goal_sent=False,
                 controller_endpoint=GRIPPER_ENDPOINT,
                 gripper_command_records=command_records,
                 native_action=True,
@@ -5335,18 +5412,37 @@ class IntegratedGateExecutor:
         else:
             result_status = None
             result_status_string = None
-        # F1.6: truthful controller/execute traffic flags.  The ExecuteTrajectory
-        # goal is sent only by the split-path execute handler once a valid goal
-        # was accepted; cancel/safety observe a mid-flight execute transaction
-        # (already accepted elsewhere) and never send one.  ``execute_goal_id``
-        # existing in the execute outcome is the truthful sent marker.  The
-        # controller goal is the FJT controller for split-path transactions, the
-        # native gripper controller for gripper, and absent for retreat.
+        # F1.6/F2.7: truthful controller/execute traffic flags.  The
+        # ExecuteTrajectory goal is sent only by the split-path execute handler
+        # once a valid goal was accepted; cancel/safety observe a mid-flight
+        # execute transaction (already accepted elsewhere) and never send one.
+        # ``execute_goal_id`` existing in the execute outcome is the truthful
+        # sent marker.  F2.7 pins ``controller_goal_sent`` to the EXACT FJT
+        # semantic (a ``follow_joint_trajectory`` controller goal); it is True
+        # for split-path execute and for cancel/safety observing a mid-flight
+        # FJT transaction, and False for retreat/gripper.  Retreat and gripper
+        # action traffic is surfaced through the dedicated generic/action fields
+        # (``action_goal_sent``/``action_endpoint``/``cartesian_goal_sent``/
+        # ``gripper_goal_sent``) so it is visible in ``controller-results.jsonl``
+        # without pretending it was an FJT goal.
         execute_trajectory_goal_sent = bool(
             execute_outcome.get("execute_goal_id") if isinstance(execute_outcome, Mapping) else False
         )
         if controller_goal_sent is None:
             controller_goal_sent = bool(execute_trajectory_goal_sent or goals_canceling)
+        cartesian_goal_sent = bool(retreat_goal_id is not None)
+        gripper_goal_sent = bool(gripper_command_records is not None)
+        action_goal_sent = bool(
+            execute_trajectory_goal_sent or cartesian_goal_sent or gripper_goal_sent
+        )
+        if execute_trajectory_goal_sent:
+            action_endpoint = EXECUTE_TRAJECTORY_ENDPOINT
+        elif cartesian_goal_sent:
+            action_endpoint = CARTESIAN_MOVE_ENDPOINT
+        elif gripper_goal_sent:
+            action_endpoint = GRIPPER_ENDPOINT
+        else:
+            action_endpoint = None
         record: dict[str, object] = {
             "scenario_id": scenario_id,
             "handler": spec.get("kind"),
@@ -5360,6 +5456,10 @@ class IntegratedGateExecutor:
             "execute_trajectory_goal_sent": execute_trajectory_goal_sent,
             "controller_goal_sent": bool(controller_goal_sent),
             "controller_endpoint": controller_endpoint,
+            "action_goal_sent": action_goal_sent,
+            "action_endpoint": action_endpoint,
+            "cartesian_goal_sent": cartesian_goal_sent,
+            "gripper_goal_sent": gripper_goal_sent,
             "planning_goal_id": planning_goal_id,
             "execute_goal_id": execute_goal_id,
             "goals_canceling": list(goals_canceling) if goals_canceling is not None else [],
@@ -5485,6 +5585,10 @@ class IntegratedGateExecutor:
                 "scenario_id": scenario_id,
                 "controller_goal_sent": record.get("controller_goal_sent"),
                 "controller_endpoint": record.get("controller_endpoint"),
+                "action_goal_sent": record.get("action_goal_sent"),
+                "action_endpoint": record.get("action_endpoint"),
+                "cartesian_goal_sent": record.get("cartesian_goal_sent"),
+                "gripper_goal_sent": record.get("gripper_goal_sent"),
                 "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
                 "execute_result_status": record.get("execute_result_status"),
                 "execute_result_status_string": record.get("execute_result_status_string"),
@@ -5623,8 +5727,17 @@ class IntegratedGateExecutor:
         readiness: Mapping[str, object],
         downgraded_from: object,
     ) -> None:
-        """F3.1 analog: after a D artifact write failure, downgrade every already
-        created status-bearing D artifact to evidence-invalid."""
+        """F3.1/F2.1: after a D artifact write failure, downgrade every already
+        created status-bearing D artifact to evidence-invalid.
+
+        F2.1: every status stream (``integrated-execution.jsonl``,
+        ``moveit-plans.jsonl``, ``controller-results.jsonl``) receives a final
+        corrective row with ``row_kind="final"`` and ``status="evidence-invalid"``
+        preserving the planner/plan/controller/action/UUID/digest fields and the
+        ``downgraded_from`` provenance.  A corrective append never claims pass.
+        Each append is contained: a failed corrective write must not escape and
+        must not mask the authoritative atomic summary (already written by
+        ``_write_d_fail_dominant_execution_json``, itself fail-dominant)."""
         try:
             self._write_d_fail_dominant_execution_json(
                 scenario_id, record, readiness, downgraded_from=downgraded_from
@@ -5640,9 +5753,12 @@ class IntegratedGateExecutor:
                     "scenario_id": scenario_id,
                     "event": "gate-d",
                     "stage": "D",
+                    "handler": record.get("handler"),
                     "status": "evidence-invalid",
                     "reason_code": record.get("reason_code"),
                     "planner_status": record.get("planner_status"),
+                    "plan_applicable": record.get("plan_applicable"),
+                    "controller_endpoint": record.get("controller_endpoint"),
                     "row_kind": "final",
                     "downgraded_from": downgraded_from,
                     "error": record.get("artifact_error"),
@@ -5655,8 +5771,62 @@ class IntegratedGateExecutor:
             )
         except Exception:
             pass
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "moveit-plans.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "goal_kind": record.get("handler"),
+                    "status": "evidence-invalid",
+                    "planner_status": record.get("planner_status"),
+                    "plan_applicable": record.get("plan_applicable"),
+                    "row_kind": "final",
+                    "planning_goal_id": record.get("planning_goal_id"),
+                    "execute_goal_id": record.get("execute_goal_id"),
+                    "trajectory_digest": record.get("planned_trajectory_digest"),
+                    "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                    "downgraded_from": downgraded_from,
+                    "error": record.get("artifact_error"),
+                    "diagnostic_only": True,
+                },
+            )
+        except Exception:
+            pass
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "controller-results.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "status": "evidence-invalid",
+                    "row_kind": "final",
+                    "controller_goal_sent": record.get("controller_goal_sent"),
+                    "controller_endpoint": record.get("controller_endpoint"),
+                    "action_goal_sent": record.get("action_goal_sent"),
+                    "action_endpoint": record.get("action_endpoint"),
+                    "cartesian_goal_sent": record.get("cartesian_goal_sent"),
+                    "gripper_goal_sent": record.get("gripper_goal_sent"),
+                    "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
+                    "execute_result_status": record.get("execute_result_status"),
+                    "execute_result_status_string": record.get("execute_result_status_string"),
+                    "fjt_goal_uuid": record.get("fjt_goal_uuid"),
+                    "fjt_status": record.get("fjt_status"),
+                    "fjt_goal_digest": record.get("fjt_goal_digest"),
+                    "terminal_status": record.get("terminal_status"),
+                    "downgraded_from": downgraded_from,
+                    "error": record.get("artifact_error"),
+                    "diagnostic_only": True,
+                },
+            )
+        except Exception:
+            pass
 
-    def _acquire_scene(self, scenario_id: str) -> dict[str, object] | None:
+    def _acquire_scene(
+        self, scenario_id: str, *, d_handler: str | None = None
+    ) -> dict[str, object] | None:
         """F2.5/F3.2: bounded pre-goal scene acquisition through the private spinner.
 
         Acquisition requires a valid observation received after the last
@@ -5665,6 +5835,12 @@ class IntegratedGateExecutor:
         When the newest observation is invalid the executor spins up to the
         finite timeout to try to recover with a newer valid scene; timeout with
         no valid-after-invalid observation fails closed with zero goals.
+
+        F2.3: when *d_handler* is supplied (a Stage-D handler kind), a failed
+        acquisition returns the D schema/labels (``stage=D``, ``event=gate-d``,
+        D controller/artifact shape) instead of the Gate-C ``_evidence_invalid``
+        record.  Gate-C callers pass no *d_handler* and keep the exact Gate-C
+        bytes.
         """
         timeout_s = float(self._thresholds().get("scene_acquire_timeout_s", 5.0))
         deadline = time.monotonic() + timeout_s
@@ -5677,6 +5853,23 @@ class IntegratedGateExecutor:
                 ):
                     return None
             self._spin_once()
+        if d_handler is not None:
+            if self._planning_scene_invalid:
+                return self._evidence_invalid_d(
+                    scenario_id,
+                    "planning-scene-invalid",
+                    [
+                        "a received PlanningScene failed normalization and no valid "
+                        "scene arrived after it within the acquisition timeout"
+                    ],
+                    handler=d_handler,
+                )
+            return self._evidence_invalid_d(
+                scenario_id,
+                "no-planning-scene",
+                [f"no valid PlanningScene cached within {timeout_s:.3f}s of self-spin"],
+                handler=d_handler,
+            )
         if self._planning_scene_invalid:
             return self._evidence_invalid(
                 scenario_id,
@@ -5724,9 +5917,19 @@ class IntegratedGateExecutor:
         return None
 
     def _append_visual_request(
-        self, phase: str, scenario_id: str, spec: Mapping[str, object]
+        self,
+        phase: str,
+        scenario_id: str,
+        spec: Mapping[str, object],
+        *,
+        kind: str = "plan-only",
     ) -> None:
-        """F2.7: durably append one visual-capture request record at the truthful phase."""
+        """F2.7: durably append one visual-capture request record at the truthful phase.
+
+        The default ``kind="plan-only"`` preserves the Gate-C byte shape exactly;
+        D handlers pass ``kind="gate-d-diagnostic"`` (execution-neutral, never a
+        fabricated planner capture).
+        """
         self._append_jsonl(
             self.attempt_dir / "visual-capture-requests.jsonl",
             {
@@ -5734,7 +5937,7 @@ class IntegratedGateExecutor:
                 "report_revision": REPORT_REVISION,
                 "scenario_id": scenario_id,
                 "phase": phase,
-                "capture": {"kind": "plan-only", "target": spec.get("target_pose")},
+                "capture": {"kind": kind, "target": spec.get("target_pose")},
                 "diagnostic_only": True,
             },
         )
@@ -6247,6 +6450,7 @@ __all__ = [
     "FJT_STATUS_TOPIC",
     "GATE_C_FORBIDDEN_EVENTS",
     "GATE_C_REQUIRED_EVENT_ORDER",
+    "GRIPPER_CLOSE_FIRST_EVENT_ORDER",
     "GRIPPER_CLOSE_POSITION",
     "GRIPPER_ENDPOINT",
     "GRIPPER_MAX_EFFORT",
