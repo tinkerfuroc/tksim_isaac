@@ -363,6 +363,50 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 2 —
+  "seal Gate E runtime contracts"): Resolved the full F2.1-F2.8 consolidated
+  findings.  F2.1 — Gate E now preserves the 10 cm physical threshold: every E
+  transport scenario (positive, occupied-place, cancel-transport,
+  safety-transport) requires an injected, fresh `post_grasp_lift_m_provider`
+  runtime-parameter observation BEFORE any Pick traffic.  The observed
+  production `pick_and_place` parameter must be finite and `>= object_lift_m`
+  (0.10 m) with fresh identity/receipt metadata; missing/stale/provider-error/
+  0.08 evidence fails immediately with a stable readiness reason and zero action
+  traffic (never a 15 s transport timeout).  Accepted 0.10 keeps the lift latch
+  `grasp_z + object_lift_m - tolerance` (0.81 m), physically reachable at the
+  production TCP peak 0.82 m.  F2.2 — the transport ordering tests now use
+  controllably delayed Pick result futures and assert the transport latched
+  strictly before the result future completed; a settled post-result-only
+  provider fails closed with no Place/release.  F2.3 — native-gripper rejection
+  coverage is complete (nonzero unchanged baseline passes; increment-after-
+  acceptance rejects the approach trigger with exact-Pick cleanup; missing/
+  stale/exception fails closed).  F2.4 — runner-level receipt-window negatives
+  cover the approach FJT before the acceptance baseline, the approach FJT later
+  than 2.0 s, the transport FJT before the lift latch, the transport FJT later
+  than 2.0 s after the lift latch, and a Place FJT outside its window — each
+  bounded and `evidence-invalid` with no forbidden later goal/release.  F2.5 —
+  occupied-place re-observes a fresh PlanningScene after the exact Place cancel
+  terminal and quiescence, proving `pick_and_place/object_mesh` remains attached;
+  an open/detach race-lost fails `evidence-invalid` with the post-cancel scene
+  sequence/attachment recorded in the trigger.  F2.6 — the unexpected-exception
+  path derives cleanup/goal identity/sent flags before durable writes so every
+  artifact truthfully preserves the accepted-goal state with
+  `status=evidence-invalid`.  F2.7 — blocked-approach/unreachable-grasp require
+  production-real terminal consistency (GoalStatus ABORTED=6 together with a
+  non-success/non-canceled task result such as `planning_failed=2`); a
+  contradictory SUCCEEDED-terminal/failure-Result (or canceled/safety Result)
+  pair is rejected.  Humble suite 155, pure suite 126.
+
+  **Live `post_grasp_lift_m:=0.10` readback obligation (Task 8/10).**  The later
+  live orchestrator MUST launch `pick_and_place` with the ROS parameter override
+  `post_grasp_lift_m:=0.10` AND independently read back that value before Gate E
+  (the production default is `post_grasp_lift_m=0.08`, which produces an attached
+  lift peak of 0.80 m, 0.01 m below the 0.81 m Gate-E lift latch and therefore
+  `evidence-invalid`).  The read-back must be provided to Gate E through the
+  injected `post_grasp_lift_m_provider` seam with fresh identity/receipt
+  metadata; Gate E fails immediately, zero-traffic, if the observed value is
+  missing, stale, non-finite, or below `object_lift_m` (0.10 m).
+
 - 2026-08-03 (integrated qualification Task 6, formal-review fix round 1 —
   "make Gate E live-observable"): Made Gate E live-observable per the full
   F1.1-F1.15 consolidated findings.  The positive and occupied-place sequences
