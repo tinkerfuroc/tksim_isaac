@@ -314,6 +314,54 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 2 —
+  "seal Gate E runtime contracts"): Resolved the full F2.1-F2.8 consolidated
+  SPEC/QUALITY findings in the Stage-E path.  F2.1 — the 10 cm physical
+  threshold is preserved (Gate E never weakens `object_lift_m` to the 0.08 m
+  production default); every E transport scenario (positive, occupied-place,
+  cancel-transport, safety-transport) now requires an injected, fresh
+  `post_grasp_lift_m_provider` runtime-parameter observation BEFORE any Pick
+  traffic.  The observed production `pick_and_place` parameter must be finite
+  and `>= object_lift_m` (0.10 m), with fresh identity/receipt metadata;
+  missing/stale/provider-error/0.08 evidence fails immediately with a stable
+  readiness reason (`no-post-grasp-lift-m-provider`,
+  `post-grasp-lift-m-provider-{missing,stale,non-finite,unavailable}`,
+  `post-grasp-lift-m-below-object-lift`) and zero action traffic — never a
+  15 s transport timeout.  Accepted 0.10 keeps the lift latch
+  `grasp_z + object_lift_m - tolerance` (0.81 m), physically reachable at the
+  production TCP peak 0.82 m.  F2.2 — the positive/occupied-place/
+  cancel-transport/safety-transport ordering tests now use controllably
+  delayed Pick result futures (`result_ready_at=1.5`) and assert
+  `transport_latched < pick_result_ready`; a runner-level negative proves that
+  only settled post-result provider/history evidence fails closed
+  (`evidence-invalid`, no Place, no release).  F2.3 — native-gripper
+  rejection coverage is completed: a fresh nonzero baseline that stays
+  unchanged passes, an increment-after-acceptance rejects the approach trigger
+  (exact Pick cleaned up, no attachment/later goal, artifacts
+  `evidence-invalid`), and missing/stale/provider-exception evidence fails
+  closed.  F2.4 — runner-level receipt-window negatives prove the approach
+  FJT before the acceptance baseline, the approach FJT later than 2.0 s, the
+  transport FJT before the lift latch, the transport FJT later than 2.0 s
+  after the lift latch, and a Place target-motion FJT outside its window are
+  each bounded and `evidence-invalid` with no forbidden later goal/release.
+  F2.5 — occupied-place re-observes a fresh PlanningScene after the exact
+  Place cancel terminal and quiescence, proving `pick_and_place/object_mesh`
+  remains attached; if open/detach wins the race Gate E fails
+  `evidence-invalid`, and the post-cancel scene sequence/attachment state is
+  recorded in the trigger artifact.  F2.6 — `_e_unexpected_exception` derives
+  cleanup/goal identity/sent flags BEFORE durable writes; every durable
+  artifact (`integrated-execution.jsonl/.json`, `moveit-plans.jsonl`,
+  `controller-results.jsonl`, `goals/<id>.json`) truthfully preserves the
+  accepted Pick/Place handle, goal IDs, goals sent, cleanup outcome, trigger,
+  and `status=evidence-invalid` (no row claims no goal was sent when one was
+  accepted).  F2.7 — blocked-approach/unreachable-grasp require production-real
+  terminal consistency: action-client GoalStatus ABORTED (6) together with a
+  non-success/non-canceled task result such as `planning_failed` (2); a
+  contradictory SUCCEEDED-terminal/failure-Result (or canceled/safety Result)
+  pair is rejected.  Humble suite grows to 155 tests and the pure suite to 126
+  (F2.1 `_post_grasp_lift_m_observation` threshold + transport-kind set tests).
+  No build or live run is required.
+
 - 2026-08-03 (integrated qualification Task 6, formal-review fix round 1 —
   "make Gate E live-observable"): Resolved the full F1.1-F1.15 consolidated
   SPEC/QUALITY findings in the Stage-E path.  F1.1/F1.2 — the positive and

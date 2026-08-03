@@ -242,6 +242,13 @@ E_FJT_CORRELATION_TIMEOUT_S = 2.0
 E_TRIGGER_TCP_SPEED_M_S = 0.01
 E_LIFT_Z_TOLERANCE_M = 0.01
 E_NORMAL_STATE_SAMPLES = 2
+#: F2.1: the E scenarios that observe the production ``post_grasp_lift_m``
+#: runtime parameter (those whose transport trigger requires the lift-complete
+#: latch to be physically reachable).  Approach/blocked/malformed controls do
+#: not transport and never require the seam.
+_E_TRANSPORT_KINDS: frozenset[str] = frozenset(
+    {"positive", "occupied-place", "cancel-transport", "safety-transport"}
+)
 
 #: ``tinker_arm_msgs/action/Pick`` / ``Place`` ``Result.status`` codes
 #: (distinct from the action-client ``action_msgs/msg/GoalStatus`` enum).
@@ -1940,6 +1947,48 @@ def _fjt_within_receipt_window(
     return delta <= window
 
 
+def _post_grasp_lift_m_observation(
+    sample: object,
+    *,
+    object_lift_m: float,
+    fresh_limit_s: object,
+) -> tuple[float, dict[str, object]] | str:
+    """Validate one fresh observed ``post_grasp_lift_m`` runtime-parameter sample.
+
+    F2.1: the E transport scenarios observe the production ``pick_and_place``
+    runtime parameter ``post_grasp_lift_m`` (production default 0.08 m) through
+    an injected provider.  The committed qualification requires ``object_lift_m``
+    >= 0.10 m, so the observed lift value must be finite and ``>= object_lift_m``;
+    anything missing/stale/non-finite/below-threshold returns a stable reason
+    string.  On acceptance returns ``(value_m, meta)`` where *meta* carries the
+    provider identity, receipt time, observed value, and the enforced threshold.
+    """
+    if not isinstance(sample, Mapping):
+        return "missing"
+    identity = sample.get("identity")
+    if not (isinstance(identity, (int, str)) and str(identity)):
+        return "missing"
+    if not _fresh(sample.get("age_s"), fresh_limit_s):
+        return "stale"
+    value_m = sample.get("value_m")
+    if isinstance(value_m, bool):
+        return "non-finite"
+    try:
+        value_m = float(value_m)
+    except (TypeError, ValueError):
+        return "non-finite"
+    if not math.isfinite(value_m):
+        return "non-finite"
+    if value_m < float(object_lift_m):
+        return f"below-object-lift: observed {value_m} < required {float(object_lift_m)}"
+    return value_m, {
+        "identity": str(identity),
+        "received_mono": float(time.monotonic()),
+        "value_m": value_m,
+        "object_lift_m": float(object_lift_m),
+    }
+
+
 def _tcp_z_from_samples(
     samples: Sequence[Mapping[str, object]],
 ) -> float | None:
@@ -2634,6 +2683,12 @@ class IntegratedGateExecutor:
         }
         self._e_native_gripper_count_provider: Callable[[], Mapping[str, object]] | None = None
         self._e_native_gripper_count_baseline: int | None = None
+        # F2.1: strictly per-attempt observation of the production
+        # ``pick_and_place`` runtime parameter ``post_grasp_lift_m``.  The
+        # injected provider is a live-observable seam (never a tf/action
+        # dependency); the accepted observation is persisted into E artifacts.
+        self._e_post_grasp_lift_m_provider: Callable[[], Mapping[str, object]] | None = None
+        self._e_post_grasp_lift_m_observed: Mapping[str, object] | None = None
 
     # -- construction helpers ----------------------------------------------
 
@@ -5956,6 +6011,8 @@ class IntegratedGateExecutor:
         }
         self._e_native_gripper_count_provider = None
         self._e_native_gripper_count_baseline = None
+        self._e_post_grasp_lift_m_provider = None
+        self._e_post_grasp_lift_m_observed = None
 
     def _e_native_gripper_count(self) -> int | None:
         """Fresh receipt-sequenced native gripper action-goal count, else None.
@@ -5982,15 +6039,49 @@ class IntegratedGateExecutor:
             return None
         return int(count)
 
+    def _e_post_grasp_lift_m(self) -> tuple[float, dict[str, object]] | None:
+        """Fresh observed production ``post_grasp_lift_m`` value, else ``None``.
+
+        F2.1: the injected provider observes the live ``pick_and_place`` ROS
+        runtime parameter ``post_grasp_lift_m``.  Gate E requires the finite
+        value to be ``>= object_lift_m`` (0.10 m for the committed
+        qualification) so the observed lift peak ``grasp_z + post_grasp_lift_m``
+        is physically reachable at the lift latch ``grasp_z + object_lift_m -
+        tolerance``.  Missing/stale/non-finite/provider-error evidence returns
+        ``None`` and the caller fails closed with zero action traffic.
+        """
+        provider = self._e_post_grasp_lift_m_provider
+        if provider is None:
+            return None
+        try:
+            sample = provider()
+        except Exception:
+            return None
+        result = _post_grasp_lift_m_observation(
+            sample,
+            object_lift_m=self._e_object_lift_m(),
+            fresh_limit_s=self._thresholds().get("tf_fresh_s", 0.25),
+        )
+        if isinstance(result, str):
+            return None
+        return result
+
     def _e_unexpected_exception(
         self, scenario_id: str, exc: Exception, *, spec: Mapping[str, object]
     ) -> dict[str, object]:
-        """F1.9: fail-closed unexpected-exception evidence with accepted-goal cleanup.
+        """F1.9/F2.6: fail-closed unexpected-exception evidence with cleanup.
 
         Any exception escaping an E runner is contained into a complete Gate-E
         record.  If an action goal was accepted, bounded cleanup/cancel is
         attempted on the exact handle before the record is finalized; the
         cleanup outcome is recorded without ever claiming cancel success.
+
+        F2.6: the accepted-goal truth (pick/place goal-sent flags, goal IDs,
+        goals sent, cleanup outcome) is derived BEFORE any durable write, so
+        ``_evidence_invalid_e`` persists the truthful rows into
+        ``integrated-execution.jsonl``/``.json``, ``moveit-plans.jsonl``,
+        ``controller-results.jsonl`` and the goal artifact.  No durable row may
+        claim no goal was sent when one was accepted.
         """
         cleanup: dict[str, object] = {}
         goal_handle = self._e_active_goal_handle
@@ -6004,22 +6095,24 @@ class IntegratedGateExecutor:
                 cleanup = {"cleanup": "exception", "cleanup_error": str(clean_exc)}
             self._e_active_goal_handle = None
         goal_state = dict(self._e_goal_state)
-        record = self._evidence_invalid_e(
+        pick_goal_sent = bool(goal_state.get("pick_sent"))
+        place_goal_sent = bool(goal_state.get("place_sent"))
+        place_goal_accepted = bool(goal_state.get("place_sent"))
+        goals_sent = int(pick_goal_sent) + int(place_goal_sent)
+        return self._evidence_invalid_e(
             scenario_id,
             "unexpected-exception",
             [f"{type(exc).__name__}: {exc}"],
             handler=spec.get("kind"),
+            spec=spec,
+            pick_goal_sent=pick_goal_sent,
+            place_goal_sent=place_goal_sent,
+            place_goal_accepted=place_goal_accepted,
+            goals_sent=goals_sent,
+            pick_goal_id=goal_state.get("pick_goal_id"),
+            place_goal_id=goal_state.get("place_goal_id"),
+            cleanup=cleanup,
         )
-        record["pick_goal_sent"] = bool(goal_state.get("pick_sent"))
-        record["place_goal_sent"] = bool(goal_state.get("place_sent"))
-        record["place_goal_accepted"] = bool(goal_state.get("place_sent"))
-        record["goals_sent"] = int(bool(goal_state.get("pick_sent"))) + int(
-            bool(goal_state.get("place_sent"))
-        )
-        record["pick_goal_id"] = goal_state.get("pick_goal_id")
-        record["place_goal_id"] = goal_state.get("place_goal_id")
-        record["cleanup"] = cleanup
-        return record
 
     def run_pick_place_sequence(
         self,
@@ -6027,6 +6120,7 @@ class IntegratedGateExecutor:
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
         native_gripper_goal_count_provider: Callable[[], Mapping[str, object]] | None = None,
+        post_grasp_lift_m_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         """Run one Gate-E fixed-target Pick/Place sequence (positive or negative).
 
@@ -6035,7 +6129,9 @@ class IntegratedGateExecutor:
         production two-goal Pick then Place; every negative runs its isolated
         short journal and never infers a physical verdict.  Per-attempt E state
         is reset first (F1.7) and any escaping exception is contained fail-closed
-        with accepted-goal cleanup (F1.9).
+        with accepted-goal cleanup (F1.9).  F2.1: the E transport scenarios also
+        require a fresh observed ``post_grasp_lift_m`` runtime-parameter
+        provider before any Pick traffic.
         """
         self._e_reset_attempt_state()
         spec: Mapping[str, object] = {}
@@ -6045,6 +6141,7 @@ class IntegratedGateExecutor:
             except ValueError as exc:
                 return self._evidence_invalid_e(scenario_id, "scenario-rejected", [str(exc)])
             self._e_native_gripper_count_provider = native_gripper_goal_count_provider
+            self._e_post_grasp_lift_m_provider = post_grasp_lift_m_provider
             if spec["kind"] == "positive":
                 return self._run_e_positive(
                     spec,
@@ -6063,12 +6160,14 @@ class IntegratedGateExecutor:
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
         native_gripper_goal_count_provider: Callable[[], Mapping[str, object]] | None = None,
+        post_grasp_lift_m_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         """Run the Gate-E positive fixed-target Pick then Place sequence."""
         return self.run_pick_place_sequence(
             "qualification-pick-place-positive",
             current_tcp_pose_provider=current_tcp_pose_provider,
             native_gripper_goal_count_provider=native_gripper_goal_count_provider,
+            post_grasp_lift_m_provider=post_grasp_lift_m_provider,
         )
 
     def run_pick_place_negative(
@@ -6077,6 +6176,7 @@ class IntegratedGateExecutor:
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
         native_gripper_goal_count_provider: Callable[[], Mapping[str, object]] | None = None,
+        post_grasp_lift_m_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         """Run one isolated Gate-E negative Pick/Place control.
 
@@ -6100,6 +6200,7 @@ class IntegratedGateExecutor:
                     handler=spec["kind"],
                 )
             self._e_native_gripper_count_provider = native_gripper_goal_count_provider
+            self._e_post_grasp_lift_m_provider = post_grasp_lift_m_provider
             return self._run_e_negative(
                 spec,
                 current_tcp_pose_provider=current_tcp_pose_provider,
@@ -6425,6 +6526,51 @@ class IntegratedGateExecutor:
                     handler=spec["kind"],
                 )
             self._e_native_gripper_count_baseline = gripper_count_baseline
+        # F2.1: the E transport scenarios (positive, occupied-place,
+        # cancel-transport, safety-transport) require a fresh observation of the
+        # production ``pick_and_place`` runtime parameter ``post_grasp_lift_m``
+        # BEFORE any Pick traffic.  The committed qualification requires
+        # ``object_lift_m=0.10``; the production default ``post_grasp_lift_m``
+        # is 0.08, which makes the observed lift peak 0.80 m < the 0.81 m latch,
+        # so Gate E must fail immediately with a stable readiness reason and
+        # zero action traffic (never a 15 s transport timeout).  The later live
+        # orchestrator must launch ``pick_and_place`` with
+        # ``post_grasp_lift_m:=0.10`` and read back the value before Gate E.
+        if spec["kind"] in _E_TRANSPORT_KINDS:
+            if self._e_post_grasp_lift_m_provider is None:
+                return self._evidence_invalid_e(
+                    scenario_id, "no-post-grasp-lift-m-provider",
+                    ["post_grasp_lift_m_provider is required for E transport scenarios"],
+                    handler=spec["kind"],
+                )
+            try:
+                lift_sample = self._e_post_grasp_lift_m_provider()
+            except Exception as exc:
+                return self._evidence_invalid_e(
+                    scenario_id, "post-grasp-lift-m-provider-unavailable",
+                    [f"post_grasp_lift_m provider raised: {exc}"],
+                    handler=spec["kind"],
+                )
+            lift_result = _post_grasp_lift_m_observation(
+                lift_sample,
+                object_lift_m=self._e_object_lift_m(),
+                fresh_limit_s=self._thresholds().get("tf_fresh_s", 0.25),
+            )
+            if isinstance(lift_result, str):
+                reason_map = {
+                    "missing": "post-grasp-lift-m-provider-missing",
+                    "stale": "post-grasp-lift-m-provider-stale",
+                    "non-finite": "post-grasp-lift-m-provider-non-finite",
+                    "below-object-lift": "post-grasp-lift-m-below-object-lift",
+                }
+                prefix = lift_result.split(":")[0]
+                return self._evidence_invalid_e(
+                    scenario_id, reason_map.get(prefix, "post-grasp-lift-m-provider-invalid"),
+                    [f"post_grasp_lift_m observation rejected: {lift_result}"],
+                    handler=spec["kind"],
+                )
+            lift_value, lift_meta = lift_result
+            self._e_post_grasp_lift_m_observed = lift_meta
         acquire_error = self._acquire_scene(scenario_id, e_handler=spec["kind"])
         if acquire_error is not None:
             return acquire_error
@@ -6622,6 +6768,40 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, task_result_status=result_status,
                 terminal_status=result_outcome.get("terminal_status"),
             )
+        terminal_status = result_outcome.get("terminal_status")
+        # F2.7: production ``complete_pick`` aborts any Pick non-success other
+        # than (canceled while canceling), so blocked-approach/unreachable-grasp
+        # must record an action-client ABORTED terminal together with a
+        # non-success, non-canceled task result.  A contradictory pair (e.g. a
+        # SUCCEEDED GoalStatus delivering a failure Result, or a canceled/safety
+        # Result) is rejected rather than diagnostic-passed.
+        if terminal_status != "aborted":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=(
+                    f"blocked/unreachable Pick terminal must be aborted for a "
+                    f"non-success result, got terminal={terminal_status} "
+                    f"result={result_status}"
+                ),
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, task_result_status=result_status,
+                terminal_status=terminal_status,
+            )
+        if result_status in (PICK_PLACE_RESULT_CANCELED, PICK_PLACE_RESULT_SAFETY_STOP):
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=(
+                    f"blocked/unreachable Pick must not be canceled/safety-stopped, "
+                    f"got result={result_status}"
+                ),
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, task_result_status=result_status,
+                terminal_status=terminal_status,
+            )
         pick_terminal = self._e_record_snapshot("pick-terminal")
         if pick_terminal != "recorded":
             return self._finalize_e_attempt(
@@ -6700,13 +6880,28 @@ class IntegratedGateExecutor:
             trigger = self._e_wait_transport_started(baseline, spec)
             trigger_event = "transport"
         if trigger is None:
+            # F2.3: when a cancel trigger never fires (e.g. the native gripper
+            # count increased after acceptance), the exact accepted Pick is
+            # cleaned up before the evidence-invalid finalization; no
+            # attachment/later goal ever occurs and the cleanup outcome is
+            # recorded truthfully in the durable artifacts.
+            cleanup: dict[str, object] = {}
+            if self._e_active_goal_handle is not None:
+                try:
+                    cleanup = self._cleanup_execute_goal(
+                        self._e_active_goal_handle,
+                        timeout_s=self._thresholds().get("cancel_timeout_s", 3.0),
+                    )
+                except Exception as clean_exc:  # pragma: no cover - defensive
+                    cleanup = {"cleanup": "exception", "cleanup_error": str(clean_exc)}
+                self._e_active_goal_handle = None
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
                 event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
                 task_error=f"{kind} trigger timed out before observable evidence",
                 pick_goal_sent=True, place_goal_sent=False,
                 place_goal_accepted=False, goals_sent=1,
-                pick_goal_id=pick_goal_id,
+                pick_goal_id=pick_goal_id, cleanup=cleanup,
             )
         if trigger_event == "transport":
             attach_status = self._e_record_diff_from_current("scene-attach")
@@ -7431,6 +7626,37 @@ class IntegratedGateExecutor:
                 trigger=place_trigger, cancel_response=cancel_response,
             )
         event_log.append("quiescent")
+        # F2.5: after the exact Place cancel terminal and quiescence, require a
+        # fresh PlanningScene observation proving ``pick_and_place/object_mesh``
+        # remains attached.  If the Place server's open/detach won the cancel
+        # race (target-motion FJT completed before the cancel latched), Gate E
+        # fails ``evidence-invalid`` here rather than deferring all observability
+        # to Task 7.  The post-cancel scene join key/attachment state is recorded
+        # in the final trigger artifact.
+        post_scene = self._latest_planning_scene
+        post_cancel_attached = self._e_target_attached()
+        post_cancel_scene_sequence = (
+            int(post_scene.get("scene_sequence", -1)) if isinstance(post_scene, Mapping) else -1
+        )
+        post_cancel_trigger = dict(place_trigger)
+        post_cancel_trigger["post_cancel_target_attached"] = bool(post_cancel_attached)
+        post_cancel_trigger["post_cancel_scene_sequence"] = int(post_cancel_scene_sequence)
+        if not post_cancel_attached:
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=(
+                    "occupied-place target detached before post-cancel re-observation "
+                    "(open/detach won the cancel race)"
+                ),
+                pick_goal_sent=True, place_goal_sent=True,
+                place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
+                pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
+                task_result_status=place_result_status,
+                terminal_status=place_terminal_status,
+                trigger=post_cancel_trigger, cancel_response=cancel_response,
+            )
+        event_log.append("post-cancel-attached")
         teardown_status = self._e_record_snapshot("teardown")
         if teardown_status != "recorded":
             return self._finalize_e_attempt(
@@ -7442,7 +7668,7 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
                 task_result_status=place_result_status,
                 terminal_status=place_terminal_status,
-                trigger=place_trigger, cancel_response=cancel_response,
+                trigger=post_cancel_trigger, cancel_response=cancel_response,
             )
         event_log.append("teardown")
         return self._finalize_e_attempt(
@@ -7453,7 +7679,7 @@ class IntegratedGateExecutor:
             pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
             task_result_status=place_result_status,
             terminal_status=place_terminal_status,
-            trigger=place_trigger, cancel_response=cancel_response,
+            trigger=post_cancel_trigger, cancel_response=cancel_response,
         )
 
     def _e_wait_place_target_motion(self, baseline: Mapping[str, object], spec) -> Mapping[str, object] | None:
@@ -7734,8 +7960,31 @@ class IntegratedGateExecutor:
         reasons: Sequence[str],
         *,
         handler: str | None = None,
+        spec: Mapping[str, object] | None = None,
+        post_grasp_lift_m_observed: object = None,
+        pick_goal_sent: bool = False,
+        place_goal_sent: bool = False,
+        place_goal_accepted: bool = False,
+        goals_sent: int = 0,
+        pick_goal_id: object = None,
+        place_goal_id: object = None,
+        cleanup: Mapping[str, object] | None = None,
+        trigger: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        """Task 6: E-stage evidence-invalid record with the E schema and durable rows."""
+        """Task 6: E-stage evidence-invalid record with the E schema and durable rows.
+
+        F2.1: an observed ``post_grasp_lift_m`` runtime parameter (when present)
+        is persisted so pre-goal failures keep the observed lift evidence.
+        F2.6: when an action goal was accepted, the truthful goal-state fields
+        (pick/place goal-sent flags, goal IDs, goals sent, cleanup outcome) are
+        persisted into every durable artifact; no row claims no goal was sent
+        when one was accepted.
+        """
+        controller_goal_sent = bool(
+            trigger is not None
+            or cleanup is not None
+            or post_grasp_lift_m_observed is not None
+        )
         record: dict[str, object] = {
             "scenario_id": scenario_id,
             "stage": "E",
@@ -7744,12 +7993,21 @@ class IntegratedGateExecutor:
             "status": "evidence-invalid",
             "reason_code": reason_code,
             "reasons": list(reasons),
-            "pick_goal_sent": False,
-            "place_goal_sent": False,
-            "place_goal_accepted": False,
-            "goals_sent": 0,
+            "pick_goal_sent": bool(pick_goal_sent),
+            "place_goal_sent": bool(place_goal_sent),
+            "place_goal_accepted": bool(place_goal_accepted),
+            "goals_sent": int(goals_sent),
+            "pick_goal_id": pick_goal_id,
+            "place_goal_id": place_goal_id,
+            "controller_goal_sent": bool(controller_goal_sent),
             "isaac_joint_commands_published": False,
         }
+        if post_grasp_lift_m_observed is not None:
+            record["post_grasp_lift_m_observed"] = dict(post_grasp_lift_m_observed)
+        if cleanup is not None:
+            record["cleanup"] = dict(cleanup)
+        if trigger is not None:
+            record["trigger"] = dict(trigger)
         if handler is not None:
             record["handler"] = handler
         try:
@@ -7763,12 +8021,19 @@ class IntegratedGateExecutor:
                 "reason_code": reason_code,
                 "reasons": list(reasons),
                 "diagnostic_only": True,
-                "pick_goal_sent": False,
-                "place_goal_sent": False,
-                "place_goal_accepted": False,
+                "pick_goal_sent": bool(pick_goal_sent),
+                "place_goal_sent": bool(place_goal_sent),
+                "place_goal_accepted": bool(place_goal_accepted),
+                "controller_goal_sent": bool(controller_goal_sent),
                 "isaac_joint_commands_published": False,
                 "timestamp": float(time.monotonic()),
             }
+            if post_grasp_lift_m_observed is not None:
+                row["post_grasp_lift_m_observed"] = dict(post_grasp_lift_m_observed)
+            if cleanup is not None:
+                row["cleanup"] = dict(cleanup)
+            if trigger is not None:
+                row["trigger"] = dict(trigger)
             if handler is not None:
                 row["handler"] = handler
             self._append_jsonl(self.attempt_dir / "integrated-execution.jsonl", row)
@@ -7782,21 +8047,122 @@ class IntegratedGateExecutor:
                     "report_revision": REPORT_REVISION,
                     "scenario_id": scenario_id,
                     "stage": "E",
+                    "handler": handler,
                     "diagnostic_only": True,
                     "physical_verdict": None,
                     "status": "evidence-invalid",
                     "reason_code": reason_code,
                     "reasons": list(reasons),
-                    "pick_goal_sent": False,
-                    "place_goal_sent": False,
-                    "place_goal_accepted": False,
+                    "pick_goal_sent": bool(pick_goal_sent),
+                    "place_goal_sent": bool(place_goal_sent),
+                    "place_goal_accepted": bool(place_goal_accepted),
+                    "goals_sent": int(goals_sent),
+                    "pick_goal_id": pick_goal_id,
+                    "place_goal_id": place_goal_id,
+                    "controller_goal_sent": bool(controller_goal_sent),
+                    "post_grasp_lift_m_observed": (
+                        dict(post_grasp_lift_m_observed)
+                        if post_grasp_lift_m_observed is not None
+                        else None
+                    ),
+                    "cleanup": dict(cleanup) if cleanup is not None else None,
+                    "trigger": dict(trigger) if trigger is not None else None,
                     "isaac_joint_commands_published": False,
                 },
             )
         except Exception:
             pass
+        if spec is not None:
+            self._write_e_pregoal_durable_rows(
+                scenario_id, spec, record, handler=handler,
+                task_result_status=None, terminal_status=None,
+            )
         self._e_journal_failure(reason=reason_code, graph_diagnosis="E diagnostic journal")
         return record
+
+    def _write_e_pregoal_durable_rows(
+        self,
+        scenario_id: str,
+        spec: Mapping[str, object],
+        record: Mapping[str, object],
+        *,
+        handler: str | None,
+        task_result_status: object,
+        terminal_status: str | None,
+    ) -> None:
+        """Write the non-execution durable E rows for an evidence-invalid path.
+
+        F2.6: ``_evidence_invalid_e`` is used by the unexpected-exception path
+        after a Pick/Place goal was accepted.  Every durable artifact must
+        truthfully preserve the accepted-goal state (goal-sent flags, goal IDs,
+        goals sent, cleanup/cancel outcome, ``status=evidence-invalid``); no row
+        may claim no goal was sent when one was accepted.
+        """
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "moveit-plans.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "goal_kind": spec.get("kind"),
+                    "status": "evidence-invalid",
+                    "row_kind": "lifecycle",
+                    "pick_goal_sent": record.get("pick_goal_sent"),
+                    "place_goal_sent": record.get("place_goal_sent"),
+                    "diagnostic_only": True,
+                },
+            )
+        except Exception:
+            pass
+        try:
+            self._append_jsonl(
+                self.attempt_dir / "controller-results.jsonl",
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "status": "evidence-invalid",
+                    "controller_goal_sent": record.get("controller_goal_sent"),
+                    "controller_endpoint": FJT_ENDPOINT if record.get("controller_goal_sent") else None,
+                    "gripper_goal_sent": False,
+                    "task_result_status": task_result_status,
+                    "terminal_status": terminal_status,
+                    "diagnostic_only": True,
+                },
+            )
+        except Exception:
+            pass
+        try:
+            goal_path = self.attempt_dir / "goals" / f"{scenario_id}.json"
+            goal_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(
+                {
+                    "schema_version": 1,
+                    "report_revision": REPORT_REVISION,
+                    "scenario_id": scenario_id,
+                    "handler": handler,
+                    "stage": "E",
+                    "diagnostic_only": True,
+                    "physical_verdict": None,
+                    "polarity": spec.get("polarity"),
+                    "status": "evidence-invalid",
+                    "reason_code": record.get("reason_code"),
+                    "pick_goal_sent": record.get("pick_goal_sent"),
+                    "place_goal_sent": record.get("place_goal_sent"),
+                    "place_goal_accepted": record.get("place_goal_accepted"),
+                    "goals_sent": record.get("goals_sent"),
+                    "pick_goal_id": record.get("pick_goal_id"),
+                    "place_goal_id": record.get("place_goal_id"),
+                    "geometry": dict(spec.get("geometry") or {}),
+                    "cleanup": dict(record.get("cleanup") or {}),
+                    "trigger": dict(record.get("trigger") or {}),
+                    "isaac_joint_commands_published": False,
+                },
+                goal_path,
+            )
+        except Exception:
+            pass
 
     def _e_journal_failure(self, *, reason: str, graph_diagnosis: str) -> str:
         """Write the canonical E failure planning-scene.json, returning its status.
@@ -7856,6 +8222,7 @@ class IntegratedGateExecutor:
         terminal_status: str | None = None,
         trigger: Mapping[str, object] | None = None,
         cancel_response: Mapping[str, object] | None = None,
+        cleanup: Mapping[str, object] | None = None,
         fjt_goal_uuid: object = None,
         fjt_status: object = None,
     ) -> dict[str, object]:
@@ -7947,6 +8314,8 @@ class IntegratedGateExecutor:
             "graph": graph_status,
             "isaac_joint_commands_published": False,
         }
+        if self._e_post_grasp_lift_m_observed is not None:
+            record["post_grasp_lift_m_observed"] = dict(self._e_post_grasp_lift_m_observed)
         if trigger is not None:
             record["trigger"] = dict(trigger)
             if "goal_uuid" in trigger and record.get("fjt_goal_uuid") is None:
@@ -7959,6 +8328,8 @@ class IntegratedGateExecutor:
             record["cancel_goals_canceling"] = list(cancel_response.get("goals_canceling") or [])
             if cancel_response.get("error"):
                 record["cancel_error"] = cancel_response.get("error")
+        if cleanup is not None:
+            record["cleanup"] = dict(cleanup)
         try:
             self._write_e_artifacts(scenario_id, spec, record, readiness)
         except Exception as exc:
@@ -7995,6 +8366,8 @@ class IntegratedGateExecutor:
                 "place_goal_sent": record.get("place_goal_sent"),
                 "place_goal_accepted": record.get("place_goal_accepted"),
                 "controller_goal_sent": record.get("controller_goal_sent"),
+                "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
+                "cleanup": dict(record.get("cleanup") or {}),
                 "trigger": dict(record.get("trigger") or {}),
                 "isaac_joint_commands_published": False,
                 "timestamp": float(time.monotonic()),
@@ -8056,6 +8429,8 @@ class IntegratedGateExecutor:
                 "task_result_status": record.get("task_result_status"),
                 "task_result_status_string": record.get("task_result_status_string"),
                 "terminal_status": record.get("terminal_status"),
+                "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
+                "cleanup": dict(record.get("cleanup") or {}),
                 "trigger": dict(record.get("trigger") or {}),
                 "event_log": record.get("event_log"),
                 "elapsed_s": record.get("elapsed_s"),
@@ -8081,6 +8456,8 @@ class IntegratedGateExecutor:
                 "place_goal_accepted": record.get("place_goal_accepted"),
                 "goals_sent": record.get("goals_sent"),
                 "geometry": dict(spec.get("geometry") or {}),
+                "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
+                "cleanup": dict(record.get("cleanup") or {}),
                 "trigger": dict(record.get("trigger") or {}),
                 "event_log": record.get("event_log"),
                 "isaac_joint_commands_published": False,
@@ -8115,6 +8492,8 @@ class IntegratedGateExecutor:
                 "pick_goal_sent": record.get("pick_goal_sent"),
                 "place_goal_sent": record.get("place_goal_sent"),
                 "place_goal_accepted": record.get("place_goal_accepted"),
+                "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
+                "cleanup": dict(record.get("cleanup") or {}),
                 "trigger": dict(record.get("trigger") or {}),
                 "downgraded_from": downgraded_from,
                 "isaac_joint_commands_published": False,
@@ -8156,6 +8535,8 @@ class IntegratedGateExecutor:
                     "place_goal_sent": record.get("place_goal_sent"),
                     "place_goal_accepted": record.get("place_goal_accepted"),
                     "controller_goal_sent": record.get("controller_goal_sent"),
+                    "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
+                    "cleanup": dict(record.get("cleanup") or {}),
                     "trigger": dict(record.get("trigger") or {}),
                     "isaac_joint_commands_published": False,
                     "timestamp": float(time.monotonic()),
@@ -8197,6 +8578,8 @@ class IntegratedGateExecutor:
                     "task_result_status": record.get("task_result_status"),
                     "task_result_status_string": record.get("task_result_status_string"),
                     "terminal_status": record.get("terminal_status"),
+                    "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
+                    "cleanup": dict(record.get("cleanup") or {}),
                     "trigger": dict(record.get("trigger") or {}),
                     "downgraded_from": downgraded_from,
                     "error": record.get("artifact_error"),

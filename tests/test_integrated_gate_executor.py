@@ -2124,3 +2124,97 @@ def test_stage_d_expected_physical_lists_match_scenario_declarations():
         spec = stage_d_dispatch(scenario_name, scenario=readiness_scenario(contract))
         assert list(declared) == spec["expected_physical"]
         assert list(declared) == list(STAGE_D_EXPECTED_PHYSICAL[scenario_name])
+
+
+def test_post_grasp_lift_m_observation_enforces_010_threshold():
+    """F2.1: the injected ``post_grasp_lift_m`` runtime-parameter observation
+    accepts a finite value >= ``object_lift_m`` (0.10 m) and rejects the
+    production default 0.08, bool, non-finite, missing-identity, and stale
+    samples with a stable reason string (never a 15 s transport timeout)."""
+    from validation.integrated_gate_executor import _post_grasp_lift_m_observation
+
+    ok = _post_grasp_lift_m_observation(
+        {"value_m": 0.10, "identity": "post-grasp-lift-m", "age_s": 0.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    )
+    assert not isinstance(ok, str)
+    value_m, meta = ok
+    assert value_m == pytest.approx(0.10)
+    assert meta["identity"] == "post-grasp-lift-m"
+    assert meta["value_m"] == pytest.approx(0.10)
+    assert meta["object_lift_m"] == pytest.approx(0.10)
+    assert meta["received_mono"] > 0.0
+    # A value above the threshold is equally accepted (0.10 + headroom).
+    high = _post_grasp_lift_m_observation(
+        {"value_m": 0.12, "identity": "post-grasp-lift-m", "age_s": 0.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    )
+    assert not isinstance(high, str)
+
+    assert _post_grasp_lift_m_observation(
+        {"value_m": 0.08, "identity": "x", "age_s": 0.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    ).startswith("below-object-lift")
+    # bool is non-finite in this contract (a raw float parameter is required).
+    assert _post_grasp_lift_m_observation(
+        {"value_m": True, "identity": "x", "age_s": 0.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    ) == "non-finite"
+    assert _post_grasp_lift_m_observation(
+        {"value_m": float("nan"), "identity": "x", "age_s": 0.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    ) == "non-finite"
+    assert _post_grasp_lift_m_observation(
+        {"value_m": "x", "identity": "x", "age_s": 0.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    ) == "non-finite"
+    # Missing identity/receipt metadata is rejected (fresh identity required).
+    assert _post_grasp_lift_m_observation(
+        {"value_m": 0.10, "age_s": 0.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    ) == "missing"
+    assert _post_grasp_lift_m_observation(
+        "not-a-sample",
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    ) == "missing"
+    # Stale samples are rejected.
+    assert _post_grasp_lift_m_observation(
+        {"value_m": 0.10, "identity": "x", "age_s": 99.0},
+        object_lift_m=0.10,
+        fresh_limit_s=0.25,
+    ) == "stale"
+
+
+def test_post_grasp_lift_m_transport_kind_set_is_exact():
+    """F2.1: exactly the four E transport scenarios require the observed
+    ``post_grasp_lift_m`` runtime parameter (positive, occupied-place,
+    cancel-transport, safety-transport); cancel-approach and the other
+    negatives never do."""
+    from validation.integrated_gate_executor import (
+        STAGE_E_KIND,
+        STAGE_E_SCENARIOS,
+        _E_TRANSPORT_KINDS,
+    )
+
+    transport_kinds = {STAGE_E_KIND[scenario] for scenario in STAGE_E_SCENARIOS}
+    assert _E_TRANSPORT_KINDS == frozenset(
+        {"positive", "occupied-place", "cancel-transport", "safety-transport"}
+    )
+    assert transport_kinds == {
+        "positive",
+        "blocked-approach",
+        "unreachable-grasp",
+        "malformed-back",
+        "cancel-approach",
+        "cancel-transport",
+        "safety-transport",
+        "occupied-place",
+    }
