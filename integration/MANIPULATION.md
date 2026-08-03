@@ -363,6 +363,25 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 7, fix round 2 — "verify terminal
+  quiescence"): Verified terminal quiescence at the anchor instead of across the
+  braking ramp (F2.1), closing the live-blocking cancel false-invalid on
+  D-cancel and E cancel-transport: the verifier now proves rest from a bounded
+  two-frame tail ending at `quiescent` (velocity <= `safety_stop_velocity_rad_s`
+  + stable command target), so the arm's real deceleration after
+  `cancel-requested`/`operator-clear` is allowed, while a ramp that does not
+  settle, a new command target/goal in the subwindow, and later journal stages
+  fail.  Fixtures carry production-real deceleration ramps.  Hardening: F2.2
+  restores forbidden-token scanning over unpaired source/provider strings while
+  keeping `env_cloud_evidence.source="observed-environment-cloud"` as semantic
+  provenance, adds `goal_kind` to the provider scan, and keeps `pipeline_id`
+  exact lowercase `"ompl"` (case variants evidence-invalid).  F2.3 adds a
+  consistent non-success safety terminal requirement to D safety.  F2.4 makes
+  CLI/API shape failures atomically write durable `evidence-invalid`
+  `gate-verdict.json`.  F2.5 restricts raw target identity to the bare
+  `qualification_cube`.  No build, no live Isaac/ROS, no cuMotion; production
+  modules/scenarios/policies/executor/journal/config untouched.
+
 - 2026-08-04 (integrated qualification Task 7, fix round 1 — "align verifier
   with production evidence"): Aligned the verifier with production
   executor/journal/backend artifact shapes and closed the review blockers and

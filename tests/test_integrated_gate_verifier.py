@@ -671,3 +671,262 @@ def test_cli_scenario_id_mismatch_exit_code(tmp_path):
         )
         assert result.returncode == 2, result.stdout + result.stderr
         assert "does not match" in result.stderr or "does not match" in result.stdout
+        # F2.4: the CLI identity-mismatch path atomically writes gate-verdict.json.
+        verdict = json.loads((attempt / "gate-verdict.json").read_text(encoding="utf-8"))
+        assert verdict["status"] == "evidence-invalid"
+        assert any("does not match" in error for error in verdict["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 2 — F2.1 terminal quiescence at the anchor, not across the ramp.
+# --------------------------------------------------------------------------- #
+def test_f2_1_cancel_fixtures_carry_deceleration_ramp(tmp_path):
+    # D cancel and E cancel-transport pass fixtures must carry a production-real
+    # deceleration ramp after cancel-requested with at least two settled tail
+    # frames at quiescent (F2.1), and the verifier must prove quiescence from
+    # that bounded tail (not max-over-window).
+    for scenario_id in ("qualification-moveit-cancel",
+                        "qualification-pick-place-cancel-transport"):
+        attempt = write_integrated_attempt(tmp_path / scenario_id, scenario=scenario_id)
+        records = _raw_records(attempt)
+        journal = _journal_records(attempt)
+        cancel_key = _first_key(journal, "cancel-requested")[0]
+        quiescent_key = _first_key(journal, "quiescent")[0]
+        # A non-zero velocity exists inside the braking window (the ramp).
+        braking_speeds = [
+            max(abs(v) for v in r["robot"]["joint_velocities"])
+            for r in records
+            if cancel_key < int(r["frame_index"]) <= quiescent_key
+        ]
+        assert any(speed > 0.02 for speed in braking_speeds), scenario_id
+        # At least two settled tail frames (quiescent-1 and quiescent).
+        tail_speeds = [
+            max(abs(v) for v in r["robot"]["joint_velocities"])
+            for r in records
+            if int(r["frame_index"]) in (quiescent_key - 1, quiescent_key)
+        ]
+        assert len(tail_speeds) == 2 and all(speed <= 0.02 for speed in tail_speeds), scenario_id
+        verdict = _verify_at(tmp_path / f"v-{scenario_id}", scenario_id)
+        assert verdict["status"] == "verified-pass", verdict["errors"]
+
+
+def test_f2_1_ramp_not_settled_fails(tmp_path):
+    # A ramp that does not settle by quiescent fails the terminal-quiescence tail.
+    for scenario_id in ("qualification-moveit-cancel",
+                        "qualification-pick-place-cancel-transport"):
+        verdict = _verify_at(tmp_path / scenario_id, scenario_id, cancel_ramp_not_settled=True)
+        assert verdict["status"] == "verified-fail", (scenario_id, verdict["status"])
+        names = [c["name"] for c in verdict["checks"] if not c["passed"]]
+        assert "quiescent_after_cancel" in names or "no_post_cancel_stage" in names
+
+
+def test_f2_1_cancel_target_change_fails(tmp_path):
+    # A new command target/goal between cancel and quiescent fails even if the
+    # velocity later settles (F2.1 item 3).
+    for scenario_id in ("qualification-moveit-cancel",
+                        "qualification-pick-place-cancel-transport"):
+        verdict = _verify_at(tmp_path / scenario_id, scenario_id, cancel_target_change=True)
+        assert verdict["status"] == "verified-fail", (scenario_id, verdict["status"])
+
+
+def test_f2_1_post_quiescent_motion_excluded_after_ramp(tmp_path):
+    # Motion only after quiescent remains excluded and does not affect the
+    # verdict even with the production-real braking ramp present (F2.1).
+    verdict = _verify_at(tmp_path, "qualification-moveit-cancel", post_quiescent_motion_ignored=True)
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+
+
+def test_f2_1_safety_braking_ramp_truth(tmp_path):
+    # F2.1 item 6: preserve the safety creep contract (no silent weakening) and
+    # determine truthfully whether a realistic safety braking ramp passes or
+    # fails.  A small ramp inside safety_position_creep_rad passes; a large ramp
+    # (0.012 rad > 0.005 rad creep bound) fails target_frozen.
+    verdict = _verify_at(tmp_path / "small", "qualification-moveit-safety", safety_braking_ramp=True)
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+    verdict = _verify_at(tmp_path / "large", "qualification-moveit-safety", safety_braking_ramp_large=True)
+    assert verdict["status"] == "verified-fail", verdict["status"]
+    names = [c["name"] for c in verdict["checks"] if not c["passed"]]
+    assert "target_frozen" in names
+
+
+def test_f2_1_safety_transport_ramp_truth(tmp_path):
+    # E safety-transport deceleration-ramp probe: the terminal-quiescence tail
+    # (no_post_clear_resume) settles on a real braking ramp and does NOT
+    # false-fail, while the strict safety_stop_frames velocity_below_stop_limit
+    # truthfully fails because the velocity at effective-stop is above the stop
+    # limit (F2.1 item 6).
+    verdict = _verify_at(
+        tmp_path,
+        "qualification-pick-place-safety-transport",
+        safety_transport_ramp=True,
+    )
+    assert verdict["status"] == "verified-fail", verdict["status"]
+    names = [c["name"] for c in verdict["checks"] if not c["passed"]]
+    assert "velocity_below_stop_limit" in names
+    assert "no_post_clear_resume" not in names
+
+
+# --------------------------------------------------------------------------- #
+# F2.2 provider-taint field gaps without re-breaking semantic provenance.
+# --------------------------------------------------------------------------- #
+def test_f2_2_env_cloud_taint_fails_closed(tmp_path):
+    # env_cloud_evidence.source="cuMotion-provider" (unpaired) fails because it
+    # carries a forbidden token, not because it is absent from the endpoint-
+    # provider node allowlist (F2.2).
+    verdict = _verify_at(
+        tmp_path,
+        "qualification-moveit-cartesian-retreat",
+        env_cloud_taint=True,
+    )
+    assert verdict["status"] == "evidence-invalid"
+    assert any("source field" in error and "forbidden token" in error
+               for error in verdict["errors"])
+
+
+def test_f2_2_env_cloud_provenance_still_passes(tmp_path):
+    # The committed semantic provenance value remains accepted (F1.3/F2.2).
+    verdict = _verify_at(tmp_path, "qualification-moveit-cartesian-retreat")
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+
+
+def test_f2_2_goal_kind_taint_fails_closed(tmp_path):
+    # goal_kind is a committed provider/goal field; a forbidden token fails.
+    verdict = _verify(tmp_path, goal_kind_taint=True)
+    assert verdict["status"] == "evidence-invalid"
+    assert any("provider field" in error and "forbidden token" in error
+               for error in verdict["errors"])
+
+
+def test_f2_2_pipeline_ompl_case_variant_fails_closed(tmp_path):
+    # Exact lowercase "ompl" is canonical identity strictness (F2.2): a case
+    # variant is evidence-invalid, deliberately not normalized.
+    verdict = _verify(tmp_path, pipeline_ompl_uppercase=True)
+    assert verdict["status"] == "evidence-invalid"
+    assert any("pipeline_id" in error for error in verdict["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# F2.3 D-safety terminal consistency.
+# --------------------------------------------------------------------------- #
+def test_f2_3_d_safety_valid_aborted_terminal(tmp_path):
+    # Production-shaped safety-stop/aborted summary: the safety terminal is a
+    # consistent non-success and the check passes.
+    verdict = _verify_at(tmp_path, "qualification-moveit-safety")
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+    check = next(c for c in verdict["checks"] if c["name"] == "safety_terminal_non_success")
+    assert check["passed"] is True
+
+
+def test_f2_3_d_safety_terminal_success_fails(tmp_path):
+    # A safety attempt claiming terminal success is verified-fail.
+    verdict = _verify_at(tmp_path, "qualification-moveit-safety", safety_terminal_success=True)
+    assert verdict["status"] == "verified-fail"
+    names = [c["name"] for c in verdict["checks"] if not c["passed"]]
+    assert "safety_terminal_non_success" in names
+
+
+def test_f2_3_d_safety_terminal_contradiction_fails(tmp_path):
+    # A contradictory safety terminal (success string + ABORTED GoalStatus) is
+    # evidence-invalid, never a pass (F2.3).
+    verdict = _verify_at(tmp_path, "qualification-moveit-safety", safety_terminal_contradiction=True)
+    assert verdict["status"] == "evidence-invalid"
+    assert any("conflicting terminal domains" in error for error in verdict["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# F2.4 atomic verdicts for CLI and direct API shape failures.
+# --------------------------------------------------------------------------- #
+def test_f2_4_malformed_bundle_fails_closed(tmp_path):
+    import tempfile
+    from integrated_gate_verifier import VERDICT_FILENAME
+    base = load_test_scenario("qualification-pick-place-positive")
+
+    def direct(bundle):
+        with tempfile.TemporaryDirectory() as directory:
+            attempt = write_integrated_attempt(Path(directory))
+            verdict = verify_integrated_attempt(
+                scenario=bundle,
+                attempt_dir=attempt,
+                config=load_test_config(),
+            )
+            assert verdict["status"] == "evidence-invalid", verdict["status"]
+            assert verdict["verified"] is False
+            durable = json.loads(
+                (attempt / VERDICT_FILENAME).read_text(encoding="utf-8")
+            )
+            assert durable["status"] == "evidence-invalid"
+            assert durable["errors"], "durable verdict must explain the malformed field"
+            return verdict
+
+    # seed as None / list / bool (bool is not a valid int scalar).
+    for bad_seed in (None, [7], True):
+        mutated = {"scenario": dict(base["scenario"]), **base}
+        mutated["scenario"]["seed"] = bad_seed
+        direct(mutated)
+    # Missing scenario mapping entirely.
+    direct({"planning_scene": base["planning_scene"],
+            "integrated": base["integrated"]})
+    # Missing integrated mapping.
+    mutated = {"scenario": dict(base["scenario"]), **base}
+    mutated.pop("integrated", None)
+    direct(mutated)
+    # Malformed report identity seed.
+    mutated = {"scenario": dict(base["scenario"]), **base}
+    mutated["report_identities"] = {"scenario_id": "qualification-pick-place-positive",
+                                    "seed": "not-an-int"}
+    direct(mutated)
+
+
+def test_f2_4_cli_malformed_bundle_writes_durable_verdict(tmp_path):
+    import subprocess
+    import tempfile
+    from integrated_gate_verifier import _repo_root
+    with tempfile.TemporaryDirectory() as directory:
+        attempt = write_integrated_attempt(Path(directory))
+        # A scenario file whose seed is malformed fails closed with a durable
+        # gate-verdict.json and exit 2.
+        bad = Path(directory) / "bad-seed.json"
+        raw = json.loads(
+            (ROOT / "simulation" / "scenarios" / "qualification-pick-place-positive.json")
+            .read_text(encoding="utf-8")
+        )
+        raw["seed"] = [7]
+        bad.write_text(json.dumps(raw), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "validation" / "integrated_gate_verifier.py"),
+                "--scenario", str(bad),
+                "--attempt-dir", str(attempt),
+                "--config", str(ROOT / "simulation" / "qualification" / "integrated-ompl.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        verdict = json.loads((attempt / "gate-verdict.json").read_text(encoding="utf-8"))
+        assert verdict["status"] == "evidence-invalid"
+        assert any("seed" in error for error in verdict["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# F2.5 raw object identity restricted to the backend-emitted bare id.
+# --------------------------------------------------------------------------- #
+def test_f2_5_raw_object_identity_is_bare_id():
+    from integrated_gate_verifier import _OBJECT_ID_CANDIDATES, _object_pose_target
+    assert _OBJECT_ID_CANDIDATES == ("qualification_cube",)
+    # A raw frame whose object id is the planning-scene namespace is not an
+    # interchangeable raw object id (F2.5).
+    from integrated_verifier_fixtures import _frame
+    frame = _frame(0, "qualification-pick-place-positive",
+                   objects=[{"id": "sim_fixture/qualification_cube",
+                             "class_name": "cube",
+                             "pose": {"xyz": [0.65, 0.0, 0.64],
+                                      "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+                             "twist": {"linear": [0.0, 0.0, 0.0],
+                                       "angular": [0.0, 0.0, 0.0]}}])
+    assert _object_pose_target(frame) is None
+    # The bare id resolves.
+    from integrated_verifier_fixtures import _cube_object
+    bare = _frame(0, "qualification-pick-place-positive", objects=[_cube_object([0.65, 0.0, 0.64], [0.0, 0.0, 0.0])])
+    assert _object_pose_target(bare) is not None

@@ -314,6 +314,44 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 7, fix round 2 — "verify terminal
+  quiescence"): Made the integrated verifier production-safe for cancel and
+  clear deceleration.  F2.1 — terminal quiescence is now proven from a bounded
+  tail ending at the `quiescent` join key (at least two consecutive settled raw
+  frames with max absolute arm velocity <= `safety_stop_velocity_rad_s` and a
+  stable command target), never from max-speed over the whole
+  `[cancel-requested, quiescent]` braking window; D-cancel and E
+  cancel-transport pass fixtures now carry a production-real deceleration ramp
+  that settles exactly at quiescent, a ramp that does not settle fails, and a
+  new command target between cancel/clear and quiescent fails even if the
+  velocity later settles.  `no_post_clear_resume`/forbidden `post_clear_resume`
+  treat motion after clear as a resume only when it is a new target/goal, not
+  the pre-existing command's deceleration.  Safety-specific
+  `safety_stop_frames`/`safety_position_creep_rad` checks are preserved; a
+  realistic D-safety braking-ramp test determines the contract truthfully
+  (small ramp inside the creep bound passes, 0.012 rad drift fails
+  `target_frozen`) and the E safety-transport ramp truthfully fails
+  `velocity_below_stop_limit` while `no_post_clear_resume` stays green.  F2.2 —
+  forbidden-token scanning is restored over unpaired source/provider strings
+  while the committed semantic provenance
+  `env_cloud_evidence.source="observed-environment-cloud"` stays accepted;
+  `goal_kind` joins the provider/goal-field scan; `pipeline_id` remains exact
+  lowercase `"ompl"` (case variants are evidence-invalid by intentional identity
+  strictness).  F2.3 — the D-safety attempt now requires a consistent non-success
+  terminal across every present status domain (`safety_terminal_non_success`);
+  a terminal claiming success fails and a contradictory pair is evidence-invalid.
+  F2.4 — the CLI identity/config-mismatch path atomically writes
+  `gate-verdict.json` before exit 2, and `verify_integrated_attempt` resolves a
+  stable fallback identity so malformed/missing bundle structures,
+  bool/string/list/null seed, missing integrated mapping, and malformed report
+  identities return durable `evidence-invalid` (never a traceback).  F2.5 — raw
+  measured target identity is restricted to the backend-emitted bare
+  `qualification_cube`; `sim_fixture/...` stays in the planning-scene diagnostic
+  domain and the dead `_target_in_object_ids` helper is removed.  Test suite
+  grows to 52 tests; affected regression + qualification batch passes 637 + 2
+  subtests.  No build, no live Isaac/ROS, no cuMotion; production
+  modules/scenarios/policies/executor/journal/config are untouched.
+
 - 2026-08-04 (integrated qualification Task 7, fix round 1 — "align verifier
   with production evidence"): Aligned the independent integrated verifier with
   production raw-truth/executor/journal shapes and closed three blocker and
