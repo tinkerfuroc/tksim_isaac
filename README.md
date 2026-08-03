@@ -314,6 +314,63 @@ References:
 
 ## Changelog
 
+- 2026-08-03 (integrated qualification Task 6 — "add fixed-target Pick and Place
+  controls"): Added the Stage-E fixed-target Pick/Place diagnostics executor to
+  the same ROS-lazy `validation/integrated_gate_executor.py`.  A closed ROS-free
+  `stage_e_dispatch` validates exactly the eight committed Stage-E scenarios
+  (`qualification-pick-place-{positive,blocked-approach,unreachable-grasp,
+  malformed-back,cancel-approach,cancel-transport,safety-transport,
+  occupied-place}`) for exact id, `integrated.stage == "E"`,
+  `integrated.execution_profile == "sim_ompl"`, exact declared polarity
+  (positive/negative), the exact configured `expected_physical` list, the exact
+  `expected_negative` required/forbidden contract, exact
+  `forbidden_endpoints == ["/isaac_joint_commands"]`, exact declared
+  `trigger_timeout_s`, and the pinned fixed-target geometry
+  (`grasp_tcp_xyz [0.65, 0, 0.72]`, `object_root_xyz [0.65, 0, 0.60]`,
+  `place_target_point` base_link `[0.85, 0, 0.72]`, identity orientation) plus
+  the declared six-value malformed-back vector; unknown/C/D-stage, malformed, or
+  mutated scenarios fail closed before any goal is created or sent.  The positive
+  sequence uses only production `/pickup_action` then `/place_action` with the
+  deterministic cube cloud and exact seven-joint `Q_OUTBOUND`, `use_mesh=True`,
+  `stay=False`, and requires observed PlanningScene attachment before
+  `scene-attach` and observed detach before `scene-detach` (never action-result
+  inference).  The E journal branches per scenario: the positive order equals
+  `POSITIVE_ORDER` exactly and each negative uses its own exact diagnostic event
+  order with scenario-specific forbidden events, so Gate-C/D journal bytes stay
+  unchanged.  Live TCP evidence reuses the existing injected
+  `current_tcp_pose_provider` seam (never an embedded TF listener): a bounded
+  per-attempt sample deque derives `tcp_z_m` and `tcp_speed_m_s = |Δxyz|/Δt`
+  from the two newest fresh receipt-sequenced samples; fewer than two fresh
+  samples means the trigger cannot fire and a timeout is evidence-invalid, never
+  a pass.  FJT correlation is receipt-window only (first fresh FJT EXECUTING
+  entry after the goal-acceptance baseline for approach, first later one for
+  transport) with observed UUIDs recorded as evidence — the internal Pick/Place
+  ExecuteTrajectory UUID is never claimed observable.
+  cancel-approach/cancel-transport cancel the exact Pick handle at the trigger;
+  safety-transport asserts operator safety, requires effective-stop evidence,
+  clears only after the stop, and requires quiescence with no auto-resume;
+  occupied-place sends Place and cancels at the first fresh Place target-motion
+  trigger while the target remains attached (never waiting for the natural
+  failure path that may open/detach).  malformed-back calls the real builder with
+  the committed six-value back vector and requires a pre-send `ValueError` with
+  zero action traffic and no PlanningScene mutation.  The fail-dominant artifact
+  transaction mirrors Gate D with `event="gate-e"`, `stage="E"`, handler/polarity,
+  pick/place goal-sent flags, both the action-client `GoalStatus` and the
+  Pick/Place `Result.status` domains, task/FJT UUIDs, trigger record, and
+  `isaac_joint_commands_published=false` across `integrated-execution.jsonl/.json`,
+  `moveit-plans.jsonl`, `controller-results.jsonl`, visual-capture requests, and
+  per-scenario goal artifacts; any journal/graph/artifact failure downgrades every
+  status-bearing stream to `evidence-invalid`.  Task 6 records diagnostics only —
+  raw contact/lift/release/collision verdicts remain Task 7 verifier work.
+  Humble suite grows to 136 tests (fixed Pick/Place geometry, malformed-back
+  pre-send rejection + zero traffic, positive full sequence + observed-attach
+  guard, cancel-approach/cancel-transport/safety-transport/occupied-place,
+  status-domain separation, receipt-window FJT selection, artifact
+  fail-dominance); the pure suite grows to 121 tests (all eight dispatches +
+  mutation rejection, per-kind journal orders/forbidden events, occupied-place
+  fixture ownership, TCP speed/z derivation and undersampling).  No build or live
+  run is required.
+
 - 2026-08-03 (integrated qualification Task 5, formal-review fix round 2 —
   "seal Gate D evidence streams"): Resolved the formal SPEC/QUALITY residual
   findings F2.1-F2.7 in the Stage-D evidence path.  F2.1 — a D artifact-write

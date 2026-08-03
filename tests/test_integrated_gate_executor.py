@@ -1310,6 +1310,487 @@ def test_stage_d_dispatch_rejects_mutated_execution_profile():
         stage_d_dispatch("qualification-moveit-safety", scenario=mutated)
 
 
+# --- Stage-E dispatch contract (Task 6 / Gate E) ----------------------------
+
+STAGE_E_SCENARIO_NAMES = (
+    "qualification-pick-place-positive",
+    "qualification-pick-place-blocked-approach",
+    "qualification-pick-place-unreachable-grasp",
+    "qualification-pick-place-malformed-back",
+    "qualification-pick-place-cancel-approach",
+    "qualification-pick-place-cancel-transport",
+    "qualification-pick-place-safety-transport",
+    "qualification-pick-place-occupied-place",
+)
+
+STAGE_E_KIND_EXPECTED = {
+    "qualification-pick-place-positive": "positive",
+    "qualification-pick-place-blocked-approach": "blocked-approach",
+    "qualification-pick-place-unreachable-grasp": "unreachable-grasp",
+    "qualification-pick-place-malformed-back": "malformed-back",
+    "qualification-pick-place-cancel-approach": "cancel-approach",
+    "qualification-pick-place-cancel-transport": "cancel-transport",
+    "qualification-pick-place-safety-transport": "safety-transport",
+    "qualification-pick-place-occupied-place": "occupied-place",
+}
+
+STAGE_E_TRIGGER_TIMEOUTS = {
+    "qualification-pick-place-positive": None,
+    "qualification-pick-place-blocked-approach": 10.0,
+    "qualification-pick-place-unreachable-grasp": 10.0,
+    "qualification-pick-place-malformed-back": 5.0,
+    "qualification-pick-place-cancel-approach": 10.0,
+    "qualification-pick-place-cancel-transport": 15.0,
+    "qualification-pick-place-safety-transport": 15.0,
+    "qualification-pick-place-occupied-place": 15.0,
+}
+
+
+@pytest.mark.parametrize("scenario_name", STAGE_E_SCENARIO_NAMES)
+def test_stage_e_dispatch_validates_eight_scenarios(scenario_name):
+    """E1: all eight Stage-E scenarios dispatch to the exact kind with the
+    declared polarity, expected_physical, expected_negative, trigger timeout,
+    and the fixed-target geometry."""
+    from validation.integrated_gate_executor import (
+        STAGE_E_EXPECTED_PHYSICAL,
+        stage_e_dispatch,
+    )
+
+    contract = scenario_report_contract(scenario_name)
+    spec = stage_e_dispatch(scenario_name, scenario=readiness_scenario(contract))
+    kind = STAGE_E_KIND_EXPECTED[scenario_name]
+    assert spec["scenario_id"] == scenario_name
+    assert spec["kind"] == kind
+    assert spec["polarity"] == ("positive" if kind == "positive" else "negative")
+    assert spec["expected_physical"] == list(STAGE_E_EXPECTED_PHYSICAL[scenario_name])
+    assert spec["forbidden_endpoints"] == ["/isaac_joint_commands"]
+    assert spec["trigger_timeout_s"] == STAGE_E_TRIGGER_TIMEOUTS[scenario_name]
+    assert spec["geometry"]["grasp_tcp_xyz"] == [0.65, 0.0, 0.72]
+    assert spec["geometry"]["object_root_xyz"] == [0.65, 0.0, 0.60]
+    assert spec["geometry"]["place_target_point"] == {
+        "frame_id": "base_link", "xyz": [0.85, 0.0, 0.72],
+    }
+    assert spec["geometry"]["place_orientation_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+    if kind != "positive":
+        assert spec["expected_negative"]["required"]
+        assert spec["expected_negative"]["forbidden"]
+    if kind == "malformed-back":
+        assert spec["back_positions"] == [0.2, -0.2, 0.15, 0.3, -0.15, 0.2]
+
+
+def test_stage_e_dispatch_rejects_non_e_scenario():
+    """E2: C/D-stage and unknown scenarios fail closed."""
+    from validation.integrated_gate_executor import stage_e_dispatch
+
+    contract = scenario_report_contract("qualification-moveit-execute-joint")
+    with pytest.raises(ValueError, match="stage must be E"):
+        stage_e_dispatch(
+            "qualification-moveit-execute-joint", scenario=readiness_scenario(contract)
+        )
+    contract = scenario_report_contract("qualification-pick-place-positive")
+    with pytest.raises(ValueError, match="scenario_id does not match"):
+        stage_e_dispatch(
+            "qualification-pick-place-cancel-transport", scenario=readiness_scenario(contract)
+        )
+    scenario = readiness_scenario(contract)
+    scenario["id"] = "other"
+    with pytest.raises(ValueError, match="not one of the Stage-E"):
+        stage_e_dispatch("other", scenario=scenario)
+
+
+def test_stage_e_dispatch_rejects_mutated_polarity_and_expected_negative():
+    """E3: mutating polarity/expected_physical/expected_negative/forbidden fails closed."""
+    from validation.integrated_gate_executor import stage_e_dispatch
+
+    contract = scenario_report_contract("qualification-pick-place-cancel-transport")
+    scenario = readiness_scenario(contract)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["acceptance"]["polarity"] = "positive"
+    with pytest.raises(ValueError, match="polarity"):
+        stage_e_dispatch("qualification-pick-place-cancel-transport", scenario=mutated)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["expected_physical"] = ["wrong"]
+    with pytest.raises(ValueError, match="expected_physical"):
+        stage_e_dispatch("qualification-pick-place-cancel-transport", scenario=mutated)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["expected_negative"]["required"] = ["wrong"]
+    with pytest.raises(ValueError, match="expected_negative"):
+        stage_e_dispatch("qualification-pick-place-cancel-transport", scenario=mutated)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["forbidden_endpoints"] = ["/other"]
+    with pytest.raises(ValueError, match="forbidden_endpoints"):
+        stage_e_dispatch("qualification-pick-place-cancel-transport", scenario=mutated)
+
+
+def test_stage_e_dispatch_rejects_mutated_execution_profile():
+    from validation.integrated_gate_executor import stage_e_dispatch
+
+    contract = scenario_report_contract("qualification-pick-place-occupied-place")
+    scenario = readiness_scenario(contract)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["execution_profile"] = "other"
+    with pytest.raises(ValueError, match="execution_profile"):
+        stage_e_dispatch("qualification-pick-place-occupied-place", scenario=mutated)
+
+
+def test_stage_e_dispatch_rejects_malformed_back_and_trigger_timeout_mutation():
+    from validation.integrated_gate_executor import stage_e_dispatch
+
+    contract = scenario_report_contract("qualification-pick-place-malformed-back")
+    scenario = readiness_scenario(contract)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["back_positions"] = [0.1] * 7
+    with pytest.raises(ValueError, match="back_positions"):
+        stage_e_dispatch("qualification-pick-place-malformed-back", scenario=mutated)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["trigger_timeout_s"] = 99.0
+    with pytest.raises(ValueError, match="trigger_timeout_s"):
+        stage_e_dispatch("qualification-pick-place-malformed-back", scenario=mutated)
+
+
+def test_stage_e_dispatch_rejects_positive_trigger_timeout_mutation():
+    from validation.integrated_gate_executor import stage_e_dispatch
+
+    contract = scenario_report_contract("qualification-pick-place-positive")
+    scenario = readiness_scenario(contract)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["trigger_timeout_s"] = 10.0
+    with pytest.raises(ValueError, match="trigger_timeout_s"):
+        stage_e_dispatch("qualification-pick-place-positive", scenario=mutated)
+
+
+def test_stage_e_dispatch_rejects_blocked_approach_goal_mutation():
+    from validation.integrated_gate_executor import stage_e_dispatch
+
+    contract = scenario_report_contract("qualification-pick-place-blocked-approach")
+    scenario = readiness_scenario(contract)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["goal"]["target_tcp_xyz"] = [0.1, 0.0, 0.1]
+    with pytest.raises(ValueError, match="target_tcp_xyz"):
+        stage_e_dispatch("qualification-pick-place-blocked-approach", scenario=mutated)
+    mutated = copy.deepcopy(scenario)
+    mutated["integrated"]["goal"]["approach"] = "sideways"
+    with pytest.raises(ValueError, match="approach"):
+        stage_e_dispatch("qualification-pick-place-blocked-approach", scenario=mutated)
+
+
+def test_e_stage_event_order_is_scenario_specific():
+    """E4: E journals use the exact per-scenario event order (never POSITIVE_ORDER
+    for negatives and never the Gate C/D order)."""
+    from validation.integrated_gate_executor import (
+        GATE_C_REQUIRED_EVENT_ORDER,
+        _e_stage_event_order,
+    )
+
+    assert _e_stage_event_order({"integrated": {"stage": "C"}}) == GATE_C_REQUIRED_EVENT_ORDER
+    assert _e_stage_event_order({"integrated": {"stage": "D"}}) == GATE_C_REQUIRED_EVENT_ORDER
+    orders = {
+        "qualification-pick-place-positive": (
+            "fixture-ready", "before-pick", "scene-attach", "lift-complete",
+            "transport", "before-release", "scene-detach", "released-settled",
+            "teardown",
+        ),
+        "qualification-pick-place-blocked-approach": (
+            "fixture-ready", "before-pick", "pick-terminal", "teardown",
+        ),
+        "qualification-pick-place-unreachable-grasp": (
+            "fixture-ready", "before-pick", "pick-terminal", "teardown",
+        ),
+        "qualification-pick-place-malformed-back": ("fixture-ready", "teardown"),
+        "qualification-pick-place-cancel-approach": (
+            "fixture-ready", "before-pick", "approach-start", "cancel-requested",
+            "quiescent", "teardown",
+        ),
+        "qualification-pick-place-cancel-transport": (
+            "fixture-ready", "before-pick", "scene-attach", "lift-complete",
+            "transport", "cancel-requested", "quiescent", "teardown",
+        ),
+        "qualification-pick-place-safety-transport": (
+            "fixture-ready", "before-pick", "scene-attach", "lift-complete",
+            "transport", "effective-stop", "operator-clear", "quiescent", "teardown",
+        ),
+        "qualification-pick-place-occupied-place": (
+            "fixture-ready", "before-pick", "scene-attach", "lift-complete",
+            "transport", "place-goal-accepted", "cancel-requested", "quiescent",
+            "teardown",
+        ),
+    }
+    for scenario_name, order in orders.items():
+        assert (
+            _e_stage_event_order({"id": scenario_name, "integrated": {"stage": "E"}})
+            == order
+        )
+
+
+def test_e_forbidden_events_are_scenario_specific():
+    from validation.integrated_gate_executor import _e_forbidden_events
+
+    transport_block = (
+        "before-release", "scene-detach", "released-settled", "task-cleanup",
+    )
+    assert _e_forbidden_events(
+        {"id": "qualification-pick-place-positive", "integrated": {"stage": "E"}}
+    ) == ()
+    assert _e_forbidden_events(
+        {"id": "qualification-pick-place-blocked-approach", "integrated": {"stage": "E"}}
+    ) == (
+        "scene-attach", "lift-complete", "transport", "before-release",
+        "scene-detach", "released-settled", "task-cleanup",
+    )
+    assert _e_forbidden_events(
+        {"id": "qualification-pick-place-malformed-back", "integrated": {"stage": "E"}}
+    ) == (
+        "before-pick", "scene-attach", "lift-complete", "transport",
+        "before-release", "scene-detach", "released-settled", "task-cleanup",
+    )
+    assert _e_forbidden_events(
+        {"id": "qualification-pick-place-cancel-approach", "integrated": {"stage": "E"}}
+    ) == (
+        "scene-attach", "lift-complete", "transport", "before-release",
+        "scene-detach", "released-settled", "task-cleanup",
+    )
+    for name in (
+        "qualification-pick-place-cancel-transport",
+        "qualification-pick-place-safety-transport",
+        "qualification-pick-place-occupied-place",
+    ):
+        assert _e_forbidden_events(
+            {"id": name, "integrated": {"stage": "E"}}
+        ) == transport_block
+
+
+def test_e_positive_order_matches_journal_positive_order():
+    from planning_scene_journal import POSITIVE_ORDER
+
+    from validation.integrated_gate_executor import STAGE_E_REQUIRED_EVENT_ORDER
+
+    assert STAGE_E_REQUIRED_EVENT_ORDER["positive"] == POSITIVE_ORDER
+
+
+def _e_journal_for(tmp_path: Path, contract: dict[str, object], *, kind: str):
+    from planning_scene_journal import (
+        PlanningSceneJournal,
+        load_model_touch_contract,
+    )
+
+    from validation.integrated_gate_executor import (
+        STAGE_E_FORBIDDEN_EVENTS,
+        STAGE_E_REQUIRED_EVENT_ORDER,
+        TARGET_OBJECT_ID,
+        TASK_NAMESPACE,
+    )
+
+    declaration = contract["planning_scene_declaration"]
+    touch = load_model_touch_contract()
+    journal = PlanningSceneJournal(
+        fixture_revision=declaration["revision"],
+        task_namespace=TASK_NAMESPACE,
+        target_object_id=TARGET_OBJECT_ID,
+        expected_attach_link=touch["link_tcp"],
+        expected_touch_links=touch["touch_links"],
+        required_event_order=STAGE_E_REQUIRED_EVENT_ORDER[kind],
+        forbidden_events=STAGE_E_FORBIDDEN_EVENTS[kind],
+        jsonl_path=tmp_path / "planning-scene.jsonl",
+    )
+    return journal, declaration
+
+
+def _e_scene(
+    declaration: Mapping[str, object],
+    *,
+    seq: int,
+    world_ids: Sequence[str],
+    attached_ids: Sequence[str] = (),
+):
+    from planning_scene_journal import load_model_touch_contract
+
+    from validation.integrated_gate_executor import TARGET_OBJECT_ID
+
+    touch = load_model_touch_contract()
+    attached_links: dict[str, str] = {}
+    touch_links: dict[str, list[str]] = {}
+    for object_id in attached_ids:
+        attached_links[object_id] = touch["link_tcp"]
+        touch_links[object_id] = list(touch["touch_links"])
+    return {
+        "scene_sequence": int(seq),
+        "scene_timestamp": float(seq),
+        "frame_index": int(seq),
+        "timestamp": float(seq),
+        "owned_ids": [str(object_id) for object_id in world_ids],
+        "attached_ids": [str(object_id) for object_id in attached_ids],
+        "attached_links": attached_links,
+        "touch_links": touch_links,
+        "fixture_revision": declaration["revision"],
+        "scene_revision_digest": "a" * 64,
+        "acm_digest": "b" * 64,
+        "robot_state_digest": "c" * 64,
+        "source": "/planning_scene",
+    }
+
+
+def test_e_positive_journal_finalizes_exact_positive_order(tmp_path):
+    """E5: the positive E journal finalizes only with the exact POSITIVE_ORDER."""
+    from validation.integrated_gate_executor import STAGE_E_REQUIRED_EVENT_ORDER
+
+    contract = scenario_report_contract("qualification-pick-place-positive")
+    journal, declaration = _e_journal_for(tmp_path, contract, kind="positive")
+    fixture = list(fixture_owned_ids(declaration))
+    target = "pick_and_place/object_mesh"
+    journal.record_diff(
+        "fixture-ready", _e_scene(declaration, seq=1, world_ids=fixture + [target])
+    )
+    journal.record_diff(
+        "before-pick", _e_scene(declaration, seq=2, world_ids=fixture + [target])
+    )
+    journal.record_diff(
+        "scene-attach",
+        _e_scene(declaration, seq=3, world_ids=fixture, attached_ids=[target]),
+    )
+    journal.snapshot("lift-complete", frame_index=4, timestamp=4.0)
+    journal.snapshot("transport", frame_index=5, timestamp=5.0)
+    journal.snapshot("before-release", frame_index=6, timestamp=6.0)
+    journal.record_diff(
+        "scene-detach", _e_scene(declaration, seq=7, world_ids=fixture + [target])
+    )
+    journal.snapshot("released-settled", frame_index=8, timestamp=8.0)
+    journal.snapshot("teardown", frame_index=9, timestamp=9.0)
+    final = journal.finalize("diagnostic-pass")
+    assert final["status"] == "diagnostic-pass"
+    assert final["events"] == list(STAGE_E_REQUIRED_EVENT_ORDER["positive"])
+    assert final["authority"] == "physics_truth"
+
+
+def test_e_blocked_approach_journal_forbids_scene_attach(tmp_path):
+    """E6: a blocked-approach journal rejects a forbidden scene-attach transition."""
+    from validation.integrated_gate_executor import STAGE_E_REQUIRED_EVENT_ORDER
+
+    contract = scenario_report_contract("qualification-pick-place-blocked-approach")
+    journal, declaration = _e_journal_for(tmp_path, contract, kind="blocked-approach")
+    fixture = list(fixture_owned_ids(declaration))
+    target = "pick_and_place/object_mesh"
+    journal.record_diff(
+        "fixture-ready", _e_scene(declaration, seq=1, world_ids=fixture + [target])
+    )
+    journal.record_diff(
+        "before-pick", _e_scene(declaration, seq=2, world_ids=fixture + [target])
+    )
+    with pytest.raises(ValueError, match="forbidden"):
+        journal.record_diff(
+            "scene-attach",
+            _e_scene(declaration, seq=3, world_ids=fixture, attached_ids=[target]),
+        )
+    journal.snapshot("pick-terminal", frame_index=3, timestamp=3.0)
+    journal.snapshot("teardown", frame_index=4, timestamp=4.0)
+    final = journal.finalize("diagnostic-pass")
+    assert final["events"] == list(STAGE_E_REQUIRED_EVENT_ORDER["blocked-approach"])
+
+
+def test_e_malformed_back_journal_is_fixture_ready_teardown(tmp_path):
+    """E7: the malformed-back journal never records before-pick (forbidden)."""
+    from validation.integrated_gate_executor import STAGE_E_REQUIRED_EVENT_ORDER
+
+    contract = scenario_report_contract("qualification-pick-place-malformed-back")
+    journal, declaration = _e_journal_for(tmp_path, contract, kind="malformed-back")
+    fixture = list(fixture_owned_ids(declaration))
+    journal.record_diff(
+        "fixture-ready", _e_scene(declaration, seq=1, world_ids=fixture)
+    )
+    with pytest.raises(ValueError, match="forbidden"):
+        journal.snapshot("before-pick", frame_index=2, timestamp=2.0)
+    journal.snapshot("teardown", frame_index=2, timestamp=2.0)
+    final = journal.finalize("diagnostic-pass")
+    assert final["events"] == list(STAGE_E_REQUIRED_EVENT_ORDER["malformed-back"])
+
+
+def test_occupied_place_has_distinct_fixture_owner():
+    """E8: the occupied-place occupant is fixture-owned and distinct from the
+    pick target source, matching the place region."""
+    contract = scenario_report_contract("qualification-pick-place-occupied-place")
+    target_id = contract["integrated"]["goal"]["target_object_id"]
+    objects = contract["scenario_mapping"]["declaration"]["objects"]
+    occupant = next(item for item in objects if item.get("role") == "occupied-place")
+    assert target_id == "pick_and_place/object_mesh"
+    assert occupant["owner"] == "sim_fixture"
+    assert occupant["planning_scene_id"].startswith("sim_fixture/")
+    assert occupant["planning_scene_id"] != contract["integrated"]["goal"]["target_source_id"]
+    assert occupant["region"] == contract["integrated"]["goal"]["place_region"]
+
+
+def test_e_status_domains_are_distinct():
+    """E9: action-client GoalStatus and Pick/Place Result.status are two domains."""
+    from validation.integrated_gate_executor import (
+        PICK_PLACE_RESULT_NAMES,
+        _execute_status_name,
+        _pick_place_result_name,
+    )
+
+    assert _execute_status_name(4) == "succeeded"
+    assert _execute_status_name(5) == "canceled"
+    assert _execute_status_name(6) == "aborted"
+    # tinker_arm_msgs Pick/Place Result.status: 0 success .. 9 internal_error.
+    assert _pick_place_result_name(0) == "success"
+    assert _pick_place_result_name(4) == "canceled"
+    assert _pick_place_result_name(5) == "safety_stop"
+    assert _pick_place_result_name(9) == "internal_error"
+    assert PICK_PLACE_RESULT_NAMES[4] == "canceled"
+    for bad in (10, -1, 3.5, True, "4", None):
+        with pytest.raises(ValueError):
+            _pick_place_result_name(bad)
+
+
+def test_receipt_window_fjt_selection_is_sequence_bounded_not_causal():
+    """E10: FJT correlation is a receipt-window (seq-bounded), never a UUID claim."""
+    from validation.integrated_gate_executor import (
+        _first_fjt_goal_after_acceptance,
+        _next_fjt_goal,
+    )
+
+    base = {"fjt_seq": 10}
+    entries = [
+        {"goal_uuid": "a", "status": 2, "seq": 11},
+        {"goal_uuid": "b", "status": 1, "seq": 12},
+        {"goal_uuid": "c", "status": 2, "seq": 13},
+        {"goal_uuid": "d", "status": 2, "seq": 14},
+    ]
+    first = _first_fjt_goal_after_acceptance(entries, base=base)
+    assert first["goal_uuid"] == "a"
+    assert first["status"] == 2
+    assert first["seq"] == 11
+    next_goal = _next_fjt_goal(entries, after_seq=first["seq"])
+    assert next_goal["goal_uuid"] == "c"
+    assert _first_fjt_goal_after_acceptance([], base=base) is None
+    assert _next_fjt_goal(entries, after_seq=14) is None
+    # The observed FJT goal_uuid is recorded as evidence and never asserted
+    # equal to the Pick/Place internal ExecuteTrajectory UUID.
+    assert first["goal_uuid"] != "pick-internal-uuid"
+
+
+def test_tcp_speed_and_z_derive_from_two_newest_fresh_samples():
+    """E11: tcp_z_m and tcp_speed_m_s come from the two newest fresh samples."""
+    from validation.integrated_gate_executor import (
+        _tcp_speed_from_samples,
+        _tcp_z_from_samples,
+    )
+
+    samples = [
+        {"received_mono": 100.0, "xyz": [0.5, 0.0, 0.70]},
+        {"received_mono": 101.0, "xyz": [0.5, 0.0, 0.72]},
+    ]
+    assert _tcp_z_from_samples(samples) == pytest.approx(0.72)
+    assert _tcp_speed_from_samples(samples) == pytest.approx(0.02)
+    assert _tcp_z_from_samples(samples[:1]) == pytest.approx(0.70)
+    assert _tcp_speed_from_samples(samples[:1]) is None
+    assert _tcp_speed_from_samples([]) is None
+    assert _tcp_z_from_samples([]) is None
+    assert _tcp_speed_from_samples(
+        [
+            {"received_mono": 100.0, "xyz": [0.5, 0.0, 0.70]},
+            {"received_mono": 100.0, "xyz": [0.5, 0.0, 0.72]},
+        ]
+    ) is None
+
+
 # --- Stage-D pure helpers ---------------------------------------------------
 
 def test_execute_status_name_maps_terminal_statuses():
@@ -1391,23 +1872,32 @@ def test_derive_retreat_target_fails_closed_on_bad_input():
             derive_retreat_target_pose(source, distance_m=0.10, axis="+z")
 
 
-def test_run_pick_place_negative_is_zero_traffic_fail_closed_stub():
-    """D8: Gate-E negative stub records no release and zero goals for the two
-    cancellation identities, and rejects all others."""
-    from validation.integrated_gate_executor import run_pick_place_negative
+def test_stage_e_dispatch_rejects_unknown_and_non_e_identities():
+    """E12: unknown identities fail closed and the positive scenario is
+    dispatchable (its kind is positive, so the negative runner's ValueError
+    gate is reachable)."""
+    from validation.integrated_gate_executor import stage_e_dispatch
 
-    record = run_pick_place_negative("cancel-approach")
-    assert record["events"] == ["approach-start", "cancel"]
-    assert record["release_stage_started"] is False
-    assert record["released"] is False
-    assert record["goals_sent"] == 0
-    record = run_pick_place_negative("qualification-pick-place-cancel-transport")
-    assert record["events"] == ["approach-start", "lift-complete", "cancel"]
-    assert record["release_stage_started"] is False
-    assert record["released"] is False
-    for bad in ("qualification-pick-place-positive", "cancel", "other", ""):
-        with pytest.raises(ValueError):
-            run_pick_place_negative(bad)
+    contract = scenario_report_contract("qualification-pick-place-positive")
+    positive = stage_e_dispatch(
+        "qualification-pick-place-positive",
+        scenario=readiness_scenario(contract),
+    )
+    assert positive["kind"] == "positive"
+    # An unknown id that does not match the scenario mapping fails closed.
+    cancel_contract = scenario_report_contract("qualification-pick-place-cancel-approach")
+    with pytest.raises(ValueError, match="scenario_id does not match"):
+        stage_e_dispatch("other", scenario=readiness_scenario(cancel_contract))
+    # An id that matches the mapping but is not a committed E scenario fails
+    # closed after identity/stage/profile checks.
+    for bad in ("cancel", "other"):
+        scenario = readiness_scenario(cancel_contract)
+        scenario["id"] = bad
+        with pytest.raises(ValueError, match="not one of the Stage-E"):
+            stage_e_dispatch(bad, scenario=scenario)
+    # An empty scenario id fails closed as a nonempty-string requirement.
+    with pytest.raises(ValueError, match="nonempty string"):
+        stage_e_dispatch("", scenario=readiness_scenario(cancel_contract))
 
 
 def test_d_stage_event_order_is_scenario_specific():
