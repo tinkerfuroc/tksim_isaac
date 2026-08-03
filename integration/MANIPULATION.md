@@ -363,6 +363,31 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 4 —
+  "preserve Gate E downgrade truth"): Preserved controller truth through the E
+  fail-dominant downgrade path and eliminated the load-sensitive rclpy CDR-
+  padding digest flake in the D-side qualification tests.  F4.1 — the E
+  fail-dominant downgrade writers now carry `controller_goal_sent`/
+  `controller_goal_uuid`/`controller_endpoint` from the pre-downgrade truthful
+  record into the authoritative downgrade `integrated-execution.json` summary
+  and the final `integrated-execution.jsonl`/`controller-results.jsonl`
+  downgrade rows, so a late artifact failure never erases or fabricates the
+  controller identity an attempt actually observed; two sourced-Humble tests
+  force a late goal-artifact write failure after an observed approach FJT and
+  on the no-controller path, asserting identical controller truth across every
+  authoritative/final downgrade artifact and that no final row claims pass.
+  F4.2 — the D-side qualification tests now serialize the canonical planned
+  trajectory exactly once per setup and reuse that byte/digest snapshot for the
+  provider's FJT evidence, making the plan/executed/FJT-join digests
+  byte-identical inside the executor's run window (removing the documented
+  rclpy CDR-padding nondeterminism under memory churn), while a separate
+  field-by-field semantic identity check (`_robot_trajectories_equivalent`) and
+  a mutation-negative test prove the unchanged-trajectory proof is not
+  circular.  Production digest semantics and Gate D/E runtime behavior are
+  unchanged (the wrapper returns the exact real serialized bytes); the executor
+  truth rules (2.0 s FJT correlation, controller traffic only from observed FJT
+  evidence) are unaffected.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 3 —
   "make Gate E temporal evidence deterministic"): Made the flagship Gate-E
   temporal proofs deterministic and sealed the fresh-replay and controller-truth

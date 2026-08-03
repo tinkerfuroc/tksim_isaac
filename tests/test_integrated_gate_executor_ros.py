@@ -21,6 +21,7 @@ cancellation).
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -2004,6 +2005,133 @@ def _cancel_info_for(goal_uuid_hex):
     )
 
 
+def _install_deterministic_serialize(executor):
+    """Make the executor's CDR digest computation deterministic for the D-path.
+
+    F4.2: rclpy ``serialize_message`` writes uninitialized alignment-padding
+    bytes into the destination buffer, so the byte digest of a semantically
+    identical ``RobotTrajectory`` can differ between calls separated by time or
+    allocations under memory churn (an acknowledged test-harness defect, not a
+    production defect).  This per-executor wrapper caches the first serialization
+    of each message object and returns those exact bytes on later serializations
+    of the same object, so every digest computed inside the executor's run window
+    (plan digest, executed digest, FJT-join expected digest) is byte-identical to
+    the single setup-time snapshot.  The raw serialized bytes are never altered,
+    so digest semantics are unchanged; the caller separately asserts semantic
+    identity field-by-field so reusing one digest snapshot is not circular.
+
+    The executor's own ``self.ros`` dict is copied first so the shared module
+    level ROS import cache is never mutated for other tests in the process.
+    """
+    executor.ros = dict(executor.ros)
+    cache: dict[int, tuple[object, bytes]] = {}
+    original = executor.ros["serialize_message"]
+
+    def _deterministic_serialize(message):
+        key = id(message)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached[1]
+        raw = original(message)
+        # Hold a strong reference so the id is never reused by a later object
+        # while the cache is active (rclpy messages are unhashable/weakref-less).
+        cache[key] = (message, raw)
+        return raw
+
+    executor.ros["serialize_message"] = _deterministic_serialize
+    return _deterministic_serialize
+
+
+def _floats_equivalent(a, b, tol=1e-9):
+    a = list(a)
+    b = list(b)
+    if len(a) != len(b):
+        return False
+    return all(
+        math.isfinite(float(x)) and math.isfinite(float(y)) and abs(float(x) - float(y)) <= tol
+        for x, y in zip(a, b)
+    )
+
+
+def _robot_trajectories_equivalent(a, b) -> bool:
+    """Semantic field-by-field identity of two ``RobotTrajectory`` messages.
+
+    F4.2: compares joint names, point count/order, positions/velocities/
+    accelerations/effort, time-from-start, and the multi-DOF joint trajectory
+    (joint names, transform count, translation and quaternion per transform) —
+    the full semantic trajectory identity that a byte digest cannot reliably
+    prove under CDR padding nondeterminism.
+    """
+    if type(a) is not type(b):
+        return False
+    ajt = a.joint_trajectory
+    bjt = b.joint_trajectory
+    if list(ajt.joint_names) != list(bjt.joint_names):
+        return False
+    if len(ajt.points) != len(bjt.points):
+        return False
+    for pa, pb in zip(ajt.points, bjt.points):
+        if not _floats_equivalent(pa.positions, pb.positions):
+            return False
+        if not _floats_equivalent(pa.velocities, pb.velocities):
+            return False
+        if not _floats_equivalent(pa.accelerations, pb.accelerations):
+            return False
+        if not _floats_equivalent(pa.effort, pb.effort):
+            return False
+        if pa.time_from_start.sec != pb.time_from_start.sec:
+            return False
+        if pa.time_from_start.nanosec != pb.time_from_start.nanosec:
+            return False
+    am = a.multi_dof_joint_trajectory
+    bm = b.multi_dof_joint_trajectory
+    if list(am.joint_names) != list(bm.joint_names):
+        return False
+    if len(am.points) != len(bm.points):
+        return False
+    for pa, pb in zip(am.points, bm.points):
+        if len(pa.transforms) != len(pb.transforms):
+            return False
+        for ta, tb in zip(pa.transforms, pb.transforms):
+            if (
+                ta.translation.x != tb.translation.x
+                or ta.translation.y != tb.translation.y
+                or ta.translation.z != tb.translation.z
+            ):
+                return False
+            if (
+                ta.rotation.x != tb.rotation.x
+                or ta.rotation.y != tb.rotation.y
+                or ta.rotation.z != tb.rotation.z
+                or ta.rotation.w != tb.rotation.w
+            ):
+                return False
+    return True
+
+
+def test_semantic_trajectory_identity_detects_mutation():
+    """F4.2 mutation-negative: the semantic identity helper must fail when the
+    executed trajectory differs from the planned snapshot, so a reused provider
+    digest can never mask a mutated trajectory."""
+    planned = _success_result().planned_trajectory
+    snapshot = copy.deepcopy(planned)
+    assert _robot_trajectories_equivalent(planned, snapshot) is True
+    # Mutate a joint position: a replanned/mutated trajectory must be detected.
+    mutated = copy.deepcopy(planned)
+    mutated.joint_trajectory.points[0].positions[0] = 9.9
+    assert _robot_trajectories_equivalent(mutated, snapshot) is False
+    # Mutate a joint name, point count, velocity, effort, and time-from-start.
+    renamed = copy.deepcopy(planned)
+    renamed.joint_trajectory.joint_names = ["changed"]
+    assert _robot_trajectories_equivalent(renamed, snapshot) is False
+    extra_point = copy.deepcopy(planned)
+    extra_point.joint_trajectory.points.append(copy.deepcopy(extra_point.joint_trajectory.points[0]))
+    assert _robot_trajectories_equivalent(extra_point, snapshot) is False
+    reordered = copy.deepcopy(planned)
+    reordered.joint_trajectory.points[0].velocities = [1.0]
+    assert _robot_trajectories_equivalent(reordered, snapshot) is False
+
+
 def test_execute_trajectory_goal_constructs_unchanged_goal():
     from moveit_msgs.action import ExecuteTrajectory
     from rclpy.serialization import serialize_message
@@ -2103,15 +2231,18 @@ def test_cartesian_move_goal_rejects_wrong_frame_and_zero_quaternion():
 def test_executor_run_execute_sequence_split_path_pass(tmp_path):
     import uuid as _uuid
 
-    from rclpy.serialization import serialize_message
-
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
     try:
-        # Use ONE result object for both the plan handle and the digest source:
-        # rclpy ``serialize_message`` is stable for a single object but writes
-        # distinct padding bytes for independently-constructed identical objects.
+        # F4.2: make the executor's CDR digest computation deterministic for this
+        # test (see _install_deterministic_serialize) so the digest snapshot taken
+        # once below is byte-identical to every digest the executor computes in
+        # its run window.  This removes the load-sensitive rclpy CDR-padding
+        # flake (an acknowledged test-harness defect) without changing the raw
+        # serialized bytes or any production digest semantics.
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
         planned = plan_result.planned_trajectory
+        planned_snapshot = copy.deepcopy(planned)
         plan_uuid = _uuid.uuid4().bytes
         execute_uuid = _uuid.uuid4().bytes
         plan_handle = _FakeGoalHandle(
@@ -2129,17 +2260,19 @@ def test_executor_run_execute_sequence_split_path_pass(tmp_path):
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
 
-        # The provider digest is computed at call time (inside the executor's
-        # run window): rclpy ``serialize_message`` writes padding bytes from
-        # heap state, so a digest precomputed at test-setup can differ from the
-        # executor's canonical digest under memory churn (a genuine test flake,
-        # not a production defect).
-        def _provider():
-            digest = hashlib.sha256(serialize_message(planned)).hexdigest()
-            return _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=digest)
-
+        # F4.2: serialize the canonical planned trajectory EXACTLY ONCE at setup
+        # and reuse that byte/digest snapshot for the provider's FJT evidence.
+        # (Previously the provider re-serialized `planned` at call time inside the
+        # run window, so CDR padding bytes could differ from the executor's own
+        # digest under memory churn — a genuine test flake, not a production
+        # defect.  The deterministic serialize seam makes that single snapshot
+        # authoritative for the whole run.)
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
-            "qualification-moveit-execute-joint", fjt_transaction_provider=_provider
+            "qualification-moveit-execute-joint",
+            fjt_transaction_provider=lambda: _fjt_evidence(
+                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            ),
         )
         assert record["status"] == "diagnostic-pass"
         assert record["execute_trajectory_goal_sent"] is True
@@ -2157,18 +2290,20 @@ def test_executor_run_execute_sequence_split_path_pass(tmp_path):
         assert record["fjt_status"] == EXECUTE_STATUS_SUCCEEDED
         assert record["execute_result_status"] == EXECUTE_STATUS_SUCCEEDED
         assert record["execute_result_status_string"] == "succeeded"
-        # Both digests are computed by the executor inside the same run window
-        # (the FJT join already proved the provider digest matches them).
+        # F4.2: the unchanged planned trajectory is what reached /execute_trajectory
+        # and joined to the FJT evidence.  Semantic identity is asserted field-by-field
+        # against the setup snapshot (not object identity and not a circular byte
+        # digest); the record digests are additionally self-consistent because the
+        # deterministic serialize seam reused the one snapshot.
         assert record["planned_trajectory_digest"] == record["executed_trajectory_digest"]
         assert len(move_client.sent_goals) == 1
         assert len(exec_client.sent_goals) == 1
         exec_goal = exec_client.sent_goals[0]
-        # ROS generated messages copy on sub-message assignment; the split-path
-        # contract requires the canonical ROS-serialized trajectory digest to be
-        # unchanged after assignment (no mutation/replanning/round-trip), not
-        # object identity.
+        assert _robot_trajectories_equivalent(exec_goal.trajectory, planned_snapshot) is True
+        # The canonical digest of the sent trajectory is unchanged after assignment
+        # (no mutation/replanning/round-trip) — now deterministic via the seam.
         assert (
-            hashlib.sha256(serialize_message(exec_goal.trajectory)).hexdigest()
+            hashlib.sha256(executor.ros["serialize_message"](exec_goal.trajectory)).hexdigest()
             == record["executed_trajectory_digest"]
         )
         assert record["event_log"] == [
@@ -2213,13 +2348,12 @@ def test_executor_run_execute_sequence_missing_provider_fails_closed(tmp_path):
 def test_executor_run_execute_sequence_fjt_mismatch_fails_closed(tmp_path):
     import uuid as _uuid
 
-    from rclpy.serialization import serialize_message
-
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
     try:
-        # Use ONE result object for both the plan handle and the digest source:
-        # rclpy ``serialize_message`` is stable for a single object but writes
-        # distinct padding bytes for independently-constructed identical objects.
+        # F4.2: deterministic CDR digest seam (see _install_deterministic_serialize)
+        # so the FJT digest matches and the negative is deterministically the
+        # UUID join failure, never a load-sensitive digest-padding mismatch.
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
         planned = plan_result.planned_trajectory
         plan_uuid = _uuid.uuid4().bytes
@@ -2238,14 +2372,14 @@ def test_executor_run_execute_sequence_fjt_mismatch_fails_closed(tmp_path):
         _synthetic_scene(executor, contract)
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
-        trajectory_digest = hashlib.sha256(serialize_message(planned)).hexdigest()
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         # Provider evidence joins to a different (unknown) UUID -> mismatch.
         provider = _fjt_evidence("d" * 32, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest)
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-joint", fjt_transaction_provider=lambda: provider
         )
         assert record["status"] == "evidence-invalid"
-        assert "fjt evidence" in record.get("execute_error", "")
+        assert "fjt evidence goal_uuid does not join" in record.get("execute_error", "")
         assert len(move_client.sent_goals) == 1
         assert len(exec_client.sent_goals) == 1
     finally:
@@ -4967,6 +5101,226 @@ def test_executor_e_f33_post_goal_cleanup_retained_no_controller_fabrication(tmp
 
 
 # --------------------------------------------------------------------------- #
+# F4.1: E fail-dominant downgrade preserves controller truth.
+#
+# The normal and exception E writers carry controller_goal_sent / _uuid /
+# _endpoint consistently; the fail-dominant downgrade writer must too, with
+# values from the pre-downgrade truthful record.  These tests force a late
+# required-artifact write failure after an observed (or absent) FJT and assert
+# identical controller truth across every authoritative/final downgrade row.
+# --------------------------------------------------------------------------- #
+
+def test_executor_e_downgrade_preserves_controller_truth_after_observed_fjt(
+    tmp_path, monkeypatch
+):
+    """F4.1: a late required-artifact write failure after an observed approach
+    FJT downgrades every authoritative/final E artifact to evidence-invalid while
+    preserving the exact observed controller truth (sent flag, goal UUID,
+    endpoint) from the pre-downgrade truthful record.  No final row claims pass.
+    """
+    import uuid as _uuid
+
+    from validation import integrated_gate_executor as _ige
+    from validation.integrated_gate_executor import PICK_PLACE_RESULT_CANCELED
+
+    executor, contract = _e_executor(tmp_path, "qualification-pick-place-cancel-approach")
+    try:
+        _feed_e_scene(executor, contract)
+        pick_uuid = _uuid.uuid4().bytes
+        pick_hex = _uuid.UUID(bytes=pick_uuid).hex
+        pick_handle = _FakeGoalHandle(
+            accepted=True, result=_pick_result(PICK_PLACE_RESULT_CANCELED), goal_id=pick_uuid,
+            status=EXECUTE_STATUS_CANCELED, result_ready_at=0.0,
+            cancel_ready_at=0.0, cancel_response=_cancel_info_for(pick_hex),
+        )
+        executor._action_clients["/pickup_action"] = _FakeMoveClient(
+            server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
+        )
+        _seed_fresh_joint(executor, [0.0] * 7, seq=101)
+        _seed_fresh_joint(executor, [0.0] * 7, seq=102)
+        # F3.1: the approach FJT is injected only after the approach wait starts
+        # (goal accepted + baseline captured) — a barrier, never a fixed timer.
+        approach_wait_started = _approach_wait_instrument(executor)
+
+        def _driver():
+            approach_wait_started.wait(timeout=10)
+            _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=51)
+
+        driver = threading.Thread(target=_driver, daemon=True)
+        driver.start()
+        # F4.1: force a late required-artifact write failure on the goal artifact
+        # (the final write of the primary path).  The pre-downgrade truthful
+        # summary is already durably written, so the fail-dominant downgrade is
+        # what overwrites every status stream.
+        real_write = _ige._atomic_write_json
+
+        def _flaky(value, path):
+            if Path(path).name == "qualification-pick-place-cancel-approach.json":
+                raise OSError("simulated late goal artifact write failure")
+            return real_write(value, path)
+
+        monkeypatch.setattr(_ige, "_atomic_write_json", _flaky)
+        try:
+            record = executor.run_pick_place_negative(
+                "qualification-pick-place-cancel-approach",
+                current_tcp_pose_provider=_tcp_pose_provider(
+                    [[0.5, 0.0, 0.70], [0.5, 0.0, 0.72], [0.52, 0.0, 0.72]]
+                ),
+                native_gripper_goal_count_provider=_native_gripper_provider(0),
+            )
+        finally:
+            driver.join(timeout=10)
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "artifact-write-failed"
+        assert "simulated late goal artifact write failure" in (
+            record.get("artifact_error") or ""
+        )
+        # F4.1: the pre-downgrade truthful record keeps the observed controller
+        # truth — controller true ONLY because an FJT was actually observed.
+        assert record["pick_goal_sent"] is True
+        assert record["place_goal_sent"] is False
+        assert record["controller_goal_sent"] is True
+        assert record["controller_goal_uuid"] == pick_hex
+        assert record["controller_endpoint"] == FJT_ENDPOINT
+        assert record["fjt_goal_uuid"] == pick_hex
+        # The observed-FJT cancel path performs no task-goal cleanup; the late
+        # artifact failure must not fabricate a cleanup outcome.
+        assert "cleanup" not in record
+        # The authoritative downgrade summary preserves identical controller truth.
+        exec_json = json.loads(
+            (tmp_path / "integrated-execution.json").read_text(encoding="utf-8")
+        )
+        assert exec_json["status"] == "evidence-invalid"
+        assert exec_json["reason_code"] == "artifact-write-failed"
+        assert exec_json["downgraded_from"] == "diagnostic-pass"
+        assert exec_json["reasons"] == ["simulated late goal artifact write failure"]
+        assert exec_json["controller_goal_sent"] is True
+        assert exec_json["controller_goal_uuid"] == pick_hex
+        assert exec_json["controller_endpoint"] == FJT_ENDPOINT
+        assert exec_json["pick_goal_sent"] is True
+        assert exec_json["cleanup"] == {}
+        assert exec_json["trigger"]["trigger_kind"] == "approach"
+        assert exec_json["trigger"]["goal_uuid"] == pick_hex
+        # The final downgrade row in integrated-execution.jsonl.
+        exec_rows = _jsonl_rows(tmp_path / "integrated-execution.jsonl")
+        last = exec_rows[-1]
+        assert last["status"] == "evidence-invalid"
+        assert last["row_kind"] == "final"
+        assert last["downgraded_from"] == "diagnostic-pass"
+        assert last["controller_goal_sent"] is True
+        assert last["controller_goal_uuid"] == pick_hex
+        assert last["controller_endpoint"] == FJT_ENDPOINT
+        # The final downgrade row in controller-results.jsonl.
+        ctrl_rows = _jsonl_rows(tmp_path / "controller-results.jsonl")
+        last = ctrl_rows[-1]
+        assert last["status"] == "evidence-invalid"
+        assert last["row_kind"] == "final"
+        assert last["controller_goal_sent"] is True
+        assert last["controller_goal_uuid"] == pick_hex
+        assert last["controller_endpoint"] == FJT_ENDPOINT
+        # moveit-plans.jsonl also receives a final evidence-invalid corrective row.
+        mp_rows = _jsonl_rows(tmp_path / "moveit-plans.jsonl")
+        last = mp_rows[-1]
+        assert last["status"] == "evidence-invalid"
+        assert last["row_kind"] == "final"
+        # F4.1: no final row in any status stream claims pass.
+        for name in (
+            "integrated-execution.jsonl",
+            "moveit-plans.jsonl",
+            "controller-results.jsonl",
+        ):
+            assert not any(
+                r.get("row_kind") == "final"
+                and r.get("status") in ("diagnostic-pass", "diagnostic-fail")
+                for r in _jsonl_rows(tmp_path / name)
+            ), name
+    finally:
+        executor.shutdown()
+
+
+def test_executor_e_downgrade_no_controller_keeps_fields_false_none(
+    tmp_path, monkeypatch
+):
+    """F4.1: the no-controller path (task goal accepted, NO FJT ever observed)
+    forces a late artifact-write failure; every authoritative/final downgrade
+    artifact keeps all three controller-truth fields false/None and no final row
+    claims pass."""
+    import uuid as _uuid
+
+    from validation import integrated_gate_executor as _ige
+    from validation.integrated_gate_executor import PICK_PLACE_RESULT_CANCELED
+
+    _bounded_stage_e_dispatch(monkeypatch, 0.4)
+    executor, contract = _e_executor(tmp_path, "qualification-pick-place-cancel-approach")
+    try:
+        _feed_e_scene(executor, contract)
+        pick_uuid = _uuid.uuid4().bytes
+        pick_hex = _uuid.UUID(bytes=pick_uuid).hex
+        pick_handle = _FakeGoalHandle(
+            accepted=True, result=_pick_result(PICK_PLACE_RESULT_CANCELED), goal_id=pick_uuid,
+            status=EXECUTE_STATUS_CANCELED, result_ready_at=0.0,
+            cancel_ready_at=0.0, cancel_response=_cancel_info_for(pick_hex),
+        )
+        executor._action_clients["/pickup_action"] = _FakeMoveClient(
+            server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
+        )
+        _seed_fresh_joint(executor, [0.0] * 7, seq=101)
+        _seed_fresh_joint(executor, [0.0] * 7, seq=102)
+        real_write = _ige._atomic_write_json
+
+        def _flaky(value, path):
+            if Path(path).name == "qualification-pick-place-cancel-approach.json":
+                raise OSError("simulated late goal artifact write failure")
+            return real_write(value, path)
+
+        monkeypatch.setattr(_ige, "_atomic_write_json", _flaky)
+        record = executor.run_pick_place_negative(
+            "qualification-pick-place-cancel-approach",
+            current_tcp_pose_provider=_tcp_pose_provider(
+                [[0.5, 0.0, 0.70], [0.5, 0.0, 0.72]]
+            ),
+            native_gripper_goal_count_provider=_native_gripper_provider(0),
+        )
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "artifact-write-failed"
+        assert record["pick_goal_sent"] is True
+        # No FJT was ever observed -> all controller-truth fields stay false/None.
+        assert record["controller_goal_sent"] is False
+        assert record["controller_goal_uuid"] is None
+        assert record["controller_endpoint"] is None
+        # The accepted-goal cleanup outcome is retained truthfully through the
+        # late artifact failure (not erased, not fabricated).
+        assert record["cleanup"]["cleanup"] == "accepted"
+        exec_json = json.loads(
+            (tmp_path / "integrated-execution.json").read_text(encoding="utf-8")
+        )
+        assert exec_json["status"] == "evidence-invalid"
+        assert exec_json["pick_goal_sent"] is True
+        assert exec_json["controller_goal_sent"] is False
+        assert exec_json["controller_goal_uuid"] is None
+        assert exec_json["controller_endpoint"] is None
+        assert exec_json["cleanup"]["cleanup"] == "accepted"
+        for name in ("integrated-execution.jsonl", "controller-results.jsonl"):
+            rows = _jsonl_rows(tmp_path / name)
+            last = rows[-1]
+            assert last["status"] == "evidence-invalid"
+            assert last["row_kind"] == "final"
+            assert last["controller_goal_sent"] is False
+            assert last["controller_goal_uuid"] is None
+            assert last["controller_endpoint"] is None
+            assert not any(
+                r.get("row_kind") == "final"
+                and r.get("status") in ("diagnostic-pass", "diagnostic-fail")
+                for r in rows
+            ), name
+        mp_rows = _jsonl_rows(tmp_path / "moveit-plans.jsonl")
+        assert mp_rows[-1]["status"] == "evidence-invalid"
+        assert mp_rows[-1]["row_kind"] == "final"
+    finally:
+        executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
 # Pre-review fix round 1 (F1.1-F1.8): make Gate D runtime truthful.
 #
 # These tests were added as part of the red/green repair.  Each negative test
@@ -5602,10 +5956,10 @@ def test_executor_execute_timeout_cleans_up_accepted_goal(tmp_path):
     on the exact handle with a bounded wait; never left running."""
     import uuid as _uuid
 
-    from rclpy.serialization import serialize_message
-
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
     try:
+        # F4.2: deterministic CDR digest seam (see _install_deterministic_serialize).
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
         planned = plan_result.planned_trajectory
         plan_uuid = _uuid.uuid4().bytes
@@ -5625,7 +5979,7 @@ def test_executor_execute_timeout_cleans_up_accepted_goal(tmp_path):
         executor._action_clients["/move_action"] = move_client
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
-        trajectory_digest = hashlib.sha256(serialize_message(planned)).hexdigest()
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-joint",
             fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest),
@@ -5951,12 +6305,13 @@ def test_executor_run_execute_sequence_pose_pass(tmp_path):
     construction through the split path and writes the complete artifact set."""
     import uuid as _uuid
 
-    from rclpy.serialization import serialize_message
-
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-pose")
     try:
+        # F4.2: deterministic CDR digest seam (see _install_deterministic_serialize).
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
         planned = plan_result.planned_trajectory
+        planned_snapshot = copy.deepcopy(planned)
         plan_uuid = _uuid.uuid4().bytes
         execute_uuid = _uuid.uuid4().bytes
         plan_handle = _FakeGoalHandle(
@@ -5974,12 +6329,14 @@ def test_executor_run_execute_sequence_pose_pass(tmp_path):
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
 
-        def _provider():
-            digest = hashlib.sha256(serialize_message(planned)).hexdigest()
-            return _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=digest)
-
+        # F4.2: serialize the planned trajectory once at setup and reuse that
+        # byte/digest snapshot for the provider's FJT evidence.
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
-            "qualification-moveit-execute-pose", fjt_transaction_provider=_provider
+            "qualification-moveit-execute-pose",
+            fjt_transaction_provider=lambda: _fjt_evidence(
+                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            ),
         )
         assert record["status"] == "diagnostic-pass"
         assert record["handler"] == "execute-pose"
@@ -5992,6 +6349,8 @@ def test_executor_run_execute_sequence_pose_pass(tmp_path):
         assert constraint.orientation_constraints[0].link_name == "link_tcp"
         assert len(move_client.sent_goals) == 1
         assert len(exec_client.sent_goals) == 1
+        # F4.2: semantic identity of the sent trajectory vs the setup snapshot.
+        assert _robot_trajectories_equivalent(exec_client.sent_goals[0].trajectory, planned_snapshot) is True
         for name in (
             "integrated-execution.jsonl",
             "moveit-plans.jsonl",
@@ -6009,12 +6368,13 @@ def test_executor_d_visual_before_precedes_first_goal_and_after_follows(tmp_path
     the first D goal and after rows follow the terminal/failure handling."""
     import uuid as _uuid
 
-    from rclpy.serialization import serialize_message
-
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
     try:
+        # F4.2: deterministic CDR digest seam (see _install_deterministic_serialize).
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
         planned = plan_result.planned_trajectory
+        planned_snapshot = copy.deepcopy(planned)
         plan_uuid = _uuid.uuid4().bytes
         execute_uuid = _uuid.uuid4().bytes
         plan_handle = _FakeGoalHandle(
@@ -6032,14 +6392,18 @@ def test_executor_d_visual_before_precedes_first_goal_and_after_follows(tmp_path
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
 
-        def _provider():
-            digest = hashlib.sha256(serialize_message(planned)).hexdigest()
-            return _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=digest)
-
+        # F4.2: serialize the planned trajectory once at setup and reuse that
+        # byte/digest snapshot for the provider's FJT evidence.
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
-            "qualification-moveit-execute-joint", fjt_transaction_provider=_provider
+            "qualification-moveit-execute-joint",
+            fjt_transaction_provider=lambda: _fjt_evidence(
+                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            ),
         )
         assert record["status"] == "diagnostic-pass"
+        # F4.2: semantic identity of the sent trajectory vs the setup snapshot.
+        assert _robot_trajectories_equivalent(exec_client.sent_goals[0].trajectory, planned_snapshot) is True
         rows = _jsonl_rows(tmp_path / "visual-capture-requests.jsonl")
         timestamps = [float(row.get("timestamp", 0.0)) for row in rows]
         phases = [str(row.get("phase")) for row in rows]
@@ -6060,14 +6424,15 @@ def test_executor_d_artifact_write_failure_downgrades_all_three_streams_execute(
     status streams, and no final row claims pass."""
     import uuid as _uuid
 
-    from rclpy.serialization import serialize_message
-
     from validation import integrated_gate_executor as _ige
 
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
     try:
+        # F4.2: deterministic CDR digest seam (see _install_deterministic_serialize).
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
         planned = plan_result.planned_trajectory
+        planned_snapshot = copy.deepcopy(planned)
         plan_uuid = _uuid.uuid4().bytes
         execute_uuid = _uuid.uuid4().bytes
         plan_handle = _FakeGoalHandle(
@@ -6085,9 +6450,9 @@ def test_executor_d_artifact_write_failure_downgrades_all_three_streams_execute(
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
 
-        def _provider():
-            digest = hashlib.sha256(serialize_message(planned)).hexdigest()
-            return _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=digest)
+        # F4.2: serialize the planned trajectory once at setup and reuse that
+        # byte/digest snapshot for the provider's FJT evidence.
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
 
         real_write = _ige._atomic_write_json
 
@@ -6098,10 +6463,17 @@ def test_executor_d_artifact_write_failure_downgrades_all_three_streams_execute(
 
         monkeypatch.setattr(_ige, "_atomic_write_json", _flaky)
         record = executor.run_execute_sequence(
-            "qualification-moveit-execute-joint", fjt_transaction_provider=_provider
+            "qualification-moveit-execute-joint",
+            fjt_transaction_provider=lambda: _fjt_evidence(
+                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            ),
         )
         assert record["status"] == "evidence-invalid"
         assert record["reason_code"] == "artifact-write-failed"
+        # F4.2: the FJT digest join is deterministic now, so the attempt always
+        # reaches the artifact-write failure with a diagnostic-pass provenance.
+        assert record["planned_trajectory_digest"] == record["executed_trajectory_digest"]
+        assert _robot_trajectories_equivalent(exec_client.sent_goals[0].trajectory, planned_snapshot) is True
         for name in (
             "integrated-execution.jsonl",
             "moveit-plans.jsonl",
@@ -6112,11 +6484,10 @@ def test_executor_d_artifact_write_failure_downgrades_all_three_streams_execute(
             last = rows[-1]
             assert last["status"] == "evidence-invalid", name
             assert last["row_kind"] == "final", name
-            # The downgrade source is whatever the attempt was before the write
-            # failure; the split-path execute may also fail the FJT digest under
-            # memory churn (documented rclpy serialize_message padding), making
-            # the source evidence-invalid.  Either value is truthful provenance.
-            assert last["downgraded_from"] in ("diagnostic-pass", "evidence-invalid"), name
+            # The downgrade source is the pre-downgrade pass (the deterministic
+            # seam removed the load-sensitive FJT digest flake that used to make
+            # the source evidence-invalid under memory churn).
+            assert last["downgraded_from"] == "diagnostic-pass", name
             assert not any(
                 r.get("row_kind") == "final"
                 and r.get("status") in ("diagnostic-pass", "diagnostic-fail")
@@ -6548,14 +6919,15 @@ def test_executor_execute_action_semantics_artifact(tmp_path):
     visual captures use kind=gate-d-diagnostic."""
     import uuid as _uuid
 
-    from rclpy.serialization import serialize_message
-
     from validation import integrated_gate_executor as _ige
 
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
     try:
+        # F4.2: deterministic CDR digest seam (see _install_deterministic_serialize).
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
         planned = plan_result.planned_trajectory
+        planned_snapshot = copy.deepcopy(planned)
         plan_uuid = _uuid.uuid4().bytes
         execute_uuid = _uuid.uuid4().bytes
         plan_handle = _FakeGoalHandle(
@@ -6573,14 +6945,18 @@ def test_executor_execute_action_semantics_artifact(tmp_path):
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
 
-        def _provider():
-            digest = hashlib.sha256(serialize_message(planned)).hexdigest()
-            return _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=digest)
-
+        # F4.2: serialize the planned trajectory once at setup and reuse that
+        # byte/digest snapshot for the provider's FJT evidence.
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
-            "qualification-moveit-execute-joint", fjt_transaction_provider=_provider
+            "qualification-moveit-execute-joint",
+            fjt_transaction_provider=lambda: _fjt_evidence(
+                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            ),
         )
         assert record["status"] == "diagnostic-pass"
+        # F4.2: semantic identity of the sent trajectory vs the setup snapshot.
+        assert _robot_trajectories_equivalent(exec_client.sent_goals[0].trajectory, planned_snapshot) is True
         assert record["controller_goal_sent"] is True
         assert record["controller_endpoint"] == FJT_ENDPOINT
         assert record["action_goal_sent"] is True

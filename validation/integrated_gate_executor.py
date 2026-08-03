@@ -8654,6 +8654,15 @@ class IntegratedGateExecutor:
                 "pick_goal_sent": record.get("pick_goal_sent"),
                 "place_goal_sent": record.get("place_goal_sent"),
                 "place_goal_accepted": record.get("place_goal_accepted"),
+                # F4.1: the authoritative fail-dominant E summary must preserve
+                # controller truth exactly like the primary ``_write_e_artifacts``
+                # summary.  Values come from the pre-downgrade truthful record:
+                # controller true only with observed FJT evidence; UUID/endpoint
+                # None when false.  A late artifact failure never erases the
+                # controller/action/task identity the attempt actually observed.
+                "controller_goal_sent": record.get("controller_goal_sent"),
+                "controller_goal_uuid": record.get("controller_goal_uuid"),
+                "controller_endpoint": record.get("controller_endpoint"),
                 "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
                 "cleanup": dict(record.get("cleanup") or {}),
                 "trigger": dict(record.get("trigger") or {}),
@@ -8696,7 +8705,13 @@ class IntegratedGateExecutor:
                     "pick_goal_sent": record.get("pick_goal_sent"),
                     "place_goal_sent": record.get("place_goal_sent"),
                     "place_goal_accepted": record.get("place_goal_accepted"),
+                    # F4.1: the final downgrade row carries the full controller
+                    # truth (uuid + endpoint alongside the sent flag) so the
+                    # integrated-execution stream agrees with the summary and
+                    # controller-results rows.
                     "controller_goal_sent": record.get("controller_goal_sent"),
+                    "controller_goal_uuid": record.get("controller_goal_uuid"),
+                    "controller_endpoint": record.get("controller_endpoint"),
                     "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
                     "cleanup": dict(record.get("cleanup") or {}),
                     "trigger": dict(record.get("trigger") or {}),
@@ -8734,7 +8749,11 @@ class IntegratedGateExecutor:
                     "scenario_id": scenario_id,
                     "status": "evidence-invalid",
                     "row_kind": "final",
+                    # F4.1: the final controller-results downgrade row preserves
+                    # controller_goal_uuid alongside the sent flag and endpoint so
+                    # no downgrade row drops the observed FJT identity.
                     "controller_goal_sent": record.get("controller_goal_sent"),
+                    "controller_goal_uuid": record.get("controller_goal_uuid"),
                     "controller_endpoint": record.get("controller_endpoint"),
                     "gripper_goal_sent": record.get("gripper_goal_sent"),
                     "task_result_status": record.get("task_result_status"),
