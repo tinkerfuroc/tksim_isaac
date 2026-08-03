@@ -363,6 +363,26 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-03 (integrated qualification Task 5, formal-review fix round 2 —
+  "seal Gate D evidence streams"): Sealed the Stage-D evidence streams against
+  the formal SPEC/QUALITY residual findings.  A D artifact-write downgrade
+  appends a final `row_kind="final"`/`status="evidence-invalid"` corrective row
+  to every status stream (`integrated-execution.jsonl`, `moveit-plans.jsonl`,
+  `controller-results.jsonl`) preserving planner/plan/controller/action/UUID/
+  digest fields and `downgraded_from`; gripper close→open is supported through a
+  fresh close-first journal contract selected before its first record (never
+  mutating a nonempty journal); D scene-acquisition failures carry D
+  stage/handler/scenario labels and the D schema; an accepted execute UUID
+  rejection performs one bounded cleanup; environment-cloud evidence requires
+  structural PointCloud2 self-consistency (`row_step >= width*point_step`,
+  `len(data) == row_step*height`, usable x/y/z FLOAT32 layout when fields are
+  advertised); both MoveGroup builders pin `look_around=False`; the dead
+  fail-open helpers are removed; and `controller_goal_sent` is documented as the
+  exact FJT semantic with retreat/gripper traffic surfaced through
+  `action_goal_sent`/`action_endpoint`/`cartesian_goal_sent`/`gripper_goal_sent`
+  and D visual captures labeled `gate-d-diagnostic`.  Gate-C bytes, the Task-3
+  journal graph, and all policy blobs are unchanged.
+
 - 2026-08-02 (integrated qualification Task 5, pre-review fix round 1 — "make
   Gate D runtime truthful"): Hardened the Stage-D lifecycle and evidence path
   against the real Humble rclpy action API.  `shutdown()` now explicitly destroys

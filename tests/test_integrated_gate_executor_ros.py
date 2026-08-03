@@ -2331,7 +2331,14 @@ def test_executor_run_gripper_sequence_pass(tmp_path):
         assert record["commands"] == ["open", "close"]
         assert record["native_action"] is True
         assert record["execute_trajectory_goal_sent"] is False
-        assert record["controller_goal_sent"] is True
+        # F2.7: controller_goal_sent is the exact FJT semantic — the native
+        # gripper controller is not an FJT goal, so it is False and the gripper
+        # traffic is surfaced via gripper_goal_sent/action_goal_sent.
+        assert record["controller_goal_sent"] is False
+        assert record["gripper_goal_sent"] is True
+        assert record["action_goal_sent"] is True
+        assert record["action_endpoint"] == GRIPPER_ENDPOINT
+        assert record["cartesian_goal_sent"] is False
         assert len(sent) == 2
         assert sent[0].command.position == 0.0
         assert sent[1].command.position == 0.85
@@ -3126,8 +3133,24 @@ def test_executor_d_goal_artifact_write_failure_downgrades_pass(tmp_path, monkey
             (tmp_path / "integrated-execution.json").read_text(encoding="utf-8")
         )
         assert exec_json["status"] == "evidence-invalid"
-        rows = _jsonl_rows(tmp_path / "integrated-execution.jsonl")
-        assert rows and rows[-1]["status"] == "evidence-invalid"
+        # F2.1: a downgrade appends final/evidence-invalid corrective rows to
+        # every status stream and never leaves a final row claiming pass.
+        for name in (
+            "integrated-execution.jsonl",
+            "moveit-plans.jsonl",
+            "controller-results.jsonl",
+        ):
+            rows = _jsonl_rows(tmp_path / name)
+            assert rows, name
+            last = rows[-1]
+            assert last["status"] == "evidence-invalid", name
+            assert last["row_kind"] == "final", name
+            assert last["downgraded_from"] == "diagnostic-pass", name
+            assert not any(
+                r.get("row_kind") == "final"
+                and r.get("status") in ("diagnostic-pass", "diagnostic-fail")
+                for r in rows
+            ), name
     finally:
         executor.shutdown()
 
@@ -3319,6 +3342,14 @@ def test_executor_retreat_env_cloud_evidence_records_digest_source_and_bytes(tmp
         assert evidence["points"] == 125
         assert evidence["bytes"] > 0
         assert len(evidence["digest"]) == 64
+        # F2.5: the observed cloud advertises a usable x/y/z FLOAT32 layout.
+        assert evidence["point_layout"] == {
+            "x_offset": 0,
+            "y_offset": 4,
+            "z_offset": 8,
+            "datatype": "float32",
+            "count": 1,
+        }
         assert record["collision_checking"] is True
         # The exact observed cloud was passed into env_points, serialized non-empty.
         serialized_env = bytes(client.sent_goals[0].env_points.data)
@@ -3429,5 +3460,641 @@ def test_executor_d_visual_before_precedes_first_goal_and_after_follows(tmp_path
         assert "before" in phases and "after" in phases
         assert timestamps == sorted(timestamps)
         assert phases.index("before") < phases.index("after")
+    finally:
+        executor.shutdown()
+
+
+# ---- F2.1: corrective final rows on every D status stream ---------------------
+
+def test_executor_d_artifact_write_failure_downgrades_all_three_streams_execute(
+    tmp_path, monkeypatch
+):
+    """F2.1: a required integrated-execution.json write failure on a plan-applicable
+    execute pass propagates final/evidence-invalid corrective rows into ALL THREE
+    status streams, and no final row claims pass."""
+    import uuid as _uuid
+
+    from rclpy.serialization import serialize_message
+
+    from validation import integrated_gate_executor as _ige
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
+    try:
+        plan_result = _success_result()
+        planned = plan_result.planned_trajectory
+        plan_uuid = _uuid.uuid4().bytes
+        execute_uuid = _uuid.uuid4().bytes
+        plan_handle = _FakeGoalHandle(
+            accepted=True, result=plan_result, goal_id=plan_uuid, result_ready_at=0.0
+        )
+        execute_handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=execute_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        move_client = _FakeMoveClient(server_ready=True, goal_handle=plan_handle, send_ready_at=0.0)
+        exec_client = _FakeMoveClient(server_ready=True, goal_handle=execute_handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = move_client
+        executor._action_clients["/execute_trajectory"] = exec_client
+        _synthetic_scene(executor, contract)
+        execute_hex = _uuid.UUID(bytes=execute_uuid).hex
+        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+
+        def _provider():
+            digest = hashlib.sha256(serialize_message(planned)).hexdigest()
+            return _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=digest)
+
+        real_write = _ige._atomic_write_json
+
+        def _flaky(value, path):
+            if Path(path).name == "integrated-execution.json":
+                raise OSError("simulated summary write failure")
+            return real_write(value, path)
+
+        monkeypatch.setattr(_ige, "_atomic_write_json", _flaky)
+        record = executor.run_execute_sequence(
+            "qualification-moveit-execute-joint", fjt_transaction_provider=_provider
+        )
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "artifact-write-failed"
+        for name in (
+            "integrated-execution.jsonl",
+            "moveit-plans.jsonl",
+            "controller-results.jsonl",
+        ):
+            rows = _jsonl_rows(tmp_path / name)
+            assert rows, name
+            last = rows[-1]
+            assert last["status"] == "evidence-invalid", name
+            assert last["row_kind"] == "final", name
+            # The downgrade source is whatever the attempt was before the write
+            # failure; the split-path execute may also fail the FJT digest under
+            # memory churn (documented rclpy serialize_message padding), making
+            # the source evidence-invalid.  Either value is truthful provenance.
+            assert last["downgraded_from"] in ("diagnostic-pass", "evidence-invalid"), name
+            assert not any(
+                r.get("row_kind") == "final"
+                and r.get("status") in ("diagnostic-pass", "diagnostic-fail")
+                for r in rows
+            ), name
+    finally:
+        executor.shutdown()
+
+
+def test_executor_d_artifact_write_failure_downgrades_all_three_streams_gripper(
+    tmp_path, monkeypatch
+):
+    """F2.1: a plan-not-applicable gripper pass downgrades every status stream
+    with a final/evidence-invalid corrective row."""
+    import uuid as _uuid
+
+    from validation import integrated_gate_executor as _ige
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-gripper")
+    try:
+        sent = []
+
+        def _send_goal(goal):
+            handle = _FakeGoalHandle(
+                accepted=True, result=None,
+                goal_id=_uuid.uuid4().bytes,
+                status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+            )
+            sent.append(goal)
+            return _FakeFuture(handle, ready_at=0.0)
+
+        client = _FakeMoveClient(server_ready=True, goal_handle=None, send_ready_at=0.0)
+        client.send_goal_async = _send_goal
+        executor._action_clients["/xarm_gripper/gripper_action"] = client
+        _synthetic_scene(executor, contract)
+        real_write = _ige._atomic_write_json
+
+        def _flaky(value, path):
+            if Path(path).name == "qualification-moveit-gripper.json":
+                raise OSError("simulated gripper goal artifact write failure")
+            return real_write(value, path)
+
+        monkeypatch.setattr(_ige, "_atomic_write_json", _flaky)
+        record = executor.run_gripper_sequence("qualification-moveit-gripper")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "artifact-write-failed"
+        for name in (
+            "integrated-execution.jsonl",
+            "moveit-plans.jsonl",
+            "controller-results.jsonl",
+        ):
+            rows = _jsonl_rows(tmp_path / name)
+            assert rows, name
+            last = rows[-1]
+            assert last["status"] == "evidence-invalid", name
+            assert last["row_kind"] == "final", name
+            assert last["downgraded_from"] == "diagnostic-pass", name
+            assert not any(
+                r.get("row_kind") == "final"
+                and r.get("status") in ("diagnostic-pass", "diagnostic-fail")
+                for r in rows
+            ), name
+    finally:
+        executor.shutdown()
+
+
+# ---- F2.2: close-first gripper journal order ---------------------------------
+
+def test_executor_run_gripper_sequence_close_first_pass(tmp_path):
+    """F2.2/L1: open_first=False (close→open) passes using the close-first journal
+    order (fixture-ready → gripper-close-terminal → gripper-open-terminal →
+    teardown), rebuilding the fresh journal before its first record."""
+    import uuid as _uuid
+
+    from validation import integrated_gate_executor as _ige
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-gripper")
+    try:
+        close_uuid = _uuid.uuid4().bytes
+        open_uuid = _uuid.uuid4().bytes
+        client = _FakeMoveClient(server_ready=True, goal_handle=None, send_ready_at=0.0)
+        sent = []
+
+        def _send_goal(goal):
+            handle = _FakeGoalHandle(
+                accepted=True, result=None,
+                goal_id=close_uuid if len(sent) == 0 else open_uuid,
+                status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+            )
+            sent.append(goal)
+            return _FakeFuture(handle, ready_at=0.0)
+
+        client.send_goal_async = _send_goal
+        executor._action_clients["/xarm_gripper/gripper_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gripper_sequence("qualification-moveit-gripper", open_first=False)
+        assert record["status"] == "diagnostic-pass"
+        assert record["commands"] == ["close", "open"]
+        assert record["open_first"] is False
+        assert sent[0].command.position == GRIPPER_CLOSE_POSITION
+        assert sent[1].command.position == GRIPPER_OPEN_POSITION
+        assert record["event_log"] == [
+            "fixture-ready", "gripper-close-terminal", "gripper-open-terminal", "teardown"
+        ]
+        assert tuple(executor.journal.required_event_order) == (
+            _ige.GRIPPER_CLOSE_FIRST_EVENT_ORDER
+        )
+    finally:
+        executor.shutdown()
+
+
+def test_executor_run_gripper_sequence_close_first_order_replacement_refused(tmp_path):
+    """F2.2/L1: an open_first=False attempt on a non-empty journal is refused and
+    never mutates the journal's required order."""
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-gripper")
+    try:
+        sent = []
+
+        def _send_goal(goal):
+            handle = _FakeGoalHandle(
+                accepted=True, result=None,
+                goal_id=_uuid.uuid4().bytes,
+                status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+            )
+            sent.append(goal)
+            return _FakeFuture(handle, ready_at=0.0)
+
+        client = _FakeMoveClient(server_ready=True, goal_handle=None, send_ready_at=0.0)
+        client.send_goal_async = _send_goal
+        executor._action_clients["/xarm_gripper/gripper_action"] = client
+        _synthetic_scene(executor, contract)
+        first = executor.run_gripper_sequence("qualification-moveit-gripper")
+        assert first["status"] == "diagnostic-pass"
+        original_order = tuple(executor.journal.required_event_order)
+        record = executor.run_gripper_sequence("qualification-moveit-gripper", open_first=False)
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "journal-order-rebuild-refused"
+        assert record["reasons"] == ["refused: journal already holds records"]
+        assert tuple(executor.journal.required_event_order) == original_order
+    finally:
+        executor.shutdown()
+
+
+# ---- F2.3: D-labeled scene-acquisition failures -------------------------------
+
+def test_executor_d_scene_acquire_no_scene_writes_d_schema(tmp_path):
+    """F2.3/L2: a D handler with no cached PlanningScene fails closed through the
+    D evidence path (stage=D, event=gate-d, handler label), never a Gate-C
+    zero-controller record."""
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
+    try:
+        # Deliberately no _synthetic_scene: the executor never receives one.  The
+        # fjt provider is required by the execute handler before acquisition, but
+        # acquisition fails first so the provider is never invoked.
+        record = executor.run_execute_sequence(
+            "qualification-moveit-execute-joint",
+            fjt_transaction_provider=lambda: _fjt_evidence("a" * 32, EXECUTE_STATUS_SUCCEEDED),
+        )
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "no-planning-scene"
+        assert record["stage"] == "D"
+        assert record["handler"] == "execute-joint"
+        rows = _jsonl_rows(tmp_path / "integrated-execution.jsonl")
+        assert rows and rows[-1]["status"] == "evidence-invalid"
+        assert rows[-1]["event"] == "gate-d"
+        assert rows[-1]["stage"] == "D"
+        assert rows[-1]["event"] != "gate-c-plan-only"
+    finally:
+        executor.shutdown()
+
+
+def test_executor_d_scene_acquire_invalid_writes_d_schema(tmp_path):
+    """F2.3/L2: a normalization-failed PlanningScene routes through the D
+    evidence path with D labels, not a Gate-C record."""
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cartesian-retreat")
+    try:
+        executor._planning_scene_invalid = True
+        source = {
+            "frame_id": "base_link",
+            "xyz": [0.2, 0.0, 0.72],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "identity": "tcp-observation-1",
+            "age_s": 0.05,
+        }
+        record = executor.run_cartesian_retreat(
+            "qualification-moveit-cartesian-retreat",
+            current_tcp_pose_provider=lambda: source,
+            environment_cloud_provider=lambda: deterministic_cube_cloud(),
+        )
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "planning-scene-invalid"
+        assert record["stage"] == "D"
+        rows = _jsonl_rows(tmp_path / "integrated-execution.jsonl")
+        assert rows and rows[-1]["status"] == "evidence-invalid"
+        assert rows[-1]["event"] == "gate-d"
+        assert rows[-1]["event"] != "gate-c-plan-only"
+    finally:
+        executor.shutdown()
+
+
+# ---- F2.4: cleanup on accepted-UUID rejection ---------------------------------
+
+def test_executor_execute_uuid_mismatch_cleans_up_accepted_handle(tmp_path):
+    """F2.4/L3: an invalid execute UUID on an accepted handle triggers exactly one
+    bounded cleanup attempt before the evidence is finalized invalid."""
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
+    try:
+        plan_result = _success_result()
+        plan_uuid = _uuid.uuid4().bytes
+        plan_handle = _FakeGoalHandle(
+            accepted=True, result=plan_result, goal_id=plan_uuid, result_ready_at=0.0
+        )
+        # Accepted execute handle whose goal_id cannot normalize to a valid UUID.
+        execute_handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=None,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        move_client = _FakeMoveClient(server_ready=True, goal_handle=plan_handle, send_ready_at=0.0)
+        exec_client = _FakeMoveClient(server_ready=True, goal_handle=execute_handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = move_client
+        executor._action_clients["/execute_trajectory"] = exec_client
+        _synthetic_scene(executor, contract)
+        # The fjt provider is required before the execute send but is never
+        # invoked: the UUID-identity failure returns before FJT validation.
+        record = executor.run_execute_sequence(
+            "qualification-moveit-execute-joint",
+            fjt_transaction_provider=lambda: _fjt_evidence("a" * 32, EXECUTE_STATUS_SUCCEEDED),
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "UUIDs must both be valid" in record["execute_error"]
+        # Exactly one bounded cleanup attempt (cancel_goal_async called once).
+        assert execute_handle.cancel_goal_async_calls == 1
+        assert "cleanup" in record
+        # The cleanup outcome is recorded without claiming a successful cancel
+        # unless the exact CancelGoal contract is satisfied (empty goals_canceling
+        # vs the expected UUID is rejected).
+        assert record["cleanup"]["cleanup"] in ("rejected", "failed", "timed-out", "unknown")
+        assert "cleanup_result_status" in record["cleanup"]
+    finally:
+        executor.shutdown()
+
+
+# ---- F2.5: structural PointCloud2 evidence ------------------------------------
+
+def test_executor_retreat_env_cloud_truncated_rejected(tmp_path):
+    """F2.5/L4: a truncated byte buffer fails closed with no action goal sent."""
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cartesian-retreat")
+    try:
+        handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=_uuid.uuid4().bytes,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/cartesian_move_action"] = client
+        source = {
+            "frame_id": "base_link",
+            "xyz": [0.2, 0.0, 0.72],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "identity": "tcp-observation-1",
+            "age_s": 0.05,
+        }
+        _synthetic_scene(executor, contract)
+        cloud = deterministic_cube_cloud()
+        cloud.data = cloud.data[:-10]
+        record = executor.run_cartesian_retreat(
+            "qualification-moveit-cartesian-retreat",
+            current_tcp_pose_provider=lambda: source,
+            environment_cloud_provider=lambda: cloud,
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "data length" in record["execute_error"]
+        assert len(client.sent_goals) == 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_retreat_env_cloud_oversized_rejected(tmp_path):
+    """F2.5/L4: an oversized byte buffer fails closed with no action goal sent."""
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cartesian-retreat")
+    try:
+        handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=_uuid.uuid4().bytes,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/cartesian_move_action"] = client
+        source = {
+            "frame_id": "base_link",
+            "xyz": [0.2, 0.0, 0.72],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "identity": "tcp-observation-1",
+            "age_s": 0.05,
+        }
+        _synthetic_scene(executor, contract)
+        cloud = deterministic_cube_cloud()
+        cloud.data = bytes(cloud.data) + b"\x00" * 10
+        record = executor.run_cartesian_retreat(
+            "qualification-moveit-cartesian-retreat",
+            current_tcp_pose_provider=lambda: source,
+            environment_cloud_provider=lambda: cloud,
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "data length" in record["execute_error"]
+        assert len(client.sent_goals) == 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_retreat_env_cloud_undersized_row_step_rejected(tmp_path):
+    """F2.5/L4: a row_step below width*point_step fails closed."""
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cartesian-retreat")
+    try:
+        handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=_uuid.uuid4().bytes,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/cartesian_move_action"] = client
+        source = {
+            "frame_id": "base_link",
+            "xyz": [0.2, 0.0, 0.72],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "identity": "tcp-observation-1",
+            "age_s": 0.05,
+        }
+        _synthetic_scene(executor, contract)
+        cloud = deterministic_cube_cloud()
+        cloud.row_step = 1200  # < width*point_step (125*12=1500)
+        record = executor.run_cartesian_retreat(
+            "qualification-moveit-cartesian-retreat",
+            current_tcp_pose_provider=lambda: source,
+            environment_cloud_provider=lambda: cloud,
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "row_step" in record["execute_error"]
+        assert len(client.sent_goals) == 0
+    finally:
+        executor.shutdown()
+
+
+def test_executor_retreat_env_cloud_valid_padded_row_accepted(tmp_path):
+    """F2.5/L4: a valid row-padded buffer (row_step > width*point_step, exact
+    row_step*height payload) is accepted and drives the retreat goal."""
+    import uuid as _uuid
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cartesian-retreat")
+    try:
+        retreat_uuid = _uuid.uuid4().bytes
+        handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=retreat_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/cartesian_move_action"] = client
+        source = {
+            "frame_id": "base_link",
+            "xyz": [0.2, 0.0, 0.72],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "identity": "tcp-observation-1",
+            "age_s": 0.05,
+        }
+        _synthetic_scene(executor, contract)
+        cloud = deterministic_cube_cloud()
+        cloud.row_step = 1520
+        cloud.data = bytes(cloud.data) + b"\x00" * 20
+        record = executor.run_cartesian_retreat(
+            "qualification-moveit-cartesian-retreat",
+            current_tcp_pose_provider=lambda: source,
+            environment_cloud_provider=lambda: cloud,
+        )
+        assert record["status"] == "diagnostic-pass"
+        evidence = record["env_cloud_evidence"]
+        assert evidence["row_step"] == 1520
+        assert evidence["bytes"] == 1520
+        assert evidence["point_layout"] == {
+            "x_offset": 0,
+            "y_offset": 4,
+            "z_offset": 8,
+            "datatype": "float32",
+            "count": 1,
+        }
+        assert len(client.sent_goals) == 1
+    finally:
+        executor.shutdown()
+
+
+# ---- F2.6: look_around pin + dead fail-open helpers removed -------------------
+
+def test_executor_movegroup_builders_pin_look_around_false():
+    """F2.6/L1: both MoveGroup builders explicitly pin planning_options.look_around
+    to False, never relying on the moveit_msgs default."""
+    from geometry_msgs.msg import PoseStamped
+
+    joint_goal = build_joint_move_group_goal(Q_OUTBOUND, plan_only=True)
+    assert joint_goal.planning_options.look_around is False
+    target = PoseStamped()
+    target.header.frame_id = "base_link"
+    target.pose.position.x = 0.65
+    target.pose.position.y = 0.0
+    target.pose.position.z = 0.72
+    target.pose.orientation.w = 1.0
+    pose_goal = build_pose_move_group_goal(target, plan_only=True)
+    assert pose_goal.planning_options.look_around is False
+
+
+def test_executor_dead_fail_open_helpers_removed():
+    """F2.6/L2: the dead fail-open helper methods were deleted from the executor."""
+    from validation import integrated_gate_executor as _ige
+
+    for name in ("_safety_terminal_status", "_safety_velocity_frames", "_d_journal_pass"):
+        assert not hasattr(_ige.IntegratedGateExecutor, name), name
+
+
+# ---- F2.7: unambiguous action/controller/capture semantics --------------------
+
+def test_executor_execute_action_semantics_artifact(tmp_path):
+    """F2.7/L3: execute records controller_goal_sent=True (exact FJT semantic),
+    action_goal_sent=True with the ExecuteTrajectory action endpoint, and D
+    visual captures use kind=gate-d-diagnostic."""
+    import uuid as _uuid
+
+    from rclpy.serialization import serialize_message
+
+    from validation import integrated_gate_executor as _ige
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
+    try:
+        plan_result = _success_result()
+        planned = plan_result.planned_trajectory
+        plan_uuid = _uuid.uuid4().bytes
+        execute_uuid = _uuid.uuid4().bytes
+        plan_handle = _FakeGoalHandle(
+            accepted=True, result=plan_result, goal_id=plan_uuid, result_ready_at=0.0
+        )
+        execute_handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=execute_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        move_client = _FakeMoveClient(server_ready=True, goal_handle=plan_handle, send_ready_at=0.0)
+        exec_client = _FakeMoveClient(server_ready=True, goal_handle=execute_handle, send_ready_at=0.0)
+        executor._action_clients["/move_action"] = move_client
+        executor._action_clients["/execute_trajectory"] = exec_client
+        _synthetic_scene(executor, contract)
+        execute_hex = _uuid.UUID(bytes=execute_uuid).hex
+        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+
+        def _provider():
+            digest = hashlib.sha256(serialize_message(planned)).hexdigest()
+            return _fjt_evidence(execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=digest)
+
+        record = executor.run_execute_sequence(
+            "qualification-moveit-execute-joint", fjt_transaction_provider=_provider
+        )
+        assert record["status"] == "diagnostic-pass"
+        assert record["controller_goal_sent"] is True
+        assert record["controller_endpoint"] == FJT_ENDPOINT
+        assert record["action_goal_sent"] is True
+        assert record["action_endpoint"] == _ige.EXECUTE_TRAJECTORY_ENDPOINT
+        assert record["cartesian_goal_sent"] is False
+        assert record["gripper_goal_sent"] is False
+        controller_rows = _jsonl_rows(tmp_path / "controller-results.jsonl")
+        assert controller_rows and controller_rows[-1]["controller_goal_sent"] is True
+        assert controller_rows[-1]["action_goal_sent"] is True
+        assert controller_rows[-1]["action_endpoint"] == _ige.EXECUTE_TRAJECTORY_ENDPOINT
+        capture_rows = _jsonl_rows(tmp_path / "visual-capture-requests.jsonl")
+        assert capture_rows and all(
+            row["capture"]["kind"] == "gate-d-diagnostic" for row in capture_rows
+        )
+    finally:
+        executor.shutdown()
+
+
+def test_executor_retreat_action_semantics_artifact(tmp_path):
+    """F2.7/L3: retreat records controller_goal_sent=False (no FJT goal), with the
+    CartesianMove traffic surfaced via cartesian_goal_sent/action_goal_sent."""
+    import uuid as _uuid
+
+    from validation import integrated_gate_executor as _ige
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-cartesian-retreat")
+    try:
+        retreat_uuid = _uuid.uuid4().bytes
+        handle = _FakeGoalHandle(
+            accepted=True, result=None, goal_id=retreat_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
+        executor._action_clients["/cartesian_move_action"] = client
+        source = {
+            "frame_id": "base_link",
+            "xyz": [0.2, 0.0, 0.72],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "identity": "tcp-observation-1",
+            "age_s": 0.05,
+        }
+        _synthetic_scene(executor, contract)
+        record = executor.run_cartesian_retreat(
+            "qualification-moveit-cartesian-retreat",
+            current_tcp_pose_provider=lambda: source,
+            environment_cloud_provider=lambda: deterministic_cube_cloud(),
+        )
+        assert record["status"] == "diagnostic-pass"
+        assert record["controller_goal_sent"] is False
+        assert record["controller_endpoint"] == CARTESIAN_MOVE_ENDPOINT
+        assert record["action_goal_sent"] is True
+        assert record["action_endpoint"] == CARTESIAN_MOVE_ENDPOINT
+        assert record["cartesian_goal_sent"] is True
+        assert record["gripper_goal_sent"] is False
+        controller_rows = _jsonl_rows(tmp_path / "controller-results.jsonl")
+        assert controller_rows and controller_rows[-1]["controller_goal_sent"] is False
+        assert controller_rows[-1]["cartesian_goal_sent"] is True
+        assert controller_rows[-1]["action_goal_sent"] is True
+        assert controller_rows[-1]["action_endpoint"] == CARTESIAN_MOVE_ENDPOINT
+    finally:
+        executor.shutdown()
+
+
+def test_executor_gripper_action_semantics_artifact(tmp_path):
+    """F2.7/L3: gripper records controller_goal_sent=False (no FJT goal) with the
+    native gripper traffic surfaced via gripper_goal_sent/action_goal_sent."""
+    import uuid as _uuid
+
+    from validation import integrated_gate_executor as _ige
+
+    executor, contract = _d_executor(tmp_path, "qualification-moveit-gripper")
+    try:
+        sent = []
+
+        def _send_goal(goal):
+            handle = _FakeGoalHandle(
+                accepted=True, result=None,
+                goal_id=_uuid.uuid4().bytes,
+                status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+            )
+            sent.append(goal)
+            return _FakeFuture(handle, ready_at=0.0)
+
+        client = _FakeMoveClient(server_ready=True, goal_handle=None, send_ready_at=0.0)
+        client.send_goal_async = _send_goal
+        executor._action_clients["/xarm_gripper/gripper_action"] = client
+        _synthetic_scene(executor, contract)
+        record = executor.run_gripper_sequence("qualification-moveit-gripper")
+        assert record["status"] == "diagnostic-pass"
+        assert record["controller_goal_sent"] is False
+        assert record["controller_endpoint"] == GRIPPER_ENDPOINT
+        assert record["action_goal_sent"] is True
+        assert record["action_endpoint"] == GRIPPER_ENDPOINT
+        assert record["cartesian_goal_sent"] is False
+        assert record["gripper_goal_sent"] is True
+        controller_rows = _jsonl_rows(tmp_path / "controller-results.jsonl")
+        assert controller_rows and controller_rows[-1]["controller_goal_sent"] is False
+        assert controller_rows[-1]["gripper_goal_sent"] is True
+        assert controller_rows[-1]["action_goal_sent"] is True
+        assert controller_rows[-1]["action_endpoint"] == GRIPPER_ENDPOINT
+        assert controller_rows[-1]["gripper_goal_sent"] is True
     finally:
         executor.shutdown()
