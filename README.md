@@ -314,6 +314,38 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 4 —
+  "preserve Gate E downgrade truth"): Preserved controller/action/task truth
+  through the E fail-dominant downgrade path and removed the load-sensitive
+  rclpy CDR-padding digest flake.  F4.1 — the E fail-dominant downgrade writers
+  (`_write_e_fail_dominant_execution_json` and the final
+  `integrated-execution.jsonl`/`controller-results.jsonl` downgrade rows) now
+  preserve `controller_goal_sent`/`controller_goal_uuid`/`controller_endpoint`
+  from the pre-downgrade truthful record, so a late required-artifact write
+  failure never erases or fabricates the controller identity the attempt
+  actually observed; two sourced-Humble downgrade tests force a late goal-
+  artifact write failure after an observed approach FJT (identical controller
+  truth across every authoritative/final downgrade artifact, no final row
+  claims pass) and on the no-controller path (all three fields stay
+  `False`/`None`, accepted-goal cleanup retained).  F4.2 — the D-side digest
+  nondeterminism is eliminated by serializing the canonical planned trajectory
+  EXACTLY ONCE per test setup (`_install_deterministic_serialize` caches the
+  exact rclpy `serialize_message` bytes by object identity per executor,
+  so the plan/executed/FJT-join digests are byte-identical inside the run
+  window) while separately asserting full semantic trajectory identity
+  (`_robot_trajectories_equivalent`) field-by-field on the actual
+  `ExecuteTrajectory` goal, with a mutation-negative
+  `test_semantic_trajectory_identity_detects_mutation` proving a mutated
+  executed trajectory is caught even when the provider digest is reused.  The
+  raw serialized bytes are never altered, so production digest semantics and
+  Gate D/E runtime behavior are unchanged; every affected sibling D test now
+  serializes once at setup and reuses the snapshot digest.  Humble suite grows
+  to 164 tests (pure suite stays 126); the full sourced-Humble suite passes 10
+  consecutive fresh clean processes, the affected D-digest tests pass 50
+  consecutive iterations and 8 concurrent processes, and the flagship Gate-E
+  temporal subset passes 20 consecutive clean iterations.  No build or live
+  run is required.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 3 —
   "make Gate E temporal evidence deterministic"): Resolved the F3.1-F3.5
   consolidated findings in the Stage-E path, preserving every review-clean
