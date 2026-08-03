@@ -363,6 +363,66 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-03 (integrated qualification Task 6 — "add fixed-target Pick and Place
+  controls"): Added the Stage-E fixed-target Pick/Place diagnostics executor to
+  the same ROS-lazy `validation/integrated_gate_executor.py`.  A closed ROS-free
+  `stage_e_dispatch` validates exactly the eight committed Stage-E scenarios
+  (`qualification-pick-place-{positive,blocked-approach,unreachable-grasp,
+  malformed-back,cancel-approach,cancel-transport,safety-transport,
+  occupied-place}`) for exact id, `integrated.stage == "E"`,
+  `execution_profile == "sim_ompl"`, exact polarity, exact `expected_physical` /
+  `expected_negative` contracts, exact `forbidden_endpoints ==
+  ["/isaac_joint_commands"]`, exact `trigger_timeout_s`, and pinned fixed-target
+  geometry (`grasp_tcp_xyz [0.65, 0, 0.72]`, `object_root_xyz [0.65, 0, 0.60]`,
+  `place_target_point` base_link `[0.85, 0, 0.72]`, identity orientation) plus
+  the declared six-value malformed-back vector; unknown/mutated/C/D-stage
+  scenarios fail closed before any goal.  The positive sequence uses only
+  production `/pickup_action` then `/place_action` with the deterministic cube
+  cloud and exact seven-joint `Q_OUTBOUND` (`use_mesh=True`, `stay=False`) and
+  records `scene-attach`/`scene-detach` only from observed PlanningScene
+  transitions, never from action-result inference.  The E journal branches per
+  scenario (positive equals `POSITIVE_ORDER`; each negative has its own exact
+  diagnostic order and forbidden events), leaving Gate-C/D journal bytes and the
+  Task-3 journal graph unchanged.
+
+  **Live TCP provider obligation (later orchestration).**  Task 6 reuses the
+  executor's injected `current_tcp_pose_provider` seam and owns no TF state: the
+  executor keeps a bounded per-attempt sample deque and derives `tcp_z_m` plus
+  `tcp_speed_m_s = |Δxyz|/Δt` from the two newest fresh receipt-sequenced
+  `base_link` samples; fewer than two fresh samples means the trigger cannot
+  fire and a timeout is evidence-invalid, never a pass.  The **live orchestrator
+  (Task 7/10) must supply** a TF-backed provider in its own ROS node/context that
+  reads `/tf` `world → base_link → link_tcp` from the sim/DDS, resolves the chain
+  to `link_tcp`, gates freshness against the configured `tf_fresh_s`, and returns
+  the normalized fresh `base_link` TCP-pose mapping.  The executor destroys no TF
+  state and `shutdown()` need not touch TF; the provider is injected and freed by
+  the orchestrator.  FJT correlation is receipt-window only: the executor captures
+  the FJT/joint/start baseline at Pick/Place goal acceptance, uses the first fresh
+  FJT EXECUTING entry after acceptance for the approach trigger, the first later
+  fresh EXECUTING entry for transport, and records the observed FJT goal UUID as
+  evidence — it never claims the internal Pick/Place ExecuteTrajectory UUID is
+  observable (that UUID is private to production).
+
+  **Gate E artifact and status semantics.**  Two status domains are kept separate
+  and both recorded: the action-client `GoalStatus` (SUCCEEDED=4, CANCELED=5,
+  ABORTED=6) and the Pick/Place `Result.status` (0 success, 1 invalid_goal,
+  2 planning_failed, 3 execution_failed, 4 canceled, 5 safety_stop,
+  6 scene_inconsistent, 7 postcondition_failed, 8 timeout, 9 internal_error).
+  A canceled Pick/Place therefore records both `terminal_status="canceled"` and
+  `task_result_status=4`/`task_result_status_string="canceled"`.  The fail-dominant
+  artifact transaction mirrors Gate D with `event="gate-e"`, `stage="E"`,
+  `diagnostic_only=true`, `physical_verdict=null`, handler/polarity, pick/place
+  goal-sent flags, `goals_sent`, task/FJT UUIDs, trigger record, and
+  `isaac_joint_commands_published=false` across `integrated-execution.jsonl/.json`,
+  `moveit-plans.jsonl`, `controller-results.jsonl`, visual-capture requests
+  (`capture.kind="gate-e-diagnostic"`), and per-scenario `goals/<scenario_id>.json`;
+  any journal/graph/artifact write or finalization failure downgrades every
+  status-bearing stream to a final `evidence-invalid` disposition.  Negative
+  diagnostics may expose `diagnostic-pass` only when their exact short journal,
+  graph, and artifacts are complete.  Task 6 records diagnostics only; raw
+  contact/lift/release/collision verdicts remain Task 7 verifier work.  No build
+  or live run is required.
+
 - 2026-08-03 (integrated qualification Task 5, formal-review fix round 2 —
   "seal Gate D evidence streams"): Sealed the Stage-D evidence streams against
   the formal SPEC/QUALITY residual findings.  A D artifact-write downgrade
