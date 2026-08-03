@@ -6013,6 +6013,15 @@ class IntegratedGateExecutor:
         self._e_native_gripper_count_baseline = None
         self._e_post_grasp_lift_m_provider = None
         self._e_post_grasp_lift_m_observed = None
+        # F3.1/F3.3: per-attempt observation seams.  ``_e_lift_latch_mono`` is the
+        # monotonic instant the Gate-E lift-complete latch fired (a test barrier
+        # waits on it before injecting the transport FJT, replacing fixed wall-
+        # clock timer races).  ``_e_observed_fjt_trigger`` is the first captured
+        # FJT-based trigger (approach/transport/place) so the unexpected-
+        # exception path can derive controller traffic ONLY from actual observed
+        # FJT evidence (F3.3), never from task-goal cleanup.
+        self._e_lift_latch_mono = None
+        self._e_observed_fjt_trigger = None
 
     def _e_native_gripper_count(self) -> int | None:
         """Fresh receipt-sequenced native gripper action-goal count, else None.
@@ -6039,33 +6048,6 @@ class IntegratedGateExecutor:
             return None
         return int(count)
 
-    def _e_post_grasp_lift_m(self) -> tuple[float, dict[str, object]] | None:
-        """Fresh observed production ``post_grasp_lift_m`` value, else ``None``.
-
-        F2.1: the injected provider observes the live ``pick_and_place`` ROS
-        runtime parameter ``post_grasp_lift_m``.  Gate E requires the finite
-        value to be ``>= object_lift_m`` (0.10 m for the committed
-        qualification) so the observed lift peak ``grasp_z + post_grasp_lift_m``
-        is physically reachable at the lift latch ``grasp_z + object_lift_m -
-        tolerance``.  Missing/stale/non-finite/provider-error evidence returns
-        ``None`` and the caller fails closed with zero action traffic.
-        """
-        provider = self._e_post_grasp_lift_m_provider
-        if provider is None:
-            return None
-        try:
-            sample = provider()
-        except Exception:
-            return None
-        result = _post_grasp_lift_m_observation(
-            sample,
-            object_lift_m=self._e_object_lift_m(),
-            fresh_limit_s=self._thresholds().get("tf_fresh_s", 0.25),
-        )
-        if isinstance(result, str):
-            return None
-        return result
-
     def _e_unexpected_exception(
         self, scenario_id: str, exc: Exception, *, spec: Mapping[str, object]
     ) -> dict[str, object]:
@@ -6082,8 +6064,14 @@ class IntegratedGateExecutor:
         ``integrated-execution.jsonl``/``.json``, ``moveit-plans.jsonl``,
         ``controller-results.jsonl`` and the goal artifact.  No durable row may
         claim no goal was sent when one was accepted.
+
+        F3.3: ``controller_goal_sent`` is derived ONLY from actual observed FJT
+        evidence (``_e_observed_fjt_trigger``).  Accepting/canceling a task goal
+        or attempting task-goal cleanup never proves a controller goal was sent;
+        when no goal was accepted, cleanup is ``None`` so it cannot imply
+        traffic.
         """
-        cleanup: dict[str, object] = {}
+        cleanup: Mapping[str, object] | None = None
         goal_handle = self._e_active_goal_handle
         if goal_handle is not None:
             try:
@@ -6099,6 +6087,13 @@ class IntegratedGateExecutor:
         place_goal_sent = bool(goal_state.get("place_sent"))
         place_goal_accepted = bool(goal_state.get("place_sent"))
         goals_sent = int(pick_goal_sent) + int(place_goal_sent)
+        observed_fjt = self._e_observed_fjt_trigger
+        controller_goal_sent = bool(
+            observed_fjt is not None and observed_fjt.get("goal_uuid") is not None
+        )
+        controller_goal_uuid = (
+            observed_fjt.get("goal_uuid") if observed_fjt is not None else None
+        )
         return self._evidence_invalid_e(
             scenario_id,
             "unexpected-exception",
@@ -6112,6 +6107,8 @@ class IntegratedGateExecutor:
             pick_goal_id=goal_state.get("pick_goal_id"),
             place_goal_id=goal_state.get("place_goal_id"),
             cleanup=cleanup,
+            controller_goal_sent=controller_goal_sent,
+            controller_goal_uuid=controller_goal_uuid,
         )
 
     def run_pick_place_sequence(
@@ -7085,6 +7082,9 @@ class IntegratedGateExecutor:
             captured["fjt_receipt_delta_s"] = _fjt_receipt_delta_s(
                 first, baseline.get("start_mono")
             )
+            # F3.3: retain the observed FJT trigger for the unexpected-exception
+            # controller-truth derivation (approach FJT is controller traffic).
+            self._e_observed_fjt_trigger = dict(captured)
             return True
 
         if not self._wait_for(_seen, timeout_s):
@@ -7145,6 +7145,9 @@ class IntegratedGateExecutor:
                     ),
                 }
             )
+            # F3.1: record the lift-latch wall instant so a deterministic test
+            # barrier can inject the transport FJT strictly after the latch.
+            self._e_lift_latch_mono = float(lift["lift_mono"])
             return True
 
         def _transport_seen() -> bool:
@@ -7170,6 +7173,9 @@ class IntegratedGateExecutor:
                 next_goal, lift.get("lift_mono")
             )
             captured.update(lift)
+            # F3.3: retain the observed FJT trigger so the unexpected-exception
+            # path can derive controller traffic from real FJT evidence only.
+            self._e_observed_fjt_trigger = dict(captured)
             return True
 
         while time.monotonic() < deadline:
@@ -7543,6 +7549,21 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
                 task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
             )
+        # F3.2: record the pre-cancel PlanningScene baseline (the latest valid
+        # scene sequence and receipt time used for the transport/Place trigger)
+        # so the post-cancel re-observation can be gated on a strictly newer
+        # scene rather than accepting the last cached pre-cancel attached scene.
+        pre_cancel_scene = self._latest_planning_scene
+        pre_cancel_scene_sequence = (
+            int(pre_cancel_scene.get("scene_sequence", -1))
+            if isinstance(pre_cancel_scene, Mapping)
+            else -1
+        )
+        pre_cancel_scene_receipt = (
+            float(pre_cancel_scene.get("scene_timestamp", 0.0))
+            if isinstance(pre_cancel_scene, Mapping)
+            else None
+        )
         cancel_requested = self._e_record_snapshot("cancel-requested")
         if cancel_requested != "recorded":
             return self._finalize_e_attempt(
@@ -7600,6 +7621,9 @@ class IntegratedGateExecutor:
                 terminal_status=place_terminal_status,
                 trigger=place_trigger, cancel_response=cancel_response,
             )
+        # F3.2: the exact Place cancel terminal wall instant.  A fresh post-cancel
+        # PlanningScene observation must be received strictly after this instant.
+        cancel_terminal_mono = float(time.monotonic())
         if not self._e_wait_quiescent(place_baseline):
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
@@ -7626,22 +7650,60 @@ class IntegratedGateExecutor:
                 trigger=place_trigger, cancel_response=cancel_response,
             )
         event_log.append("quiescent")
-        # F2.5: after the exact Place cancel terminal and quiescence, require a
-        # fresh PlanningScene observation proving ``pick_and_place/object_mesh``
-        # remains attached.  If the Place server's open/detach won the cancel
-        # race (target-motion FJT completed before the cancel latched), Gate E
-        # fails ``evidence-invalid`` here rather than deferring all observability
-        # to Task 7.  The post-cancel scene join key/attachment state is recorded
+        # F2.5/F3.2: after the exact Place cancel terminal and quiescence, require
+        # a STRICTLY FRESH PlanningScene observation proving
+        # ``pick_and_place/object_mesh`` remains attached.  The last cached
+        # pre-cancel attached scene is never accepted: the runner boundedly waits
+        # for a valid scene whose ``scene_sequence`` is strictly greater than the
+        # pre-cancel baseline AND whose receipt time is after the cancel terminal.
+        # Only that fresh scene may establish ``post_cancel_target_attached``;
+        # timeout, malformed newer scene, unchanged sequence, or detached target
+        # is ``evidence-invalid``.  Baseline sequence, post-cancel sequence,
+        # receipt delta, attachment state, and timeout/error reason are recorded
         # in the final trigger artifact.
-        post_scene = self._latest_planning_scene
-        post_cancel_attached = self._e_target_attached()
-        post_cancel_scene_sequence = (
-            int(post_scene.get("scene_sequence", -1)) if isinstance(post_scene, Mapping) else -1
-        )
         post_cancel_trigger = dict(place_trigger)
-        post_cancel_trigger["post_cancel_target_attached"] = bool(post_cancel_attached)
-        post_cancel_trigger["post_cancel_scene_sequence"] = int(post_cancel_scene_sequence)
-        if not post_cancel_attached:
+        post_cancel_trigger["pre_cancel_scene_sequence"] = int(pre_cancel_scene_sequence)
+        if pre_cancel_scene_receipt is not None:
+            post_cancel_trigger["pre_cancel_scene_receipt_mono"] = float(pre_cancel_scene_receipt)
+        post_cancel_trigger["post_cancel_scene_sequence"] = int(pre_cancel_scene_sequence)
+        post_cancel_trigger["post_cancel_scene_receipt_delta_s"] = None
+        post_cancel_trigger["post_cancel_target_attached"] = False
+        post_cancel_trigger["post_cancel_fresh_scene_reason"] = "pending"
+        fresh = self._e_wait_post_cancel_fresh_scene(
+            pre_cancel_scene_sequence,
+            cancel_terminal_mono,
+            timeout_s=float(self._thresholds().get("post_cancel_scene_wait_s", 2.0)),
+        )
+        if fresh is None:
+            if (
+                self._planning_scene_invalid
+                and self._scene_invalid_sequence is not None
+                and int(self._scene_invalid_sequence) > int(pre_cancel_scene_sequence)
+            ):
+                post_cancel_trigger["post_cancel_fresh_scene_reason"] = (
+                    "post-cancel newer scene malformed/provider-error (fail-closed)"
+                )
+            else:
+                post_cancel_trigger["post_cancel_fresh_scene_reason"] = (
+                    "post-cancel fresh scene timed out (no strictly newer valid scene)"
+                )
+            post_cancel_trigger["post_cancel_scene_sequence"] = int(pre_cancel_scene_sequence)
+            post_cancel_trigger["post_cancel_scene_receipt_delta_s"] = None
+            post_cancel_trigger["post_cancel_target_attached"] = False
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=post_cancel_trigger["post_cancel_fresh_scene_reason"],
+                pick_goal_sent=True, place_goal_sent=True,
+                place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
+                pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
+                task_result_status=place_result_status,
+                terminal_status=place_terminal_status,
+                trigger=post_cancel_trigger, cancel_response=cancel_response,
+            )
+        post_cancel_trigger.update(dict(fresh))
+        post_cancel_trigger["post_cancel_fresh_scene_reason"] = "fresh-observed"
+        if not bool(fresh.get("post_cancel_target_attached")):
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
                 event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
@@ -7715,9 +7777,58 @@ class IntegratedGateExecutor:
             captured["fjt_receipt_delta_s"] = _fjt_receipt_delta_s(
                 first, baseline.get("start_mono")
             )
+            # F3.3: retain the observed FJT trigger for the unexpected-exception
+            # controller-truth derivation (place target-motion FJT is controller
+            # traffic).
+            self._e_observed_fjt_trigger = dict(captured)
             return True
 
         if not self._wait_for(_seen, timeout_s):
+            return None
+        return captured
+
+    def _e_wait_post_cancel_fresh_scene(
+        self, pre_cancel_seq, cancel_terminal_mono, *, timeout_s
+    ) -> dict[str, object] | None:
+        """F3.2: boundedly wait for a strictly newer valid PlanningScene.
+
+        After the exact Place cancel terminal and quiescence, occupied-place must
+        NOT accept the last cached pre-cancel attached scene.  This wait requires
+        a valid PlanningScene observation whose ``scene_sequence`` is strictly
+        greater than the pre-cancel baseline AND whose receipt time is after the
+        cancel terminal.  Only that fresh scene may establish
+        ``post_cancel_target_attached``.  Returns the captured observation
+        (sequence, receipt delta, attachment state) or ``None`` on timeout /
+        unchanged sequence / malformed-newer (the fail-closed latch keeps the
+        last valid cached scene, so a malformed newer callback simply never
+        advances the observable sequence).
+        """
+        captured: dict[str, object] = {}
+
+        def _seen() -> bool:
+            scene = self._latest_planning_scene
+            if scene is None:
+                return False
+            seq = int(scene.get("scene_sequence", -1))
+            if seq <= int(pre_cancel_seq):
+                return False
+            receipt = scene.get("scene_timestamp")
+            if receipt is None:
+                return False
+            try:
+                receipt_s = float(receipt)
+            except (TypeError, ValueError):
+                return False
+            if receipt_s < float(cancel_terminal_mono):
+                return False
+            captured["post_cancel_scene_sequence"] = seq
+            captured["post_cancel_scene_receipt_delta_s"] = (
+                receipt_s - float(cancel_terminal_mono)
+            )
+            captured["post_cancel_target_attached"] = bool(self._e_target_attached())
+            return True
+
+        if not self._wait_for(_seen, float(timeout_s)):
             return None
         return captured
 
@@ -7970,6 +8081,8 @@ class IntegratedGateExecutor:
         place_goal_id: object = None,
         cleanup: Mapping[str, object] | None = None,
         trigger: Mapping[str, object] | None = None,
+        controller_goal_sent: bool | None = None,
+        controller_goal_uuid: object = None,
     ) -> dict[str, object]:
         """Task 6: E-stage evidence-invalid record with the E schema and durable rows.
 
@@ -7979,12 +8092,19 @@ class IntegratedGateExecutor:
         (pick/place goal-sent flags, goal IDs, goals sent, cleanup outcome) are
         persisted into every durable artifact; no row claims no goal was sent
         when one was accepted.
+        F3.3: ``controller_goal_sent`` is true ONLY when an actual FJT
+        transaction/status/UUID was observed for the attempt.  Accepting/canceling
+        a Pick/Place goal, attempting task-goal cleanup, or observing the
+        ``post_grasp_lift_m`` runtime parameter never implies a controller goal
+        was sent.  When ``controller_goal_sent`` is not passed explicitly it is
+        derived from a trigger carrying an FJT ``goal_uuid``.
         """
-        controller_goal_sent = bool(
-            trigger is not None
-            or cleanup is not None
-            or post_grasp_lift_m_observed is not None
-        )
+        if controller_goal_sent is None:
+            controller_goal_sent = bool(
+                trigger is not None and trigger.get("goal_uuid") is not None
+            )
+        controller_goal_sent = bool(controller_goal_sent)
+        controller_endpoint = FJT_ENDPOINT if controller_goal_sent else None
         record: dict[str, object] = {
             "scenario_id": scenario_id,
             "stage": "E",
@@ -8000,6 +8120,8 @@ class IntegratedGateExecutor:
             "pick_goal_id": pick_goal_id,
             "place_goal_id": place_goal_id,
             "controller_goal_sent": bool(controller_goal_sent),
+            "controller_goal_uuid": controller_goal_uuid,
+            "controller_endpoint": controller_endpoint,
             "isaac_joint_commands_published": False,
         }
         if post_grasp_lift_m_observed is not None:
@@ -8025,6 +8147,8 @@ class IntegratedGateExecutor:
                 "place_goal_sent": bool(place_goal_sent),
                 "place_goal_accepted": bool(place_goal_accepted),
                 "controller_goal_sent": bool(controller_goal_sent),
+                "controller_goal_uuid": controller_goal_uuid,
+                "controller_endpoint": controller_endpoint,
                 "isaac_joint_commands_published": False,
                 "timestamp": float(time.monotonic()),
             }
@@ -8060,6 +8184,8 @@ class IntegratedGateExecutor:
                     "pick_goal_id": pick_goal_id,
                     "place_goal_id": place_goal_id,
                     "controller_goal_sent": bool(controller_goal_sent),
+                    "controller_goal_uuid": controller_goal_uuid,
+                    "controller_endpoint": controller_endpoint,
                     "post_grasp_lift_m_observed": (
                         dict(post_grasp_lift_m_observed)
                         if post_grasp_lift_m_observed is not None
@@ -8123,7 +8249,18 @@ class IntegratedGateExecutor:
                     "report_revision": REPORT_REVISION,
                     "scenario_id": scenario_id,
                     "status": "evidence-invalid",
+                    # F3.3: task-goal truth is preserved consistently here too —
+                    # controller_goal_sent stays False even when a task goal was
+                    # accepted (accepting/canceling a task goal is not controller
+                    # traffic).
+                    "pick_goal_sent": record.get("pick_goal_sent"),
+                    "place_goal_sent": record.get("place_goal_sent"),
+                    "place_goal_accepted": record.get("place_goal_accepted"),
+                    "goals_sent": record.get("goals_sent"),
+                    "pick_goal_id": record.get("pick_goal_id"),
+                    "place_goal_id": record.get("place_goal_id"),
                     "controller_goal_sent": record.get("controller_goal_sent"),
+                    "controller_goal_uuid": record.get("controller_goal_uuid"),
                     "controller_endpoint": FJT_ENDPOINT if record.get("controller_goal_sent") else None,
                     "gripper_goal_sent": False,
                     "task_result_status": task_result_status,
@@ -8154,6 +8291,11 @@ class IntegratedGateExecutor:
                     "goals_sent": record.get("goals_sent"),
                     "pick_goal_id": record.get("pick_goal_id"),
                     "place_goal_id": record.get("place_goal_id"),
+                    "controller_goal_sent": record.get("controller_goal_sent"),
+                    "controller_goal_uuid": record.get("controller_goal_uuid"),
+                    "controller_endpoint": (
+                        FJT_ENDPOINT if record.get("controller_goal_sent") else None
+                    ),
                     "geometry": dict(spec.get("geometry") or {}),
                     "cleanup": dict(record.get("cleanup") or {}),
                     "trigger": dict(record.get("trigger") or {}),
@@ -8280,11 +8422,22 @@ class IntegratedGateExecutor:
                 result_status_string = _pick_place_result_name(result_status)
             except ValueError:
                 result_status_string = None
+        # F3.3: controller traffic is derived ONLY from actual observed FJT
+        # evidence — a trigger carrying an FJT ``goal_uuid`` or an explicit
+        # ``fjt_goal_uuid``.  A task terminal (executing/succeeded/canceled) or
+        # task-goal cleanup never implies a controller goal was sent.
         controller_goal_sent = bool(
-            trigger is not None
+            (trigger is not None and trigger.get("goal_uuid") is not None)
             or fjt_goal_uuid is not None
-            or terminal_status in ("executing", "succeeded")
         )
+        # F3.3: keep the observed FJT goal UUID alongside the controller-truth
+        # flags so every finalize record is consistent with ``_evidence_invalid_e``
+        # (``controller_goal_sent``/``controller_goal_uuid``/``controller_endpoint``).
+        controller_goal_uuid = fjt_goal_uuid
+        if trigger is not None and trigger.get("goal_uuid") is not None:
+            controller_goal_uuid = trigger.get("goal_uuid")
+        if not controller_goal_sent:
+            controller_goal_uuid = None
         record: dict[str, object] = {
             "scenario_id": scenario_id,
             "handler": spec.get("kind"),
@@ -8301,6 +8454,7 @@ class IntegratedGateExecutor:
             "pick_goal_id": pick_goal_id,
             "place_goal_id": place_goal_id,
             "controller_goal_sent": bool(controller_goal_sent),
+            "controller_goal_uuid": controller_goal_uuid,
             "controller_endpoint": FJT_ENDPOINT if controller_goal_sent else None,
             "gripper_goal_sent": False,
             "task_result_status": result_status,
@@ -8394,6 +8548,7 @@ class IntegratedGateExecutor:
                 "report_revision": REPORT_REVISION,
                 "scenario_id": scenario_id,
                 "controller_goal_sent": record.get("controller_goal_sent"),
+                "controller_goal_uuid": record.get("controller_goal_uuid"),
                 "controller_endpoint": record.get("controller_endpoint"),
                 "gripper_goal_sent": record.get("gripper_goal_sent"),
                 "task_result_status": record.get("task_result_status"),
@@ -8425,6 +8580,7 @@ class IntegratedGateExecutor:
                 "pick_goal_id": record.get("pick_goal_id"),
                 "place_goal_id": record.get("place_goal_id"),
                 "controller_goal_sent": record.get("controller_goal_sent"),
+                "controller_goal_uuid": record.get("controller_goal_uuid"),
                 "controller_endpoint": record.get("controller_endpoint"),
                 "task_result_status": record.get("task_result_status"),
                 "task_result_status_string": record.get("task_result_status_string"),
@@ -8455,6 +8611,12 @@ class IntegratedGateExecutor:
                 "place_goal_sent": record.get("place_goal_sent"),
                 "place_goal_accepted": record.get("place_goal_accepted"),
                 "goals_sent": record.get("goals_sent"),
+                "pick_goal_id": record.get("pick_goal_id"),
+                "place_goal_id": record.get("place_goal_id"),
+                # F3.3: controller truth is preserved in the goal artifact too.
+                "controller_goal_sent": record.get("controller_goal_sent"),
+                "controller_goal_uuid": record.get("controller_goal_uuid"),
+                "controller_endpoint": record.get("controller_endpoint"),
                 "geometry": dict(spec.get("geometry") or {}),
                 "post_grasp_lift_m_observed": dict(record.get("post_grasp_lift_m_observed") or {}),
                 "cleanup": dict(record.get("cleanup") or {}),
