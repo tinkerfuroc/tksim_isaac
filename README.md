@@ -314,6 +314,37 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 6, formal-review fix round 5 —
+  "harden final trajectory digest test"): Hardened the last remaining
+  `run_execute_sequence` caller in the sourced-Humble D acceptance suite that
+  reached the executor's own planned/executed CDR-digest comparison without the
+  deterministic serializer seam.  F5.1 —
+  `test_executor_execute_uuid_mismatch_cleans_up_accepted_handle` now installs
+  the same test-local `_install_deterministic_serialize` seam as its seven F4.2
+  siblings (the canonical planned trajectory is serialized EXACTLY ONCE at
+  setup; that byte/digest snapshot is authoritative for the whole run window),
+  so the rejection is deterministically the plan/execute UUID-identity failure
+  and never a load-sensitive rclpy CDR-padding digest mismatch.  The test's real
+  purpose is preserved: the accepted `ExecuteTrajectory` handle has a UUID
+  identity mismatch, exactly one bounded cleanup attempt is made, and the final
+  `execute_error` is the UUID reason.  The sent `ExecuteTrajectory.Goal`
+  trajectory identity is now asserted semantically field-by-field
+  (`_robot_trajectories_equivalent`) against the setup snapshot, and the
+  provider's FJT evidence reuses the single canonical digest snapshot.  A
+  complete caller audit confirms every `run_execute_sequence` call in
+  `tests/test_integrated_gate_executor_ros.py` either installs the seam or
+  returns before the digest comparison by direct control flow (the two
+  no-scene/no-provider negatives fail closed in `_acquire_scene`/the
+  `fjt_transaction_provider is None` gate before any plan/execute goal, so they
+  cannot reach `planned_digest_before`).  Production serializer/digest code is
+  unchanged and the digest checks are not weakened; the raw serialized bytes are
+  never altered.  Humble suite stays 164 tests (pure suite stays 126); the
+  UUID-mismatch test passes 100 consecutive fresh iterations, the affected
+  D-digest batch passes 50 consecutive iterations, the concurrent stress passes
+  all processes under load, the full sourced-Humble suite passes 10 consecutive
+  fresh clean processes, and the flagship Gate-E temporal subset passes 20
+  consecutive clean iterations.  No build or live run is required.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 4 —
   "preserve Gate E downgrade truth"): Preserved controller/action/task truth
   through the E fail-dominant downgrade path and removed the load-sensitive

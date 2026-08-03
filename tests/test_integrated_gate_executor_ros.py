@@ -6699,7 +6699,15 @@ def test_executor_execute_uuid_mismatch_cleans_up_accepted_handle(tmp_path):
 
     executor, contract = _d_executor(tmp_path, "qualification-moveit-execute-joint")
     try:
+        # F5.1: deterministic CDR digest seam (see _install_deterministic_serialize)
+        # so the executor's own planned/executed digest comparison at the start of
+        # the execute send is byte-identical and the rejection is deterministically
+        # the UUID-identity failure, never a load-sensitive CDR-padding digest
+        # mismatch (the F4.2 flake class this round closes).
+        deterministic_serialize = _install_deterministic_serialize(executor)
         plan_result = _success_result()
+        planned = plan_result.planned_trajectory
+        planned_snapshot = copy.deepcopy(planned)
         plan_uuid = _uuid.uuid4().bytes
         plan_handle = _FakeGoalHandle(
             accepted=True, result=plan_result, goal_id=plan_uuid, result_ready_at=0.0
@@ -6714,14 +6722,23 @@ def test_executor_execute_uuid_mismatch_cleans_up_accepted_handle(tmp_path):
         executor._action_clients["/move_action"] = move_client
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
-        # The fjt provider is required before the execute send but is never
-        # invoked: the UUID-identity failure returns before FJT validation.
+        # F5.1: serialize the canonical planned trajectory EXACTLY ONCE at setup
+        # and reuse that byte/digest snapshot for the provider's FJT evidence.
+        # The provider is never invoked (the UUID-identity failure returns before
+        # FJT validation), but the snapshot is authoritative for the whole run.
+        trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-joint",
-            fjt_transaction_provider=lambda: _fjt_evidence("a" * 32, EXECUTE_STATUS_SUCCEEDED),
+            fjt_transaction_provider=lambda: _fjt_evidence(
+                "a" * 32, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            ),
         )
         assert record["status"] == "evidence-invalid"
         assert "UUIDs must both be valid" in record["execute_error"]
+        # F5.1: the sent ExecuteTrajectory goal still carries the unchanged planned
+        # trajectory (semantic field-by-field identity vs the setup snapshot).
+        assert len(exec_client.sent_goals) == 1
+        assert _robot_trajectories_equivalent(exec_client.sent_goals[0].trajectory, planned_snapshot) is True
         # Exactly one bounded cleanup attempt (cancel_goal_async called once).
         assert execute_handle.cancel_goal_async_calls == 1
         assert "cleanup" in record
