@@ -314,6 +314,43 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8 — "orchestrate Gates A-F"):
+  Added the offline orchestration/lifecycle layer over the review-clean
+  six-gate core suite, the Task 6 physics-ready gate, and the Task 7
+  independent integrated verifier.  `validation/integrated_qualification.py`
+  exposes `IntegratedRunner` with CLI stages `A`/`B`/`C`/`D`/`E`/`F`/`all`.
+  Stage A calls the existing core suite through the unchanged
+  `manipulation_qualification.py --gate GATE_NAME` semantics (six required
+  gates, exact raw/evaluator drains, valid rosbags, clean teardown, existing
+  contact sheets).  Before Gate B the runner atomically writes
+  `outputs/integrated/attempt-start.json` with UTC/monotonic start identities,
+  then invokes the committed `source_lock_manifest.py` producer with the
+  config-resolved authorization policy and validates the exit code and output
+  schema before invoking the offline static closure; Gate B is fail-closed and
+  never captures/trusts current state, and blocks C-F on any non-pass.  Stages
+  C-E run every listed scenario in a unique child ROS domain in `[0,232]` with
+  a unique immutable attempt directory; readiness requires the overlay's
+  atomically written `physics-ready.json` to bind its `scenario_report_sha256`
+  to the exact bytes of the atomically written `scenario-runner.json` and to
+  carry the full committed identity (scenario id/seed,
+  scenario_declaration_sha256, planning_scene_sha256, integrated_sha256, model
+  fingerprint, provider-manifest digest, final `STATE_PLAYING`, and a final
+  `state=1`/`boundary=PHYSICS_READY` operation), so a transient
+  `state=PHYSICS_READY` alone is insufficient.  Execution return codes never
+  override the independent verifier verdict; teardown failures downgrade a
+  scenario to `evidence-invalid` and every attempt is preserved.  Stage F is
+  the explicit Tasks 9-10 extension point (`not-implemented`).  Reusable core
+  helpers (source identity, record topics/QoS, process launch/readiness,
+  truth/evaluator drain, rosbag finalization, termination/resource cleanup)
+  were extracted as additive thin delegations in
+  `validation/manipulation_qualification.py` with no behavior change to the
+  six-gate runner.  `tests/test_integrated_qualification.py` (15 tests: 8
+  deterministic orchestration-contract tests plus 7 real-runner offline
+  contract tests) passes; focused suite is 80 passed + 2 subtests, and the
+  broader qualification regression batch is 264 passed.  No build, no live
+  Isaac/ROS, no cuMotion; production modules/scenarios/policies/executor/
+  journal/config and the two source-lock policy files are untouched.
+
 - 2026-08-04 (integrated qualification Task 7, fix round 2 — "verify terminal
   quiescence"): Made the integrated verifier production-safe for cancel and
   clear deceleration.  F2.1 — terminal quiescence is now proven from a bounded

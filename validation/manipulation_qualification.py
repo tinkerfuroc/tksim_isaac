@@ -3227,6 +3227,177 @@ def qualification_source_inventory(
     return runner._source_inventory()
 
 
+# ---------------------------------------------------------------------------
+# Task 8 additive: reusable core lifecycle helpers for the integrated runner.
+#
+# These are thin, semantically identical exposures of the six-gate runner's
+# process/rosbag/drain/resource mechanics so the integrated qualification
+# orchestrator can reuse them without duplicating lifecycle logic.  None of
+# them changes ``QualificationRunner`` behavior or the ``--gate`` CLI.
+# ---------------------------------------------------------------------------
+
+
+def qualification_source_identity(
+    *,
+    root: Path = ROOT,
+    config_path: Path | None = None,
+    scenario_path: Path | None = None,
+) -> dict[str, Any]:
+    """Capture the immutable source identity for a qualification attempt.
+
+    Combines the runner's source/provenance inventory with the runtime/tool
+    versions.  Reuses the exact six-gate inventory and version builders; the
+    integrated runner records this before Gate B so a later source-lock check
+    can never fall back to capturing and trusting current state.
+    """
+    return {
+        "sources": qualification_source_inventory(
+            root=root, config_path=config_path, scenario_path=scenario_path
+        ),
+        "versions": _runtime_versions(root=root),
+    }
+
+
+def qualification_record_topics(
+    record_topics: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    """Expose the approved record-topic set (configurable default).
+
+    The integrated runner passes its own topic set (identical to
+    ``APPROVED_RECORD_TOPICS`` by default) through the same QoS/rosbag helpers.
+    """
+    return tuple(record_topics or APPROVED_RECORD_TOPICS)
+
+
+def qualification_rosbag_qos_profiles(
+    profiles: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Expose the configurable rosbag QoS override profiles."""
+    return dict(profiles or ROSBAG_QOS_OVERRIDE_PROFILES)
+
+
+def qualification_rosbag_output_evidence(path: Path) -> dict[str, Any]:
+    """Open/validate a rosbag output database without touching the runner."""
+    return QualificationRunner._rosbag_output_evidence(path)
+
+
+def qualification_rosbag_metadata_evidence(
+    metadata: str,
+    *,
+    minimum_message_counts: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Parse/validate rosbag2 metadata fail-closed, reusing the gate policy."""
+    return QualificationRunner._rosbag_metadata_evidence(
+        metadata, minimum_message_counts=minimum_message_counts
+    )
+
+
+def qualification_jsonl_records(path: Path) -> tuple[list[Mapping[str, Any]], list[str]]:
+    """Read raw/evaluator JSONL records with per-line errors, unchanged."""
+    return QualificationRunner._jsonl_records(path)
+
+
+def qualification_jsonl_count(path: Path) -> int:
+    """Count nonblank JSONL records, unchanged."""
+    return QualificationRunner._jsonl_count(path)
+
+
+def qualification_compare_truth_records(
+    raw_records: Sequence[Mapping[str, Any]],
+    evaluator_records: Sequence[Mapping[str, Any]],
+    raw_errors: Sequence[str] = (),
+    evaluator_errors: Sequence[str] = (),
+) -> tuple[bool, list[str]]:
+    """Require exact raw/evaluator correlation, unchanged."""
+    return QualificationRunner._compare_truth_records(
+        raw_records,
+        evaluator_records,
+        raw_errors=raw_errors,
+        evaluator_errors=evaluator_errors,
+    )
+
+
+def qualification_start_process(
+    runner: QualificationRunner,
+    name: str,
+    command: Sequence[str],
+    manifest: QualificationManifest,
+) -> None:
+    """Start a managed child process under the runner's ownership/cleanup."""
+    runner._start(name, command, manifest)
+
+
+def qualification_observe(
+    runner: QualificationRunner,
+    command: Sequence[str],
+    manifest: QualificationManifest,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Run a ROS observation via the runner, retaining the full result."""
+    return runner._observe(command, manifest, timeout=timeout)
+
+
+def qualification_wait_for_ready(runner: QualificationRunner, manifest: QualificationManifest) -> bool:
+    """Run the runner's bounded readiness loop unchanged."""
+    return runner._ready(manifest)
+
+
+def qualification_wait_for_evaluator_drain(
+    runner: QualificationRunner, manifest: QualificationManifest
+) -> bool:
+    """Wait for exact raw/evaluator drain using the runner's bounded wait."""
+    return runner._wait_for_evaluator_drain(manifest)
+
+
+def qualification_rosbag_final_evidence(
+    runner: QualificationRunner,
+    manifest: QualificationManifest,
+    *,
+    final: bool = True,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Finalize/validate the rosbag evidence unchanged."""
+    return runner._rosbag_final_evidence(manifest, final=final)
+
+
+def qualification_stop_process(runner: QualificationRunner, name: str) -> int | None:
+    """Stop a managed process using graceful-then-forced teardown."""
+    return runner._stop(name)
+
+
+def qualification_attempt_processes(runner: QualificationRunner) -> list[dict[str, Any]]:
+    """Find descendants that escaped a launcher process group."""
+    return runner._attempt_processes()
+
+
+def qualification_terminate_attempt_orphans(
+    runner: QualificationRunner, *, grace_s: float = 1.0
+) -> list[dict[str, Any]]:
+    """Force-terminate escaped attempt descendants and report survivors."""
+    return runner._terminate_attempt_orphans(grace_s=grace_s)
+
+
+def qualification_gpu_processes(runner: QualificationRunner) -> dict[str, Any]:
+    """Snapshot GPU processes using the runner's nvidia-smi accounting."""
+    return runner._gpu_processes()
+
+
+def qualification_write_resource_evidence(
+    runner: QualificationRunner,
+    manifest: QualificationManifest,
+    baseline: Mapping[str, Any],
+) -> bool:
+    """Assess owned-PID survivors and unexplained GPU memory growth."""
+    return runner._write_resource_evidence(manifest, baseline)
+
+
+def qualification_settle_evidence_files(
+    runner: QualificationRunner, manifest: QualificationManifest
+) -> None:
+    """Wait briefly for descendant logs/evidence to stop changing."""
+    runner._settle_evidence_files(manifest)
+
+
 def _new_suite_dir(attempt_root: Path) -> tuple[str, Path]:
     attempt_root.mkdir(parents=True, exist_ok=True)
     for _ in range(20):
