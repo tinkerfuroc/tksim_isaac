@@ -314,6 +314,40 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 7 — "independent integrated
+  raw-physics verifier"): Added the independent, integrated raw-physics
+  verifier for the 17-scenario manipulation-qualification matrix.
+  `validation/integrated_gate_verifier.py` is a ROS-free Python 3.12 module
+  whose physical verdicts derive only from `physics_truth.jsonl` raw truth and
+  the PlanningScene journal; executor/action/controller/PlanningScene results
+  are diagnostic-only.  It implements Table 1 per-scenario terminal anchors
+  (gate_start = fixture-ready timestamp; gate_end = teardown for plan-only and
+  malformed-back, execution/retreat/gripper-terminal, quiescent,
+  released-settled, or pick-terminal otherwise), Table 2 observation subwindows
+  that end at quiescent/released-settled and never at teardown, the
+  `select_integrated_gate_window` wrapper over the verifier's nearest-pre-start
+  + in-gate selection (no post-terminal drain, no duplicates), physics.hz
+  resolution through `core_config` -> manipulation-core.json (120.0), the
+  endpoint allowlist = REQUIRED_ACTIONS ∪ REQUIRED_SERVICES (forbidden
+  direct-Isaac endpoints fail closed), phase-aware attachment validation,
+  exact raw/evaluator canonical equality with a distinct
+  "raw/evaluator drain mismatch" reason code, the `gate-b-status.json`
+  `{"schema_version":1,"status":"blocked"}` blocked-by-gate-b marker
+  (fail-closed), and verdict gate = scenario id with stage/polarity separated.
+  Tests: `tests/integrated_verifier_fixtures.py` (deterministic 17-scenario
+  attempt builder with fault injection) and `tests/test_integrated_gate_verifier.py`
+  (the brief's eight acceptance tests verbatim plus adversarial coverage: full
+  17-scenario pass and per-class verified-fail matrix, terminal-anchor
+  exclusion of post-terminal drain, subwindows ending at quiescent,
+  blocked-by-gate-b marker, physics-hz core_config resolution and rejection,
+  endpoint allowlist, verdict-gate identity, drain-mismatch reason code, strict
+  >1.0 N contact threshold, transport direction guard, lift baseline pinned to
+  the pre-start frame, phase-aware attachment, obstacle-contact exclusion of
+  the grasped target, and negative forbidden-after-terminal).  23 new tests
+  pass; affected regression suites (Gate D/E, journal, static-contract, config,
+  qualification fixtures) pass 480.  No build, no live Isaac/ROS, no cuMotion;
+  production modules/scenarios/policies are untouched.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 5 —
   "harden final trajectory digest test"): Hardened the last remaining
   `run_execute_sequence` caller in the sourced-Humble D acceptance suite that
