@@ -1925,13 +1925,18 @@ def _fjt_evidence(goal_uuid, status, *, digest=None, sequence=None, timestamp=No
     }
 
 
-def _seed_fresh_fjt(executor, goal_uuid, status, *, seq=None):
+def _seed_fresh_fjt(executor, goal_uuid, status, *, seq=None, advance=False):
     """Append an FJT status entry with a seq ahead of the attempt baseline.
 
     F1.4: status entries are windowed to the current attempt; a seeded entry
     must read as received *after* the execution-window baseline.  We keep the
     executor's receipt counter untouched and assign seqs above it so the
     baseline (captured at execution start) is always below these entries.
+
+    F1.6: ``advance=True`` also moves the executor's receipt counter to the
+    seeded seq so a later baseline (e.g. the occupied-place Place baseline)
+    is captured above the earlier Pick-phase entries and a subsequent fresh
+    entry is the first in the window (never a stale pre-Pick entry).
     """
     if seq is None:
         seq = executor._fjt_receipt_sequence + 50
@@ -1943,6 +1948,8 @@ def _seed_fresh_fjt(executor, goal_uuid, status, *, seq=None):
             "seq": int(seq),
         }
     )
+    if advance:
+        executor._fjt_receipt_sequence = max(executor._fjt_receipt_sequence, int(seq))
 
 
 def _seed_fresh_joint(executor, velocities, *, positions=None, seq=None):
@@ -2484,13 +2491,36 @@ def _place_result(status: int):
 
 def _seed_e_transport_evidence(executor, pick_hex, *, joint_seqs=(101, 102)):
     """Seed the fresh FJT EXECUTING pair and settled joint frames the E
-    transport trigger requires (receipt-window correlation, never UUID claims)."""
+    lift-complete latch requires (receipt-window correlation, never UUID claims).
+
+    F1.6: the seeded approach/lift FJT entries advance the executor's receipt
+    counter so the later transport FJT is the first entry inside the 2.0 s
+    receipt window after the lift latch.
+    """
     from validation.integrated_gate_executor import EXECUTE_STATUS_EXECUTING
 
-    _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=51)
-    _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=52)
+    _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=51, advance=True)
+    _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=52, advance=True)
     _seed_fresh_joint(executor, [0.0] * 7, seq=joint_seqs[0])
     _seed_fresh_joint(executor, [0.0] * 7, seq=joint_seqs[1])
+
+
+def _seed_transport_fjt(executor, pick_hex, *, seq=53):
+    """Seed the transport FJT entry *during* the run, after the lift latch.
+
+    F1.2/F1.6: the transport FJT must be received after the lift-complete latch
+    (its ``received_mono`` is captured when this is called) and inside the
+    2.0 s receipt window; a pre-seeded entry would be stale and reject the
+    trigger.
+    """
+    from validation.integrated_gate_executor import EXECUTE_STATUS_EXECUTING
+
+    _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=seq, advance=True)
+
+
+def _native_gripper_provider(count):
+    """A fresh native gripper action-goal count provider for cancel-approach."""
+    return lambda: {"count": int(count), "age_s": 0.0}
 
 
 def test_positive_pick_uses_fixed_pose_cloud_and_seven_back_joints():
@@ -2562,8 +2592,13 @@ def test_malformed_back_is_rejected_before_action_send():
 def test_executor_run_pick_place_negative_rejects_positive_scenario(tmp_path):
     executor, _ = _e_executor(tmp_path, "qualification-pick-place-positive")
     try:
-        with pytest.raises(ValueError, match="does not dispatch the positive"):
-            executor.run_pick_place_negative("qualification-pick-place-positive")
+        record = executor.run_pick_place_negative("qualification-pick-place-positive")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "positive-not-dispatched"
+        assert record["stage"] == "E"
+        assert record["pick_goal_sent"] is False
+        assert record["place_goal_sent"] is False
+        assert record["isaac_joint_commands_published"] is False
     finally:
         executor.shutdown()
 
@@ -2590,10 +2625,9 @@ def test_executor_e_malformed_back_zero_traffic(tmp_path):
         place_client = _FakeMoveClient(server_ready=True, goal_handle=None, send_ready_at=0.0)
         executor._action_clients["/pickup_action"] = pick_client
         executor._action_clients["/place_action"] = place_client
-        record = executor.run_pick_place_negative(
-            "qualification-pick-place-malformed-back",
-            current_tcp_pose_provider=_tcp_pose_provider([[0.5, 0.0, 0.70]]),
-        )
+        # F1.12: malformed-back rejects before any motion, so no TCP provider is
+        # required (and none is supplied here).
+        record = executor.run_pick_place_negative("qualification-pick-place-malformed-back")
         assert record["status"] == "diagnostic-pass"
         assert record["pick_goal_sent"] is False
         assert record["place_goal_sent"] is False
@@ -2608,6 +2642,7 @@ def test_executor_e_malformed_back_zero_traffic(tmp_path):
 
 
 def test_executor_e_positive_full_sequence(tmp_path):
+    import json
     import threading
     import uuid as _uuid
 
@@ -2633,18 +2668,24 @@ def test_executor_e_positive_full_sequence(tmp_path):
             server_ready=True, goal_handle=place_handle, send_ready_at=0.0,
         )
         _seed_e_transport_evidence(executor, pick_hex)
-        tcp_provider = _tcp_pose_provider([[0.5, 0.0, 0.70], [0.5, 0.0, 0.82]])
-        # Drive the observed scene transitions during the bounded polling waits.
+        # F1.2/F1.1: the transport FJT is received during Pick execution, after
+        # the lift-complete latch and inside the 2.0 s receipt window.
+        tcp_provider = _tcp_pose_provider(
+            [[0.5, 0.0, 0.70], [0.5, 0.0, 0.82], [0.55, 0.0, 0.82]]
+        )
         timer_attach = threading.Timer(0.05, lambda: _feed_e_scene(executor, contract, attached=True))
+        timer_transport = threading.Timer(0.25, lambda: _seed_transport_fjt(executor, pick_hex))
         timer_detach = threading.Timer(
-            0.15, lambda: _feed_e_scene(executor, contract, attached=False, include_target=True)
+            0.35, lambda: _feed_e_scene(executor, contract, attached=False, include_target=True)
         )
         timer_attach.start()
+        timer_transport.start()
         timer_detach.start()
         try:
             record = executor.run_pick_place_positive(current_tcp_pose_provider=tcp_provider)
         finally:
             timer_attach.cancel()
+            timer_transport.cancel()
             timer_detach.cancel()
         assert record["status"] == "diagnostic-pass"
         assert record["pick_goal_sent"] is True
@@ -2661,6 +2702,15 @@ def test_executor_e_positive_full_sequence(tmp_path):
         assert record["terminal_status"] == "succeeded"
         assert record["controller_goal_sent"] is True
         assert record["isaac_joint_commands_published"] is False
+        # F1.2/F1.5: the persisted trigger records the two-phase transport
+        # evidence (lift-complete latch + later transport FJT receipt delta).
+        trigger = record["trigger"]
+        assert trigger["trigger_kind"] == "transport"
+        assert trigger["scene_target_attached"] is True
+        assert trigger["lift_tcp_z_m"] >= 0.81
+        assert trigger["lift_normal_state_samples"] >= 2
+        assert trigger["fjt_receipt_delta_s"] is not None
+        assert trigger["fjt_receipt_delta_s"] <= 2.0
         for name in (
             "integrated-execution.jsonl",
             "moveit-plans.jsonl",
@@ -2669,13 +2719,27 @@ def test_executor_e_positive_full_sequence(tmp_path):
         ):
             assert (tmp_path / name).stat().st_size > 0, name
         assert (tmp_path / "integrated-execution.json").stat().st_size > 0
-        assert (tmp_path / "goals" / "qualification-pick-place-positive.json").stat().st_size > 0
+        goal_path = tmp_path / "goals" / "qualification-pick-place-positive.json"
+        assert goal_path.stat().st_size > 0
+        # F1.5: the goal artifact persists the validated spec geometry, not an
+        # empty dict.
+        goal_json = json.loads(goal_path.read_text(encoding="utf-8"))
+        assert goal_json["geometry"]["grasp_tcp_xyz"] == [0.65, 0.0, 0.72]
+        assert goal_json["geometry"]["object_root_xyz"] == [0.65, 0.0, 0.60]
+        assert goal_json["geometry"]["place_target_point"]["xyz"] == [0.85, 0.0, 0.72]
+        assert goal_json["trigger"]["trigger_kind"] == "transport"
+        execution_json = json.loads(
+            (tmp_path / "integrated-execution.json").read_text(encoding="utf-8")
+        )
+        assert execution_json["trigger"]["trigger_kind"] == "transport"
     finally:
         executor.shutdown()
 
 
 def test_executor_e_positive_requires_observed_attach(tmp_path):
     import uuid as _uuid
+
+    from validation.integrated_gate_executor import stage_e_dispatch
 
     executor, contract = _e_executor(tmp_path, "qualification-pick-place-positive")
     try:
@@ -2689,19 +2753,31 @@ def test_executor_e_positive_requires_observed_attach(tmp_path):
             server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
         )
         _seed_e_transport_evidence(executor, _uuid.UUID(bytes=pick_uuid).hex)
-        # No attached scene is ever observed: transport evidence stays absent.
-        record = executor.run_pick_place_positive(
-            current_tcp_pose_provider=_tcp_pose_provider([[0.5, 0.0, 0.70], [0.5, 0.0, 0.82]])
+        # F1.2: no attached scene is ever observed, so the lift-complete latch
+        # cannot fire and the transport trigger stays absent (bounded wait).
+        spec = dict(
+            stage_e_dispatch("qualification-pick-place-positive", scenario=executor.scenario)
         )
-        assert record["status"] == "evidence-invalid"
-        assert "transport evidence" in record.get("reason_code", "")
-        assert record["place_goal_sent"] is False
+        spec["trigger_timeout_s"] = 0.3
+        executor._last_tcp_pose_provider = _tcp_pose_provider(
+            [[0.5, 0.0, 0.70], [0.5, 0.0, 0.82], [0.55, 0.0, 0.82]]
+        )
+        baseline = executor._d_baseline()
+        trigger = executor._e_wait_transport_started(baseline, spec)
+        assert trigger is None
     finally:
         executor.shutdown()
 
 
 def test_executor_e_cancel_approach(tmp_path):
+    import threading
     import uuid as _uuid
+
+    from validation.integrated_gate_executor import (
+        EXECUTE_STATUS_CANCELED,
+        EXECUTE_STATUS_EXECUTING,
+        PICK_PLACE_RESULT_CANCELED,
+    )
 
     executor, contract = _e_executor(tmp_path, "qualification-pick-place-cancel-approach")
     try:
@@ -2709,22 +2785,35 @@ def test_executor_e_cancel_approach(tmp_path):
         pick_uuid = _uuid.uuid4().bytes
         pick_hex = _uuid.UUID(bytes=pick_uuid).hex
         pick_handle = _FakeGoalHandle(
-            accepted=True, result=None, goal_id=pick_uuid, status=None,
-            result_ready_at=60.0, cancel_ready_at=0.0,
-            cancel_response=_cancel_info_for(pick_hex),
+            accepted=True, result=_pick_result(PICK_PLACE_RESULT_CANCELED), goal_id=pick_uuid,
+            status=EXECUTE_STATUS_CANCELED, result_ready_at=0.0,
+            cancel_ready_at=0.0, cancel_response=_cancel_info_for(pick_hex),
         )
         executor._action_clients["/pickup_action"] = _FakeMoveClient(
             server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
         )
-        from validation.integrated_gate_executor import EXECUTE_STATUS_EXECUTING
-
-        _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=51)
+        # F1.10: the native gripper action-goal count stays at baseline zero.
+        gripper_provider = _native_gripper_provider(0)
+        # Settled joint frames let the post-cancel quiescence wait pass.
         _seed_fresh_joint(executor, [0.0] * 7, seq=101)
         _seed_fresh_joint(executor, [0.0] * 7, seq=102)
-        tcp_provider = _tcp_pose_provider([[0.5, 0.0, 0.70], [0.5, 0.0, 0.72]])
-        record = executor.run_pick_place_negative(
-            "qualification-pick-place-cancel-approach", current_tcp_pose_provider=tcp_provider
+        # F1.6: the approach FJT is received after the goal-acceptance baseline,
+        # inside the 2.0 s receipt window.
+        timer_approach = threading.Timer(
+            0.05,
+            lambda: _seed_fresh_fjt(executor, pick_hex, EXECUTE_STATUS_EXECUTING, seq=51),
         )
+        timer_approach.start()
+        try:
+            record = executor.run_pick_place_negative(
+                "qualification-pick-place-cancel-approach",
+                current_tcp_pose_provider=_tcp_pose_provider(
+                    [[0.5, 0.0, 0.70], [0.5, 0.0, 0.72], [0.52, 0.0, 0.72]]
+                ),
+                native_gripper_goal_count_provider=gripper_provider,
+            )
+        finally:
+            timer_approach.cancel()
         assert record["status"] == "diagnostic-pass"
         assert record["pick_goal_sent"] is True
         assert record["place_goal_sent"] is False
@@ -2737,6 +2826,18 @@ def test_executor_e_cancel_approach(tmp_path):
         assert record["fjt_goal_uuid"] == pick_hex
         assert pick_handle.cancel_goal_async_calls == 1
         assert record["isaac_joint_commands_published"] is False
+        # F1.4: both status domains from the canceled Pick terminal.
+        assert record["task_result_status"] == PICK_PLACE_RESULT_CANCELED
+        assert record["task_result_status_string"] == "canceled"
+        assert record["terminal_status"] == "canceled"
+        # F1.10: the trigger records the native gripper count not increasing.
+        trigger = record["trigger"]
+        assert trigger["trigger_kind"] == "approach"
+        assert trigger["native_gripper_goal_count_baseline"] == 0
+        assert trigger["native_gripper_goal_count_now"] == 0
+        assert trigger["scene_target_attached"] is False
+        assert trigger["fjt_receipt_delta_s"] is not None
+        assert trigger["fjt_receipt_delta_s"] <= 2.0
     finally:
         executor.shutdown()
 
@@ -2745,23 +2846,33 @@ def test_executor_e_cancel_transport(tmp_path):
     import threading
     import uuid as _uuid
 
+    from validation.integrated_gate_executor import (
+        EXECUTE_STATUS_CANCELED,
+        PICK_PLACE_RESULT_CANCELED,
+    )
+
     executor, contract = _e_executor(tmp_path, "qualification-pick-place-cancel-transport")
     try:
         _feed_e_scene(executor, contract)
         pick_uuid = _uuid.uuid4().bytes
         pick_hex = _uuid.UUID(bytes=pick_uuid).hex
         pick_handle = _FakeGoalHandle(
-            accepted=True, result=None, goal_id=pick_uuid, status=None,
-            result_ready_at=60.0, cancel_ready_at=0.0,
-            cancel_response=_cancel_info_for(pick_hex),
+            accepted=True, result=_pick_result(PICK_PLACE_RESULT_CANCELED), goal_id=pick_uuid,
+            status=EXECUTE_STATUS_CANCELED, result_ready_at=0.0,
+            cancel_ready_at=0.0, cancel_response=_cancel_info_for(pick_hex),
         )
         executor._action_clients["/pickup_action"] = _FakeMoveClient(
             server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
         )
         _seed_e_transport_evidence(executor, pick_hex)
-        tcp_provider = _tcp_pose_provider([[0.5, 0.0, 0.70], [0.5, 0.0, 0.82]])
+        # F1.6: the transport FJT is received during the run (after the lift
+        # latch and inside the 2.0 s receipt window); a pre-seeded entry would
+        # be stale and reject the trigger.
         timer_attach = threading.Timer(0.05, lambda: _feed_e_scene(executor, contract, attached=True))
+        timer_transport = threading.Timer(0.2, lambda: _seed_transport_fjt(executor, pick_hex))
+        tcp_provider = _tcp_pose_provider([[0.5, 0.0, 0.70], [0.5, 0.0, 0.82], [0.55, 0.0, 0.82]])
         timer_attach.start()
+        timer_transport.start()
         try:
             record = executor.run_pick_place_negative(
                 "qualification-pick-place-cancel-transport",
@@ -2769,6 +2880,7 @@ def test_executor_e_cancel_transport(tmp_path):
             )
         finally:
             timer_attach.cancel()
+            timer_transport.cancel()
         assert record["status"] == "diagnostic-pass"
         assert record["pick_goal_sent"] is True
         assert record["place_goal_sent"] is False
@@ -2780,6 +2892,15 @@ def test_executor_e_cancel_transport(tmp_path):
         assert record["cancel_response"] == "accepted"
         assert record["fjt_goal_uuid"] == pick_hex
         assert record["isaac_joint_commands_published"] is False
+        # F1.4: both status domains from the canceled Pick terminal.
+        assert record["task_result_status"] == PICK_PLACE_RESULT_CANCELED
+        assert record["task_result_status_string"] == "canceled"
+        assert record["terminal_status"] == "canceled"
+        trigger = record["trigger"]
+        assert trigger["trigger_kind"] == "transport"
+        assert trigger["scene_target_attached"] is True
+        assert trigger["fjt_receipt_delta_s"] is not None
+        assert trigger["fjt_receipt_delta_s"] <= 2.0
     finally:
         executor.shutdown()
 
@@ -2788,25 +2909,46 @@ def test_executor_e_safety_transport(tmp_path):
     import threading
     import uuid as _uuid
 
+    from validation.integrated_gate_executor import (
+        EXECUTE_STATUS_ABORTED,
+        PICK_PLACE_RESULT_SAFETY_STOP,
+    )
+
     executor, contract = _e_executor(tmp_path, "qualification-pick-place-safety-transport")
     try:
         _feed_e_scene(executor, contract)
-        from std_msgs.msg import Bool
 
-        executor._latest_safety_stop = Bool(data=True)
+        class _CausalOperatorPublisher:
+            """F1.3: the assert publication causes the observed safety stop and
+            the clear publication causes the release — causality through the
+            executor's own ``_wait_for_safety_stop`` polling."""
+
+            def __init__(self, owner):
+                self.published: list[bool] = []
+                self._owner = owner
+
+            def publish(self, message):
+                value = bool(message.data)
+                self.published.append(value)
+                self._owner._latest_safety_stop = message
+
+        fake_publisher = _CausalOperatorPublisher(executor)
+        executor.operator_publisher = fake_publisher
         pick_uuid = _uuid.uuid4().bytes
         pick_hex = _uuid.UUID(bytes=pick_uuid).hex
         pick_handle = _FakeGoalHandle(
-            accepted=True, result=None, goal_id=pick_uuid, status=None,
-            result_ready_at=60.0, cancel_ready_at=0.0,
+            accepted=True, result=_pick_result(PICK_PLACE_RESULT_SAFETY_STOP), goal_id=pick_uuid,
+            status=EXECUTE_STATUS_ABORTED, result_ready_at=0.0, cancel_ready_at=0.0,
         )
         executor._action_clients["/pickup_action"] = _FakeMoveClient(
             server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
         )
         _seed_e_transport_evidence(executor, pick_hex)
-        tcp_provider = _tcp_pose_provider([[0.5, 0.0, 0.70], [0.5, 0.0, 0.82]])
         timer_attach = threading.Timer(0.05, lambda: _feed_e_scene(executor, contract, attached=True))
+        timer_transport = threading.Timer(0.2, lambda: _seed_transport_fjt(executor, pick_hex))
+        tcp_provider = _tcp_pose_provider([[0.5, 0.0, 0.70], [0.5, 0.0, 0.82], [0.55, 0.0, 0.82]])
         timer_attach.start()
+        timer_transport.start()
         try:
             record = executor.run_pick_place_negative(
                 "qualification-pick-place-safety-transport",
@@ -2814,6 +2956,7 @@ def test_executor_e_safety_transport(tmp_path):
             )
         finally:
             timer_attach.cancel()
+            timer_transport.cancel()
         assert record["status"] == "diagnostic-pass"
         assert record["pick_goal_sent"] is True
         assert record["place_goal_sent"] is False
@@ -2824,6 +2967,17 @@ def test_executor_e_safety_transport(tmp_path):
         ]
         assert record.get("cancel_response") is None
         assert record["isaac_joint_commands_published"] is False
+        # F1.3: assert (True) then clear (False), in that exact order; the
+        # effective stop was caused by the assert publication, not pre-seeded.
+        assert fake_publisher.published == [True, False]
+        # F1.4: safety transport ends the Pick with Result.status=5 (safety_stop)
+        # and an action-client ABORTED terminal (production complete_pick abort()).
+        assert record["task_result_status"] == PICK_PLACE_RESULT_SAFETY_STOP
+        assert record["task_result_status_string"] == "safety_stop"
+        assert record["terminal_status"] == "aborted"
+        trigger = record["trigger"]
+        assert trigger["trigger_kind"] == "transport"
+        assert trigger["operator_published"] == [True, False]
     finally:
         executor.shutdown()
 
@@ -2831,6 +2985,12 @@ def test_executor_e_safety_transport(tmp_path):
 def test_executor_e_occupied_place(tmp_path):
     import threading
     import uuid as _uuid
+
+    from validation.integrated_gate_executor import (
+        EXECUTE_STATUS_CANCELED,
+        EXECUTE_STATUS_EXECUTING,
+        PICK_PLACE_RESULT_CANCELED,
+    )
 
     executor, contract = _e_executor(tmp_path, "qualification-pick-place-occupied-place")
     try:
@@ -2844,8 +3004,8 @@ def test_executor_e_occupied_place(tmp_path):
             status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
         )
         place_handle = _FakeGoalHandle(
-            accepted=True, result=None, goal_id=place_uuid, status=None,
-            result_ready_at=60.0, cancel_ready_at=0.0,
+            accepted=True, result=_place_result(PICK_PLACE_RESULT_CANCELED), goal_id=place_uuid,
+            status=EXECUTE_STATUS_CANCELED, result_ready_at=0.0, cancel_ready_at=0.0,
             cancel_response=_cancel_info_for(place_hex),
         )
         executor._action_clients["/pickup_action"] = _FakeMoveClient(
@@ -2855,16 +3015,22 @@ def test_executor_e_occupied_place(tmp_path):
             server_ready=True, goal_handle=place_handle, send_ready_at=0.0,
         )
         _seed_e_transport_evidence(executor, pick_hex)
-        from validation.integrated_gate_executor import EXECUTE_STATUS_EXECUTING
-
-        _seed_fresh_fjt(executor, place_hex, EXECUTE_STATUS_EXECUTING, seq=53)
-        # The third pose moves relative to the second so the place target-motion
-        # trigger observes fresh TCP motion (|dxyz|/dt >= trigger threshold).
+        # F1.6: the transport FJT is received during Pick execution, after the
+        # lift latch; the Place FJT is received during the run after the Place
+        # goal-acceptance baseline (both inside the 2.0 s receipt window).
+        # The third pose moves relative to the second so both triggers observe
+        # fresh TCP motion (|dxyz|/dt >= trigger threshold).
         tcp_provider = _tcp_pose_provider(
             [[0.5, 0.0, 0.70], [0.5, 0.0, 0.82], [0.55, 0.0, 0.82]]
         )
         timer_attach = threading.Timer(0.05, lambda: _feed_e_scene(executor, contract, attached=True))
+        timer_transport = threading.Timer(0.2, lambda: _seed_transport_fjt(executor, pick_hex))
+        timer_place = threading.Timer(
+            0.4, lambda: _seed_fresh_fjt(executor, place_hex, EXECUTE_STATUS_EXECUTING, seq=54, advance=True)
+        )
         timer_attach.start()
+        timer_transport.start()
+        timer_place.start()
         try:
             record = executor.run_pick_place_negative(
                 "qualification-pick-place-occupied-place",
@@ -2872,6 +3038,8 @@ def test_executor_e_occupied_place(tmp_path):
             )
         finally:
             timer_attach.cancel()
+            timer_transport.cancel()
+            timer_place.cancel()
         assert record["status"] == "diagnostic-pass"
         assert record["pick_goal_sent"] is True
         assert record["place_goal_sent"] is True
@@ -2884,6 +3052,237 @@ def test_executor_e_occupied_place(tmp_path):
         ]
         assert record["cancel_response"] == "accepted"
         assert record["isaac_joint_commands_published"] is False
+        # F1.4: the canceled Place (not the successful Pick) supplies the
+        # terminal status evidence: Result.status=4 (canceled) and an
+        # action-client CANCELED terminal.
+        assert record["task_result_status"] == PICK_PLACE_RESULT_CANCELED
+        assert record["task_result_status_string"] == "canceled"
+        assert record["terminal_status"] == "canceled"
+        trigger = record["trigger"]
+        assert trigger["trigger_kind"] == "place-target-motion"
+        assert trigger["scene_target_attached"] is True
+        assert trigger["fjt_receipt_delta_s"] is not None
+        assert trigger["fjt_receipt_delta_s"] <= 2.0
+    finally:
+        executor.shutdown()
+
+
+# ---- F1.13 / F1.7 / F1.12: pre-goal artifacts and per-attempt state --------
+
+def test_executor_e_pre_goal_failure_writes_complete_artifacts(tmp_path):
+    """F1.13: a pre-goal evidence-invalid path (missing TCP provider) writes
+    planning-scene.json even when the journal has no prior records."""
+    executor, _ = _e_executor(tmp_path, "qualification-pick-place-cancel-approach")
+    try:
+        record = executor.run_pick_place_negative("qualification-pick-place-cancel-approach")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "no-tcp-pose-provider"
+        assert record["pick_goal_sent"] is False
+        assert record["goals_sent"] == 0
+        assert record["isaac_joint_commands_published"] is False
+        for name in (
+            "planning-scene.json",
+            "integrated-execution.json",
+            "integrated-execution.jsonl",
+        ):
+            assert (tmp_path / name).stat().st_size > 0, name
+    finally:
+        executor.shutdown()
+
+
+def test_executor_e_per_attempt_state_reset_prevents_cross_contamination(tmp_path):
+    """F1.7: one executor reused across consecutive E attempts clears every
+    per-attempt TCP sample and E-specific trigger/latch/goal state at attempt
+    start, so a previous attempt's evidence can never satisfy the next attempt."""
+    executor, contract = _e_executor(tmp_path, "qualification-pick-place-cancel-transport")
+    try:
+        _feed_e_scene(executor, contract)
+        # Simulate leaked per-attempt state from a prior attempt: a high-z TCP
+        # sample that would satisfy the transport trigger, plus the native
+        # gripper seam and an accepted goal handle.
+        executor._tcp_pose_samples.append(
+            {"xyz": [0.5, 0.0, 0.82], "received_mono": float(time.monotonic()), "identity": "leaked"}
+        )
+        executor._e_native_gripper_count_provider = _native_gripper_provider(3)
+        executor._e_native_gripper_count_baseline = 3
+        executor._e_active_goal_handle = object()
+        executor._e_goal_state["pick_sent"] = True
+        executor._e_goal_state["pick_goal_id"] = "leaked"
+        # A fresh attempt on the same executor resets before any provider sample
+        # or readiness check, so it fails closed on the (absent) TCP provider and
+        # the leaked state is gone before any trigger can be satisfied.
+        record = executor.run_pick_place_negative("qualification-pick-place-cancel-transport")
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "no-tcp-pose-provider"
+        assert record["pick_goal_sent"] is False
+        assert record["goals_sent"] == 0
+        assert executor._tcp_pose_samples == []
+        assert executor._e_native_gripper_count_provider is None
+        assert executor._e_native_gripper_count_baseline is None
+        assert executor._e_active_goal_handle is None
+        assert executor._e_goal_state["pick_sent"] is False
+        assert executor._e_goal_state["pick_goal_id"] is None
+    finally:
+        executor.shutdown()
+
+
+# ---- F1.9: unexpected-exception fail-closed with accepted-goal cleanup ------
+
+def test_executor_e_unexpected_exception_fails_closed_with_cleanup(tmp_path):
+    """F1.9: an exception escaping an E runner after Pick acceptance fails
+    closed with ``reason_code='unexpected-exception'``, bounded cleanup is
+    attempted on the exact accepted goal, and nothing propagates to the caller."""
+    import threading
+    import uuid as _uuid
+
+    from validation.integrated_gate_executor import (
+        EXECUTE_STATUS_CANCELED,
+        PICK_PLACE_RESULT_CANCELED,
+    )
+
+    executor, contract = _e_executor(tmp_path, "qualification-pick-place-cancel-transport")
+    try:
+        _feed_e_scene(executor, contract)
+        pick_uuid = _uuid.uuid4().bytes
+        pick_hex = _uuid.UUID(bytes=pick_uuid).hex
+        pick_handle = _FakeGoalHandle(
+            accepted=True, result=_pick_result(PICK_PLACE_RESULT_CANCELED), goal_id=pick_uuid,
+            status=EXECUTE_STATUS_CANCELED, result_ready_at=0.0, cancel_ready_at=0.0,
+            cancel_response=_cancel_info_for(pick_hex),
+        )
+        executor._action_clients["/pickup_action"] = _FakeMoveClient(
+            server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
+        )
+        _seed_e_transport_evidence(executor, pick_hex)
+        # Inject a failure right after the transport latch and scene-attach diff,
+        # after the Pick goal was accepted.
+        original = executor._e_record_snapshot
+
+        def _boom(event):
+            if event == "lift-complete":
+                raise RuntimeError("injected snapshot failure")
+            return original(event)
+
+        executor._e_record_snapshot = _boom
+        timer_attach = threading.Timer(0.05, lambda: _feed_e_scene(executor, contract, attached=True))
+        timer_transport = threading.Timer(0.2, lambda: _seed_transport_fjt(executor, pick_hex))
+        timer_attach.start()
+        timer_transport.start()
+        try:
+            record = executor.run_pick_place_negative(
+                "qualification-pick-place-cancel-transport",
+                current_tcp_pose_provider=_tcp_pose_provider(
+                    [[0.5, 0.0, 0.70], [0.5, 0.0, 0.82], [0.55, 0.0, 0.82]]
+                ),
+            )
+        finally:
+            timer_attach.cancel()
+            timer_transport.cancel()
+        assert record["status"] == "evidence-invalid"
+        assert record["reason_code"] == "unexpected-exception"
+        assert "injected snapshot failure" in " ".join(record.get("reasons") or [])
+        # The accepted Pick goal was recorded and bounded cleanup was attempted.
+        assert record["pick_goal_sent"] is True
+        assert record["goals_sent"] == 1
+        assert record["cleanup"]["cleanup"] == "accepted"
+        assert record["place_goal_sent"] is False
+        assert record["isaac_joint_commands_published"] is False
+    finally:
+        executor.shutdown()
+
+
+# ---- F1.11: blocked-approach / unreachable-grasp real runner paths ----------
+
+def test_executor_e_blocked_unreachable_terminal_non_success(tmp_path):
+    """F1.11: both ``_run_e_blocked_or_unreachable`` scenarios drive a real
+    accepted Pick goal, record a terminal non-success in both status domains,
+    produce the exact short journal, send no Place/later goal, and write
+    complete fail-dominant artifacts."""
+    import json
+    import uuid as _uuid
+
+    from validation.integrated_gate_executor import EXECUTE_STATUS_SUCCEEDED
+
+    for scenario_id in (
+        "qualification-pick-place-blocked-approach",
+        "qualification-pick-place-unreachable-grasp",
+    ):
+        executor, contract = _e_executor(tmp_path / scenario_id, scenario_id)
+        try:
+            _feed_e_scene(executor, contract)
+            pick_uuid = _uuid.uuid4().bytes
+            pick_hex = _uuid.UUID(bytes=pick_uuid).hex
+            # Real-shape accepted Pick goal whose terminal is non-success in the
+            # action-client GoalStatus (succeeded delivering a failure result)
+            # and the Pick Result.status (planning_failed=2).
+            pick_handle = _FakeGoalHandle(
+                accepted=True, result=_pick_result(2), goal_id=pick_uuid,
+                status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+            )
+            executor._action_clients["/pickup_action"] = _FakeMoveClient(
+                server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
+            )
+            record = executor.run_pick_place_negative(
+                scenario_id, current_tcp_pose_provider=_tcp_pose_provider(
+                    [[0.5, 0.0, 0.70], [0.5, 0.0, 0.72]]
+                )
+            )
+            assert record["status"] == "diagnostic-pass", record.get("reason_code")
+            assert record["pick_goal_sent"] is True
+            assert record["place_goal_sent"] is False
+            assert record["goals_sent"] == 1
+            assert record["event_log"] == [
+                "fixture-ready", "before-pick", "pick-terminal", "teardown",
+            ]
+            assert record["task_result_status"] == 2
+            assert record["task_result_status_string"] == "planning_failed"
+            assert record["terminal_status"] == "succeeded"
+            assert record["isaac_joint_commands_published"] is False
+            # Complete fail-dominant artifacts, including the short journal.
+            for name in (
+                "integrated-execution.jsonl",
+                "moveit-plans.jsonl",
+                "controller-results.jsonl",
+                "planning-scene.json",
+                "integrated-execution.json",
+            ):
+                assert (tmp_path / scenario_id / name).stat().st_size > 0, name
+            goal_path = tmp_path / scenario_id / "goals" / f"{scenario_id}.json"
+            assert goal_path.stat().st_size > 0
+            goal_json = json.loads(goal_path.read_text(encoding="utf-8"))
+            assert goal_json["geometry"]["grasp_tcp_xyz"] == [0.65, 0.0, 0.72]
+        finally:
+            executor.shutdown()
+
+
+def test_executor_e_blocked_unreachable_success_status_rejects_negative(tmp_path):
+    """F1.11: a Pick success terminal rejects the negative diagnostic."""
+    import uuid as _uuid
+
+    executor, contract = _e_executor(tmp_path, "qualification-pick-place-blocked-approach")
+    try:
+        _feed_e_scene(executor, contract)
+        pick_uuid = _uuid.uuid4().bytes
+        pick_handle = _FakeGoalHandle(
+            accepted=True, result=_pick_result(0), goal_id=pick_uuid,
+            status=EXECUTE_STATUS_SUCCEEDED, result_ready_at=0.0,
+        )
+        executor._action_clients["/pickup_action"] = _FakeMoveClient(
+            server_ready=True, goal_handle=pick_handle, send_ready_at=0.0,
+        )
+        record = executor.run_pick_place_negative(
+            "qualification-pick-place-blocked-approach",
+            current_tcp_pose_provider=_tcp_pose_provider(
+                [[0.5, 0.0, 0.70], [0.5, 0.0, 0.72]]
+            )
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "must not succeed" in record["reason_code"]
+        assert record["place_goal_sent"] is False
+        assert record["goals_sent"] == 1
+        assert record["task_result_status"] == 0
+        assert record["terminal_status"] == "succeeded"
+        assert record["event_log"] == ["fixture-ready", "before-pick"]
     finally:
         executor.shutdown()
 

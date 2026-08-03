@@ -1791,6 +1791,104 @@ def test_tcp_speed_and_z_derive_from_two_newest_fresh_samples():
     ) is None
 
 
+def test_e_public_exports_import_star_succeeds():
+    """F1.12: ``from validation.integrated_gate_executor import *`` must succeed;
+    the stale module-level ``run_pick_place_*`` stub names are gone."""
+    namespace: dict[str, object] = {}
+    exec("from validation.integrated_gate_executor import *", namespace)
+    assert "IntegratedGateExecutor" in namespace
+    assert "stage_e_dispatch" in namespace
+    assert "build_pick_goal" in namespace
+    assert "Q_OUTBOUND" in namespace
+    assert "run_pick_place_negative" not in namespace
+    assert "run_pick_place_positive" not in namespace
+    assert "run_pick_place_sequence" not in namespace
+
+
+def test_e_fjt_receipt_window_boundaries():
+    """F1.6: the 2.0 s receipt-time correlation window accepts inside, rejects
+    just outside, and treats negative/missing/non-finite deltas as stale."""
+    from validation.integrated_gate_executor import (
+        E_FJT_CORRELATION_TIMEOUT_S,
+        _fjt_receipt_delta_s,
+        _fjt_within_receipt_window,
+    )
+
+    boundary = 1000.0
+    window = float(E_FJT_CORRELATION_TIMEOUT_S)
+    assert window == pytest.approx(2.0)
+    exactly = {"received_mono": boundary + window}
+    assert _fjt_receipt_delta_s(exactly, boundary) == pytest.approx(window)
+    assert _fjt_within_receipt_window(exactly, boundary, window) is True
+    just_inside = {"received_mono": boundary + window - 1e-6}
+    assert _fjt_within_receipt_window(just_inside, boundary, window) is True
+    just_outside = {"received_mono": boundary + window + 1e-6}
+    assert _fjt_within_receipt_window(just_outside, boundary, window) is False
+    stale = {"received_mono": boundary - 1.0}
+    assert _fjt_receipt_delta_s(stale, boundary) is None
+    assert _fjt_within_receipt_window(stale, boundary, window) is False
+    assert _fjt_receipt_delta_s({}, boundary) is None
+    assert _fjt_receipt_delta_s({"received_mono": float("nan")}, boundary) is None
+    assert _fjt_receipt_delta_s({"received_mono": float("inf")}, boundary) is None
+    assert _fjt_within_receipt_window({}, boundary, window) is False
+    assert _fjt_within_receipt_window({"received_mono": 1.0}, boundary, "not-a-number") is False
+
+
+def test_e_fixture_scene_error_keeps_gate_cd_strict():
+    """F1.8: a stray ``pick_and_place/*`` world object fails shared fixture
+    readiness for Gates C/D; only the exact task target is permitted through the
+    explicit Stage-E ``allow_e_target`` path, and an arbitrary task-namespace
+    object is still rejected there."""
+    from validation.integrated_gate_executor import (
+        TARGET_OBJECT_ID,
+        IntegratedGateExecutor,
+        expected_fixture_geometry_digest,
+    )
+
+    contract = scenario_report_contract("qualification-pick-place-positive")
+    declaration = contract["planning_scene_declaration"]
+    expected_ids = list(fixture_owned_ids(declaration))
+    expected_digest = expected_fixture_geometry_digest(declaration)
+
+    class _FixtureSceneStub:
+        scenario = readiness_scenario(contract)
+
+        def _expected_fixture_geometry_digest(self):
+            return expected_digest
+
+    stub = _FixtureSceneStub()
+
+    def _scene(owned_ids):
+        return {
+            "owned_ids": list(owned_ids),
+            "attached_ids": [],
+            "fixture_geometry_digest": expected_digest,
+        }
+
+    assert IntegratedGateExecutor._fixture_scene_error(stub, _scene(expected_ids)) is None
+    # C/D: any stray world object (task-namespace or otherwise) fails fixture
+    # readiness with the exact ordered "must equal" message.
+    for stray in ("pick_and_place/other", TARGET_OBJECT_ID, "sim_fixture/extra"):
+        error = IntegratedGateExecutor._fixture_scene_error(
+            stub, _scene(expected_ids + [stray])
+        )
+        assert error is not None and "must equal" in error, stray
+    # E: the exact target is permitted only with allow_e_target=True.
+    with_target = _scene(expected_ids + [TARGET_OBJECT_ID])
+    assert (
+        IntegratedGateExecutor._fixture_scene_error(stub, with_target, allow_e_target=True)
+        is None
+    )
+    assert (
+        IntegratedGateExecutor._fixture_scene_error(stub, with_target)
+        is not None
+    )
+    # E: an arbitrary task-namespace object is still rejected even when allowed.
+    stray_e = _scene(expected_ids + ["pick_and_place/other"])
+    error_e = IntegratedGateExecutor._fixture_scene_error(stub, stray_e, allow_e_target=True)
+    assert error_e is not None and "must equal" in error_e
+
+
 # --- Stage-D pure helpers ---------------------------------------------------
 
 def test_execute_status_name_maps_terminal_statuses():
