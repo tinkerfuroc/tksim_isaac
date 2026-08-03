@@ -363,6 +363,31 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 7 — "independent integrated
+  raw-physics verifier"): Added the independent verifier
+  `validation/integrated_gate_verifier.py` (ROS-free Python 3.12) whose
+  physical verdicts derive only from raw physics truth (`physics_truth.jsonl`)
+  plus the PlanningScene journal; action/executor/controller/PlanningScene
+  results are diagnostic-only.  It implements the full 17-scenario contract
+  (3 plan-only, 6 execute/retreat/gripper/cancel/safety, 8 pick-place
+  positive/negative): Table 1 per-scenario terminal anchors and Table 2
+  observation subwindows (ending at quiescent/released-settled, never at
+  teardown), the integrated gate-window wrapper, physics.hz via `core_config`,
+  the REQUIRED_ACTIONS ∪ REQUIRED_SERVICES endpoint allowlist, phase-aware
+  attachment validation, exact raw/evaluator canonical equality with a distinct
+  "raw/evaluator drain mismatch" reason code, the `gate-b-status.json`
+  blocked-by-gate-b fail-closed marker, and verdict gate = scenario id with
+  stage/polarity separated.  Test fixtures (`tests/integrated_verifier_fixtures.py`)
+  build deterministic attempts for all 17 scenarios with fault injection;
+  `tests/test_integrated_gate_verifier.py` carries the brief's eight acceptance
+  tests verbatim plus adversarial coverage (full-matrix pass, per-class
+  verified-fail, terminal-anchor drain exclusion, subwindow termination,
+  marker handling, physics-hz, allowlist, verdict-gate identity, strict contact
+  threshold, transport direction, lift baseline, attachment phases, obstacle
+  exclusion of the grasped target, negative-after-terminal).  23 new tests
+  pass; 480 regression tests pass.  No build or live run required; production
+  modules/scenarios/policies are unchanged.
+
 - 2026-08-04 (integrated qualification Task 6, formal-review fix round 5 —
   "harden final trajectory digest test"): Closed the last remaining D-side
   digest-padding flake path in the sourced-Humble acceptance suite.
