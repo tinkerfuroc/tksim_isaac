@@ -41,6 +41,7 @@ try:
         _contacts,
         _distance,
         _finite,
+        _first,
         _gripper_efforts,
         _gripper_position,
         _joint_data,
@@ -62,6 +63,7 @@ try:
         _robot,
         _safety,
         _target_vector,
+        _vector,
         _walk,
     )
 except ModuleNotFoundError:
@@ -74,6 +76,7 @@ except ModuleNotFoundError:
         _contacts,
         _distance,
         _finite,
+        _first,
         _gripper_efforts,
         _gripper_position,
         _joint_data,
@@ -95,12 +98,14 @@ except ModuleNotFoundError:
         _robot,
         _safety,
         _target_vector,
+        _vector,
         _walk,
     )
 
 try:
     from integrated_gate_executor import (  # noqa: F401
         D_FORBIDDEN_EVENTS,
+        EXECUTE_STATUS_CANCELED,
         EXECUTE_STATUS_SUCCEEDED,
         GATE_C_FORBIDDEN_EVENTS,
         GATE_C_REQUIRED_EVENT_ORDER,
@@ -129,6 +134,7 @@ try:
 except ModuleNotFoundError:
     from validation.integrated_gate_executor import (  # noqa: F401
         D_FORBIDDEN_EVENTS,
+        EXECUTE_STATUS_CANCELED,
         EXECUTE_STATUS_SUCCEEDED,
         GATE_C_FORBIDDEN_EVENTS,
         GATE_C_REQUIRED_EVENT_ORDER,
@@ -238,6 +244,75 @@ TASK_TARGET_ID = CANONICAL_TARGET_HANDOFF
 _ARM_CONTACT_BODIES = tuple(f"link{index}" for index in range(1, 8))
 _GRASP_CONTACT_BODIES = ("left_finger", "right_finger", "link_tcp")
 _ROBOT_CONTACT_BODIES = frozenset(_ARM_CONTACT_BODIES) | frozenset(_GRASP_CONTACT_BODIES)
+
+#: Production raw-truth object id candidates for the task target.  The backend
+#: emits the full ``sim_fixture/`` namespace (``_expected_scenario_objects``
+#: uses ``record["id"]`` verbatim); the core ``_object`` helper defaults to the
+#: bare ``qualification_cube`` id.  Resolve either form so live E attempts and
+#: the synthetic fixtures both verify.
+_OBJECT_ID_CANDIDATES = ("sim_fixture/qualification_cube", "qualification_cube")
+
+#: Provider/goal selection fields whose values must never carry a forbidden
+#: token (F1.6).  Deliberately narrow: semantic free-text fields such as
+#: environment-cloud provenance stay out of the scan.
+_PROVIDER_KEYS = frozenset(
+    {"pipeline_id", "provider", "execution_profile", "planner_id", "planner_name"}
+)
+
+
+def _as_int(value: Any, name: str) -> int:
+    """Validate a non-boolean integer scalar (F1.5)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise EvidenceError(f"{name} must be an integer, not {type(value).__name__}")
+    return value
+
+
+def _as_index(value: Any, name: str) -> int:
+    """Validate a non-boolean non-negative integer index (F1.5)."""
+    result = _as_int(value, name)
+    if result < 0:
+        raise EvidenceError(f"{name} must be non-negative")
+    return result
+
+
+def _as_timestamp(value: Any, name: str) -> float:
+    """Validate a finite numeric timestamp scalar (F1.5)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise EvidenceError(f"{name} must be numeric")
+    timestamp = float(value)
+    if not math.isfinite(timestamp):
+        raise EvidenceError(f"{name} must be finite")
+    return timestamp
+
+
+def _object_pose_target(frame: Mapping[str, Any]) -> tuple[list[float], list[float], list[float]] | None:
+    """Return the task-target object pose, resolving either id form.
+
+    Mirrors ``manipulation_gate_verifier._object_pose`` but accepts the
+    production ``sim_fixture/`` id.  Returns None when the target is absent.
+    """
+    for object_id in _OBJECT_ID_CANDIDATES:
+        obj = _object(frame, object_id)
+        if obj is None:
+            continue
+        pose = obj.get("pose")
+        position = _pose_position(pose, "object.pose")
+        orientation = _pose_quaternion(pose, "object.pose")
+        twist = obj.get("twist", {})
+        if not isinstance(twist, Mapping):
+            raise EvidenceError("object.twist must be an object")
+        velocity = _vector(
+            _first(twist, ("linear", "linear_velocity")) or [0, 0, 0],
+            "object.twist.linear",
+            3,
+        )
+        return position, orientation, velocity
+    return None
+
+
+def _target_in_object_ids(object_id: str) -> bool:
+    """True when an object id refers to the qualification cube (either form)."""
+    return object_id in _OBJECT_ID_CANDIDATES
 
 
 def _canonical_json(value: Any) -> str:
@@ -381,8 +456,8 @@ def _journal_event_keys(
         event = str(record.get("event", ""))
         if event and event not in keys:
             keys[event] = (
-                int(record["frame_index"]),
-                float(record["timestamp"]),
+                _as_index(record["frame_index"], f"journal.{event}.frame_index"),
+                _as_timestamp(record["timestamp"], f"journal.{event}.timestamp"),
             )
     return keys
 
@@ -492,25 +567,39 @@ def _integrated_endpoint_validator(
     Never calls ``manipulation_gate_verifier._is_external``: ``diagnostic_only``
     rows are the expected executor output.  Endpoints present in the artifacts
     must be in ``REQUIRED_ACTIONS ∪ REQUIRED_SERVICES`` and not forbidden.
-    Paired source metadata, when actually persisted, must match the committed
-    endpoint-source mapping.  Returns a list of reason strings (empty = valid).
+    Paired source metadata, when actually persisted in the **same** mapping as
+    its endpoint, must match the committed endpoint-source mapping.  Unrelated
+    semantic ``source`` fields (e.g. ``env_cloud_evidence.source ==
+    "observed-environment-cloud"``) are not endpoint provider metadata and are
+    never flagged (F1.3).  Provider/goal selection fields are scanned for
+    forbidden tokens and a persisted ``pipeline_id`` must be ``"ompl"`` (F1.6).
+    Returns a list of reason strings (empty = valid).
     """
     reasons: list[str] = []
     forbidden = {str(value) for value in forbidden_endpoints}
     forbidden = {value for value in forbidden if value}
     tokens = [str(value) for value in forbidden_tokens if str(value)]
+
+    def _tainted(value: Any) -> bool:
+        lowered = str(value).lower()
+        return any(token.lower() in lowered for token in tokens)
+
     for record in records:
         for mapping in _walk(record):
             endpoint_values: list[str] = []
             source_values: list[str] = []
+            provider_values: list[str] = []
+            pipeline_values: list[str] = []
             for key, value in mapping.items():
                 normalized = str(key).lower()
-                if normalized in _ENDPOINT_KEYS:
-                    if value is not None:
-                        endpoint_values.append(str(value))
-                if normalized in _SOURCE_KEYS:
-                    if value is not None and str(value):
-                        source_values.append(str(value))
+                if normalized in _ENDPOINT_KEYS and value is not None:
+                    endpoint_values.append(str(value))
+                if normalized in _SOURCE_KEYS and value is not None and str(value):
+                    source_values.append(str(value))
+                if normalized in _PROVIDER_KEYS and value is not None and str(value):
+                    provider_values.append(str(value))
+                if normalized == "pipeline_id" and value is not None and str(value):
+                    pipeline_values.append(str(value))
             for endpoint in endpoint_values:
                 if not endpoint:
                     continue
@@ -518,19 +607,24 @@ def _integrated_endpoint_validator(
                     reasons.append(f"endpoint {endpoint!r} is not in the allowlist")
                 if endpoint in forbidden:
                     reasons.append(f"endpoint {endpoint!r} is forbidden")
-                lowered = endpoint.lower()
-                if any(token.lower() in lowered for token in tokens):
+                if _tainted(endpoint):
                     reasons.append(
                         f"endpoint {endpoint!r} contains a forbidden token"
                     )
-            for source in source_values:
-                lowered = source.lower()
-                if any(token.lower() in lowered for token in tokens):
+            # Provider/goal field taint (F1.6).
+            for provider in provider_values:
+                if _tainted(provider):
                     reasons.append(
-                        f"source {source!r} contains a forbidden token"
+                        f"provider field {provider!r} contains a forbidden token"
                     )
-                if source not in set(_REQUIRED_ENDPOINT_SOURCES.values()):
-                    reasons.append(f"source {source!r} is not a known endpoint provider")
+            # A persisted pipeline_id must be the integrated ompl planner.
+            for pipeline in pipeline_values:
+                if pipeline != "ompl":
+                    reasons.append(
+                        f"pipeline_id {pipeline!r} is not the integrated ompl planner"
+                    )
+            # Paired source ownership is validated ONLY when the endpoint and
+            # its source coexist in the same endpoint-evidence mapping (F1.3).
             if endpoint_values and source_values:
                 for endpoint in endpoint_values:
                     expected = _REQUIRED_ENDPOINT_SOURCES.get(endpoint)
@@ -643,14 +737,20 @@ def _validate_scene_journal(
                 raise EvidenceError(
                     "scene-attach target touch links differ from canonical touch links"
                 )
-        elif detach_index is not None and index > detach_index:
+        elif detach_index is not None and index >= detach_index:
+            # At and after scene-detach the task target is absent (world-state
+            # transition back).  The scene-detach record itself is detached:
+            # the executor snapshots the current scene only after the target has
+            # left the attached set (F1.2).
             if attached:
                 raise EvidenceError(
-                    f"journal {record.get('event')!r} re-attaches the target after "
-                    "scene-detach"
+                    f"journal {record.get('event')!r} carries the target at or "
+                    "after scene-detach"
                 )
         else:
-            # Retained phase: target stays attached through the anchor.
+            # Retained phase: attach_index < index < detach_index (or through
+            # the anchor when the scenario order forbids detach).  Target stays
+            # attached.
             if not attached:
                 raise EvidenceError(
                     f"journal {record.get('event')!r} dropped the target during "
@@ -661,8 +761,8 @@ def _validate_scene_journal(
     raw_by_frame = ctx["raw_by_frame"]
     tolerance = 1.0 / ctx["physics_hz"]
     for record in journal_records:
-        frame_index = int(record["frame_index"])
-        timestamp = float(record["timestamp"])
+        frame_index = _as_index(record["frame_index"], "journal.frame_index")
+        timestamp = _as_timestamp(record["timestamp"], "journal.timestamp")
         raw = raw_by_frame.get(frame_index)
         if raw is None:
             raise EvidenceError(
@@ -678,8 +778,10 @@ def _validate_scene_journal(
 
     # --- 5. Task-7 rule: bilateral contact strictly before scene-attach ------
     if attach_index is not None:
-        attach_key = (journal_records[attach_index]["frame_index"],
-                      journal_records[attach_index]["timestamp"])
+        attach_key = (
+            _as_index(journal_records[attach_index]["frame_index"], "scene-attach.frame_index"),
+            _as_timestamp(journal_records[attach_index]["timestamp"], "scene-attach.timestamp"),
+        )
         earliest_bilateral: int | None = None
         for parsed in ctx["all_parsed"]:
             if _bilateral_strict(parsed["raw"], ctx["thresholds"]["contact_force_n"]) == (
@@ -796,26 +898,59 @@ def _execution_gateway_errors(
 # --------------------------------------------------------------------------- #
 # Stage-specific physical checks
 # --------------------------------------------------------------------------- #
-def _terminal_success(summary: Mapping[str, Any]) -> bool | None:
+_GOAL_STATUS_NON_SUCCESS = frozenset({EXECUTE_STATUS_CANCELED, 6})
+
+
+def _terminal_success(summary: Mapping[str, Any]) -> bool:
+    """Resolve the executor terminal across all present terminal domains.
+
+    Each present domain is parsed with exact types and exact enum semantics.
+    When multiple domains are present they must agree on the success/non-success
+    polarity; a contradictory pair raises ``EvidenceError`` (-> evidence-invalid),
+    never a permissive selection.  ``diagnostic-pass`` is an artifact status and
+    is never terminal proof.  ``terminal_status``, ``execute_result_status``
+    (action GoalStatus) and ``task_result_status`` (Pick/Place Result) are kept
+    as separate domains.
+    """
+    verdicts: list[bool] = []
+
     terminal = summary.get("terminal_status")
     if terminal is not None:
         rendered = str(terminal).strip().lower()
         if rendered in _SUCCESS_TERMINALS:
-            return True
-        if rendered in _NON_SUCCESS_TERMINALS:
-            return False
+            verdicts.append(True)
+        elif rendered in _NON_SUCCESS_TERMINALS:
+            verdicts.append(False)
+        else:
+            raise EvidenceError(
+                f"terminal_status {terminal!r} is not a known terminal"
+            )
+
     result_status = summary.get("execute_result_status")
-    if isinstance(result_status, int) and not isinstance(result_status, bool):
-        if result_status == EXECUTE_STATUS_SUCCEEDED:
-            return True
-        if result_status != 0:
-            return False
-    status = str(summary.get("status", "")).strip().lower()
-    if status in _SUCCESS_TERMINALS or status == "diagnostic-pass":
-        return True
-    if status in _NON_SUCCESS_TERMINALS:
-        return False
-    return None
+    if result_status is not None:
+        status = _as_int(result_status, "execute_result_status")
+        if status == EXECUTE_STATUS_SUCCEEDED:
+            verdicts.append(True)
+        elif status in _GOAL_STATUS_NON_SUCCESS:
+            verdicts.append(False)
+        else:
+            raise EvidenceError(
+                f"execute_result_status {status} is not a terminal GoalStatus"
+            )
+
+    task_result = summary.get("task_result_status")
+    if task_result is not None:
+        status = _as_int(task_result, "task_result_status")
+        verdicts.append(status == PICK_PLACE_RESULT_SUCCESS)
+
+    if not verdicts:
+        raise EvidenceError("execution summary has no terminal evidence")
+    first = verdicts[0]
+    if any(value != first for value in verdicts[1:]):
+        raise EvidenceError(
+            f"conflicting terminal domains: {verdicts}"
+        )
+    return first
 
 
 def _terminal_non_success(summary: Mapping[str, Any]) -> bool:
@@ -1128,14 +1263,13 @@ def _gate_d_cancel_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     thresholds = ctx["thresholds"]
     tolerance = thresholds["numeric_tolerance"]
     summary = ctx["execution_summary"]
-    sub = _subwindow(ctx, "cancel-requested", "quiescent")
-    sub_parsed = [ctx["parsed_by_frame"][int(r["frame_index"])] for r in sub]
-
+    # F1.4: parse terminal domains with exact semantics; a contradictory pair
+    # raises EvidenceError instead of resolving permissively.
+    _terminal_success(summary)
     canceled = (
-        summary.get("execute_result_status") == 5
-        or str(summary.get("terminal_status", "")).strip().lower()
+        str(summary.get("terminal_status", "")).strip().lower()
         in {"canceled", "cancelled"}
-    )
+    ) or summary.get("execute_result_status") == EXECUTE_STATUS_CANCELED
     cancel_check = _mk_check(
         "execute_goal_canceled",
         canceled,
@@ -1143,6 +1277,11 @@ def _gate_d_cancel_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
                  "terminal_status": summary.get("terminal_status")},
         reasons=() if canceled else ("execute goal was not canceled",),
     )
+    # F1.7: every scenario-owned temporal predicate reads only its exact
+    # observation subwindow [cancel-requested, quiescent]; motion after
+    # quiescent (post-terminal drain before teardown) is never admitted.
+    sub = _subwindow(ctx, "cancel-requested", "quiescent")
+    sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
     max_speed = _max_arm_speed(sub_parsed) if sub_parsed else 0.0
     max_target = _max_target_delta(sub_parsed) if sub_parsed else 0.0
     quiescent_passed = (
@@ -1157,26 +1296,18 @@ def _gate_d_cancel_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
         frames=[int(p["frame_index"]) for p in sub_parsed],
     )
     keys = ctx["event_keys"]
+    cancel_key = keys.get("cancel-requested", (0, 0))
     later_stage = any(
         event in ("execution-terminal", "execution-start")
         for event in keys
-        if keys[event][0] > keys.get("cancel-requested", (0, 0))[0]
+        if keys[event][0] > cancel_key[0]
     )
-    quiescent_key = keys.get("quiescent")
-    post_quiescent_motion = False
-    if quiescent_key is not None:
-        for parsed in ctx["all_parsed"]:
-            if parsed["timestamp"] > quiescent_key[1]:
-                _, _, velocities, _ = _arm_joint_data(parsed["raw"])
-                if max(abs(value) for value in velocities) > tolerance:
-                    post_quiescent_motion = True
-                    break
-    no_later_passed = not later_stage and not post_quiescent_motion
+    no_later_passed = not later_stage
     no_later_check = _mk_check(
         "no_later_stage",
         no_later_passed,
-        metrics={"later_stage": later_stage, "post_quiescent_motion": post_quiescent_motion},
-        reasons=() if no_later_passed else ("cancel was followed by a later stage or motion",),
+        metrics={"later_stage": later_stage},
+        reasons=() if no_later_passed else ("cancel was followed by a later stage",),
     )
     return [cancel_check, quiescent_check, no_later_check]
 
@@ -1238,16 +1369,22 @@ def _gate_d_safety_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     )
 
     # No auto-resume: no target change after operator-clear without a new goal.
-    clear_key = keys.get("operator-clear")
+    # F1.7: the check reads only the [operator-clear, quiescent] subwindow;
+    # post-quiescent drain is never admitted.
     auto_resume = False
-    if clear_key is not None:
+    clear_key = keys.get("operator-clear")
+    if clear_key is not None and quiescent_key is not None:
+        frozen_target = _arm_joint_data(frozen_records[0]["raw"])[1]
         for parsed in ctx["all_parsed"]:
-            if parsed["timestamp"] > clear_key[1]:
-                target = _target_vector(parsed["raw"])
-                if target is not None:
-                    if _max_delta(target, _arm_joint_data(frozen_records[0]["raw"])[1]) > tolerance:
-                        auto_resume = True
-                        break
+            if parsed["timestamp"] < clear_key[1]:
+                continue
+            if parsed["timestamp"] > quiescent_key[1]:
+                break
+            target = _target_vector(parsed["raw"])
+            if target is not None:
+                if _max_delta(target, frozen_target) > tolerance:
+                    auto_resume = True
+                    break
     no_resume_check = _mk_check(
         "no_auto_resume",
         not auto_resume,
@@ -1283,7 +1420,7 @@ def _gate_e_positive_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     # 2. lift from the pre-start frame's cube pose.
     lift_samples: list[tuple[int, float]] = []
     for parsed in window_parsed:
-        pose = _object_pose(parsed["raw"])
+        pose =  _object_pose_target(parsed["raw"])
         if pose is None:
             continue
         lift_samples.append((int(parsed["frame_index"]), pose[0][2]))
@@ -1306,7 +1443,7 @@ def _gate_e_positive_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     translations: list[float] = []
     final_cube: list[float] = initial
     for parsed in window_parsed:
-        pose = _object_pose(parsed["raw"])
+        pose =  _object_pose_target(parsed["raw"])
         if pose is None:
             continue
         translations.append(_distance(pose[0], initial))
@@ -1372,7 +1509,7 @@ def _gate_e_positive_checks(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     # 6. settled_speed in the release subwindow.
     max_speed = 0.0
     for parsed in release_parsed:
-        pose = _object_pose(parsed["raw"])
+        pose =  _object_pose_target(parsed["raw"])
         if pose is None:
             continue
         max_speed = max(max_speed, _distance(pose[2], [0.0, 0.0, 0.0]))
@@ -1435,7 +1572,7 @@ def _bounded_drift_check(
         frame_index = int(parsed["frame_index"])
         if frame_index not in bilateral_indices:
             continue
-        pose = _object_pose(parsed["raw"])
+        pose =  _object_pose_target(parsed["raw"])
         if pose is None:
             continue
         position, orientation, _ = pose
@@ -1498,7 +1635,11 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
         status = summary.get("task_result_status")
         if status is None:
             status = summary.get("execute_result_status")
-        passed = status is not None and int(status) != PICK_PLACE_RESULT_SUCCESS
+        if status is None:
+            return _mk_check(token, False, metrics={"task_result_status": None},
+                             reasons=("no pick terminal status recorded",))
+        code = _as_int(status, "pick_terminal_non_success.status")
+        passed = code != PICK_PLACE_RESULT_SUCCESS
         return _mk_check(token, passed, metrics={"task_result_status": status},
                          reasons=() if passed else ("pick terminal was success",))
     if token == "contact_absent":
@@ -1522,7 +1663,7 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
     if token == "lift_m_lt:0.02":
         max_z = initial[2]
         for p in window_parsed:
-            pose = _object_pose(p["raw"])
+            pose =  _object_pose_target(p["raw"])
             if pose is not None:
                 max_z = max(max_z, pose[0][2])
         lift = max_z - initial[2]
@@ -1606,24 +1747,23 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
         return _mk_check(token, passed, metrics={"scene_attach": attach_key, "cancel": cancel_key},
                          reasons=() if passed else ("scene-attach did not precede cancel",))
     if token == "no_post_cancel_stage":
+        # F1.7: the check reads only the [cancel-requested, quiescent] subwindow.
+        # Journal events after cancel-requested are scanned for later-stage
+        # leaks; fresh motion is scanned strictly inside the subwindow.  Motion
+        # after quiescent (post-terminal drain) is never admitted.
         cancel_key = keys.get("cancel-requested")
+        quiescent_key = keys.get("quiescent")
         forbidden_after = ("place-goal-accepted", "scene-detach", "released-settled")
         later = [
             event
             for event in forbidden_after
             if event in keys and cancel_key is not None and keys[event][0] > cancel_key[0]
         ]
-        quiescent_key = keys.get("quiescent")
-        post_motion = False
-        if quiescent_key is not None:
-            for p in ctx["all_parsed"]:
-                if p["timestamp"] > quiescent_key[1]:
-                    _, _, velocities, _ = _arm_joint_data(p["raw"])
-                    if max(abs(value) for value in velocities) > tolerance:
-                        post_motion = True
-                        break
-        passed = not later and not post_motion
-        return _mk_check(token, passed, metrics={"later_events": later, "post_quiescent_motion": post_motion},
+        sub = _subwindow(ctx, "cancel-requested", "quiescent")
+        sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
+        motion = _max_arm_speed(sub_parsed) if sub_parsed else 0.0
+        passed = not later and motion <= tolerance
+        return _mk_check(token, passed, metrics={"later_events": later, "subwindow_motion_rad_s": motion},
                          reasons=() if passed else ("post-cancel stage observed",))
     if token == "safety_observed_during_transport":
         transport_key = keys.get("transport")
@@ -1661,18 +1801,15 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
         return _mk_check(token, passed, metrics={"max_joint_speed_rad_s": max_speed},
                          reasons=() if passed else ("velocity above stop limit",))
     if token == "no_post_clear_resume":
-        clear_key = keys.get("operator-clear")
-        if clear_key is None:
-            return _mk_check(token, False, metrics={}, reasons=("no operator-clear key",))
-        motion = False
-        for p in ctx["all_parsed"]:
-            if p["timestamp"] > clear_key[1]:
-                _, _, velocities, _ = _arm_joint_data(p["raw"])
-                if max(abs(value) for value in velocities) > tolerance:
-                    motion = True
-                    break
-        passed = not motion
-        return _mk_check(token, passed, metrics={"post_clear_motion": motion},
+        # F1.7: the check reads only the [operator-clear, quiescent] subwindow.
+        # Motion after quiescent (post-terminal drain) is never admitted.
+        sub = _subwindow(ctx, "operator-clear", "quiescent")
+        if not sub:
+            return _mk_check(token, False, metrics={}, reasons=("no operator-clear/quiescent keys",))
+        sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
+        motion = _max_arm_speed(sub_parsed) if sub_parsed else 0.0
+        passed = motion <= tolerance
+        return _mk_check(token, passed, metrics={"post_clear_motion_rad_s": motion},
                          reasons=() if passed else ("motion resumed after operator-clear",))
     if token == "pick_physical_retained":
         sub = _subwindow(ctx, "place-goal-accepted", "quiescent")
@@ -1689,14 +1826,39 @@ def _required_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[str
         status = summary.get("task_result_status")
         if status is None:
             status = summary.get("execute_result_status")
-        passed = status is not None and int(status) != PICK_PLACE_RESULT_SUCCESS
+        if status is None:
+            return _mk_check(token, False, metrics={"task_result_status": None},
+                             reasons=("no place terminal status recorded",))
+        code = _as_int(status, "place_terminal_non_success.status")
+        passed = code != PICK_PLACE_RESULT_SUCCESS
         return _mk_check(token, passed, metrics={"task_result_status": status},
                          reasons=() if passed else ("place terminal was success",))
     if token == "scene_attached_after_place_failure":
-        attach_key = keys.get("scene-attach")
-        passed = attach_key is not None
-        return _mk_check(token, passed, metrics={"scene_attach": attach_key},
-                         reasons=() if passed else ("target not attached after place failure",))
+        place_key = keys.get("place-goal-accepted")
+        quiescent_key = keys.get("quiescent")
+        if place_key is None:
+            return _mk_check(token, False, metrics={},
+                             reasons=("no place-goal-accepted key",))
+        if quiescent_key is None:
+            return _mk_check(token, False, metrics={},
+                             reasons=("no quiescent key",))
+        # F1.8: the target must remain attached in the journal records after the
+        # place failure through quiescent — not merely that a scene-attach ever
+        # occurred.  Records before the place-failure terminal are ignored.
+        attached_after = [
+            record.get("event")
+            for record in ctx["journal_records"]
+            if _as_index(record["frame_index"], "journal.frame_index") >= place_key[0]
+            and _as_index(record["frame_index"], "journal.frame_index") <= quiescent_key[0]
+            and TASK_TARGET_ID in set(record.get("attached_ids", []))
+        ]
+        passed = bool(attached_after)
+        return _mk_check(
+            token,
+            passed,
+            metrics={"attached_after_place_failure": attached_after},
+            reasons=() if passed else ("target not attached through quiescent after place failure",),
+        )
     raise EvidenceError(f"unknown required negative predicate {token!r}")
 
 
@@ -1723,7 +1885,7 @@ def _forbidden_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[st
     if token in ("lift", "lift_complete", "release"):
         max_z = initial[2]
         for p in window_parsed:
-            pose = _object_pose(p["raw"])
+            pose =  _object_pose_target(p["raw"])
             if pose is not None:
                 max_z = max(max_z, pose[0][2])
         lift = max_z - initial[2]
@@ -1745,22 +1907,19 @@ def _forbidden_negative_predicate(token: str, ctx: Mapping[str, Any]) -> dict[st
         return _mk_check(token, not value, metrics={"observed": value},
                          reasons=() if not value else (f"forbidden {token} observed",))
     if token == "post_clear_resume":
-        clear_key = keys.get("operator-clear")
+        # F1.7: reads only the [operator-clear, quiescent] subwindow.
+        sub = _subwindow(ctx, "operator-clear", "quiescent")
         motion = False
-        if clear_key is not None:
-            for p in ctx["all_parsed"]:
-                if p["timestamp"] > clear_key[1]:
-                    _, _, velocities, _ = _arm_joint_data(p["raw"])
-                    if max(abs(value) for value in velocities) > tolerance:
-                        motion = True
-                        break
+        if sub:
+            sub_parsed = [ctx["parsed_by_frame"][_as_index(r["frame_index"], "subwindow.frame_index")] for r in sub]
+            motion = _max_arm_speed(sub_parsed) > tolerance
         return _mk_check(token, not motion, metrics={"post_clear_motion": motion},
                          reasons=() if not motion else ("forbidden post-clear resume observed",))
     if token == "target_region_settled":
         region = ctx["region_center"]
         final_radial = 1.0e9
         for p in window_parsed:
-            pose = _object_pose(p["raw"])
+            pose =  _object_pose_target(p["raw"])
             if pose is not None:
                 final_radial = _distance(pose[0][:2], region[:2])
         passed = final_radial > thresholds["placement_region_radius_m"]
@@ -1812,7 +1971,14 @@ def _gate_b_status(
     except EvidenceError as error:
         base["errors"].append(f"gate-b-status.json invalid: {error}")
         return base
-    if int(value.get("schema_version", 0)) != 1:
+    try:
+        schema_version = _as_int(
+            value.get("schema_version", 0), "gate-b-status.json.schema_version"
+        )
+    except EvidenceError as error:
+        base["errors"].append(str(error))
+        return base
+    if schema_version != 1:
         base["errors"].append("gate-b-status.json schema_version must be 1")
         return base
     if str(value.get("status")) == "blocked":
@@ -1863,7 +2029,10 @@ def verify_integrated_attempt(
     if isinstance(report_identities, Mapping):
         if str(report_identities.get("scenario_id", "")) != scenario_id:
             raise EvidenceError("report_identities.scenario_id does not match scenario id")
-        if int(report_identities.get("seed", -1)) != seed:
+        identity_seed = _as_int(
+            report_identities.get("seed", None), "report_identities.seed"
+        )
+        if identity_seed != seed:
             raise EvidenceError("report_identities.seed does not match scenario seed")
 
     manifest_path = attempt_dir / "manifest.json"
@@ -1898,6 +2067,8 @@ def verify_integrated_attempt(
         journal_records = _read_jsonl(attempt_dir / "planning-scene.jsonl", required=True)
 
         # gate-window.json slicing indices (full production schema, M4).
+        # F1.5: raw_start_index/evaluator_start_index are validated as
+        # non-boolean non-negative integers; malformed values fail closed.
         gate_window_path = attempt_dir / "gate-window.json"
         raw_start_index = 0
         evaluator_start_index: int | None = None
@@ -1907,10 +2078,14 @@ def verify_integrated_attempt(
                 raise EvidenceError("gate-window.json gate does not match scenario id")
             if str(gate_window.get("attempt_id", "")) != attempt_id:
                 raise EvidenceError("gate-window.json attempt_id does not match")
-            raw_start_index = int(gate_window.get("raw_start_index", 0))
-            evaluator_index = gate_window.get("evaluator_start_index")
-            if isinstance(evaluator_index, int) and not isinstance(evaluator_index, bool):
-                evaluator_start_index = evaluator_index
+            if "raw_start_index" in gate_window:
+                raw_start_index = _as_index(
+                    gate_window["raw_start_index"], "gate-window.raw_start_index"
+                )
+            if "evaluator_start_index" in gate_window:
+                evaluator_start_index = _as_index(
+                    gate_window["evaluator_start_index"], "gate-window.evaluator_start_index"
+                )
 
         # Raw/evaluator exact correlation (distinct drain-mismatch reason code).
         _raw_evaluator_correlation(
@@ -1920,11 +2095,13 @@ def verify_integrated_attempt(
             evaluator_start_index=evaluator_start_index,
         )
 
-        # Scenario/seed match on every raw frame.
+        # Scenario/seed match on every raw frame.  F1.5: every raw seed is a
+        # non-boolean integer, validated exactly, never coerced.
         for index, raw in enumerate(raw_records):
             if str(raw.get("scenario", "")) != scenario_id:
                 raise EvidenceError(f"physics_truth[{index}] scenario does not match the attempt")
-            if int(raw.get("seed", -1)) != seed:
+            raw_seed = _as_int(raw.get("seed", None), f"physics_truth[{index}].seed")
+            if raw_seed != seed:
                 raise EvidenceError(f"physics_truth[{index}] seed does not match the attempt")
 
         # Expected objects are not measured truth: every measured object must be
@@ -2034,13 +2211,21 @@ def verify_integrated_attempt(
         }
         _validate_scene_journal(journal_records, ctx)
 
-        # Pre-start initial cube pose and velocity.
+        # Pre-start initial cube pose and velocity (F1.1).  The qualification
+        # cube exists only for Stage E scenarios; C/D raw truth carries
+        # ``objects: []`` / ``object: None`` and never needs the cube.  Only E
+        # predicates (positive and negative) consume ``initial``.
         pre_start = window_parsed[0]
-        initial_pose = _object_pose(pre_start["raw"])
-        if initial_pose is None:
-            raise EvidenceError("pre-start frame has no qualification_cube object")
-        ctx["initial"] = initial_pose[0]
-        ctx["pre_start_velocity"] = initial_pose[2]
+        initial_pose = _object_pose_target(pre_start["raw"])
+        if stage == "E":
+            if initial_pose is None:
+                raise EvidenceError("pre-start frame has no qualification_cube object")
+            ctx["initial"] = initial_pose[0]
+            ctx["pre_start_velocity"] = initial_pose[2]
+        else:
+            # C/D: no cube is expected; E-only predicates are never dispatched.
+            ctx["initial"] = [0.0, 0.0, 0.0]
+            ctx["pre_start_velocity"] = [0.0, 0.0, 0.0]
         geometry = config.get("geometry_contract", {})
         region = geometry.get("place_region_center_xyz", [0.85, 0.0, 0.64])
         if not isinstance(region, Sequence) or isinstance(region, (str, bytes)) or len(region) != 3:
@@ -2172,14 +2357,30 @@ def _expected_target_quaternion(ctx: Mapping[str, Any]) -> list[float] | None:
     return None
 
 
-def _scenario_bundle_from_declaration(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize a raw scenario declaration into the canonical bundle shape."""
+def _scenario_bundle_from_declaration(
+    raw: Mapping[str, Any],
+    *,
+    expected_id: str | None = None,
+) -> dict[str, Any]:
+    """Normalize a raw scenario declaration into the canonical bundle shape.
+
+    ``expected_id`` is the scenario id derived from the CLI argument (the
+    filename basename for an explicit path, or the bare id).  When provided it
+    is compared against the declaration's own ``id`` and a mismatch fails closed
+    (F1.9).  The bundle mirrors ``tests/qualification_test_helpers.load_test_scenario``
+    so both the fixture path and the production CLI feed
+    ``verify_integrated_attempt`` the same shape.
+    """
     scenario_id = str(raw.get("id", ""))
+    if not scenario_id:
+        raise EvidenceError("scenario declaration has no id")
+    if expected_id is not None and scenario_id != expected_id:
+        raise EvidenceError(
+            f"scenario id {scenario_id!r} does not match {expected_id!r}"
+        )
     if raw.get("schema_version") != 2:
         raise EvidenceError(f"{scenario_id}: scenario schema_version must be 2")
-    seed = int(raw["seed"])
-    if not scenario_id or str(raw.get("id", "")) != scenario_id:
-        raise EvidenceError("scenario id must match the filename/declaration")
+    seed = _as_int(raw.get("seed", None), f"{scenario_id}.seed")
     declaration = {
         str(key): value for key, value in raw.items() if key not in {"id", "seed"}
     }
@@ -2217,17 +2418,43 @@ def _main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     scenario_arg = args.scenario
-    raw_path = Path(scenario_arg)
-    if raw_path.is_file():
-        raw = _read_json(raw_path)
-    else:
-        scenario_path = _repo_root() / "simulation" / "scenarios" / f"{scenario_arg}.json"
-        raw = _read_json(scenario_path)
-    scenario = _scenario_bundle_from_declaration(raw)
-    config = _read_json(Path(args.config))
+    attempt_dir = Path(args.attempt_dir)
+    config_path = Path(args.config)
+    # F1.9: scenario/config resolution is part of the fail-closed boundary.
+    # A mismatched filename/id (or any EvidenceError during bundle/config
+    # normalization) yields evidence-invalid exit code 2, never a traceback.
+    try:
+        raw_path = Path(scenario_arg)
+        if raw_path.is_file():
+            raw = _read_json(raw_path)
+            expected_id = raw_path.stem
+        else:
+            scenario_path = _repo_root() / "simulation" / "scenarios" / f"{scenario_arg}.json"
+            raw = _read_json(scenario_path)
+            expected_id = scenario_arg
+        scenario = _scenario_bundle_from_declaration(raw, expected_id=expected_id)
+        config = _read_json(config_path)
+    except EvidenceError as error:
+        print(json.dumps({"schema_version": SCHEMA_VERSION,
+                          "attempt_id": attempt_dir.name,
+                          "gate": expected_id,
+                          "stage": "",
+                          "polarity": "",
+                          "status": "evidence-invalid",
+                          "pass": False,
+                          "verified": False,
+                          "authority": "physics_truth.jsonl",
+                          "action_results_diagnostic_only": True,
+                          "checks": [],
+                          "metrics": {},
+                          "errors": [str(error)],
+                          "execution_sources": ["integrated-execution.jsonl",
+                                                "integrated-execution.json"]},
+                         sort_keys=True, indent=2))
+        return 2
     verdict = verify_integrated_attempt(
         scenario=scenario,
-        attempt_dir=Path(args.attempt_dir),
+        attempt_dir=attempt_dir,
         config=config,
     )
     print(json.dumps(verdict, sort_keys=True, indent=2))

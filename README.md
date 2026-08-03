@@ -314,6 +314,53 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 7, fix round 1 — "align verifier
+  with production evidence"): Aligned the independent integrated verifier with
+  production raw-truth/executor/journal shapes and closed three blocker and
+  three major defects found by specification and adversarial review.  F1.1 —
+  the pre-start `qualification_cube` requirement is now Stage-E-only: C/D
+  scenarios declare `objects: []` and real backend truth carries `objects:
+  []`/`object: None`/`expected_objects: {}`, so C/D verify with production-real
+  empty object sets (the fixture's unconditional cube injection is removed).
+  F1.2 — the `scene-detach` journal record now uses the committed after-state
+  (target detached), matching the executor's post-detachment snapshot and the
+  journal transition rule; the fixture `detach_pending` exception is removed and
+  attached-at-detach fails closed.  F1.3 — the endpoint/provider validator is
+  scoped to endpoint evidence: paired `_REQUIRED_ENDPOINT_SOURCES` ownership is
+  checked only when an endpoint and its provider coexist in the same mapping, so
+  the real D cartesian-retreat `env_cloud_evidence.source ==
+  "observed-environment-cloud"` (cloud provenance, not an endpoint provider) is
+  accepted; wrong paired provider metadata still fails.  F1.4 — contradictory
+  terminal domains (success string vs ABORTED numeric, or the reverse) and
+  missing terminal evidence now fail closed as `evidence-invalid`, never a
+  permissive selection; `diagnostic-pass` is no longer terminal proof; the same
+  consistency rule applies to `_terminal_non_success`, D cancel, and E negative
+  controller/place terminal checks.  F1.5 — all evidence-owned scalar/indices
+  (`seed`, `raw_start_index`, `evaluator_start_index`, journal keys, result
+  codes) are validated as non-boolean integers/indices; malformed values produce
+  `evidence-invalid` and the public boundary/CLI always atomically writes
+  `gate-verdict.json` (no traceback).  F1.6 — forbidden execution-provider taint
+  now scans narrow provider/goal fields (`pipeline_id`, `provider`,
+  `execution_profile`, planner fields) beyond endpoint/source values; a
+  persisted `pipeline_id` must be `"ompl"`; semantic free-text fields stay out
+  of the scan.  F1.7 — every scenario-owned temporal predicate reads only its
+  exact Table-2 observation subwindow ending at `quiescent`/`released-settled`;
+  post-terminal drain motion after `quiescent` is ignored, while the same motion
+  between cancel/clear and `quiescent` fails.  F1.8 — `scene_attached_after_place_failure`
+  now proves the target is attached in the journal records after the place
+  failure through `quiescent`; fixture `goals_sent` is a production-shaped count
+  (never a character list); the D retreat fixture carries the real
+  `env_cloud_evidence` shape; verified-fail coverage added for
+  `qualification-pick-place-cancel-approach` and `qualification-moveit-plan-pose`
+  (all 17 scenarios now have a pass and a direct failing mutation).  F1.9 — the
+  CLI bundle normalization compares a declaration id to the actual scenario
+  path/bare-id and fails closed (exit 2) on a mismatched filename/id; the
+  self-comparison dead check is removed.  Test suite grows to 36 tests (all
+  prior 23 plus 13 new producer-shape/malformed/terminal/temporal/identity
+  tests); affected regression + qualification batch passes 622 + 2 subtests.
+  No build, no live Isaac/ROS, no cuMotion; production
+  modules/scenarios/policies are untouched.
+
 - 2026-08-04 (integrated qualification Task 7 — "independent integrated
   raw-physics verifier"): Added the independent, integrated raw-physics
   verifier for the 17-scenario manipulation-qualification matrix.

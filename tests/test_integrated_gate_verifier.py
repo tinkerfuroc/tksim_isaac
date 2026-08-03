@@ -10,6 +10,8 @@ from pathlib import Path
 import json
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "validation"))
 sys.path.insert(0, str(ROOT / "tests"))
@@ -132,20 +134,25 @@ def test_full_matrix_all_17_scenarios_pass():
 
 def test_full_matrix_verified_fail_per_class():
     import tempfile
+    # F1.7: post-terminal drain motion is ignored, so the fail mutations for
+    # cancel/cancel-transport inject motion strictly inside the observation
+    # subwindow (between the cancel/clear key and quiescent), not after it.
     fails = {
         "qualification-moveit-plan-joint": dict(plan_only_target_delta=0.01),
+        "qualification-moveit-plan-pose": dict(plan_only_target_delta=0.01),
         "qualification-moveit-plan-blocked": dict(plan_result_success=True),
         "qualification-moveit-execute-joint": dict(joint_tracking_error_rad=0.05),
         "qualification-moveit-execute-pose": dict(tcp_tracking_error_m=0.05),
         "qualification-moveit-cartesian-retreat": dict(retreat_short=True),
         "qualification-moveit-gripper": dict(gripper_travel_short=True),
-        "qualification-moveit-cancel": dict(cancel_post_terminal_motion=0.02),
+        "qualification-moveit-cancel": dict(post_quiescent_motion_fails=True),
         "qualification-moveit-safety": dict(safety_post_clear_target_motion=0.01),
         "qualification-pick-place-positive": dict(placement_error_m=0.20),
         "qualification-pick-place-blocked-approach": dict(approach_contact=True),
         "qualification-pick-place-unreachable-grasp": dict(approach_tcp_motion=True),
         "qualification-pick-place-malformed-back": dict(malformed_pick_goal_sent=True),
-        "qualification-pick-place-cancel-transport": dict(post_cancel_motion=True),
+        "qualification-pick-place-cancel-approach": dict(approach_contact=True),
+        "qualification-pick-place-cancel-transport": dict(post_quiescent_motion_fails=True),
         "qualification-pick-place-safety-transport": dict(post_clear_resume=True),
         "qualification-pick-place-occupied-place": dict(occupied_release=True),
     }
@@ -209,14 +216,17 @@ def test_terminal_anchor_excludes_post_terminal_drain(tmp_path):
 # §8.3 C1 — observation subwindows end at quiescent, never teardown.
 # --------------------------------------------------------------------------- #
 def test_observation_subwindow_ends_at_quiescent_never_teardown(tmp_path):
-    # Fresh motion strictly after quiescent (before teardown) is outside the
-    # [cancel-requested, quiescent] observation subwindow, so it fails via
-    # no_later_stage (post-quiescent scan), not via quiescent_after_cancel.
-    verdict = _verify_at(tmp_path, "qualification-moveit-cancel", cancel_post_terminal_motion=0.02)
+    # F1.7: motion strictly after quiescent (before teardown) is outside the
+    # [cancel-requested, quiescent] observation subwindow and is ignored.
+    verdict = _verify_at(tmp_path, "qualification-moveit-cancel", post_quiescent_motion_ignored=True)
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+
+    # The same motion strictly between cancel-requested and quiescent fails
+    # quiescent_after_cancel (the subwindow read admits it).
+    verdict = _verify_at(tmp_path / "fail", "qualification-moveit-cancel", post_quiescent_motion_fails=True)
     assert verdict["status"] == "verified-fail"
     names = [c["name"] for c in verdict["checks"] if not c["passed"]]
-    assert "no_later_stage" in names
-    assert "quiescent_after_cancel" not in names
+    assert "quiescent_after_cancel" in names
 
 
 # --------------------------------------------------------------------------- #
@@ -441,3 +451,223 @@ def test_negative_forbidden_after_terminal(tmp_path):
     assert verdict["status"] == "verified-fail"
     names = [c["name"] for c in verdict["checks"] if not c["passed"]]
     assert "target_region_settled" in names
+
+
+# --------------------------------------------------------------------------- #
+# Fix round 1 — F1.1 stage-real object evidence.
+# --------------------------------------------------------------------------- #
+def test_cd_scenarios_do_not_require_qualification_cube(tmp_path):
+    import tempfile
+    # C/D scenarios declare objects: [] in production; raw truth has
+    # objects=[], object=None, expected_objects={}.  The verifier must verify
+    # them without any cube (F1.1).
+    for scenario_id in ALL_17_SCENARIOS[:9]:
+        with tempfile.TemporaryDirectory() as directory:
+            attempt = write_integrated_attempt(Path(directory), scenario=scenario_id)
+            records = _raw_records(attempt)
+            assert all(frame.get("objects") == [] for frame in records), scenario_id
+            assert all(frame.get("object") is None for frame in records), scenario_id
+            assert all(frame.get("expected_objects") == {} for frame in records), scenario_id
+            verdict = verify_integrated_attempt(
+                scenario=load_test_scenario(scenario_id),
+                attempt_dir=attempt,
+                config=load_test_config(),
+            )
+            assert verdict["status"] == "verified-pass", (
+                f"{scenario_id}: {verdict['errors'][:1]}"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# F1.2 scene-detach uses the committed after-state.
+# --------------------------------------------------------------------------- #
+def test_scene_detach_record_is_detached(tmp_path):
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        attempt = write_integrated_attempt(Path(directory))
+        verdict = verify_integrated_attempt(
+            scenario=load_test_scenario("qualification-pick-place-positive"),
+            attempt_dir=attempt,
+            config=load_test_config(),
+        )
+        assert verdict["status"] == "verified-pass"
+        journal = _journal_records(attempt)
+        detach = next(r for r in journal if r["event"] == "scene-detach")
+        assert "pick_and_place/object_mesh" not in detach["attached_ids"]
+
+
+def test_scene_detach_still_attached_fails_closed(tmp_path):
+    # A scene-detach record that still carries the target is producer-shaped
+    # wrong and fails closed (F1.2).
+    verdict = _verify(
+        tmp_path,
+        scenario="qualification-pick-place-positive",
+        scene_detach_still_attached=True,
+    )
+    assert verdict["status"] == "evidence-invalid"
+    assert any("scene-detach" in error for error in verdict["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# F1.3 endpoint/provider checks scoped to endpoint evidence.
+# --------------------------------------------------------------------------- #
+def test_env_cloud_evidence_source_is_not_endpoint_provider(tmp_path):
+    # D cartesian-retreat embeds env_cloud_evidence.source ==
+    # "observed-environment-cloud"; that is cloud provenance, not an endpoint
+    # provider, so it must not invalidate the attempt (F1.3).
+    verdict = _verify_at(tmp_path, "qualification-moveit-cartesian-retreat")
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+
+
+def test_wrong_paired_source_fails(tmp_path):
+    # A fabricated paired source_node next to the FJT endpoint fails the
+    # endpoint-source ownership check (F1.3); this is a true pairing, unlike
+    # the environment-cloud provenance source.
+    verdict = _verify_at(
+        tmp_path,
+        "qualification-moveit-cartesian-retreat",
+        wrong_paired_source=True,
+    )
+    assert verdict["status"] == "evidence-invalid"
+    assert any("source" in error for error in verdict["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# F1.4 contradictory terminal domains fail closed.
+# --------------------------------------------------------------------------- #
+def test_conflicting_terminal_domains_fail_closed(tmp_path):
+    # success string + ABORTED numeric -> evidence-invalid, never a pass.
+    verdict = _verify_at(
+        tmp_path / "sa",
+        "qualification-moveit-execute-joint",
+        terminal_conflict_success_aborted=True,
+    )
+    assert verdict["status"] == "evidence-invalid", verdict["status"]
+    # aborted string + SUCCEEDED numeric -> evidence-invalid.
+    verdict = _verify_at(
+        tmp_path / "as",
+        "qualification-moveit-execute-joint",
+        terminal_conflict_aborted_succeeded=True,
+    )
+    assert verdict["status"] == "evidence-invalid", verdict["status"]
+
+
+def test_missing_terminal_evidence_fails_closed(tmp_path):
+    verdict = _verify_at(
+        tmp_path,
+        "qualification-moveit-execute-joint",
+        terminal_missing=True,
+    )
+    assert verdict["status"] == "evidence-invalid", verdict["status"]
+
+
+# --------------------------------------------------------------------------- #
+# F1.5 malformed scalar evidence fails closed.
+# --------------------------------------------------------------------------- #
+def test_malformed_scalar_evidence_fails_closed(tmp_path):
+    # Malformed raw seed.
+    for override in ("seed_null", "seed_list"):
+        verdict = _verify(tmp_path / override, **{override: True})
+        assert verdict["status"] == "evidence-invalid", override
+
+    # Malformed gate-window indices.
+    for override in ("raw_start_index_null", "raw_start_index_str", "raw_start_index_neg"):
+        verdict = _verify(tmp_path / override, **{override: True})
+        assert verdict["status"] == "evidence-invalid", override
+
+    # Malformed evaluator index.
+    for override in ("evaluator_start_index_str", "evaluator_start_index_null"):
+        verdict = _verify(tmp_path / override, **{override: True})
+        assert verdict["status"] == "evidence-invalid", override
+
+
+# --------------------------------------------------------------------------- #
+# F1.6 forbidden execution-provider taint beyond endpoint fields.
+# --------------------------------------------------------------------------- #
+def test_provider_field_taint_fails_closed(tmp_path):
+    verdict = _verify(tmp_path / "pipeline", pipeline_taint=True)
+    assert verdict["status"] == "evidence-invalid"
+    assert any("pipeline_id" in error for error in verdict["errors"])
+
+    verdict = _verify(tmp_path / "provider", provider_taint=True)
+    assert verdict["status"] == "evidence-invalid"
+    assert any("provider" in error for error in verdict["errors"])
+
+    verdict = _verify(tmp_path / "anygrasp", pipeline_anygrasp=True)
+    assert verdict["status"] == "evidence-invalid"
+    assert any("pipeline_id" in error for error in verdict["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# F1.7 temporal checks stay inside the contracted observation subwindow.
+# --------------------------------------------------------------------------- #
+def test_post_quiescent_motion_ignored_after_subwindow(tmp_path):
+    # Motion after quiescent (post-terminal drain) is ignored on the D cancel
+    # scenario (F1.7).
+    verdict = _verify_at(
+        tmp_path,
+        "qualification-moveit-cancel",
+        post_quiescent_motion_ignored=True,
+    )
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+
+    # The same motion between cancel-requested and quiescent fails.
+    verdict = _verify_at(
+        tmp_path / "fail",
+        "qualification-moveit-cancel",
+        post_quiescent_motion_fails=True,
+    )
+    assert verdict["status"] == "verified-fail"
+
+
+# --------------------------------------------------------------------------- #
+# F1.8 occupied-place retention and fixture realism.
+# --------------------------------------------------------------------------- #
+def test_occupied_place_attached_after_place_failure(tmp_path):
+    verdict = _verify_at(tmp_path, "qualification-pick-place-occupied-place")
+    assert verdict["status"] == "verified-pass", verdict["errors"]
+    check = next(c for c in verdict["checks"] if c["name"] == "scene_attached_after_place_failure")
+    assert check["passed"] is True
+    assert check["metrics"]["attached_after_place_failure"]
+
+
+# --------------------------------------------------------------------------- #
+# F1.9 CLI scenario identity is truthful.
+# --------------------------------------------------------------------------- #
+def test_scenario_bundle_identity_mismatch_fails_closed(tmp_path):
+    from integrated_gate_verifier import _scenario_bundle_from_declaration, EvidenceError
+    import json as _json
+    raw = _json.loads(
+        (ROOT / "simulation" / "scenarios" / "qualification-pick-place-positive.json")
+        .read_text(encoding="utf-8")
+    )
+    with pytest.raises(EvidenceError):
+        _scenario_bundle_from_declaration(raw, expected_id="qualification-moveit-cancel")
+
+
+def test_cli_scenario_id_mismatch_exit_code(tmp_path):
+    import subprocess
+    import tempfile
+    from integrated_gate_verifier import _repo_root
+    with tempfile.TemporaryDirectory() as directory:
+        attempt = write_integrated_attempt(Path(directory))
+        # Explicit file path whose filename id disagrees with the declaration id.
+        wrong = Path(directory) / "wrong-name.json"
+        wrong.write_text(
+            (ROOT / "simulation" / "scenarios" / "qualification-pick-place-positive.json")
+            .read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "validation" / "integrated_gate_verifier.py"),
+                "--scenario", str(wrong),
+                "--attempt-dir", str(attempt),
+                "--config", str(ROOT / "simulation" / "qualification" / "integrated-ompl.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert "does not match" in result.stderr or "does not match" in result.stdout
