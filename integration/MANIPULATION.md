@@ -363,6 +363,56 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-03 (integrated qualification Task 6, formal-review fix round 1 —
+  "make Gate E live-observable"): Made Gate E live-observable per the full
+  F1.1-F1.15 consolidated findings.  The positive and occupied-place sequences
+  now observe lift-complete and transport **during** Pick execution (production
+  `stay=false` returns to `Q_OUTBOUND` before the result, so post-result
+  transport evidence can never exist).  The transport trigger is two-phase:
+  `lift_complete` latches on observed attachment + TCP z above the lift
+  threshold + settled arm velocity + two fresh normal samples; `transport_started`
+  then requires a **later** fresh FJT EXECUTING entry + attached target + fresh
+  TCP motion, never re-requiring the settled condition while moving.  Safety-
+  transport asserts with `publish_operator(True)` and clears with `False` only
+  after the effective stop.  Every cancel/safety interruption boundedly awaits
+  the exact goal result and records both status domains (canceled: GoalStatus
+  CANCELED=5 + `Result.status=4`; safety-transport: `Result.status=5` +
+  ABORTED terminal).  The complete trigger object and validated-spec geometry
+  are persisted into the authoritative artifacts and final downgrade rows.
+  `E_FJT_CORRELATION_TIMEOUT_S == 2.0` bounds all FJT receipt windows and the
+  actual receipt delta is recorded.  Every E attempt resets per-attempt state;
+  the shared fixture-scene check keeps Gate C/D strict while permitting only the
+  exact task target via the explicit E path; all E dispatches fail closed on any
+  exception with accepted-goal cleanup; and pre-goal failures still write
+  canonical `planning-scene.json`.  Humble suite 141, pure suite 124.
+
+  **Live order obligation — transport observed during Pick execution.**  The
+  live orchestrator (Task 7/10) must keep the Pick goal **executing** while the
+  executor polls the two-phase transport predicate: production Pick with
+  `stay=false` lifts, returns to `Q_OUTBOUND`, and only then publishes its
+  result, so the executor latches the lift/transport checkpoints from the
+  injected TCP/JJT/scene streams during that window.  A flow that awaits the
+  Pick terminal before polling transport can never observe the transient return
+  motion and will finalize `evidence-invalid` (the pre-fix defect).
+
+  **Live native-gripper obligation (cancel-approach).**  cancel-approach now
+  requires the injected, receipt-sequenced
+  `native_gripper_goal_count_provider` seam instead of the fake-only
+  `ActionClient.sent_goals` attribute.  The later live orchestrator must provide
+  the native gripper action-goal count **from the real action stream**: a fresh
+  non-negative integer count plus a fresh `age_s` gate, captured at baseline and
+  at each trigger poll.  The trigger requires the count not to increase and the
+  target to remain unattached; missing/stale/provider-error evidence fails
+  closed with `evidence-invalid`.
+
+  **Live scene-attach prerequisite.**  The journal attach transition requires
+  the target world object to be present in the pre-attach scene (shared
+  `_validate_transition`).  The live orchestrator must therefore **predeclare
+  the task-owned world object** (`pick_and_place/object_mesh`) before the Pick
+  attach transition (or record an intermediate world-appearance diff); the
+  executor fails closed when the target world object is absent at fixture-ready
+  and never fabricates the object.
+
 - 2026-08-03 (integrated qualification Task 6 — "add fixed-target Pick and Place
   controls"): Added the Stage-E fixed-target Pick/Place diagnostics executor to
   the same ROS-lazy `validation/integrated_gate_executor.py`.  A closed ROS-free

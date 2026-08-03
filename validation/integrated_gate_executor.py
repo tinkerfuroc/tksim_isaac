@@ -1905,6 +1905,41 @@ def _next_fjt_goal(
     return None
 
 
+def _fjt_receipt_delta_s(entry: Mapping[str, object], boundary_mono: object) -> float | None:
+    """Seconds between the FJT status receipt and *boundary_mono* (or ``None``).
+
+    F1.6: the receipt-time correlation window uses the FJT status topic
+    ``received_mono`` timestamp versus the task-goal acceptance/latch baseline.
+    A non-finite or negative delta (received before the boundary) is ``None``.
+    """
+    received = entry.get("received_mono")
+    if received is None:
+        return None
+    try:
+        delta = float(received) - float(boundary_mono)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(delta) or delta < 0.0:
+        return None
+    return delta
+
+
+def _fjt_within_receipt_window(
+    entry: Mapping[str, object], boundary_mono: object, window_s: object
+) -> bool:
+    """True when the FJT receipt is a fresh positive delta inside *window_s*."""
+    try:
+        window = float(window_s)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(window) or window < 0.0:
+        return False
+    delta = _fjt_receipt_delta_s(entry, boundary_mono)
+    if delta is None:
+        return False
+    return delta <= window
+
+
 def _tcp_z_from_samples(
     samples: Sequence[Mapping[str, object]],
 ) -> float | None:
@@ -2586,6 +2621,19 @@ class IntegratedGateExecutor:
         # ``current_tcp_pose_provider`` (never a TF listener embedded here).
         self._tcp_pose_samples: list[dict[str, object]] = []
         self._last_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None
+        # F1.7/F1.9/F1.10: strictly per-attempt Gate-E trigger/latch state.  Reset
+        # at the start of every public E entry point so a reused executor can
+        # never carry a previous attempt's sample/latch/goal evidence into the
+        # next attempt.
+        self._e_active_goal_handle: Any = None
+        self._e_goal_state: dict[str, object] = {
+            "pick_sent": False,
+            "pick_goal_id": None,
+            "place_sent": False,
+            "place_goal_id": None,
+        }
+        self._e_native_gripper_count_provider: Callable[[], Mapping[str, object]] | None = None
+        self._e_native_gripper_count_baseline: int | None = None
 
     # -- construction helpers ----------------------------------------------
 
@@ -5890,57 +5938,174 @@ class IntegratedGateExecutor:
 
     # -- Task 6 / Gate E fixed-target Pick and Place -------------------------
 
+    def _e_reset_attempt_state(self) -> None:
+        """F1.7: reset every per-attempt Gate-E sample/latch/goal state.
+
+        Called at the start of every public E entry point so a reused executor
+        can never satisfy a trigger with a previous attempt's TCP sample, FJT/
+        joint receipt, native gripper count, or accepted goal handle.
+        """
+        self._tcp_pose_samples.clear()
+        self._last_tcp_pose_provider = None
+        self._e_active_goal_handle = None
+        self._e_goal_state = {
+            "pick_sent": False,
+            "pick_goal_id": None,
+            "place_sent": False,
+            "place_goal_id": None,
+        }
+        self._e_native_gripper_count_provider = None
+        self._e_native_gripper_count_baseline = None
+
+    def _e_native_gripper_count(self) -> int | None:
+        """Fresh receipt-sequenced native gripper action-goal count, else None.
+
+        F1.10: the injected provider reports the native gripper action-server
+        goal count (a live-observable seam, not the fake-only ``sent_goals``
+        attribute).  Missing/stale/non-finite/provider-error evidence returns
+        ``None`` so cancel-approach fails closed.
+        """
+        provider = self._e_native_gripper_count_provider
+        if provider is None:
+            return None
+        try:
+            sample = provider()
+        except Exception:
+            return None
+        if not isinstance(sample, Mapping):
+            return None
+        count = sample.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        age = sample.get("age_s")
+        if not _fresh(age, self._thresholds().get("tf_fresh_s", 0.25)):
+            return None
+        return int(count)
+
+    def _e_unexpected_exception(
+        self, scenario_id: str, exc: Exception, *, spec: Mapping[str, object]
+    ) -> dict[str, object]:
+        """F1.9: fail-closed unexpected-exception evidence with accepted-goal cleanup.
+
+        Any exception escaping an E runner is contained into a complete Gate-E
+        record.  If an action goal was accepted, bounded cleanup/cancel is
+        attempted on the exact handle before the record is finalized; the
+        cleanup outcome is recorded without ever claiming cancel success.
+        """
+        cleanup: dict[str, object] = {}
+        goal_handle = self._e_active_goal_handle
+        if goal_handle is not None:
+            try:
+                cleanup = self._cleanup_execute_goal(
+                    goal_handle,
+                    timeout_s=self._thresholds().get("cancel_timeout_s", 3.0),
+                )
+            except Exception as clean_exc:  # pragma: no cover - defensive
+                cleanup = {"cleanup": "exception", "cleanup_error": str(clean_exc)}
+            self._e_active_goal_handle = None
+        goal_state = dict(self._e_goal_state)
+        record = self._evidence_invalid_e(
+            scenario_id,
+            "unexpected-exception",
+            [f"{type(exc).__name__}: {exc}"],
+            handler=spec.get("kind"),
+        )
+        record["pick_goal_sent"] = bool(goal_state.get("pick_sent"))
+        record["place_goal_sent"] = bool(goal_state.get("place_sent"))
+        record["place_goal_accepted"] = bool(goal_state.get("place_sent"))
+        record["goals_sent"] = int(bool(goal_state.get("pick_sent"))) + int(
+            bool(goal_state.get("place_sent"))
+        )
+        record["pick_goal_id"] = goal_state.get("pick_goal_id")
+        record["place_goal_id"] = goal_state.get("place_goal_id")
+        record["cleanup"] = cleanup
+        return record
+
     def run_pick_place_sequence(
         self,
         scenario_id: str,
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
+        native_gripper_goal_count_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         """Run one Gate-E fixed-target Pick/Place sequence (positive or negative).
 
         The scenario is validated fail-closed through :func:`stage_e_dispatch`
         before any goal is created or sent.  The positive scenario runs the
         production two-goal Pick then Place; every negative runs its isolated
-        short journal and never infers a physical verdict.
+        short journal and never infers a physical verdict.  Per-attempt E state
+        is reset first (F1.7) and any escaping exception is contained fail-closed
+        with accepted-goal cleanup (F1.9).
         """
+        self._e_reset_attempt_state()
+        spec: Mapping[str, object] = {}
         try:
-            spec = stage_e_dispatch(scenario_id, scenario=self.scenario)
-        except ValueError as exc:
-            return self._evidence_invalid_e(scenario_id, "scenario-rejected", [str(exc)])
-        if spec["kind"] == "positive":
-            return self._run_e_positive(spec, current_tcp_pose_provider=current_tcp_pose_provider)
-        return self._run_e_negative(spec, current_tcp_pose_provider=current_tcp_pose_provider)
+            try:
+                spec = stage_e_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid_e(scenario_id, "scenario-rejected", [str(exc)])
+            self._e_native_gripper_count_provider = native_gripper_goal_count_provider
+            if spec["kind"] == "positive":
+                return self._run_e_positive(
+                    spec,
+                    current_tcp_pose_provider=current_tcp_pose_provider,
+                    native_gripper_goal_count_provider=native_gripper_goal_count_provider,
+                )
+            return self._run_e_negative(
+                spec,
+                current_tcp_pose_provider=current_tcp_pose_provider,
+            )
+        except Exception as exc:
+            return self._e_unexpected_exception(scenario_id, exc, spec=spec)
 
     def run_pick_place_positive(
         self,
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
+        native_gripper_goal_count_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         """Run the Gate-E positive fixed-target Pick then Place sequence."""
-        spec = stage_e_dispatch("qualification-pick-place-positive", scenario=self.scenario)
-        return self._run_e_positive(spec, current_tcp_pose_provider=current_tcp_pose_provider)
+        return self.run_pick_place_sequence(
+            "qualification-pick-place-positive",
+            current_tcp_pose_provider=current_tcp_pose_provider,
+            native_gripper_goal_count_provider=native_gripper_goal_count_provider,
+        )
 
     def run_pick_place_negative(
         self,
         scenario_id: str,
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
+        native_gripper_goal_count_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         """Run one isolated Gate-E negative Pick/Place control.
 
         The positive scenario is never dispatched through the negative path; an
         unknown or non-E identity fails closed through :func:`stage_e_dispatch`
-        before any goal is created or sent.
+        before any goal is created or sent.  Per-attempt E state is reset first
+        and any escaping exception is contained fail-closed (F1.7/F1.9).
         """
+        self._e_reset_attempt_state()
+        spec: Mapping[str, object] = {}
         try:
-            spec = stage_e_dispatch(scenario_id, scenario=self.scenario)
-        except ValueError as exc:
-            return self._evidence_invalid_e(scenario_id, "scenario-rejected", [str(exc)])
-        if spec["kind"] == "positive":
-            raise ValueError(
-                f"run_pick_place_negative does not dispatch the positive scenario: {scenario_id}"
+            try:
+                spec = stage_e_dispatch(scenario_id, scenario=self.scenario)
+            except ValueError as exc:
+                return self._evidence_invalid_e(scenario_id, "scenario-rejected", [str(exc)])
+            if spec["kind"] == "positive":
+                return self._evidence_invalid_e(
+                    scenario_id,
+                    "positive-not-dispatched",
+                    ["run_pick_place_negative does not dispatch the positive scenario"],
+                    handler=spec["kind"],
+                )
+            self._e_native_gripper_count_provider = native_gripper_goal_count_provider
+            return self._run_e_negative(
+                spec,
+                current_tcp_pose_provider=current_tcp_pose_provider,
             )
-        return self._run_e_negative(spec, current_tcp_pose_provider=current_tcp_pose_provider)
+        except Exception as exc:
+            return self._e_unexpected_exception(scenario_id, exc, spec=spec)
 
     # -- Gate E TCP pose sampling (injected provider; never a TF listener) ---
 
@@ -6132,10 +6297,20 @@ class IntegratedGateExecutor:
             return {"status": "goal-send-exception", "reason_code": "goal-send-exception", "error": str(exc)}
         if goal_handle is None or not getattr(goal_handle, "accepted", False):
             return {"status": "goal-rejected", "reason_code": "goal-rejected"}
+        goal_id = self._normalize_goal_id(goal_handle)
+        # F1.9: track the active accepted goal so an unexpected exception can
+        # perform bounded cleanup and record truthful pick/place goal state.
+        self._e_active_goal_handle = goal_handle
+        if endpoint == "/pickup_action":
+            self._e_goal_state["pick_sent"] = True
+            self._e_goal_state["pick_goal_id"] = goal_id
+        elif endpoint == "/place_action":
+            self._e_goal_state["place_sent"] = True
+            self._e_goal_state["place_goal_id"] = goal_id
         return {
             "status": "accepted",
             "goal_handle": goal_handle,
-            "goal_id": self._normalize_goal_id(goal_handle),
+            "goal_id": goal_id,
             "endpoint": endpoint,
         }
 
@@ -6156,6 +6331,26 @@ class IntegratedGateExecutor:
             "status": "done",
             "result": getattr(response, "result", None),
             "terminal_status": _execute_status_name(getattr(response, "status", None)),
+        }
+
+    def _e_wait_interrupted_result(self, goal_handle: Any) -> dict[str, object]:
+        """F1.4: bounded await of an interrupted Pick/Place result terminal.
+
+        Records both status domains from the actual goal handle/result: the
+        action-client ``GoalStatus`` (as ``terminal_status``) and the Pick/Place
+        ``Result.status`` (as ``result_status``).  A timeout or exception is
+        returned as-is so the caller fails closed.
+        """
+        outcome = self._e_wait_action_result(goal_handle)
+        result = outcome.get("result")
+        result_status = getattr(result, "status", None) if result is not None else None
+        return {
+            "status": outcome.get("status"),
+            "result_status": result_status,
+            "terminal_status": outcome.get("terminal_status"),
+            "result_status_string": (
+                _pick_place_result_name(result_status) if result_status is not None else None
+            ),
         }
 
     # -- Gate E journal event helpers ---------------------------------------
@@ -6189,7 +6384,10 @@ class IntegratedGateExecutor:
     def _e_prepare(self, spec: Mapping[str, object], *, current_tcp_pose_provider) -> dict[str, object] | None:
         """Shared E preamble.  Returns ``None`` on success or an evidence record."""
         scenario_id = spec["scenario_id"]
-        if current_tcp_pose_provider is None:
+        # F1.12: malformed-back never moves and never samples TCP — it rejects
+        # before any motion-only provider requirement, so the TCP provider is
+        # required for every E kind except malformed-back.
+        if current_tcp_pose_provider is None and spec["kind"] != "malformed-back":
             return self._evidence_invalid_e(
                 scenario_id, "no-tcp-pose-provider",
                 ["current_tcp_pose_provider is required before sending a Pick/Place goal"],
@@ -6208,6 +6406,25 @@ class IntegratedGateExecutor:
             return self._evidence_invalid_e(
                 scenario_id, "readiness-failed", list(readiness["reasons"]), handler=spec["kind"]
             )
+        # F1.10: cancel-approach requires a fresh native gripper action-goal
+        # count provider at baseline (zero native gripper goals before any goal);
+        # missing/stale/provider-error evidence fails closed.
+        gripper_count_baseline: int | None = None
+        if spec["kind"] == "cancel-approach":
+            if self._e_native_gripper_count_provider is None:
+                return self._evidence_invalid_e(
+                    scenario_id, "no-native-gripper-provider",
+                    ["native_gripper_goal_count_provider is required for cancel-approach"],
+                    handler=spec["kind"],
+                )
+            gripper_count_baseline = self._e_native_gripper_count()
+            if gripper_count_baseline is None:
+                return self._evidence_invalid_e(
+                    scenario_id, "native-gripper-provider-unavailable",
+                    ["native gripper count provider returned no fresh finite count at baseline"],
+                    handler=spec["kind"],
+                )
+            self._e_native_gripper_count_baseline = gripper_count_baseline
         acquire_error = self._acquire_scene(scenario_id, e_handler=spec["kind"])
         if acquire_error is not None:
             return acquire_error
@@ -6220,7 +6437,7 @@ class IntegratedGateExecutor:
         scene = self._journal_scene(join)
         if scene is None:
             return self._evidence_invalid_e(scenario_id, "no-planning-scene", [], handler=spec["kind"])
-        scene_error = self._fixture_scene_error(scene)
+        scene_error = self._fixture_scene_error(scene, allow_e_target=True)
         if scene_error is not None:
             return self._evidence_invalid_e(
                 scenario_id, "fixture-scene-mismatch", [scene_error], handler=spec["kind"]
@@ -6551,6 +6768,34 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, trigger=trigger,
                 cancel_response=cancel_response,
             )
+        # F1.4: boundedly await the exact canceled Pick terminal and record both
+        # status domains from the actual handle/result.  A mismatched/unknown/
+        # nonterminal status fails closed.
+        interrupted = self._e_wait_interrupted_result(outcome["goal_handle"])
+        interrupted_status = interrupted.get("status")
+        interrupted_result_status = interrupted.get("result_status")
+        interrupted_terminal_status = interrupted.get("terminal_status")
+        if (
+            interrupted_status != "done"
+            or interrupted_result_status != PICK_PLACE_RESULT_CANCELED
+            or interrupted_terminal_status != "canceled"
+        ):
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=(
+                    f"{kind} canceled Pick terminal mismatch: result "
+                    f"{interrupted_status}/status {interrupted_result_status} "
+                    f"({interrupted.get('result_status_string')}) terminal "
+                    f"{interrupted_terminal_status}"
+                ),
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+                cancel_response=cancel_response,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
+            )
         if not self._e_wait_quiescent(baseline):
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
@@ -6560,6 +6805,8 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
                 cancel_response=cancel_response,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
         quiescent = self._e_record_snapshot("quiescent")
         if quiescent != "recorded":
@@ -6571,6 +6818,8 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
                 cancel_response=cancel_response,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
         event_log.append("quiescent")
         teardown_status = self._e_record_snapshot("teardown")
@@ -6583,6 +6832,8 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
                 cancel_response=cancel_response,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
         event_log.append("teardown")
         return self._finalize_e_attempt(
@@ -6592,31 +6843,53 @@ class IntegratedGateExecutor:
             place_goal_accepted=False, goals_sent=1,
             pick_goal_id=pick_goal_id, trigger=trigger,
             cancel_response=cancel_response,
+            task_result_status=interrupted_result_status,
+            terminal_status=interrupted_terminal_status,
         )
 
     def _e_wait_approach_started(self, baseline: Mapping[str, object], spec) -> Mapping[str, object] | None:
-        """Wait for the cancel-approach trigger (fresh FJT EXECUTING + TCP motion)."""
+        """Wait for the cancel-approach trigger (fresh FJT EXECUTING + TCP motion).
+
+        F1.6/F1.10: the approach FJT must be received within
+        ``E_FJT_CORRELATION_TIMEOUT_S`` of the goal-acceptance baseline, the
+        target must never attach, and the injected native gripper action-goal
+        count must not increase (zero native gripper goals before any
+        cancellation).  Missing/stale/provider-error gripper evidence or a
+        received-before-baseline FJT can never satisfy the trigger.
+        """
         timeout_s = float(spec.get("trigger_timeout_s") or 10.0)
         speed_limit = self._e_trigger_speed_m_s()
+        window_s = float(E_FJT_CORRELATION_TIMEOUT_S)
         captured: dict[str, object] = {}
 
         def _seen() -> bool:
             self._e_record_tcp_sample(self._last_tcp_pose_provider)
             if self._e_target_attached():
                 return False
-            gripper_client = self._action_clients.get("/xarm_gripper/gripper_action")
-            sent_goals = getattr(gripper_client, "sent_goals", None)
-            if isinstance(sent_goals, list) and len(sent_goals) > 0:
+            gripper_now = self._e_native_gripper_count()
+            if gripper_now is None:
+                return False
+            baseline_count = self._e_native_gripper_count_baseline
+            if baseline_count is None or gripper_now != baseline_count:
                 return False
             first = self._e_first_fjt_after_acceptance(baseline)
             if first is None:
+                return False
+            if not _fjt_within_receipt_window(first, baseline.get("start_mono"), window_s):
                 return False
             speed = self._e_tcp_speed_m_s()
             if speed is None or speed < speed_limit:
                 return False
             captured.update(dict(first))
+            captured["trigger_kind"] = "approach"
             captured["tcp_speed_m_s"] = float(speed)
             captured["tcp_z_m"] = self._e_tcp_z_m()
+            captured["scene_target_attached"] = False
+            captured["native_gripper_goal_count_baseline"] = baseline_count
+            captured["native_gripper_goal_count_now"] = gripper_now
+            captured["fjt_receipt_delta_s"] = _fjt_receipt_delta_s(
+                first, baseline.get("start_mono")
+            )
             return True
 
         if not self._wait_for(_seen, timeout_s):
@@ -6624,51 +6897,93 @@ class IntegratedGateExecutor:
         return captured
 
     def _e_wait_transport_started(self, baseline: Mapping[str, object], spec) -> Mapping[str, object] | None:
-        """Wait for the transport trigger (attach + lift + later fresh FJT EXECUTING)."""
+        """Two-phase transport trigger (F1.2/F1.6).
+
+        Phase 1 ``lift_complete`` latches only after observed target attachment,
+        TCP z above the configured lift threshold, ``max_abs_arm_velocity_rad_s
+        <= settled`` and at least two consecutive fresh normal-state samples.
+        Phase 2 ``transport_started`` then requires a **later** fresh FJT
+        ``EXECUTING`` entry, target still attached, and fresh TCP speed >= the
+        trigger limit; it never re-requires the settled condition while moving.
+        Receipt sequences/timestamps prove the transport FJT/TCP evidence is
+        later than the lift latch (``fjt_receipt_delta_s`` within
+        ``E_FJT_CORRELATION_TIMEOUT_S`` of the lift latch boundary).
+        """
         timeout_s = float(spec.get("trigger_timeout_s") or 15.0)
         speed_limit = self._e_trigger_speed_m_s()
+        window_s = float(E_FJT_CORRELATION_TIMEOUT_S)
+        settled_limit = self._e_settled_speed_m_s()
+        lift_z = (
+            float(spec["geometry"]["grasp_tcp_xyz"][2])
+            + self._e_object_lift_m()
+            - self._e_lift_z_tolerance_m()
+        )
         captured: dict[str, object] = {}
-        first_holder: dict[str, object] = {}
+        lift: dict[str, object] = {}
+        deadline = time.monotonic() + timeout_s
 
-        def _seen() -> bool:
+        def _lift_latched() -> bool:
             self._e_record_tcp_sample(self._last_tcp_pose_provider)
             if not self._e_target_attached():
                 return False
             tcp_z = self._e_tcp_z_m()
-            if tcp_z is None:
-                return False
-            grasp_z = float(spec["geometry"]["grasp_tcp_xyz"][2])
-            if tcp_z < grasp_z + self._e_object_lift_m() - self._e_lift_z_tolerance_m():
+            if tcp_z is None or tcp_z < lift_z:
                 return False
             max_velocity = self._e_max_abs_velocity_rad_s(baseline)
-            if max_velocity is None or max_velocity > self._e_safety_stop_velocity_rad_s():
+            if max_velocity is None or max_velocity > settled_limit:
                 return False
-            if self._e_normal_state_sample_count(baseline) < self._e_normal_state_samples():
+            normal_samples = self._e_normal_state_sample_count(baseline)
+            if normal_samples < self._e_normal_state_samples():
                 return False
-            if not first_holder:
-                first = self._e_first_fjt_after_acceptance(baseline)
-                if first is None:
-                    return False
-                first_holder.update(dict(first))
-            else:
-                first = first_holder
+            newest = self._newest_fjt_status()
+            lift.update(
+                {
+                    "lift_tcp_z_m": float(tcp_z),
+                    "lift_max_abs_arm_velocity_rad_s": float(max_velocity),
+                    "lift_normal_state_samples": int(normal_samples),
+                    "lift_scene_target_attached": True,
+                    "lift_mono": float(time.monotonic()),
+                    "lift_fjt_seq": int(
+                        newest.get("seq", 0)
+                        if newest is not None
+                        else baseline.get("fjt_seq", 0)
+                    ),
+                }
+            )
+            return True
+
+        def _transport_seen() -> bool:
+            self._e_record_tcp_sample(self._last_tcp_pose_provider)
+            if not self._e_target_attached():
+                return False
             next_goal = _next_fjt_goal(
-                self._fresh_fjt_entries(baseline), after_seq=first.get("seq", 0)
+                self._fresh_fjt_entries(baseline), after_seq=lift.get("lift_fjt_seq", 0)
             )
             if next_goal is None:
+                return False
+            if not _fjt_within_receipt_window(next_goal, lift.get("lift_mono"), window_s):
                 return False
             speed = self._e_tcp_speed_m_s()
             if speed is None or speed < speed_limit:
                 return False
             captured.update(dict(next_goal))
+            captured["trigger_kind"] = "transport"
             captured["tcp_speed_m_s"] = float(speed)
             captured["tcp_z_m"] = self._e_tcp_z_m()
-            captured["approach_fjt_goal_uuid"] = first.get("goal_uuid")
+            captured["scene_target_attached"] = True
+            captured["fjt_receipt_delta_s"] = _fjt_receipt_delta_s(
+                next_goal, lift.get("lift_mono")
+            )
+            captured.update(lift)
             return True
 
-        if not self._wait_for(_seen, timeout_s):
-            return None
-        return captured
+        while time.monotonic() < deadline:
+            if lift and _transport_seen():
+                return captured
+            if not lift and _lift_latched():
+                continue
+            self._spin_once()
+        return None
 
     def _e_wait_quiescent(self, baseline: Mapping[str, object]) -> bool:
         timeout_s = float(self._thresholds().get("quiescence_timeout_s", 5.0))
@@ -6750,11 +7065,14 @@ class IntegratedGateExecutor:
                     pick_goal_id=pick_goal_id, trigger=trigger,
                 )
             event_log.append(label)
-        # Assert operator safety: assert the operator's protective request, then
-        # require the effective safety-stop, clear only after the stop, and never
-        # send a later goal.
+        # Assert operator safety: assert with publish_operator(True) (a True
+        # operator input is a protective stop request), then require the
+        # effective safety-stop, await the exact safety-stopped Pick terminal
+        # (F1.4), clear only after the stop, and never send a later goal.
+        operator_published: list[bool] = []
         try:
-            self.publish_operator(False)
+            self.publish_operator(True)
+            operator_published.append(True)
         except Exception as exc:
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
@@ -6784,8 +7102,39 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, trigger=trigger,
             )
         event_log.append("effective-stop")
+        trigger["operator_published"] = list(operator_published)
+        # F1.4: boundedly await the exact safety-stopped Pick terminal.  Current
+        # production semantics: interruption_result maps a SafetyStop interrupt to
+        # ResultStatus::SafetyStop, and complete_pick aborts (GoalStatus=ABORTED)
+        # for any status other than Success / (Canceled while canceling), so the
+        # action-client terminal is "aborted" and the Pick Result.status is 5.
+        interrupted = self._e_wait_interrupted_result(outcome["goal_handle"])
+        interrupted_status = interrupted.get("status")
+        interrupted_result_status = interrupted.get("result_status")
+        interrupted_terminal_status = interrupted.get("terminal_status")
+        if (
+            interrupted_status != "done"
+            or interrupted_result_status != PICK_PLACE_RESULT_SAFETY_STOP
+            or interrupted_terminal_status != "aborted"
+        ):
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=(
+                    f"safety-transport Pick terminal mismatch: result "
+                    f"{interrupted_status}/status {interrupted_result_status} "
+                    f"({interrupted.get('result_status_string')}) terminal "
+                    f"{interrupted_terminal_status}"
+                ),
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
+            )
         try:
-            self.publish_operator(True)
+            self.publish_operator(False)
+            operator_published.append(False)
         except Exception as exc:
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
@@ -6794,7 +7143,10 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=False,
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
+        trigger["operator_published"] = list(operator_published)
         operator_clear = self._e_record_snapshot("operator-clear")
         if operator_clear != "recorded":
             return self._finalize_e_attempt(
@@ -6804,6 +7156,8 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=False,
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
         event_log.append("operator-clear")
         if not self._e_wait_quiescent(baseline):
@@ -6814,6 +7168,8 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=False,
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
         quiescent = self._e_record_snapshot("quiescent")
         if quiescent != "recorded":
@@ -6824,6 +7180,8 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=False,
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
         event_log.append("quiescent")
         teardown_status = self._e_record_snapshot("teardown")
@@ -6835,6 +7193,8 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=False,
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
             )
         event_log.append("teardown")
         return self._finalize_e_attempt(
@@ -6843,6 +7203,8 @@ class IntegratedGateExecutor:
             pick_goal_sent=True, place_goal_sent=False,
             place_goal_accepted=False, goals_sent=1,
             pick_goal_id=pick_goal_id, trigger=trigger,
+            task_result_status=interrupted_result_status,
+            terminal_status=interrupted_terminal_status,
         )
 
     def _run_e_occupied_place(
@@ -6883,6 +7245,22 @@ class IntegratedGateExecutor:
             )
         pick_goal_id = pick_outcome.get("goal_id")
         baseline = self._d_baseline()
+        # F1.1/F1.2: observe and latch the lift and transport checkpoints WHILE
+        # the Pick goal remains executing (production Pick with ``stay=false``
+        # returns to ``Q_OUTBOUND`` only after lift, so the transient return
+        # motion is already gone once the Pick result is published).  Only after
+        # the transport latch may the flow await the Pick terminal and require
+        # success.  Never infer transport from the later Pick result.
+        transport_trigger = self._e_wait_transport_started(baseline, spec)
+        if transport_trigger is None:
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error="occupied-place transport evidence was not observed during Pick execution",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id,
+            )
         pick_result = self._e_wait_action_result(pick_outcome["goal_handle"])
         result = pick_result.get("result")
         pick_status = getattr(result, "status", None) if result is not None else None
@@ -6898,19 +7276,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, task_result_status=pick_status,
                 terminal_status=pick_result.get("terminal_status"),
-            )
-        # Wait for observed attachment + transport evidence (never action-result
-        # inference for scene-attach) before recording the transport events.
-        transport_trigger = self._e_wait_transport_started(baseline, spec)
-        if transport_trigger is None:
-            return self._finalize_e_attempt(
-                scenario_id, spec, readiness, start_wall, "evidence-invalid",
-                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
-                task_error="occupied-place transport evidence was not observed after Pick success",
-                pick_goal_sent=True, place_goal_sent=False,
-                place_goal_accepted=False, goals_sent=1,
-                pick_goal_id=pick_goal_id, task_result_status=pick_status,
-                terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         for label in ("scene-attach", "lift-complete", "transport"):
             if label == "scene-attach":
@@ -6926,6 +7292,7 @@ class IntegratedGateExecutor:
                     place_goal_accepted=False, goals_sent=1,
                     pick_goal_id=pick_goal_id, task_result_status=pick_status,
                     terminal_status=pick_result.get("terminal_status"),
+                    trigger=transport_trigger,
                 )
             event_log.append(label)
         try:
@@ -6939,6 +7306,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, task_result_status=pick_status,
                 terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         place_outcome = self._send_e_action_goal("/place_action", place_goal)
         if place_outcome["status"] != "accepted":
@@ -6950,6 +7318,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=2,
                 pick_goal_id=pick_goal_id, place_goal_id=place_outcome.get("goal_id"),
                 task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         place_goal_id = place_outcome.get("goal_id")
         place_goal_accepted = True
@@ -6964,6 +7333,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
                 task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         event_log.append("place-goal-accepted")
         place_baseline = self._d_baseline()
@@ -7007,6 +7377,34 @@ class IntegratedGateExecutor:
                 task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
                 trigger=place_trigger, cancel_response=cancel_response,
             )
+        # F1.4: boundedly await the exact canceled Place terminal and record both
+        # status domains from the actual handle/result.  Do not reuse the Pick's
+        # success status as the Place status.
+        interrupted = self._e_wait_interrupted_result(place_outcome["goal_handle"])
+        interrupted_status = interrupted.get("status")
+        place_result_status = interrupted.get("result_status")
+        place_terminal_status = interrupted.get("terminal_status")
+        if (
+            interrupted_status != "done"
+            or place_result_status != PICK_PLACE_RESULT_CANCELED
+            or place_terminal_status != "canceled"
+        ):
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=(
+                    f"occupied-place canceled Place terminal mismatch: result "
+                    f"{interrupted_status}/status {place_result_status} "
+                    f"({interrupted.get('result_status_string')}) terminal "
+                    f"{place_terminal_status}"
+                ),
+                pick_goal_sent=True, place_goal_sent=True,
+                place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
+                pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
+                task_result_status=place_result_status,
+                terminal_status=place_terminal_status,
+                trigger=place_trigger, cancel_response=cancel_response,
+            )
         if not self._e_wait_quiescent(place_baseline):
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
@@ -7015,7 +7413,8 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=True,
                 place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
-                task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
+                task_result_status=place_result_status,
+                terminal_status=place_terminal_status,
                 trigger=place_trigger, cancel_response=cancel_response,
             )
         quiescent = self._e_record_snapshot("quiescent")
@@ -7027,7 +7426,8 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=True,
                 place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
-                task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
+                task_result_status=place_result_status,
+                terminal_status=place_terminal_status,
                 trigger=place_trigger, cancel_response=cancel_response,
             )
         event_log.append("quiescent")
@@ -7040,7 +7440,8 @@ class IntegratedGateExecutor:
                 pick_goal_sent=True, place_goal_sent=True,
                 place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
-                task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
+                task_result_status=place_result_status,
+                terminal_status=place_terminal_status,
                 trigger=place_trigger, cancel_response=cancel_response,
             )
         event_log.append("teardown")
@@ -7050,7 +7451,8 @@ class IntegratedGateExecutor:
             pick_goal_sent=True, place_goal_sent=True,
             place_goal_accepted=place_goal_accepted, goals_sent=place_goals_sent,
             pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
-            task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
+            task_result_status=place_result_status,
+            terminal_status=place_terminal_status,
             trigger=place_trigger, cancel_response=cancel_response,
         )
 
@@ -7059,10 +7461,12 @@ class IntegratedGateExecutor:
 
         The place trigger requires the target to remain attached (the Place
         server may open/detach only on its natural failure path, which we never
-        wait for here).
+        wait for here).  F1.6: the Place FJT must be received within
+        ``E_FJT_CORRELATION_TIMEOUT_S`` of the Place goal-acceptance baseline.
         """
         timeout_s = float(spec.get("trigger_timeout_s") or 15.0)
         speed_limit = self._e_trigger_speed_m_s()
+        window_s = float(E_FJT_CORRELATION_TIMEOUT_S)
         captured: dict[str, object] = {}
 
         def _seen() -> bool:
@@ -7072,12 +7476,19 @@ class IntegratedGateExecutor:
             first = self._e_first_fjt_after_acceptance(baseline)
             if first is None:
                 return False
+            if not _fjt_within_receipt_window(first, baseline.get("start_mono"), window_s):
+                return False
             speed = self._e_tcp_speed_m_s()
             if speed is None or speed < speed_limit:
                 return False
             captured.update(dict(first))
+            captured["trigger_kind"] = "place-target-motion"
             captured["tcp_speed_m_s"] = float(speed)
             captured["tcp_z_m"] = self._e_tcp_z_m()
+            captured["scene_target_attached"] = True
+            captured["fjt_receipt_delta_s"] = _fjt_receipt_delta_s(
+                first, baseline.get("start_mono")
+            )
             return True
 
         if not self._wait_for(_seen, timeout_s):
@@ -7103,6 +7514,7 @@ class IntegratedGateExecutor:
         spec: Mapping[str, object],
         *,
         current_tcp_pose_provider: Callable[[], Mapping[str, object]] | None = None,
+        native_gripper_goal_count_provider: Callable[[], Mapping[str, object]] | None = None,
     ) -> dict[str, object]:
         scenario_id = spec["scenario_id"]
         start_wall = time.monotonic()
@@ -7152,6 +7564,22 @@ class IntegratedGateExecutor:
             )
         pick_goal_id = pick_outcome.get("goal_id")
         baseline = self._d_baseline()
+        # F1.1/F1.2: observe and latch the lift and transport checkpoints WHILE
+        # the Pick goal remains executing (production Pick with ``stay=false``
+        # returns to ``Q_OUTBOUND`` only after lift, so the transient return
+        # motion is already gone once the Pick result is published).  Only after
+        # the transport latch may the flow await the Pick terminal and require
+        # success.  Never infer transport from the later Pick result.
+        transport_trigger = self._e_wait_transport_started(baseline, spec)
+        if transport_trigger is None:
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error="positive transport evidence was not observed during Pick execution",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id,
+            )
         pick_result = self._e_wait_action_result(pick_outcome["goal_handle"])
         result = pick_result.get("result")
         pick_status = getattr(result, "status", None) if result is not None else None
@@ -7164,21 +7592,11 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, task_result_status=pick_status,
                 terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
-        # Record lift and transport only after their online predicates become
-        # true: observed attachment plus a later fresh FJT EXECUTING entry and
-        # fresh TCP motion (never action-result inference for scene-attach).
-        transport_trigger = self._e_wait_transport_started(baseline, spec)
-        if transport_trigger is None:
-            return self._finalize_e_attempt(
-                scenario_id, spec, readiness, start_wall, "evidence-invalid",
-                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
-                task_error="positive transport evidence was not observed after Pick success",
-                pick_goal_sent=True, place_goal_sent=False,
-                place_goal_accepted=False, goals_sent=1,
-                pick_goal_id=pick_goal_id, task_result_status=pick_status,
-                terminal_status=pick_result.get("terminal_status"),
-            )
+        # Record lift and transport only after their online predicates became
+        # true (observed attachment plus a later fresh FJT EXECUTING entry and
+        # fresh TCP motion; never action-result inference for scene-attach).
         for label in ("scene-attach", "lift-complete", "transport"):
             if label == "scene-attach":
                 status = self._e_record_diff_from_current("scene-attach")
@@ -7193,6 +7611,7 @@ class IntegratedGateExecutor:
                     place_goal_accepted=False, goals_sent=1,
                     pick_goal_id=pick_goal_id, task_result_status=pick_status,
                     terminal_status=pick_result.get("terminal_status"),
+                    trigger=transport_trigger,
                 )
             event_log.append(label)
         before_release = self._e_record_snapshot("before-release")
@@ -7205,6 +7624,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, task_result_status=pick_status,
                 terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         event_log.append("before-release")
         try:
@@ -7218,6 +7638,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=1,
                 pick_goal_id=pick_goal_id, task_result_status=pick_status,
                 terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         place_outcome = self._send_e_action_goal("/place_action", place_goal)
         if place_outcome["status"] != "accepted":
@@ -7229,6 +7650,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=2,
                 pick_goal_id=pick_goal_id, place_goal_id=place_outcome.get("goal_id"),
                 task_result_status=pick_status, terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         place_goal_id = place_outcome.get("goal_id")
         place_goal_accepted = True
@@ -7248,6 +7670,7 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
                 task_result_status=place_status,
                 terminal_status=place_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         # Require observed detach before recording scene-detach.
         if not self._e_wait_detached():
@@ -7260,6 +7683,7 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
                 task_result_status=place_status,
                 terminal_status=place_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         scene_detach = self._e_record_diff_from_current("scene-detach")
         if scene_detach != "recorded":
@@ -7272,6 +7696,7 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
                 task_result_status=place_status,
                 terminal_status=place_result.get("terminal_status"),
+                trigger=transport_trigger,
             )
         event_log.append("scene-detach")
         for label in ("released-settled", "teardown"):
@@ -7286,6 +7711,7 @@ class IntegratedGateExecutor:
                     pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
                     task_result_status=place_status,
                     terminal_status=place_result.get("terminal_status"),
+                    trigger=transport_trigger,
                 )
             event_log.append(label)
         return self._finalize_e_attempt(
@@ -7296,6 +7722,7 @@ class IntegratedGateExecutor:
             pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
             task_result_status=place_status,
             terminal_status=place_result.get("terminal_status"),
+            trigger=transport_trigger,
         )
 
     # -- Gate E evidence / artifacts ----------------------------------------
@@ -7372,7 +7799,12 @@ class IntegratedGateExecutor:
         return record
 
     def _e_journal_failure(self, *, reason: str, graph_diagnosis: str) -> str:
-        """Write the canonical E failure planning-scene.json, returning its status."""
+        """Write the canonical E failure planning-scene.json, returning its status.
+
+        F1.13: a pre-goal failure may leave the journal empty; ``finalize_failure``
+        rejects that, but the fail-dominant artifact must still be written so no
+        pre-goal ``evidence-invalid`` path omits ``planning-scene.json``.
+        """
         try:
             self.journal.finalize_failure(
                 reason=reason,
@@ -7380,6 +7812,26 @@ class IntegratedGateExecutor:
                 json_path=self.attempt_dir / "planning-scene.json",
             )
             return "written"
+        except ValueError as exc:
+            if "empty PlanningScene journal" not in str(exc):
+                return f"failed: {exc}"
+            try:
+                _atomic_write_json(
+                    {
+                        "schema_version": int(getattr(self.journal, "SCHEMA_VERSION", 1)),
+                        "status": "evidence-invalid",
+                        "authority": "physics_truth",
+                        "reason": reason,
+                        "graph_diagnosis": graph_diagnosis,
+                        "events": [],
+                        "records": [],
+                        "graph": {},
+                    },
+                    self.attempt_dir / "planning-scene.json",
+                )
+                return "written"
+            except Exception as write_exc:
+                return f"failed: {write_exc}"
         except Exception as exc:
             return f"failed: {exc}"
 
@@ -7543,6 +7995,7 @@ class IntegratedGateExecutor:
                 "place_goal_sent": record.get("place_goal_sent"),
                 "place_goal_accepted": record.get("place_goal_accepted"),
                 "controller_goal_sent": record.get("controller_goal_sent"),
+                "trigger": dict(record.get("trigger") or {}),
                 "isaac_joint_commands_published": False,
                 "timestamp": float(time.monotonic()),
             },
@@ -7603,6 +8056,7 @@ class IntegratedGateExecutor:
                 "task_result_status": record.get("task_result_status"),
                 "task_result_status_string": record.get("task_result_status_string"),
                 "terminal_status": record.get("terminal_status"),
+                "trigger": dict(record.get("trigger") or {}),
                 "event_log": record.get("event_log"),
                 "elapsed_s": record.get("elapsed_s"),
                 "isaac_joint_commands_published": False,
@@ -7626,7 +8080,8 @@ class IntegratedGateExecutor:
                 "place_goal_sent": record.get("place_goal_sent"),
                 "place_goal_accepted": record.get("place_goal_accepted"),
                 "goals_sent": record.get("goals_sent"),
-                "geometry": dict(record.get("geometry") or {}),
+                "geometry": dict(spec.get("geometry") or {}),
+                "trigger": dict(record.get("trigger") or {}),
                 "event_log": record.get("event_log"),
                 "isaac_joint_commands_published": False,
             },
@@ -7660,6 +8115,7 @@ class IntegratedGateExecutor:
                 "pick_goal_sent": record.get("pick_goal_sent"),
                 "place_goal_sent": record.get("place_goal_sent"),
                 "place_goal_accepted": record.get("place_goal_accepted"),
+                "trigger": dict(record.get("trigger") or {}),
                 "downgraded_from": downgraded_from,
                 "isaac_joint_commands_published": False,
             },
@@ -7700,6 +8156,7 @@ class IntegratedGateExecutor:
                     "place_goal_sent": record.get("place_goal_sent"),
                     "place_goal_accepted": record.get("place_goal_accepted"),
                     "controller_goal_sent": record.get("controller_goal_sent"),
+                    "trigger": dict(record.get("trigger") or {}),
                     "isaac_joint_commands_published": False,
                     "timestamp": float(time.monotonic()),
                 },
@@ -7740,6 +8197,7 @@ class IntegratedGateExecutor:
                     "task_result_status": record.get("task_result_status"),
                     "task_result_status_string": record.get("task_result_status_string"),
                     "terminal_status": record.get("terminal_status"),
+                    "trigger": dict(record.get("trigger") or {}),
                     "downgraded_from": downgraded_from,
                     "error": record.get("artifact_error"),
                     "diagnostic_only": True,
@@ -8342,7 +8800,9 @@ class IntegratedGateExecutor:
             [f"no valid PlanningScene cached within {timeout_s:.3f}s of self-spin"],
         )
 
-    def _fixture_scene_error(self, scene: Mapping[str, object]) -> str | None:
+    def _fixture_scene_error(
+        self, scene: Mapping[str, object], *, allow_e_target: bool = False
+    ) -> str | None:
         """F2.6/F3.3: return a reason when *scene* does not match the fixture contract.
 
         Beyond the exact ordered owned-ID set and empty attached set, the scene
@@ -8350,22 +8810,28 @@ class IntegratedGateExecutor:
         (primitive/mesh geometry, dimensions/scales, frame, and poses), so a
         stale full scene with the same IDs but an old cube pose is never
         labeled fixture-ready.
+
+        F1.8: only an explicit Stage-E path may pass ``allow_e_target=True``,
+        permitting the exact task-owned target ``pick_and_place/object_mesh`` in
+        the world.  Gate C/D paths keep the strict fixture-only validation
+        unchanged: any non-fixture world object — including an arbitrary
+        task-namespace object — is a owned-set mismatch and fails the exact
+        ordered check (same ``must equal`` message shape as the original).
         """
         declaration = _as_mapping(
             self.scenario.get("planning_scene_declaration") or self.scenario.get("planning_scene")
         )
         expected_ids = list(fixture_owned_ids(declaration))
         owned_ids = list(scene.get("owned_ids", []))
-        # Task 6 / Gate E: the pick target object (a task-namespace object, never
-        # a fixture object) legitimately sits in the world at fixture-ready and is
-        # not part of the fixture projection; trailing task-namespace world ids
-        # are therefore allowed without weakening the exact ordered fixture-owned
-        # check.  Gate C/D scenes never carry task objects, so behavior there is
-        # byte-identical.
+        allowed_world_ids = {TARGET_OBJECT_ID} if allow_e_target else set()
+        # Task-namespace world objects are permitted only when they are the exact
+        # allowed E target; every other non-fixture object stays in the owned set
+        # and fails the exact ordered check below.
         task_world_ids = [
             object_id for object_id in owned_ids
             if object_id not in expected_ids
             and str(object_id).startswith(TASK_NAMESPACE)
+            and object_id in allowed_world_ids
         ]
         owned_fixture_ids = [
             object_id for object_id in owned_ids if object_id not in task_world_ids
@@ -8972,6 +9438,8 @@ __all__ = [
     "STAGE_E_TRIGGER_TIMEOUT_S",
     "TARGET_OBJECT_ID",
     "TASK_NAMESPACE",
+    "_fjt_receipt_delta_s",
+    "_fjt_within_receipt_window",
     "IntegratedGateExecutor",
     "build_cartesian_move_goal",
     "build_execute_trajectory_goal",
@@ -8986,9 +9454,6 @@ __all__ = [
     "evaluate_executor_readiness",
     "expected_fixture_geometry_digest",
     "expected_physics_ready_report",
-    "run_pick_place_negative",
-    "run_pick_place_positive",
-    "run_pick_place_sequence",
     "stage_c_dispatch",
     "stage_d_dispatch",
     "stage_e_dispatch",

@@ -314,6 +314,63 @@ References:
 
 ## Changelog
 
+- 2026-08-03 (integrated qualification Task 6, formal-review fix round 1 —
+  "make Gate E live-observable"): Resolved the full F1.1-F1.15 consolidated
+  SPEC/QUALITY findings in the Stage-E path.  F1.1/F1.2 — the positive and
+  occupied-place sequences now observe and latch lift-complete and transport
+  **while the Pick goal remains executing** (production `stay=false` returns to
+  `Q_OUTBOUND` before publishing the result); the transport trigger is a
+  two-phase temporal predicate: `lift_complete` latches only after observed
+  attachment + TCP z above the configured lift threshold + settled arm velocity
+  (<= `settled_speed_m_s`) + two consecutive fresh normal-state samples, and
+  `transport_started` then requires a **later** fresh FJT EXECUTING entry, target
+  still attached, and fresh TCP speed >= the trigger limit, without re-requiring
+  the settled condition while moving; receipt sequences/timestamps prove the
+  transport evidence is later than the lift latch.  F1.3 — safety-transport uses
+  the correct operator polarity (assert with `publish_operator(True)`, clear with
+  `False` only after the effective stop) and the Humble test drives a causal fake
+  publisher asserting the exact publication order `[True, False]`.  F1.4 — every
+  accepted cancel/safety interruption boundedly awaits the exact goal result and
+  records both status domains from the actual handle/result (canceled Pick/Place:
+  action-client GoalStatus CANCELED=5 + `Result.status=4`; safety-transport:
+  `Result.status=5` safety_stop + action-client ABORTED terminal per production
+  `complete_pick` abort semantics).  F1.5 — the complete trigger object (join
+  key, task/FJT UUIDs, receipt seq/time, TCP z/speed, arm velocity/normal
+  samples, attachment, trigger kind, safety/cancel evidence) is persisted into
+  `integrated-execution.jsonl/.json` and the per-scenario `goals/<id>.json`
+  `geometry` is written from the validated dispatch spec (asserted exact fixed
+  geometry), with trigger fields preserved in final downgrade rows.  F1.6 —
+  `E_FJT_CORRELATION_TIMEOUT_S == 2.0` now bounds every FJT receipt window
+  (approach vs goal-acceptance baseline, transport vs lift latch, Place
+  target-motion vs Place baseline) and the actual receipt delta is recorded;
+  stale/received-before-boundary entries are `None` and never satisfy a trigger
+  (boundary tests just inside/outside the window).  F1.7 — every public E entry
+  resets all per-attempt state (`_tcp_pose_samples`, native gripper seam,
+  active-goal handle/state) before any provider sample; a reused-executor test
+  proves no previous sample can satisfy the next attempt.  F1.8 — the shared
+  `_fixture_scene_error` keeps Gate C/D exact fixture-only validation strict: a
+  stray `pick_and_place/*` world object fails fixture readiness with the exact
+  ordered "must equal" message, and only the exact task target is permitted via
+  the explicit Stage-E `allow_e_target` argument.  F1.9 — every E public dispatch
+  fails closed on any escaping exception (`reason_code="unexpected-exception"`)
+  with bounded cleanup of the accepted goal and complete Gate-E artifacts, and an
+  injected snapshot failure after Pick acceptance is verified end-to-end.  F1.10 —
+  cancel-approach uses the injected receipt-sequenced
+  `native_gripper_goal_count_provider` seam (not the fake-only `sent_goals`
+  attribute); the fresh count must not increase and the target must stay
+  unattached, with missing/stale/provider-error evidence failing closed.  F1.11 —
+  sourced-Humble integration tests cover both `_run_e_blocked_or_unreachable`
+  scenarios (real accepted Pick goal, terminal non-success in both status
+  domains, exact short journal, no Place/later goal, complete fail-dominant
+  artifacts, and success-status rejection).  F1.12 — `__all__` no longer lists
+  the removed module-level `run_pick_place_*` stubs (`import *` succeeds) and
+  malformed-back requires no TCP provider because it rejects before any motion.
+  F1.13 — pre-goal evidence-invalid paths write canonical `planning-scene.json`
+  even when the journal has no prior records.  Humble suite grows to 141 tests
+  and the pure suite to 124 (import-star, receipt-window boundaries, C/D fixture
+  strictness regression, blocked/unreachable, per-attempt reset, pre-goal
+  artifacts, unexpected-exception cleanup).  No build or live run is required.
+
 - 2026-08-03 (integrated qualification Task 6 — "add fixed-target Pick and Place
   controls"): Added the Stage-E fixed-target Pick/Place diagnostics executor to
   the same ROS-lazy `validation/integrated_gate_executor.py`.  A closed ROS-free
