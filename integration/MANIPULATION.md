@@ -363,6 +363,27 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 7, fix round 1 — "align verifier
+  with production evidence"): Aligned the verifier with production
+  executor/journal/backend artifact shapes and closed the review blockers and
+  majors (F1.1-F1.9).  The pre-start `qualification_cube` requirement is now
+  Stage-E-only (C/D production truth carries `objects: []`); the `scene-detach`
+  record uses the committed after-state (target detached, matching the
+  executor/journal); the endpoint/provider validator is scoped to endpoint
+  evidence so `env_cloud_evidence.source` (cloud provenance) is accepted while
+  wrong paired providers fail; contradictory terminal domains and malformed
+  scalar evidence fail closed as `evidence-invalid` (never a crash or a
+  permissive pass); forbidden cuMotion/AnyGrasp/start_grasp taint is enforced
+  in provider/goal fields with `pipeline_id` required to be `"ompl"`;
+  scenario-owned temporal predicates read only their Table-2 subwindows ending
+  at `quiescent`/`released-settled` (post-terminal drain ignored);
+  `scene_attached_after_place_failure` proves retained attachment through
+  `quiescent`; fixture `goals_sent` is a production-shaped count and D retreat
+  carries the real `env_cloud_evidence` shape; the CLI fails closed (exit 2) on
+  a scenario filename/id mismatch.  36 tests (13 new), affected regression +
+  qualification batch 622 + 2 subtests pass.  No build or live run required;
+  production modules/scenarios/policies are unchanged.
+
 - 2026-08-04 (integrated qualification Task 7 — "independent integrated
   raw-physics verifier"): Added the independent verifier
   `validation/integrated_gate_verifier.py` (ROS-free Python 3.12) whose

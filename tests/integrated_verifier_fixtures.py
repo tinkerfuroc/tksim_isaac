@@ -114,8 +114,20 @@ _EVENT_FRAMES: Mapping[str, list[tuple[str, int]]] = {
     ],
 }
 
-#: Scenario-specific expected_objects / measured object ids.
+#: Scenario-specific measured object ids (production shape).  C/D scenarios
+#: declare ``objects: []`` so real backend truth carries ``objects: []`` /
+#: ``object: None`` / ``expected_objects: {}``.  Only E scenarios spawn the
+#: qualification cube (F1.1).
 _OBJECTS_BY_SCENARIO: Mapping[str, list[str]] = {
+    "qualification-moveit-plan-joint": [],
+    "qualification-moveit-plan-pose": [],
+    "qualification-moveit-plan-blocked": [],
+    "qualification-moveit-execute-joint": [],
+    "qualification-moveit-execute-pose": [],
+    "qualification-moveit-cartesian-retreat": [],
+    "qualification-moveit-gripper": [],
+    "qualification-moveit-cancel": [],
+    "qualification-moveit-safety": [],
     "qualification-pick-place-positive": ["qualification_cube"],
     "qualification-pick-place-blocked-approach": [
         "qualification_cube", "qualification_plan_blocker",
@@ -440,11 +452,6 @@ def _e_state_at(kind: str, fi: Mapping[str, int], index: int) -> dict[str, Any]:
 
 def _objects_for(scenario_id: str, kind: str, stage: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     object_ids = list(_OBJECTS_BY_SCENARIO.get(scenario_id, []))
-    # The integrated verifier unconditionally requires a qualification_cube in
-    # the pre-start frame for every stage; C/D gates also carry the sim-fixture
-    # pick target at rest in raw truth.
-    if "qualification_cube" not in object_ids:
-        object_ids = ["qualification_cube", *object_ids]
     objects: list[dict[str, Any]] = []
     for object_id in object_ids:
         if object_id == "qualification_cube":
@@ -505,15 +512,13 @@ def _build_journal(
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     attached = False
-    detach_pending = False
     for sequence, (event, frame_index) in enumerate(eframes, 1):
         if event == "scene-attach":
             attached = True
         elif event == "scene-detach":
-            # The scene-detach journal key itself still carries the attached
-            # target (the retained phase ends strictly after that record).
-            detach_pending = True
-        elif detach_pending:
+            # The scene-detach record is the world-state transition back: the
+            # executor snapshots the current scene only after the target has
+            # left the attached set, so this record is detached (F1.2).
             attached = False
         attached_ids = [CANONICAL_TARGET_HANDOFF] if attached else []
         records.append(
@@ -532,6 +537,28 @@ def _build_journal(
 # --------------------------------------------------------------------------- #
 # Executor / controller / moveit / goal artifacts
 # --------------------------------------------------------------------------- #
+def _env_cloud_evidence_for(kind: str) -> dict[str, Any]:
+    """Production-shaped ``env_cloud_evidence`` for the D cartesian retreat.
+
+    The real executor embeds ``env_cloud_evidence.source ==
+    "observed-environment-cloud"`` in the retreat summary (F1.3); that value is
+    environment-cloud provenance, not an endpoint provider, so the endpoint
+    validator must not flag it.  Other D handlers record no environment cloud.
+    """
+    if kind == "retreat":
+        return {
+            "digest": "f" * 64,
+            "source": "observed-environment-cloud",
+            "frame_id": "base_link",
+            "width": 640,
+            "height": 480,
+            "points": 307200,
+            "point_layout": "opaque-bytes",
+            "validated": True,
+        }
+    return {}
+
+
 def _build_executor_artifacts(
     scenario_id: str,
     kind: str,
@@ -782,7 +809,7 @@ def _build_executor_artifacts(
             "terminal_status": terminal_status,
             "cleanup": {},
             "journal_issues": [],
-            "env_cloud_evidence": {},
+            "env_cloud_evidence": _env_cloud_evidence_for(kind),
             "event_log": [],
             "elapsed_s": 1.0,
             "isaac_joint_commands_published": False,
@@ -802,7 +829,7 @@ def _build_executor_artifacts(
             "pick_goal_sent": pick_goal_sent,
             "place_goal_sent": place_goal_sent,
             "place_goal_accepted": place_goal_accepted,
-            "goals_sent": list("pick" if pick_goal_sent else ""),
+            "goals_sent": int(pick_goal_sent) + int(place_goal_sent),
             "pick_goal_id": "pick-1" if pick_goal_sent else None,
             "place_goal_id": "place-1" if place_goal_sent else None,
             "controller_goal_sent": controller_goal_sent,
@@ -888,7 +915,7 @@ def _build_executor_artifacts(
             "pick_goal_sent": pick_goal_sent,
             "place_goal_sent": place_goal_sent,
             "place_goal_accepted": place_goal_accepted,
-            "goals_sent": list("pick" if pick_goal_sent else ""),
+            "goals_sent": int(pick_goal_sent) + int(place_goal_sent),
             "pick_goal_id": "pick-1" if pick_goal_sent else None,
             "place_goal_id": "place-1" if place_goal_sent else None,
             "controller_goal_sent": controller_goal_sent,
@@ -1100,6 +1127,20 @@ def write_integrated_attempt(root: Path, **overrides: Any) -> Path:
         stage=stage,
         kind=kind,
     )
+
+    # --- Apply gate-window mutations (F1.5) ---------------------------------
+    gate_window_mut = execution_json.pop("_gate_window_mut", None)
+    if isinstance(gate_window_mut, Mapping):
+        for key, value in gate_window_mut.items():
+            gate_window[key] = value
+
+    # --- Apply provider taint to the goal artifact (F1.6) -------------------
+    if overrides.get("pipeline_taint") is True and goal is not None:
+        goal["pipeline_id"] = "cuMotion"
+    if overrides.get("provider_taint") is True and goal is not None:
+        goal["provider"] = "start_grasp"
+    if overrides.get("pipeline_anygrasp") is True and goal is not None:
+        goal["pipeline_id"] = "AnyGrasp"
 
     # --- Write all artifacts -------------------------------------------------
     (attempt / "manifest.json").write_text(
@@ -1567,6 +1608,149 @@ def _apply_overrides(
         exec_json["pick_goal_sent"] = True
         for row in exec_jsonl:
             row["pick_goal_sent"] = True
+
+    # --- Fix-round 1 fault injections (F1.1-F1.9) ----------------------------
+
+    # C/D production-shape pass proof: with objects=[] the verifier must still
+    # verify C/D (it never needs the cube).  This override is a no-op marker
+    # used by the production-shape pass tests.
+    if overrides.get("prod_shape") is True:
+        pass
+
+    # scene_detach_still_attached=True: force the scene-detach record itself to
+    # carry the target (F1.2) -> evidence-invalid.
+    if overrides.get("scene_detach_still_attached") is True:
+        for record in journal_out:
+            if record["event"] == "scene-detach":
+                record["attached_ids"] = [CANONICAL_TARGET_HANDOFF]
+                record["attached_links"] = {CANONICAL_TARGET_HANDOFF: CANONICAL_LINK_TCP}
+                record["touch_links"] = {CANONICAL_TARGET_HANDOFF: list(CANONICAL_TOUCH_LINKS)}
+
+    # wrong_paired_source=True: add a paired source_node next to the existing
+    # controller_endpoint whose value does not match _REQUIRED_ENDPOINT_SOURCES
+    # (F1.3) -> evidence-invalid.  This is a true endpoint/provider pairing, so
+    # the paired-source ownership check must reject it.
+    if overrides.get("wrong_paired_source") is True:
+        exec_json["source_node"] = "/fabricated_provider"
+        for row in exec_jsonl:
+            row["source_node"] = "/fabricated_provider"
+
+    # seed_null / seed_list: malformed raw seed (F1.5) -> evidence-invalid.
+    if "seed_null" in overrides:
+        for frame in raw:
+            frame["seed"] = None
+    if "seed_list" in overrides:
+        for frame in raw:
+            frame["seed"] = [7]
+
+    # raw_start_index_null / raw_start_index_str / raw_start_index_neg:
+    # malformed gate-window indices (F1.5) -> evidence-invalid.
+    if "raw_start_index_null" in overrides:
+        exec_json.setdefault("_gate_window_mut", {})["raw_start_index"] = None
+    if "raw_start_index_str" in overrides:
+        exec_json.setdefault("_gate_window_mut", {})["raw_start_index"] = "5"
+    if "raw_start_index_neg" in overrides:
+        exec_json.setdefault("_gate_window_mut", {})["raw_start_index"] = -3
+
+    # evaluator_start_index_str / evaluator_start_index_null: malformed
+    # evaluator index (F1.5) -> evidence-invalid.
+    if "evaluator_start_index_str" in overrides:
+        exec_json.setdefault("_gate_window_mut", {})["evaluator_start_index"] = "5"
+    if "evaluator_start_index_null" in overrides:
+        exec_json.setdefault("_gate_window_mut", {})["evaluator_start_index"] = None
+
+    # terminal_conflict_success_aborted=True: D execute-joint summary has
+    # terminal_status="succeeded" but execute_result_status=6 (F1.4).
+    if overrides.get("terminal_conflict_success_aborted") is True:
+        exec_json["terminal_status"] = "succeeded"
+        exec_json["execute_result_status"] = 6
+        exec_json["execute_result_status_string"] = "aborted"
+        for row in controller_out:
+            row["terminal_status"] = "succeeded"
+            row["execute_result_status"] = 6
+            row["execute_result_status_string"] = "aborted"
+            row["fjt_status"] = "succeeded"
+
+    # terminal_conflict_aborted_succeeded=True: terminal_status="aborted" but
+    # execute_result_status=4 (F1.4) -> evidence-invalid.
+    if overrides.get("terminal_conflict_aborted_succeeded") is True:
+        exec_json["terminal_status"] = "aborted"
+        exec_json["execute_result_status"] = 4
+        exec_json["execute_result_status_string"] = "succeeded"
+        for row in controller_out:
+            row["terminal_status"] = "aborted"
+            row["execute_result_status"] = 4
+            row["execute_result_status_string"] = "succeeded"
+            row["fjt_status"] = "aborted"
+
+    # terminal_missing=True: strip terminal evidence (F1.4) -> evidence-invalid.
+    if overrides.get("terminal_missing") is True:
+        for key in ("terminal_status", "execute_result_status",
+                    "execute_result_status_string", "task_result_status",
+                    "task_result_status_string"):
+            exec_json.pop(key, None)
+            for row in exec_jsonl:
+                row.pop(key, None)
+            for row in controller_out:
+                row.pop(key, None)
+
+    # pipeline_taint=True: set pipeline_id="cuMotion" in goals/summary (F1.6).
+    if overrides.get("pipeline_taint") is True:
+        exec_json.setdefault("goal", {})["pipeline_id"] = "cuMotion"
+        for row in plans_out:
+            row["pipeline_id"] = "cuMotion"
+        for row in exec_jsonl:
+            row["pipeline_id"] = "cuMotion"
+
+    # provider_taint=True: set provider="start_grasp" in a goal (F1.6).
+    if overrides.get("provider_taint") is True:
+        exec_json["provider"] = "start_grasp"
+        for row in plans_out:
+            row["provider"] = "start_grasp"
+
+    # pipeline_anygrasp=True: pipeline_id="AnyGrasp" (F1.6).
+    if overrides.get("pipeline_anygrasp") is True:
+        exec_json.setdefault("goal", {})["pipeline_id"] = "AnyGrasp"
+
+    # post_quiescent_motion_ignored=True: motion after quiescent but before
+    # teardown on the D cancel scenario (F1.7).  The observation subwindow ends
+    # at quiescent so this motion is IGNORED by quiescent_after_cancel and the
+    # attempt still passes (the no_later_stage scan is removed).
+    if overrides.get("post_quiescent_motion_ignored") is True:
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        if quiescent_key is not None:
+            for frame in raw:
+                if int(frame["frame_index"]) <= quiescent_key:
+                    continue
+                joints = list(frame["robot"]["joint_positions"])
+                if len(joints) >= 8:
+                    joints[0] += 0.05
+                    frame["robot"]["joint_positions"] = joints
+                    frame["robot"]["joint_velocities"] = [0.05] * 8
+
+    # post_quiescent_motion_fails=True: same motion but the test asserts that
+    # motion strictly between cancel and quiescent fails quiescent_after_cancel.
+    if overrides.get("post_quiescent_motion_fails") is True:
+        cancel_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "cancel-requested"),
+            None,
+        )
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        if cancel_key is not None and quiescent_key is not None:
+            midpoint = (cancel_key + quiescent_key) // 2
+            for frame in raw:
+                if midpoint <= int(frame["frame_index"]) <= quiescent_key:
+                    joints = list(frame["robot"]["joint_positions"])
+                    if len(joints) >= 8:
+                        joints[0] += 0.05
+                        frame["robot"]["joint_positions"] = joints
+                        frame["robot"]["joint_velocities"] = [0.05] * 8
 
     # Return every artifact so override mutations reach the written files.
     return raw, sync_evaluator(), journal_out, exec_jsonl, exec_json, plans_out, controller_out
