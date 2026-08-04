@@ -754,6 +754,40 @@ def test_real_source_lock_fail_is_evidence_invalid():
     assert result["status"] == STATUS_EVIDENCE_INVALID
 
 
+def test_real_default_production_root_matches_committed_policy():
+    """The default production root is the committed package-repository path
+    resolved into the real source-lock policy, and Gate B passes that exact
+    resolved path as ``--production-root`` to the manifest producer."""
+    runner = IntegratedRunner(attempt_root=Path(_tmp()))
+    policy_path = runner.production_root / "integration/source-locks.json"
+    assert policy_path.is_file()
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    resolved_root = Path(policy["root"]).resolve()
+    assert runner.production_root == resolved_root
+
+    seam_dir = Path(_tmp())
+    attempt_start = seam_dir / "attempt-start.json"
+    attempt_start.write_text(
+        json.dumps({"schema_version": 1, "attempt_id": "seam"}), encoding="utf-8"
+    )
+    captured: list[list[str]] = []
+
+    def fake_command_runner(command, **kwargs):
+        captured.append(list(command))
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    runner._command_runner = fake_command_runner
+    _path, evidence = runner._invoke_source_lock_manifest(
+        attempt_start, seam_dir / "source-lock-manifest.json"
+    )
+    # The future qualification lock is absent, so the producer fails closed;
+    # the regression is that the resolved package-repository path reaches it.
+    assert evidence["status"] == STATUS_EVIDENCE_INVALID
+    assert len(captured) == 1
+    production_flag = captured[0].index("--production-root")
+    assert captured[0][production_flag + 1] == str(resolved_root)
+
+
 def test_real_static_contract_producer_exit_zero_without_output_is_invalid():
     """Producer exit 0 without a newly written static contract is invalid."""
 
