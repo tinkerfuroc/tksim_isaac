@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -100,6 +101,12 @@ class QualificationVisualCapture:
         self._records: list[dict[str, Any]] = []
         self._errors: list[str] = []
         self._reported_error_keys: set[tuple] = set()
+        # F5.4: sequences durably marked terminal (e.g. a partially captured
+        # sequence that can no longer satisfy the latency contract) survive a
+        # consumer process restart so restarts never retry them or grow
+        # identical errors.
+        self._terminal_sequences: set[int] = set()
+        self._load_terminal_sequences()
         self._sensors: dict[str, Any] = {}
         self._initialize_cameras()
         self._seed_durable_completion()
@@ -156,15 +163,98 @@ class QualificationVisualCapture:
                 annotators=["rgb"],
             )
 
+    def _load_terminal_sequences(self) -> None:
+        """Load durable terminal-sequence markers (F5.4 restart persistence)."""
+        path = self.attempt_dir / "visual-terminal.json"
+        if not path.is_file():
+            return
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(value, Mapping):
+            return
+        records = value.get("terminal_sequences")
+        if isinstance(records, list):
+            for sequence in records:
+                if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0:
+                    self._terminal_sequences.add(sequence)
+
     def _seed_durable_completion(self) -> None:
         """Mark request sequences durable-complete when every configured camera
-        already has a durable keyframe (F4.5 restart-safe completion)."""
+        already has a durable keyframe (F4.5 restart-safe completion), and seed
+        any durably terminal sequences (F5.4)."""
         for sequence in sorted({sequence for (sequence, _camera) in self._handled_cameras}):
             if all(
                 (sequence, camera_name) in self._handled_cameras
                 for camera_name in self._sensors
             ):
                 self._handled_sequences.add(sequence)
+        self._handled_sequences.update(self._terminal_sequences)
+
+    def _mark_sequence_terminal(self, sequence: int, message: str) -> None:
+        """F5.4: durably record a terminal capture failure for a partially
+        captured sequence and stop retrying it.
+
+        The terminal decision is persisted atomically to ``visual-terminal.json``
+        so a restarted consumer never retries the sequence and never grows an
+        identical error.  Already-durable camera evidence is preserved; the
+        missing camera is never fabricated.
+        """
+        if sequence in self._terminal_sequences:
+            return
+        self._terminal_sequences.add(sequence)
+        self._handled_sequences.add(sequence)
+        self._record_capture_error_once(("terminal-capture", sequence), message)
+        payload = {
+            "schema_version": 1,
+            "gate": self.gate,
+            "terminal_sequences": sorted(self._terminal_sequences),
+        }
+        path = self.attempt_dir / "visual-terminal.json"
+        temporary = path.with_suffix(".json.tmp")
+        with open(temporary, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        dir_fd = os.open(str(self.attempt_dir), os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    @staticmethod
+    def _persist_png(image: Any, output: Path) -> None:
+        """F5.4: atomically and durably persist a PNG before its keyframe row.
+
+        Temporary file -> image bytes fsync -> atomic replace -> parent-directory
+        fsync, so a keyframe journal row is never durable before the referenced
+        image bytes.
+        """
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=str(output.parent))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                image.save(stream, format="PNG", optimize=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, output)
+            dir_fd = os.open(str(output.parent), os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _rgb_image(value: Any):
@@ -211,6 +301,22 @@ class QualificationVisualCapture:
         captured_frame_index = int(self.backend.physics_frame_index)
         capture_latency_frames = captured_frame_index - requested_frame_index
         if not 0 <= capture_latency_frames <= MAX_CAPTURE_LATENCY_FRAMES:
+            # F5.4: a partially captured sequence (at least one camera already
+            # durably handled) that can no longer satisfy the latency contract on
+            # a restarted consumer is terminal.  Preserve the already-durable
+            # camera evidence, never fabricate the missing camera, never relax
+            # the latency bound, and never retry/error-loop across polls or
+            # restarts.
+            if any(
+                (sequence, camera_name) in self._handled_cameras
+                for camera_name in self._sensors
+            ):
+                self._mark_sequence_terminal(
+                    sequence,
+                    f"capture request {sequence!r} failed: capture latency is outside the "
+                    f"bounded contract ({capture_latency_frames} frames) after partial capture",
+                )
+                return
             raise ValueError(
                 "capture latency is outside the bounded contract: "
                 f"{capture_latency_frames} frames"
@@ -237,7 +343,10 @@ class QualificationVisualCapture:
                 f"{sequence:04d}-{event}-{camera_name}.png"
             )
             output = self.attempt_dir / relative
-            image.save(output, format="PNG", optimize=False)
+            # F5.4: the PNG must be atomically and durably persisted before its
+            # keyframe journal row; a journal row is never durable before the
+            # referenced image bytes.
+            self._persist_png(image, output)
             record = {
                     "schema_version": 1,
                     "gate": self.gate,
@@ -344,7 +453,7 @@ class QualificationVisualCapture:
                 continue
             try:
                 self._capture_request(request)
-            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            except (KeyError, OSError, TypeError, ValueError, RuntimeError) as error:
                 sequence = request.get("sequence")
                 self._errors.append(f"capture request {sequence!r} failed: {error}")
                 if isinstance(sequence, int) and not any(

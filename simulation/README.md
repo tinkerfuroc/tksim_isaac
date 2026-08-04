@@ -91,6 +91,26 @@ work.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 5 — "final narrow
+  production-suite closure"): `simulation/tinker_sim_isaac/qualification_visual_capture.py`
+  now expires a request sequence that a restarted consumer can no longer satisfy
+  within the bounded capture-latency contract after a partial capture (camera-1
+  durably captured, camera-2 missing, and latency now above
+  `MAX_CAPTURE_LATENCY_FRAMES`): it records one deduplicated terminal error,
+  marks the sequence terminal/handled via the durable `visual-terminal.json`
+  marker so it never retries or grows duplicate errors, preserves camera-1's
+  evidence, never fabricates camera-2, and never relaxes the latency bound
+  (F5.4).  Each PNG is now persisted atomically and durably (temp file, fsync,
+  atomic replace, parent-directory fsync) BEFORE its keyframe journal row is
+  appended and fsynced, so a journal row never references a half-written image.
+  The offline integrated evidence tests now cover stale-partial restart
+  terminal/no-retry/no-fabrication, in-range partial restart still completing
+  the missing camera, and image-persistence failure preventing any journal
+  append.  This is offline production-suite closure only; no live
+  Isaac/camera/rosbag/GPU/OMPL/cuMotion claim; Task 10 still owns the Gate-F
+  wiring and a load-bearing live rosbag; `_image_stats` still requires live RTX
+  calibration.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 4 — "align evidence with
   real capture artifacts"): `simulation/tinker_sim_isaac/qualification_visual_capture.py`
   is now restart-safe across a partial two-camera capture.  The durable

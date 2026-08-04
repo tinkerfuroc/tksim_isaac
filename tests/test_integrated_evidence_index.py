@@ -70,6 +70,7 @@ POSITIVE_ID = "qualification-pick-place-positive"
 CANCEL_ID = "qualification-pick-place-cancel-approach"
 CANCEL_TRANSPORT_ID = "qualification-pick-place-cancel-transport"
 SAFETY_ID = "qualification-pick-place-safety-transport"
+MOVEIT_SAFETY_ID = "qualification-moveit-safety"
 MISSING_FP = "0" * 64
 
 # Real RTX GPU inventory emitted by ``_gpu_processes`` (schema_version 2): the
@@ -155,7 +156,7 @@ def _scenario_events(scenario_id: str) -> tuple[str, ...]:
         return POSITIVE_EVENTS
     if scenario_id in (CANCEL_ID, CANCEL_TRANSPORT_ID):
         return CANCEL_EVENTS
-    if scenario_id == SAFETY_ID:
+    if scenario_id in (SAFETY_ID, MOVEIT_SAFETY_ID):
         return SAFETY_EVENTS
     return POSITIVE_EVENTS
 
@@ -175,7 +176,7 @@ def _scenario_integrated(scenario_id: str) -> dict[str, object]:
             "authority": "physics_truth",
             "execution_profile": "sim_ompl",
         }
-    if scenario_id == SAFETY_ID:
+    if scenario_id in (SAFETY_ID, MOVEIT_SAFETY_ID):
         return {
             "acceptance": {"polarity": "negative"},
             "expected_negative": {"required": ["safety-quiescent"], "forbidden": ["transport"]},
@@ -1909,6 +1910,17 @@ def _add_sibling_cancel(suite_dir: Path) -> Path:
     return suite_dir
 
 
+def _add_sibling_safety(suite_dir: Path) -> Path:
+    """Add a second safety scenario (moveit-safety) as a full attempt dir."""
+    _write_attempt_dir(
+        suite_dir, MOVEIT_SAFETY_ID,
+        attempt_id="attempt-moveit-safety",
+        include_rosbag=False,
+        include_planning_scene=False,
+    )
+    return suite_dir
+
+
 def test_missing_sibling_attempt_fails_per_attempt(tmp_path):
     """F3.3: a sibling cancel attempt never satisfies another attempt's events."""
     suite_dir = make_complete_evidence_suite(tmp_path)
@@ -2597,6 +2609,69 @@ def test_keyframe_latency_noninteger_fails(tmp_path):
     assert verdict["status"] == "verified-fail"
 
 
+# --- F5.2 required latency/execution-sequence fields cannot be absent --------
+
+
+def test_keyframe_latency_missing_fails(tmp_path):
+    """F5.2: capture_latency_frames is mandatory; a missing value is a critical
+    diagnostic (never a silently skipped check)."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    del rows[0]["capture_latency_frames"]
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-latency-missing" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_execution_sequence_missing_fails(tmp_path):
+    """F5.2: execution_event_sequence is mandatory on the keyframe side; a
+    missing value is a critical diagnostic."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    del rows[0]["execution_event_sequence"]
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-execution-sequence-missing" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_request_source_sequence_missing_fails(tmp_path):
+    """F5.2: source_execution_event_sequence is mandatory on the canonical
+    request side; a missing value is a critical diagnostic even when the
+    keyframe side is present."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    request_path = suite_dir / "E" / POSITIVE_ID / "visual-capture-requests.jsonl"
+    rows = [json.loads(line) for line in request_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        if isinstance(row.get("sequence"), int) and not isinstance(row.get("sequence"), bool):
+            del row["source_execution_event_sequence"]
+    _rewrite_jsonl(request_path, rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-source-sequence-missing" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_latency_two_still_passes(tmp_path):
+    """F5.2: the real latency-2 relation (raw = requested + latency) remains a
+    valid pass; requested is never restored to equal raw."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = [json.loads(line) for line in _first_keyframe_path(suite_dir).read_text(encoding="utf-8").splitlines()]
+    assert rows
+    for row in rows:
+        assert row["capture_latency_frames"] == CAPTURE_LATENCY
+        assert row["raw_frame_index"] - row["requested_physics_frame_index"] == CAPTURE_LATENCY
+    render_sheets(suite_dir)
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]
+
+
 # --- F4.2 real nine-field Humble rosbag2 QoS profiles ------------------------
 
 
@@ -2765,8 +2840,10 @@ def test_overlay_renamed_overlay_contract_recognized(tmp_path):
     assert any(e["path"] == "legacy-overlay-contract.json" for e in overlay)
 
 
-def test_overlay_duplicate_non_contradictory_passes(tmp_path):
-    """F4.4: duplicate overlay artifacts with identical identities are not a
+def test_overlay_duplicate_identical_duplicates_fail(tmp_path):
+    """F5.3: the Gate-F suite must contain exactly one overlay-contract artifact.
+    Identical duplicates (identical production/simulator implementation
+    identities) fail with the exactly-one reason, even though they are not a
     contradiction."""
     suite_dir = make_complete_evidence_suite(tmp_path)
     (suite_dir / "overlay-contract.json").write_text(
@@ -2777,7 +2854,10 @@ def test_overlay_duplicate_non_contradictory_passes(tmp_path):
     overlay = [e for e in index["files"] if e.get("category") == "overlay-contract"]
     assert len(overlay) == 2
     verdict = validate_gate_f(index, suite_dir=suite_dir)
-    assert "contradict across overlay-contract artifacts" not in " ".join(verdict["reasons"])
+    reasons = " ".join(verdict["reasons"])
+    assert verdict["status"] == "verified-fail"
+    assert "exactly one overlay contract artifact" in reasons
+    assert "contradict across overlay-contract artifacts" not in reasons
 
 
 def test_overlay_duplicate_contradictory_identities_fail(tmp_path):

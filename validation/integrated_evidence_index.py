@@ -716,7 +716,13 @@ def _load_capture_bindings(
     """
     suite_resolved = suite_dir.resolve()
     bindings: dict[str, dict[str, Any]] = {}
-    identity_owners: dict[tuple[str, str], str] = {}
+    # F5.1: the duplicate (event, camera) identity check is scoped per attempt
+    # directory.  The same four cancel labels are emitted by three cancel
+    # scenarios and the same four safety labels by two safety scenarios, so a
+    # global identity map would reject legitimate multi-scenario suites.  A
+    # duplicate identity within the same attempt directory (same
+    # (scenario, attempt, event, camera)) remains fail-closed.
+    identity_owners_by_dir: dict[str, dict[tuple[str, str], str]] = {}
     physics_cache: dict[str, list[Mapping[str, Any]]] = {}
     table_cache: dict[
         str, tuple[dict[tuple[str, int], Mapping[str, Any]], dict[tuple[str, int], Mapping[str, Any]]]
@@ -799,6 +805,7 @@ def _load_capture_bindings(
 
             canonical_rel = f"{rel_dir}{path_rel}"
             identity = (event, camera)
+            identity_owners = identity_owners_by_dir.setdefault(rel_dir, {})
             if identity in identity_owners:
                 diagnostics.append(
                     {
@@ -924,7 +931,18 @@ def _load_capture_bindings(
                     }
                 )
             latency = record.get("capture_latency_frames")
-            if latency is not None:
+            if latency is None:
+                # F5.2: capture_latency_frames is mandatory; a missing value is
+                # a critical diagnostic, never a silently skipped check.
+                diagnostics.append(
+                    {
+                        "code": "keyframe-latency-missing",
+                        "path": str(keyframes_path),
+                        "line": line,
+                        "request_sequence": request_sequence,
+                    }
+                )
+            else:
                 latency_type_ok = (
                     isinstance(latency, int)
                     and not isinstance(latency, bool)
@@ -955,12 +973,59 @@ def _load_capture_bindings(
                         )
             execution_event_sequence = record.get("execution_event_sequence")
             source_execution_event_sequence = candidate.get("source_execution_event_sequence")
-            if execution_event_sequence is not None and source_execution_event_sequence is not None and (
+            # F5.2: both execution sequences are mandatory positive integers and
+            # must be equal.  Missing either side is a critical diagnostic;
+            # validation never happens only when both happen to be present.
+            if execution_event_sequence is None:
+                diagnostics.append(
+                    {
+                        "code": "keyframe-execution-sequence-missing",
+                        "path": str(keyframes_path),
+                        "line": line,
+                        "request_sequence": request_sequence,
+                    }
+                )
+            elif (
                 isinstance(execution_event_sequence, bool)
                 or not isinstance(execution_event_sequence, int)
-                or isinstance(source_execution_event_sequence, bool)
+                or execution_event_sequence <= 0
+            ):
+                diagnostics.append(
+                    {
+                        "code": "keyframe-execution-sequence-invalid",
+                        "path": str(keyframes_path),
+                        "line": line,
+                        "request_sequence": request_sequence,
+                        "value": repr(execution_event_sequence),
+                    }
+                )
+            if source_execution_event_sequence is None:
+                diagnostics.append(
+                    {
+                        "code": "keyframe-source-sequence-missing",
+                        "path": str(keyframes_path),
+                        "line": line,
+                        "request_sequence": request_sequence,
+                    }
+                )
+            elif (
+                isinstance(source_execution_event_sequence, bool)
                 or not isinstance(source_execution_event_sequence, int)
-                or execution_event_sequence != source_execution_event_sequence
+                or source_execution_event_sequence <= 0
+            ):
+                diagnostics.append(
+                    {
+                        "code": "keyframe-source-sequence-invalid",
+                        "path": str(keyframes_path),
+                        "line": line,
+                        "request_sequence": request_sequence,
+                        "value": repr(source_execution_event_sequence),
+                    }
+                )
+            elif (
+                isinstance(execution_event_sequence, int)
+                and not isinstance(execution_event_sequence, bool)
+                and execution_event_sequence != source_execution_event_sequence
             ):
                 diagnostics.append(
                     {
@@ -1554,6 +1619,15 @@ def _validate_source_provenance(
     overlay_entries = _entries_by_category(index, "overlay-contract")
     if not overlay_entries:
         reasons.append("missing overlay contract (overlay-contract.json)")
+    elif len(overlay_entries) > 1:
+        # F5.3: the Gate-F evidence suite must contain exactly one categorized
+        # overlay-contract artifact.  More than one fails even when the
+        # production/simulator implementation identities are identical; a
+        # contradictory duplicate additionally carries the sharper contradiction
+        # reason below.
+        reasons.append(
+            f"expected exactly one overlay contract artifact, found {len(overlay_entries)}"
+        )
     for entry in overlay_entries:
         overlay = _read_json_rel(suite_dir, entry["path"])
         if overlay is None:

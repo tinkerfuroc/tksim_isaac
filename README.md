@@ -314,6 +314,37 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 5 — "final narrow
+  production-suite closure"): Closed the last offline production-suite residuals
+  so the contact-sheet and Gate-F tooling now supports the full 17-scenario
+  production suite shape.  `validation/integrated_contact_sheets.py::_all_bound_capture_entries` now
+  tolerates shared event labels (the same four cancel labels across three cancel
+  scenarios and the same four safety labels across two safety scenarios) and
+  selects exactly one deterministic representative capture per event by the rank
+  canonical event order, then scenario, attempt, preferred camera
+  (`overview` before `manipulation_closeup`, then other camera names), then path
+  (F5.1).  `validation/integrated_evidence_index.py` scopes the duplicate
+  `(event, camera)` keyframe-identity check per attempt directory so
+  multi-scenario label sharing is normal while a duplicate within the same
+  `(scenario, attempt, event, camera)` stays fail-closed; `capture_latency_frames`
+  and both `execution_event_sequence` / `source_execution_event_sequence` are
+  now mandatory positive integers that must be equal — missing either side is a
+  critical diagnostic and the real `raw = requested + latency` relation is
+  retained, never requested==raw (F5.2); and the Gate-F suite must contain
+  exactly one categorized overlay-contract artifact, failing on more than one
+  even with identical production/simulator identities while contradictory
+  duplicates keep the sharper contradiction reason (F5.3).
+  `simulation/tinker_sim_isaac/qualification_visual_capture.py` expires a
+  partially captured sequence that can no longer satisfy the bounded latency
+  contract on a restarted consumer: one deduplicated terminal error, a durable
+  terminal-sequences marker, preserved camera-1 evidence, no camera-2
+  fabrication, no retry/error growth across polls/restarts, and each PNG is
+  atomically and durably persisted (temp + file fsync + atomic replace +
+  parent-directory fsync) before its keyframe journal row (F5.4).  This is
+  offline production-suite closure only; no live Isaac/camera/rosbag/GPU/OMPL/
+  cuMotion claim; Task 10 still owns the Gate-F wiring and a load-bearing live
+  rosbag; `_image_stats` still requires live RTX calibration.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 4 — "align evidence with
   real capture artifacts"): Closed the source-fixable residuals so Gate F accepts
   genuine live producer output.  `validation/integrated_evidence_index.py` now

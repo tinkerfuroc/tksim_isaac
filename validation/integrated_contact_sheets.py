@@ -417,16 +417,37 @@ def _canonical_suite_event_order(index: Mapping[str, Any]) -> list[str]:
     return order
 
 
-def _all_bound_capture_entries(suite_dir: Path) -> list[dict[str, Any]]:
-    """Select one bound capture per visual event in the canonical suite order.
+#: Preferred camera order for a deterministic representative selection (F5.1):
+#: ``overview`` before ``manipulation_closeup``, then any other camera names.
+_PREFERRED_CAMERA_ORDER = ("overview", "manipulation_closeup")
 
-    Bound captures are ordered by the required suite event sequence
-    (positive -> cancel -> safety), not by index path order; within an event the
-    deterministic camera/path ordering is preserved.  Unknown visual event
-    identities (not part of the canonical required suite for the present kinds)
-    are rejected instead of silently placed, and an event whose bound captures
-    carry conflicting scenario/attempt identities is rejected as a duplicate
-    event identity.
+
+def _camera_rank(camera: str) -> tuple[int, str]:
+    """Deterministic camera ordering: preferred cameras first, then name."""
+    if camera in _PREFERRED_CAMERA_ORDER:
+        return (_PREFERRED_CAMERA_ORDER.index(camera), camera)
+    return (len(_PREFERRED_CAMERA_ORDER), camera)
+
+
+def _all_bound_capture_entries(suite_dir: Path) -> list[dict[str, Any]]:
+    """Select one deterministic representative bound capture per visual event.
+
+    Bound captures are ordered by the canonical required suite event sequence
+    (positive -> cancel -> safety), not by index path order.  Unknown visual
+    event identities (not part of the canonical required suite for the present
+    kinds) are rejected instead of silently placed.
+
+    F5.1: the same cancel labels are emitted by three cancel scenarios and the
+    same safety labels by two safety scenarios, so an event legitimately spans
+    multiple scenario/attempt transactions.  Multiple scenarios/attempts sharing
+    an event are normal and never raise.  For each event exactly one
+    deterministic representative capture is selected from the already validated
+    per-attempt bindings using the rank: canonical event rank (the outer order),
+    then ``scenario``, ``attempt``, preferred camera order (``overview`` before
+    ``manipulation_closeup``, then other camera names), then path.  Duplicate or
+    conflicting capture identity within the same ``(scenario, attempt, event,
+    camera)`` is already fail-closed in the evidence index and is never hidden
+    here.
     """
     index = _load_index(suite_dir)
     order = _canonical_suite_event_order(index)
@@ -448,15 +469,14 @@ def _all_bound_capture_entries(suite_dir: Path) -> list[dict[str, Any]]:
         captures = by_event.get(event, [])
         if not captures:
             continue
-        scenarios = {capture.get("scenario") for capture in captures}
-        attempts = {capture.get("attempt") for capture in captures}
-        if len(scenarios) != 1 or len(attempts) != 1:
-            raise ValueError(
-                f"duplicate visual event identity in evidence index: {event!r} "
-                f"is bound to multiple scenario/attempt transactions"
+        captures.sort(
+            key=lambda capture: (
+                capture.get("scenario") or "",
+                capture.get("attempt") or "",
+                _camera_rank(capture.get("camera") or ""),
+                capture["path"],
             )
-        # Deterministic camera/path ordering within the event.
-        captures.sort(key=lambda capture: (capture.get("camera") or "", capture["path"]))
+        )
         entries.append(captures[0])
     return entries
 
