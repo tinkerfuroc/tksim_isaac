@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -54,6 +55,8 @@ IMAGE_SIZE = (960, 540)
 CAMERAS = ("overview", "manipulation_closeup")
 PHYSICS_HZ = 120.0
 PHYSICS_FRAMES = 80
+# F4.1: real capture latency in frames (raw = requested + CAPTURE_LATENCY).
+CAPTURE_LATENCY = 2
 SUITE_ATTEMPT = "suite-20260804T000000Z-1000-abcdef0123"
 ATTEMPT_IDS = {
     "qualification-pick-place-positive": "attempt-positive",
@@ -187,11 +190,16 @@ def _write_attempt_dir(
     scenario_id: str,
     *,
     attempt_id: str,
+    attempt_subdir: str | None = None,
     include_rosbag: bool = True,
     include_planning_scene: bool = True,
 ) -> Path:
-    """Write a real-shaped integrated attempt directory for one scenario."""
-    attempt_dir = suite_dir / "E" / scenario_id
+    """Write a real-shaped integrated attempt directory for one scenario.
+
+    ``attempt_subdir`` overrides the on-disk attempt directory name so a second
+    attempt bearing the same scenario id can be written to a distinct path.
+    """
+    attempt_dir = suite_dir / "E" / (attempt_subdir or scenario_id)
     attempt_dir.mkdir(parents=True, exist_ok=True)
 
     # manifest.json (real producer schema).
@@ -491,12 +499,33 @@ def _write_attempt_dir(
             "/sim/status/contract": "std_msgs/msg/String",
             "/sim/status/command_gateway": "std_msgs/msg/String",
         }
-        # F3.8: realistic per-topic offered QoS.  The two
+        # F3.8/F4.2: realistic per-topic offered QoS.  The two
         # ROSBAG_QOS_OVERRIDE_PROFILES topics carry keep_last/depth1/
         # reliable/transient_local; the remaining approved publishers are
         # RELIABLE (with VOLATILE durability) per the overlay publisher contract.
-        override_qos = "- history: 1\n  depth: 1\n  reliability: 1\n  durability: 1\n"
-        volatile_qos = "- history: 1\n  depth: 10\n  reliability: 1\n  durability: 3\n"
+        # Humble rosbag2 serializes the full nine-field rmw_qos_profile_t.
+        override_qos = (
+            "- history: 1\n"
+            "  depth: 1\n"
+            "  reliability: 1\n"
+            "  durability: 1\n"
+            "  deadline: 0\n"
+            "  lifespan: 0\n"
+            "  liveliness: 1\n"
+            "  liveliness_lease_duration: 0\n"
+            "  avoid_ros_namespace_conventions: false\n"
+        )
+        volatile_qos = (
+            "- history: 1\n"
+            "  depth: 10\n"
+            "  reliability: 1\n"
+            "  durability: 3\n"
+            "  deadline: 0\n"
+            "  lifespan: 0\n"
+            "  liveliness: 1\n"
+            "  liveliness_lease_duration: 0\n"
+            "  avoid_ros_namespace_conventions: false\n"
+        )
         topic_qos = {
             "/sim/hardware/safety_stop": override_qos,
             "/sim/status/contract": override_qos,
@@ -538,14 +567,19 @@ def _write_attempt_dir(
         for camera in CAMERAS:
             sequence = event_index * len(CAMERAS) + 1 + (0 if camera == CAMERAS[0] else 1)
             frame_index = base_frame + event_index * 10
-            timestamp = frame_index / PHYSICS_HZ
+            requested_time = frame_index / PHYSICS_HZ
+            # F4.1: the real producer captures with a nonzero latency contract:
+            # requested frame = round(requested_time / physics_dt), raw frame =
+            # requested + CAPTURE_LATENCY, and latency = raw - requested.
+            captured_frame_index = frame_index + CAPTURE_LATENCY
+            captured_timestamp = captured_frame_index / PHYSICS_HZ
             request_rows.append(
                 {
                     "schema_version": 1,
                     "sequence": sequence,
                     "gate": scenario_id,
                     "event": event,
-                    "simulated_timestamp": timestamp,
+                    "simulated_timestamp": requested_time,
                     "source_execution_event_sequence": sequence,
                 }
             )
@@ -557,12 +591,12 @@ def _write_attempt_dir(
                     "event": event,
                     "request_sequence": sequence,
                     "execution_event_sequence": sequence,
-                    "requested_simulated_timestamp": timestamp,
+                    "requested_simulated_timestamp": requested_time,
                     "requested_physics_frame_index": frame_index,
-                    "capture_latency_frames": 0,
+                    "capture_latency_frames": CAPTURE_LATENCY,
                     "max_capture_latency_frames": 4,
-                    "simulated_timestamp": timestamp,
-                    "raw_frame_index": frame_index,
+                    "simulated_timestamp": captured_timestamp,
+                    "raw_frame_index": captured_frame_index,
                     "physics_dt": 1.0 / PHYSICS_HZ,
                     "camera": camera,
                     "camera_fixture": {"eye": [0.0, 0.0, 0.0], "target": [0.0, 0.0, 0.0]},
@@ -629,7 +663,7 @@ def write_canonical_evidence_tree(
     # mapping records; source_locks.status is the truthful real value
     # ``"excluded_in_task_8"`` (not a fabricated ``"pass"``).
     _write_json(
-        suite_dir / "overlay-contract.json",
+        suite_dir / "ompl-overlay-contract.json",
         {
             "schema_version": 1,
             "contract_id": "simulator-ompl-overlay-acceptance",
@@ -1159,7 +1193,7 @@ def test_index_rejects_symlink_escape(tmp_path):
 
 def test_index_rejects_output_as_input(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    target = suite_dir / "overlay-contract.json"
+    target = suite_dir / "ompl-overlay-contract.json"
     with pytest.raises(ValueError, match="output-as-input|output"):
         build_evidence_index(suite_dir=suite_dir, output=target)
 
@@ -1464,7 +1498,7 @@ def test_source_lock_uppercase_commit_fails_gate_f(tmp_path):
 def test_overlay_contract_missing_repositories_fails_gate_f(tmp_path):
     """F2.5: overlay-contract nested repositories identity is required."""
     suite_dir = make_complete_evidence_suite(tmp_path)
-    overlay = suite_dir / "overlay-contract.json"
+    overlay = suite_dir / "ompl-overlay-contract.json"
     value = json.loads(overlay.read_text(encoding="utf-8"))
     del value["repositories"]
     overlay.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
@@ -1801,7 +1835,7 @@ def test_overlay_path_scope_scalar_is_accepted(tmp_path):
 def test_overlay_scalar_garbage_under_repository_key_fails(tmp_path):
     """F3.2: a scalar under a repository mapping key still fails."""
     suite_dir = make_complete_evidence_suite(tmp_path)
-    overlay = suite_dir / "overlay-contract.json"
+    overlay = suite_dir / "ompl-overlay-contract.json"
     value = json.loads(overlay.read_text(encoding="utf-8"))
     value["repositories"]["production"] = "not-a-mapping"
     _rewrite_json(overlay, value)
@@ -1812,7 +1846,7 @@ def test_overlay_scalar_garbage_under_repository_key_fails(tmp_path):
 def test_overlay_missing_production_fails(tmp_path):
     """F3.2: removing the production repository mapping fails."""
     suite_dir = make_complete_evidence_suite(tmp_path)
-    overlay = suite_dir / "overlay-contract.json"
+    overlay = suite_dir / "ompl-overlay-contract.json"
     value = json.loads(overlay.read_text(encoding="utf-8"))
     del value["repositories"]["production"]
     _rewrite_json(overlay, value)
@@ -1823,7 +1857,7 @@ def test_overlay_missing_production_fails(tmp_path):
 def test_overlay_malformed_identity_fails(tmp_path):
     """F3.2: a non-40-hex implementation identity fails."""
     suite_dir = make_complete_evidence_suite(tmp_path)
-    overlay = suite_dir / "overlay-contract.json"
+    overlay = suite_dir / "ompl-overlay-contract.json"
     value = json.loads(overlay.read_text(encoding="utf-8"))
     value["repositories"]["simulator"]["implementation_identity"] = "A" * 40
     _rewrite_json(overlay, value)
@@ -1834,7 +1868,7 @@ def test_overlay_malformed_identity_fails(tmp_path):
 def test_overlay_malformed_path_scope_fails(tmp_path):
     """F3.2: a non-scalar ``path_scope`` is malformed."""
     suite_dir = make_complete_evidence_suite(tmp_path)
-    overlay = suite_dir / "overlay-contract.json"
+    overlay = suite_dir / "ompl-overlay-contract.json"
     value = json.loads(overlay.read_text(encoding="utf-8"))
     value["repositories"]["path_scope"] = {"nested": True}
     _rewrite_json(overlay, value)
@@ -1845,7 +1879,7 @@ def test_overlay_malformed_path_scope_fails(tmp_path):
 def test_overlay_source_locks_missing_status_fails(tmp_path):
     """F3.2: source_locks must be a mapping with a truthful non-empty status."""
     suite_dir = make_complete_evidence_suite(tmp_path)
-    overlay = suite_dir / "overlay-contract.json"
+    overlay = suite_dir / "ompl-overlay-contract.json"
     value = json.loads(overlay.read_text(encoding="utf-8"))
     del value["source_locks"]["status"]
     _rewrite_json(overlay, value)
@@ -2269,8 +2303,20 @@ def _f34_emit_positive(executor, scenario_id: str) -> list[str]:
     return statuses
 
 
-def _f34_capture(monkeypatch, attempt_dir: Path, gate: str, backend, frames: list[int]):
-    """Drive the real ``QualificationVisualCapture`` through its env factory."""
+def _f34_capture(
+    monkeypatch,
+    attempt_dir: Path,
+    gate: str,
+    backend,
+    frames: list[int],
+    *,
+    latency: int = CAPTURE_LATENCY,
+):
+    """Drive the real ``QualificationVisualCapture`` through its env factory.
+
+    The backend renders ``latency`` physics frames past the requested frame, so
+    the real producer emits nonzero ``capture_latency_frames`` (F4.1).
+    """
     from simulation.tinker_sim_isaac.qualification_visual_capture import (
         QualificationVisualCapture,
     )
@@ -2290,8 +2336,8 @@ def _f34_capture(monkeypatch, attempt_dir: Path, gate: str, backend, frames: lis
     capture = QualificationVisualCapture.from_environment(app=object(), backend=backend)
     assert capture is not None
     for frame in frames:
-        backend.physics_frame_index = frame
-        backend.simulation_time = frame / PHYSICS_HZ
+        backend.physics_frame_index = frame + latency
+        backend.simulation_time = (frame + latency) / PHYSICS_HZ
         capture.poll()
     return capture
 
@@ -2360,9 +2406,9 @@ def test_f34_integrated_producer_path_gate_f_verified_pass(tmp_path, monkeypatch
     by_event: dict[str, int] = {}
     for record in keyframes:
         assert record["gate"] == POSITIVE_ID
-        assert record["capture_latency_frames"] == 0
+        assert record["capture_latency_frames"] == CAPTURE_LATENCY
         assert record["max_capture_latency_frames"] == 4
-        assert record["requested_physics_frame_index"] == record["raw_frame_index"]
+        assert record["requested_physics_frame_index"] == record["raw_frame_index"] - CAPTURE_LATENCY
         assert (attempt_dir / record["path"]).is_file()
         by_event[record["event"]] = by_event.get(record["event"], 0) + 1
     assert set(by_event) == set(REQUIRED_POSITIVE_EVENTS)
@@ -2417,3 +2463,418 @@ def test_f34_diagnostic_only_journal_fails_closed(tmp_path, monkeypatch):
     assert "missing required positive visual events" in joined
     assert "unrecognized-capture-request-shape" not in joined
     assert "capture-request-without-image" not in joined
+
+
+# --------------------------------------------------------------------------- #
+# Task 9 fix round 4 (F4.1-F4.5) — real capture latency / nine-field QoS /
+# canonical CLI order / verbatim overlay artifacts / attempt-key closure
+# --------------------------------------------------------------------------- #
+
+
+def _first_keyframe_path(suite_dir: Path) -> Path:
+    return suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl"
+
+
+def _nine_field_qos(
+    history: int = 1,
+    depth: int = 10,
+    reliability: int = 1,
+    durability: int = 3,
+    deadline: int = 0,
+    lifespan: int = 0,
+    liveliness: int = 1,
+    liveliness_lease_duration: int = 0,
+    avoid_ros_namespace_conventions: bool = True,
+) -> str:
+    """Real Humble rosbag2 nine-field ``rmw_qos_profile_t`` YAML serialization."""
+    return (
+        f"- history: {history}\n"
+        f"  depth: {depth}\n"
+        f"  reliability: {reliability}\n"
+        f"  durability: {durability}\n"
+        f"  deadline: {deadline}\n"
+        f"  lifespan: {lifespan}\n"
+        f"  liveliness: {liveliness}\n"
+        f"  liveliness_lease_duration: {liveliness_lease_duration}\n"
+        f"  avoid_ros_namespace_conventions: {str(avoid_ros_namespace_conventions).lower()}\n"
+    )
+
+
+def _trim_attempt_visual(attempt_dir: Path, keep_events: set[str]) -> None:
+    """Keep only the keyframes/requests/PNGs for the given events in an attempt."""
+    kf_path = attempt_dir / "visual-keyframes.jsonl"
+    req_path = attempt_dir / "visual-capture-requests.jsonl"
+    kf_rows = [json.loads(line) for line in kf_path.read_text(encoding="utf-8").splitlines()]
+    req_rows = [json.loads(line) for line in req_path.read_text(encoding="utf-8").splitlines()]
+    kf_rows = [row for row in kf_rows if row["event"] in keep_events]
+    kept_paths = {row["path"] for row in kf_rows}
+    for png in (attempt_dir / "visual/source").glob("*.png"):
+        if png.relative_to(attempt_dir).as_posix() not in kept_paths:
+            png.unlink()
+    # Keep canonical sequence requests only for kept events; executor diagnostic
+    # records (no int sequence) stay co-tenanted.
+    req_rows = [
+        row
+        for row in req_rows
+        if (isinstance(row.get("sequence"), int) and row.get("event") in keep_events)
+        or not isinstance(row.get("sequence"), int)
+    ]
+    _rewrite_jsonl(kf_path, kf_rows)
+    _rewrite_jsonl(req_path, req_rows)
+
+
+# --- F4.1 real capture-latency arithmetic -----------------------------------
+
+
+def test_factory_latency_two_records_valid(tmp_path):
+    """F4.1: the production-shaped factory emits latency-2 keyframes that satisfy
+    the real arithmetic (raw - requested == latency) and pass Gate F."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = [json.loads(line) for line in _first_keyframe_path(suite_dir).read_text(encoding="utf-8").splitlines()]
+    assert rows
+    for row in rows:
+        assert row["capture_latency_frames"] == CAPTURE_LATENCY
+        assert row["raw_frame_index"] - row["requested_physics_frame_index"] == CAPTURE_LATENCY
+        expected_rounded = int(math.floor(row["requested_simulated_timestamp"] / row["physics_dt"] + 0.5))
+        assert row["requested_physics_frame_index"] == expected_rounded
+    render_sheets(suite_dir)
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]
+
+
+def test_keyframe_wrong_requested_rounding_fails(tmp_path):
+    """F4.1: a requested frame that is not the producer's exact rounded-frame
+    calculation from requested time / physics dt fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["requested_physics_frame_index"] = int(rows[0]["requested_physics_frame_index"]) - 1
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-request-frame-mismatch" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_requested_frame_invalid_fails(tmp_path):
+    """F4.1: a missing/non-integer requested_physics_frame_index is invalid."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["requested_physics_frame_index"] = None
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-request-frame-invalid" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_latency_delta_mismatch_fails(tmp_path):
+    """F4.1: a latency field inconsistent with the frame delta (raw - requested)
+    fails even when it is within the [0, MAX] range."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    assert rows[0]["raw_frame_index"] - rows[0]["requested_physics_frame_index"] == CAPTURE_LATENCY
+    rows[0]["capture_latency_frames"] = CAPTURE_LATENCY - 1
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-latency-delta-mismatch" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_latency_noninteger_fails(tmp_path):
+    """F4.1: a non-integer capture_latency_frames fails (out-of-range)."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["capture_latency_frames"] = 1.5
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-latency-out-of-range" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+# --- F4.2 real nine-field Humble rosbag2 QoS profiles ------------------------
+
+
+def test_rosbag_nine_field_qos_passes_gate_f(tmp_path):
+    """F4.2: the real nine-field rmw_qos_profile_t passes for all approved topics,
+    including the recorder override subset on the two override topics."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]
+    assert "recorder override contract" not in " ".join(summary["reasons"])
+
+
+def test_rosbag_override_wrong_required_field_fails(tmp_path):
+    """F4.2: an override topic with the wrong depth (still nine-field) fails the
+    recorder override subset contract."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/sim/hardware/safety_stop")
+    record["topic_metadata"]["offered_qos_profiles"] = _nine_field_qos(depth=5, durability=1)
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "recorder override contract" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_malformed_extra_field_fails(tmp_path):
+    """F4.2: a present-but-malformed extra rmw field (negative deadline) fails
+    the real schema."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/clock")
+    record["topic_metadata"]["offered_qos_profiles"] = _nine_field_qos(deadline=-5)
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "malformed RMW QoS fields" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_malformed_liveliness_extra_fails(tmp_path):
+    """F4.2: an out-of-range liveliness enum value in a real profile fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/clock")
+    record["topic_metadata"]["offered_qos_profiles"] = _nine_field_qos(liveliness=99)
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "malformed RMW QoS fields" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_missing_required_field_fails(tmp_path):
+    """F4.2: a profile missing a required field (depth) fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/clock")
+    text = _nine_field_qos()
+    record["topic_metadata"]["offered_qos_profiles"] = text.replace("  depth: 10\n", "")
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "malformed RMW QoS fields" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_arbitrary_string_qos_fails(tmp_path):
+    """F4.2: an arbitrary non-YAML-list string for offered_qos_profiles fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/sim/status/contract")
+    record["topic_metadata"]["offered_qos_profiles"] = "reliable"
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "not a YAML profile list" in " ".join(verdict["reasons"])
+
+
+# --- F4.3 canonical production CLI sheet event order -------------------------
+
+
+def test_cli_path_order_would_be_cancel_positive_safety(tmp_path):
+    """F4.3: the index's raw path-sorted capture order is cancel-first; the
+    production helper corrects it to positive -> cancel -> safety."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = json.loads((suite_dir / INDEX_NAME).read_text(encoding="utf-8"))
+    path_sorted = list(
+        dict.fromkeys(
+            entry["event"]
+            for entry in index["files"]
+            if entry.get("category") == "capture" and entry.get("bound")
+        )
+    )
+    assert path_sorted[0] in CANCEL_EVENTS  # raw path order is cancel-first
+    from validation.integrated_contact_sheets import _all_bound_capture_entries
+
+    entries = _all_bound_capture_entries(suite_dir)
+    assert [entry["event"] for entry in entries] == list(
+        POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS
+    )
+
+
+def test_cli_multi_scenario_sheets_canonical_order_gate_f_pass(tmp_path):
+    """F4.3: the real CLI main() over a positive+cancel+safety suite embeds the
+    canonical ordered events in both sheets and reaches Gate F verified-pass."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    from validation.integrated_contact_sheets import main
+
+    assert main(["--suite-dir", str(suite_dir)]) == 0
+    agent_meta = _read_sheet_metadata(suite_dir / AGENT_NAME)
+    user_meta = _read_sheet_metadata(suite_dir / USER_NAME)
+    assert agent_meta is not None and user_meta is not None
+    expected = list(POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS)
+    assert agent_meta["events"] == expected
+    assert user_meta["events"] == expected
+    assert agent_meta["role"] == "agent" and user_meta["role"] == "user"
+    assert agent_meta["captures"] == user_meta["captures"]
+    rebuild_index(suite_dir)
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]
+
+
+def test_cli_rejects_unknown_event_identity(tmp_path):
+    """F4.3: an unknown visual event identity in the index is rejected, never
+    silently placed."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = json.loads((suite_dir / INDEX_NAME).read_text(encoding="utf-8"))
+    index["files"].append(
+        {
+            "path": "E/qualification-pick-place-positive/visual/source/9999-bogus-overview.png",
+            "sha256": "ab" * 32,
+            "size": 1,
+            "mode": "0644",
+            "category": "capture",
+            "bound": True,
+            "event": "bogus-event",
+            "scenario": POSITIVE_ID,
+            "attempt": "attempt-positive",
+        }
+    )
+    (suite_dir / INDEX_NAME).write_text(json.dumps(index, sort_keys=True), encoding="utf-8")
+    from validation.integrated_contact_sheets import _all_bound_capture_entries
+
+    with pytest.raises(ValueError, match="unknown visual event identity"):
+        _all_bound_capture_entries(suite_dir)
+
+
+# --- F4.4 verbatim overlay artifacts and root-relative lock paths ------------
+
+
+def test_overlay_ompl_filename_and_root_relative_lock_pass(tmp_path):
+    """F4.4: the real ompl-overlay-contract.json filename and the verbatim
+    root-relative integration/source-locks.json reference bind through Gate F."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]
+    index = _final_index(suite_dir)
+    assert any(e.get("category") == "overlay-contract" and e["path"].endswith("ompl-overlay-contract.json") for e in index["files"])
+
+
+def test_overlay_renamed_overlay_contract_recognized(tmp_path):
+    """F4.4: a legitimate ``*-overlay-contract.json`` is categorized as
+    overlay-contract, not ``other``."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "legacy-overlay-contract.json").write_text(
+        (suite_dir / "ompl-overlay-contract.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    index = _final_index(suite_dir)
+    overlay = [e for e in index["files"] if e.get("category") == "overlay-contract"]
+    assert any(e["path"] == "ompl-overlay-contract.json" for e in overlay)
+    assert any(e["path"] == "legacy-overlay-contract.json" for e in overlay)
+
+
+def test_overlay_duplicate_non_contradictory_passes(tmp_path):
+    """F4.4: duplicate overlay artifacts with identical identities are not a
+    contradiction."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "overlay-contract.json").write_text(
+        (suite_dir / "ompl-overlay-contract.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    index = _final_index(suite_dir)
+    overlay = [e for e in index["files"] if e.get("category") == "overlay-contract"]
+    assert len(overlay) == 2
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "contradict across overlay-contract artifacts" not in " ".join(verdict["reasons"])
+
+
+def test_overlay_duplicate_contradictory_identities_fail(tmp_path):
+    """F4.4: two overlay artifacts with contradictory production identities
+    fail closed."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = json.loads((suite_dir / "ompl-overlay-contract.json").read_text(encoding="utf-8"))
+    value["repositories"]["production"]["implementation_identity"] = "c" * 40
+    _write_json(suite_dir / "overlay-contract.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "contradict across overlay-contract artifacts" in " ".join(verdict["reasons"])
+
+
+def test_overlay_missing_overlay_contract_fails(tmp_path):
+    """F4.4: a suite with no recognized overlay contract fails closed."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "ompl-overlay-contract.json").unlink()
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "missing overlay contract" in " ".join(verdict["reasons"])
+
+
+def test_overlay_lock_path_escape_fails(tmp_path):
+    """F4.4: an escaping (..) simulator_lock_path never binds."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "ompl-overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    value["source_locks"]["simulator_lock_path"] = "../outside.json"
+    _rewrite_json(overlay, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "not suite-relative" in " ".join(verdict["reasons"])
+
+
+def test_overlay_lock_path_absolute_fails(tmp_path):
+    """F4.4: an absolute simulator_lock_path never reads outside the suite."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "ompl-overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    value["source_locks"]["simulator_lock_path"] = "/etc/passwd"
+    _rewrite_json(overlay, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "not suite-relative" in " ".join(verdict["reasons"])
+
+
+# --- F4.5 fail-closed lows ----------------------------------------------------
+
+
+def test_split_same_scenario_across_two_attempts_fails(tmp_path):
+    """F4.5: two attempts bearing the same scenario id must never merge their
+    event subsets; each attempt is checked independently."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    # Add a second cancel attempt in its own directory, manifest-only (no
+    # scenario-bundle) so it does not trigger a duplicate-scenario-declaration.
+    _write_attempt_dir(
+        suite_dir,
+        CANCEL_ID,
+        attempt_id="attempt-cancel-2",
+        attempt_subdir="cancel-2",
+        include_rosbag=False,
+        include_planning_scene=True,
+    )
+    (suite_dir / "E" / "cancel-2" / "scenario-bundle.json").unlink()
+    # Split the four cancel events across the two attempts.
+    _trim_attempt_visual(
+        suite_dir / "E" / CANCEL_ID,
+        {"cancel-execution-start", "cancel-trigger"},
+    )
+    _trim_attempt_visual(
+        suite_dir / "E" / "cancel-2",
+        {"cancel-velocity-compliant", "cancel-terminal"},
+    )
+    index = _final_index(suite_dir)
+    assert not index.get("diagnostics"), index.get("diagnostics")
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert verdict["status"] == "verified-fail"
+    assert CANCEL_ID in reasons
+    assert "attempt-cancel-2" in reasons
+    assert "missing required" in reasons
+
+
+def test_cleanup_empty_gpu_inventory_with_available_true_fails(tmp_path):
+    """F4.5: empty/empty GPU inventories never pass vacuously when a snapshot
+    reports available=true."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["baseline"]["gpus"] = []
+    value["final"]["gpus"] = []
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "empty GPU inventory despite available=true" in " ".join(verdict["reasons"])
+
+
+def test_cleanup_malformed_gpu_record_fails(tmp_path):
+    """F4.5: a GPU inventory record missing the physical uuid identity fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["final"]["gpus"] = [{"index": 0, "memory_used_mib": 2048}]
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "malformed GPU inventory record" in " ".join(verdict["reasons"])

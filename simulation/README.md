@@ -91,6 +91,23 @@ work.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 4 — "align evidence with
+  real capture artifacts"): `simulation/tinker_sim_isaac/qualification_visual_capture.py`
+  is now restart-safe across a partial two-camera capture.  The durable
+  completion seed is per `(request_sequence, camera)`: a request sequence is
+  marked durably complete only once every configured camera has a durable
+  keyframe, so a crash after camera-1's keyframe but before camera-2's re-captures
+  only the missing camera on restart and never duplicates a completed camera.
+  The offline integrated evidence tests now exercise real nonzero capture latency
+  (`raw_frame_index - requested_physics_frame_index` in `[0, 4]`), the real
+  nine-field Humble rosbag2 QoS profile, canonical production CLI sheet event
+  ordering, verbatim `ompl-overlay-contract.json` artifacts with root-relative
+  lock paths, and exact `(scenario_id, attempt_id)` visual closure.  `_image_stats`
+  thresholds still require live RTX calibration; Task 10 must wire Gate F and
+  launch/finalize a load-bearing integrated rosbag; no live Isaac/camera/rosbag/
+  GPU run occurred in this repair; the future qualification tooling lock remains
+  absent until after review-clean Task 10.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 3 — "make integrated
   evidence production-real"): `simulation/tinker_sim_isaac/qualification_visual_capture.py`
   now seeds its handled-request-sequence set from the durable

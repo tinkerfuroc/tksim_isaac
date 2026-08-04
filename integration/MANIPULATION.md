@@ -363,6 +363,32 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 4 — "align evidence with
+  real capture artifacts"): Aligned the offline Gate-F evidence contract with the
+  real producer output.  `validation/integrated_evidence_index.py` validates the
+  real capture-latency arithmetic (`requested_physics_frame_index` == the
+  producer's rounded-frame calculation; `capture_latency_frames` integer in
+  `[0, MAX]` equal to `raw_frame_index - requested_physics_frame_index`; primary
+  key and timestamp tolerance retained at the captured frame), parses the real
+  Humble nine-field rosbag2 QoS profile and matches the recorder override as a
+  required-field subset, recognizes both `overlay-contract.json` and the real
+  `ompl-overlay-contract.json` (any `*-overlay-contract.json`) as one
+  authoritative overlay-contract identity (contradictory duplicates fail), and
+  resolves a verbatim root-relative `source_locks.simulator_lock_path` against
+  the evidence suite without escaping it or silently accepting an absent lock.
+  `validation/integrated_contact_sheets.py` orders production CLI bound captures
+  by the canonical required suite event sequence and rejects unknown/duplicate
+  event identities.  Visual completeness keys by exact `(scenario_id,
+  attempt_id)`, a nonempty valid GPU inventory is required when
+  baseline/final `available=true`, and `qualification_visual_capture.py` is
+  restart-safe across a partial two-camera capture (per-`(request_sequence,
+  camera)` durable completion).  Offline production-shaped latency/QoS/CLI/
+  overlay/restart tests pass; `_image_stats` thresholds still require live RTX
+  calibration, Task 10 must wire Gate F and launch/finalize a load-bearing live
+  rosbag, and no live Isaac/RTX/camera/rosbag/GPU run occurred in this repair.
+  The future qualification tooling lock remains absent until after review-clean
+  Task 10.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 3 — "make integrated
   evidence production-real"): Made the integrated evidence pipeline accept
   genuine live artifacts.  The evidence index (`validation/integrated_evidence_index.py`)

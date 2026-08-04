@@ -72,9 +72,13 @@ class QualificationVisualCapture:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.records_path = attempt_dir / "visual-keyframes.jsonl"
         self._handled_sequences: set[int] = set()
-        # F3.4: at-most-once must survive a consumer process restart.  Seed the
-        # already-handled request sequences from the durable keyframe journal so
-        # a restarted consumer never re-captures an already captured sequence.
+        self._handled_cameras: set[tuple[int, str]] = set()
+        # F3.4/F4.5: at-most-once must survive a consumer process restart and be
+        # restart-safe across a partial two-camera capture.  Seed the durable
+        # per-(request_sequence, camera) completion set from the keyframe
+        # journal so a restarted consumer never re-captures an already captured
+        # camera and never drops a not-yet-captured camera.  A sequence is
+        # durable-complete only once every configured camera has a keyframe.
         if self.records_path.is_file():
             try:
                 for line in self.records_path.read_text(encoding="utf-8").splitlines():
@@ -82,8 +86,15 @@ class QualificationVisualCapture:
                         continue
                     record = json.loads(line)
                     sequence = record.get("request_sequence")
-                    if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0:
-                        self._handled_sequences.add(sequence)
+                    camera = record.get("camera")
+                    if (
+                        isinstance(sequence, int)
+                        and not isinstance(sequence, bool)
+                        and sequence > 0
+                        and isinstance(camera, str)
+                        and camera
+                    ):
+                        self._handled_cameras.add((sequence, camera))
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
         self._records: list[dict[str, Any]] = []
@@ -91,6 +102,7 @@ class QualificationVisualCapture:
         self._reported_error_keys: set[tuple] = set()
         self._sensors: dict[str, Any] = {}
         self._initialize_cameras()
+        self._seed_durable_completion()
 
     @classmethod
     def from_environment(
@@ -143,6 +155,16 @@ class QualificationVisualCapture:
                 resolution=(540, 960),
                 annotators=["rgb"],
             )
+
+    def _seed_durable_completion(self) -> None:
+        """Mark request sequences durable-complete when every configured camera
+        already has a durable keyframe (F4.5 restart-safe completion)."""
+        for sequence in sorted({sequence for (sequence, _camera) in self._handled_cameras}):
+            if all(
+                (sequence, camera_name) in self._handled_cameras
+                for camera_name in self._sensors
+            ):
+                self._handled_sequences.add(sequence)
 
     @staticmethod
     def _rgb_image(value: Any):
@@ -197,6 +219,10 @@ class QualificationVisualCapture:
         for _ in range(2):
             self._render_update()
         for camera_name, sensor in self._sensors.items():
+            if (sequence, camera_name) in self._handled_cameras:
+                # F4.5: a camera already durably captured for this sequence is
+                # never re-captured (restart-safe partial completion).
+                continue
             rgb = None
             sensor_info: Mapping[str, Any] = {}
             for _ in range(30):
@@ -243,6 +269,15 @@ class QualificationVisualCapture:
                 )
                 stream.flush()
                 os.fsync(stream.fileno())
+            # Mark this camera durably handled only after its keyframe is
+            # fsync'd, so a crash between cameras leaves the missing camera
+            # re-capturable on restart.
+            self._handled_cameras.add((sequence, camera_name))
+        if all(
+            (sequence, camera_name) in self._handled_cameras
+            for camera_name in self._sensors
+        ):
+            self._handled_sequences.add(sequence)
 
     @staticmethod
     def _is_executor_diagnostic(record: Mapping[str, Any]) -> bool:
@@ -312,7 +347,16 @@ class QualificationVisualCapture:
             except (KeyError, TypeError, ValueError, RuntimeError) as error:
                 sequence = request.get("sequence")
                 self._errors.append(f"capture request {sequence!r} failed: {error}")
-                if isinstance(sequence, int):
+                if isinstance(sequence, int) and not any(
+                    (sequence, camera_name) in self._handled_cameras
+                    for camera_name in self._sensors
+                ):
+                    # F4.5: no camera was durably captured for this sequence, so
+                    # the failure is terminal for the request (e.g. gate
+                    # mismatch, bad timestamp, out-of-contract latency).  If at
+                    # least one camera was already durably captured, leave the
+                    # sequence unhandled so the missing cameras are retried on
+                    # the next poll/restart without duplicating completed ones.
                     self._handled_sequences.add(sequence)
                 continue
             self._handled_sequences.add(sequence)

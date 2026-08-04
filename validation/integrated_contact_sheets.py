@@ -398,10 +398,41 @@ def _validate_sheet_image(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _canonical_suite_event_order(index: Mapping[str, Any]) -> list[str]:
+    """Return the canonical required suite event sequence for the present kinds.
+
+    Mirrors the Gate-F validator's required order:
+    ``REQUIRED_POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS`` for the kinds
+    present in the suite (F4.3).  A production CLI sheet embeds exactly this
+    ordered event sequence so ``validate_gate_f`` accepts a real generated sheet.
+    """
+    kinds = set(index.get("scenario_kinds") or [])
+    order: list[str] = []
+    if "positive" in kinds:
+        order.extend(REQUIRED_POSITIVE_EVENTS)
+    if "cancel" in kinds:
+        order.extend(CANCEL_EVENTS)
+    if "safety" in kinds:
+        order.extend(SAFETY_EVENTS)
+    return order
+
+
 def _all_bound_capture_entries(suite_dir: Path) -> list[dict[str, Any]]:
+    """Select one bound capture per visual event in the canonical suite order.
+
+    Bound captures are ordered by the required suite event sequence
+    (positive -> cancel -> safety), not by index path order; within an event the
+    deterministic camera/path ordering is preserved.  Unknown visual event
+    identities (not part of the canonical required suite for the present kinds)
+    are rejected instead of silently placed, and an event whose bound captures
+    carry conflicting scenario/attempt identities is rejected as a duplicate
+    event identity.
+    """
     index = _load_index(suite_dir)
+    order = _canonical_suite_event_order(index)
+    known = set(order)
     entries: list[dict[str, Any]] = []
-    seen_events: set[str] = set()
+    by_event: dict[str, list[dict[str, Any]]] = {}
     for entry in index.get("files", []):
         if (
             isinstance(entry, Mapping)
@@ -410,10 +441,23 @@ def _all_bound_capture_entries(suite_dir: Path) -> list[dict[str, Any]]:
             and isinstance(entry.get("event"), str)
         ):
             event = entry["event"]
-            if event in seen_events:
-                continue
-            seen_events.add(event)
-            entries.append(dict(entry))
+            if event not in known:
+                raise ValueError(f"unknown visual event identity in evidence index: {event!r}")
+            by_event.setdefault(event, []).append(dict(entry))
+    for event in order:
+        captures = by_event.get(event, [])
+        if not captures:
+            continue
+        scenarios = {capture.get("scenario") for capture in captures}
+        attempts = {capture.get("attempt") for capture in captures}
+        if len(scenarios) != 1 or len(attempts) != 1:
+            raise ValueError(
+                f"duplicate visual event identity in evidence index: {event!r} "
+                f"is bound to multiple scenario/attempt transactions"
+            )
+        # Deterministic camera/path ordering within the event.
+        captures.sort(key=lambda capture: (capture.get("camera") or "", capture["path"]))
+        entries.append(captures[0])
     return entries
 
 
