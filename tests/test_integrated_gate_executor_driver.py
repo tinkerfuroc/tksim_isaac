@@ -23,6 +23,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "validation"))
 sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
+sys.path.insert(0, str(ROOT / "simulation"))
 
 import integrated_gate_executor_driver as d  # noqa: E402
 from integrated_gate_executor import (  # noqa: E402
@@ -619,3 +620,221 @@ def test_derived_terminal_timeout_malformed_fails_closed():
                 }
             }
         )
+
+
+# --------------------------------------------------------------------------- #
+# F3.7 — pure layer stays pure: double-parameter records and duck-typed results
+# --------------------------------------------------------------------------- #
+
+def test_double_parameter_is_a_plain_pure_dict():
+    record = d._double_parameter("post_grasp_lift_m", 0.10)
+    assert type(record) is dict
+    assert record == {"name": "post_grasp_lift_m", "value": 0.10}
+    # The pure layer never fabricates an rclpy object and stays import-safe.
+    assert "rclpy" not in sys.modules
+
+
+def test_double_parameter_coerces_name_and_value():
+    record = d._double_parameter(123, "0.5")
+    assert record == {"name": "123", "value": 0.5}
+
+
+def test_set_result_ok_duck_typing_is_exact():
+    class Ok:
+        successful = True
+
+    class Bad:
+        successful = False
+
+    assert d._set_result_ok(Ok()) is True
+    assert d._set_result_ok(Bad()) is False
+    assert d._set_result_ok([Ok()]) is True
+    assert d._set_result_ok([Bad()]) is False
+    assert d._set_result_ok([]) is False
+    assert d._set_result_ok({"successful": True}) is True
+    assert d._set_result_ok({"successful": False}) is False
+    assert d._set_result_ok(None) is False
+    assert d._set_result_ok(True) is True
+    assert d._set_result_ok(False) is False
+
+
+def test_extract_double_accepts_response_values_and_plain_records():
+    class ParamValue:
+        type = 3  # rcl_interfaces PARAMETER_DOUBLE
+        double_value = 0.10
+
+    class GetResponse:
+        values = [ParamValue()]
+
+    assert d._extract_double(GetResponse(), "post_grasp_lift_m") == 0.10
+    assert d._extract_double({"value": 0.3}, "x") == 0.3
+
+    class AttrValue:
+        value = 0.5
+
+    assert d._extract_double(AttrValue(), "x") == 0.5
+
+
+def _get_response(values):
+    class GetResponse:
+        pass
+
+    response = GetResponse()
+    response.values = values
+    return response
+
+
+class _ParamValue:
+    def __init__(self, type_, double_value=None):
+        self.type = type_
+        self.double_value = double_value
+
+
+def test_extract_double_fails_closed_on_non_double():
+    assert d._extract_double(None, "x") is None
+    assert d._extract_double(float("nan"), "x") is None
+    assert d._extract_double(float("inf"), "x") is None
+    assert d._extract_double(True, "x") is None
+    assert d._extract_double(_get_response([]), "x") is None
+    # Wrong parameter type (not PARAMETER_DOUBLE) fails closed.
+    assert d._extract_double(_get_response([_ParamValue(1, 0.1)]), "x") is None
+    # Non-finite / boolean double values fail closed.
+    assert d._extract_double(_get_response([_ParamValue(3, float("nan"))]), "x") is None
+    assert d._extract_double(_get_response([_ParamValue(3, True)]), "x") is None
+    # Missing values entirely fails closed.
+    assert d._extract_double(_get_response(None), "x") is None
+
+
+# --------------------------------------------------------------------------- #
+# F3.1/F3.2 — bundle committed-identity binding stays fail-closed
+# --------------------------------------------------------------------------- #
+
+def test_build_executor_scenario_missing_committed_identity_fails_closed():
+    bundle = _bundle()
+    for missing in (
+        "report_identities",
+        "integrated",
+        "planning_scene_declaration",
+        "planning_scene",
+        "scenario",
+    ):
+        variant = dict(bundle)
+        del variant[missing]
+        with pytest.raises(d.DriverError):
+            d.build_executor_scenario(variant)
+
+
+# --------------------------------------------------------------------------- #
+# Option A+ — qualification-only occupancy from committed scenario geometry
+# --------------------------------------------------------------------------- #
+
+import run_sim as rs  # noqa: E402
+
+
+def test_build_occupancy_dimensions_origin_and_footprint():
+    import math
+
+    obj = {
+        "id": "sim_fixture/pedestal",
+        "primitive": {"type": "box", "dimensions": [0.12, 0.12, 0.6]},
+        "pose": {"xyz": [0.65, 0.0, 0.3], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    m = rs.build_occupancy_from_planning_scene([obj], resolution=0.05, half_extent=60.0)
+    assert m.width == 2400
+    assert m.height == 2400
+    assert m.resolution == 0.05
+    assert m.origin_x == -60.0
+    assert m.origin_y == -60.0
+    assert m.occupied_at_world(0.65, 0.0) is True
+    assert m.occupied_at_world(-4.0, -4.0) is False
+    rects = m.rectangles()
+    assert len(rects) == 1
+    cx, cy, sx, sy = rects[0]
+    assert abs(cx - 0.65) < 0.1
+    assert abs(cy) < 0.1
+    assert 0.10 <= sx <= 0.20
+    assert 0.10 <= sy <= 0.20
+    # A 40 m ray from the origin toward +x (where the pedestal sits) is
+    # blocked well before the lidar range; the boundary is never a fake
+    # obstacle within range.
+    hit = m.raycast(0.0, 0.0, 0.0, minimum=0.3, maximum=40.0)
+    assert math.isfinite(hit)
+    assert 0.3 <= hit <= 1.0
+    # A ray in free space reaches the map limit without a fake obstacle.
+    free = m.raycast(0.0, 0.0, math.pi / 2.0, minimum=0.3, maximum=40.0)
+    assert free == float("inf")
+
+
+def test_build_occupancy_rejects_malformed_fixture_geometry():
+    base = {
+        "id": "f",
+        "primitive": {"type": "box", "dimensions": [0.1, 0.1, 0.1]},
+        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    # Non-box primitive is rejected, never silently invented.
+    bad = {**base, "primitive": {"type": "cylinder", "dimensions": [0.1, 0.1, 0.1]}}
+    with pytest.raises(ValueError, match="unsupported qualification fixture"):
+        rs.build_occupancy_from_planning_scene([bad])
+    # Non-axis-aligned quaternion is rejected.
+    bad = {
+        **base,
+        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.707, 0.707]},
+    }
+    with pytest.raises(ValueError, match="axis-aligned"):
+        rs.build_occupancy_from_planning_scene([bad])
+    # Non-positive dimensions are rejected.
+    bad = {**base, "primitive": {"type": "box", "dimensions": [0.0, 0.1, 0.1]}}
+    with pytest.raises(ValueError, match="positive"):
+        rs.build_occupancy_from_planning_scene([bad])
+    # Non-finite values are rejected.
+    bad = {
+        **base,
+        "pose": {"xyz": [float("nan"), 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    with pytest.raises(ValueError, match="finite"):
+        rs.build_occupancy_from_planning_scene([bad])
+    # Missing pose is rejected.
+    bad = {"id": "f", "primitive": {"type": "box", "dimensions": [0.1, 0.1, 0.1]}}
+    with pytest.raises(ValueError, match="no pose"):
+        rs.build_occupancy_from_planning_scene([bad])
+
+
+def test_build_occupancy_rejects_bad_grid_parameters():
+    obj = {
+        "id": "f",
+        "primitive": {"type": "box", "dimensions": [0.1, 0.1, 0.1]},
+        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    with pytest.raises(ValueError, match="resolution"):
+        rs.build_occupancy_from_planning_scene([obj], resolution=0.0)
+    with pytest.raises(ValueError, match="resolution"):
+        rs.build_occupancy_from_planning_scene([obj], resolution=True)
+    # The half-extent must exceed the 40 m lidar range.
+    with pytest.raises(ValueError, match="lidar range"):
+        rs.build_occupancy_from_planning_scene([obj], half_extent=40.0)
+    with pytest.raises(ValueError, match="lidar range"):
+        rs.build_occupancy_from_planning_scene([obj], half_extent=41.0)
+
+
+def test_qualification_occupancy_resolves_committed_scenario():
+    # The free-space scenario has no PlanningScene boxes → no occupancy map.
+    assert rs.qualification_occupancy(ROOT, "qualification-free-space") is None
+    # The positive E scenario has box fixtures → a deterministic occupancy map.
+    m = rs.qualification_occupancy(ROOT, "qualification-pick-place-positive")
+    assert m is not None
+    assert m.resolution == 0.05
+    assert m.occupied_at_world(0.65, 0.0) is True
+    assert m.occupied_at_world(0.85, 0.0) is True
+    assert m.occupied_at_world(-4.0, -4.0) is False
+
+
+def test_gateway_lidar_enabled_resolution_is_exact():
+    # navigation-parity always enables the development lidar (unchanged).
+    assert rs.gateway_lidar_enabled("navigation-parity", False) is True
+    assert rs.gateway_lidar_enabled("navigation-parity", True) is True
+    # manipulation-core enables it only under --qualification.
+    assert rs.gateway_lidar_enabled("manipulation-core", True) is True
+    assert rs.gateway_lidar_enabled("manipulation-core", False) is False
+    # Any other profile stays disabled.
+    assert rs.gateway_lidar_enabled("streaming", True) is False
+    assert rs.gateway_lidar_enabled("manipulation-cumotion", True) is False

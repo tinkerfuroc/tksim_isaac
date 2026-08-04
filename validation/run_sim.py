@@ -62,6 +62,151 @@ def _expected_scenario_objects(root: Path, scenario_name: str) -> dict[str, dict
     return expected
 
 
+# --------------------------------------------------------------------------- #
+# Task-8 fix round 3 (Option A+): qualification-only occupancy for the
+# development LiDAR.  For ``manipulation-core`` runs with ``--qualification``,
+# a pure 2-D ``OccupancyMap`` is built from the committed scenario
+# ``planning_scene.objects`` box footprints in world coordinates.  The grid is
+# a fixed deterministic resolution with a generous half-extent (well beyond the
+# 40 m development-lidar range) so a 40 m ray never reaches the map boundary:
+# out-of-bounds is never a fake obstacle.  Ordinary ``manipulation-core``
+# without ``--qualification`` keeps ``backend.occupancy is None`` and
+# ``development_lidar=False``; navigation-parity is unchanged.
+# --------------------------------------------------------------------------- #
+
+#: Development-lidar raycast maximum in the simulator gateway (meters).
+_LIDAR_MAX_RANGE_M = 40.0
+#: Grid resolution used for the qualification occupancy map.
+_OCCUPANCY_RESOLUTION_M = 0.05
+#: Half-extent of the square world-frame occupancy grid.  With the robot at the
+#: canonical origin and the lidar 0.12 m ahead of base, a 40 m ray reaches at
+#: most ~40.13 m from the origin, so a 60 m half-extent guarantees the map
+#: boundary is never reached within the lidar range.
+_OCCUPANCY_HALF_EXTENT_M = 60.0
+
+
+def build_occupancy_from_planning_scene(
+    objects: list[dict[str, object]],
+    *,
+    resolution: float = _OCCUPANCY_RESOLUTION_M,
+    half_extent: float = _OCCUPANCY_HALF_EXTENT_M,
+) -> object:
+    """Build a pure deterministic ``OccupancyMap`` from scenario box footprints.
+
+    Every PlanningScene object must be an axis-aligned box (``primitive.type ==
+    "box"`` with three finite positive ``dimensions`` and an identity
+    quaternion); any other or malformed fixture geometry is rejected rather
+    than silently inventing occupancy.  The XY footprint of each box is marked
+    occupied.  The map covers ``[-half_extent, half_extent]^2`` in world
+    coordinates so the full 40 m lidar range stays inside bounds.
+    """
+    import math
+
+    from tinker_sim_core.occupancy import OccupancyMap
+
+    if isinstance(resolution, bool) or not isinstance(resolution, (int, float)) or not math.isfinite(float(resolution)) or float(resolution) <= 0.0:
+        raise ValueError("occupancy resolution must be finite and positive")
+    if isinstance(half_extent, bool) or not isinstance(half_extent, (int, float)) or not math.isfinite(float(half_extent)) or float(half_extent) <= 0.0:
+        raise ValueError("occupancy half_extent must be finite and positive")
+    resolution = float(resolution)
+    half_extent = float(half_extent)
+    if half_extent <= _LIDAR_MAX_RANGE_M + 2.0:
+        raise ValueError("occupancy half_extent must exceed the 40 m lidar range")
+    width = int(round(2.0 * half_extent / resolution))
+    height = int(round(2.0 * half_extent / resolution))
+    origin_x = -half_extent
+    origin_y = -half_extent
+    occupied: list[list[bool]] = [[False] * width for _ in range(height)]
+
+    def _finite_vector(values: object, *, length: int, name: str) -> list[float]:
+        if not isinstance(values, (list, tuple)) or len(values) != length:
+            raise ValueError(f"{name} must be a sequence of {length} finite values")
+        converted = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be finite")
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"{name} must be finite")
+            converted.append(number)
+        return converted
+
+    for record in objects:
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+            raise ValueError("planning_scene object must carry an id string")
+        primitive = record.get("primitive")
+        if not isinstance(primitive, dict) or primitive.get("type") != "box":
+            raise ValueError(f"unsupported qualification fixture primitive for {record.get('id')!r}")
+        dimensions = _finite_vector(primitive.get("dimensions"), length=3, name="box dimensions")
+        if any(value <= 0.0 for value in dimensions):
+            raise ValueError(f"box dimensions must be positive for {record.get('id')!r}")
+        pose = record.get("pose")
+        if not isinstance(pose, dict):
+            raise ValueError(f"box fixture {record.get('id')!r} has no pose")
+        xyz = _finite_vector(pose.get("xyz"), length=3, name="pose xyz")
+        quaternion = _finite_vector(pose.get("quaternion_xyzw"), length=4, name="pose quaternion")
+        qx, qy, qz, qw = quaternion
+        if abs(qx) > 1.0e-6 or abs(qy) > 1.0e-6 or abs(qz) > 1.0e-6 or abs(qw - 1.0) > 1.0e-3:
+            raise ValueError(
+                f"only axis-aligned box fixtures are supported for occupancy ({record.get('id')!r})"
+            )
+        half_x = dimensions[0] / 2.0
+        half_y = dimensions[1] / 2.0
+        gx0 = max(int((xyz[0] - half_x - origin_x) // resolution), 0)
+        gx1 = min(int((xyz[0] + half_x - origin_x) // resolution), width - 1)
+        gy0 = max(int((xyz[1] - half_y - origin_y) // resolution), 0)
+        gy1 = min(int((xyz[1] + half_y - origin_y) // resolution), height - 1)
+        if gx0 > gx1 or gy0 > gy1:
+            continue
+        for gy in range(gy0, gy1 + 1):
+            row = occupied[gy]
+            for gx in range(gx0, gx1 + 1):
+                row[gx] = True
+    return OccupancyMap(
+        width,
+        height,
+        resolution,
+        origin_x,
+        origin_y,
+        tuple(tuple(row) for row in occupied),
+    )
+
+
+def qualification_occupancy(root: Path, scenario_name: str) -> object | None:
+    """Return the qualification-only ``OccupancyMap`` for the committed scenario.
+
+    ``None`` for ``"empty"`` and for scenarios without PlanningScene box
+    geometry; a deterministic map from the scenario ``planning_scene.objects``
+    otherwise.  Malformed/unsupported fixture geometry raises (never silently
+    invents occupancy).
+    """
+    if scenario_name == "empty":
+        return None
+    sys.path.insert(0, str(root / "simulation"))
+    from tinker_sim_core.scenario import load_named_scenario
+
+    scenario = load_named_scenario(root, scenario_name)
+    planning_scene = scenario.planning_scene
+    objects = planning_scene.get("objects", ()) if isinstance(planning_scene, dict) else ()
+    if not objects:
+        return None
+    return build_occupancy_from_planning_scene(list(objects))
+
+
+def gateway_lidar_enabled(sensor_profile: str, qualification: bool) -> bool:
+    """Resolve the development-lidar gateway flag per sensor profile.
+
+    navigation-parity always enables development LiDAR (unchanged).  Only
+    ``manipulation-core`` qualification runs enable it; ordinary
+    ``manipulation-core`` and other profiles keep it disabled.
+    """
+    if sensor_profile == "navigation-parity":
+        return True
+    if sensor_profile == "manipulation-core":
+        return bool(qualification)
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -148,7 +293,10 @@ def main() -> int:
             if args.ros:
                 from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
-                gateway = RosStandardGateway(backend, development_lidar=True)
+                gateway = RosStandardGateway(
+                    backend,
+                    development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
+                )
             print(
                 json.dumps(
                     {
@@ -235,10 +383,18 @@ def main() -> int:
             )
             if backend.physics_device != "cpu":
                 raise RuntimeError("manipulation-core selected a non-CPU physics device")
+            # Task-8 fix round 3 (Option A+): qualification-only occupancy for
+            # the development LiDAR.  Ordinary manipulation-core keeps
+            # ``backend.occupancy is None`` and ``development_lidar=False``.
+            if args.qualification:
+                backend.occupancy = qualification_occupancy(root, args.scenario)
             if args.ros:
                 from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
-                gateway = RosStandardGateway(backend)
+                gateway = RosStandardGateway(
+                    backend,
+                    development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
+                )
             if args.qualification:
                 from tinker_sim_isaac.qualification_visual_capture import (
                     QualificationVisualCapture,
