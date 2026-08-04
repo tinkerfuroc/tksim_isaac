@@ -5149,7 +5149,16 @@ class IntegratedGateExecutor:
                     execute_error=f"execution-start journal snapshot rejected: {snap}",
                     journal_issues=[snap],
                 )
-            self._append_visual_event("cancel-execution-start", scenario_id)
+            _visual_event_status = self._append_visual_event("cancel-execution-start", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'cancel-execution-start' rejected: {_visual_event_status}",
+                    goals_canceling=[execute_goal_id] if execute_goal_id is not None else [],
+                )
 
             # F1.2: a cancel pass is impossible without the exact live
             # ExecuteTrajectory ClientGoalHandle.  Raw UUID kwargs or provider
@@ -5251,7 +5260,17 @@ class IntegratedGateExecutor:
                     journal_issues=[snap], goals_canceling=goals_canceling,
                     cancel_response=cancel_response,
                 )
-            self._append_visual_event("cancel-trigger", scenario_id)
+            _visual_event_status = self._append_visual_event("cancel-trigger", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'cancel-trigger' rejected: {_visual_event_status}",
+                    goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                )
 
             # F1.2: require the ExecuteTrajectory action result terminal CANCELED (5).
             action_status, action_status_string = self._wait_execute_result_status(
@@ -5372,7 +5391,21 @@ class IntegratedGateExecutor:
                         "execute_result_status_string": action_status_string,
                     },
                 )
-            self._append_visual_event("cancel-velocity-compliant", scenario_id)
+            _visual_event_status = self._append_visual_event("cancel-velocity-compliant", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'cancel-velocity-compliant' rejected: {_visual_event_status}",
+                    goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
+                )
             event_log.append("teardown")
             snap = self._journal_snapshot_d("teardown")
             if snap != "recorded":
@@ -5389,7 +5422,21 @@ class IntegratedGateExecutor:
                         "execute_result_status_string": action_status_string,
                     },
                 )
-            self._append_visual_event("cancel-terminal", scenario_id)
+            _visual_event_status = self._append_visual_event("cancel-terminal", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'cancel-terminal' rejected: {_visual_event_status}",
+                    goals_canceling=goals_canceling,
+                    cancel_response=cancel_response,
+                    execute_outcome={
+                        "execute_result_status": action_status,
+                        "execute_result_status_string": action_status_string,
+                    },
+                )
             return self._finalize_d_attempt(
                 scenario_id, spec, None, None, "diagnostic-pass",
                 readiness, start_wall, event_log=event_log,
@@ -5553,7 +5600,15 @@ class IntegratedGateExecutor:
                     execute_error=f"execution-start journal snapshot rejected: {snap}",
                     journal_issues=[snap],
                 )
-            self._append_visual_event("safety-execution-start", scenario_id)
+            _visual_event_status = self._append_visual_event("safety-execution-start", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'safety-execution-start' rejected: {_visual_event_status}",
+                )
 
             # F1.4/F1.3: the safety interruption must target a transaction that
             # actually started — FJT EXECUTING(2) joined and a fresh joint frame
@@ -5612,7 +5667,15 @@ class IntegratedGateExecutor:
                     execute_error=f"effective-stop journal snapshot rejected: {snap}",
                     journal_issues=[snap],
                 )
-            self._append_visual_event("safety-trigger", scenario_id)
+            _visual_event_status = self._append_visual_event("safety-trigger", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'safety-trigger' rejected: {_visual_event_status}",
+                )
 
             # F1.3: the old ExecuteTrajectory/FJT transaction must reach ABORTED
             # (6) after the safety assertion.  The provider evidence and its join
@@ -5717,7 +5780,16 @@ class IntegratedGateExecutor:
                     execute_error=f"operator-clear journal snapshot rejected: {snap}",
                     journal_issues=[snap], fjt_evidence=provider_evidence,
                 )
-            self._append_visual_event("safety-velocity-compliant", scenario_id)
+            _visual_event_status = self._append_visual_event("safety-velocity-compliant", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'safety-velocity-compliant' rejected: {_visual_event_status}",
+                    fjt_evidence=provider_evidence,
+                )
 
             # F1.4/M2: bounded post-clear stability — no fresh goal UUID, all
             # velocities bounded, and every arm-joint position within
@@ -5779,7 +5851,16 @@ class IntegratedGateExecutor:
                     execute_error=f"teardown journal snapshot rejected: {snap}",
                     journal_issues=[snap], fjt_evidence=provider_evidence,
                 )
-            self._append_visual_event("safety-post-clear", scenario_id)
+            _visual_event_status = self._append_visual_event("safety-post-clear", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error=f"visual event 'safety-post-clear' rejected: {_visual_event_status}",
+                    fjt_evidence=provider_evidence,
+                )
             return self._finalize_d_attempt(
                 scenario_id, spec, None, None, "diagnostic-pass",
                 readiness, start_wall, event_log=event_log,
@@ -6464,6 +6545,7 @@ class IntegratedGateExecutor:
         """
         self._visual_event_sequence = 0
         self._emitted_visual_events.clear()
+        self._visual_event_failures = []
         self._last_join_key = None
 
     def _e_reset_attempt_state(self) -> None:
@@ -7321,7 +7403,15 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=0,
             )
         event_log.append("before-pick")
-        self._append_visual_event("cancel-execution-start", scenario_id)
+        _visual_event_status = self._append_visual_event("cancel-execution-start", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'cancel-execution-start' rejected: {_visual_event_status}",
+                pick_goal_sent=False, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=0,
+            )
         self._append_visual_request("before-pick", scenario_id, spec, kind="gate-e-diagnostic")
         try:
             goal = self._e_pick_goal(spec)
@@ -7420,7 +7510,16 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, trigger=trigger,
             )
         event_log.append("cancel-requested")
-        self._append_visual_event("cancel-trigger", scenario_id)
+        _visual_event_status = self._append_visual_event("cancel-trigger", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'cancel-trigger' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+            )
         cancel_response = self._cancel_execute_goal(
             outcome["goal_handle"],
             expected_goal_uuid=pick_goal_id or "",
@@ -7490,7 +7589,19 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("quiescent")
-        self._append_visual_event("cancel-velocity-compliant", scenario_id)
+        _visual_event_status = self._append_visual_event("cancel-velocity-compliant", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'cancel-velocity-compliant' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+                cancel_response=cancel_response,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
+            )
         teardown_status = self._e_record_snapshot("teardown")
         if teardown_status != "recorded":
             return self._finalize_e_attempt(
@@ -7505,7 +7616,19 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("teardown")
-        self._append_visual_event("cancel-terminal", scenario_id)
+        _visual_event_status = self._append_visual_event("cancel-terminal", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'cancel-terminal' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+                cancel_response=cancel_response,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
+            )
         return self._finalize_e_attempt(
             scenario_id, spec, readiness, start_wall, "diagnostic-pass",
             event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
@@ -7688,7 +7811,15 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=0,
             )
         event_log.append("before-pick")
-        self._append_visual_event("safety-execution-start", scenario_id)
+        _visual_event_status = self._append_visual_event("safety-execution-start", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'safety-execution-start' rejected: {_visual_event_status}",
+                pick_goal_sent=False, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=0,
+            )
         self._append_visual_request("before-pick", scenario_id, spec, kind="gate-e-diagnostic")
         try:
             goal = self._e_pick_goal(spec)
@@ -7782,7 +7913,16 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, trigger=trigger,
             )
         event_log.append("effective-stop")
-        self._append_visual_event("safety-trigger", scenario_id)
+        _visual_event_status = self._append_visual_event("safety-trigger", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'safety-trigger' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+            )
         trigger["operator_published"] = list(operator_published)
         # F1.4: boundedly await the exact safety-stopped Pick terminal.  Current
         # production semantics: interruption_result maps a SafetyStop interrupt to
@@ -7841,7 +7981,18 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("operator-clear")
-        self._append_visual_event("safety-velocity-compliant", scenario_id)
+        _visual_event_status = self._append_visual_event("safety-velocity-compliant", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'safety-velocity-compliant' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
+            )
         if not self._e_wait_quiescent(baseline):
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
@@ -7879,7 +8030,18 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("teardown")
-        self._append_visual_event("safety-post-clear", scenario_id)
+        _visual_event_status = self._append_visual_event("safety-post-clear", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'safety-post-clear' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, trigger=trigger,
+                task_result_status=interrupted_result_status,
+                terminal_status=interrupted_terminal_status,
+            )
         return self._finalize_e_attempt(
             scenario_id, spec, readiness, start_wall, "diagnostic-pass",
             event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
@@ -8348,8 +8510,16 @@ class IntegratedGateExecutor:
             return prepared
         fixture_ready_recorded = True
         event_log.append("fixture-ready")
-        self._append_visual_event("readiness", scenario_id)
         readiness = prepared["readiness"]
+        _visual_event_status = self._append_visual_event("readiness", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'readiness' rejected: {_visual_event_status}",
+                pick_goal_sent=False, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=0,
+            )
 
         before_pick = self._e_record_snapshot("before-pick")
         if before_pick != "recorded":
@@ -8361,7 +8531,15 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=0,
             )
         event_log.append("before-pick")
-        self._append_visual_event("approach", scenario_id)
+        _visual_event_status = self._append_visual_event("approach", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'approach' rejected: {_visual_event_status}",
+                pick_goal_sent=False, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=0,
+            )
         self._append_visual_request("before-pick", scenario_id, spec, kind="gate-e-diagnostic")
         try:
             pick_goal = self._e_pick_goal(spec)
@@ -8436,8 +8614,30 @@ class IntegratedGateExecutor:
                 )
             event_log.append(label)
             if label == "scene-attach":
-                self._append_visual_event("bilateral-contact", scenario_id)
-        self._append_visual_event("attached-transport", scenario_id)
+                _visual_event_status = self._append_visual_event("bilateral-contact", scenario_id)
+                if _visual_event_status != "recorded":
+                    return self._finalize_e_attempt(
+                        scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                        event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                        task_error=f"visual event 'bilateral-contact' rejected: {_visual_event_status}",
+                        pick_goal_sent=True, place_goal_sent=False,
+                        place_goal_accepted=False, goals_sent=1,
+                        pick_goal_id=pick_goal_id, task_result_status=pick_status,
+                        terminal_status=pick_result.get("terminal_status"),
+                        trigger=transport_trigger,
+                    )
+        _visual_event_status = self._append_visual_event("attached-transport", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'attached-transport' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, task_result_status=pick_status,
+                terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
+            )
         before_release = self._e_record_snapshot("before-release")
         if before_release != "recorded":
             return self._finalize_e_attempt(
@@ -8451,7 +8651,18 @@ class IntegratedGateExecutor:
                 trigger=transport_trigger,
             )
         event_log.append("before-release")
-        self._append_visual_event("place-target", scenario_id)
+        _visual_event_status = self._append_visual_event("place-target", scenario_id)
+        if _visual_event_status != "recorded":
+            return self._finalize_e_attempt(
+                scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                task_error=f"visual event 'place-target' rejected: {_visual_event_status}",
+                pick_goal_sent=True, place_goal_sent=False,
+                place_goal_accepted=False, goals_sent=1,
+                pick_goal_id=pick_goal_id, task_result_status=pick_status,
+                terminal_status=pick_result.get("terminal_status"),
+                trigger=transport_trigger,
+            )
         try:
             place_goal = self._e_place_goal(spec)
         except Exception as exc:
@@ -8540,9 +8751,21 @@ class IntegratedGateExecutor:
                 )
             event_log.append(label)
             if label == "released-settled":
-                self._append_visual_event("released-settled", scenario_id)
+                _visual_event_status = self._append_visual_event("released-settled", scenario_id)
             elif label == "teardown":
-                self._append_visual_event("terminal", scenario_id)
+                _visual_event_status = self._append_visual_event("terminal", scenario_id)
+            if _visual_event_status != "recorded":
+                return self._finalize_e_attempt(
+                    scenario_id, spec, readiness, start_wall, "evidence-invalid",
+                    event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
+                    task_error=f"visual event '{label}' rejected: {_visual_event_status}",
+                    pick_goal_sent=True, place_goal_sent=True,
+                    place_goal_accepted=place_goal_accepted, goals_sent=2,
+                    pick_goal_id=pick_goal_id, place_goal_id=place_goal_id,
+                    task_result_status=place_status,
+                    terminal_status=place_result.get("terminal_status"),
+                    trigger=transport_trigger,
+                )
         return self._finalize_e_attempt(
             scenario_id, spec, readiness, start_wall, "diagnostic-pass",
             event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
@@ -9965,17 +10188,27 @@ class IntegratedGateExecutor:
         ``"rejected: <exc>"``).  A required event is never emitted before its
         durable journal checkpoint exists (the caller emits strictly after the
         corresponding journal snapshot/diff succeeds).
+
+        F3.9: every non-``"recorded"`` status is also appended to
+        ``self._visual_event_failures`` (per-attempt, reset by
+        ``_reset_visual_event_state``) so the fail-dominant routing and any
+        diagnostic trail can observe exactly which required visual event was
+        rejected and how.
         """
         if event in self._emitted_visual_events:
+            self._visual_event_failures.append((event, "duplicate"))
             return "duplicate"
         if self._last_join_key is None:
+            self._visual_event_failures.append((event, "no-join-key"))
             return "no-join-key"
         _frame_index, timestamp = self._last_join_key
         try:
             timestamp = float(timestamp)
         except (TypeError, ValueError):
+            self._visual_event_failures.append((event, "invalid-timestamp"))
             return "invalid-timestamp"
         if not math.isfinite(timestamp) or timestamp < 0.0:
+            self._visual_event_failures.append((event, "invalid-timestamp"))
             return "invalid-timestamp"
         self._visual_event_sequence += 1
         record = {
@@ -9989,7 +10222,9 @@ class IntegratedGateExecutor:
         try:
             self._append_jsonl(self.attempt_dir / "visual-capture-requests.jsonl", record)
         except (OSError, ValueError, TypeError) as exc:
-            return f"rejected: {exc}"
+            status = f"rejected: {exc}"
+            self._visual_event_failures.append((event, status))
+            return status
         self._emitted_visual_events.add(event)
         return "recorded"
 

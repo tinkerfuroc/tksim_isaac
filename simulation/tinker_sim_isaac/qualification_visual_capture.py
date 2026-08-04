@@ -72,6 +72,20 @@ class QualificationVisualCapture:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.records_path = attempt_dir / "visual-keyframes.jsonl"
         self._handled_sequences: set[int] = set()
+        # F3.4: at-most-once must survive a consumer process restart.  Seed the
+        # already-handled request sequences from the durable keyframe journal so
+        # a restarted consumer never re-captures an already captured sequence.
+        if self.records_path.is_file():
+            try:
+                for line in self.records_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    sequence = record.get("request_sequence")
+                    if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0:
+                        self._handled_sequences.add(sequence)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
         self._records: list[dict[str, Any]] = []
         self._errors: list[str] = []
         self._reported_error_keys: set[tuple] = set()

@@ -314,6 +314,47 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 3 — "make integrated
+  evidence production-real"): Closed the two real-schema blockers so Gate F can
+  accept genuine live artifacts and added the direct env/producer/consumer/
+  end-to-end producer tests.  `validation/integrated_evidence_index.py` now
+  parses the real nonempty RTX GPU inventory in `resource-cleanup.json`
+  (baseline/final `gpus` are the physical inventory, not survivor lists) and
+  recomputes cleanup `clean` from baseline/final availability, owned live PIDs,
+  owned GPU survivors, unexplained memory, and termination state, with GPU
+  topology invariance on the producer's stable `uuid`/`index` identity keys
+  (F3.1); it accepts the real nested `repositories.production`/.simulator
+  mapping plus scalar `repositories.path_scope` and the real source-lock status
+  while still requiring lowercase 40-hex identities (F3.2); it computes required
+  visual events per exact attempt/scenario so no cancel/safety sibling satisfies
+  another and events split across siblings fail, with contact-sheet embedded
+  events equal to the complete required suite sequence (F3.3); it cross-checks
+  keyframe `requested_simulated_timestamp`/`requested_physics_frame_index`/
+  `execution_event_sequence` against the canonical request within the strict
+  numerical tolerance and keeps `capture_latency_frames` in
+  `[0, MAX_CAPTURE_LATENCY_FRAMES]` (F3.5); it binds manifest/config/model/
+  source/attempt/verdict identities and fails on a missing enclosing manifest
+  (F3.6); `validation/integrated_contact_sheets.py` rejects output equal to any
+  indexed evidence artifact before any overwrite (F3.7); rosbag QoS is parsed
+  from the real YAML profiles (reliability/depth, recorder override) and every
+  metadata-listed storage file must exist and be nonempty with no extra
+  conflicting storage (F3.8).  `validation/integrated_gate_executor.py` makes
+  every `_append_visual_event` producer failure fail-dominant: duplicate,
+  no-join-key, invalid-timestamp, and rejected append all route the D/E attempt
+  to `evidence-invalid` with the exact rejected event (F3.9), and
+  `manipulation_qualification.py::_env` rejects a present-but-noncanonical
+  integrated scenario id against `QUALIFICATION_SCENARIO_NAMES` before launch
+  (F3.10).  `simulation/tinker_sim_isaac/qualification_visual_capture.py` seeds
+  its handled-sequence set from the durable `visual-keyframes.jsonl` so a
+  restarted consumer never re-captures (F3.4).  New direct tests drive the real
+  runner env, real executor producer, real capture consumer, and one true
+  integrated producer path (executor → consumer → index/sheets/summary → Gate F
+  `verified-pass`) plus a diagnostic-only journal fail-closed test.  `_image_stats`
+  thresholds still require live RTX calibration; Task 10 must wire Gate F and
+  launch/finalize a load-bearing integrated rosbag; no live Isaac/camera/rosbag/
+  GPU run occurred in this repair; the future qualification tooling lock remains
+  absent until after review-clean Task 10.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 2 — "produce integrated
   visual evidence"): Produced the canonical visual-capture evidence end-to-end
   and closed the validator's semantic gaps.  The integrated executor

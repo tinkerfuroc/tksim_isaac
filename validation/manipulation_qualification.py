@@ -1102,6 +1102,18 @@ class QualificationRunner:
                     "attempt manifest; missing/malformed scenario identity fails "
                     "closed before child launch"
                 )
+            # F3.10: reject a present-but-noncanonical integrated scenario id
+            # using the current scenario contract (the committed canonical
+            # qualification scenario names), not a string-prefix heuristic.
+            from validation.integrated_qualification import (  # noqa: PLC0415
+                QUALIFICATION_SCENARIO_NAMES,
+            )
+
+            if scenario_id not in QUALIFICATION_SCENARIO_NAMES:
+                raise ValueError(
+                    f"integrated Isaac child scenario id {scenario_id!r} is not a "
+                    "canonical qualification scenario; failing closed before launch"
+                )
             qualification_gate = scenario_id
             visual_evidence = "1"
         environment.update(
