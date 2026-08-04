@@ -213,7 +213,7 @@ AGENT_SHEET_NAME = "contact-sheet-integrated-agent.png"
 USER_SHEET_NAME = "contact-sheet-integrated-user.png"
 
 DEFAULT_CONFIG = ROOT / "simulation/qualification/integrated-ompl.json"
-DEFAULT_PRODUCTION_ROOT = Path("/home/tinker/tk25_ws")
+DEFAULT_PRODUCTION_ROOT = Path("/home/tinker/tk25_ws/src/tk25_manipulation")
 DEFAULT_ATTEMPT_ROOT = ROOT / "outputs/integrated"
 DEFAULT_MODEL_BUNDLE_MANIFEST = ROOT / "outputs/ompl-overlay/model-bundle-r2/model-bundle.json"
 DEFAULT_PROVIDER_MANIFEST = ROOT / "ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json"
