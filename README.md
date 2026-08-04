@@ -314,6 +314,60 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 2 — "wire executor
+  evidence producer"): Wired the live producer of the executor evidence and the
+  per-scenario terminal marker that round 1 lacked, and sealed finalization so
+  an exception can never escape the per-scenario boundary.  New source-run
+  Humble driver `validation/integrated_gate_executor_driver.py` (ROS-lazy at
+  import, runs under the existing `ros-tooling` environment as
+  `/usr/bin/python3`) loads the orchestrator's atomically written
+  `scenario-bundle.json`, derives dispatch for exactly the 17 canonical
+  scenario ids from the committed executor constants, constructs the real
+  `IntegratedGateExecutor` for the current immutable attempt with live
+  readiness/join-key/graph providers, dispatches exactly one run method, and
+  writes `execution-terminal.json` (scenario id + attempt id + resolved attempt
+  path cross-bound, `marker: executor-driver`) only after the executor's own
+  artifact finalization (`integrated-execution.json` must exist).  A driver
+  setup/dispatch exception writes a durable fail-closed terminal
+  (`evidence-invalid`) and exits nonzero; unknown scenario ids and stale or
+  wrong-identity terminal markers fail closed before any ROS traffic.  The
+  orchestrator now launches the driver as a third owned child
+  (`qualification_start_process(runner, "executor", ...)`) only after canonical
+  PHYSICS_READY (with the bundle atomically written at
+  `<attempt_dir>/scenario-bundle.json`) and waits for a current-attempt
+  cross-bound terminal within a config-derived budget —
+  `plan + 2*execute + cancel + scene + max(cancel,30)` = exactly 305.0 s for
+  the committed thresholds, separate from the 30 s readiness budget — failing
+  immediately if the executor process exits without a marker.  For every E
+  transport scenario the driver sets and reads back
+  `/pick_and_place.post_grasp_lift_m = 0.10` on the live task server via an
+  rclpy parameter client (rejected/unavailable/malformed/low read-back fails
+  closed before Pick traffic) and supplies the observed read-back as the typed
+  provider, never a default.  The additive `"executor": "ros-tooling"` role in
+  `QualificationRunner._start` shares the Humble overlay's DDS/domain/attempt/
+  PYTHONPATH/AMENT_PREFIX_PATH environment and never alters six-gate behavior.
+  `_finalize_attempt` now isolates every cleanup phase (executor stop, Isaac
+  stop, exact raw/evaluator drain while Humble is alive, Humble stop, rosbag
+  handling, orphan termination, resource evidence, settle) with per-phase
+  try/except so a single failing phase records a distinct failure reason while
+  all later cleanup still runs; both `_execute_scenario` and `_teardown_scenario`
+  guard a whole-helper escape and convert it to durable per-scenario
+  `evidence-invalid`.  Integrated C-E rosbag remains a truthful non-load-bearing
+  diagnostic (`not-recorded`; a present valid bag is validated, a corrupt one
+  fails closed); Task 9/Gate F must add or index the intended recorder.  Live
+  provider obligations (readiness snapshot liveness, TF TCP pose, environment
+  cloud, native gripper goal count, long-motion UUIDs) are carried as live
+  obligations and are never claimed by offline doubles.  Offline regressions:
+  new `tests/test_integrated_gate_executor_driver.py` (25 ROS-free tests),
+  55 integrated-orchestration tests (incl. third-child launch ordering, terminal
+  budget/cross-binds, and per-phase finalize isolation with stage continuation),
+  511 passed in the broader qualification batch, and the sourced-Humble real
+  executor/journal surface (164 + 184 passed) proving the executor finalizes
+  `integrated-execution.json`, `moveit-plans.jsonl`, `controller-results.jsonl`,
+  `planning-scene.jsonl`, and `planning-scene.json`.  No build, no live
+  Isaac/ROS, no GPU-process change, no cuMotion; executor/verifier/journal/
+  overlay-launch/scenarios/configs/locks and all production files are untouched.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 1 — "execute
   integrated scenario lifecycle"): Made the integrated C-E lifecycle executable
   and fail-dominant on the real manifest/launch path.  Integrated scenario ids

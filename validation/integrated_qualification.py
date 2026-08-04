@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -197,8 +198,11 @@ SOURCE_IDENTITIES_FILENAME = "source-identities.json"
 # The maximum valid ROS domain id (the simulator's Fast DDS bound).
 MAX_ROS_DOMAIN_ID = 232
 
-# The scenario terminal markers the orchestrator accepts as durable scenario
-# completion evidence (written by the scenario executor / launch).  The
+# The scenario terminal markers the executor/driver produce as durable scenario
+# completion evidence.  ``execution-terminal.json`` is the authoritative
+# cross-bound marker written by the source-run executor driver (F2.2) and is what
+# ``_wait_for_scenario_terminal`` requires; ``integrated-execution.json`` is the
+# executor's own terminal summary, written just before the driver marker.  The
 # orchestrator never waits for its own verifier's ``gate-verdict.json``.
 TERMINAL_EVIDENCE_FILENAMES = ("execution-terminal.json", "integrated-execution.json")
 
@@ -251,6 +255,7 @@ class IntegratedRunner:
         attempt_root: Path | None = None,
         base_domain_id: int = 100,
         readiness_timeout_s: float = 30.0,
+        terminal_timeout_s: float | None = None,
         bag_startup_timeout_s: float = 5.0,
         model_bundle_manifest: Path | None = None,
         provider_manifest_path: Path | None = None,
@@ -266,6 +271,17 @@ class IntegratedRunner:
         self.attempt_root = Path(attempt_root or DEFAULT_ATTEMPT_ROOT).resolve()
         self.base_domain_id = int(base_domain_id)
         self.readiness_timeout_s = float(readiness_timeout_s)
+        # F2.5: the scenario terminal budget is derived from committed config
+        # thresholds (305.0 s for the current integrated-ompl config) and is
+        # deliberately separate from the physics-readiness budget.  A
+        # constructor/CLI override is accepted for deterministic tests, but the
+        # normal CLI/config path uses the derivation and never undercuts the
+        # executor's sequential run-method deadlines.
+        self.terminal_timeout_s = (
+            float(terminal_timeout_s)
+            if terminal_timeout_s is not None
+            else self._derived_terminal_timeout()
+        )
         self.bag_startup_timeout_s = float(bag_startup_timeout_s)
         self.model_bundle_manifest = (
             Path(model_bundle_manifest).resolve()
@@ -301,6 +317,44 @@ class IntegratedRunner:
 
     def _config(self) -> dict[str, Any]:
         return _json_file(self.config_path)
+
+    def _derived_terminal_timeout(self) -> float:
+        """Derive the scenario terminal budget from committed config thresholds.
+
+        ``plan_timeout_s + 2*execute_timeout_s + cancel_timeout_s +
+        scene_timeout_s + max(cancel_timeout_s, 30.0)`` = exactly ``305.0`` for
+        the current integrated-ompl thresholds (15/120/10/10), covering the
+        source-inspected worst E transport path (~275 s) and D gripper path
+        (240 s).  Malformed config fails closed.
+        """
+        config = self._config()
+        thresholds = config.get("thresholds")
+        if not isinstance(thresholds, Mapping):
+            raise ValueError("integrated config has no thresholds object")
+        try:
+            terms = {
+                key: float(thresholds[key])
+                for key in (
+                    "plan_timeout_s",
+                    "execute_timeout_s",
+                    "cancel_timeout_s",
+                    "scene_timeout_s",
+                )
+            }
+        except (TypeError, ValueError, KeyError) as error:
+            raise ValueError(f"integrated config terminal thresholds are malformed: {error}") from error
+        for key, value in terms.items():
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"integrated config {key} must be finite and positive")
+        cancel = terms["cancel_timeout_s"]
+        settle = max(cancel, 30.0)
+        return (
+            terms["plan_timeout_s"]
+            + 2.0 * terms["execute_timeout_s"]
+            + terms["cancel_timeout_s"]
+            + terms["scene_timeout_s"]
+            + settle
+        )
 
     def _stages_config(self) -> dict[str, Any]:
         config = self._config()
@@ -879,6 +933,55 @@ class IntegratedRunner:
             f"provider_manifest_path:={self.provider_manifest_path}",
         ]
 
+    def _executor_scenario_command(
+        self, name: str, attempt_dir: Path, domain_id: int
+    ) -> list[str]:
+        """F2.3: the source-run Humble executor driver third-child command.
+
+        ``/usr/bin/python3`` (Humble 3.10) runs the driver source under the
+        existing ``ros-tooling`` environment, binding the exact bundle/config/
+        attempt/domain/seed arguments to the current immutable attempt.  The
+        driver is launched only after canonical PHYSICS_READY, never during the
+        initial two-child launch.
+        """
+        return [
+            "/usr/bin/python3",
+            str(self.root / "validation/integrated_gate_executor_driver.py"),
+            "--scenario-bundle",
+            str(attempt_dir / "scenario-bundle.json"),
+            "--attempt-dir",
+            str(attempt_dir),
+            "--config",
+            str(self.config_path),
+            "--domain",
+            str(domain_id),
+            "--seed",
+            str(self.seed),
+        ]
+
+    def _write_scenario_bundle(
+        self, attempt_dir: Path, name: str, manifest: QualificationManifest
+    ) -> Path:
+        """F2.3: atomically write the already-validated scenario bundle.
+
+        The orchestrator computes the bundle (scenario id/seed/declaration,
+        planning-scene declaration + mapping, integrated mapping, report
+        identities) and serializes it once; the Humble driver loads it unchanged
+        and never recomputes identities across Python versions.  The bundle also
+        carries the current-attempt identity so the driver and orchestrator
+        cross-bind the terminal marker.
+        """
+        bundle = self._scenario_bundle(name)
+        payload = {
+            "schema_version": 1,
+            "scenario_id": name,
+            "attempt_id": manifest.attempt_id,
+            "attempt_dir": str(Path(attempt_dir).resolve()),
+            **dict(bundle),
+        }
+        _write_json_atomic(attempt_dir / "scenario-bundle.json", payload)
+        return attempt_dir / "scenario-bundle.json"
+
     def _new_scenario_runner(
         self, allocation: AttemptAllocation, name: str
     ) -> QualificationRunner:
@@ -1090,19 +1193,95 @@ class IntegratedRunner:
             time.sleep(0.25)
         return last
 
-    def _wait_for_scenario_terminal(self, attempt_dir: Path, name: str) -> dict[str, Any]:
-        deadline = time.monotonic() + self.readiness_timeout_s
+    def _terminal_cross_binds(
+        self,
+        value: Mapping[str, Any],
+        attempt_dir: Path,
+        name: str,
+        attempt_id: str | None,
+    ) -> bool:
+        """A terminal marker is eligible only when it binds the current attempt.
+
+        F2.3: the orchestrator never accepts an arbitrary preexisting marker — it
+        must carry the exact scenario id, the exact current-attempt id, and the
+        current attempt path.
+        """
+        if str(value.get("scenario_id")) != name:
+            return False
+        if attempt_id is not None and str(value.get("attempt_id")) != attempt_id:
+            return False
+        marker_path = str(value.get("attempt_dir", ""))
+        if marker_path:
+            try:
+                if Path(marker_path).resolve() != Path(attempt_dir).resolve():
+                    return False
+            except (OSError, ValueError):
+                return False
+        return True
+
+    def _executor_exited(self, runner: QualificationRunner) -> bool:
+        process = runner._processes.get("executor")
+        if process is None:
+            return False
+        try:
+            return process.poll() is not None
+        except Exception:  # noqa: BLE001 - defensive process liveness boundary
+            return False
+
+    def _wait_for_scenario_terminal(
+        self,
+        attempt_dir: Path,
+        name: str,
+        *,
+        runner: QualificationRunner | None = None,
+        attempt_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Wait for the executor driver terminal within the derived budget.
+
+        F2.3: waits for ``execution-terminal.json`` (cross-bound to the current
+        scenario/attempt/path).  If the executor driver process exits before
+        producing a valid current-attempt marker, fail immediately rather than
+        sleeping the full timeout.  F2.5: uses ``terminal_timeout_s`` (derived
+        from config, 305.0 s for the current thresholds) — never the readiness
+        budget, so a marker arriving after 30 s but before the derived deadline
+        is still eligible.
+        """
+        deadline = time.monotonic() + self.terminal_timeout_s
         while time.monotonic() < deadline:
-            for marker_name in TERMINAL_EVIDENCE_FILENAMES:
-                marker = attempt_dir / marker_name
-                if marker.is_file():
-                    try:
-                        value = _json_file(marker)
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        value = {}
-                    return {"ok": True, "terminal": value, "marker": str(marker)}
+            marker = attempt_dir / "execution-terminal.json"
+            if marker.is_file():
+                try:
+                    value = _json_file(marker)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    value = {}
+                if self._terminal_cross_binds(value, attempt_dir, name, attempt_id):
+                    return {
+                        "ok": True,
+                        "terminal": value,
+                        "marker": str(marker),
+                        "source": "executor-driver",
+                    }
+                return {
+                    "ok": False,
+                    "reason": (
+                        "terminal marker identity does not bind the current "
+                        "scenario/attempt/path"
+                    ),
+                    "terminal": value,
+                }
+            if runner is not None and self._executor_exited(runner):
+                return {
+                    "ok": False,
+                    "reason": (
+                        "executor process exited without producing a current-attempt "
+                        "terminal marker"
+                    ),
+                }
             time.sleep(0.25)
-        return {"ok": False, "reason": "scenario execution terminal was not observed"}
+        return {
+            "ok": False,
+            "reason": "scenario execution terminal was not observed within the terminal budget",
+        }
 
     def _verify_attempt(self, attempt_dir: Path, name: str, stage: str) -> dict[str, Any]:
         try:
@@ -1177,10 +1356,15 @@ class IntegratedRunner:
     ) -> dict[str, Any]:
         """Stop producers, drain, finalize rosbag, and clean up; fail-dominant.
 
-        Mirrors the six-gate ordering: stop the Isaac producer first so the
-        evaluator consumes its final raw frames, then wait for the bounded
-        evaluator/raw drain, then stop the evaluator and recorder, finalize the
-        rosbag, terminate escaped orphans, and write cleanup/resource evidence.
+        F2.6: every cleanup phase is attempted independently — an exception in
+        executor stop, Isaac stop, drain, Humble stop, rosbag handling, orphan
+        termination, resource evidence, or settle is caught and recorded as a
+        distinct failure reason while all later phases still run.  The executor
+        is stopped first so it cannot continue issuing commands while the graph
+        shuts down; then Isaac is stopped to freeze raw production; the exact
+        evaluator/raw drain runs while Humble is still alive; then Humble and
+        the recorder are stopped, rosbag evidence finalized, escaped orphans
+        terminated, cleanup/resource evidence written, and evidence settled.
         Returns the failures list; the independent verifier runs only after this
         is final and clean.
         """
@@ -1193,32 +1377,89 @@ class IntegratedRunner:
                 "exit_codes": {},
             }
         exit_codes: dict[str, int | None] = {}
-        if "isaac" in runner._processes:
-            exit_codes["isaac"] = qualification_stop_process(runner, "isaac")
-        drained = qualification_wait_for_evaluator_drain(runner, manifest)
-        if not drained:
-            failures.append("raw/evaluator drain did not correlate exactly")
-        if "humble" in runner._processes:
-            exit_codes["humble"] = qualification_stop_process(runner, "humble")
-        if "rosbag" in runner._processes:
-            exit_codes["rosbag"] = qualification_stop_process(runner, "rosbag")
-        rosbag_ok, rosbag_evidence, rosbag_failures = self._integrated_rosbag_evidence(
-            manifest.attempt_dir
-        )
-        if rosbag_failures:
-            failures.extend(rosbag_failures)
-        orphan_initial = qualification_attempt_processes(runner)
-        if orphan_initial:
-            qualification_terminate_attempt_orphans(runner)
-            failures.append("orphan attempt processes remained after teardown")
-        resources_clean = qualification_write_resource_evidence(
-            runner, manifest, gpu_baseline or {}
-        )
-        if not resources_clean:
-            failures.append(
-                "cleanup/resource evidence reported owned survivors or GPU memory growth"
+
+        # Phase 1 — executor stop (before graph shutdown so it cannot continue
+        # issuing commands; on normal terminal completion it has already exited).
+        try:
+            if "executor" in runner._processes:
+                exit_codes["executor"] = qualification_stop_process(runner, "executor")
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            failures.append(f"executor stop failed: {error}")
+
+        # Phase 2 — Isaac stop (freeze raw production for the exact drain).
+        try:
+            if "isaac" in runner._processes:
+                exit_codes["isaac"] = qualification_stop_process(runner, "isaac")
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            failures.append(f"isaac stop failed: {error}")
+
+        # Phase 3 — exact evaluator/raw drain while Humble is alive.
+        drained = False
+        try:
+            drained = qualification_wait_for_evaluator_drain(runner, manifest)
+            if not drained:
+                failures.append("raw/evaluator drain did not correlate exactly")
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            drained = False
+            failures.append(f"evaluator drain failed: {error}")
+
+        # Phase 4 — Humble stop.
+        try:
+            if "humble" in runner._processes:
+                exit_codes["humble"] = qualification_stop_process(runner, "humble")
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            failures.append(f"humble stop failed: {error}")
+
+        # Phase 5 — recorder stop (six-gate only; integrated path has no bag).
+        try:
+            if "rosbag" in runner._processes:
+                exit_codes["rosbag"] = qualification_stop_process(runner, "rosbag")
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            failures.append(f"rosbag stop failed: {error}")
+
+        # Phase 6 — tolerant integrated rosbag evidence (F2.7 semantics).
+        rosbag_ok = False
+        rosbag_evidence: dict[str, Any] = {}
+        try:
+            rosbag_ok, rosbag_evidence, rosbag_failures = self._integrated_rosbag_evidence(
+                manifest.attempt_dir
             )
-        qualification_settle_evidence_files(runner, manifest)
+            if rosbag_failures:
+                failures.extend(rosbag_failures)
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            rosbag_ok = False
+            failures.append(f"integrated rosbag evidence failed: {error}")
+
+        # Phase 7 — orphan termination.
+        orphan_initial: list[dict[str, Any]] = []
+        try:
+            orphan_initial = qualification_attempt_processes(runner)
+            if orphan_initial:
+                qualification_terminate_attempt_orphans(runner)
+                failures.append("orphan attempt processes remained after teardown")
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            failures.append(f"orphan termination failed: {error}")
+
+        # Phase 8 — cleanup/resource evidence.
+        resources_clean = False
+        try:
+            resources_clean = qualification_write_resource_evidence(
+                runner, manifest, gpu_baseline or {}
+            )
+            if not resources_clean:
+                failures.append(
+                    "cleanup/resource evidence reported owned survivors or GPU memory growth"
+                )
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            resources_clean = False
+            failures.append(f"resource evidence failed: {error}")
+
+        # Phase 9 — settle evidence files.
+        try:
+            qualification_settle_evidence_files(runner, manifest)
+        except Exception as error:  # noqa: BLE001 - per-phase isolation
+            failures.append(f"settle failed: {error}")
+
         return {
             "failures": failures,
             "exit_codes": exit_codes,
@@ -1234,6 +1475,10 @@ class IntegratedRunner:
 
         Returns False when any teardown/drain/bag/resource obligation failed so
         ``run_scenario`` can downgrade the scenario to ``evidence-invalid``.
+        F2.6: an unexpected ``_finalize_attempt`` escape is guarded and converted
+        into durable per-scenario failure evidence (the phase-level isolation
+        inside ``_finalize_attempt`` keeps every later cleanup running, so this
+        guard only covers a whole-helper escape).
         """
         runner, manifest = self._scenario_manifest_store.pop(
             allocation.attempt_dir, (None, None)
@@ -1241,7 +1486,10 @@ class IntegratedRunner:
         if runner is None:
             return True
         baseline = self._gpu_baselines.pop(allocation.attempt_dir, None)
-        finalize = self._finalize_attempt(runner, manifest, baseline)
+        try:
+            finalize = self._finalize_attempt(runner, manifest, baseline)
+        except Exception as error:  # noqa: BLE001 - F2.6 whole-helper escape guard
+            return False
         return not finalize["failures"]
 
     def _execute_scenario(
@@ -1269,16 +1517,38 @@ class IntegratedRunner:
                             ready_reason or "physics readiness was not achieved"
                         )
                     else:
-                        terminal = self._wait_for_scenario_terminal(attempt_dir, name)
-                        if not terminal.get("ok"):
-                            failure_reasons.append(
-                                str(
-                                    terminal.get(
-                                        "reason",
-                                        "scenario execution terminal was not observed",
+                        # F2.3: only after canonical PHYSICS_READY — atomically
+                        # write the already-validated bundle and launch the
+                        # source-run Humble executor driver as a third owned child
+                        # under the exact same ROS domain and attempt directory.
+                        try:
+                            self._write_scenario_bundle(attempt_dir, name, manifest)
+                            qualification_start_process(
+                                runner,
+                                "executor",
+                                self._executor_scenario_command(
+                                    name, attempt_dir, allocation.domain_id
+                                ),
+                                manifest,
+                            )
+                        except Exception as error:  # noqa: BLE001 - fail-closed executor launch
+                            failure_reasons.append(f"executor launch failed: {error}")
+                        if not failure_reasons:
+                            terminal = self._wait_for_scenario_terminal(
+                                attempt_dir,
+                                name,
+                                runner=runner,
+                                attempt_id=manifest.attempt_id,
+                            )
+                            if not terminal.get("ok"):
+                                failure_reasons.append(
+                                    str(
+                                        terminal.get(
+                                            "reason",
+                                            "scenario execution terminal was not observed",
+                                        )
                                     )
                                 )
-                            )
                 except Exception as error:  # noqa: BLE001 - fail-dominant lifecycle
                     error_text = str(error)
                     failure_reasons.append(f"scenario lifecycle raised: {error}")
@@ -1293,10 +1563,18 @@ class IntegratedRunner:
             effective_runner = runner or stored_runner
             effective_manifest = manifest or stored_manifest
             baseline = self._gpu_baselines.pop(attempt_dir, None)
-            finalize_evidence = self._finalize_attempt(
-                effective_runner, effective_manifest, baseline
-            )
-            failure_reasons.extend(finalize_evidence.get("failures", []))
+            try:
+                finalize_evidence = self._finalize_attempt(
+                    effective_runner, effective_manifest, baseline
+                )
+                failure_reasons.extend(finalize_evidence.get("failures", []))
+            except Exception as error:  # noqa: BLE001 - F2.6 whole-helper escape guard
+                error_text = error_text or str(error)
+                finalize_evidence = {
+                    "failures": [f"finalize_attempt escaped: {error}"],
+                    "error": str(error),
+                }
+                failure_reasons.append(f"finalize_attempt escaped: {error}")
         if error_text is not None or failure_reasons:
             return self._scenario_result(
                 name,
@@ -1547,6 +1825,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--attempt-root", type=Path, default=DEFAULT_ATTEMPT_ROOT)
     parser.add_argument("--base-domain-id", type=int, default=100)
     parser.add_argument("--readiness-timeout", type=float, default=30.0)
+    # F2.5: optional override for deterministic tests; the normal CLI/config path
+    # leaves this None and derives the terminal budget from config thresholds.
+    parser.add_argument("--terminal-timeout", type=float, default=None)
     parser.add_argument("--model-bundle-manifest", type=Path)
     parser.add_argument("--provider-manifest-path", type=Path)
     parser.add_argument("--isaac-command", help="override Isaac wrapper command")
@@ -1561,6 +1842,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         attempt_root=args.attempt_root,
         base_domain_id=args.base_domain_id,
         readiness_timeout_s=args.readiness_timeout,
+        terminal_timeout_s=args.terminal_timeout,
         model_bundle_manifest=args.model_bundle_manifest,
         provider_manifest_path=args.provider_manifest_path,
         isaac_command=args.isaac_command,
