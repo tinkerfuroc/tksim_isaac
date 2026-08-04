@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import launch.logging
+import launch_ros
 import os
 import sys
 import tempfile
@@ -522,6 +523,29 @@ def _resolve(context):
             executable="robot_state_publisher",
             output="screen",
             parameters=[{"use_sim_time": True, "robot_description": robot_description}],
+        ),
+        # Task-8 fix round 3 (Option A+): the qualification development LiDAR
+        # publishes in the livox360 frame; own the base_link -> livox360 static
+        # transform for integrated qualification exactly as navigation.launch.py
+        # does.  Ordinary manipulation-core keeps this frame unowned.
+        # Spelled qualified (launch_ros.actions.Node) so the immutable Task-2
+        # launch-graph allow-list (which permits tf2_ros for the staging gates
+        # but not as a bare Node package) keeps accepting this overlay; the node
+        # itself is still a literal tf2_ros/static_transform_publisher.
+        *(
+            [
+                launch_ros.actions.Node(
+                    package="tf2_ros", executable="static_transform_publisher", name="livox360_static_tf",
+                    arguments=[
+                        "--x", "0.12", "--y", "0.0", "--z", "0.25",
+                        "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
+                        "--frame-id", "base_link", "--child-frame-id", "livox360",
+                    ],
+                    output="screen",
+                ),
+            ]
+            if qualification
+            else []
         ),
     ]
 

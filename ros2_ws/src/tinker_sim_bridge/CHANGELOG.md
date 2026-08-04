@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (integrated qualification executor driver — Task 8 fix round 3: observe live integrated providers)
+
+- The integrated launch now owns the `base_link -> livox360` static transform
+  for qualification runs only: one `tf2_ros/static_transform_publisher` named
+  `livox360_static_tf` (xyz `0.12 0.0 0.25`, identity quaternion), matching
+  `navigation.launch.py`.  It is spelled `launch_ros.actions.Node(...)` so the
+  immutable Task-2 launch-graph allow-list (which permits `tf2_ros` only for
+  the staging gates) keeps accepting the overlay; the launched executable is
+  the literal `tf2_ros/static_transform_publisher`.  Ordinary
+  `manipulation-core` runs leave the frame unowned.
+- Qualification-only development LiDAR: `validation/run_sim.py` adds
+  `build_occupancy_from_planning_scene` (pure deterministic 2-D occupancy map
+  at 0.05 m / 60 m half-extent from committed scenario PlanningScene box
+  footprints), `qualification_occupancy` (map only for scenarios with box
+  fixtures; None for empty/free-space), and `gateway_lidar_enabled` (development
+  lidar only for `navigation-parity` or `manipulation-core --qualification`).
+- The executor driver (`validation/integrated_gate_executor_driver.py`) now
+  observes live integrated providers: a driver-owned `_LiveProviderObserver`
+  node on the executor's private-context spinner; `_call_service_with_spinner`
+  (async future + explicit `_spin_once`) for every controller/graph service
+  query because rclpy delivers responses to the spinner's wait set, not the
+  calling client's node; driver-side `_goal_id_hex` normalization for real
+  rclpy UUID goal handles; operator-baseline re-publish inside the readiness
+  snapshot; and `declare_parameter` + `add_on_set_parameters_callback` for
+  `/pick_and_place.post_grasp_lift_m`.  No reference to executor internals
+  (`_observed_graph`/`_tf_lookup`/`_latest_environment_cloud`/
+  `_native_gripper_goal_count`/`ParameterClient`/`server_is_available`).
+- Tests: `tests/test_integrated_gate_executor_driver.py` grows to 36 ROS-free
+  tests (hermetic double-parameter pure layer, Option A+ occupancy and gateway
+  profile resolution, bundle committed-identity fail-closed); new
+  `tests/ros_humble/test_integrated_gate_executor_driver_providers.py` (22
+  sourced-Humble tests: live readiness, controllers, FJT digest, native
+  gripper, parameter set/read-back, negative-mutation fail-closed, and cancel
+  presend).  No build, no live Isaac/ROS, no GPU-process change, no cuMotion.
+
 ### Fixed (Task 1 fix round 1: align integrated fixture geometry)
 
 - Aligned the physical (bottom-origin USD) roots with the PlanningScene

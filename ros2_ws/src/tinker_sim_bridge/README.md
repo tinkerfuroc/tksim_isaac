@@ -469,6 +469,34 @@ chains the staged providers through `OnProcessExit` handlers:
    fresh message checks, independently of status topics, and publishes the
    pass/fail JSON on `/sim/status/integrated_manipulation`.
 
+### Option A+ development LiDAR and static frame (Task 8, fix round 3)
+
+For integrated qualification only (`--qualification`), the final composition
+also owns the `base_link -> livox360` static transform exactly as
+`navigation.launch.py` does: one `tf2_ros/static_transform_publisher` named
+`livox360_static_tf`, xyz `(0.12, 0.0, 0.25)`, quaternion `(0, 0, 0, 1)`.  The
+node is spelled `launch_ros.actions.Node(...)` (instead of the bare `Node(...)`)
+so the immutable Task-2 launch-graph allow-list — which accepts `tf2_ros` only
+for the staging gates, not as a bare Node package — keeps accepting this
+overlay; the launched executable is still the literal
+`tf2_ros/static_transform_publisher`.  Ordinary `manipulation-core` runs leave
+this frame unowned.  Qualification backend occupancy (from committed scenario
+PlanningScene box footprints) and the development-lidar enablement live in
+`validation/run_sim.py` (`build_occupancy_from_planning_scene`,
+`qualification_occupancy`, `gateway_lidar_enabled`); the executor driver
+consumes the real `/livox/lidar` cloud and transforms it to `base_link`.
+
+### Executor driver live observer
+
+`validation/integrated_gate_executor_driver.py` (source-run under
+`ros-tooling`) constructs a driver-owned `_LiveProviderObserver` node in the
+executor's private rclpy context and registers it on the executor's spinner so
+readiness/TF/cloud/gripper/FJT/graph providers observe live ROS traffic rather
+than executor internals.  Because rclpy delivers service responses to the
+spinner's wait set (not the calling client's node), all controller/graph service
+queries use `_call_service_with_spinner` (async future + explicit `_spin_once`)
+instead of the blocking `client.call()` that hangs on a shared private context.
+
 ### Provider manifest
 
 `integration/provider-manifest.json` (schema version 1) records the four

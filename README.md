@@ -314,6 +314,48 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 3 — "observe live
+  integrated providers"): Replaced every fabricated/placeholder provider with a
+  driver-owned live observer and a real graph/service surface, and adopted
+  Option A+ for the qualification development LiDAR.  The driver now constructs
+  a private-context `_LiveProviderObserver` node added to the executor's spinner
+  (multi-node private-context rclpy requires driving the shared spinner, so all
+  controller/graph service calls go through `_call_service_with_spinner` polling
+  an async future instead of the blocking `client.call()` that hangs when the
+  spinner owns the response); readiness, TF TCP pose, PointCloud2 environment
+  cloud, native gripper goal count, FJT transaction digest, and live graph
+  introspection all come from observed subscriptions/transforms, never executor
+  internals (`_observed_graph`/`_tf_lookup`/`_latest_environment_cloud`/
+  `_native_gripper_goal_count`/`ParameterClient`/`server_is_available` are all
+  unreferenced).  Long-motion goal UUIDs are normalized driver-side
+  (`_goal_id_hex`) because `_normalize_goal_uuid` rejects real rclpy UUID
+  messages.  For E transport scenarios the driver re-publishes the operator
+  baseline and refreshes its age inside the readiness snapshot so a live fresh
+  operator sample is actually observed.  The `/pick_and_place.post_grasp_lift_m`
+  service uses `declare_parameter` + `add_on_set_parameters_callback` (rclpy
+  auto-creates `/get_parameters`/`set_parameters` on every node; a manual
+  service conflicts).  Option A+: `run_sim.build_occupancy_from_planning_scene`
+  builds a pure deterministic 2-D occupancy map (0.05 m, 60 m half-extent) from
+  committed scenario PlanningScene box footprints; `qualification_occupancy`
+  returns it only for scenarios with box fixtures (None for empty/free-space);
+  `gateway_lidar_enabled` enables the development lidar only for
+  `navigation-parity` or `manipulation-core --qualification`; and the integrated
+  launch owns the exact `base_link -> livox360` static transform
+  (tf2_ros/static_transform_publisher named `livox360_static_tf`,
+  xyz 0.12/0.0/0.25, quaternion identity), spelled qualified
+  (`launch_ros.actions.Node`) so the immutable Task-2 launch-graph allow-list
+  still accepts the overlay.  Raw-verifier authority is unchanged.  Offline
+  regressions: `tests/test_integrated_gate_executor_driver.py` grows to 36
+  ROS-free tests (hermetic double-parameter pure layer, Option A+ occupancy and
+  gateway-profile resolution, bundle committed-identity fail-closed); broad
+  ROS-free qualification batch 1220 passed + 2 skipped + 9 subtests with the
+  sole pre-existing `uv` executable-hash provenance failure unchanged; launch
+  contract 7 passed; sourced-Humble `tests/ros_humble/` 54 passed + 1 skipped
+  (22 new provider tests incl. live readiness/controllers/FJT/native-gripper/
+  parameter/negative-mutation/cancel-provider paths).  No build, no live
+  Isaac/ROS, no GPU-process change, no cuMotion; executor/verifier/journal/
+  scenarios/configs/locks/`ros_gateway.py` and all production files untouched.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 2 — "wire executor
   evidence producer"): Wired the live producer of the executor evidence and the
   per-scenario terminal marker that round 1 lacked, and sealed finalization so
