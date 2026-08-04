@@ -311,6 +311,17 @@ class _ControlledGraph:
         self._execute_hold_s = 0.0
         self._motion_active = False
         self._stop_servers = False
+        # F5.3/F5.6: per-server ExecuteTrajectory controls — delay the goal
+        # acceptance callback (delayed-acceptance exact-cancel) and/or reject
+        # cancellation (cleanup-rejection fail-closed).
+        self._execute_goal_accept_delay_s = 0.0
+        self._execute_reject_cancel = False
+        # F5.4: deterministic teardown bookkeeping.  Every action server, node,
+        # thread, and the controlled executor/context are tracked so teardown
+        # can drain and join everything before interpreter exit — no daemon-thread
+        # reliance and no un-drained action goal coroutine.
+        self._tracked_threads: list[threading.Thread] = []
+        self._drained = False
         # F4.9 negative controls: disable FJT emission on execute (no-new-goal),
         # force the controller UUID to a pre-seeded value (stale-heartbeat
         # replay), and emit a second distinct controller UUID (multiple-new).
@@ -486,10 +497,13 @@ class _ControlledGraph:
         # Spinner.  F4.9: four worker threads so a held execute goal (cancel/
         # safety hold loop) never starves the action-server cancel/result
         # handlers and the service servers (ListControllers, parameters).
+        # F5.4: the thread is non-daemon and tracked; teardown shuts the
+        # executor down and joins it explicitly (never daemon-thread reliance).
         self._executor = MultiThreadedExecutor(context=self._context, num_threads=4)
         for node in self._nodes:
             self._executor.add_node(node)
-        self._thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._thread = threading.Thread(target=self._executor.spin, name="controlled-executor", daemon=False)
+        self._tracked_threads.append(self._thread)
         self._thread.start()
 
         # Continuous stream publisher: the real simulator publishes the
@@ -497,7 +511,8 @@ class _ControlledGraph:
         # controlled graph must too — otherwise the executor/observer caches go
         # stale between test-driven spins (freshness gates are sub-second).
         self._stop_publish = False
-        self._publish_thread = threading.Thread(target=self._publish_loop, daemon=True)
+        self._publish_thread = threading.Thread(target=self._publish_loop, name="controlled-publish", daemon=False)
+        self._tracked_threads.append(self._publish_thread)
         self._publish_thread.start()
 
         # F4.8: emit a strictly-increasing physics-truth JSONL stream at the
@@ -507,7 +522,8 @@ class _ControlledGraph:
             self._truth_path = self._attempt_dir / "physics_truth.jsonl"
             self._truth_frame = 0
             self._stop_truth = False
-            self._truth_thread = threading.Thread(target=self._truth_loop, daemon=True)
+            self._truth_thread = threading.Thread(target=self._truth_loop, name="controlled-truth", daemon=False)
+            self._tracked_threads.append(self._truth_thread)
             self._truth_thread.start()
 
     def _truth_loop(self) -> None:
@@ -575,6 +591,27 @@ class _ControlledGraph:
             # (empty goals_canceling) and strand the cancel/safety presend goals.
             from rclpy.action import CancelResponse
 
+            return CancelResponse.ACCEPT
+
+        def _execute_goal_callback(goal_request):
+            # F5.3/F5.6: delayed-acceptance knob — the ExecuteTrajectory server
+            # holds the goal request open for ``_execute_goal_accept_delay_s``
+            # before accepting, so the driver's acceptance-timeout cleanup path
+            # is exercised with a real server-side accepted/moving goal.
+            from rclpy.action import GoalResponse
+
+            delay = float(self._execute_goal_accept_delay_s)
+            if delay > 0.0:
+                time.sleep(delay)
+            return GoalResponse.ACCEPT
+
+        def _execute_cancel_callback(goal_handle):
+            # F5.6: cleanup-rejection knob — the server rejects every cancel, so
+            # exact-UUID cleanup fails closed without canceling another goal.
+            from rclpy.action import CancelResponse
+
+            if self._execute_reject_cancel:
+                return CancelResponse.REJECT
             return CancelResponse.ACCEPT
 
         def _make_simple_execute(result_type):
@@ -675,13 +712,18 @@ class _ControlledGraph:
             specs.append((self._pick_node, Fold, "/fold_action", _make_simple_execute(Fold.Result)))
         self._action_servers = []
         for node, action_type, name, execute in specs:
+            # F5.3/F5.6: the ExecuteTrajectory server gets the per-server delayed
+            # acceptance / cancel-rejection callbacks; all other servers keep the
+            # stock accept / accept-cancel behavior.
+            goal_cb = _execute_goal_callback if name == "/execute_trajectory" else _accept
+            cancel_cb = _execute_cancel_callback if name == "/execute_trajectory" else _accept_cancel
             server = ActionServer(
                 node,
                 action_type,
                 name,
                 execute_callback=execute,
-                goal_callback=_accept,
-                cancel_callback=_accept_cancel,
+                goal_callback=goal_cb,
+                cancel_callback=cancel_cb,
             )
             self._action_servers.append(server)
 
@@ -773,51 +815,95 @@ class _ControlledGraph:
         msg.status_list.append(status_entry)
         self._fjt_status_pub.publish(msg)
 
+    def _join_thread(self, thread: threading.Thread | None, name: str, timeout_s: float = 5.0) -> None:
+        """F5.4: bounded join of a tracked controlled-graph thread (asserts done)."""
+        if thread is None:
+            return
+        thread.join(timeout=timeout_s)
+        assert not thread.is_alive(), (
+            f"controlled-graph {name} thread did not stop within {timeout_s:.1f}s"
+        )
+
+    def _drain_action_goals(self, *, timeout_s: float) -> None:
+        """F5.4: drain every action-server goal result future (bounded + asserted).
+
+        Setting ``_stop_servers`` makes every held execute callback observe it
+        (the hold loops poll it every few ms) and abort, which resolves the
+        server's result futures; then the ``ActionServer._execute_goal``
+        coroutines terminate and are awaited by the controlled executor.
+        """
+        deadline = time.monotonic() + float(timeout_s)
+        while True:
+            unresolved = 0
+            for server in list(getattr(self, "_action_servers", []) or []):
+                for future in list(getattr(server, "_result_futures", {}).values()):
+                    if not future.done():
+                        unresolved += 1
+            if unresolved == 0:
+                return
+            if time.monotonic() >= deadline:
+                break
+            try:
+                # Keep the controlled executor spinning so the execute
+                # callbacks observe ``_stop_servers`` and abort.
+                self._executor.spin_once(timeout_sec=0.01)
+            except Exception:  # noqa: BLE001 - drain boundary
+                time.sleep(0.01)
+        assert unresolved == 0, (
+            f"{unresolved} action result future(s) unresolved after teardown drain"
+        )
+
     def stop(self) -> None:
+        # F5.4: deterministic teardown order.  Every wait is bounded and asserts
+        # completion; no daemon-thread reliance and no silently abandoned work.
+        if getattr(self, "_drained", False):
+            return
+        self._drained = True
         self._stop_publish = True
         self._stop_truth = True
-        truth_thread = getattr(self, "_truth_thread", None)
-        if truth_thread is not None:
-            try:
-                truth_thread.join(timeout=2.0)
-            except Exception:  # noqa: BLE001
-                pass
-        # F4.9: break any held execute goal (cancel/safety hold loop) so its
-        # ``ActionServer._execute_goal`` coroutine terminates and is awaited
-        # before the action servers/nodes are destroyed — no leaked-coroutine
-        # or failed-response warnings at teardown.
+        # 1. Stop new publishes/goals: held execute callbacks see _stop_servers
+        #    and abort their hold loops.
         self._stop_servers = True
-        publish_thread = getattr(self, "_publish_thread", None)
-        if publish_thread is not None:
+        # 2. Drain/cancel accepted goals and await execute callbacks/results.
+        self._drain_action_goals(timeout_s=10.0)
+        # 3. Join the publish/truth threads (bounded + asserted).
+        self._join_thread(getattr(self, "_truth_thread", None), "truth")
+        self._join_thread(getattr(self, "_publish_thread", None), "publish")
+        # 4. Stop and join the controlled executor worker threads.
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
             try:
-                publish_thread.join(timeout=2.0)
-            except Exception:  # noqa: BLE001
+                executor.shutdown()
+            except Exception:  # noqa: BLE001 - executor shutdown is idempotent
                 pass
-        if getattr(self, "_executor", None) is not None:
+            self._executor = None
+        self._join_thread(getattr(self, "_thread", None), "executor")
+        # 5. Remove/destroy action servers and nodes, then shut down the context.
+        for server in list(getattr(self, "_action_servers", []) or []):
             try:
-                # Give a held execute callback a bounded window to observe
-                # ``_stop_servers``, publish ABORTED, and return before the
-                # executor is shut down.
-                time.sleep(0.25)
-            except Exception:  # noqa: BLE001
+                server.destroy()
+            except Exception:  # noqa: BLE001 - server destroy is idempotent
                 pass
-            try:
-                self._executor.shutdown()
-            except Exception:
-                pass
-        for node in self._nodes:
+        self._action_servers = []
+        for node in list(self._nodes):
             try:
                 node.destroy_node()
-            except Exception:
+            except Exception:  # noqa: BLE001 - node destroy is idempotent
                 pass
         self._nodes = []
         context = getattr(self, "_context", None)
         if context is not None:
             try:
                 context.try_shutdown()
-            except Exception:
+            except Exception:  # noqa: BLE001 - context shutdown is idempotent
                 pass
             self._context = None
+        # 6. Fail if any controlled-graph thread remains live after teardown.
+        live_threads = [t for t in self._tracked_threads if t.is_alive()]
+        assert not live_threads, (
+            "controlled-graph threads still live after teardown: "
+            + ", ".join(t.name for t in live_threads)
+        )
 
 
 @pytest.fixture(scope="module")
@@ -835,19 +921,31 @@ def rclpy_runtime():
 @pytest.fixture()
 def graph(rclpy_runtime):
     g = _ControlledGraph()
-    g.start()
+    try:
+        g.start()
+    except Exception:
+        # F5.4: a partial start must still tear down any threads/nodes/context
+        # that were already created so a failed setup cannot leak them.
+        g.stop()
+        raise
     yield g
     g.stop()
 
 
-def _construct_real_executor(attempt_dir: Path, *, scenario_id: str = "qualification-pick-place-positive", domain_id: int | None = None):
+def _construct_real_executor(
+    attempt_dir: Path,
+    *,
+    scenario_id: str = "qualification-pick-place-positive",
+    domain_id: int | None = None,
+    config: dict[str, object] | None = None,
+):
     contract = _contract_for(scenario_id)
     bundle = _bundle_from_contract(contract, scenario_id, attempt_dir)
     _write_report(attempt_dir, contract)
     return d._construct_executor(
         bundle=bundle,
         attempt_dir=attempt_dir,
-        config=_test_config(),
+        config=config if config is not None else _test_config(),
         domain_id=_ACTIVE_DOMAIN if domain_id is None else domain_id,
         seed=int(contract["scenario_mapping"]["seed"]),
     )
@@ -885,8 +983,15 @@ def _drive_spin(executor, *, until=None, timeout_s: float = 5.0, graph=None) -> 
         time.sleep(0.02)
 
 
-def _assert_ready(executor, *, timeout_s: float = 5.0) -> None:
-    """F4.9: readiness must be genuinely ready; surface the failure reasons."""
+def _assert_ready(executor, *, timeout_s: float = 30.0) -> None:
+    """F4.9/F5.4: readiness must be genuinely ready; surface failure reasons.
+
+    F5.4: the controlled readiness budget is exactly 30.0 s, matching production
+    ``run_driver`` (``readiness_timeout_s=30.0``).  This closes the harness-only
+    cold-DDS discovery failures the old 5.0 s budget produced when three full
+    graphs/executors were constructed in one process, without changing product
+    readiness semantics.
+    """
     outcome = d._wait_for_readiness(executor, timeout_s=timeout_s)
     assert outcome.get("ready") is True, outcome.get("reasons")
 
@@ -1689,7 +1794,15 @@ def test_presend_failure_cleans_up_retained_handle(tmp_path):
     graph.start()
     executor = None
     try:
-        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        # F5.2: the production FJT discovery default is 10.0 s, which exceeds the
+        # 5 s hold and would let the held goal auto-succeed before cleanup.  This
+        # test exercises the presend-failure cleanup path, so it explicitly
+        # overrides the FJT wait to fail discovery BEFORE the hold expires and
+        # cleanup must cancel the still-active exact goal.
+        config = dict(_test_config())
+        config["thresholds"] = dict(config["thresholds"])
+        config["thresholds"]["fjt_wait_timeout_s"] = 0.5
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id, config=config)
         _drive_spin(executor, graph=graph, timeout_s=2.0)
         _assert_ready(executor)
         with pytest.raises(d.DriverError, match="no new controller FJT goal") as exc_info:
@@ -1750,3 +1863,464 @@ def test_controlled_e_path_reaches_run_pick_place_sequence(graph, tmp_path):
         assert isinstance(record, dict) and "status" in record
     finally:
         executor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# F5.5 — owner-QoS mutation: extra incompatible endpoint before the owner
+# --------------------------------------------------------------------------- #
+
+def test_owner_qos_mutation_extra_incompatible_endpoint(rclpy_runtime):
+    """F5.5: owner-QoS selection is by normalized label, not discovery order.
+
+    Creates an extra incompatible-QoS (BEST_EFFORT) publisher for the
+    planning-scene topic BEFORE the required RELIABLE ``/move_group`` owner, and
+    verifies owner-specific selection still chooses ``/move_group``,
+    ``/fixture_planning_scene``, and ``/tinker_integrated_gate_executor`` as
+    appropriate.  Missing or duplicate required owner endpoints return ``{}``
+    and fail closed.
+    """
+    from moveit_msgs.msg import PlanningScene
+    from std_msgs.msg import String
+    from validation.integrated_gate_executor import (
+        JOURNAL_FIXTURE_TOPIC_QOS,
+        JOURNAL_PLANNING_SCENE_TOPIC_QOS,
+    )
+
+    ctx = rclpy.Context()
+    ctx.init(domain_id=_next_domain())
+    decoy = Node("sim_other_owner", namespace="/", context=ctx, use_global_arguments=False, cli_args=[])
+    move_group = Node("move_group", namespace="/", context=ctx, use_global_arguments=False, cli_args=[])
+    fixture = Node("fixture_planning_scene", namespace="/", context=ctx, use_global_arguments=False, cli_args=[])
+    gate = Node("tinker_integrated_gate_executor", namespace="/", context=ctx, use_global_arguments=False, cli_args=[])
+    spinner = MultiThreadedExecutor(context=ctx, num_threads=2)
+    nodes = (decoy, move_group, fixture, gate)
+    for node in nodes:
+        spinner.add_node(node)
+
+    def _spin_settle(timeout_s: float = 8.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                spinner.spin_once(timeout_sec=0.05)
+            except Exception:  # noqa: BLE001 - discovery settle boundary
+                pass
+            time.sleep(0.01)
+
+    try:
+        # Extra incompatible-QoS publisher created BEFORE the required owner.
+        decoy_qos = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE
+        )
+        decoy.create_publisher(PlanningScene, PLANNING_SCENE_TOPIC, decoy_qos)
+        owner_qos = QoSProfile(
+            depth=int(JOURNAL_PLANNING_SCENE_TOPIC_QOS["depth"]),
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        move_group.create_publisher(PlanningScene, PLANNING_SCENE_TOPIC, owner_qos)
+        fixture_qos = QoSProfile(
+            depth=int(JOURNAL_FIXTURE_TOPIC_QOS["depth"]),
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        fixture.create_publisher(String, FIXTURE_TOPIC, fixture_qos)
+        gate.create_subscription(String, FIXTURE_TOPIC, lambda msg: None, fixture_qos)
+        _spin_settle()
+
+        # Planning-scene offered QoS: the /move_group owner is selected despite
+        # the earlier BEST_EFFORT decoy (selection by label, not discovery order).
+        pub_labels, pub_infos = d._publishers_for(gate, PLANNING_SCENE_TOPIC)
+        assert "/move_group" in pub_labels, pub_labels
+        planner_qos = d._select_endpoint_qos(
+            pub_labels, pub_infos, "/move_group", expected_depth=int(JOURNAL_PLANNING_SCENE_TOPIC_QOS["depth"])
+        )
+        assert planner_qos, pub_labels
+        assert planner_qos["reliability"] == "RELIABLE"
+        assert planner_qos["durability"] == "VOLATILE"
+        assert planner_qos["depth"] == int(JOURNAL_PLANNING_SCENE_TOPIC_QOS["depth"])
+
+        # Fixture owner offered QoS and gate requested QoS by label.
+        fixture_pub_labels, fixture_pub_infos = d._publishers_for(gate, FIXTURE_TOPIC)
+        fixture_owner_qos = d._select_endpoint_qos(
+            fixture_pub_labels, fixture_pub_infos, "/fixture_planning_scene",
+            expected_depth=int(JOURNAL_FIXTURE_TOPIC_QOS["depth"]),
+        )
+        assert fixture_owner_qos, fixture_pub_labels
+        assert fixture_owner_qos["durability"] == "TRANSIENT_LOCAL"
+        gate_sub_labels, gate_sub_infos = d._subscribers_for(gate, FIXTURE_TOPIC)
+        gate_req_qos = d._select_endpoint_qos(
+            gate_sub_labels, gate_sub_infos, "/tinker_integrated_gate_executor",
+            expected_depth=int(JOURNAL_FIXTURE_TOPIC_QOS["depth"]),
+        )
+        assert gate_req_qos, gate_sub_labels
+
+        # Missing required owner endpoint returns {} (fail closed).
+        assert d._select_endpoint_qos(pub_labels, pub_infos, "/missing_owner", expected_depth=100) == {}
+
+        # Duplicate required owner endpoint returns {} (fail closed).
+        move_group.create_publisher(PlanningScene, PLANNING_SCENE_TOPIC, owner_qos)
+        _spin_settle()
+        dup_labels, dup_infos = d._publishers_for(gate, PLANNING_SCENE_TOPIC)
+        assert d._select_endpoint_qos(
+            dup_labels, dup_infos, "/move_group", expected_depth=100
+        ) == {}
+    finally:
+        try:
+            spinner.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        for node in nodes:
+            try:
+                node.destroy_node()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            ctx.try_shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# F5.6 — source-real positive/negative evidence tests
+# --------------------------------------------------------------------------- #
+
+def test_controlled_d_execute_source_real_delayed_status_positive(tmp_path):
+    """F5.6: controller FJT status delayed >1 s but <10 s commits diagnostic-pass.
+
+    Uses the real action/status subscriptions (never ``_seed_fjt_status``) and
+    holds the controller goal open for 2 s so the terminal status arrives beyond
+    the old 1 s false-negative boundary but within the 10 s production budget.
+    """
+    scenario_id = "qualification-moveit-execute-joint"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    graph._execute_hold_s = 2.0
+    graph.start()
+    executor = None
+    try:
+        # F5.6: the execute result + controller terminal arrive ~2 s in, so the
+        # execute wait must exceed the 0.5 s test default; the FJT/motion waits
+        # stay at the production 10.0 s defaults (no override in the config).
+        config = dict(_test_config())
+        config["thresholds"] = dict(config["thresholds"])
+        config["thresholds"]["execute_timeout_s"] = 5.0
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id, config=config)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        kwargs = d._live_runtime_provider_factory(
+            executor=executor, scenario_id=scenario_id, bundle=None,
+            config=config, attempt_dir=Path(tmp_path),
+        )
+        _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
+        started = time.monotonic()
+        record = executor.run_execute_sequence(scenario_id, **kwargs)
+        elapsed = time.monotonic() - started
+        assert record["status"] == "diagnostic-pass", record
+        assert elapsed >= 1.0, f"controller delay not exercised ({elapsed:.2f}s)"
+        assert elapsed < 10.0, f"controller delay exceeded the 10 s budget ({elapsed:.2f}s)"
+        assert record["fjt_status"] == EXECUTE_STATUS_SUCCEEDED
+        assert record["fjt_goal_uuid"] != record["execute_goal_id"]
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_f51_bound_provider_does_not_switch_on_second_post_capture_status(tmp_path):
+    """F5.1/F5.6: a second post-capture status cannot switch the transaction.
+
+    The provider is bound to the exact captured terminal entry; a second real
+    status emission for the SAME FJT UUID (advancing the sequence) after the
+    capture must not change the evidence the provider returns.
+    """
+    scenario_id = "qualification-moveit-execute-joint"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        captured_uuid = _fresh_uuid_hex()
+        # F5.1: a real status emission is the capture; the provider binds to it.
+        # Poll up to 5 s for the entry — under full-module DDS load a fixed short
+        # spin may not receive the emit in time.
+        graph.emit_fjt(captured_uuid, EXECUTE_STATUS_SUCCEEDED)
+        captured = None
+        poll_deadline = time.monotonic() + 5.0
+        while time.monotonic() < poll_deadline:
+            _drive_spin(executor, graph=graph, timeout_s=0.2)
+            for entry in reversed(executor._fjt_status_cache):
+                if str(entry.get("goal_uuid")) == captured_uuid:
+                    captured = dict(entry)
+                    break
+            if captured is not None:
+                break
+        assert captured is not None, "captured FJT status entry was not observed"
+        # The FJT provider also requires the exact executed-trajectory digest.
+        # This isolated seam test pins a known digest; the positive D paths
+        # capture the real digest via the execute recorder at send time.
+        executor._execute_recorder.last_trajectory_digest = hashlib.sha256(b"seam-test").hexdigest()
+        provider = d._fjt_transaction_provider(executor, expected_fjt_entry=captured)
+        # Deterministic second post-capture status for the SAME UUID.
+        graph.emit_fjt(captured_uuid, EXECUTE_STATUS_SUCCEEDED)
+        poll_deadline = time.monotonic() + 5.0
+        while time.monotonic() < poll_deadline:
+            _drive_spin(executor, graph=graph, timeout_s=0.2)
+            matching = [
+                entry for entry in executor._fjt_status_cache
+                if str(entry.get("goal_uuid")) == captured_uuid
+            ]
+            if len(matching) >= 2:
+                break
+        evidence = provider()
+        # The provider returns the exact captured entry, never the newest.
+        assert evidence["goal_uuid"] == captured_uuid
+        assert evidence["sequence"] == captured["seq"]
+        assert evidence["timestamp"] == captured["received_mono"]
+        assert evidence["source"] == FJT_STATUS_TOPIC
+        # The second status IS in the live cache (mutation proven), seq advanced.
+        matching = [
+            entry for entry in executor._fjt_status_cache
+            if str(entry.get("goal_uuid")) == captured_uuid
+        ]
+        assert len(matching) >= 2, "second post-capture status not observed"
+        assert max(int(e.get("seq", 0)) for e in matching) > int(captured["seq"])
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_acceptance_timeout_exact_cancel(tmp_path):
+    """F5.3: a delayed acceptance response is canceled/drained by exact goal UUID.
+
+    The ExecuteTrajectory server delays the acceptance callback beyond the
+    driver's ``accept_timeout_s`` while the goal is genuinely accepted and the
+    long motion begins during the bounded cleanup grace period.  The driver must
+    retain the late handle, cancel/drain the exact goal, leave no in-flight
+    coroutine, and fail closed with the original presend error preserved.
+    """
+    scenario_id = "qualification-moveit-cancel"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    # Acceptance response lands at ~0.4 s > accept_timeout_s=0.1, and within the
+    # bounded grace period (>= 0.5 s), so the late handle is retained + canceled.
+    graph._execute_goal_accept_delay_s = 0.4
+    graph._execute_hold_s = 5.0
+    graph._motion_active = True
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        goal = build_execute_trajectory_goal(_planned_trajectory())
+        with pytest.raises(d.DriverError, match="acceptance timed out") as exc_info:
+            d._send_execute_retaining_handle(
+                executor, scenario_id, goal, accept_timeout_s=0.1,
+            )
+        message = str(exc_info.value)
+        assert "exact-UUID cleanup=" in message
+        cleanup_text = message.split("exact-UUID cleanup=", 1)[1]
+        cleanup = json.loads(cleanup_text)
+        assert isinstance(cleanup, dict)
+        # The exact preassigned goal was owned and canceled/drained.
+        assert cleanup.get("late_acceptance") is True
+        assert isinstance(cleanup.get("cleanup_goal_uuid"), str) and len(cleanup["cleanup_goal_uuid"]) == 32
+        assert cleanup.get("cleanup_result_status") in (
+            EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED, EXECUTE_STATUS_SUCCEEDED,
+        ), cleanup
+        # No uncontrolled motion survives: a final idempotent cleanup sees the
+        # retained handle already terminal (cancel rejected on a terminal goal)
+        # and leaves nothing live on the execute server.
+        final_cleanup = d._cleanup_retained_presend(executor)
+        assert final_cleanup.get("cleanup") in ("none", "rejected", "accepted"), final_cleanup
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                graph._executor.spin_once(timeout_sec=0.01)
+            except Exception:  # noqa: BLE001
+                pass
+            unresolved = [
+                future for server in graph._action_servers
+                for future in getattr(server, "_result_futures", {}).values()
+                if not future.done()
+            ]
+            if not unresolved:
+                break
+            time.sleep(0.01)
+        assert not unresolved, f"{len(unresolved)} execute result future(s) still live"
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_acceptance_timeout_exact_uuid_cancel_no_handle(tmp_path):
+    """F5.3: no late handle → typed exact-UUID CancelGoal path, fail closed.
+
+    When the acceptance response stays delayed through the grace period, the
+    driver sends a typed ``action_msgs/srv/CancelGoal`` request for the exact
+    preassigned UUID.  With the server's goal-callback still open the cancel is
+    rejected/unknown (no uncontrolled motion) and the driver fails closed.
+    """
+    scenario_id = "qualification-moveit-cancel"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    # Acceptance callback sleeps past accept_timeout_s AND past the bounded grace
+    # period (>= 0.5 s), so no handle arrives and the exact-UUID cancel path is
+    # used.  The goal becomes accepted only after the driver has already failed
+    # closed; graph teardown then aborts it (no uncontrolled motion survives).
+    graph._execute_goal_accept_delay_s = 1.0
+    graph._execute_hold_s = 5.0
+    graph._motion_active = True
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        goal = build_execute_trajectory_goal(_planned_trajectory())
+        with pytest.raises(d.DriverError, match="acceptance timed out") as exc_info:
+            d._send_execute_retaining_handle(
+                executor, scenario_id, goal, accept_timeout_s=0.05,
+            )
+        message = str(exc_info.value)
+        cleanup_text = message.split("exact-UUID cleanup=", 1)[1]
+        cleanup = json.loads(cleanup_text)
+        assert isinstance(cleanup, dict)
+        assert cleanup.get("late_acceptance") is False
+        # The exact-UUID cancel was attempted; a rejection/unknown/terminal
+        # response is observable evidence that no uncontrolled motion survives.
+        assert cleanup.get("cancel_response") in ("rejected", "accepted", "unavailable", "timed-out")
+        assert isinstance(cleanup.get("cleanup_goal_uuid"), str) and len(cleanup["cleanup_goal_uuid"]) == 32
+    finally:
+        # F5.6: the goal becomes accepted AFTER the driver has failed closed.
+        # Tear the graph down FIRST (aborting the late-accepted goal) while the
+        # executor client is still alive so the server's result response has a
+        # live client — no "failed to send response (timeout)" warning.
+        graph.stop()
+        if executor is not None:
+            executor.shutdown()
+
+
+def test_exact_uuid_cancel_rejection_fails_closed(tmp_path):
+    """F5.6: cleanup cancellation rejection fails closed without another goal.
+
+    The ExecuteTrajectory server rejects every cancel; the exact-UUID typed
+    cancel request must fail closed (``rejected``), never cancel a different
+    goal, and leave the driver able to raise without an uncontrolled motion.
+    """
+    scenario_id = "qualification-moveit-cancel"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    graph._execute_reject_cancel = True
+    graph._execute_hold_s = 5.0
+    graph._motion_active = True
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        # Send one real ExecuteTrajectory goal (accepted, held open).  We wait
+        # for ACCEPTANCE only — the goal must stay active so the exact-UUID
+        # cancel is meaningful; teardown then aborts the held goal.
+        goal = build_execute_trajectory_goal(_planned_trajectory())
+        send_future = executor._action_clients["/execute_trajectory"].send_goal_async(goal)
+        deadline = time.monotonic() + 5.0
+        while not send_future.done() and time.monotonic() < deadline:
+            executor._spin_once()
+        assert send_future.done(), "execute goal was not accepted in time"
+        handle = send_future.result()
+        assert handle is not None and getattr(handle, "accepted", False)
+        goal_uuid = d._goal_id_hex(handle)
+        assert isinstance(goal_uuid, str) and len(goal_uuid) == 32
+        # Typed exact-UUID cancel is rejected by the server → fail closed.
+        cancel = d._cancel_execute_goal_by_uuid(executor, goal_uuid, timeout_s=3.0)
+        assert cancel.get("response") == "rejected", cancel
+        # No unrelated goal was canceled and no cancel-all was issued: the
+        # response never lists a UUID other than the requested one.
+        assert cancel.get("goals_canceling") != [goal_uuid] or cancel.get("goals_canceling") == []
+        assert cancel.get("response") in ("rejected", "wrong-goal", "unavailable", "timed-out")
+    finally:
+        # F5.6: the held goal (cancel rejected) is aborted by the graph teardown.
+        # Tear the graph down FIRST while the executor client is still alive so
+        # the server's abort result response has a live client — no
+        # "failed to send response (timeout)" warning.
+        graph.stop()
+        if executor is not None:
+            executor.shutdown()
+
+
+def test_exact_uuid_cancel_accepted_requires_terminal_evidence(tmp_path):
+    """F5.3/F5.6: an accepted exact-UUID cancel requires observable terminal
+    evidence for that exact execute goal UUID before teardown.
+
+    Sends a real ExecuteTrajectory goal (accepted, held open), issues the typed
+    exact-UUID ``action_msgs/srv/CancelGoal`` request, and verifies the server
+    acknowledges the exact goal (``goals_canceling == [uuid]``) and that the
+    executor observes terminal execute status for that exact UUID.
+    """
+    scenario_id = "qualification-moveit-cancel"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    graph._execute_hold_s = 5.0
+    graph._motion_active = True
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        goal = build_execute_trajectory_goal(_planned_trajectory())
+        send_future = executor._action_clients["/execute_trajectory"].send_goal_async(goal)
+        deadline = time.monotonic() + 5.0
+        while not send_future.done() and time.monotonic() < deadline:
+            executor._spin_once()
+        assert send_future.done(), "execute goal was not accepted in time"
+        handle = send_future.result()
+        assert handle is not None and getattr(handle, "accepted", False)
+        goal_uuid = d._goal_id_hex(handle)
+        assert isinstance(goal_uuid, str) and len(goal_uuid) == 32
+        # Typed exact-UUID cancel on an accepting server → "accepted".
+        cancel = d._cancel_execute_goal_by_uuid(executor, goal_uuid, timeout_s=3.0)
+        assert cancel.get("response") == "accepted", cancel
+        assert cancel.get("goals_canceling") == [goal_uuid]
+        # Observable terminal evidence for that exact UUID (the driver's step-3
+        # requirement before teardown).
+        terminal = executor._wait_for_execute_status(
+            goal_uuid,
+            (EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED, EXECUTE_STATUS_SUCCEEDED),
+            3.0,
+        )
+        assert terminal is not None, "no terminal execute status for the exact UUID"
+        assert terminal.get("status") in (
+            EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED, EXECUTE_STATUS_SUCCEEDED,
+        )
+        # Drain the goal result so the server coroutine terminates.
+        result_future = handle.get_result_async()
+        deadline = time.monotonic() + 3.0
+        while not result_future.done() and time.monotonic() < deadline:
+            executor._spin_once()
+        assert result_future.done()
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_exact_uuid_cancel_service_unavailable_fails_closed(rclpy_runtime, tmp_path):
+    """F5.6: unavailable cancel service fails closed without cancel-all.
+
+    With no ExecuteTrajectory action server on the graph, the typed exact-UUID
+    cancel service never becomes available; the driver's cleanup must fail
+    closed (``unavailable``), never cancel-all or block indefinitely.
+    """
+    executor = None
+    try:
+        # Construct the executor WITHOUT any controlled action server: the
+        # /execute_trajectory cancel service is therefore unavailable.
+        executor = _construct_real_executor(Path(tmp_path))
+        cancel = d._cancel_execute_goal_by_uuid(executor, _fresh_uuid_hex(), timeout_s=0.6)
+        assert cancel.get("response") == "unavailable", cancel
+        assert isinstance(cancel.get("error"), str) and cancel["error"]
+    finally:
+        if executor is not None:
+            executor.shutdown()

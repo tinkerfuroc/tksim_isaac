@@ -61,7 +61,13 @@ sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
 # level); its committed scenario/kind constants are the single source of truth
 # for the 17-scenario dispatch table.
 from integrated_gate_executor import (  # noqa: E402
+    EXECUTE_STATUS_ABORTED,
+    EXECUTE_STATUS_CANCELED,
+    EXECUTE_STATUS_SUCCEEDED,
+    EXECUTE_STATUS_TOPIC,
+    EXECUTE_TRAJECTORY_ENDPOINT,
     FJT_ENDPOINT,
+    FJT_STATUS_TOPIC,
     STAGE_C_SCENARIOS,
     STAGE_D_KIND,
     STAGE_D_SCENARIOS,
@@ -927,13 +933,18 @@ class _ExecuteTrajectoryRecorder(_ActionClientRecorder):
         self.send_count = 0
         self.last_send_mono: float | None = None
 
-    def send_goal_async(self, goal: Any) -> Any:
+    def send_goal_async(self, goal: Any, goal_uuid: Any = None) -> Any:
         self.send_count += 1
         self.last_send_mono = time.monotonic()
         trajectory = getattr(goal, "trajectory", None)
         if trajectory is not None:
             raw = self._executor.ros["serialize_message"](trajectory)
             self.last_trajectory_digest = hashlib.sha256(bytes(raw)).hexdigest()
+        # F5.3: forward a caller-preassigned goal UUID so exact-UUID cancellation
+        # is owned from before the send even if the acceptance response is
+        # delayed (Humble rclpy ``send_goal_async(goal, goal_uuid=...)``).
+        if goal_uuid is not None:
+            return self._real.send_goal_async(goal, goal_uuid=goal_uuid)
         return self._real.send_goal_async(goal)
 
 
@@ -1800,22 +1811,70 @@ def _native_gripper_goal_count_provider(executor: Any) -> Callable[[], Mapping[s
 
 
 def _fjt_transaction_provider(
-    executor: Any, *, expected_goal_uuid: str | None = None
+    executor: Any,
+    *,
+    expected_goal_uuid: str | None = None,
+    expected_fjt_entry: Mapping[str, Any] | None = None,
 ) -> Callable[[], Mapping[str, Any]]:
     """Provide FJT transactions from the observed status cache + execute recorder.
 
-    F3.4: goal_uuid/status/sequence/timestamp come from the executor's newest
-    fresh real ``_fjt_status_cache`` entry; the trajectory digest is the digest
-    of the exact ExecuteTrajectory goal captured by the execute recorder.  No
+    F3.4: goal_uuid/status/sequence/timestamp come from the executor's fresh real
+    ``_fjt_status_cache`` entry; the trajectory digest is the digest of the
+    exact ExecuteTrajectory goal captured by the execute recorder.  No
     status-record hashing and no invented digest.
 
     F4.3/F4.4: when *expected_goal_uuid* is supplied the newest entry for that
     exact controller goal UUID is returned (the cancel/safety presend path
     discovered it before the run method); the provider evidence then binds to
     the distinct controller transaction, never to the ExecuteTrajectory UUID.
+
+    F5.1: when *expected_fjt_entry* is supplied (or the provider is later bound
+    via ``bind(entry)``), the provider returns UUID/status/sequence/timestamp/
+    source from that exact captured entry and never selects "newest"
+    independently.  A second status emission for the same controller goal after
+    the capture therefore cannot switch the transaction.
     """
+    state: dict[str, object] = {
+        "entry": dict(expected_fjt_entry) if expected_fjt_entry is not None else None
+    }
+
+    def _evidence_from_entry(entry: Mapping[str, Any]) -> Mapping[str, Any]:
+        goal_uuid = entry.get("goal_uuid")
+        status = entry.get("status")
+        sequence = entry.get("seq")
+        timestamp = entry.get("received_mono")
+        if not isinstance(goal_uuid, str) or not goal_uuid:
+            raise DriverError("bound FJT status entry has no goal_uuid")
+        if isinstance(status, bool) or not isinstance(status, int):
+            raise DriverError("bound FJT status entry has no integer status")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise DriverError("bound FJT status entry has no valid sequence")
+        if isinstance(timestamp, bool):
+            raise DriverError("bound FJT status entry has no finite timestamp")
+        try:
+            timestamp_f = float(timestamp)
+        except (TypeError, ValueError):
+            raise DriverError("bound FJT status entry has no finite timestamp") from None
+        if not math.isfinite(timestamp_f):
+            raise DriverError("bound FJT status entry has no finite timestamp")
+        recorder = getattr(executor, "_execute_recorder", None)
+        digest = recorder.last_trajectory_digest if recorder is not None else None
+        if not isinstance(digest, str) or not digest:
+            raise DriverError("no executed-trajectory digest captured by the execute recorder")
+        return {
+            "endpoint": FJT_ENDPOINT,
+            "goal_uuid": goal_uuid,
+            "trajectory_digest": digest,
+            "source": FJT_STATUS_TOPIC,
+            "sequence": sequence,
+            "timestamp": timestamp_f,
+            "status": status,
+        }
 
     def _provider() -> Mapping[str, Any]:
+        entry = state.get("entry")
+        if entry is not None:
+            return _evidence_from_entry(entry)
         entries = executor._fjt_status_entries()
         if not entries:
             raise DriverError("no FJT status-topic entry observed for this transaction")
@@ -1830,38 +1889,14 @@ def _fjt_transaction_provider(
                 )
             entries = filtered
         newest = entries[-1]
-        goal_uuid = newest.get("goal_uuid")
-        status = newest.get("status")
-        sequence = newest.get("seq")
-        timestamp = newest.get("received_mono")
-        if not isinstance(goal_uuid, str) or not goal_uuid:
-            raise DriverError("newest FJT status entry has no goal_uuid")
-        if isinstance(status, bool) or not isinstance(status, int):
-            raise DriverError("newest FJT status entry has no integer status")
-        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
-            raise DriverError("newest FJT status entry has no valid sequence")
-        if isinstance(timestamp, bool):
-            raise DriverError("newest FJT status entry has no finite timestamp")
-        try:
-            timestamp_f = float(timestamp)
-        except (TypeError, ValueError):
-            raise DriverError("newest FJT status entry has no finite timestamp") from None
-        if not math.isfinite(timestamp_f):
-            raise DriverError("newest FJT status entry has no finite timestamp")
-        recorder = getattr(executor, "_execute_recorder", None)
-        digest = recorder.last_trajectory_digest if recorder is not None else None
-        if not isinstance(digest, str) or not digest:
-            raise DriverError("no executed-trajectory digest captured by the execute recorder")
-        return {
-            "endpoint": FJT_ENDPOINT,
-            "goal_uuid": goal_uuid,
-            "trajectory_digest": digest,
-            "source": "executor-action-client-goal-introspection",
-            "sequence": sequence,
-            "timestamp": timestamp_f,
-            "status": status,
-        }
+        return _evidence_from_entry(newest)
 
+    # F5.1: late single-capture binding seam — the run method binds the provider
+    # to the exact terminal status entry captured by ``_wait_for_fjt_status``.
+    def _bind(entry: Mapping[str, Any]) -> None:
+        state["entry"] = dict(entry)
+
+    _provider.bind = _bind  # type: ignore[attr-defined]
     return _provider
 
 
@@ -1909,6 +1944,208 @@ def _long_motion_provider_from_presend(
     return _provider
 
 
+def _new_preassigned_goal_uuid(executor: Any) -> tuple[Any, str]:
+    """F5.3: build a caller-generated 16-byte action goal UUID and its hex.
+
+    Returns the ``unique_identifier_msgs/msg/UUID`` message to pass to
+    ``send_goal_async(goal, goal_uuid=...)`` plus the lowercase 16-byte hex the
+    driver retains before the send for exact-UUID cancellation ownership.
+    """
+    from unique_identifier_msgs.msg import UUID as UUIDMessage
+
+    raw = _uuid.uuid4().bytes
+    message = UUIDMessage()
+    message.uuid = list(raw)
+    return message, _uuid.UUID(bytes=raw).hex
+
+
+def _cancel_execute_goal_by_uuid(
+    executor: Any, goal_uuid_hex: str, *, timeout_s: float
+) -> dict[str, object]:
+    """F5.3: typed exact-UUID ``action_msgs/srv/CancelGoal`` request.
+
+    Sends a real ``action_msgs/srv/CancelGoal`` request to the execute action's
+    cancel-goal service endpoint using the preassigned goal UUID.  Fails closed
+    on an unavailable/timed-out/failed/wrong-goal/rejected response.  Never
+    issues cancel-all or a timestamp-wide cancellation.
+    """
+    from action_msgs.srv import CancelGoal
+    from integrated_gate_executor import _normalize_goal_uuid
+
+    endpoint = f"{EXECUTE_TRAJECTORY_ENDPOINT}/_action/cancel_goal"
+    node = getattr(executor, "node", None)
+    if node is None:
+        return {"response": "failed", "error": "executor has no node for exact-UUID cancel"}
+    client = node.create_client(CancelGoal, endpoint)
+    try:
+        wait_s = min(max(float(timeout_s), 0.1), 2.0)
+        if not client.wait_for_service(timeout_sec=wait_s):
+            return {
+                "response": "unavailable",
+                "error": f"cancel service {endpoint} unavailable within {wait_s:.1f}s",
+            }
+        request = CancelGoal.Request()
+        request.goal_info.goal_id.uuid = list(bytes.fromhex(goal_uuid_hex))
+        future = client.call_async(request)
+        deadline = time.monotonic() + float(timeout_s)
+        while not future.done() and time.monotonic() < deadline:
+            executor._spin_once()
+        if not future.done():
+            return {
+                "response": "timed-out",
+                "error": "cancel response did not resolve within the bounded wait",
+            }
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001 - cancel boundary
+            return {"response": "failed", "error": f"cancel request raised: {exc}"}
+        return_code = getattr(response, "return_code", None)
+        goals_canceling = [
+            normalized
+            for normalized in (
+                _normalize_goal_uuid(getattr(info, "goal_id", None))
+                for info in getattr(response, "goals_canceling", [])
+            )
+            if normalized
+        ]
+        if (
+            isinstance(return_code, int)
+            and not isinstance(return_code, bool)
+            and return_code == 0
+            and goals_canceling == [goal_uuid_hex]
+        ):
+            return {
+                "response": "accepted",
+                "return_code": return_code,
+                "goals_canceling": goals_canceling,
+                "error": None,
+            }
+        if goals_canceling and goals_canceling != [goal_uuid_hex]:
+            return {
+                "response": "wrong-goal",
+                "return_code": return_code,
+                "goals_canceling": goals_canceling,
+                "error": (
+                    "cancel response referenced a goal UUID other than the "
+                    "preassigned execute goal"
+                ),
+            }
+        return {
+            "response": "rejected",
+            "return_code": return_code,
+            "goals_canceling": goals_canceling,
+            "error": (
+                "cancel did not join the exact preassigned execute goal UUID "
+                "(unknown/terminal/rejected goal)"
+            ),
+        }
+    finally:
+        try:
+            client.destroy()
+        except Exception:  # noqa: BLE001 - best-effort client cleanup
+            pass
+
+
+def _cleanup_delayed_acceptance(
+    executor: Any,
+    preassigned_hex: str,
+    send_future: Any,
+    *,
+    accept_timeout_s: float,
+) -> dict[str, object]:
+    """F5.3: bounded exact-goal cleanup when the acceptance response is delayed.
+
+    The server may have accepted the ExecuteTrajectory goal and begun the long
+    motion even though the acceptance response has not arrived within
+    ``accept_timeout_s``.  This owns a cancellation path for that exact goal:
+
+    1. spin for a bounded grace period for a late acceptance response; if a
+       handle arrives, retain and cancel/drain it on the exact handle;
+    2. if no handle arrives, send a typed exact-UUID ``action_msgs/srv/
+       CancelGoal`` request to the execute action's cancel service;
+    3. on an accepted cancel, require observable terminal execute status for
+       that exact UUID before teardown; a rejection/unknown/terminal response
+       is itself observable evidence that no uncontrolled motion survives.
+
+    Never cancels a different goal.  Cleanup diagnostics are returned without
+    masking the original presend failure (the caller raises).
+    """
+    try:
+        cancel_timeout_s = float(executor._thresholds().get("cancel_timeout_s", 10.0))
+    except Exception:  # noqa: BLE001 - defensive cleanup boundary
+        cancel_timeout_s = 5.0
+    # Step 1: bounded grace period for a late acceptance response.
+    grace_s = min(max(float(accept_timeout_s), 0.5), 5.0)
+    grace_deadline = time.monotonic() + grace_s
+    while not send_future.done() and time.monotonic() < grace_deadline:
+        executor._spin_once()
+    if send_future.done():
+        try:
+            goal_handle = send_future.result()
+        except Exception as exc:  # noqa: BLE001 - late-acceptance boundary
+            return {
+                "cleanup": "error",
+                "late_acceptance": True,
+                "cleanup_goal_uuid": preassigned_hex,
+                "cleanup_error": f"late acceptance future raised: {exc}",
+            }
+        if goal_handle is None or not getattr(goal_handle, "accepted", False):
+            return {
+                "cleanup": "none",
+                "cleanup_reason": "late-rejected",
+                "late_acceptance": True,
+                "cleanup_goal_uuid": preassigned_hex,
+            }
+        try:
+            executor._presend_execute_handle = goal_handle
+        except Exception:  # noqa: BLE001 - best-effort retention
+            pass
+        outcome = executor._cleanup_execute_goal(goal_handle, timeout_s=cancel_timeout_s)
+        outcome = dict(outcome)
+        outcome["late_acceptance"] = True
+        outcome["cleanup_goal_uuid"] = _goal_id_hex(goal_handle) or preassigned_hex
+        return outcome
+    # Step 2: no handle; typed exact-UUID CancelGoal request.
+    cancel = _cancel_execute_goal_by_uuid(executor, preassigned_hex, timeout_s=cancel_timeout_s)
+    result: dict[str, object] = {
+        "late_acceptance": False,
+        "cleanup_goal_uuid": preassigned_hex,
+        "cancel_response": cancel.get("response"),
+        "cancel_return_code": cancel.get("return_code"),
+        "cancel_goals_canceling": list(cancel.get("goals_canceling") or []),
+        "cancel_error": cancel.get("error"),
+    }
+    if cancel.get("response") != "accepted":
+        # Rejection/unknown/terminal/unavailable/timed-out/wrong-goal: fail
+        # closed.  A rejection means the server never accepted the goal (no
+        # uncontrolled motion) or the goal is already terminal; either way the
+        # exact-UUID response is observable evidence.
+        result["cleanup"] = "rejected"
+        result["terminal_evidence"] = None
+        result["terminal_evidence_reason"] = cancel.get("error") or str(cancel.get("response"))
+        return result
+    # Step 3: accepted cancel — require observable terminal evidence for the
+    # exact UUID within a bounded wait before teardown.
+    terminal_timeout_s = min(max(float(cancel_timeout_s), 1.0), 15.0)
+    terminal = executor._wait_for_execute_status(
+        preassigned_hex,
+        (EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED, EXECUTE_STATUS_SUCCEEDED),
+        terminal_timeout_s,
+    )
+    if terminal is not None:
+        result["cleanup"] = "canceled"
+        result["terminal_evidence"] = dict(terminal)
+        result["terminal_status"] = terminal.get("status")
+        return result
+    result["cleanup"] = "cancel-unconfirmed"
+    result["terminal_evidence"] = None
+    result["terminal_evidence_reason"] = (
+        "cancel accepted but no terminal execute status observed for the exact "
+        f"goal UUID within {terminal_timeout_s:.1f}s"
+    )
+    return result
+
+
 def _send_execute_retaining_handle(
     executor: Any,
     scenario_id: str,
@@ -1922,27 +2159,45 @@ def _send_execute_retaining_handle(
     F3.5: the accepted handle is passed to ``run_cancel_sequence`` as the live
     ``execute_goal_handle`` (never an artifact-file-derived UUID).  The execute
     recorder captures the exact goal trajectory digest at send time.
+
+    F5.3: a caller-generated goal UUID is passed to ``send_goal_async`` so the
+    driver owns an exact-UUID cancellation path from before the send even if the
+    server accepts the goal but the acceptance response is delayed.  On
+    acceptance-response timeout the driver enters the bounded cleanup phase
+    (:func:`_cleanup_delayed_acceptance`) before raising.  Never cancel-all.
     """
     client = executor._action_clients["/execute_trajectory"]
     if not client.wait_for_server(timeout_sec=server_timeout_s):
         raise DriverError("/execute_trajectory server was not available for pre-send")
-    send_future = client.send_goal_async(goal)
+    # F5.3: preassign the goal UUID and retain it BEFORE the send so a delayed
+    # acceptance response cannot strand a server-side accepted long motion.
+    preassigned_uuid, preassigned_hex = _new_preassigned_goal_uuid(executor)
+    try:
+        executor._presend_execute_goal_uuid = preassigned_hex
+    except Exception:  # noqa: BLE001 - best-effort retention
+        pass
+    send_future = client.send_goal_async(goal, goal_uuid=preassigned_uuid)
     accept_deadline = time.monotonic() + accept_timeout_s
     while not send_future.done() and time.monotonic() < accept_deadline:
         executor._spin_once()
-    if not send_future.done():
-        try:
-            send_future.cancel()
-        except Exception:  # noqa: BLE001
-            pass
-        raise DriverError("pre-send execute goal acceptance timed out")
-    goal_handle = send_future.result()
-    if goal_handle is None or not getattr(goal_handle, "accepted", False):
-        raise DriverError("pre-send execute goal was rejected")
-    execute_goal_id = _goal_id_hex(goal_handle)
-    if not (isinstance(execute_goal_id, str) and execute_goal_id):
-        raise DriverError("pre-send execute goal produced no valid normalized UUID")
-    return execute_goal_id, goal_handle
+    if send_future.done():
+        goal_handle = send_future.result()
+        if goal_handle is None or not getattr(goal_handle, "accepted", False):
+            raise DriverError("pre-send execute goal was rejected")
+        execute_goal_id = _goal_id_hex(goal_handle)
+        if not (isinstance(execute_goal_id, str) and execute_goal_id):
+            raise DriverError("pre-send execute goal produced no valid normalized UUID")
+        return execute_goal_id, goal_handle
+    # F5.3: acceptance-response timeout.  The server may have accepted and begun
+    # the long motion with a delayed acceptance response; cancel/drain the exact
+    # goal before raising (bounded, idempotent, never cancel-all).
+    cleanup = _cleanup_delayed_acceptance(
+        executor, preassigned_hex, send_future, accept_timeout_s=accept_timeout_s
+    )
+    raise DriverError(
+        "pre-send execute goal acceptance timed out; exact-UUID cleanup="
+        + json.dumps(cleanup, sort_keys=True)
+    )
 
 
 def _presend_long_motion(executor: Any, scenario_id: str) -> dict[str, Any]:
@@ -1989,10 +2244,20 @@ def _presend_long_motion(executor: Any, scenario_id: str) -> dict[str, Any]:
         executor._presend_execute_handle = execute_goal_handle
     except Exception:  # noqa: BLE001 - best-effort retention
         pass
+    # F5.3: the preassigned UUID is superseded by the real retained handle once
+    # the acceptance response lands; clear it so teardown cleanup prefers the
+    # handle and never issues a redundant exact-UUID cancel for a handled goal.
+    try:
+        executor._presend_execute_goal_uuid = None
+    except Exception:  # noqa: BLE001 - best-effort reset
+        pass
     # F4.4: wait bounded for the unique new controller FJT goal to reach
     # ACCEPTED(1) or EXECUTING(2) after the pre-send baseline.  Discovery
     # ignores any UUID already known at baseline.
-    fjt_wait_s = float(executor._thresholds().get("fjt_wait_timeout_s", 1.0))
+    # F5.2: the production FJT wait default is exactly 10.0 s (an explicit
+    # finite positive scenario override remains authoritative; a malformed
+    # override fails closed).
+    fjt_wait_s = executor._threshold_timeout("fjt_wait_timeout_s", 10.0)
     fjt_entry = executor._wait_for_fjt_status(
         None, (1, 2), fjt_wait_s, baseline=transaction_baseline
     )
@@ -2011,6 +2276,9 @@ def _presend_long_motion(executor: Any, scenario_id: str) -> dict[str, Any]:
         "execute_goal_id": execute_goal_id,
         "execute_goal_handle": execute_goal_handle,
         "fjt_goal_id": fjt_goal_id,
+        # F5.1: return the exact single-captured entry so the runtime provider
+        # factory binds the FJT provider to it (never a later re-read).
+        "fjt_entry": dict(fjt_entry),
         "transaction_baseline": dict(transaction_baseline),
     }
 
@@ -2022,10 +2290,42 @@ def _cleanup_retained_presend(executor: Any) -> dict[str, object]:
     summary without raising.  Cleanup errors are preserved in the returned
     summary and never mask the caller's original status, so no uncontrolled
     long motion survives a failed cancel/safety/provider/finalization path.
+
+    F5.3: if no handle is retained but a preassigned execute goal UUID was, the
+    driver still owns an exact-UUID cancel path and issues a typed CancelGoal
+    request for that exact UUID (bounded, never cancel-all) so a delayed
+    acceptance cannot strand a server-side motion through teardown.
     """
     handle = getattr(executor, "_presend_execute_handle", None)
     if handle is None:
-        return {"cleanup": "none", "cleanup_reason": "no-retained-presend-handle"}
+        goal_uuid = getattr(executor, "_presend_execute_goal_uuid", None)
+        if not (isinstance(goal_uuid, str) and goal_uuid):
+            return {"cleanup": "none", "cleanup_reason": "no-retained-presend-handle"}
+        try:
+            timeout_s = float(executor._thresholds().get("cancel_timeout_s", 10.0))
+        except Exception:  # noqa: BLE001 - defensive cleanup boundary
+            timeout_s = 5.0
+        cancel = _cancel_execute_goal_by_uuid(executor, goal_uuid, timeout_s=timeout_s)
+        outcome: dict[str, object] = {
+            "cleanup": "exact-uuid-cancel",
+            "cleanup_goal_uuid": goal_uuid,
+            "cancel_response": cancel.get("response"),
+            "cancel_return_code": cancel.get("return_code"),
+            "cancel_goals_canceling": list(cancel.get("goals_canceling") or []),
+            "cancel_error": cancel.get("error"),
+        }
+        if cancel.get("response") == "accepted":
+            terminal = executor._wait_for_execute_status(
+                goal_uuid,
+                (EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED, EXECUTE_STATUS_SUCCEEDED),
+                min(max(float(timeout_s), 1.0), 15.0),
+            )
+            outcome["cleanup_terminal"] = dict(terminal) if terminal is not None else None
+        try:
+            executor._presend_execute_goal_uuid = None
+        except Exception:  # noqa: BLE001 - best-effort reset
+            pass
+        return outcome
     try:
         timeout_s = float(executor._thresholds().get("cancel_timeout_s", 10.0))
     except Exception:  # noqa: BLE001 - defensive cleanup boundary
@@ -2142,8 +2442,13 @@ def _live_runtime_provider_factory(
                 presend["planning_goal_id"],
                 presend["execute_goal_id"],
             )
+            # F5.1: bind the FJT provider to the exact single-captured presend
+            # entry (the run method later re-binds it to the terminal entry via
+            # ``bind``; the provider never selects "newest" independently).
             kwargs["fjt_transaction_provider"] = _fjt_transaction_provider(
-                executor, expected_goal_uuid=presend["fjt_goal_id"]
+                executor,
+                expected_goal_uuid=presend["fjt_goal_id"],
+                expected_fjt_entry=presend.get("fjt_entry"),
             )
             kwargs["fjt_goal_id"] = presend["fjt_goal_id"]
             kwargs["transaction_baseline"] = presend["transaction_baseline"]

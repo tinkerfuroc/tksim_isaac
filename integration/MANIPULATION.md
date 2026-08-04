@@ -363,6 +363,38 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 5 — "stabilize controller
+  evidence lifecycle"): Final repair round driven by the fix-round-4 coordinator
+  result (positive D trio 11/17 fresh-process runs, one cancel transaction
+  committed `evidence-invalid`, one interpreter-teardown crash, and five harness
+  5 s readiness-budget failures).  Each required FJT state is one immutable
+  captured status entry: `_wait_for_fjt_status`/`_wait_for_fjt_executing` capture
+  and return a copy, `run_execute_sequence`/`run_cancel_sequence`/`run_safety_sequence`
+  retain that entry and bind the provider through `_bind_and_call_fjt_provider`,
+  and `_validate_fjt_evidence` validates only against the captured entry (never a
+  fresh cache query); the provider returns UUID/status/sequence/timestamp/source
+  from that exact entry and the exact recorded ExecuteTrajectory digest, and any
+  post-capture second status for the same UUID cannot switch the transaction.
+  Defaults are now 10.0 s for both `fjt_wait_timeout_s` and
+  `motion_trigger_timeout_s` with fail-closed malformed overrides.  The presend
+  goal uses a caller-generated action UUID and the driver owns an exact-UUID
+  cancel path through the acceptance-response timeout (late-handle retention or a
+  typed `CancelGoal` on `/execute_trajectory/_action/cancel_goal` with terminal
+  evidence), so no accepted long-motion goal can be stranded by a delayed
+  acceptance response.  The controlled graph teardown drains all goals/coroutines/
+  futures/threads/nodes/contexts in bounded explicit order and the readiness
+  budget is 30.0 s; a stale-but-valid join key waits a bounded 0.1 s for the next
+  advancing physics-truth frame before failing closed (closes the round-4
+  fresh-process `evidence-invalid` at the teardown journal snapshot).  Fresh
+  counts: provider suite 38 passed / zero warnings in
+  three consecutive fresh processes; each positive D execute/cancel/safety test
+  4/4 alone; the three positive D tests together 30/30 consecutive fresh
+  processes, zero warnings/crashes/timeouts; plus fresh delayed-status,
+  second-post-capture, delayed-acceptance exact-cancel, cleanup-rejection/
+  unavailable, and owner-QoS mutation tests.  No build, no live Isaac/GPU/cuMotion;
+  all immutable production files and the future qualification source lock
+  untouched.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 4 — "bind real
   controller transactions"): Bound every Stage-D controller transaction to the
   real controller FJT goal UUID — never the MoveIt ExecuteTrajectory UUID.

@@ -1459,6 +1459,89 @@ def test_stage_e_dispatch_rejects_positive_trigger_timeout_mutation():
         stage_e_dispatch("qualification-pick-place-positive", scenario=mutated)
 
 
+def test_f52_d_wait_timeout_defaults_are_10_and_malformed_overrides_fail_closed():
+    """F5.2: bounded production-real D wait defaults and fail-closed overrides."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    def _bare_executor(config):
+        executor = object.__new__(IntegratedGateExecutor)
+        executor.config = config
+        return executor
+
+    # No overrides: the production defaults are exactly 10.0 seconds for both
+    # the FJT wait and the motion-trigger wait.
+    executor = _bare_executor({"thresholds": {}})
+    assert executor._threshold_timeout("fjt_wait_timeout_s", 10.0) == 10.0
+    assert executor._threshold_timeout("motion_trigger_timeout_s", 10.0) == 10.0
+
+    # Explicit finite positive scenario overrides remain authoritative.
+    executor = _bare_executor(
+        {"thresholds": {"fjt_wait_timeout_s": 3.0, "motion_trigger_timeout_s": 4.5}}
+    )
+    assert executor._threshold_timeout("fjt_wait_timeout_s", 10.0) == 3.0
+    assert executor._threshold_timeout("motion_trigger_timeout_s", 10.0) == 4.5
+
+    # Malformed / non-finite / boolean / zero / negative overrides fail closed.
+    malformed = (
+        True, False, 0.0, -1.0, float("nan"), float("inf"), float("-inf"),
+        "not-a-number", None, [3.0], {"s": 1},
+    )
+    for key in ("fjt_wait_timeout_s", "motion_trigger_timeout_s"):
+        for bad in malformed:
+            executor = _bare_executor({"thresholds": {key: bad}})
+            with pytest.raises(ValueError, match="finite positive number"):
+                executor._threshold_timeout(key, 10.0)
+
+
+def test_join_key_retries_on_stale_but_valid_key():
+    """F5.4: a valid-but-non-advancing join key waits bounded for the next
+    advancing truth frame instead of emitting a spurious ``no-join-key``.
+
+    Two journal snapshots landing inside one truth frame observe the same
+    (frame_index, timestamp); the executor must wait for the next advancing
+    frame (bounded), while a missing provider or a genuinely stalled/malformed
+    stream still fails closed.
+    """
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    calls = {"n": 0}
+    stale_calls = {"n": 0}
+
+    def _advancing_provider():
+        calls["n"] += 1
+        return (calls["n"] * 10, float(calls["n"]))
+
+    # Fresh executor: first call succeeds immediately (no previous key), the
+    # strict-increase guarantee is preserved for an always-advancing stream.
+    executor = object.__new__(IntegratedGateExecutor)
+    executor._last_join_key = None
+    executor.join_key_provider = _advancing_provider
+    assert executor._join_key() == (10, 1.0)
+    assert executor._join_key() == (20, 2.0)
+    assert calls["n"] == 2
+
+    # A stale-but-valid key (same frame/timestamp as the previous capture) must
+    # retry within a bounded window until the truth advances.
+    def _stale_then_advance():
+        stale_calls["n"] += 1
+        if stale_calls["n"] <= 2:
+            return (5, 1.0)  # stale vs the (5, 1.0) baseline and against itself
+        return (6, 2.0)  # advancing
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor._last_join_key = (5, 1.0)
+    executor.join_key_provider = _stale_then_advance
+    key = executor._join_key()
+    assert key == (6, 2.0), key
+    assert stale_calls["n"] >= 3, stale_calls["n"]
+
+    # A missing provider still fails closed immediately.
+    executor = object.__new__(IntegratedGateExecutor)
+    executor._last_join_key = None
+    executor.join_key_provider = None
+    assert executor._join_key() is None
+
+
 def test_stage_e_dispatch_rejects_blocked_approach_goal_mutation():
     from validation.integrated_gate_executor import stage_e_dispatch
 
