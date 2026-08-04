@@ -314,6 +314,54 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 5 — "stabilize controller
+  evidence lifecycle"): Repaired the four load-bearing defects found by fresh
+  coordinator repetition of fix round 4 (the positive D trio passed only 11/17
+  fresh-process runs, one real cancel transaction committed `evidence-invalid`,
+  one process crashed at interpreter teardown, and five tests hit the 5 s
+  harness readiness budget).  FJT terminal evidence is now a single immutable
+  capture transaction: `_wait_for_fjt_status` captures one `dict(entry)` copy,
+  the run methods bind the provider via `_bind_and_call_fjt_provider` and pass the
+  exact captured entry into `_validate_fjt_evidence`, and a second post-capture
+  status emission for the same controller UUID can no longer switch or race the
+  transaction (provider UUID/status/sequence/timestamp must equal the captured
+  entry exactly, source is the real
+  `/xarm7_traj_controller/follow_joint_trajectory/_action/status` topic).  The
+  production-real D wait defaults are now exactly `fjt_wait_timeout_s = 10.0` and
+  `motion_trigger_timeout_s = 10.0` (`_threshold_timeout`); finite positive
+  scenario overrides stay authoritative and malformed/non-finite/boolean/zero/
+  negative overrides fail closed.  Presend ExecuteTrajectory goals now carry a
+  preassigned action UUID (`send_goal_async(..., goal_uuid=...)`) retained before
+  send; on acceptance-response timeout the driver enters a bounded cleanup phase
+  (late-acceptance grace, then a typed exact-UUID `action_msgs/srv/CancelGoal` to
+  `/execute_trajectory/_action/cancel_goal`, requiring cancellation/terminal
+  evidence for that exact UUID) so no uncontrolled presend motion can survive
+  driver exit, and it never cancels all/timestamp-wide/unrelated goals.  The
+  controlled Humble harness now tracks every execute coroutine/goal/result/
+  cancel future, hold/release event, thread, node, and context and drains them in
+  explicit bounded order before shutdown (no daemon-thread reliance), and its
+  readiness budget is exactly 30.0 s to match production `run_driver`.  A
+  valid-but-non-advancing join key (two journal snapshots landing inside one
+  truth frame observe the same frame_index/timestamp) now waits a bounded 0.1 s
+  for the next advancing physics-truth frame instead of emitting a spurious
+  `no-join-key`; malformed keys, a missing provider, or a genuinely stalled
+  truth stream still fail closed (`JOIN_KEY_RETRY_S`).  An
+  owner-QoS mutation creates an extra incompatible publisher/subscriber before
+  the required endpoint and still selects `/move_group`,
+  `/fixture_planning_scene`, and `/tinker_integrated_gate_executor`; missing or
+  duplicate required owner endpoints return `{}` and fail closed.  Fresh
+  verification: ROS-free executor + driver suites pass; sourced-Humble provider
+  suite 38 passed with zero warnings across three consecutive fresh-process runs;
+  each positive D execute/cancel/safety test passes 4 consecutive fresh-process
+  runs alone; the three positive D tests together pass 30/30 consecutive
+  fresh-process runs with fresh domain IDs and zero warnings/crashes/timeouts;
+  the delayed-status (>1 s, <10 s), second-post-capture-status, delayed-
+  acceptance exact-cancel (both late-handle and exact-UUID paths), cleanup
+  rejection/unavailable fail-closed, and owner-QoS mutation tests pass fresh.
+  No build, no live Isaac/GPU/cuMotion; executor/verifier/journal/orchestrator/
+  scenarios/configs/locks/gateway/bridge/scripts and all production files
+  untouched; the future qualification source lock remains absent.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 4 — "bind real
   controller transactions"): Bound every Stage-D controller transaction to the
   real FJT controller goal UUID, distinct from the MoveIt ExecuteTrajectory

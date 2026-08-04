@@ -188,6 +188,10 @@ GRIPPER_CLOSE_FIRST_EVENT_ORDER: tuple[str, ...] = (
 EXECUTE_TRAJECTORY_ENDPOINT = "/execute_trajectory"
 FJT_ENDPOINT = "/xarm7_traj_controller/follow_joint_trajectory"
 FJT_STATUS_TOPIC = "/xarm7_traj_controller/follow_joint_trajectory/_action/status"
+#: F5.3: the real ExecuteTrajectory action-status topic.  The driver requires
+#: observable terminal evidence for the exact preassigned execute goal UUID
+#: before acceptance-timeout cleanup completes.
+EXECUTE_STATUS_TOPIC = "/execute_trajectory/_action/status"
 GRIPPER_ENDPOINT = "/xarm_gripper/gripper_action"
 CARTESIAN_MOVE_ENDPOINT = "/cartesian_move_action"
 
@@ -217,6 +221,17 @@ RETREAT_DISTANCE_M = 0.10
 
 #: Bound on the cached FJT status entries retained by the executor.
 FJT_STATUS_CACHE_LIMIT = 64
+
+#: Bound on the cached ExecuteTrajectory action-status entries (F5.3).  Mirrors
+#: the FJT bound so a live action server cannot grow memory without bound.
+EXECUTE_STATUS_CACHE_LIMIT = 64
+
+#: F5.4: bounded grace for a valid-but-non-advancing join key.  A file-tail
+#: truth read may observe the same (frame_index, timestamp) twice when two
+#: journal snapshots land inside one truth frame; wait this long for the next
+#: advancing frame before failing closed with ``no-join-key``.  A genuinely
+#: stalled or missing truth stream still fails closed after the window.
+JOIN_KEY_RETRY_S = 0.1
 
 TASK_NAMESPACE = "pick_and_place/"
 TARGET_OBJECT_ID = "pick_and_place/object_mesh"
@@ -2703,6 +2718,11 @@ class IntegratedGateExecutor:
         self._fjt_status_cache: list[dict[str, object]] = []
         self._fjt_receipt_sequence = 0
         self._last_fjt_discovery_error: str | None = None
+        # F5.3: real ExecuteTrajectory action-status cache (terminal evidence for
+        # acceptance-timeout exact-goal cleanup).  Kept outside the journal graph
+        # projection exactly like the FJT status cache.
+        self._execute_status_cache: list[dict[str, object]] = []
+        self._execute_receipt_sequence = 0
         self._joint_receipt_sequence = 0
         self._scene_sequence = 0
         self._last_join_key: tuple[int, float] | None = None
@@ -2884,6 +2904,16 @@ class IntegratedGateExecutor:
             self._on_fjt_status,
             _fjt_status_qos(ros),
         )
+        # F5.3: real ExecuteTrajectory action-status subscription for the
+        # acceptance-timeout exact-goal cleanup terminal-evidence requirement.
+        # Same stock Humble action-status QoS; stays outside the journal graph
+        # projection like the FJT subscription.
+        self.node.create_subscription(
+            ros["GoalStatusArray"],
+            EXECUTE_STATUS_TOPIC,
+            self._on_execute_status,
+            _fjt_status_qos(ros),
+        )
 
     def _make_scene_callback(self, source: str):
         def callback(message: Any) -> None:
@@ -2975,16 +3005,90 @@ class IntegratedGateExecutor:
             if goal_uuid is None or isinstance(status, bool) or not isinstance(status, int):
                 continue
             self._fjt_receipt_sequence += 1
+            # F5.1: every cache entry carries the exact observed status-topic
+            # source (never a generic prose label).
             self._fjt_status_cache.append(
                 {
                     "goal_uuid": goal_uuid,
                     "status": int(status),
                     "received_mono": float(time.monotonic()),
                     "seq": self._fjt_receipt_sequence,
+                    "source": FJT_STATUS_TOPIC,
                 }
             )
         if len(self._fjt_status_cache) > FJT_STATUS_CACHE_LIMIT:
             del self._fjt_status_cache[: len(self._fjt_status_cache) - FJT_STATUS_CACHE_LIMIT]
+
+    def _on_execute_status(self, message: Any) -> None:
+        """Cache bounded, well-formed ``(goal_uuid, status)`` execute entries.
+
+        F5.3: mirrors ``_on_fjt_status`` but reads the real ExecuteTrajectory
+        action-status topic.  The driver uses these entries as observable
+        terminal evidence for the exact preassigned execute goal UUID during
+        acceptance-timeout cleanup.  Malformed entries are dropped and the cache
+        is bounded (newest ``EXECUTE_STATUS_CACHE_LIMIT`` entries).
+        """
+        status_list = getattr(message, "status_list", None)
+        if not isinstance(status_list, (list, tuple)):
+            return
+        for status_entry in status_list:
+            goal_info = getattr(status_entry, "goal_info", None)
+            goal_id = getattr(goal_info, "goal_id", None)
+            goal_uuid = _normalize_goal_uuid(goal_id)
+            status = getattr(status_entry, "status", None)
+            if goal_uuid is None or isinstance(status, bool) or not isinstance(status, int):
+                continue
+            self._execute_receipt_sequence += 1
+            self._execute_status_cache.append(
+                {
+                    "goal_uuid": goal_uuid,
+                    "status": int(status),
+                    "received_mono": float(time.monotonic()),
+                    "seq": self._execute_receipt_sequence,
+                    "source": EXECUTE_STATUS_TOPIC,
+                }
+            )
+        if len(self._execute_status_cache) > EXECUTE_STATUS_CACHE_LIMIT:
+            del self._execute_status_cache[: len(self._execute_status_cache) - EXECUTE_STATUS_CACHE_LIMIT]
+
+    def _execute_status_entries(self) -> list[dict[str, object]]:
+        return list(self._execute_status_cache)
+
+    def _wait_for_execute_status(
+        self,
+        goal_uuid: str,
+        target_statuses: Sequence[int],
+        timeout_s: object,
+    ) -> dict[str, object] | None:
+        """Bounded wait for a real execute-status entry for *goal_uuid*.
+
+        F5.3: used only by the driver's acceptance-timeout cleanup to require
+        observable terminal evidence for the exact preassigned execute goal UUID
+        before teardown.  Entries are captured once as an immutable copy so a
+        later status emission cannot race the caller.  Returns ``None`` on
+        timeout or malformed input.
+        """
+        if not (isinstance(goal_uuid, str) and goal_uuid):
+            return None
+        try:
+            wanted = set(int(status) for status in target_statuses)
+        except (TypeError, ValueError):
+            return None
+        captured: dict[str, object] | None = None
+
+        def _seen() -> bool:
+            nonlocal captured
+            for entry in reversed(self._execute_status_cache):
+                if entry.get("goal_uuid") != goal_uuid:
+                    continue
+                if int(entry.get("status", -1)) in wanted:
+                    captured = dict(entry)
+                    return True
+            return False
+
+        if not self._wait_for(_seen, timeout_s):
+            return None
+        return captured
 
     def _fjt_status_entries(self) -> list[dict[str, object]]:
         return list(self._fjt_status_cache)
@@ -2995,12 +3099,15 @@ class IntegratedGateExecutor:
     def _seed_fjt_status(self, goal_uuid: str, status: int, *, seq: int | None = None) -> None:
         """Seed one FJT status-topic entry (test/offline path)."""
         self._fjt_receipt_sequence += 1
+        # F5.1: the seeded entry carries the exact observed status-topic source
+        # so provider/validator joins are identical for real and offline paths.
         self._fjt_status_cache.append(
             {
                 "goal_uuid": goal_uuid,
                 "status": int(status),
                 "received_mono": float(time.monotonic()),
                 "seq": seq if seq is not None else self._fjt_receipt_sequence,
+                "source": FJT_STATUS_TOPIC,
             }
         )
         if len(self._fjt_status_cache) > FJT_STATUS_CACHE_LIMIT:
@@ -3161,12 +3268,15 @@ class IntegratedGateExecutor:
                     return False
                 for entry in reversed(self._fresh_fjt_entries(baseline, discovered)):
                     if int(entry.get("status", -1)) in wanted:
-                        captured = entry
+                        # F5.1: capture an immutable copy of the exact entry so
+                        # a later status emission/cache trim cannot change it.
+                        captured = dict(entry)
                         return True
                 return False
             for entry in reversed(self._fresh_fjt_entries(baseline, goal_uuid)):
                 if int(entry.get("status", -1)) in wanted:
-                    captured = entry
+                    # F5.1: immutable single capture (see above).
+                    captured = dict(entry)
                     return True
             return False
 
@@ -3479,30 +3589,42 @@ class IntegratedGateExecutor:
     def _join_key(self) -> tuple[int, float] | None:
         if self.join_key_provider is None:
             return None
-        try:
-            key = self.join_key_provider()
-        except Exception:
-            return None
-        if not isinstance(key, (tuple, list)) or len(key) != 2:
-            return None
-        frame_index = key[0]
-        timestamp = key[1]
-        if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 0:
-            return None
-        if isinstance(timestamp, bool):
-            return None
-        try:
-            timestamp = float(timestamp)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(timestamp) or timestamp < 0.0:
-            return None
-        if self._last_join_key is not None:
-            previous_frame, previous_timestamp = self._last_join_key
-            if frame_index <= previous_frame or timestamp <= previous_timestamp:
+        # F5.4: a valid-shaped but non-advancing key is a file-tail read race:
+        # the truth stream advances continuously, but two journal snapshots
+        # landing inside one truth frame observe the same (frame_index,
+        # timestamp).  Wait a bounded time for the next advancing frame before
+        # failing closed, so a live always-advancing truth never emits a
+        # spurious ``no-join-key``.  Malformed keys, a missing provider, or a
+        # genuinely stalled truth stream still fail closed after the window.
+        deadline = time.monotonic() + JOIN_KEY_RETRY_S
+        while True:
+            try:
+                key = self.join_key_provider()
+            except Exception:
+                key = None
+            if not isinstance(key, (tuple, list)) or len(key) != 2:
                 return None
-        self._last_join_key = (frame_index, timestamp)
-        return (frame_index, timestamp)
+            frame_index = key[0]
+            timestamp = key[1]
+            if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 0:
+                return None
+            if isinstance(timestamp, bool):
+                return None
+            try:
+                timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(timestamp) or timestamp < 0.0:
+                return None
+            if self._last_join_key is not None:
+                previous_frame, previous_timestamp = self._last_join_key
+                if frame_index <= previous_frame or timestamp <= previous_timestamp:
+                    if time.monotonic() >= deadline:
+                        return None
+                    time.sleep(0.002)
+                    continue
+            self._last_join_key = (frame_index, timestamp)
+            return (frame_index, timestamp)
 
     def _journal_scene(self, join: tuple[int, float]) -> dict[str, object] | None:
         diagnostic = self._latest_planning_scene
@@ -3571,6 +3693,26 @@ class IntegratedGateExecutor:
 
     def _thresholds(self) -> Mapping[str, object]:
         return _as_mapping(self.config.get("thresholds"))
+
+    def _threshold_timeout(self, key: str, default: float) -> float:
+        """Return a finite positive threshold timeout; fail closed on malformed.
+
+        F5.2: an explicit finite positive scenario override is authoritative;
+        missing, boolean, non-finite, zero, negative, or otherwise malformed
+        overrides fail closed (raising ValueError, which the run methods convert
+        to ``evidence-invalid``).  The production defaults for the FJT and
+        motion-trigger waits are exactly 10.0 seconds.
+        """
+        raw = self._thresholds().get(key, default)
+        if isinstance(raw, bool):
+            raise ValueError(f"{key} must be a finite positive number, got bool")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a finite positive number, got {raw!r}") from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{key} must be a finite positive number, got {raw!r}")
+        return value
 
     def _send_plan_only_goal(
         self,
@@ -4428,6 +4570,25 @@ class IntegratedGateExecutor:
             "diagnostic_only": True,
         }
 
+    def _bind_and_call_fjt_provider(
+        self, provider: Any, entry: Mapping[str, object]
+    ) -> object:
+        """Bind *provider* to the single-captured *entry* and call it.
+
+        F5.1: the driver's production FJT provider exposes a ``bind(entry)``
+        method so a run method can bind it to the exact terminal status entry
+        captured by ``_wait_for_fjt_status`` before calling it.  Offline
+        providers without ``bind`` are called directly; the validator then
+        checks their evidence against the captured entry, never against a
+        re-read of the mutable cache.  Binding is best-effort: a provider that
+        does not support late binding is still called so its evidence is checked
+        against the captured entry (fail-closed on mismatch).
+        """
+        bind = getattr(provider, "bind", None)
+        if callable(bind):
+            bind(dict(entry))
+        return provider()
+
     def _validate_fjt_evidence(
         self,
         provider_evidence: object,
@@ -4435,6 +4596,7 @@ class IntegratedGateExecutor:
         expected_trajectory_digest: str | None,
         baseline: Mapping[str, object] | None = None,
         expected_fjt_goal_uuid: str | None = None,
+        expected_fjt_entry: Mapping[str, object] | None = None,
     ) -> tuple[bool, str | None]:
         """Validate injected FJT transaction evidence and join it to status.
 
@@ -4446,11 +4608,17 @@ class IntegratedGateExecutor:
 
         F4.3: when *expected_fjt_goal_uuid* is supplied the provider UUID must
         equal that discovered controller goal UUID (never the ExecuteTrajectory
-        UUID).  The provider UUID/status/sequence/timestamp must join the exact
-        real status-topic cache entry for that controller transaction received
-        inside the current execution window (after *baseline*): the newest entry
-        for the provider's goal UUID must carry the provider status, sequence,
-        and timestamp exactly (not merely valid types).  Missing, stale,
+        UUID).
+
+        F5.1: when *expected_fjt_entry* is supplied (the exact entry captured by
+        ``_wait_for_fjt_status``), the provider UUID/status/sequence/timestamp
+        must equal that captured entry EXACTLY and the validator MUST NOT
+        re-query ``_fjt_status_cache`` for the transaction.  A second status
+        emission for the same UUID between capture and validation therefore can
+        never switch the transaction or race it to ``evidence-invalid``; any
+        mismatch fails closed.  When *expected_fjt_entry* is None the legacy
+        cache-join path is used (the newest joined cache entry must carry the
+        provider status/sequence/timestamp exactly).  Missing, stale,
         mismatched, extra, malformed, or provider-exception evidence makes the
         attempt ``evidence-invalid``.
         """
@@ -4483,6 +4651,27 @@ class IntegratedGateExecutor:
         provider_status = provider_evidence.get("status")
         if isinstance(provider_status, bool) or not isinstance(provider_status, int):
             return False, "fjt evidence status must be an integer"
+        # F5.1: single-capture path — validate against the exact captured entry,
+        # never the mutable cache.
+        if expected_fjt_entry is not None:
+            if goal_uuid != expected_fjt_entry.get("goal_uuid"):
+                return False, (
+                    "fjt evidence goal_uuid does not equal the captured controller "
+                    "goal UUID"
+                )
+            if provider_status != expected_fjt_entry.get("status"):
+                return False, (
+                    "fjt evidence status does not join the captured status entry"
+                )
+            if sequence != expected_fjt_entry.get("seq"):
+                return False, (
+                    "fjt evidence sequence does not join the captured status entry"
+                )
+            if timestamp != expected_fjt_entry.get("received_mono"):
+                return False, (
+                    "fjt evidence timestamp does not join the captured status entry"
+                )
+            return True, None
         candidates = self._fjt_status_cache
         if baseline is not None:
             candidates = self._fresh_fjt_entries(baseline)
@@ -4697,7 +4886,7 @@ class IntegratedGateExecutor:
             # creates its own FJT action goal).  Discover the unique new
             # controller goal UUID in the current window; never key FJT status
             # on ``execute_goal_id``.
-            fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
+            fjt_wait_s = self._threshold_timeout("fjt_wait_timeout_s", 10.0)
             joined = self._wait_for_fjt_status(
                 None, (execute_result_status,), fjt_wait_s, baseline=baseline
             )
@@ -4718,7 +4907,12 @@ class IntegratedGateExecutor:
                 )
             fjt_goal_id = str(joined.get("goal_uuid"))
             try:
-                provider_evidence = fjt_transaction_provider()
+                # F5.1: bind the provider to the exact captured terminal entry
+                # before calling it; a second status emission for the same UUID
+                # cannot switch the transaction.
+                provider_evidence = self._bind_and_call_fjt_provider(
+                    fjt_transaction_provider, joined
+                )
             except Exception as exc:
                 return self._finalize_d_attempt(
                     scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
@@ -4733,6 +4927,7 @@ class IntegratedGateExecutor:
                 expected_trajectory_digest=executed_digest_after,
                 baseline=baseline,
                 expected_fjt_goal_uuid=fjt_goal_id,
+                expected_fjt_entry=joined,
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
@@ -4987,8 +5182,8 @@ class IntegratedGateExecutor:
             # EXECUTING(2) joined and at least one fresh current-attempt joint
             # frame proves arm motion above threshold.  A transaction that never
             # started moving cannot be interrupted.
-            fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
-            motion_wait_s = float(self._thresholds().get("motion_trigger_timeout_s", 1.0))
+            fjt_wait_s = self._threshold_timeout("fjt_wait_timeout_s", 10.0)
+            motion_wait_s = self._threshold_timeout("motion_trigger_timeout_s", 10.0)
             motion_limit = float(self._thresholds().get("cancel_motion_velocity_rad_s", 0.005))
             if not self._wait_for_fjt_executing(fjt_goal_id, fjt_wait_s, baseline=baseline):
                 return self._finalize_d_attempt(
@@ -5112,7 +5307,11 @@ class IntegratedGateExecutor:
                     },
                 )
             try:
-                provider_evidence = fjt_transaction_provider()
+                # F5.1: bind the provider to the exact captured CANCELED terminal
+                # entry before calling it (single-capture evidence transaction).
+                provider_evidence = self._bind_and_call_fjt_provider(
+                    fjt_transaction_provider, fjt_terminal
+                )
             except Exception as exc:
                 return self._finalize_d_attempt(
                     scenario_id, spec, None, None, "evidence-invalid",
@@ -5130,6 +5329,7 @@ class IntegratedGateExecutor:
             fjt_ok, fjt_reason = self._validate_fjt_evidence(
                 provider_evidence, expected_trajectory_digest=None, baseline=baseline,
                 expected_fjt_goal_uuid=fjt_goal_id,
+                expected_fjt_entry=fjt_terminal,
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
@@ -5344,8 +5544,8 @@ class IntegratedGateExecutor:
             # F1.4/F1.3: the safety interruption must target a transaction that
             # actually started — FJT EXECUTING(2) joined and a fresh joint frame
             # proves arm motion above threshold.
-            fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
-            motion_wait_s = float(self._thresholds().get("motion_trigger_timeout_s", 1.0))
+            fjt_wait_s = self._threshold_timeout("fjt_wait_timeout_s", 10.0)
+            motion_wait_s = self._threshold_timeout("motion_trigger_timeout_s", 10.0)
             motion_limit = float(self._thresholds().get("safety_motion_velocity_rad_s", 0.005))
             if not self._wait_for_fjt_executing(fjt_goal_id, fjt_wait_s, baseline=baseline):
                 return self._finalize_d_attempt(
@@ -5415,7 +5615,11 @@ class IntegratedGateExecutor:
                     execute_error="joined FJT controller goal never reached ABORTED after the safety assertion",
                 )
             try:
-                provider_evidence = fjt_transaction_provider()
+                # F5.1: bind the provider to the exact captured ABORTED terminal
+                # entry before calling it (single-capture evidence transaction).
+                provider_evidence = self._bind_and_call_fjt_provider(
+                    fjt_transaction_provider, aborted_entry
+                )
             except Exception as exc:
                 return self._finalize_d_attempt(
                     scenario_id, spec, None, None, "evidence-invalid",
@@ -5427,6 +5631,7 @@ class IntegratedGateExecutor:
             fjt_ok, fjt_reason = self._validate_fjt_evidence(
                 provider_evidence, expected_trajectory_digest=None, baseline=baseline,
                 expected_fjt_goal_uuid=fjt_goal_id,
+                expected_fjt_entry=aborted_entry,
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
