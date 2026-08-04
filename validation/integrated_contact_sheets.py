@@ -259,10 +259,16 @@ def build_contact_sheet(
         rel_output = None
     if rel_output is not None:
         name = rel_output.rsplit("/", 1)[-1]
-        if name in _PROTECTED_OUTPUT_NAMES and name != output_resolved.name:
-            raise ValueError(f"output-as-input: refusing to overwrite protected artifact {rel_output}")
-        if output_resolved in {suite_resolved / INDEX_NAME, suite_resolved / SUMMARY_NAME}:
-            raise ValueError(f"output-as-input: refusing to overwrite {rel_output}")
+        if name in _PROTECTED_OUTPUT_NAMES:
+            # F2.9: a sheet may only overwrite its own expected output path;
+            # any other protected artifact (the sibling sheet, the index, or the
+            # summary) is rejected before any byte is written.
+            expected = USER_NAME if user else AGENT_NAME
+            if name != expected:
+                raise ValueError(f"output-as-input: refusing to overwrite protected artifact {rel_output}")
+        indexed = by_path.get(rel_output)
+        if indexed is not None and indexed.get("category") == "capture":
+            raise ValueError(f"output-as-input: refusing to overwrite indexed capture {rel_output}")
 
     rows: list[dict[str, Any]] = []
     seen_paths: set[str] = set()

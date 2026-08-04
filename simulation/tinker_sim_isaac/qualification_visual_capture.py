@@ -74,6 +74,7 @@ class QualificationVisualCapture:
         self._handled_sequences: set[int] = set()
         self._records: list[dict[str, Any]] = []
         self._errors: list[str] = []
+        self._reported_error_keys: set[tuple] = set()
         self._sensors: dict[str, Any] = {}
         self._initialize_cameras()
 
@@ -229,6 +230,35 @@ class QualificationVisualCapture:
                 stream.flush()
                 os.fsync(stream.fileno())
 
+    @staticmethod
+    def _is_executor_diagnostic(record: Mapping[str, Any]) -> bool:
+        """Recognize the exact integrated executor diagnostic record shape.
+
+        ``IntegratedGateExecutor._append_visual_request`` writes
+        ``{schema_version, report_revision, scenario_id, phase,
+        capture:{kind,target}, diagnostic_only: true}`` with no
+        ``sequence``/``gate``/``event``/``simulated_timestamp``.  Such records
+        are diagnostic-only evidence: never capture-driving, never a handled
+        sequence, never an error.
+        """
+        return (
+            record.get("diagnostic_only") is True
+            and not isinstance(record.get("sequence"), int)
+            and isinstance(record.get("scenario_id"), str)
+            and bool(record["scenario_id"])
+            and isinstance(record.get("phase"), str)
+            and bool(record["phase"])
+            and isinstance(record.get("capture"), Mapping)
+        )
+
+    def _record_capture_error_once(self, key: tuple, message: str) -> None:
+        """Durably report a malformed/unknown record exactly once (no error loop)."""
+        if key in self._reported_error_keys:
+            return
+        self._reported_error_keys.add(key)
+        if message not in self._errors:
+            self._errors.append(message)
+
     def poll(self) -> None:
         try:
             requests = _json_lines(self.request_path)
@@ -238,21 +268,41 @@ class QualificationVisualCapture:
                 self._errors.append(message)
             return
         for request in requests:
+            if not isinstance(request, Mapping):
+                self._record_capture_error_once(
+                    ("non-mapping", repr(request)),
+                    f"unrecognized visual capture request record (not an object): {request!r}",
+                )
+                continue
+            if self._is_executor_diagnostic(request):
+                # F2.3: executor diagnostic records are co-tenanted with the
+                # canonical sequence records; skip silently, never error-spam,
+                # never fabricate a handled sequence.
+                continue
             try:
                 sequence = int(request["sequence"])
                 requested_time = float(request["simulated_timestamp"])
-                if sequence in self._handled_sequences:
-                    continue
-                if requested_time > float(self.backend.simulation_time) + 1e-12:
-                    continue
+            except (KeyError, TypeError, ValueError):
+                self._record_capture_error_once(
+                    ("malformed", json.dumps(request, sort_keys=True, default=str)[:200]),
+                    "unrecognized visual capture request record (missing canonical "
+                    f"sequence/simulated_timestamp): {json.dumps(request, sort_keys=True, default=str)[:200]}",
+                )
+                continue
+            if sequence in self._handled_sequences:
+                continue
+            if requested_time > float(self.backend.simulation_time) + 1e-12:
+                continue
+            try:
                 self._capture_request(request)
-                self._handled_sequences.add(sequence)
-                break
             except (KeyError, TypeError, ValueError, RuntimeError) as error:
                 sequence = request.get("sequence")
                 self._errors.append(f"capture request {sequence!r} failed: {error}")
                 if isinstance(sequence, int):
                     self._handled_sequences.add(sequence)
+                continue
+            self._handled_sequences.add(sequence)
+            break
 
     def close(self) -> None:
         payload = {

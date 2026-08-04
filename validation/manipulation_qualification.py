@@ -1082,6 +1082,28 @@ class QualificationRunner:
             )
         else:
             raise ValueError(f"unknown qualification process role: {role!r}")
+        # F2.1: the integrated runner enables the existing visual-capture
+        # producer for its Isaac child with the exact scenario id as the gate.
+        # The six-gate behavior remains byte/semantic compatible; non-Isaac
+        # roles never receive an invented visual gate.
+        qualification_gate = self.gate
+        visual_evidence = (
+            "1"
+            if self.gate in GATES
+            and (self.root / "validation/manipulation_contact_sheets.py").is_file()
+            else "0"
+        )
+        if self.gate == "integrated" and role == "isaac":
+            scenario = manifest.data.get("scenario")
+            scenario_id = scenario.get("id") if isinstance(scenario, Mapping) else None
+            if not isinstance(scenario_id, str) or not scenario_id:
+                raise ValueError(
+                    "integrated Isaac child requires an exact scenario id in the "
+                    "attempt manifest; missing/malformed scenario identity fails "
+                    "closed before child launch"
+                )
+            qualification_gate = scenario_id
+            visual_evidence = "1"
         environment.update(
             {
                 "ROS_DOMAIN_ID": str(
@@ -1096,13 +1118,8 @@ class QualificationRunner:
                 "TINKER_SIM_EVALUATOR_JSONL": str(manifest.attempt_dir / "evaluator.jsonl"),
                 "TINKER_SIM_ROSBAG_DIR": str(manifest.attempt_dir / "rosbag"),
                 "TINKER_SIM_PHYSICS_DEVICE": "cpu",
-                "TINKER_SIM_QUALIFICATION_GATE": self.gate,
-                "TINKER_SIM_VISUAL_EVIDENCE": (
-                    "1"
-                    if self.gate in GATES
-                    and (self.root / "validation/manipulation_contact_sheets.py").is_file()
-                    else "0"
-                ),
+                "TINKER_SIM_QUALIFICATION_GATE": qualification_gate,
+                "TINKER_SIM_VISUAL_EVIDENCE": visual_evidence,
                 "ISAACSIM_HEADLESS": "1",
             }
         )

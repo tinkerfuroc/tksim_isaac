@@ -363,6 +363,35 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 2 — "produce integrated
+  visual evidence"): Produced the canonical visual-capture evidence end-to-end
+  and closed the validator's semantic gaps.  The integrated executor
+  (`validation/integrated_gate_executor.py`) now appends canonical
+  sequence-shaped EventJournal capture requests at every required positive,
+  cancel, and safety checkpoint (`_append_visual_event`), strictly after the
+  durable planning-scene/journal checkpoint it binds, with a per-attempt
+  sequence reset and duplicate-event rejection; the executor diagnostic records
+  (`_append_visual_request`) remain a separate non-capture-driving shape.
+  `manipulation_qualification.py::_env` enables the capture producer for
+  integrated Isaac children only (exact canonical scenario id as
+  `TINKER_SIM_QUALIFICATION_GATE`, `TINKER_SIM_VISUAL_EVIDENCE=1`, fail-closed
+  on missing scenario id).  `qualification_visual_capture.py` co-tenants the two
+  request shapes safely: executor diagnostics are skipped silently, malformed
+  records are reported exactly once, and capture freshness stays within the
+  bounded `MAX_CAPTURE_LATENCY_FRAMES=4` contract.  The evidence index
+  (`validation/integrated_evidence_index.py`) binds captures only through the
+  canonical request↔keyframe transaction and requires exactly one raw and one
+  evaluator row per `(scenario_id, frame_index)` key within
+  `max(1e-6, 0.5*physics_dt)`; any index diagnostic fails Gate F closed.
+  F2.5-F2.9 close source/provenance, verdict, MoveIt/controller status domain,
+  per-attempt PlanningScene, exact 11-topic rosbag, cleanup-recompute, and
+  contact-sheet output-as-input semantics.  New tests: evidence-index mutations
+  (16) + contact-sheet mutations (3) = 19 added (54 + 23 total in the two
+  suites); affected ROS-free regressions pass; Humble-sourced
+  `test_integrated_gate_executor_ros.py` passes.  No build, no live Isaac/ROS/
+  GPU/cuMotion, and no rosbag/capture production ran; the future qualification
+  source lock remains absent.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 1 — "bind evidence index
   to live artifacts"): The initial 44 tests were synthetic and did not exercise
   real Task 2-8 producer schemas, so this repair re-pinned every semantic parser
