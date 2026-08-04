@@ -348,7 +348,9 @@ def _write_attempt_dir(
                     "schema_version": 1,
                     "report_revision": "2026-08-04",
                     "scenario_id": scenario_id,
-                    "status": "succeeded",
+                    # Lifecycle rows carry no status; only the final corrective
+                    # row carries the executor's evidence-status domain (F2.6).
+                    **({"status": "diagnostic-pass"} if row_kind == "final" else {}),
                     "row_kind": row_kind,
                     "controller_goal_sent": True,
                     "controller_goal_uuid": f"goal-{scenario_id}",
@@ -453,15 +455,27 @@ def _write_attempt_dir(
 
         bag = attempt_dir / "rosbag"
         bag.mkdir(parents=True, exist_ok=True)
+        # F2.7: all 11 approved record topics with their exact message types.
+        record_topic_types = {
+            "/clock": "rosgraph_msgs/msg/Clock",
+            "/isaac_joint_states": "sensor_msgs/msg/JointState",
+            "/isaac_joint_commands": "sensor_msgs/msg/JointState",
+            "/sim/truth/robot_state": "tinker_sim_interfaces/msg/RobotTruth",
+            "/sim/truth/object_state": "tinker_sim_interfaces/msg/ObjectTruth",
+            "/sim/truth/contacts": "tinker_sim_interfaces/msg/ContactTruth",
+            "/sim/truth/task_state": "tinker_sim_interfaces/msg/TaskTruth",
+            "/sim/safety/collision": "std_msgs/msg/Bool",
+            "/sim/hardware/safety_stop": "std_msgs/msg/Bool",
+            "/sim/status/contract": "std_msgs/msg/String",
+            "/sim/status/command_gateway": "std_msgs/msg/String",
+        }
         metadata_topics = []
-        for topic in ("/clock", "/sim/truth/robot_state", "/sim/truth/object_state",
-                      "/sim/truth/contacts", "/sim/truth/task_state", "/sim/safety/collision",
-                      "/sim/hardware/safety_stop", "/sim/status/contract", "/sim/status/command_gateway"):
+        for topic, topic_type in record_topic_types.items():
             metadata_topics.append(
                 {
                     "topic_metadata": {
                         "name": topic,
-                        "type": "example_msgs/msg/Example",
+                        "type": topic_type,
                         "offered_qos_profiles": (
                             "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n"
                         ),
@@ -578,9 +592,23 @@ def write_canonical_evidence_tree(
             "stages": {"F": {"cameras": list(CAMERAS)}},
         },
     )
+    # Real nested overlay-contract shape (F2.5): repositories map with
+    # implementation_identity commits + source_locks status.
     _write_json(
         suite_dir / "overlay-contract.json",
-        {"repository": "simulator", "implementation_head": "c" * 40},
+        {
+            "schema_version": 1,
+            "contract_id": "simulator-ompl-overlay-acceptance",
+            "repositories": {
+                "production": {"implementation_identity": PROD_COMMIT},
+                "simulator": {"implementation_identity": SIM_COMMIT},
+            },
+            "source_locks": {
+                "status": "pass",
+                "simulator_lock_path": "integration/source-locks.json",
+                "production_lock_path": "integration/source-locks.json",
+            },
+        },
     )
     # Attempt-start identity (real orchestrator producer schema).
     _write_json(
@@ -795,11 +823,18 @@ def test_index_is_deterministic_and_excludes_itself(tmp_path):
 
 
 def test_missing_repository_commit_blocks_final_acceptance(tmp_path):
-    # A suite with a missing/invalid source-lock manifest cannot pass Gate F.
+    # A source-lock manifest missing a repository's implementation commit
+    # cannot pass Gate F (F2.5).
     suite_dir = make_complete_evidence_suite(tmp_path)
+    lock = suite_dir / f"gate-b-{SUITE_ATTEMPT}" / "source-lock-manifest.json"
+    value = json.loads(lock.read_text(encoding="utf-8"))
+    del value["production"]["implementation_head"]
+    lock.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
     verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
     assert verdict["status"] == "verified-fail"
-    assert "contact sheet" in " ".join(verdict["reasons"]).lower()
+    assert "implementation_head" in reasons
+    assert "production" in reasons
 
 
 def test_missing_rosbag_metadata_fails_gate_f(tmp_path):
@@ -1241,3 +1276,221 @@ def test_simulator_commit_and_production_commit_present_in_manifest(tmp_path):
     index = _final_index(suite_dir)
     manifests = [e for e in index["files"] if e.get("category") == "manifest"]
     assert manifests
+
+
+# --- Task 9 fix-round-2 mutation tests (F2.4-F2.9) ---------------------------
+
+
+def _rewrite_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_executor_diagnostic_only_journal_is_not_capture_driving(tmp_path):
+    """F2.4: a journal with only executor diagnostic records must never drive a
+    capture, never crash, and never emit a capture-request-without-image
+    diagnostic for the diagnostic records themselves."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    request_path = suite_dir / "E" / POSITIVE_ID / "visual-capture-requests.jsonl"
+    rows = [json.loads(line) for line in request_path.read_text(encoding="utf-8").splitlines()]
+    sequence_rows = [row for row in rows if isinstance(row.get("sequence"), int)]
+    executor_rows = [row for row in rows if row.get("diagnostic_only") is True]
+    assert sequence_rows and executor_rows
+    # Keep only the executor diagnostic records (no canonical sequence records).
+    _rewrite_jsonl(request_path, executor_rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    # The executor diagnostic records never produce a request-without-image.
+    assert "capture-request-without-image" not in codes
+    # Keyframes can no longer join a canonical request -> orphan, fail-closed.
+    assert "keyframe-request-sequence-orphan" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_index_diagnostics_fail_closed(tmp_path):
+    """F2.4: any index diagnostic fails Gate F closed."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    request_path = suite_dir / "E" / POSITIVE_ID / "visual-capture-requests.jsonl"
+    rows = [json.loads(line) for line in request_path.read_text(encoding="utf-8").splitlines()]
+    rows.append(dict(rows[0]))  # duplicate canonical sequence
+    _rewrite_jsonl(request_path, rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "duplicate-request-sequence" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert "any index diagnostic fails Gate F closed" in reasons
+
+
+def test_duplicate_physics_key_fails_gate_f(tmp_path):
+    """F2.4/F2.6: duplicate raw (scenario, frame_index) key is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    raw_path = suite_dir / "E" / POSITIVE_ID / "physics_truth.jsonl"
+    rows = [json.loads(line) for line in raw_path.read_text(encoding="utf-8").splitlines()]
+    rows.append(_raw_frame(0, POSITIVE_ID))
+    _rewrite_jsonl(raw_path, rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "duplicate-physics-key" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "duplicate raw physics key" in " ".join(verdict["reasons"])
+
+
+def test_duplicate_evaluator_key_fails_gate_f(tmp_path):
+    """F2.4/F2.6: duplicate evaluator (scenario, frame_index) key is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    evaluator_path = suite_dir / "E" / POSITIVE_ID / "evaluator.jsonl"
+    rows = [json.loads(line) for line in evaluator_path.read_text(encoding="utf-8").splitlines()]
+    rows.append({"schema_version": 1, "frame": _raw_frame(0, POSITIVE_ID), "frame_index": 0})
+    _rewrite_jsonl(evaluator_path, rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "duplicate-evaluator-key" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "duplicate evaluator key" in " ".join(verdict["reasons"])
+
+
+def test_keyframe_binds_within_bounded_dt_window(tmp_path):
+    """F2.4: a keyframe timestamp inside the 0.5*dt window still physics-binds."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    keyframes = suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl"
+    rows = [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+    rows[0]["simulated_timestamp"] = float(rows[0]["simulated_timestamp"]) + 0.002
+    _rewrite_jsonl(keyframes, rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-physics-unbound" not in codes
+    captures = [e for e in index["files"] if e.get("category") == "capture" and e.get("bound")]
+    assert captures
+
+
+def test_keyframe_outside_bounded_dt_window_fails(tmp_path):
+    """F2.4: a keyframe timestamp beyond the 0.5*dt window is unbound."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    keyframes = suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl"
+    rows = [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+    rows[0]["simulated_timestamp"] = float(rows[0]["simulated_timestamp"]) + 0.1
+    _rewrite_jsonl(keyframes, rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "keyframe-physics-unbound" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_source_lock_digest_mismatch_fails_gate_f(tmp_path):
+    """F2.5: a source-lock repository with observed != expected digest fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    lock = suite_dir / f"gate-b-{SUITE_ATTEMPT}" / "source-lock-manifest.json"
+    value = json.loads(lock.read_text(encoding="utf-8"))
+    value["production"]["observed_status_sha256"] = "f" * 64
+    lock.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert "digest mismatch" in reasons
+    assert "production" in reasons
+
+
+def test_source_lock_uppercase_commit_fails_gate_f(tmp_path):
+    """F2.5: uppercase/malformed 40-hex commits are rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    lock = suite_dir / f"gate-b-{SUITE_ATTEMPT}" / "source-lock-manifest.json"
+    value = json.loads(lock.read_text(encoding="utf-8"))
+    value["simulator_overlay"]["implementation_head"] = "A" * 40
+    lock.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "lowercase 40-hex" in " ".join(verdict["reasons"])
+
+
+def test_overlay_contract_missing_repositories_fails_gate_f(tmp_path):
+    """F2.5: overlay-contract nested repositories identity is required."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    del value["repositories"]
+    overlay.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "overlay contract has no repositories map" in " ".join(verdict["reasons"])
+
+
+def test_verdict_attempt_identity_mismatch_fails_gate_f(tmp_path):
+    """F2.6: a gate verdict whose attempt_id does not match the manifest fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    verdict_path = suite_dir / "E" / POSITIVE_ID / "gate-verdict.json"
+    value = json.loads(verdict_path.read_text(encoding="utf-8"))
+    value["attempt_id"] = "wrong-attempt"
+    verdict_path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "does not match manifest" in " ".join(verdict["reasons"])
+
+
+def test_moveit_out_of_domain_status_fails_gate_f(tmp_path):
+    """F2.6: moveit row status must be in the evidence-status domain."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    moveit = suite_dir / "E" / POSITIVE_ID / "moveit-plans.jsonl"
+    rows = [json.loads(line) for line in moveit.read_text(encoding="utf-8").splitlines()]
+    rows[0]["status"] = "succeeded"
+    _rewrite_jsonl(moveit, rows)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "out-of-domain status" in " ".join(verdict["reasons"])
+
+
+def test_controller_out_of_domain_status_fails_gate_f(tmp_path):
+    """F2.6: a controller row with an out-of-domain status fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    controller = suite_dir / "E" / POSITIVE_ID / "controller-results.jsonl"
+    rows = [json.loads(line) for line in controller.read_text(encoding="utf-8").splitlines()]
+    rows[0]["status"] = "succeeded"
+    _rewrite_jsonl(controller, rows)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "out-of-domain status" in " ".join(verdict["reasons"])
+
+
+def test_planning_scene_journal_without_final_fails_gate_f(tmp_path):
+    """F2.6: PlanningScene evidence is per-attempt (journal requires sibling final)."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "E" / POSITIVE_ID / "planning-scene.json").unlink()
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "has a journal but no final artifact" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_missing_approved_topic_fails_gate_f(tmp_path):
+    """F2.7: the full 11-topic approved record set is required."""
+    import yaml
+
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    metadata = suite_dir / "E" / POSITIVE_ID / "rosbag" / "metadata.yaml"
+    document = yaml.safe_load(metadata.read_text(encoding="utf-8"))
+    topics = document["rosbag2_bagfile_information"]["topics_with_message_count"]
+    topics = [t for t in topics if t["topic_metadata"]["name"] != "/isaac_joint_states"]
+    document["rosbag2_bagfile_information"]["topics_with_message_count"] = topics
+    metadata.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "missing approved record topics" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_topic_type_mismatch_fails_gate_f(tmp_path):
+    """F2.7: an approved topic with the wrong message type fails."""
+    import yaml
+
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    metadata = suite_dir / "E" / POSITIVE_ID / "rosbag" / "metadata.yaml"
+    document = yaml.safe_load(metadata.read_text(encoding="utf-8"))
+    topics = document["rosbag2_bagfile_information"]["topics_with_message_count"]
+    for topic in topics:
+        if topic["topic_metadata"]["name"] == "/clock":
+            topic["topic_metadata"]["type"] = "std_msgs/msg/String"
+    document["rosbag2_bagfile_information"]["topics_with_message_count"] = topics
+    metadata.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "does not match expected" in " ".join(verdict["reasons"])
+
+
+def test_cleanup_clean_flag_contradiction_fails_gate_f(tmp_path):
+    """F2.8: clean=True that contradicts the recorded final/owned state fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    cleanup = suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json"
+    value = json.loads(cleanup.read_text(encoding="utf-8"))
+    value["final"] = {"available": True, "gpus": [{"id": 0, "name": "NVIDIA"}], "processes": []}
+    cleanup.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "contradicts the recorded" in " ".join(verdict["reasons"])

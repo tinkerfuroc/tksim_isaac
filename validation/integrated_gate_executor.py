@@ -2726,6 +2726,13 @@ class IntegratedGateExecutor:
         self._joint_receipt_sequence = 0
         self._scene_sequence = 0
         self._last_join_key: tuple[int, float] | None = None
+        # F2.2: per-attempt canonical capture-driving sequence counter and
+        # emitted-event set.  Sequence-shape EventJournal requests use a strictly
+        # increasing positive integer sequence; duplicate event emission for the
+        # same scenario transaction is rejected.  Executor diagnostic records
+        # (``_append_visual_request``) are a separate, non-capture-driving shape.
+        self._visual_event_sequence = 0
+        self._emitted_visual_events: set[str] = set()
         # Task 6: bounded per-attempt TCP sample deque fed by the injected
         # ``current_tcp_pose_provider`` (never a TF listener embedded here).
         self._tcp_pose_samples: list[dict[str, object]] = []
@@ -5018,6 +5025,7 @@ class IntegratedGateExecutor:
         start_wall = time.monotonic()
         fixture_ready_recorded = False
         event_log: list[str] = []
+        self._reset_visual_event_state()
         try:
             try:
                 spec = stage_d_dispatch(scenario_id, scenario=self.scenario)
@@ -5141,6 +5149,7 @@ class IntegratedGateExecutor:
                     execute_error=f"execution-start journal snapshot rejected: {snap}",
                     journal_issues=[snap],
                 )
+            self._append_visual_event("cancel-execution-start", scenario_id)
 
             # F1.2: a cancel pass is impossible without the exact live
             # ExecuteTrajectory ClientGoalHandle.  Raw UUID kwargs or provider
@@ -5242,6 +5251,7 @@ class IntegratedGateExecutor:
                     journal_issues=[snap], goals_canceling=goals_canceling,
                     cancel_response=cancel_response,
                 )
+            self._append_visual_event("cancel-trigger", scenario_id)
 
             # F1.2: require the ExecuteTrajectory action result terminal CANCELED (5).
             action_status, action_status_string = self._wait_execute_result_status(
@@ -5362,6 +5372,7 @@ class IntegratedGateExecutor:
                         "execute_result_status_string": action_status_string,
                     },
                 )
+            self._append_visual_event("cancel-velocity-compliant", scenario_id)
             event_log.append("teardown")
             snap = self._journal_snapshot_d("teardown")
             if snap != "recorded":
@@ -5378,6 +5389,7 @@ class IntegratedGateExecutor:
                         "execute_result_status_string": action_status_string,
                     },
                 )
+            self._append_visual_event("cancel-terminal", scenario_id)
             return self._finalize_d_attempt(
                 scenario_id, spec, None, None, "diagnostic-pass",
                 readiness, start_wall, event_log=event_log,
@@ -5432,6 +5444,7 @@ class IntegratedGateExecutor:
         start_wall = time.monotonic()
         fixture_ready_recorded = False
         event_log: list[str] = []
+        self._reset_visual_event_state()
         try:
             try:
                 spec = stage_d_dispatch(scenario_id, scenario=self.scenario)
@@ -5540,6 +5553,7 @@ class IntegratedGateExecutor:
                     execute_error=f"execution-start journal snapshot rejected: {snap}",
                     journal_issues=[snap],
                 )
+            self._append_visual_event("safety-execution-start", scenario_id)
 
             # F1.4/F1.3: the safety interruption must target a transaction that
             # actually started — FJT EXECUTING(2) joined and a fresh joint frame
@@ -5598,6 +5612,7 @@ class IntegratedGateExecutor:
                     execute_error=f"effective-stop journal snapshot rejected: {snap}",
                     journal_issues=[snap],
                 )
+            self._append_visual_event("safety-trigger", scenario_id)
 
             # F1.3: the old ExecuteTrajectory/FJT transaction must reach ABORTED
             # (6) after the safety assertion.  The provider evidence and its join
@@ -5702,6 +5717,7 @@ class IntegratedGateExecutor:
                     execute_error=f"operator-clear journal snapshot rejected: {snap}",
                     journal_issues=[snap], fjt_evidence=provider_evidence,
                 )
+            self._append_visual_event("safety-velocity-compliant", scenario_id)
 
             # F1.4/M2: bounded post-clear stability — no fresh goal UUID, all
             # velocities bounded, and every arm-joint position within
@@ -5763,6 +5779,7 @@ class IntegratedGateExecutor:
                     execute_error=f"teardown journal snapshot rejected: {snap}",
                     journal_issues=[snap], fjt_evidence=provider_evidence,
                 )
+            self._append_visual_event("safety-post-clear", scenario_id)
             return self._finalize_d_attempt(
                 scenario_id, spec, None, None, "diagnostic-pass",
                 readiness, start_wall, event_log=event_log,
@@ -6438,6 +6455,17 @@ class IntegratedGateExecutor:
 
     # -- Task 6 / Gate E fixed-target Pick and Place -------------------------
 
+    def _reset_visual_event_state(self) -> None:
+        """F2.2: reset the per-attempt canonical capture-driving sequence state.
+
+        A reused executor instance must never carry a previous attempt's visual
+        event sequence counter, emitted-event set, or stale join key into a new
+        attempt; every attempt restarts its canonical EventJournal sequence at 1.
+        """
+        self._visual_event_sequence = 0
+        self._emitted_visual_events.clear()
+        self._last_join_key = None
+
     def _e_reset_attempt_state(self) -> None:
         """F1.7: reset every per-attempt Gate-E sample/latch/goal state.
 
@@ -6445,6 +6473,7 @@ class IntegratedGateExecutor:
         can never satisfy a trigger with a previous attempt's TCP sample, FJT/
         joint receipt, native gripper count, or accepted goal handle.
         """
+        self._reset_visual_event_state()
         self._tcp_pose_samples.clear()
         self._last_tcp_pose_provider = None
         self._e_active_goal_handle = None
@@ -7292,6 +7321,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=0,
             )
         event_log.append("before-pick")
+        self._append_visual_event("cancel-execution-start", scenario_id)
         self._append_visual_request("before-pick", scenario_id, spec, kind="gate-e-diagnostic")
         try:
             goal = self._e_pick_goal(spec)
@@ -7390,6 +7420,7 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, trigger=trigger,
             )
         event_log.append("cancel-requested")
+        self._append_visual_event("cancel-trigger", scenario_id)
         cancel_response = self._cancel_execute_goal(
             outcome["goal_handle"],
             expected_goal_uuid=pick_goal_id or "",
@@ -7459,6 +7490,7 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("quiescent")
+        self._append_visual_event("cancel-velocity-compliant", scenario_id)
         teardown_status = self._e_record_snapshot("teardown")
         if teardown_status != "recorded":
             return self._finalize_e_attempt(
@@ -7473,6 +7505,7 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("teardown")
+        self._append_visual_event("cancel-terminal", scenario_id)
         return self._finalize_e_attempt(
             scenario_id, spec, readiness, start_wall, "diagnostic-pass",
             event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
@@ -7655,6 +7688,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=0,
             )
         event_log.append("before-pick")
+        self._append_visual_event("safety-execution-start", scenario_id)
         self._append_visual_request("before-pick", scenario_id, spec, kind="gate-e-diagnostic")
         try:
             goal = self._e_pick_goal(spec)
@@ -7748,6 +7782,7 @@ class IntegratedGateExecutor:
                 pick_goal_id=pick_goal_id, trigger=trigger,
             )
         event_log.append("effective-stop")
+        self._append_visual_event("safety-trigger", scenario_id)
         trigger["operator_published"] = list(operator_published)
         # F1.4: boundedly await the exact safety-stopped Pick terminal.  Current
         # production semantics: interruption_result maps a SafetyStop interrupt to
@@ -7806,6 +7841,7 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("operator-clear")
+        self._append_visual_event("safety-velocity-compliant", scenario_id)
         if not self._e_wait_quiescent(baseline):
             return self._finalize_e_attempt(
                 scenario_id, spec, readiness, start_wall, "evidence-invalid",
@@ -7843,6 +7879,7 @@ class IntegratedGateExecutor:
                 terminal_status=interrupted_terminal_status,
             )
         event_log.append("teardown")
+        self._append_visual_event("safety-post-clear", scenario_id)
         return self._finalize_e_attempt(
             scenario_id, spec, readiness, start_wall, "diagnostic-pass",
             event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
@@ -8311,6 +8348,7 @@ class IntegratedGateExecutor:
             return prepared
         fixture_ready_recorded = True
         event_log.append("fixture-ready")
+        self._append_visual_event("readiness", scenario_id)
         readiness = prepared["readiness"]
 
         before_pick = self._e_record_snapshot("before-pick")
@@ -8323,6 +8361,7 @@ class IntegratedGateExecutor:
                 place_goal_accepted=False, goals_sent=0,
             )
         event_log.append("before-pick")
+        self._append_visual_event("approach", scenario_id)
         self._append_visual_request("before-pick", scenario_id, spec, kind="gate-e-diagnostic")
         try:
             pick_goal = self._e_pick_goal(spec)
@@ -8396,6 +8435,9 @@ class IntegratedGateExecutor:
                     trigger=transport_trigger,
                 )
             event_log.append(label)
+            if label == "scene-attach":
+                self._append_visual_event("bilateral-contact", scenario_id)
+        self._append_visual_event("attached-transport", scenario_id)
         before_release = self._e_record_snapshot("before-release")
         if before_release != "recorded":
             return self._finalize_e_attempt(
@@ -8409,6 +8451,7 @@ class IntegratedGateExecutor:
                 trigger=transport_trigger,
             )
         event_log.append("before-release")
+        self._append_visual_event("place-target", scenario_id)
         try:
             place_goal = self._e_place_goal(spec)
         except Exception as exc:
@@ -8496,6 +8539,10 @@ class IntegratedGateExecutor:
                     trigger=transport_trigger,
                 )
             event_log.append(label)
+            if label == "released-settled":
+                self._append_visual_event("released-settled", scenario_id)
+            elif label == "teardown":
+                self._append_visual_event("terminal", scenario_id)
         return self._finalize_e_attempt(
             scenario_id, spec, readiness, start_wall, "diagnostic-pass",
             event_log=event_log, fixture_ready_recorded=fixture_ready_recorded,
@@ -9880,7 +9927,10 @@ class IntegratedGateExecutor:
 
         The default ``kind="plan-only"`` preserves the Gate-C byte shape exactly;
         D handlers pass ``kind="gate-d-diagnostic"`` (execution-neutral, never a
-        fabricated planner capture).
+        fabricated planner capture).  This executor diagnostic shape
+        (``{scenario_id, phase, capture:{kind,target}, diagnostic_only}``) is
+        diagnostic-only evidence: it never drives capture, never becomes a
+        binding, and never satisfies a required visual event.
         """
         self._append_jsonl(
             self.attempt_dir / "visual-capture-requests.jsonl",
@@ -9893,6 +9943,55 @@ class IntegratedGateExecutor:
                 "diagnostic_only": True,
             },
         )
+
+    def _append_visual_event(self, event: str, scenario_id: str) -> str:
+        """F2.2: durably append one canonical sequence-shape capture request.
+
+        The canonical EventJournal sequence shape
+        ``{schema_version, sequence, gate, event, simulated_timestamp,
+        source_execution_event_sequence}`` is the only capture-driving schema.
+        ``gate`` is the exact scenario id end-to-end; ``simulated_timestamp`` is
+        the current strict physics-truth tail (the durable checkpoint's
+        ``_join_key()`` frame, finite and nonnegative, never fabricated);
+        ``source_execution_event_sequence`` is the exact journal sequence of the
+        durable checkpoint that triggered this visual event.
+
+        The request is appended atomically/durably to the same
+        ``visual-capture-requests.jsonl`` as the executor diagnostic records;
+        the capture consumer and validator co-tenant the two shapes.
+
+        Returns ``"recorded"`` on success or a fail-closed status string
+        (``"duplicate"`` / ``"no-join-key"`` / ``"invalid-timestamp"`` /
+        ``"rejected: <exc>"``).  A required event is never emitted before its
+        durable journal checkpoint exists (the caller emits strictly after the
+        corresponding journal snapshot/diff succeeds).
+        """
+        if event in self._emitted_visual_events:
+            return "duplicate"
+        if self._last_join_key is None:
+            return "no-join-key"
+        _frame_index, timestamp = self._last_join_key
+        try:
+            timestamp = float(timestamp)
+        except (TypeError, ValueError):
+            return "invalid-timestamp"
+        if not math.isfinite(timestamp) or timestamp < 0.0:
+            return "invalid-timestamp"
+        self._visual_event_sequence += 1
+        record = {
+            "schema_version": 1,
+            "sequence": self._visual_event_sequence,
+            "gate": scenario_id,
+            "event": event,
+            "simulated_timestamp": timestamp,
+            "source_execution_event_sequence": int(getattr(self.journal, "record_count", 0)),
+        }
+        try:
+            self._append_jsonl(self.attempt_dir / "visual-capture-requests.jsonl", record)
+        except (OSError, ValueError, TypeError) as exc:
+            return f"rejected: {exc}"
+        self._emitted_visual_events.add(event)
+        return "recorded"
 
     def _finalize_failure_artifact(self, reason: str, graph_diagnosis: str) -> str:
         """F2.1: write planning-scene.json as a canonical failure artifact."""

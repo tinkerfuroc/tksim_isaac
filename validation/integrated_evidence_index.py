@@ -100,6 +100,35 @@ POSITIVE_VISUAL_ID = "qualification-pick-place-positive"
 _HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
+#: Executor durable-row status domain (F2.6): the only status values the
+#: moveit/controller/execution rows may carry.
+_EVIDENCE_STATUS_DOMAIN = frozenset(
+    {
+        "diagnostic-pass",
+        "diagnostic-fail",
+        "evidence-invalid",
+        "blocked-by-gate-b",
+        "verified-pass",
+    }
+)
+
+#: Rosbag2 approved record topics with their exact message types (F2.7).
+#: Mirrors the real ``APPROVED_RECORD_TOPICS`` producer contract and the
+#: manipulation topic/type map in ``tinker_sim_bridge/contract_guard.py``.
+APPROVED_RECORD_TOPIC_TYPES: dict[str, str] = {
+    "/clock": "rosgraph_msgs/msg/Clock",
+    "/isaac_joint_states": "sensor_msgs/msg/JointState",
+    "/isaac_joint_commands": "sensor_msgs/msg/JointState",
+    "/sim/truth/robot_state": "tinker_sim_interfaces/msg/RobotTruth",
+    "/sim/truth/object_state": "tinker_sim_interfaces/msg/ObjectTruth",
+    "/sim/truth/contacts": "tinker_sim_interfaces/msg/ContactTruth",
+    "/sim/truth/task_state": "tinker_sim_interfaces/msg/TaskTruth",
+    "/sim/safety/collision": "std_msgs/msg/Bool",
+    "/sim/hardware/safety_stop": "std_msgs/msg/Bool",
+    "/sim/status/contract": "std_msgs/msg/String",
+    "/sim/status/command_gateway": "std_msgs/msg/String",
+}
+
 #: Recognized in-progress atomic temp prefixes (L8: never index as evidence).
 _TEMP_PREFIXES = (
     ".evidence-index.json.",
@@ -107,27 +136,6 @@ _TEMP_PREFIXES = (
     ".contact-sheet-integrated-",
     ".contact-sheet-",
 )
-
-#: Executor visual-request phases mirror the real ``_append_visual_request``
-#: call sites.  Used only as a deterministic event->phase fallback when the
-#: request journal carries the executor diagnostic shape (no sequence).
-_EVENT_TO_PHASE: Mapping[str, str] = {
-    "readiness": "before",
-    "approach": "before-pick",
-    "bilateral-contact": "before-pick",
-    "attached-transport": "after",
-    "place-target": "after",
-    "released-settled": "after",
-    "terminal": "terminal",
-    "cancel-execution-start": "before-pick",
-    "cancel-trigger": "before-pick",
-    "cancel-velocity-compliant": "after",
-    "cancel-terminal": "terminal",
-    "safety-execution-start": "before-pick",
-    "safety-trigger": "before-pick",
-    "safety-velocity-compliant": "after",
-    "safety-post-clear": "terminal",
-}
 
 #: ROS-free pure-Python validators/helpers reused from the Task 2-8 producers.
 #: ``_read_json``/``_read_jsonl`` reject NaN/Infinity and non-object roots;
@@ -615,6 +623,77 @@ def _physics_frames(suite_dir: Path, attempt_dir: Path) -> list[Mapping[str, Any
         return []
 
 
+def _evaluator_frames(suite_dir: Path, attempt_dir: Path) -> list[Mapping[str, Any]]:
+    path = attempt_dir / "evaluator.jsonl"
+    if not path.is_file():
+        return []
+    try:
+        return _v_read_jsonl(path, required=False)
+    except EvidenceError:
+        return []
+
+
+def _raw_scenario(record: Mapping[str, Any]) -> str:
+    value = record.get("scenario")
+    return value if isinstance(value, str) else ""
+
+
+def _physics_key_tables(
+    raw_records: Sequence[Mapping[str, Any]],
+    evaluator_records: Sequence[Mapping[str, Any]],
+    attempt_dir: Path,
+    diagnostics: list[dict[str, Any]],
+) -> tuple[dict[tuple[str, int], Mapping[str, Any]], dict[tuple[str, int], Mapping[str, Any]]]:
+    """Build ``(scenario, frame_index)`` primary-key tables for raw/evaluator truth.
+
+    F2.4: a keyframe binds to exactly one raw truth and exactly one evaluator
+    record by its primary key; duplicate keys are reported and fail Gate F.
+    """
+    raw_by_key: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for frame_record in raw_records:
+        frame_index = frame_record.get("frame_index")
+        if not isinstance(frame_index, int) or isinstance(frame_index, bool):
+            continue
+        key = (_raw_scenario(frame_record), frame_index)
+        if key in raw_by_key:
+            diagnostics.append(
+                {
+                    "code": "duplicate-physics-key",
+                    "path": str(attempt_dir),
+                    "scenario": key[0],
+                    "frame_index": frame_index,
+                }
+            )
+            continue
+        raw_by_key[key] = frame_record
+    evaluator_by_key: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for evaluator_record in evaluator_records:
+        frame_index = evaluator_record.get("frame_index")
+        embedded = evaluator_record.get("frame")
+        embedded_frame_index = embedded.get("frame_index") if isinstance(embedded, Mapping) else None
+        if not isinstance(frame_index, int) or isinstance(frame_index, bool):
+            if isinstance(embedded_frame_index, int) and not isinstance(embedded_frame_index, bool):
+                frame_index = embedded_frame_index
+        if not isinstance(frame_index, int) or isinstance(frame_index, bool):
+            continue
+        scenario = _raw_scenario(evaluator_record)
+        if not scenario and isinstance(embedded, Mapping):
+            scenario = _raw_scenario(embedded)
+        key = (scenario, frame_index)
+        if key in evaluator_by_key:
+            diagnostics.append(
+                {
+                    "code": "duplicate-evaluator-key",
+                    "path": str(attempt_dir),
+                    "scenario": scenario,
+                    "frame_index": frame_index,
+                }
+            )
+            continue
+        evaluator_by_key[key] = evaluator_record
+    return raw_by_key, evaluator_by_key
+
+
 def _load_capture_bindings(
     suite_dir: Path,
     diagnostics: list[dict[str, Any]],
@@ -635,15 +714,13 @@ def _load_capture_bindings(
     bindings: dict[str, dict[str, Any]] = {}
     identity_owners: dict[tuple[str, str], str] = {}
     physics_cache: dict[str, list[Mapping[str, Any]]] = {}
+    table_cache: dict[
+        str, tuple[dict[tuple[str, int], Mapping[str, Any]], dict[tuple[str, int], Mapping[str, Any]]]
+    ] = {}
     covered_sequences: set[int] = set()
-    covered_scenarios: set[str] = set()
 
-    keyframe_journal_dirs = {
-        rel_dir for rel_dir, _path in _all_journal_paths(suite_resolved, "visual-keyframes.jsonl")
-    }
     for rel_dir, keyframes_path in _all_journal_paths(suite_resolved, "visual-keyframes.jsonl"):
         sequence_requests: dict[int, dict[str, Any]] = {}
-        executor_requests: dict[str, list[dict[str, Any]]] = {}
         request_path = suite_resolved / f"{rel_dir}visual-capture-requests.jsonl"
         if request_path.is_file():
             for item in _read_request_records(request_path, diagnostics):
@@ -656,9 +733,9 @@ def _load_capture_bindings(
                         )
                         continue
                     sequence_requests[sequence] = record
-                else:
-                    scenario_id = record["scenario_id"]
-                    executor_requests.setdefault(scenario_id, []).append(record)
+                # F2.4: executor diagnostic records (shape "executor") are
+                # recognized but never capture-driving and never joined to a
+                # keyframe; they stay diagnostic-only evidence.
         else:
             diagnostics.append(
                 {"code": "missing-visual-request-journal", "path": str(request_path)}
@@ -731,30 +808,17 @@ def _load_capture_bindings(
                 continue
             identity_owners[identity] = canonical_rel
 
-            # --- Join to exactly one request ---------------------------------
-            joined_request: dict[str, Any] | None = None
+            # --- Join to exactly one canonical request (F2.4) ----------------
             execution_request: str | None = None
-            if sequence_requests:
-                candidate = sequence_requests.get(request_sequence)
-                if candidate is not None:
-                    if candidate.get("gate") == gate and candidate.get("event") == event:
-                        joined_request = candidate
-                        execution_request = str(candidate["event"])
-                        covered_sequences.add(request_sequence)
-                    else:
-                        diagnostics.append(
-                            {
-                                "code": "keyframe-request-sequence-mismatch",
-                                "path": str(keyframes_path),
-                                "line": line,
-                                "request_sequence": request_sequence,
-                            }
-                        )
-                        continue
+            candidate = sequence_requests.get(request_sequence)
+            if candidate is not None:
+                if candidate.get("gate") == gate and candidate.get("event") == event:
+                    execution_request = str(candidate["event"])
+                    covered_sequences.add(request_sequence)
                 else:
                     diagnostics.append(
                         {
-                            "code": "keyframe-request-sequence-orphan",
+                            "code": "keyframe-request-sequence-mismatch",
                             "path": str(keyframes_path),
                             "line": line,
                             "request_sequence": request_sequence,
@@ -762,37 +826,15 @@ def _load_capture_bindings(
                     )
                     continue
             else:
-                executor_for_scenario = executor_requests.get(gate)
-                if not executor_for_scenario:
-                    diagnostics.append(
-                        {"code": "keyframe-without-request", "path": str(keyframes_path), "line": line, "scenario": gate}
-                    )
-                    continue
-                mapped_phase = _EVENT_TO_PHASE.get(event)
-                phase_candidates = [
-                    record for record in executor_for_scenario if record["record"].get("phase") == mapped_phase
-                ]
-                if mapped_phase is not None and len(phase_candidates) == 1:
-                    joined_request = phase_candidates[0]["record"]
-                    execution_request = str(mapped_phase)
-                elif len(executor_for_scenario) == 1:
-                    joined_request = executor_for_scenario[0]["record"]
-                    execution_request = str(joined_request.get("phase"))
-                else:
-                    diagnostics.append(
-                        {
-                            "code": "keyframe-ambiguous-request-phase",
-                            "path": str(keyframes_path),
-                            "line": line,
-                            "scenario": gate,
-                            "event": event,
-                            "phases": sorted(
-                                str(record["record"].get("phase")) for record in executor_for_scenario
-                            ),
-                        }
-                    )
-                    continue
-                covered_scenarios.add(gate)
+                diagnostics.append(
+                    {
+                        "code": "keyframe-request-sequence-orphan",
+                        "path": str(keyframes_path),
+                        "line": line,
+                        "request_sequence": request_sequence,
+                    }
+                )
+                continue
 
             # --- Attempt/scenario identity ------------------------------------
             image_path = (suite_resolved / canonical_rel).resolve()
@@ -826,7 +868,7 @@ def _load_capture_bindings(
                 )
                 continue
 
-            # --- Physics cross-bind (frame/timestamp) ------------------------
+            # --- Physics cross-bind (F2.4 bounded-dt, primary key) -----------
             attempt_dir = _enclosing_attempt_dir(suite_resolved, image_path.parent)
             if attempt_dir is None:
                 diagnostics.append(
@@ -837,16 +879,37 @@ def _load_capture_bindings(
             if attempt_dir_key not in physics_cache:
                 physics_cache[attempt_dir_key] = _physics_frames(suite_resolved, attempt_dir)
             physics_records = physics_cache[attempt_dir_key]
+            if attempt_dir_key not in table_cache:
+                table_cache[attempt_dir_key] = _physics_key_tables(
+                    physics_records,
+                    _evaluator_frames(suite_resolved, attempt_dir),
+                    attempt_dir,
+                    diagnostics,
+                )
+            raw_by_key, evaluator_by_key = table_cache[attempt_dir_key]
             physics_bound = False
-            for frame_record in physics_records:
-                if str(frame_record.get("scenario", "")) != gate:
-                    continue
-                if frame_record.get("frame_index") == frame:
-                    ts = frame_record.get("timestamp")
-                    if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(float(ts)):
-                        if abs(float(ts) - timestamp) <= 1e-6:
-                            physics_bound = True
-                            break
+            raw = raw_by_key.get((gate, frame))
+            if raw is not None:
+                raw_ts = raw.get("timestamp")
+                physics_dt = record.get("physics_dt")
+                if (
+                    isinstance(physics_dt, (int, float))
+                    and not isinstance(physics_dt, bool)
+                    and math.isfinite(float(physics_dt))
+                    and float(physics_dt) > 0.0
+                ):
+                    physics_dt = float(physics_dt)
+                else:
+                    physics_dt = None
+                if (
+                    isinstance(raw_ts, (int, float))
+                    and not isinstance(raw_ts, bool)
+                    and math.isfinite(float(raw_ts))
+                    and (gate, frame) in evaluator_by_key
+                ):
+                    window = max(1e-6, 0.5 * physics_dt) if physics_dt is not None else 1e-6
+                    if abs(float(raw_ts) - timestamp) <= window:
+                        physics_bound = True
             if not physics_bound:
                 diagnostics.append(
                     {
@@ -856,6 +919,7 @@ def _load_capture_bindings(
                         "path": canonical_rel,
                         "frame_index": frame,
                         "timestamp": timestamp,
+                        "scenario": gate,
                     }
                 )
                 continue
@@ -873,7 +937,8 @@ def _load_capture_bindings(
                 "physics_bound": True,
             }
 
-    # Request without any keyframe image.
+    # Canonical request without any keyframe image.  Executor diagnostic
+    # records are never capture-driving and never fail here (F2.4).
     for rel_dir, request_path in _all_journal_paths(suite_resolved, "visual-capture-requests.jsonl"):
         for item in _read_request_records(request_path, diagnostics):
             record = item["record"]
@@ -881,11 +946,6 @@ def _load_capture_bindings(
                 diagnostics.append(
                     {"code": "capture-request-without-image", "request_sequence": record["sequence"], "path": str(request_path)}
                 )
-            elif item["shape"] == "executor" and record["scenario_id"] not in covered_scenarios:
-                if not keyframe_journal_dirs or rel_dir not in keyframe_journal_dirs:
-                    diagnostics.append(
-                        {"code": "capture-request-without-image", "scenario_id": record["scenario_id"], "path": str(request_path)}
-                    )
     return bindings, physics_cache
 
 
@@ -1012,6 +1072,12 @@ def _json_identity(
             identity["repositories"] = [
                 str(item) for item in repositories if isinstance(item, str)
             ]
+            for repo_name in identity["repositories"]:
+                repo_value = value.get(repo_name)
+                if isinstance(repo_value, Mapping):
+                    for field in ("head", "implementation_head", "resolved_policy_commit"):
+                        if isinstance(repo_value.get(field), str):
+                            identity[f"{repo_name}.{field}"] = repo_value[field]
     elif name == "static-contract.json":
         if isinstance(value.get("status"), str):
             identity["status"] = value["status"]
@@ -1049,9 +1115,17 @@ def _json_identity(
             if value.get(key) is not None:
                 identity[key] = value[key]
     elif name == "overlay-contract.json":
-        for key in ("repository", "implementation_head"):
-            if isinstance(value.get(key), str):
-                identity[key] = value[key]
+        repositories = value.get("repositories")
+        if isinstance(repositories, Mapping):
+            for repo_name, repo_value in sorted(repositories.items()):
+                if (
+                    isinstance(repo_value, Mapping)
+                    and isinstance(repo_value.get("implementation_identity"), str)
+                ):
+                    identity[f"repository.{repo_name}.implementation_identity"] = repo_value["implementation_identity"]
+        source_locks = value.get("source_locks")
+        if isinstance(source_locks, Mapping) and isinstance(source_locks.get("status"), str):
+            identity["source_locks.status"] = source_locks["status"]
     elif rel_path.startswith("config/") and rel_path.endswith(".json"):
         for key in ("id", "profile", "execution_profile", "seed"):
             if value.get(key) is not None:
@@ -1266,6 +1340,60 @@ def _validate_source_provenance(
         identity = entry.get("identity") or {}
         if identity.get("status") != "pass":
             reasons.append(f"source lock manifest status is not pass: {entry['path']}")
+        # F2.5: per-repository commit/digest identity closure.
+        lock = _read_json_rel(suite_dir, entry["path"])
+        if lock is None:
+            reasons.append(f"unreadable source lock manifest: {entry['path']}")
+            continue
+        repositories = lock.get("repositories")
+        if not isinstance(repositories, list) or not repositories:
+            reasons.append(f"source lock manifest has no repositories: {entry['path']}")
+            continue
+        for repo_name in repositories:
+            repo_value = lock.get(repo_name)
+            if not isinstance(repo_value, Mapping):
+                reasons.append(
+                    f"source lock manifest missing repository record {repo_name!r}: {entry['path']}"
+                )
+                continue
+            if repo_value.get("status") not in ("pass", "verified-pass"):
+                reasons.append(
+                    f"source lock repository {repo_name!r} status is not pass: {entry['path']}"
+                )
+            for field in ("implementation_head", "resolved_policy_commit"):
+                raw = repo_value.get(field)
+                if not isinstance(raw, str) or not _HEX40_RE.fullmatch(raw):
+                    reasons.append(
+                        f"source lock repository {repo_name!r} {field} is missing/invalid "
+                        f"(lowercase 40-hex): {entry['path']}"
+                    )
+            raw_head = repo_value.get("head")
+            if raw_head is not None and (
+                not isinstance(raw_head, str) or not _HEX40_RE.fullmatch(raw_head)
+            ):
+                reasons.append(
+                    f"source lock repository {repo_name!r} head is not lowercase 40-hex: {entry['path']}"
+                )
+            for pair_field in ("status", "diff", "untracked_manifest"):
+                expected = repo_value.get(f"expected_{pair_field}_sha256")
+                observed = repo_value.get(f"observed_{pair_field}_sha256")
+                if expected is None and observed is None:
+                    continue
+                if not isinstance(expected, str) or not _HEX64_RE.fullmatch(expected):
+                    reasons.append(
+                        f"source lock repository {repo_name!r} expected_{pair_field}_sha256 "
+                        f"is not 64-hex: {entry['path']}"
+                    )
+                if not isinstance(observed, str) or not _HEX64_RE.fullmatch(observed):
+                    reasons.append(
+                        f"source lock repository {repo_name!r} observed_{pair_field}_sha256 "
+                        f"is not 64-hex: {entry['path']}"
+                    )
+                elif expected != observed:
+                    reasons.append(
+                        f"source lock repository {repo_name!r} {pair_field} digest mismatch "
+                        f"(expected != observed): {entry['path']}"
+                    )
     # Static contracts (Gate-B closure of config/overlay/command/env/domain).
     static_entries = _entries_by_category(index, "static-contract")
     if not static_entries:
@@ -1274,6 +1402,34 @@ def _validate_source_provenance(
         identity = entry.get("identity") or {}
         if identity.get("status") != "pass":
             reasons.append(f"static contract status is not pass: {entry['path']}")
+    # Overlay contract (real nested repositories/source_locks shape, F2.5).
+    overlay_entries = _entries_by_category(index, "overlay-contract")
+    if not overlay_entries:
+        reasons.append("missing overlay contract (overlay-contract.json)")
+    for entry in overlay_entries:
+        overlay = _read_json_rel(suite_dir, entry["path"])
+        if overlay is None:
+            reasons.append(f"unreadable overlay contract: {entry['path']}")
+            continue
+        repositories = overlay.get("repositories")
+        if not isinstance(repositories, Mapping) or not repositories:
+            reasons.append(f"overlay contract has no repositories map: {entry['path']}")
+            continue
+        for repo_name, repo_value in repositories.items():
+            if not isinstance(repo_value, Mapping):
+                reasons.append(
+                    f"overlay contract repository {repo_name!r} is not an object: {entry['path']}"
+                )
+                continue
+            impl = repo_value.get("implementation_identity")
+            if not isinstance(impl, str) or not _HEX40_RE.fullmatch(impl):
+                reasons.append(
+                    f"overlay contract repository {repo_name!r} implementation_identity "
+                    f"is missing/invalid (lowercase 40-hex): {entry['path']}"
+                )
+        source_locks = overlay.get("source_locks")
+        if not isinstance(source_locks, Mapping) or not isinstance(source_locks.get("status"), str) or not source_locks["status"]:
+            reasons.append(f"overlay contract source_locks.status is missing: {entry['path']}")
     # Model fingerprint real shape.
     fp_entries = _entries_by_category(index, "model-fingerprint")
     if not fp_entries:
@@ -1384,6 +1540,30 @@ def _validate_verdicts(
             reasons.append(f"gate verdict identity mismatch for {scenario_id}: {entry['path']}")
         if identity.get("attempt_id") is None:
             reasons.append(f"gate verdict missing attempt identity for {scenario_id}: {entry['path']}")
+        # F2.6: verdict attempt identity must cross-match the attempt manifest.
+        verdict = _read_json_rel(suite_dir, entry["path"])
+        if verdict is not None:
+            verdict_attempt = verdict.get("attempt_id")
+            attempt_dir_rel = entry["path"].rsplit("/", 1)[0] if "/" in entry["path"] else ""
+            manifest_value = (
+                _read_json_rel(suite_dir, f"{attempt_dir_rel}/manifest.json")
+                if attempt_dir_rel
+                else None
+            )
+            manifest_attempt = (
+                manifest_value.get("attempt_id") if isinstance(manifest_value, Mapping) else None
+            )
+            if not isinstance(verdict_attempt, str) or not verdict_attempt:
+                reasons.append(f"gate verdict missing attempt_id: {entry['path']}")
+            elif (
+                isinstance(manifest_attempt, str)
+                and manifest_attempt
+                and verdict_attempt != manifest_attempt
+            ):
+                reasons.append(
+                    f"gate verdict attempt_id {verdict_attempt!r} does not match manifest "
+                    f"attempt_id {manifest_attempt!r}: {entry['path']}"
+                )
     # Every verdict must belong to a declared scenario.
     for scenario_id, entries in verdicts.items():
         if scenario_id not in declared:
@@ -1414,6 +1594,34 @@ def _validate_physics_and_drain(
             reasons.append(f"empty raw physics truth: {attempt_rel}/physics_truth.jsonl")
         if not evaluator:
             reasons.append(f"empty evaluator drain: {attempt_rel}/evaluator.jsonl")
+        # F2.6: reject duplicate (scenario, frame_index) primary keys in either
+        # truth stream — a key must map to exactly one raw and one evaluator row.
+        raw_seen: set[tuple[str, int]] = set()
+        for row in raw:
+            fi = row.get("frame_index")
+            if not isinstance(fi, int) or isinstance(fi, bool):
+                continue
+            key = (_raw_scenario(row), fi)
+            if key in raw_seen:
+                reasons.append(f"duplicate raw physics key in {attempt_rel}: scenario={key[0]!r} frame_index={fi}")
+            raw_seen.add(key)
+        evaluator_seen: set[tuple[str, int]] = set()
+        for row in evaluator:
+            fi = row.get("frame_index")
+            embedded = row.get("frame")
+            embedded_fi = embedded.get("frame_index") if isinstance(embedded, Mapping) else None
+            if not isinstance(fi, int) or isinstance(fi, bool):
+                if isinstance(embedded_fi, int) and not isinstance(embedded_fi, bool):
+                    fi = embedded_fi
+            if not isinstance(fi, int) or isinstance(fi, bool):
+                continue
+            scenario = _raw_scenario(row)
+            if not scenario and isinstance(embedded, Mapping):
+                scenario = _raw_scenario(embedded)
+            key = (scenario, fi)
+            if key in evaluator_seen:
+                reasons.append(f"duplicate evaluator key in {attempt_rel}: scenario={scenario!r} frame_index={fi}")
+            evaluator_seen.add(key)
         raw_start_index = 0
         evaluator_start_index: int | None = None
         gate_window = _read_json_rel(suite_dir, f"{attempt_rel}/gate-window.json")
@@ -1466,8 +1674,11 @@ def _validate_moveit_controller(
                 reasons.append(f"moveit row {row_number} in {rel} has no scenario_id")
             elif declared and row["scenario_id"] not in declared:
                 reasons.append(f"moveit row {row_number} in {rel} references undeclared scenario {row['scenario_id']}")
-            if not isinstance(row.get("status"), str) or not row["status"]:
+            status = row.get("status")
+            if not isinstance(status, str) or not status:
                 reasons.append(f"moveit row {row_number} in {rel} has no status")
+            elif status not in _EVIDENCE_STATUS_DOMAIN:
+                reasons.append(f"moveit row {row_number} in {rel} has out-of-domain status {status!r}")
         if not any(isinstance(row.get("row_kind"), str) and row["row_kind"] == "final" for row in rows):
             reasons.append(f"moveit plans not finalized: {rel}")
     for rel in _paths_by_category(index, "controller"):
@@ -1483,8 +1694,9 @@ def _validate_moveit_controller(
                 reasons.append(f"controller row {row_number} in {rel} has no scenario_id")
             elif declared and row["scenario_id"] not in declared:
                 reasons.append(f"controller row {row_number} in {rel} references undeclared scenario {row['scenario_id']}")
-            if not isinstance(row.get("status"), str) or not row["status"]:
-                reasons.append(f"controller row {row_number} in {rel} has no status")
+            status = row.get("status")
+            if status is not None and (not isinstance(status, str) or status not in _EVIDENCE_STATUS_DOMAIN):
+                reasons.append(f"controller row {row_number} in {rel} has out-of-domain status {status!r}")
 
 
 def _validate_planning_scene(
@@ -1499,6 +1711,21 @@ def _validate_planning_scene(
         reasons.append("missing planning scene journal (planning-scene.jsonl)")
     if not finals:
         reasons.append("missing planning scene final (planning-scene.json)")
+    # F2.6: PlanningScene evidence is per-attempt — every attempt journal must
+    # have its final artifact in the same attempt directory and vice versa.
+    journal_dirs = {
+        rel.rsplit("/", 1)[0] if "/" in rel else "" for rel in journals
+    }
+    final_dirs = {rel.rsplit("/", 1)[0] if "/" in rel else "" for rel in finals}
+    for attempt_rel in sorted(journal_dirs | final_dirs):
+        if attempt_rel in journal_dirs and attempt_rel not in final_dirs:
+            reasons.append(
+                f"planning scene attempt {attempt_rel or '(root)'} has a journal but no final artifact"
+            )
+        if attempt_rel in final_dirs and attempt_rel not in journal_dirs:
+            reasons.append(
+                f"planning scene attempt {attempt_rel or '(root)'} has a final artifact but no journal"
+            )
     for rel in journals:
         rows = _read_jsonl_rel(suite_dir, rel)
         if rows is None:
@@ -1531,7 +1758,7 @@ def _validate_rosbag(
     suite_dir: Path,
     reasons: list[str],
 ) -> None:
-    """Real rosbag2 metadata + storage (F1.4 Rosbag)."""
+    """Real rosbag2 metadata + storage (F1.4 Rosbag, F2.7 exact contract)."""
     metadata_entries = _entries_by_category(index, "rosbag-metadata")
     if not metadata_entries:
         reasons.append("missing rosbag metadata (rosbag/metadata.yaml)")
@@ -1554,16 +1781,20 @@ def _validate_rosbag(
             reasons.append(f"rosbag metadata has no topics_with_message_count: {rel}")
             continue
         total_messages = 0
-        topic_set: set[str] = set()
+        observed: dict[str, Mapping[str, Any]] = {}
         for record in records:
             if not isinstance(record, Mapping):
+                reasons.append(f"rosbag metadata has a malformed topic record: {rel}")
                 continue
             metadata_record = record.get("topic_metadata")
             count = record.get("message_count")
             if not isinstance(metadata_record, Mapping) or not isinstance(metadata_record.get("name"), str):
+                reasons.append(f"rosbag metadata has a topic without topic_metadata.name: {rel}")
                 continue
             topic = metadata_record["name"]
-            topic_set.add(topic)
+            if topic in observed:
+                reasons.append(f"rosbag metadata has duplicate topic {topic}: {rel}")
+            observed[topic] = dict(metadata_record)
             if isinstance(count, int) and not isinstance(count, bool) and count > 0:
                 total_messages += count
             else:
@@ -1571,6 +1802,23 @@ def _validate_rosbag(
             qos = metadata_record.get("offered_qos_profiles")
             if not isinstance(qos, str) or not qos.strip():
                 reasons.append(f"rosbag topic {topic} has no offered_qos_profiles")
+        # F2.7: the approved record-topic set must be present with exact types
+        # and per-topic nonzero counts.
+        missing_topics = sorted(set(APPROVED_RECORD_TOPIC_TYPES) - set(observed))
+        if missing_topics:
+            reasons.append(
+                f"rosbag is missing approved record topics: {', '.join(missing_topics)}"
+            )
+        for topic, expected_type in APPROVED_RECORD_TOPIC_TYPES.items():
+            metadata_record = observed.get(topic)
+            if metadata_record is None:
+                continue
+            recorded_type = metadata_record.get("type")
+            if recorded_type != expected_type:
+                reasons.append(
+                    f"rosbag topic {topic} type {recorded_type!r} does not match "
+                    f"expected {expected_type!r}"
+                )
         if total_messages <= 0:
             reasons.append(f"rosbag has zero total messages: {rel}")
         duration = root.get("duration")
@@ -1581,6 +1829,9 @@ def _validate_rosbag(
         elif not isinstance(duration, (int, float)) or (isinstance(duration, (int, float)) and not isinstance(duration, bool) and float(duration) <= 0):
             if not isinstance(duration, Mapping):
                 reasons.append(f"rosbag duration missing: {rel}")
+        storage_identifier = root.get("storage_identifier")
+        if storage_identifier != "sqlite3":
+            reasons.append(f"rosbag storage_identifier is not sqlite3: {rel}")
         bag_dir_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
         storage = [
             e
@@ -1610,6 +1861,34 @@ def _validate_cleanup(
             reasons.append(f"resource-cleanup schema_version is not 2: {rel}")
         if value.get("clean") is not True:
             reasons.append(f"resource cleanup not clean: {rel}")
+        # F2.8: recompute the clean claim from the raw baseline/final/owned
+        # state; a True clean flag that contradicts the recorded fields fails.
+        baseline = value.get("baseline")
+        final = value.get("final")
+        baseline_available = isinstance(baseline, Mapping) and baseline.get("available") is True
+        final_available = isinstance(final, Mapping) and final.get("available") is True
+        final_gpus = final.get("gpus") if isinstance(final, Mapping) else None
+        owned_pids = value.get("attempt_owned_pids")
+        owned_gpu_survivors = value.get("attempt_owned_gpu_survivors")
+        unexplained_gpu_memory = value.get("unexplained_gpu_memory")
+        recomputed_clean = (
+            baseline_available
+            and final_available
+            and isinstance(final_gpus, list)
+            and not final_gpus
+            and isinstance(owned_pids, list)
+            and not owned_pids
+            and isinstance(owned_gpu_survivors, list)
+            and not owned_gpu_survivors
+            and isinstance(unexplained_gpu_memory, list)
+            and not unexplained_gpu_memory
+        )
+        if value.get("clean") is True and not recomputed_clean:
+            reasons.append(
+                f"resource cleanup clean flag contradicts the recorded baseline/final/owned state: {rel}"
+            )
+        if isinstance(owned_pids, list) and owned_pids:
+            reasons.append(f"resource cleanup has owned pids surviving: {rel}")
         for field in ("attempt_owned_gpu_survivors", "unexplained_gpu_memory"):
             survivors = value.get(field)
             if isinstance(survivors, list) and survivors:
@@ -1705,6 +1984,14 @@ def validate_gate_f(
         reasons.append("unsupported checksum algorithm: expected sha256")
     if INDEX_NAME in by_path:
         reasons.append("index self-inclusion detected")
+
+    # ---- Index diagnostics fail closed (F2.4) --------------------------------
+    index_diagnostics = index.get("diagnostics")
+    if isinstance(index_diagnostics, list) and index_diagnostics:
+        reasons.append(
+            f"evidence index recorded {len(index_diagnostics)} diagnostics; "
+            "any index diagnostic fails Gate F closed"
+        )
 
     scenario_kinds = index.get("scenario_kinds")
     if not isinstance(scenario_kinds, list):

@@ -336,3 +336,50 @@ def test_cli_selects_bound_live_paths(tmp_path):
         isinstance(c, dict) and c.get("path", "").startswith("E/") and "visual/source/" in c.get("path", "")
         for c in user_meta["captures"]
     )
+
+
+# --- Task 9 fix-round-2 tests (F2.9 output-as-input closure) -----------------
+
+
+def test_contact_sheet_rejects_output_equal_other_sheet(tmp_path):
+    """F2.9: an agent sheet may never overwrite the user sheet (and vice versa)."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events=set(POSITIVE_EVENTS))
+    with pytest.raises(ValueError, match="output-as-input|protected"):
+        build_contact_sheet(
+            suite_dir=suite_dir,
+            image_paths=paths,
+            output=suite_dir / USER,  # agent render must not clobber user sheet
+        )
+    with pytest.raises(ValueError, match="output-as-input|protected"):
+        build_contact_sheet(
+            suite_dir=suite_dir,
+            image_paths=paths,
+            output=suite_dir / AGENT,
+            user=True,  # user render must not clobber agent sheet
+        )
+
+
+def test_contact_sheet_rejects_output_equal_own_sibling_after_write(tmp_path):
+    """F2.9: overwriting the sheet's own path is the only allowed protected output."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    result = build_contact_sheet(suite_dir, paths, output=suite_dir / AGENT)
+    assert result["role"] == "agent"
+    assert (suite_dir / AGENT).is_file()
+
+
+def test_contact_sheet_rejects_output_in_indexed_captures(tmp_path):
+    """F2.9: output colliding with an indexed capture path is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    entry = next(
+        e for e in json.loads((suite_dir / "evidence-index.json").read_text(encoding="utf-8"))["files"]
+        if e.get("category") == "capture" and e.get("event") == "readiness"
+    )
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    with pytest.raises(ValueError, match="output-as-input|indexed capture"):
+        build_contact_sheet(
+            suite_dir=suite_dir,
+            image_paths=paths,
+            output=suite_dir / entry["path"],
+        )

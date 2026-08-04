@@ -314,6 +314,44 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 2 — "produce integrated
+  visual evidence"): Produced the canonical visual-capture evidence end-to-end
+  and closed the validator's semantic gaps.  The integrated executor
+  (`validation/integrated_gate_executor.py`) now emits canonical sequence-shaped
+  EventJournal capture requests (`{schema_version, sequence, gate, event,
+  simulated_timestamp, source_execution_event_sequence}`) at every required
+  checkpoint via `_append_visual_event`, strictly after the durable journal
+  checkpoint it binds, with a per-attempt sequence reset and duplicate-event
+  rejection; `manipulation_qualification.py::_env` enables the capture producer
+  for integrated Isaac children by passing the exact canonical scenario id as
+  `TINKER_SIM_QUALIFICATION_GATE` plus `TINKER_SIM_VISUAL_EVIDENCE=1`;
+  `qualification_visual_capture.py` co-tenants executor diagnostic records
+  safely (skipped silently, never capture-driving, never error-spam).
+  `validation/integrated_evidence_index.py` binds captures only through the
+  canonical request↔keyframe transaction (`request_sequence` + exact gate/event/
+  capture path), keyframe truth by `(scenario_id, raw_frame_index)` primary key
+  with a bounded `max(1e-6, 0.5*physics_dt)` timestamp window and exactly one raw
+  and one evaluator row per key, and fails Gate F closed on any index diagnostic
+  (duplicate request sequence / keyframe identity, orphan keyframe,
+  request-without-image, malformed shape, duplicate physics/evaluator keys,
+  frame/timestamp mismatch).  F2.5 closes source/provenance semantics
+  (lowercase 40-hex commits, 64-hex status/diff/untracked digests,
+  per-repository source-lock identities, nested overlay-contract
+  `repositories`/`source_locks`); F2.6 closes scenario/evidence semantics
+  (verdict↔manifest attempt cross-match, MoveIt/controller status domain
+  `{diagnostic-pass, diagnostic-fail, evidence-invalid, blocked-by-gate-b,
+  verified-pass}`, per-attempt PlanningScene journal+final, duplicate
+  raw/evaluator rows); F2.7 makes the rosbag contract exact (all 11 approved
+  topics with exact message types, per-topic nonzero counts, QoS, sqlite3
+  storage); F2.8 recomputes cleanup `clean` against
+  baseline/final/owned-pids/GPU-survivors/unexplained memory; F2.9 makes
+  `build_contact_sheet` reject output equal to the sibling sheet or an indexed
+  capture before any byte is written.  New tests: 16 evidence-index mutations +
+  3 contact-sheet mutations (54 + 23 total); affected ROS-free regressions pass;
+  Humble-sourced `test_integrated_gate_executor_ros.py` passes.  No build, no
+  live Isaac/ROS/GPU/cuMotion, and no rosbag/capture production ran; the future
+  qualification source lock remains absent.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 1 — "bind evidence index
   to live artifacts"): The initial 44 tests were synthetic and did not exercise
   real Task 2-8 producer schemas, so this repair re-pinned every semantic parser

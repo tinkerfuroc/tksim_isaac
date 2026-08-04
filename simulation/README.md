@@ -88,3 +88,23 @@ This remains development-only and is not release-qualified. MoveIt and cuMotion
 are deferred until the manipulation core is physically evaluated; vision,
 decision, and VLA vertical slices are deferred behind the same qualification
 work.
+
+## Changelog
+
+- 2026-08-04 (integrated qualification Task 9, fix round 2 — "produce integrated
+  visual evidence"): `simulation/tinker_sim_isaac/qualification_visual_capture.py`
+  now co-tenants two request shapes in the same `visual-capture-requests.jsonl`:
+  the canonical EventJournal sequence-shape capture request
+  (`{schema_version, sequence, gate, event, simulated_timestamp,
+  source_execution_event_sequence}`) is the only capture-driving schema, and the
+  executor diagnostic record
+  (`{schema_version, report_revision, scenario_id, phase, capture:{kind,target},
+  diagnostic_only}`) is skipped silently (never capture-driving, never
+  error-spam).  Malformed/non-object records are reported exactly once
+  (deduplicated error keys) and capture freshness stays within the bounded
+  `MAX_CAPTURE_LATENCY_FRAMES=4` physics-frame contract.  The capture consumer is
+  enabled by `TINKER_SIM_VISUAL_EVIDENCE=1` with an exact scenario id in
+  `TINKER_SIM_QUALIFICATION_GATE` (set for integrated Isaac children by
+  `manipulation_qualification.py::_env`).  No build, no live Isaac/ROS/GPU run in
+  this fix round; the producer changes are exercised by ROS-free tests and the
+  Humble-sourced executor ROS tests.
