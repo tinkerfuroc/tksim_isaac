@@ -835,19 +835,24 @@ class QualificationRunner:
                 continue
         raise RuntimeError("could not allocate a unique qualification attempt directory")
 
-    def prepare_manifest(self) -> QualificationManifest:
-        if not self.config_path.is_file():
-            raise FileNotFoundError(self.config_path)
-        if not self.scenario_path.is_file():
-            raise FileNotFoundError(self.scenario_path)
+    def _build_manifest_data(
+        self,
+        *,
+        attempt_id: str,
+        attempt_dir: Path,
+        selected_gates: Sequence[str],
+        scenario: Mapping[str, Any],
+        gate: str,
+    ) -> dict[str, Any]:
+        """Build the canonical manifest data dict (shared by the six-gate and
+        integrated manifest paths).  ``selected_gates`` is the exact gate list
+        for the six-gate path and empty for the integrated path, so the
+        integrated manifest carries no core-gate selection semantics."""
         dds_profile = _resolve_dds_profile()
         config = self._config()
-        scenario = self._scenario_spec()
-        selected_gates = self._selected_gates(config)
-        attempt_id, attempt_dir = self._new_attempt_dir()
         artifact_files = _resolve_artifact(self.root, self.artifact_path)
         sources = self._source_inventory()
-        manifest_data: dict[str, Any] = {
+        return {
             "schema_version": 1,
             "attempt_id": attempt_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -870,8 +875,8 @@ class QualificationRunner:
                 ],
             },
             "seed": self.seed,
-            "gate": self.gate,
-            "selected_gates": selected_gates,
+            "gate": gate,
+            "selected_gates": [str(item) for item in selected_gates],
             "physics": dict(CPU_PHYSICS),
             "thresholds": {
                 **THRESHOLDS,
@@ -910,6 +915,60 @@ class QualificationRunner:
                 "recorded": list(APPROVED_RECORD_TOPICS),
             },
         }
+
+    def prepare_manifest(self) -> QualificationManifest:
+        if not self.config_path.is_file():
+            raise FileNotFoundError(self.config_path)
+        if not self.scenario_path.is_file():
+            raise FileNotFoundError(self.scenario_path)
+        config = self._config()
+        scenario = self._scenario_spec()
+        selected_gates = self._selected_gates(config)
+        attempt_id, attempt_dir = self._new_attempt_dir()
+        manifest_data = self._build_manifest_data(
+            attempt_id=attempt_id,
+            attempt_dir=attempt_dir,
+            selected_gates=selected_gates,
+            scenario=scenario,
+            gate=self.gate,
+        )
+        manifest_path = attempt_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return QualificationManifest(attempt_id, attempt_dir, manifest_data)
+
+    def prepare_manifest_at(
+        self,
+        attempt_id: str,
+        attempt_dir: Path,
+        *,
+        scenario_id: str | None = None,
+    ) -> QualificationManifest:
+        """Build a manifest at an externally allocated attempt directory.
+
+        This is the narrow additive integrated path.  It accepts an externally
+        allocated (freshly created) attempt directory and records the scenario
+        id with ``gate="integrated"`` and an empty ``selected_gates``, so an
+        integrated scenario id is never passed into the core six-gate selection
+        (integrated scenario ids are not members of the six-gate config).  The
+        ``QualificationRunner`` six-gate ``--gate``/``prepare_manifest``
+        behavior is unchanged.
+        """
+        if not self.config_path.is_file():
+            raise FileNotFoundError(self.config_path)
+        if not self.scenario_path.is_file():
+            raise FileNotFoundError(self.scenario_path)
+        scenario = self._scenario_spec()
+        if scenario_id is not None and scenario["id"] != scenario_id:
+            raise ValueError(
+                "scenario id {!r} != requested {!r}".format(scenario["id"], scenario_id)
+            )
+        manifest_data = self._build_manifest_data(
+            attempt_id=attempt_id,
+            attempt_dir=attempt_dir,
+            selected_gates=(),
+            scenario=scenario,
+            gate="integrated",
+        )
         manifest_path = attempt_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return QualificationManifest(attempt_id, attempt_dir, manifest_data)

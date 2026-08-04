@@ -363,6 +363,38 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 1 — "execute
+  integrated scenario lifecycle"): Made the integrated C-E lifecycle executable
+  on the real manifest/launch path.  The orchestrator no longer passes a
+  scenario id as a core `gate` (which crashed the core `_selected_gates`); it
+  builds the manifest at the externally allocated attempt directory with
+  `gate="integrated"` via the additive
+  `QualificationRunner.prepare_manifest_at` and starts both the Isaac and Humble
+  child wrappers through the real process lifecycle with the exact scenario id,
+  seed, private domain, and `TINKER_SIM_ATTEMPT_DIR`/RMW/DDS environment applied
+  to the subprocesses.  Each scenario runs in a newly created immutable attempt
+  directory that did not previously exist (repeated allocation yields distinct
+  preserved paths); a nonempty attempt directory is rejected, readiness requires
+  current-attempt manifest provenance on top of the exact `scenario-runner.json`
+  byte binding, and a zero-child-launch attempt can never false-pass on stale
+  evidence.  Per scenario the producers are stopped and the evaluator/raw drain
+  is required to correlate exactly before the independent
+  `verify_integrated_attempt` runs; rosbag, orphan, and resource evidence are
+  finalized before verification inside a single fail-dominant `try/finally`
+  lifecycle, so every post-launch exception still runs bounded cleanup.  C/D/E
+  stages carry a top-level fail-dominant status, standalone pass exits 0,
+  `--stage all` always retains Stage A and never exits 0 on Gate-B failure, and
+  a not-implemented Stage F reports non-success.  Gate B is per-invocation and
+  cross-bound: source-lock `fail`/missing/stale/self-generated artifacts are
+  `evidence-invalid`, producer exit 0 without newly written output is rejected,
+  and `model-fingerprint.json` must equal the runtime model bundle fingerprint.
+  Stage A requires the integrated config's `required_core_gates` to equal the
+  core config gate list exactly.  A malformed scenario fails closed without
+  skipping later controls.  The Task-7 L-A..L-D predicates remain delegated to
+  the independent verifier; L-E cancel-approach quiescence remains an open
+  live-only obligation (scenario/config files are immutable this round).  No
+  build, no live Isaac/ROS, no cuMotion.
+
 - 2026-08-04 (integrated qualification Task 8 — "orchestrate Gates A-F"):
   Added `validation/integrated_qualification.py`, the offline orchestration
   layer over the review-clean six-gate core suite, the Task 6 physics-ready
