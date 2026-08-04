@@ -363,6 +363,28 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 5 — "final narrow
+  production-suite closure"): Closed the last offline production-suite residuals.
+  `validation/integrated_contact_sheets.py::_all_bound_capture_entries` now
+  tolerates shared cancel/safety event labels across multiple scenarios/attempts
+  and selects exactly one deterministic representative capture per event by
+  canonical event order then scenario/attempt/preferred-camera/path (F5.1).
+  `validation/integrated_evidence_index.py` scopes the duplicate `(event, camera)`
+  keyframe-identity check per attempt directory, requires `capture_latency_frames`
+  and both `execution_event_sequence` / `source_execution_event_sequence` as
+  mandatory equal positive integers with missing either side a critical
+  diagnostic (retaining the real `raw = requested + latency` relation), and
+  requires exactly one categorized overlay-contract artifact (F5.2/F5.3).
+  `simulation/tinker_sim_isaac/qualification_visual_capture.py` expires a
+  partially captured sequence that can no longer satisfy the bounded latency
+  contract on a restarted consumer (one deduplicated terminal error, durable
+  terminal marker, preserved camera-1 evidence, no camera-2 fabrication, no
+  retry/error growth) and persists each PNG atomically and durably before its
+  keyframe row (F5.4).  This is offline production-suite closure only; no live
+  Isaac/camera/rosbag/GPU/OMPL/cuMotion claim; Task 10 still owns the Gate-F
+  wiring and a load-bearing live rosbag; `_image_stats` still requires live RTX
+  calibration.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 4 — "align evidence with
   real capture artifacts"): Aligned the offline Gate-F evidence contract with the
   real producer output.  `validation/integrated_evidence_index.py` validates the

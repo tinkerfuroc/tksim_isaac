@@ -28,6 +28,8 @@ from test_integrated_evidence_index import (  # noqa: E402
     IMAGE_SIZE,
     POSITIVE_EVENTS,
     SAFETY_EVENTS,
+    _add_sibling_cancel,
+    _add_sibling_safety,
     make_complete_evidence_suite,
     render_sheets,
     required_capture_paths,
@@ -37,6 +39,10 @@ from validation.integrated_contact_sheets import (  # noqa: E402
     USER_NAME as USER_FILE,
     build_contact_sheet,
     _read_sheet_metadata,
+)
+from validation.integrated_evidence_index import (  # noqa: E402
+    build_evidence_index,
+    build_qualification_summary,
 )
 
 REQUIRED = set(POSITIVE_EVENTS)
@@ -500,3 +506,43 @@ def test_cli_sheets_embed_canonical_suite_event_order(tmp_path):
     assert agent_meta["role"] == "agent" and user_meta["role"] == "user"
     assert agent_meta["captures_sha256"] == user_meta["captures_sha256"]
     assert [c["event"] for c in agent_meta["captures"]] == expected
+
+
+def test_f51_shared_event_labels_multi_scenario_cli_gate_f_pass(tmp_path):
+    """F5.1: the production CLI tolerates the same cancel/safety event labels
+    shared across multiple scenarios/attempts (three cancel and two safety
+    scenarios in the real suite).  The selector picks one deterministic
+    representative per event from the path-sorted input, embeds the exact
+    canonical order in both sheets, and Gate F reaches verified-pass."""
+    from validation.integrated_contact_sheets import main
+
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    _add_sibling_cancel(suite_dir)  # second cancel scenario (cancel-transport)
+    _add_sibling_safety(suite_dir)  # second safety scenario (moveit-safety)
+    # Rebuild the evidence index so the path-sorted bound captures include the
+    # sibling cancel/safety attempts sharing the same event labels.
+    build_evidence_index(suite_dir=suite_dir, output=suite_dir / "evidence-index.json")
+    assert main(["--suite-dir", str(suite_dir)]) == 0
+    expected = list(POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS)
+    agent_meta = _read_sheet_metadata(suite_dir / AGENT)
+    user_meta = _read_sheet_metadata(suite_dir / USER)
+    assert agent_meta is not None and user_meta is not None
+    assert agent_meta["events"] == expected
+    assert user_meta["events"] == expected
+    assert agent_meta["role"] == "agent" and user_meta["role"] == "user"
+    assert agent_meta["captures"] == user_meta["captures"]
+    assert len(agent_meta["captures"]) == len(expected)
+    assert [c["event"] for c in agent_meta["captures"]] == expected
+    # A representative capture is chosen deterministically from the already
+    # validated per-attempt bindings (scenario/attempt/camera/path rank).
+    by_event = {capture["event"]: capture for capture in agent_meta["captures"]}
+    assert by_event["cancel-trigger"]["scenario"] in (
+        "qualification-pick-place-cancel-approach",
+        "qualification-pick-place-cancel-transport",
+    )
+    assert by_event["safety-trigger"]["scenario"] in (
+        "qualification-pick-place-safety-transport",
+        "qualification-moveit-safety",
+    )
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]

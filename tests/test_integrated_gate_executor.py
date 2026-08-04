@@ -26,6 +26,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -3173,3 +3174,157 @@ def test_f34_consumer_from_environment_requires_attempt_and_gate(monkeypatch):
 
     with pytest.raises(RuntimeError, match="TINKER_SIM_ATTEMPT_DIR"):
         QualificationVisualCapture.from_environment(app=object(), backend=object())
+
+
+# ---------------------------------------------------------------------------
+# F5.4: partial-camera stale-restart expiry + durable PNG-before-journal order.
+#
+# After camera 1 is durably captured, a restarted consumer may observe the
+# original request more than MAX_CAPTURE_LATENCY_FRAMES late.  The sequence must
+# expire fail-closed: one deduplicated terminal error, camera-1 evidence
+# preserved, no camera-2 fabrication, no retry/error growth across polls or a
+# process restart, and each PNG durably persisted before its keyframe row.
+# ---------------------------------------------------------------------------
+
+
+def test_f54_stale_partial_restart_terminal_no_retry_no_fabrication(tmp_path, monkeypatch):
+    """F5.4: a partially captured sequence observed more than
+    MAX_CAPTURE_LATENCY_FRAMES late on restart is terminal.  Exactly one
+    deduplicated error is recorded, camera-1 evidence is preserved, camera-2 is
+    never fabricated, and repeated polls/restarts never grow identical errors."""
+    from simulation.tinker_sim_isaac.qualification_visual_capture import (
+        MAX_CAPTURE_LATENCY_FRAMES,
+    )
+
+    # Durable camera-1 (overview) keyframe from a prior partial capture.
+    (tmp_path / "visual-keyframes.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "gate": "g",
+                "event": "cancel-execution-start",
+                "request_sequence": 5,
+                "execution_event_sequence": 3,
+                "camera": "overview",
+                "path": "visual/source/0005-cancel-execution-start-overview.png",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "visual/source").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "visual/source/0005-cancel-execution-start-overview.png").write_bytes(
+        _rgb_array().tobytes()
+    )
+    # The restarted consumer observes the request more than MAX frames late.
+    late_frames = MAX_CAPTURE_LATENCY_FRAMES + 5
+    backend = _FakeRenderBackend(
+        physics_frame_index=100 + late_frames,
+        simulation_time=(100 + late_frames) / 100.0,
+    )
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request(sequence=5))
+    capture.poll()
+
+    # One terminal error, deduplicated, with the sequence marked handled.
+    assert len(capture._errors) == 1
+    assert "latency is outside the bounded contract" in capture._errors[0]
+    assert 5 in capture._handled_sequences
+    # Camera-1 evidence preserved; camera-2 never fabricated.
+    pngs = sorted(path.name for path in (tmp_path / "visual/source").glob("*.png"))
+    assert pngs == ["0005-cancel-execution-start-overview.png"]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "visual-keyframes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert [record["camera"] for record in records] == ["overview"]
+    # The terminal decision is durable so a restart never retries it.
+    terminal = json.loads((tmp_path / "visual-terminal.json").read_text(encoding="utf-8"))
+    assert terminal["terminal_sequences"] == [5]
+    # Repeated polls never grow identical errors.
+    capture.poll()
+    capture.poll()
+    assert len(capture._errors) == 1
+    # A process restart (new instance, same durable state) never retries and
+    # never grows an error.
+    restarted = _make_capture(monkeypatch, tmp_path, backend)
+    restarted.poll()
+    assert restarted._errors == []
+    assert 5 in restarted._handled_sequences
+
+
+def test_f54_in_range_partial_restart_still_completes_missing_camera(tmp_path, monkeypatch):
+    """F5.4: when the restarted consumer still satisfies the latency contract,
+    the round-4 behavior is preserved: only the missing camera is captured and
+    camera-1 is never duplicated."""
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    (tmp_path / "visual-keyframes.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "gate": "g",
+                "event": "cancel-execution-start",
+                "request_sequence": 5,
+                "execution_event_sequence": 3,
+                "camera": "overview",
+                "path": "visual/source/0005-cancel-execution-start-overview.png",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "visual/source").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "visual/source/0005-cancel-execution-start-overview.png").write_bytes(
+        _rgb_array().tobytes()
+    )
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request(sequence=5))
+    capture.poll()
+    assert capture._errors == []
+    assert 5 in capture._handled_sequences
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "visual-keyframes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    by_camera = {record["camera"] for record in records}
+    assert by_camera == {"overview", "manipulation_closeup"}
+    overview_records = [record for record in records if record["camera"] == "overview"]
+    assert len(overview_records) == 1  # camera-1 never duplicated
+    assert not (tmp_path / "visual-terminal.json").exists()
+
+
+def test_f54_image_persistence_failure_cannot_append_keyframe(tmp_path, monkeypatch):
+    """F5.4: a failed image fsync/replace must never append a keyframe journal
+    row.  A journal row is only durable after its referenced image bytes."""
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request())
+
+    real_replace = os.replace
+
+    def _failing_replace(src, dst):
+        if str(dst).endswith(".png"):
+            raise OSError("simulated image replace failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("os.replace", _failing_replace)
+    capture.poll()
+
+    # No keyframe row may be durable before its referenced image bytes.
+    keyframes_path = tmp_path / "visual-keyframes.jsonl"
+    if keyframes_path.exists():
+        assert keyframes_path.stat().st_size == 0
+    # No final PNG is left behind and the temporary file is cleaned up.
+    assert not list((tmp_path / "visual/source").glob("*.png"))
+    assert not list((tmp_path / "visual/source").glob(".*.png.*"))
+    # The failure is reported once and the sequence is not retried (no error loop).
+    assert len(capture._errors) == 1
+    assert "failed" in capture._errors[0]
+    capture.poll()
+    assert len(capture._errors) == 1
