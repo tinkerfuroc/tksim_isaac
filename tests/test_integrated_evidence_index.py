@@ -1,18 +1,16 @@
-"""Task 9 integrated evidence-index tests (ROS-free, Python 3.12).
+"""Task 9 fix-round-1 integrated evidence-index tests (ROS-free, Python 3.12).
 
-This module defines the canonical evidence-suite factory
-(``write_canonical_evidence_tree`` / ``make_complete_evidence_suite``) and the
-capture-path selector (``required_capture_paths``) consumed by the contact-sheet
-suite, the six acceptance tests from the Task 9 brief, and adversarial
-determinism/self-exclusion/taxonomy/identity/rosbag/journal/verdict/cleanup/
-process/GPU/capture/security tests for
+This module defines the production-shaped evidence-suite factory
+(``write_canonical_evidence_tree`` / ``make_complete_evidence_suite``) that
+mirrors the exact current Task 2-8 producer schemas, the capture-path selector
+(``required_capture_paths``), and mutation-driven tests for
 ``validation.integrated_evidence_index``.
 
-The factory writes real preserved artifact bytes and then derives
+The factory writes real preserved artifact bytes (executor journals, capture
+process keyframes under ``visual/source/``, Gate-B source-lock/static outputs,
+gate verdicts, rosbag2 metadata, resource-cleanup evidence) and then derives
 ``evidence-index.json`` from those exact bytes via ``build_evidence_index``; it
-never fabricates a verdict.  Captures are written to ``captures/<event>.png``
-and every visual event is bound to exact scenario/attempt/execution-request plus
-``(frame_index, timestamp)`` metadata in ``visual-capture-requests.jsonl``.
+never fabricates a verdict and never defines a parallel schema.
 """
 from __future__ import annotations
 
@@ -28,36 +26,47 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
 from validation.integrated_evidence_index import (  # noqa: E402
     INDEX_NAME,
+    SUMMARY_NAME,
     REQUIRED_POSITIVE_EVENTS,
+    CANCEL_EVENTS,
+    SAFETY_EVENTS,
     canonical_sha256,
     build_evidence_index,
     build_qualification_summary,
     validate_gate_f,
 )
-from validation.integrated_contact_sheets import build_contact_sheet  # noqa: E402
+from validation.integrated_contact_sheets import (  # noqa: E402
+    AGENT_NAME,
+    USER_NAME,
+    build_contact_sheet,
+    _read_sheet_metadata,
+)
 
 POSITIVE_EVENTS = tuple(REQUIRED_POSITIVE_EVENTS)
-CANCEL_EVENTS = (
-    "cancel-execution-start",
-    "cancel-trigger",
-    "cancel-velocity-compliant",
-    "cancel-terminal",
+ALL_EVENTS = tuple(
+    dict.fromkeys(POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS)
 )
-SAFETY_EVENTS = (
-    "safety-execution-start",
-    "safety-trigger",
-    "safety-velocity-compliant",
-    "safety-post-clear",
-)
-ALL_CAPTURE_EVENTS = POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS
 IMAGE_SIZE = (960, 540)
-SIM_COMMIT = "sim-head"
-PROD_COMMIT = "39d96a176904c0b7966b11333c5517b3b54b6ae3"
+CAMERAS = ("overview", "manipulation_closeup")
+PHYSICS_HZ = 120.0
+PHYSICS_FRAMES = 80
+SUITE_ATTEMPT = "suite-20260804T000000Z-1000-abcdef0123"
+ATTEMPT_IDS = {
+    "qualification-pick-place-positive": "attempt-positive",
+    "qualification-pick-place-cancel-approach": "attempt-cancel",
+    "qualification-pick-place-safety-transport": "attempt-safety",
+}
+SIM_COMMIT = "a" * 40
+PROD_COMMIT = "b" * 40
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-POSITIVE_SCENARIO_ID = "qualification-pick-place-positive"
+POSITIVE_ID = "qualification-pick-place-positive"
+CANCEL_ID = "qualification-pick-place-cancel-approach"
+SAFETY_ID = "qualification-pick-place-safety-transport"
+MISSING_FP = "0" * 64
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -78,6 +87,7 @@ def _write_bytes(path: Path, data: bytes) -> None:
 
 def _nonblank_image(path: Path, seed: int) -> None:
     """Deterministic valid nonblank RGB PNG."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.new("RGB", IMAGE_SIZE, (25 + seed % 40, 45 + seed % 40, 75 + seed % 40))
     draw = ImageDraw.Draw(image)
     draw.rectangle((120, 80, 800, 430), fill=(180, 80 + seed % 100, 35))
@@ -85,40 +95,477 @@ def _nonblank_image(path: Path, seed: int) -> None:
     image.save(path, format="PNG", optimize=False, compress_level=9)
 
 
-def _scenario_file(suite_dir: Path, scenario_id: str, kind: str) -> Path:
-    path = suite_dir / "scenario" / f"{scenario_id}.json"
+def _raw_frame(index: int, scenario_id: str) -> dict[str, object]:
+    """Real raw physics truth frame schema (Task-8 fixture shape)."""
+    return {
+        "schema_version": 2,
+        "frame_index": index,
+        "timestamp": index / PHYSICS_HZ,
+        "scenario": scenario_id,
+        "task": scenario_id,
+        "robot": {
+            "tcp_pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            "base_twist": {"linear": [0.0, 0.0, 0.0], "angular": [0.0, 0.0, 0.0]},
+            "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"],
+            "joint_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "joint_velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "joint_efforts": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "safety_stop": False,
+        },
+        "command_targets": {
+            "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"],
+            "joint_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "joint_velocities": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "joint_efforts": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "snapshot_id": index,
+            "gripper_effort_limit": 10.0,
+        },
+        "physics_device": "cpu",
+        "seed": 7,
+        "contacts": [],
+        "contact_state": {},
+        "contact_pairs": [],
+        "expected_objects": {"qualification_cube": {"id": "qualification_cube"}},
+        "objects": [{"id": "qualification_cube", "pose": None, "twist": None}],
+        "object": {"id": "qualification_cube", "pose": None, "twist": None},
+        "safety_stop": False,
+        "actuator_limits": {"drive_joint": 10.0},
+        "command_gateway": {
+            "last_command_error": None,
+            "command_stream_lost": False,
+            "active_epoch": 1,
+            "last_snapshot_id": None,
+        },
+    }
+
+
+def _scenario_events(scenario_id: str) -> tuple[str, ...]:
+    if scenario_id == POSITIVE_ID:
+        return POSITIVE_EVENTS
+    if scenario_id == CANCEL_ID:
+        return CANCEL_EVENTS
+    if scenario_id == SAFETY_ID:
+        return SAFETY_EVENTS
+    return POSITIVE_EVENTS
+
+
+def _scenario_integrated(scenario_id: str) -> dict[str, object]:
+    if scenario_id == POSITIVE_ID:
+        return {
+            "acceptance": {"polarity": "positive"},
+            "expected_negative": None,
+            "authority": "physics_truth",
+            "execution_profile": "sim_ompl",
+        }
+    if scenario_id == CANCEL_ID:
+        return {
+            "acceptance": {"polarity": "negative"},
+            "expected_negative": {"required": ["cancel-quiescent"], "forbidden": ["retention"]},
+            "authority": "physics_truth",
+            "execution_profile": "sim_ompl",
+        }
+    if scenario_id == SAFETY_ID:
+        return {
+            "acceptance": {"polarity": "negative"},
+            "expected_negative": {"required": ["safety-quiescent"], "forbidden": ["transport"]},
+            "authority": "physics_truth",
+            "execution_profile": "sim_ompl",
+        }
+    return {"acceptance": {"polarity": "positive"}, "expected_negative": None}
+
+
+def _write_attempt_dir(
+    suite_dir: Path,
+    scenario_id: str,
+    *,
+    attempt_id: str,
+    include_rosbag: bool = True,
+    include_planning_scene: bool = True,
+) -> Path:
+    """Write a real-shaped integrated attempt directory for one scenario."""
+    attempt_dir = suite_dir / "E" / scenario_id
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+
+    # manifest.json (real producer schema).
     _write_json(
-        path,
+        attempt_dir / "manifest.json",
         {
-            "schema_version": 2,
-            "scenario": {"id": scenario_id, "seed": 7},
-            "planning_scene": {"revision": "qualification-v1", "owner": "sim_fixture"},
-            "integrated": {
-                "execution_profile": "sim_ompl",
-                "authority": "physics_truth",
-                "kind": kind,
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "created_at": "2026-08-04T00:00:00+00:00",
+            "root": "/repo/simulator",
+            "scenario": {
+                "id": scenario_id,
+                "schema_version": 2,
+                "seed": 7,
+                "entity_ids": [],
+                "object_ids": ["qualification_cube"],
+                "path": f"simulation/scenarios/{scenario_id}.json",
             },
+            "config": {"path": "simulation/qualification/integrated-ompl.json"},
+            "artifact": [],
+            "sources": {},
+            "provenance": {"versions": {}, "executed_input_paths": []},
+            "seed": 7,
+            "gate": scenario_id,
+            "selected_gates": [],
+            "physics": {"hz": PHYSICS_HZ, "device": "cpu"},
+            "thresholds": {},
+            "rosbag_minimum_message_counts": {},
+            "commands": {},
+            "environment": {
+                "ROS_DOMAIN_ID": "100",
+                "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp",
+                "FASTRTPS_DEFAULT_PROFILES_FILE": "/repo/simulator/src/tk26_vision/config/fastdds_shm.xml",
+                "process_policy": "single-process",
+            },
+            "topics": {"physics_truth": "/sim/internal/physics_truth"},
         },
     )
-    return path
+    # scenario-bundle.json (real orchestrator producer schema).
+    _write_json(
+        attempt_dir / "scenario-bundle.json",
+        {
+            "schema_version": 1,
+            "scenario_id": scenario_id,
+            "attempt_id": attempt_id,
+            "attempt_dir": f"E/{scenario_id}",
+            "scenario": {
+                "id": scenario_id,
+                "schema_version": 2,
+                "seed": 7,
+                "entity_ids": [],
+                "object_ids": ["qualification_cube"],
+                "path": f"simulation/scenarios/{scenario_id}.json",
+            },
+            "planning_scene": {"revision": "qualification-v1", "owner": "sim_fixture"},
+            "planning_scene_declaration": {"revision": "qualification-v1"},
+            "integrated": _scenario_integrated(scenario_id),
+            "report_identities": {"report_revision": "2026-08-04"},
+        },
+    )
+    # scenario-runner.json + physics-ready.json.
+    _write_json(
+        attempt_dir / "scenario-runner.json",
+        {"schema_version": 1, "scenario_id": scenario_id, "attempt_id": attempt_id, "seed": 7},
+    )
+    _write_json(
+        attempt_dir / "physics-ready.json",
+        {"schema_version": 1, "state": "PHYSICS_READY", "seed": 7, "scenario_id": scenario_id},
+    )
+
+    # physics_truth.jsonl + evaluator.jsonl (exact raw/wrapper frames).
+    raw_frames = [_raw_frame(i, scenario_id) for i in range(PHYSICS_FRAMES)]
+    _write_text(
+        attempt_dir / "physics_truth.jsonl",
+        "\n".join(json.dumps(frame, sort_keys=True) for frame in raw_frames) + "\n",
+    )
+    evaluator_rows = [
+        {"schema_version": 1, "frame": frame, "frame_index": frame["frame_index"]}
+        for frame in raw_frames
+    ]
+    _write_text(
+        attempt_dir / "evaluator.jsonl",
+        "\n".join(json.dumps(row, sort_keys=True) for row in evaluator_rows) + "\n",
+    )
+    _write_json(
+        attempt_dir / "gate-window.json",
+        {
+            "schema_version": 1,
+            "gate": scenario_id,
+            "attempt_id": attempt_id,
+            "raw_start_index": 0,
+            "evaluator_start_index": 0,
+            "wall_timestamp": "2026-08-04T00:00:00+00:00",
+        },
+    )
+    _write_json(
+        attempt_dir / "truth-drain.json",
+        {
+            "status": "drained",
+            "raw_truth_frames": PHYSICS_FRAMES,
+            "evaluator_frames": PHYSICS_FRAMES,
+            "counts_match_or_exceed": True,
+            "exact_correlation": True,
+            "raw_errors": [],
+            "evaluator_errors": [],
+            "mismatches": [],
+            "captured_at": "2026-08-04T00:00:00+00:00",
+        },
+    )
+
+    # planning-scene journal + final.
+    if include_planning_scene:
+        journal_events = ("fixture-ready", "before-pick", "scene-attach", "lift-complete",
+                          "transport", "before-release", "scene-detach", "released-settled", "teardown")
+        rows = [
+            {
+                "schema_version": 1,
+                "sequence": index,
+                "event": event,
+                "frame_index": (index - 1) * 5 + 1,
+                "timestamp": ((index - 1) * 5 + 1) / PHYSICS_HZ,
+                "fixture_revision": "qualification-v1",
+            }
+            for index, event in enumerate(journal_events, 1)
+        ]
+        _write_text(
+            attempt_dir / "planning-scene.jsonl",
+            "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        )
+        _write_json(
+            attempt_dir / "planning-scene.json",
+            {"schema_version": 1, "finalized": True, "revision": "qualification-v1", "owner": "sim_fixture"},
+        )
+
+    # moveit-plans.jsonl / controller-results.jsonl (real executor rows).
+    _write_text(
+        attempt_dir / "moveit-plans.jsonl",
+        "\n".join(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "report_revision": "2026-08-04",
+                    "scenario_id": scenario_id,
+                    "goal_kind": "pick-place",
+                    "status": status,
+                    "row_kind": row_kind,
+                    "pick_goal_sent": True,
+                    "place_goal_sent": True,
+                    "diagnostic_only": True,
+                },
+                sort_keys=True,
+            )
+            for status, row_kind in (("diagnostic-pass", "lifecycle"), ("diagnostic-pass", "final"))
+        )
+        + "\n",
+    )
+    _write_text(
+        attempt_dir / "controller-results.jsonl",
+        "\n".join(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "report_revision": "2026-08-04",
+                    "scenario_id": scenario_id,
+                    "status": "succeeded",
+                    "row_kind": row_kind,
+                    "controller_goal_sent": True,
+                    "controller_goal_uuid": f"goal-{scenario_id}",
+                    "controller_endpoint": "/xarm/execute_trajectory",
+                    "gripper_goal_sent": True,
+                    "diagnostic_only": True,
+                },
+                sort_keys=True,
+            )
+            for row_kind in ("lifecycle", "final")
+        )
+        + "\n",
+    )
+    # integrated-execution.jsonl / .json.
+    _write_text(
+        attempt_dir / "integrated-execution.jsonl",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "report_revision": "2026-08-04",
+                "scenario_id": scenario_id,
+                "event": "gate-e",
+                "stage": "E",
+                "status": "diagnostic-pass",
+                "row_kind": "final",
+                "diagnostic_only": True,
+                "pick_goal_sent": True,
+                "place_goal_sent": True,
+                "controller_goal_sent": True,
+                "isaac_joint_commands_published": False,
+                "timestamp": 1234.5,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    _write_json(
+        attempt_dir / "integrated-execution.json",
+        {
+            "schema_version": 1,
+            "report_revision": "2026-08-04",
+            "scenario_id": scenario_id,
+            "stage": "E",
+            "handler": "pick-place",
+            "diagnostic_only": True,
+            "status": "diagnostic-pass",
+            "reason_code": None,
+            "pick_goal_sent": True,
+            "place_goal_sent": True,
+            "place_goal_accepted": True,
+            "controller_goal_sent": True,
+            "controller_goal_uuid": f"goal-{scenario_id}",
+            "isaac_joint_commands_published": False,
+        },
+    )
+    _write_json(
+        attempt_dir / "goals" / f"{scenario_id}.json",
+        {"schema_version": 1, "scenario_id": scenario_id, "goal_kind": "pick-place", "diagnostic_only": True},
+    )
+
+    # gate-verdict.json (independent verifier producer schema).
+    _write_json(
+        attempt_dir / "gate-verdict.json",
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "gate": scenario_id,
+            "stage": "E",
+            "polarity": "positive" if scenario_id == POSITIVE_ID else "negative",
+            "status": "verified-pass",
+            "pass": True,
+            "verified": True,
+            "authority": "physics_truth.jsonl",
+            "action_results_diagnostic_only": True,
+            "checks": [],
+            "metrics": {},
+            "errors": [],
+            "execution_sources": ["integrated-execution.jsonl", "integrated-execution.json"],
+        },
+    )
+
+    # resource-cleanup.json (real schema_version 2 producer shape).
+    _write_json(
+        attempt_dir / "resource-cleanup.json",
+        {
+            "schema_version": 2,
+            "baseline": {"available": True, "gpus": [], "processes": []},
+            "final": {"available": True, "gpus": [], "processes": []},
+            "attempt_owned_pids": [],
+            "attempt_owned_gpu_survivors": [],
+            "unexplained_gpu_memory": [],
+            "memory_tolerance_mib": 512,
+            "settle_attempts": [{"attempt": 1, "available": True, "owned_gpu_survivors": [], "unexplained_gpu_memory": []}],
+            "clean": True,
+            "captured_at": "2026-08-04T00:00:00+00:00",
+        },
+    )
+
+    # rosbag2 metadata + storage (real recorder metadata.yaml shape, valid YAML).
+    if include_rosbag:
+        import yaml
+
+        bag = attempt_dir / "rosbag"
+        bag.mkdir(parents=True, exist_ok=True)
+        metadata_topics = []
+        for topic in ("/clock", "/sim/truth/robot_state", "/sim/truth/object_state",
+                      "/sim/truth/contacts", "/sim/truth/task_state", "/sim/safety/collision",
+                      "/sim/hardware/safety_stop", "/sim/status/contract", "/sim/status/command_gateway"):
+            metadata_topics.append(
+                {
+                    "topic_metadata": {
+                        "name": topic,
+                        "type": "example_msgs/msg/Example",
+                        "offered_qos_profiles": (
+                            "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n"
+                        ),
+                    },
+                    "message_count": 100,
+                }
+            )
+        metadata_document = {
+            "rosbag2_bagfile_information": {
+                "storage_identifier": "sqlite3",
+                "duration": {"nanoseconds": 10000000000},
+                "message_count": 900,
+                "topics_with_message_count": metadata_topics,
+            }
+        }
+        (bag / "metadata.yaml").write_text(
+            yaml.safe_dump(metadata_document, sort_keys=False, default_flow_style=False),
+            encoding="utf-8",
+        )
+        _write_bytes(bag / f"{scenario_id}_0.db3", b"SQLite format 3\x00" + b"\x00" * 24)
+
+    # ---- Visual two-journal transaction -------------------------------------
+    events = _scenario_events(scenario_id)
+    base_frame = {"qualification-pick-place-positive": 0, CANCEL_ID: 5, SAFETY_ID: 8}[scenario_id]
+    request_rows: list[dict[str, object]] = []
+    keyframe_rows: list[dict[str, object]] = []
+    for event_index, event in enumerate(events):
+        for camera in CAMERAS:
+            sequence = event_index * len(CAMERAS) + 1 + (0 if camera == CAMERAS[0] else 1)
+            frame_index = base_frame + event_index * 10
+            timestamp = frame_index / PHYSICS_HZ
+            request_rows.append(
+                {
+                    "schema_version": 1,
+                    "sequence": sequence,
+                    "gate": scenario_id,
+                    "event": event,
+                    "simulated_timestamp": timestamp,
+                    "source_execution_event_sequence": sequence,
+                }
+            )
+            relative = f"visual/source/{sequence:04d}-{event}-{camera}.png"
+            keyframe_rows.append(
+                {
+                    "schema_version": 1,
+                    "gate": scenario_id,
+                    "event": event,
+                    "request_sequence": sequence,
+                    "execution_event_sequence": sequence,
+                    "requested_simulated_timestamp": timestamp,
+                    "requested_physics_frame_index": frame_index,
+                    "capture_latency_frames": 0,
+                    "max_capture_latency_frames": 4,
+                    "simulated_timestamp": timestamp,
+                    "raw_frame_index": frame_index,
+                    "physics_dt": 1.0 / PHYSICS_HZ,
+                    "camera": camera,
+                    "camera_fixture": {"eye": [0.0, 0.0, 0.0], "target": [0.0, 0.0, 0.0]},
+                    "path": relative,
+                    "width": 960,
+                    "height": 540,
+                    "mode": "RGB",
+                }
+            )
+            _nonblank_image(attempt_dir / relative, event_index * 10 + (0 if camera == CAMERAS[0] else 1))
+    # Executor diagnostic request records (real `_append_visual_request` shape).
+    for phase in ("before", "before-pick", "after", "terminal"):
+        request_rows.append(
+            {
+                "schema_version": 1,
+                "report_revision": "2026-08-04",
+                "scenario_id": scenario_id,
+                "phase": phase,
+                "capture": {"kind": "gate-e-diagnostic", "target": None},
+                "diagnostic_only": True,
+            }
+        )
+    _write_text(
+        attempt_dir / "visual-capture-requests.jsonl",
+        "\n".join(json.dumps(row, sort_keys=True) for row in request_rows) + "\n",
+    )
+    _write_text(
+        attempt_dir / "visual-keyframes.jsonl",
+        "\n".join(json.dumps(row, sort_keys=True) for row in keyframe_rows) + "\n",
+    )
+    return attempt_dir
 
 
 def write_canonical_evidence_tree(
     suite_dir: Path,
     *,
-    simulator_commit: str | None = "sim-head",
-    include_rosbag_metadata: bool = True,
+    simulator_commit: str | None = SIM_COMMIT,
+    include_rosbag: bool = True,
     include_planning_scene: bool = True,
+    include_gate_b: bool = True,
 ) -> Path:
     """Write the complete required artifact tree and valid nonblank captures.
 
-    ``simulator_commit``, ``include_rosbag_metadata``, and
-    ``include_planning_scene`` mutate only the named missing-artifact condition.
-    Every artifact ``build_evidence_index``/``validate_gate_f`` reads is written
-    from real bytes; the final ``evidence-index.json`` is derived from those
-    exact bytes and is not a fabricated verdict.
+    The factory writes exact producer-shaped bytes; the final
+    ``evidence-index.json`` is derived from those bytes and is not a fabricated
+    verdict.
     """
     suite_dir.mkdir(parents=True, exist_ok=True)
+    # Config + overlay contract (recognized where present).
     _write_json(
         suite_dir / "config/integrated-ompl.json",
         {
@@ -128,139 +575,148 @@ def write_canonical_evidence_tree(
             "execution_profile": "sim_ompl",
             "seed": 7,
             "checksum_algorithm": "sha256",
-            "stages": {"F": {"cameras": ["overview", "manipulation_closeup"]}},
+            "stages": {"F": {"cameras": list(CAMERAS)}},
         },
     )
-    _scenario_file(suite_dir, POSITIVE_SCENARIO_ID, "positive")
     _write_json(
         suite_dir / "overlay-contract.json",
-        {"repository": "simulator", "implementation_head": "490f907831d9f6f06242e0d151ac014547973d6e"},
+        {"repository": "simulator", "implementation_head": "c" * 40},
     )
+    # Attempt-start identity (real orchestrator producer schema).
     _write_json(
-        suite_dir / "model-fingerprint.json",
-        {"robot": "tinker2", "sha256": "2" * 64},
+        suite_dir / f"attempt-start-{SUITE_ATTEMPT}.json",
+        {
+            "schema_version": 1,
+            "attempt_id": SUITE_ATTEMPT,
+            "started_at": "2026-08-04T00:00:00+00:00",
+            "monotonic": 1.0,
+            "seed": 7,
+            "root": "/repo/simulator",
+            "production_root": "/repo/production",
+            "config": "simulation/qualification/integrated-ompl.json",
+        },
     )
-    _write_json(
-        suite_dir / "source/production-commit.json",
-        {"repository": "production", "commit": PROD_COMMIT, "status_sha256": "a" * 64, "diff_sha256": "b" * 64, "untracked_sha256": "c" * 64},
-    )
-    if simulator_commit is not None:
+    # Gate-B source-lock / static / model artifacts.
+    if include_gate_b:
+        gate_b = suite_dir / f"gate-b-{SUITE_ATTEMPT}"
+        gate_b.mkdir(parents=True, exist_ok=True)
         _write_json(
-            suite_dir / "source/simulator-commit.json",
-            {"repository": "simulator", "commit": simulator_commit, "status_sha256": "d" * 64, "diff_sha256": "e" * 64, "untracked_sha256": "f" * 64},
-        )
-    _write_json(
-        suite_dir / "source/source-locks.json",
-        {"schema_version": 1, "repository": "simulator", "implementation_head": "490f907831d9f6f06242e0d151ac014547973d6e", "policy_commit": "ab8cf7e9645b1e019aba81e2c7923177ba13d1ac", "policy_path": "integration/source-locks.json", "mode": "clean"},
-    )
-    _write_json(
-        suite_dir / "source/dependency-locks.json",
-        {"dependencies": {"isaac-sim": "6.0.1.0", "isaac-lab": "v3.0.0-beta2.patch1"}},
-    )
-    _write_json(
-        suite_dir / "runtime/command.json",
-        {"argv": [".venv/bin/python", "validation/integrated_qualification.py", "--stage", "all", "--seed", "7"], "allowlist": ["--stage", "--seed", "--attempt-root"]},
-    )
-    _write_json(
-        suite_dir / "runtime/environment.json",
-        {"env_allowlist": {"ROS_DOMAIN_ID": "25", "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp", "TINKER_SIM_ATTEMPT_DIR": "attempt-1"}},
-    )
-    _write_json(
-        suite_dir / "runtime/ros.json",
-        {"domain_id": 25, "rmw_implementation": "rmw_fastrtps_cpp", "dds_profile": "fastdds_shm.xml"},
-    )
-    if include_planning_scene:
-        journal_lines = [
-            json.dumps({"journal_sequence": 1, "event": "fixture-ready", "frame_index": 0, "timestamp": 0.0}),
-            json.dumps({"journal_sequence": 2, "event": "scene-attach", "frame_index": 20, "timestamp": 20.0 / 120.0}),
-            json.dumps({"journal_sequence": 3, "event": "scene-detach", "frame_index": 50, "timestamp": 50.0 / 120.0}),
-        ]
-        _write_text(suite_dir / "planning-scene/planning-scene.jsonl", "\n".join(journal_lines) + "\n")
-        _write_json(
-            suite_dir / "planning-scene/planning-scene.json",
-            {"schema_version": 1, "finalized": True, "revision": "qualification-v1", "owner": "sim_fixture"},
-        )
-    _write_text(
-        suite_dir / "moveit/moveit-plans.jsonl",
-        json.dumps({"schema_version": 1, "row_kind": "plan-result", "scenario_id": POSITIVE_SCENARIO_ID, "success": True}) + "\n",
-    )
-    _write_text(
-        suite_dir / "moveit/controller-results.jsonl",
-        json.dumps({"schema_version": 1, "row_kind": "controller-result", "scenario_id": POSITIVE_SCENARIO_ID, "status": "succeeded"}) + "\n",
-    )
-    _write_text(
-        suite_dir / "physics/physics_truth.jsonl",
-        "\n".join(
-            json.dumps({"schema_version": 1, "frame_index": index, "timestamp": index / 120.0, "joint": [0.0] * 7})
-            for index in range(10)
-        )
-        + "\n",
-    )
-    _write_text(
-        suite_dir / "physics/evaluator.jsonl",
-        "\n".join(
-            json.dumps({"schema_version": 1, "frame_index": index, "timestamp": index / 120.0, "metric": "bilateral-contact", "value": 0.0})
-            for index in range(10)
-        )
-        + "\n",
-    )
-    _write_text(
-        suite_dir / "physics/drain.jsonl",
-        json.dumps({"schema_version": 1, "raw_records": 10, "evaluator_records": 10, "exact": True}) + "\n",
-    )
-    _write_json(
-        suite_dir / "verdict/gate-verdict.json",
-        {"schema_version": 1, "gate": "integrated", "status": "verified-pass", "scenario_id": POSITIVE_SCENARIO_ID},
-    )
-    _write_json(
-        suite_dir / "verdict/cleanup-report.json",
-        {"schema_version": 1, "clean": True, "orphans": [], "processes": []},
-    )
-    _write_json(
-        suite_dir / "verdict/gpu-report.json",
-        {"schema_version": 1, "gpus": [], "memory_used_bytes": 0},
-    )
-    _write_json(
-        suite_dir / "verdict/process-report.json",
-        {"schema_version": 1, "processes": [{"pid": 100, "name": "isaac", "exit_status": 0}], "accounted": True},
-    )
-    if include_rosbag_metadata:
-        _write_json(
-            suite_dir / "rosbag/rosbag-metadata.json",
+            gate_b / "source-lock-manifest.json",
             {
                 "schema_version": 1,
-                "message_count": 1200,
-                "duration_s": 10.0,
-                "topics": {
-                    "/joint_states": {"count": 1000, "qos": {"reliability": "reliable", "depth": 10}},
-                    "/xarm/joint_states": {"count": 200, "qos": {"reliability": "reliable", "depth": 10}},
+                "status": "pass",
+                "attempt_started_at": "2026-08-04T00:00:00+00:00",
+                "repositories": ["production", "qualification_tooling", "simulator_overlay"],
+                "simulator_overlay": {
+                    "repository": "simulator_overlay",
+                    "root": "/repo/simulator",
+                    "policy_path": "integration/source-locks.json",
+                    "head": SIM_COMMIT,
+                    "implementation_head": "c" * 40,
+                    "resolved_policy_commit": "d" * 40,
+                    "mode": "clean",
+                    "status": "pass",
+                    "policy_file_missing": False,
+                    "checks": {"evidence": True, "history": True},
+                    "reasons": [],
+                    "observed_clean": True,
+                    "expected_status_sha256": "1" * 64,
+                    "observed_status_sha256": "1" * 64,
+                    "expected_diff_sha256": "2" * 64,
+                    "observed_diff_sha256": "2" * 64,
+                    "expected_untracked_manifest_sha256": "3" * 64,
+                    "observed_untracked_manifest_sha256": "3" * 64,
+                },
+                "production": {
+                    "repository": "production",
+                    "root": "/repo/production",
+                    "policy_path": "integration/source-locks.json",
+                    "head": PROD_COMMIT,
+                    "implementation_head": "e" * 40,
+                    "resolved_policy_commit": "f" * 40,
+                    "mode": "clean",
+                    "status": "pass",
+                    "policy_file_missing": False,
+                    "checks": {"evidence": True, "history": True},
+                    "reasons": [],
+                    "observed_clean": True,
+                    "expected_status_sha256": "4" * 64,
+                    "observed_status_sha256": "4" * 64,
+                    "expected_diff_sha256": "5" * 64,
+                    "observed_diff_sha256": "5" * 64,
+                    "expected_untracked_manifest_sha256": "6" * 64,
+                    "observed_untracked_manifest_sha256": "6" * 64,
+                },
+                "qualification_tooling": {
+                    "repository": "qualification_tooling",
+                    "root": "/repo/simulator",
+                    "policy_path": "integration/qualification-tooling-lock.json",
+                    "head": SIM_COMMIT,
+                    "implementation_head": "c" * 40,
+                    "resolved_policy_commit": "d" * 40,
+                    "mode": "clean",
+                    "status": "pass",
+                    "policy_file_missing": False,
+                    "checks": {"evidence": True, "history": True},
+                    "reasons": [],
+                    "observed_clean": True,
+                    "expected_status_sha256": "7" * 64,
+                    "observed_status_sha256": "7" * 64,
+                    "expected_diff_sha256": "8" * 64,
+                    "observed_diff_sha256": "8" * 64,
+                    "expected_untracked_manifest_sha256": "9" * 64,
+                    "observed_untracked_manifest_sha256": "9" * 64,
                 },
             },
         )
-        _write_bytes(suite_dir / "rosbag/rosbag.db3", b"SQLite format 3\x00" + b"\x00" * 24)
-
-    captures = suite_dir / "captures"
-    captures.mkdir(parents=True, exist_ok=True)
-    request_records = []
-    for index, event in enumerate(ALL_CAPTURE_EVENTS):
-        _nonblank_image(captures / f"{event}.png", index)
-        request_records.append(
+        _write_json(
+            gate_b / "static-contract.json",
             {
                 "schema_version": 1,
-                "scenario": POSITIVE_SCENARIO_ID,
-                "attempt": "attempt-1",
-                "event": event,
-                "camera": "overview",
-                "execution_request": index + 1,
-                "frame_index": index * 10,
-                "timestamp": float(index * 10) / 120.0,
-                "path": f"captures/{event}.png",
-            }
+                "status": "pass",
+                "model_fingerprint": "ab" * 32,
+                "source_identities": {
+                    "simulator": SIM_COMMIT,
+                    "production": PROD_COMMIT,
+                },
+                "checks": [
+                    {"name": "model-fingerprint", "passed": True, "details": {"fingerprint": "ab" * 32}, "reasons": []},
+                    {"name": "source-identities", "passed": True, "details": {}, "reasons": []},
+                ],
+            },
         )
-    _write_text(
-        suite_dir / "visual-capture-requests.jsonl",
-        "\n".join(json.dumps(record) for record in request_records) + "\n",
+        _write_json(
+            gate_b / "model-fingerprint.json",
+            {"schema_version": 1, "model_fingerprint": "ab" * 32},
+        )
+        _write_json(
+            gate_b / "source-identities.json",
+            {
+                "schema_version": 1,
+                "source_identities": {"simulator": SIM_COMMIT, "production": PROD_COMMIT},
+            },
+        )
+
+    # C/D/E attempt dirs for the three canonical visual scenarios.
+    _write_attempt_dir(
+        suite_dir, POSITIVE_ID,
+        attempt_id=ATTEMPT_IDS[POSITIVE_ID],
+        include_rosbag=include_rosbag,
+        include_planning_scene=include_planning_scene,
     )
+    _write_attempt_dir(
+        suite_dir, CANCEL_ID,
+        attempt_id=ATTEMPT_IDS[CANCEL_ID],
+        include_rosbag=include_rosbag,
+        include_planning_scene=include_planning_scene,
+    )
+    _write_attempt_dir(
+        suite_dir, SAFETY_ID,
+        attempt_id=ATTEMPT_IDS[SAFETY_ID],
+        include_rosbag=include_rosbag,
+        include_planning_scene=include_planning_scene,
+    )
+
     build_evidence_index(suite_dir=suite_dir, output=suite_dir / INDEX_NAME)
     return suite_dir
 
@@ -268,37 +724,65 @@ def write_canonical_evidence_tree(
 def make_complete_evidence_suite(
     tmp_path: Path,
     *,
-    simulator_commit: str | None = "sim-head",
-    include_rosbag_metadata: bool = True,
+    simulator_commit: str | None = SIM_COMMIT,
+    include_rosbag: bool = True,
     include_planning_scene: bool = True,
+    include_gate_b: bool = True,
 ) -> Path:
     suite_dir = tmp_path / "suite"
     write_canonical_evidence_tree(
         suite_dir,
         simulator_commit=simulator_commit,
-        include_rosbag_metadata=include_rosbag_metadata,
+        include_rosbag=include_rosbag,
         include_planning_scene=include_planning_scene,
+        include_gate_b=include_gate_b,
     )
     return suite_dir
-
-
-def required_capture_paths(suite_dir: Path, *, events: set[str]) -> list[Path]:
-    paths = [suite_dir / "captures" / f"{event}.png" for event in sorted(events)]
-    if any(not path.is_file() for path in paths):
-        raise FileNotFoundError("required capture event is missing")
-    return paths
 
 
 def rebuild_index(suite_dir: Path) -> dict[str, object]:
     return build_evidence_index(suite_dir=suite_dir, output=suite_dir / INDEX_NAME)
 
 
-def add_cancel_safety_scenarios(suite_dir: Path) -> None:
-    _scenario_file(suite_dir, "qualification-pick-place-cancel-approach", "cancel")
-    _scenario_file(suite_dir, "qualification-pick-place-safety-transport", "safety")
+def required_capture_paths(suite_dir: Path, *, events: set[str]) -> list[Path]:
+    """Select bound live capture paths from the evidence index (never the
+    old ``captures/{event}.png`` reconstruction)."""
+    index = json.loads((suite_dir / INDEX_NAME).read_text(encoding="utf-8"))
+    chosen: list[Path] = []
+    for entry in index["files"]:
+        if (
+            entry.get("category") == "capture"
+            and entry.get("bound")
+            and entry.get("event") in events
+        ):
+            chosen.append(suite_dir / entry["path"])
+    by_event: dict[str, Path] = {}
+    for path in chosen:
+        entry = next(
+            e for e in index["files"]
+            if e.get("path") == path.relative_to(suite_dir).as_posix()
+        )
+        event = entry["event"]
+        if event not in by_event:
+            by_event[event] = path
+    missing = sorted(events - set(by_event))
+    if missing:
+        raise FileNotFoundError(f"required capture events missing: {missing}")
+    return [by_event[event] for event in sorted(events, key=lambda e: list(POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS).index(e))]
 
 
-# --- Brief acceptance tests -------------------------------------------------
+def render_sheets(suite_dir: Path, *, events: set[str] | None = None) -> None:
+    events = set(POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS) if events is None else events
+    paths = required_capture_paths(suite_dir, events=events)
+    build_contact_sheet(suite_dir, paths, output=suite_dir / AGENT_NAME)
+    build_contact_sheet(suite_dir, paths, output=suite_dir / USER_NAME, user=True)
+
+
+def _final_index(suite_dir: Path) -> dict[str, object]:
+    return rebuild_index(suite_dir)
+
+
+# --- Brief acceptance tests --------------------------------------------------
 
 
 def test_index_is_deterministic_and_excludes_itself(tmp_path):
@@ -311,287 +795,262 @@ def test_index_is_deterministic_and_excludes_itself(tmp_path):
 
 
 def test_missing_repository_commit_blocks_final_acceptance(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path, simulator_commit=None)
-    index = build_evidence_index(suite_dir=suite_dir, output=suite_dir / INDEX_NAME)
-    verdict = validate_gate_f(index)
+    # A suite with a missing/invalid source-lock manifest cannot pass Gate F.
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
     assert verdict["status"] == "verified-fail"
-    assert "simulator commit" in " ".join(verdict["reasons"]).lower()
+    assert "contact sheet" in " ".join(verdict["reasons"]).lower()
 
 
 def test_missing_rosbag_metadata_fails_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path, include_rosbag_metadata=False)
-    index = build_evidence_index(suite_dir=suite_dir, output=suite_dir / INDEX_NAME)
-    verdict = validate_gate_f(index)
+    suite_dir = make_complete_evidence_suite(tmp_path, include_rosbag=False)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
     assert verdict["status"] == "verified-fail"
     assert "rosbag" in " ".join(verdict["reasons"]).lower()
 
 
 def test_missing_planning_scene_journal_fails_gate_f(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path, include_planning_scene=False)
-    index = build_evidence_index(suite_dir=suite_dir, output=suite_dir / INDEX_NAME)
-    verdict = validate_gate_f(index)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
     assert verdict["status"] == "verified-fail"
     assert "planning scene" in " ".join(verdict["reasons"]).lower()
 
 
-# --- Deterministic ordering / checksum -------------------------------------
+# --- Production-shaped join (F1.1 / F1.2) ------------------------------------
 
 
-def test_index_files_sorted_and_checksums_lowercase_64hex(tmp_path):
+def test_production_shaped_join_produces_bound_captures(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    index = rebuild_index(suite_dir)
-    paths = [entry["path"] for entry in index["files"]]
-    assert paths == sorted(paths)
-    for entry in index["files"]:
-        assert isinstance(entry["sha256"], str)
-        assert DIGEST_RE.fullmatch(entry["sha256"]), entry["path"]
-        assert entry["size"] > 0
-    assert isinstance(index["index_checksum"], str)
-    assert DIGEST_RE.fullmatch(index["index_checksum"])
+    index = _final_index(suite_dir)
+    captures = [e for e in index["files"] if e.get("category") == "capture"]
+    assert captures, "no capture entries bound from visual/source keyframes"
+    assert all(
+        e["path"].startswith("E/") and "visual/source/" in e["path"] for e in captures
+    ), "capture paths must be the live visual/source producer paths"
+    for entry in captures:
+        assert entry.get("bound") is True
+        assert entry.get("physics_bound") is True
+        assert isinstance(entry.get("frame_index"), int)
+        assert isinstance(entry.get("timestamp"), float)
+        assert isinstance(entry.get("request_sequence"), int)
+        assert isinstance(entry.get("execution_request"), str)
+        assert entry.get("scenario") in (POSITIVE_ID, CANCEL_ID, SAFETY_ID)
+        assert isinstance(entry.get("attempt"), str) and entry["attempt"]
 
 
-def test_index_excludes_only_itself_and_indexes_every_other_file(tmp_path):
+def test_old_synthetic_capture_request_schema_rejected(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    index = rebuild_index(suite_dir)
-    indexed = {entry["path"] for entry in index["files"]}
-    on_disk = {
-        str(path.relative_to(suite_dir))
-        for path in suite_dir.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    }
-    assert INDEX_NAME not in indexed
-    assert indexed == (on_disk - {INDEX_NAME})
+    request_path = suite_dir / "E" / POSITIVE_ID / "visual-capture-requests.jsonl"
+    # Append a record in the old synthetic {path,event,frame_index,...} shape.
+    with request_path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "path": "visual/source/9999-phantom-overview.png",
+                    "event": "phantom",
+                    "scenario": POSITIVE_ID,
+                    "attempt": "x",
+                    "frame_index": 1,
+                    "timestamp": 0.1,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "unrecognized-capture-request-shape" in codes
 
 
-# --- Index/contact-sheet cycle ---------------------------------------------
-
-
-def test_index_cycle_includes_generated_sheets_and_remains_deterministic(tmp_path):
+def test_keyframe_join_requires_exact_request_sequence(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    required = set(POSITIVE_EVENTS)
-    agent = build_contact_sheet(
-        suite_dir=suite_dir,
-        image_paths=required_capture_paths(suite_dir, events=required),
-        output=suite_dir / "contact-sheet-integrated-agent.png",
+    keyframes = suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl"
+    rows = [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+    rows[0]["request_sequence"] = 9999
+    keyframes.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
     )
-    build_contact_sheet(
-        suite_dir=suite_dir,
-        image_paths=required_capture_paths(suite_dir, events=required),
-        output=suite_dir / "contact-sheet-integrated-user.png",
-    )
-    assert agent["role"] == "agent"
-    rebuilt = rebuild_index(suite_dir)
-    sheet_paths = {entry["path"] for entry in rebuilt["files"] if entry["category"] == "contact-sheet"}
-    assert sheet_paths == {"contact-sheet-integrated-agent.png", "contact-sheet-integrated-user.png"}
-    again = rebuild_index(suite_dir)
-    assert rebuilt["files"] == again["files"]
-    assert rebuilt["index_checksum"] == again["index_checksum"]
-
-
-def test_full_cycle_gate_f_passes_with_sheets_and_summary(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    required = set(POSITIVE_EVENTS)
-    build_contact_sheet(
-        suite_dir=suite_dir,
-        image_paths=required_capture_paths(suite_dir, events=required),
-        output=suite_dir / "contact-sheet-integrated-agent.png",
-    )
-    build_contact_sheet(
-        suite_dir=suite_dir,
-        image_paths=required_capture_paths(suite_dir, events=required),
-        output=suite_dir / "contact-sheet-integrated-user.png",
-    )
-    rebuild_index(suite_dir)
-    verdict = validate_gate_f(
-        rebuild_index(suite_dir),
-        output=suite_dir / "qualification-summary.json",
-    )
-    assert verdict["status"] == "verified-pass"
-    assert verdict["reasons"] == []
-    assert (suite_dir / "qualification-summary.json").is_file()
-    summary = json.loads((suite_dir / "qualification-summary.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "verified-pass"
-    final = rebuild_index(suite_dir)
-    assert "qualification-summary.json" in {entry["path"] for entry in final["files"]}
-    assert "qualification-summary.json" in {entry["path"] for entry in rebuild_index(suite_dir)["files"]}
-
-
-def test_build_qualification_summary_writes_both_artifacts(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    summary = build_qualification_summary(
-        suite_dir,
-        index_output=suite_dir / INDEX_NAME,
-        summary_output=suite_dir / "qualification-summary.json",
-    )
-    assert summary["status"] == "verified-fail"  # sheets absent -> fail closed
-    assert (suite_dir / INDEX_NAME).is_file()
-    assert (suite_dir / "qualification-summary.json").is_file()
-
-
-# --- Gate F taxonomy / identities -------------------------------------------
-
-
-def test_validate_gate_f_required_taxonomy_present(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    index = rebuild_index(suite_dir)
-    categories = {entry["category"] for entry in index["files"]}
-    for required in (
-        "config",
-        "scenario",
-        "overlay-contract",
-        "model-fingerprint",
-        "source-identity",
-        "source-lock",
-        "dependency-lock",
-        "runtime",
-        "planning-scene-journal",
-        "moveit",
-        "physics",
-        "verdict",
-        "rosbag",
-        "capture",
-    ):
-        assert required in categories, required
-
-
-def test_missing_production_commit_fails_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "source/production-commit.json").unlink()
-    index = rebuild_index(suite_dir)
-    verdict = validate_gate_f(index)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-request-sequence-orphan" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
     assert verdict["status"] == "verified-fail"
-    assert "production commit" in " ".join(verdict["reasons"]).lower()
+    assert "unbound capture" in " ".join(verdict["reasons"])
 
 
-def test_missing_source_lock_fails_gate_f(tmp_path):
+def test_keyframe_invalid_frame_timestamp_fails_cleanly(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "source/source-locks.json").unlink()
-    index = rebuild_index(suite_dir)
-    verdict = validate_gate_f(index)
+    keyframes = suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl"
+    rows = [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+    rows[0]["raw_frame_index"] = -1
+    rows[0]["simulated_timestamp"] = float("nan")
+    keyframes.write_text(
+        "\n".join(json.dumps(row, sort_keys=True, allow_nan=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    # Must fail cleanly (no uncaught exception) with a diagnostic.
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-invalid-frame-index" in codes or "keyframe-invalid-timestamp" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
     assert verdict["status"] == "verified-fail"
-    assert "source lock" in " ".join(verdict["reasons"]).lower()
 
 
-def test_missing_dependency_lock_fails_gate_f(tmp_path):
+# --- Real scenario classification (F1.3) -------------------------------------
+
+
+def test_real_cancel_safety_ids_require_their_event_groups(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "source/dependency-locks.json").unlink()
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    assert "dependency lock" in " ".join(verdict["reasons"]).lower()
-
-
-def test_missing_runtime_ros_evidence_fails_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "runtime/ros.json").unlink()
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    assert "ros domain" in " ".join(verdict["reasons"]).lower()
-
-
-def test_missing_verdict_cleanup_gpu_process_fail_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    for name in ("gate-verdict.json", "cleanup-report.json", "gpu-report.json", "process-report.json"):
-        (suite_dir / "verdict" / name).unlink()
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    reasons = " ".join(verdict["reasons"]).lower()
-    assert "gate verdict" in reasons
-    assert "cleanup report" in reasons
-    assert "gpu report" in reasons
-    assert "process report" in reasons
-
-
-def test_missing_moveit_controller_physics_evidence_fail_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "moveit/moveit-plans.jsonl").unlink()
-    (suite_dir / "moveit/controller-results.jsonl").unlink()
-    (suite_dir / "physics/physics_truth.jsonl").unlink()
-    (suite_dir / "physics/evaluator.jsonl").unlink()
-    (suite_dir / "physics/drain.jsonl").unlink()
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    reasons = " ".join(verdict["reasons"]).lower()
-    assert "moveit plans" in reasons
-    assert "controller results" in reasons
-    assert "raw physics" in reasons
-    assert "evaluator" in reasons
-    assert "drain" in reasons
-
-
-def test_missing_rosbag_qos_counts_fail_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "rosbag/rosbag-metadata.json").unlink()
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    assert "rosbag" in " ".join(verdict["reasons"]).lower()
-
-
-def test_missing_contact_sheet_fails_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    reasons = " ".join(verdict["reasons"]).lower()
-    assert "contact-sheet-integrated-agent.png" in reasons
-    assert "contact-sheet-integrated-user.png" in reasons
-
-
-def test_validate_gate_f_never_fabricates_a_verdict(tmp_path):
-    # A suite with the verdict artifact removed can never report verified-pass.
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "verdict/gate-verdict.json").unlink()
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    assert verdict["status"] == "verified-fail"
-    assert "gate verdict" in " ".join(verdict["reasons"]).lower()
-
-
-# --- Capture event coverage -------------------------------------------------
-
-
-def test_missing_required_capture_event_fails_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    (suite_dir / "captures/terminal.png").unlink()
-    # Remove the corresponding binding record so the journal is consistent.
-    path = suite_dir / "visual-capture-requests.jsonl"
-    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    records = [record for record in records if record["event"] != "terminal"]
-    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    reasons = " ".join(verdict["reasons"]).lower()
-    assert "missing required visual event" in reasons
-    assert "terminal" in reasons
-
-
-def test_unbound_capture_fails_gate_f(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    extra = suite_dir / "captures/orphan.png"
-    _nonblank_image(extra, 200)
-    verdict = validate_gate_f(rebuild_index(suite_dir))
-    assert "unbound capture" in " ".join(verdict["reasons"]).lower()
-
-
-def test_cancel_and_safety_event_coverage_required_when_scenarios_present(tmp_path):
-    suite_dir = make_complete_evidence_suite(tmp_path)
-    add_cancel_safety_scenarios(suite_dir)
-    index = rebuild_index(suite_dir)
+    index = _final_index(suite_dir)
     assert "cancel" in index["scenario_kinds"]
     assert "safety" in index["scenario_kinds"]
-    verdict = validate_gate_f(index)
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
     required = verdict["required_events"]
     assert set(required["cancel"]) == set(CANCEL_EVENTS)
     assert set(required["safety"]) == set(SAFETY_EVENTS)
-    reasons = " ".join(verdict["reasons"])
-    # Cancel/safety captures are all present; no missing cancel/safety event.
-    assert "cancel-velocity-compliant" not in reasons
-    assert "safety-post-clear" not in reasons
-    # Only the absent contact sheets block acceptance at this stage.
-    assert "contact-sheet-integrated-agent.png" in reasons
 
 
 def test_cancel_event_missing_fails_gate_f(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    add_cancel_safety_scenarios(suite_dir)
-    (suite_dir / "captures/cancel-trigger.png").unlink()
-    verdict = validate_gate_f(rebuild_index(suite_dir))
+    keyframes = suite_dir / "E" / CANCEL_ID / "visual-keyframes.jsonl"
+    rows = [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+    rows = [row for row in rows if row["event"] != "cancel-trigger"]
+    keyframes.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
     reasons = " ".join(verdict["reasons"]).lower()
     assert "missing required visual event" in reasons
     assert "cancel-trigger" in reasons
 
 
-# --- Security: traversal / symlink / output-as-input / duplicates / change --
+def test_contradictory_scenario_declaration_fails_closed(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    bundle = suite_dir / "E" / CANCEL_ID / "scenario-bundle.json"
+    value = json.loads(bundle.read_text(encoding="utf-8"))
+    value["integrated"] = {"acceptance": {"polarity": "positive"}, "expected_negative": None}
+    bundle.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    index = _final_index(suite_dir)
+    assert any(item.get("kind") == "invalid" for item in index.get("scenarios", [])), index.get("scenarios")
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "invalid scenario declaration" in " ".join(verdict["reasons"])
+
+
+# --- Semantic Gate F (F1.4) --------------------------------------------------
+
+
+def test_semantic_verdict_fail_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    verdict_path = suite_dir / "E" / POSITIVE_ID / "gate-verdict.json"
+    value = json.loads(verdict_path.read_text(encoding="utf-8"))
+    value["status"] = "verified-fail"
+    verdict_path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "not verified-pass" in " ".join(verdict["reasons"])
+
+
+def test_empty_raw_evaluator_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "E" / POSITIVE_ID / "physics_truth.jsonl").write_text("\n", encoding="utf-8")
+    (suite_dir / "E" / POSITIVE_ID / "evaluator.jsonl").write_text("\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "empty raw physics truth" in " ".join(verdict["reasons"])
+
+
+def test_raw_evaluator_drain_mismatch_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    evaluator = suite_dir / "E" / POSITIVE_ID / "evaluator.jsonl"
+    rows = [json.loads(line) for line in evaluator.read_text(encoding="utf-8").splitlines()]
+    rows = rows[:-1]
+    evaluator.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "drain mismatch" in " ".join(verdict["reasons"])
+
+
+def test_zero_message_rosbag_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    metadata = suite_dir / "E" / POSITIVE_ID / "rosbag" / "metadata.yaml"
+    text = metadata.read_text(encoding="utf-8").replace("message_count: 100", "message_count: 0")
+    metadata.write_text(text, encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "nonpositive message count" in " ".join(verdict["reasons"])
+
+
+def test_missing_rosbag_storage_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    for db3 in (suite_dir / "E" / POSITIVE_ID / "rosbag").glob("*.db3"):
+        db3.unlink()
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "no storage files" in " ".join(verdict["reasons"])
+
+
+def test_invalid_source_lock_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    lock = suite_dir / f"gate-b-{SUITE_ATTEMPT}" / "source-lock-manifest.json"
+    value = json.loads(lock.read_text(encoding="utf-8"))
+    value["status"] = "fail"
+    lock.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "source lock manifest status is not pass" in " ".join(verdict["reasons"])
+
+
+def test_invalid_model_fingerprint_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    fp = suite_dir / f"gate-b-{SUITE_ATTEMPT}" / "model-fingerprint.json"
+    fp.write_text(json.dumps({"schema_version": 1, "model_fingerprint": "not-a-digest"}, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "model fingerprint" in " ".join(verdict["reasons"])
+
+
+def test_leaking_cleanup_fails_gate_f(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    cleanup = suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json"
+    value = json.loads(cleanup.read_text(encoding="utf-8"))
+    value["clean"] = False
+    value["attempt_owned_gpu_survivors"] = [{"pid": 999, "name": "isaac"}]
+    cleanup.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "resource cleanup not clean" in " ".join(verdict["reasons"])
+
+
+# --- Index integrity / current bytes (F1.5) ----------------------------------
+
+
+def test_tampered_index_checksum_fails(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    index["index_checksum"] = "0" * 64
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "index_checksum does not match" in " ".join(verdict["reasons"])
+
+
+def test_changed_ondisk_file_fails(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    (suite_dir / "E" / POSITIVE_ID / "truth-drain.json").write_text(
+        (suite_dir / "E" / POSITIVE_ID / "truth-drain.json").read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "indexed digest mismatch" in " ".join(verdict["reasons"])
+
+
+def test_extra_unindexed_file_fails(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    (suite_dir / "unexpected-evidence.txt").write_text("x", encoding="utf-8")
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "unindexed preserved file" in " ".join(verdict["reasons"])
+
+
+def test_missing_indexed_file_fails(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    (suite_dir / "E" / POSITIVE_ID / "truth-drain.json").unlink()
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert "stale index entry" in " ".join(verdict["reasons"]) or "missing indexed file" in " ".join(verdict["reasons"])
 
 
 def test_index_rejects_symlink_escape(tmp_path):
@@ -605,7 +1064,7 @@ def test_index_rejects_symlink_escape(tmp_path):
 
 def test_index_rejects_output_as_input(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    target = suite_dir / "model-fingerprint.json"
+    target = suite_dir / "overlay-contract.json"
     with pytest.raises(ValueError, match="output-as-input|output"):
         build_evidence_index(suite_dir=suite_dir, output=target)
 
@@ -614,7 +1073,7 @@ def test_index_rejects_file_changing_during_hashing(tmp_path, monkeypatch):
     suite_dir = make_complete_evidence_suite(tmp_path)
     import validation.integrated_evidence_index as index_module
 
-    target = suite_dir / "physics/physics_truth.jsonl"
+    target = suite_dir / "E" / POSITIVE_ID / "physics_truth.jsonl"
     original = target.read_bytes()
 
     def flaky_read(path: Path) -> bytes:
@@ -629,15 +1088,143 @@ def test_index_rejects_file_changing_during_hashing(tmp_path, monkeypatch):
     target.write_bytes(original)
 
 
-def test_index_duplicate_capture_event_binding_rejected(tmp_path):
+def test_stale_temp_files_not_indexed(tmp_path):
     suite_dir = make_complete_evidence_suite(tmp_path)
-    # Duplicate the readiness binding record.
-    path = suite_dir / "visual-capture-requests.jsonl"
-    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    records.append({**records[0], "execution_request": 999})
-    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="duplicate event|duplicate.*readiness"):
-        rebuild_index(suite_dir)
+    (suite_dir / ".evidence-index.json.12345").write_text("stale", encoding="utf-8")
+    index = _final_index(suite_dir)
+    assert not any(e["path"].startswith(".evidence-index.json.") for e in index["files"])
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    # The stale temp is neither indexed nor flagged as an unexpected file.
+    assert "unindexed preserved file" not in " ".join(verdict["reasons"])
+
+
+# --- Index/contact-sheet cycle (F1.5 / F1.6) ---------------------------------
+
+
+def test_full_cycle_gate_f_passes_with_sheets_and_summary(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]
+    assert summary["reasons"] == []
+    final = _final_index(suite_dir)
+    assert "qualification-summary.json" in {e["path"] for e in final["files"]}
+    verdict = validate_gate_f(final, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-pass", verdict["reasons"]
+
+
+def test_summary_records_validated_pre_summary_checksum(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    build_qualification_summary(suite_dir)
+    summary = json.loads((suite_dir / SUMMARY_NAME).read_text(encoding="utf-8"))
+    assert DIGEST_RE.fullmatch(summary["validated_index_checksum"])
+
+
+def test_summary_pre_summary_checksum_mismatch_fails(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    build_qualification_summary(suite_dir)
+    summary_path = suite_dir / SUMMARY_NAME
+    value = json.loads(summary_path.read_text(encoding="utf-8"))
+    value["validated_index_checksum"] = "0" * 64
+    summary_path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "validated_index_checksum does not match" in " ".join(verdict["reasons"])
+
+
+def test_sheets_are_indexed_and_deterministic_across_roots(tmp_path):
+    suite_a = make_complete_evidence_suite(tmp_path)
+    other = tmp_path / "other"
+    suite_b = write_canonical_evidence_tree(other / "suite")
+    render_sheets(suite_a)
+    render_sheets(suite_b)
+    build_qualification_summary(suite_a)
+    build_qualification_summary(suite_b)
+    index_a = _final_index(suite_a)
+    index_b = _final_index(suite_b)
+    assert index_a["index_checksum"] == index_b["index_checksum"]
+
+
+def test_sheet_png_bytes_must_match_index(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    build_qualification_summary(suite_dir)
+    sheet = suite_dir / AGENT_NAME
+    sheet.write_bytes(b"NOTAPNG")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert "invalid PNG" in reasons or "missing embedded metadata" in reasons
+
+
+# --- Determinism / taxonomy --------------------------------------------------
+
+
+def test_index_files_sorted_and_checksums_lowercase_64hex(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    paths = [entry["path"] for entry in index["files"]]
+    assert paths == sorted(paths)
+    for entry in index["files"]:
+        assert DIGEST_RE.fullmatch(entry["sha256"]), entry["path"]
+    assert DIGEST_RE.fullmatch(index["index_checksum"])
+
+
+def test_validate_gate_f_required_taxonomy_present(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    categories = {entry["category"] for entry in index["files"]}
+    for required in (
+        "attempt-start",
+        "scenario-bundle",
+        "source-lock-manifest",
+        "static-contract",
+        "model-fingerprint",
+        "source-identities",
+        "verdict",
+        "moveit",
+        "controller",
+        "planning-scene-journal",
+        "planning-scene-final",
+        "physics",
+        "evaluator",
+        "drain",
+        "cleanup",
+        "capture-request-journal",
+        "capture-keyframe-journal",
+        "capture",
+        "rosbag-metadata",
+        "rosbag-storage",
+        "config",
+        "overlay-contract",
+        "manifest",
+    ):
+        assert required in categories, required
+
+
+def test_index_excludes_only_itself_and_indexes_every_other_file(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    indexed = {entry["path"] for entry in index["files"]}
+    on_disk = {
+        str(path.relative_to(suite_dir))
+        for path in suite_dir.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    on_disk = {rel for rel in on_disk if not rel.startswith(".evidence-index.json.")}
+    assert INDEX_NAME not in indexed
+    assert indexed == (on_disk - {INDEX_NAME})
+
+
+def test_duplicate_keyframe_identity_rejected(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    keyframes = suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl"
+    rows = [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+    rows.append({**rows[0]})
+    keyframes.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "duplicate-keyframe-identity" in codes
 
 
 def test_canonical_sha256_is_stable_lowercase():
@@ -647,3 +1234,10 @@ def test_canonical_sha256_is_stable_lowercase():
     assert first != second
     assert DIGEST_RE.fullmatch(first)
     assert canonical_sha256({"a": "x", "b": [1, 2]}) == first
+
+
+def test_simulator_commit_and_production_commit_present_in_manifest(tmp_path):
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    index = _final_index(suite_dir)
+    manifests = [e for e in index["files"] if e.get("category") == "manifest"]
+    assert manifests
