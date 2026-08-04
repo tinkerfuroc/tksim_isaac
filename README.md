@@ -314,6 +314,40 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 4 — "align evidence with
+  real capture artifacts"): Closed the source-fixable residuals so Gate F accepts
+  genuine live producer output.  `validation/integrated_evidence_index.py` now
+  validates the real capture-latency arithmetic — `requested_physics_frame_index`
+  must equal the producer's exact rounded-frame calculation from the keyframe's
+  requested time and physics dt, `capture_latency_frames` must be an integer in
+  `[0, MAX_CAPTURE_LATENCY_FRAMES]` equal to `raw_frame_index -
+  requested_physics_frame_index`, and the raw/evaluator primary key and raw
+  timestamp tolerance are retained at the captured frame (F4.1).  Rosbag
+  `offered_qos_profiles` now parses the real Humble nine-field
+  `rmw_qos_profile_t` (history/depth/reliability/durability plus deadline,
+  lifespan, liveliness, liveliness_lease_duration,
+  avoid_ros_namespace_conventions) and matches the recorder override as a subset
+  on the required fields (F4.2).  `validation/integrated_contact_sheets.py` now
+  orders the production CLI's bound captures by the canonical required suite
+  event sequence (positive -> cancel -> safety), rejecting unknown/duplicate
+  event identities instead of silently placing them (F4.3).  Both
+  `overlay-contract.json` and the real `ompl-overlay-contract.json` (any
+  legitimate `*-overlay-contract.json`) are categorized as overlay-contract with
+  exactly one authoritative identity set (contradictory duplicates fail), and
+  `source_locks.simulator_lock_path` resolves a verbatim root-relative
+  `integration/source-locks.json` against the evidence suite without ever reading
+  outside it or silently accepting an absent lock (F4.4).  Visual completeness
+  keys by exact `(scenario_id, attempt_id)`; a nonempty valid GPU inventory is
+  required when baseline/final report `available=true`; and
+  `qualification_visual_capture.py` is restart-safe across a partial two-camera
+  capture, seeding durable completion per `(request_sequence, camera)` so a
+  crash after camera-1 re-captures only the missing camera on restart (F4.5).
+  All offline production-shaped latency/QoS/CLI/overlay/restart tests pass;
+  `_image_stats` thresholds still require live RTX calibration, Task 10 still
+  owns the Gate-F wiring and a load-bearing live rosbag, and no live
+  Isaac/RTX/camera/rosbag/GPU run occurred in this repair.  The future
+  qualification tooling lock remains absent until after review-clean Task 10.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 3 — "make integrated
   evidence production-real"): Closed the two real-schema blockers so Gate F can
   accept genuine live artifacts and added the direct env/producer/consumer/

@@ -309,7 +309,7 @@ def _category(rel_path: str) -> str:
         return "rosbag-metadata"
     if "/rosbag/" in rel_path:
         return "rosbag-storage"
-    if name == "overlay-contract.json":
+    if name == "overlay-contract.json" or name.endswith("-overlay-contract.json"):
         return "overlay-contract"
     if rel_path.startswith("config/") and rel_path.endswith(".json"):
         return "config"
@@ -875,35 +875,84 @@ def _load_capture_bindings(
                                 "request_timestamp": float(request_timestamp),
                             }
                         )
+            # --- F4.1: real capture-latency arithmetic --------------------------
+            # The real producer writes
+            #   requested_physics_frame_index = round(requested_simulated_timestamp / physics_dt)
+            #   raw_frame_index               = captured physics frame
+            #   capture_latency_frames        = raw_frame_index - requested_physics_frame_index
+            # with latency in [0, MAX_CAPTURE_LATENCY_FRAMES].  Requested and raw
+            # frames are NOT required to be equal; the requested frame must equal the
+            # producer's exact rounded-frame calculation from the keyframe's own
+            # requested time and physics dt, and the latency field must equal the
+            # frame delta.  The raw/evaluator primary key and raw timestamp
+            # tolerance are retained at the captured (raw) frame.
             requested_frame = record.get("requested_physics_frame_index")
-            if requested_frame is not None and (
-                isinstance(requested_frame, bool)
-                or not isinstance(requested_frame, int)
-                or requested_frame != frame
+            requested_time = record.get("requested_simulated_timestamp")
+            physics_dt_value = record.get("physics_dt")
+            expected_requested_frame: int | None = None
+            if (
+                isinstance(requested_time, (int, float))
+                and not isinstance(requested_time, bool)
+                and math.isfinite(float(requested_time))
+                and isinstance(physics_dt_value, (int, float))
+                and not isinstance(physics_dt_value, bool)
+                and math.isfinite(float(physics_dt_value))
+                and float(physics_dt_value) > 0.0
             ):
+                expected_requested_frame = int(
+                    math.floor(float(requested_time) / float(physics_dt_value) + 0.5)
+                )
+            if requested_frame is None or isinstance(requested_frame, bool) or not isinstance(requested_frame, int):
+                diagnostics.append(
+                    {
+                        "code": "keyframe-request-frame-invalid",
+                        "path": str(keyframes_path),
+                        "line": line,
+                        "request_sequence": request_sequence,
+                        "requested_physics_frame_index": repr(requested_frame),
+                    }
+                )
+            elif expected_requested_frame is not None and requested_frame != expected_requested_frame:
                 diagnostics.append(
                     {
                         "code": "keyframe-request-frame-mismatch",
                         "path": str(keyframes_path),
                         "line": line,
                         "request_sequence": request_sequence,
+                        "requested_physics_frame_index": requested_frame,
+                        "expected_rounded_frame": expected_requested_frame,
                     }
                 )
             latency = record.get("capture_latency_frames")
-            if latency is not None and (
-                isinstance(latency, bool)
-                or not isinstance(latency, int)
-                or not 0 <= latency <= MAX_CAPTURE_LATENCY_FRAMES
-            ):
-                diagnostics.append(
-                    {
-                        "code": "keyframe-latency-out-of-range",
-                        "path": str(keyframes_path),
-                        "line": line,
-                        "request_sequence": request_sequence,
-                        "capture_latency_frames": repr(latency),
-                    }
+            if latency is not None:
+                latency_type_ok = (
+                    isinstance(latency, int)
+                    and not isinstance(latency, bool)
+                    and 0 <= latency <= MAX_CAPTURE_LATENCY_FRAMES
                 )
+                if not latency_type_ok:
+                    diagnostics.append(
+                        {
+                            "code": "keyframe-latency-out-of-range",
+                            "path": str(keyframes_path),
+                            "line": line,
+                            "request_sequence": request_sequence,
+                            "capture_latency_frames": repr(latency),
+                        }
+                    )
+                elif isinstance(requested_frame, int) and not isinstance(requested_frame, bool):
+                    if frame - requested_frame != latency:
+                        diagnostics.append(
+                            {
+                                "code": "keyframe-latency-delta-mismatch",
+                                "path": str(keyframes_path),
+                                "line": line,
+                                "request_sequence": request_sequence,
+                                "raw_frame_index": frame,
+                                "requested_physics_frame_index": requested_frame,
+                                "capture_latency_frames": latency,
+                            }
+                        )
             execution_event_sequence = record.get("execution_event_sequence")
             source_execution_event_sequence = candidate.get("source_execution_event_sequence")
             if execution_event_sequence is not None and source_execution_event_sequence is not None and (
@@ -1212,7 +1261,7 @@ def _json_identity(
         for key in ("attempt_id", "seed", "root", "production_root", "config"):
             if value.get(key) is not None:
                 identity[key] = value[key]
-    elif name == "overlay-contract.json":
+    elif name == "overlay-contract.json" or name.endswith("-overlay-contract.json"):
         repositories = value.get("repositories")
         if isinstance(repositories, Mapping):
             for repo_name, repo_value in sorted(repositories.items()):
@@ -1429,6 +1478,7 @@ def _validate_source_provenance(
         if isinstance(scenarios, list)
         else {}
     )
+    by_path = _entry_by_path(index)
 
     # Source-lock manifest (real Gate-B artifact, written into gate-b-* dir).
     lock_entries = _entries_by_category(index, "source-lock-manifest")
@@ -1542,7 +1592,7 @@ def _validate_source_provenance(
             reasons.append(
                 f"overlay contract must declare production and simulator repositories: {entry['path']}"
             )
-        # F3.2: validate the real source_locks shape/status and bind the
+        # F3.2/F4.4: validate the real source_locks shape/status and bind the
         # simulator source-lock to its immutable policy artifact.  The real
         # schema uses a truthful ``status`` such as ``"excluded_in_task_8"``;
         # a fabricated ``"pass"`` is never required.
@@ -1554,16 +1604,56 @@ def _validate_source_provenance(
             if not isinstance(status, str) or not status:
                 reasons.append(f"overlay contract source_locks.status is missing: {entry['path']}")
             simulator_lock_path = source_locks.get("simulator_lock_path")
-            if (
-                isinstance(simulator_lock_path, str)
-                and simulator_lock_path
-                and not simulator_lock_path.startswith("/")
-                and not (suite_dir / simulator_lock_path).is_file()
-            ):
+            if not isinstance(simulator_lock_path, str) or not simulator_lock_path:
                 reasons.append(
-                    f"overlay contract simulator_lock_path does not resolve to an existing "
-                    f"source-lock artifact: {simulator_lock_path}"
+                    f"overlay contract source_locks.simulator_lock_path is missing: {entry['path']}"
                 )
+            else:
+                # F4.4: resolve the root-relative lock path against the evidence
+                # suite only.  A verbatim root-relative reference (e.g. the real
+                # ``integration/source-locks.json``) binds when the exact
+                # suite-relative copy is present or the path is indexed.  An
+                # absolute/escaping path never binds and an absent lock is never
+                # silently accepted.
+                lock_rel = simulator_lock_path.lstrip("/")
+                if simulator_lock_path.startswith("/") or ".." in lock_rel.split("/"):
+                    reasons.append(
+                        f"overlay contract simulator_lock_path is not suite-relative: {simulator_lock_path}"
+                    )
+                else:
+                    suite_copy = suite_dir / lock_rel
+                    indexed_lock = by_path.get(lock_rel) is not None
+                    if not (suite_copy.is_file() or indexed_lock):
+                        reasons.append(
+                            f"overlay contract simulator_lock_path does not resolve to an existing "
+                            f"source-lock artifact: {simulator_lock_path}"
+                        )
+    # F4.4: exactly one authoritative overlay contract identity set.  Multiple
+    # legitimate ``*-overlay-contract.json`` artifacts are categorized, but their
+    # production/simulator implementation identities must not contradict.
+    authoritative_overlay_identities: set[tuple[str, str]] = set()
+    for entry in overlay_entries:
+        overlay = _read_json_rel(suite_dir, entry["path"])
+        if not isinstance(overlay, Mapping):
+            continue
+        repositories = overlay.get("repositories")
+        if not isinstance(repositories, Mapping):
+            continue
+        production = repositories.get("production")
+        simulator = repositories.get("simulator")
+        if isinstance(production, Mapping) and isinstance(simulator, Mapping):
+            production_id = production.get("implementation_identity")
+            simulator_id = simulator.get("implementation_identity")
+            if isinstance(production_id, str) and isinstance(simulator_id, str):
+                authoritative_overlay_identities.add((production_id, simulator_id))
+    if len(authoritative_overlay_identities) > 1:
+        reasons.append(
+            "overlay contract identities contradict across overlay-contract artifacts: "
+            + "; ".join(
+                f"production={production} simulator={simulator}"
+                for production, simulator in sorted(authoritative_overlay_identities)
+            )
+        )
     # Model fingerprint real shape.
     fp_entries = _entries_by_category(index, "model-fingerprint")
     if not fp_entries:
@@ -2033,6 +2123,18 @@ ROSBAG_QOS_OVERRIDE = {
 _RMW_HISTORY_VALUES = (0, 1, 2, 3)       # system_default, keep_last, keep_all, unknown
 _RMW_RELIABILITY_VALUES = (0, 1, 2, 3)   # system_default, reliable, best_effort, unknown
 _RMW_DURABILITY_VALUES = (0, 1, 2, 3, 4)  # system_default, transient_local, transient, volatile, unknown
+_RMW_LIVELINESS_VALUES = (0, 1, 2, 3, 4)  # system_default, automatic, manual_by_topic, manual_by_node, unknown
+
+#: Real Humble rosbag2 serializes the full ``rmw_qos_profile_t`` in
+#: ``offered_qos_profiles``: history, depth, reliability, durability, deadline,
+#: lifespan, liveliness, liveliness_lease_duration,
+#: avoid_ros_namespace_conventions (F4.2).  The four core fields are required;
+#: the remaining RMW fields are validated when present and must satisfy the real
+#: schema (deadline/lifespan/liveliness_lease_duration are non-negative
+#: nanosecond integers, liveliness is an RMW enum, and
+#: avoid_ros_namespace_conventions is a boolean).
+_ROSBAG_QOS_REQUIRED_FIELDS = ("history", "depth", "reliability", "durability")
+_ROSBAG_QOS_RMW_DURATION_FIELDS = ("deadline", "lifespan", "liveliness_lease_duration")
 
 
 def _parse_rosbag_qos(text: str) -> list[dict[str, Any]] | None:
@@ -2059,8 +2161,9 @@ def _parse_rosbag_qos(text: str) -> list[dict[str, Any]] | None:
 
 
 def _rosbag_qos_fields_ok(profile: Mapping[str, Any]) -> bool:
-    """Require the RMW QoS enum fields be present with valid integer values."""
-    for field in ("history", "depth", "reliability", "durability"):
+    """Require the required RMW QoS fields with valid values and validate the
+    full known rmw fields when present (F4.2)."""
+    for field in _ROSBAG_QOS_REQUIRED_FIELDS:
         value = profile.get(field)
         if isinstance(value, bool) or not isinstance(value, int):
             return False
@@ -2075,6 +2178,22 @@ def _rosbag_qos_fields_ok(profile: Mapping[str, Any]) -> bool:
     if reliability not in _RMW_RELIABILITY_VALUES:
         return False
     if durability not in _RMW_DURABILITY_VALUES:
+        return False
+    for field in _ROSBAG_QOS_RMW_DURATION_FIELDS:
+        value = profile.get(field)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+    liveliness = profile.get("liveliness")
+    if liveliness is not None and (
+        isinstance(liveliness, bool)
+        or not isinstance(liveliness, int)
+        or liveliness not in _RMW_LIVELINESS_VALUES
+    ):
+        return False
+    avoid = profile.get("avoid_ros_namespace_conventions")
+    if avoid is not None and not isinstance(avoid, bool):
         return False
     return True
 
@@ -2142,10 +2261,25 @@ def _validate_rosbag(
             if not any(profile.get("reliability") == 1 for profile in profiles):
                 reasons.append(f"rosbag topic {topic} offers no reliable QoS profile")
             override = ROSBAG_QOS_OVERRIDE.get(topic)
-            if override is not None and override not in profiles:
-                reasons.append(
-                    f"rosbag topic {topic} offered QoS does not match the recorder override contract"
+            if override is not None:
+                # F4.2: the real Humble serialization carries the full
+                # nine-field rmw_qos_profile_t.  The recorder override is a
+                # subset contract: some profile must match the override's
+                # required history/depth/reliability/durability fields; the
+                # additional valid rmw fields (deadline, lifespan, liveliness,
+                # liveliness_lease_duration, avoid_ros_namespace_conventions)
+                # are permitted.
+                matched = any(
+                    profile.get("history") == override["history"]
+                    and profile.get("depth") == override["depth"]
+                    and profile.get("reliability") == override["reliability"]
+                    and profile.get("durability") == override["durability"]
+                    for profile in profiles
                 )
+                if not matched:
+                    reasons.append(
+                        f"rosbag topic {topic} offered QoS does not match the recorder override contract"
+                    )
         # F2.7: the approved record-topic set must be present with exact types
         # and per-topic nonzero counts.
         missing_topics = sorted(set(APPROVED_RECORD_TOPIC_TYPES) - set(observed))
@@ -2310,6 +2444,31 @@ def _validate_cleanup(
             reasons.append(
                 f"resource cleanup GPU topology changed between baseline and final: {rel}"
             )
+        # F4.5: when a snapshot reports ``available=true`` the GPU inventory must
+        # be a nonempty list of valid physical-GPU records in addition to a
+        # stable topology.  Empty/empty must never pass vacuously, while
+        # non-GPU/unavailable snapshots keep their existing fail semantics.
+        if baseline_available or final_available:
+            if not isinstance(baseline_gpus, list) or not isinstance(final_gpus, list):
+                reasons.append(
+                    f"resource cleanup GPU inventory is missing despite available=true: {rel}"
+                )
+            elif not baseline_gpus or not final_gpus:
+                reasons.append(
+                    f"resource cleanup has an empty GPU inventory despite available=true: {rel}"
+                )
+            else:
+                for gpu_record in baseline_gpus + final_gpus:
+                    if (
+                        not isinstance(gpu_record, Mapping)
+                        or not isinstance(gpu_record.get("uuid"), str)
+                        or not gpu_record["uuid"]
+                        or isinstance(gpu_record.get("index"), bool)
+                        or not isinstance(gpu_record.get("index"), int)
+                    ):
+                        reasons.append(
+                            f"resource cleanup has a malformed GPU inventory record: {rel}"
+                        )
         recomputed_clean = clean_state and topology_ok
         if value.get("clean") is True and not recomputed_clean:
             reasons.append(
@@ -2493,7 +2652,10 @@ def validate_gate_f(
     # ---- Required visual events with exact binding (F1.3) -------------------
     required = _required_event_sets(scenario_kinds)
     captures = _capture_entries(index)
-    scenario_events: dict[str, set[str]] = {}
+    # F4.5: visual completeness keys by the exact ``(scenario_id, attempt_id)``
+    # transaction, never by scenario id alone.  Two attempts bearing the same
+    # scenario must never merge their event subsets.
+    attempt_capture_events: dict[tuple[str, str], set[str]] = {}
     for entry in captures:
         if not entry.get("bound"):
             reasons.append(f"unbound capture: {entry.get('path')}")
@@ -2501,9 +2663,10 @@ def validate_gate_f(
         if not entry.get("physics_bound"):
             reasons.append(f"capture not physics-bound: {entry.get('path')}")
         scenario = entry.get("scenario")
+        attempt = entry.get("attempt")
         event = entry.get("event")
-        if isinstance(scenario, str) and isinstance(event, str):
-            scenario_events.setdefault(scenario, set()).add(event)
+        if isinstance(scenario, str) and isinstance(event, str) and isinstance(attempt, str):
+            attempt_capture_events.setdefault((scenario, attempt), set()).add(event)
     # F3.3: visual evidence closure is per exact attempt/scenario.  Every
     # positive/cancel/safety scenario must itself contain its kind's complete
     # event set under its exact scenario id; a sibling attempt never satisfies
@@ -2517,13 +2680,23 @@ def validate_gate_f(
         for scenario_id, scenario_item in scenario_items.items():
             if scenario_item.get("kind") != group:
                 continue
-            present_events = scenario_events.get(scenario_id, ())
-            missing = [event for event in events if event not in present_events]
-            if missing:
+            attempts_with_captures = sorted(
+                {attempt for (scenario, attempt) in attempt_capture_events if scenario == scenario_id}
+            )
+            if not attempts_with_captures:
                 reasons.append(
                     f"scenario {scenario_id} is missing required {group} visual events: "
-                    f"{', '.join(missing)}"
+                    f"{', '.join(events)}"
                 )
+                continue
+            for attempt in attempts_with_captures:
+                present_events = attempt_capture_events.get((scenario_id, attempt), set())
+                missing = [event for event in events if event not in present_events]
+                if missing:
+                    reasons.append(
+                        f"scenario {scenario_id} attempt {attempt} is missing required "
+                        f"{group} visual events: {', '.join(missing)}"
+                    )
 
     status = "verified-pass" if not reasons else "verified-fail"
     verdict: dict[str, Any] = {
@@ -2538,13 +2711,13 @@ def validate_gate_f(
         "required_events": {group: list(events) for group, events in required.items()},
         "event_coverage": {
             "scenarios": {
-                scenario: sorted(events)
-                for scenario, events in sorted(scenario_events.items())
+                f"{scenario}::{attempt}": sorted(events)
+                for (scenario, attempt), events in sorted(attempt_capture_events.items())
             },
             "missing": [
                 reason
                 for reason in reasons
-                if reason.startswith("missing required visual event")
+                if "is missing required" in reason
             ],
         },
     }

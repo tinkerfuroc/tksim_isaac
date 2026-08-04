@@ -3029,19 +3029,23 @@ def test_f34_consumer_durable_restart_seeds_handled_sequences(tmp_path, monkeypa
     """F3.4: a consumer process restart seeds its handled set from the durable
     keyframe journal, so an already-captured sequence is never re-captured."""
     backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
-    (tmp_path / "visual-keyframes.jsonl").write_text(
-        json.dumps(
+    # Seed BOTH cameras' durable keyframes for sequence 5 (a fully completed
+    # capture before the crash/restart).
+    durable_rows = []
+    for camera in ("overview", "manipulation_closeup"):
+        durable_rows.append(
             {
                 "schema_version": 1,
                 "gate": "g",
                 "event": "cancel-trigger",
                 "request_sequence": 5,
                 "execution_event_sequence": 3,
-                "camera": "overview",
-                "path": "visual/source/0005-cancel-trigger-overview.png",
+                "camera": camera,
+                "path": f"visual/source/0005-cancel-trigger-{camera}.png",
             }
         )
-        + "\n",
+    (tmp_path / "visual-keyframes.jsonl").write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in durable_rows) + "\n",
         encoding="utf-8",
     )
     capture = _make_capture(monkeypatch, tmp_path, backend)
@@ -3055,7 +3059,65 @@ def test_f34_consumer_durable_restart_seeds_handled_sequences(tmp_path, monkeypa
         .strip()
         .splitlines()
     ]
-    assert len(records) == 1  # the pre-existing durable record, no re-capture
+    assert len(records) == 2  # the pre-existing durable records, no re-capture
+
+
+def test_f34_consumer_crash_after_camera1_restart_completes_camera2(tmp_path, monkeypatch):
+    """F4.5: a crash after camera-1's keyframe but before camera-2's must not
+    mark the request sequence durably complete.  On restart only the missing
+    camera is captured once; camera-1 is never duplicated."""
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    # Simulate the crash: only camera-1 (overview) durably recorded sequence 5
+    # for the same canonical request (event cancel-execution-start) that will be
+    # re-polled on restart.
+    (tmp_path / "visual-keyframes.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "gate": "g",
+                "event": "cancel-execution-start",
+                "request_sequence": 5,
+                "execution_event_sequence": 3,
+                "camera": "overview",
+                "path": "visual/source/0005-cancel-execution-start-overview.png",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "visual/source").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "visual/source/0005-cancel-execution-start-overview.png").write_bytes(
+        _rgb_array().tobytes()
+    )
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request(sequence=5))
+    capture.poll()
+    # Sequence 5 is not durably complete until camera-2 is also captured.
+    assert capture._handled_sequences == {5}
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "visual-keyframes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert len(records) == 2  # camera-1 durable + camera-2 produced once
+    by_camera = {record["camera"] for record in records}
+    assert by_camera == {"overview", "manipulation_closeup"}
+    overview_records = [record for record in records if record["camera"] == "overview"]
+    assert len(overview_records) == 1  # camera-1 never duplicated
+    # Camera-2 is captured under the request's canonical event.
+    pngs = sorted(path.name for path in (tmp_path / "visual/source").glob("*.png"))
+    assert pngs == [
+        "0005-cancel-execution-start-manipulation_closeup.png",
+        "0005-cancel-execution-start-overview.png",
+    ]
+    # Camera-2's new keyframe carries the real latency arithmetic.
+    new_record = next(record for record in records if record["camera"] == "manipulation_closeup")
+    assert new_record["requested_physics_frame_index"] == 100
+    assert new_record["raw_frame_index"] == 102
+    assert new_record["capture_latency_frames"] == 2
+    assert new_record["event"] == "cancel-execution-start"
 
 
 def test_f34_consumer_gate_mismatch_is_a_capture_failure(tmp_path, monkeypatch):

@@ -477,3 +477,26 @@ def test_contact_sheet_own_output_path_still_regenerable(tmp_path):
     assert result["role"] == "agent"
     second = build_contact_sheet(suite_dir, paths, output=suite_dir / AGENT)
     assert second["role"] == "agent"
+
+
+# --- Task 9 fix round 4 (F4.3) -----------------------------------------------
+
+
+def test_cli_sheets_embed_canonical_suite_event_order(tmp_path):
+    """F4.3: the production CLI main() embeds the canonical required suite event
+    sequence (positive -> cancel -> safety) in both sheets for a multi-scenario
+    suite, and both sheets use the same ordered source captures with distinct
+    roles."""
+    from validation.integrated_contact_sheets import main
+
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    assert main(["--suite-dir", str(suite_dir)]) == 0
+    expected = list(POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS)
+    agent_meta = _read_sheet_metadata(suite_dir / AGENT)
+    user_meta = _read_sheet_metadata(suite_dir / USER)
+    assert agent_meta is not None and user_meta is not None
+    assert agent_meta["events"] == expected
+    assert user_meta["events"] == expected
+    assert agent_meta["role"] == "agent" and user_meta["role"] == "user"
+    assert agent_meta["captures_sha256"] == user_meta["captures_sha256"]
+    assert [c["event"] for c in agent_meta["captures"]] == expected
