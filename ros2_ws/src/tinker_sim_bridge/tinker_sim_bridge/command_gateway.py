@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Sequence
 
 import rclpy
 from rclpy.clock import Clock, ClockType
@@ -12,8 +13,8 @@ from std_msgs.msg import Bool, String
 
 from tinker_sim_core.command_mux import (
     CommandSource,
+    JointCommand,
     JointCommandMux,
-    command_from_sequences,
     encode_command_epoch,
     encode_command_frame,
     encode_snapshot_packet,
@@ -129,14 +130,74 @@ class CommandGateway(Node):
             self._rejected[source] = "blocked by safety stop"
             return
         try:
-            command = command_from_sequences(
-                message.name, message.position, message.velocity, message.effort
+            command = self._owned_command(
+                source,
+                message.name,
+                message.position,
+                message.velocity,
+                message.effort,
             )
             self._mux.accept(source, command, time.monotonic())
             self._rejected.pop(source, None)
         except Exception as error:
             self._rejected[source] = str(error)
             self.get_logger().error(f"rejected {source} joint command: {error}")
+
+    def _owned_command(
+        self,
+        source: str,
+        names: Sequence[str],
+        positions: Sequence[float],
+        velocities: Sequence[float],
+        efforts: Sequence[float],
+    ) -> JointCommand:
+        """Project a source message onto the joints that source is allowed to own.
+
+        The vendored topic_based_ros2_control publishes all eight joints in
+        ``names`` (the seven arm joints plus a state-only ``drive_joint``) but
+        carries values only for the seven arm joints, so a raw JointCommand is
+        rejected before mux ownership filtering can drop ``drive_joint``.
+        Normalize before validation: unowned names are removed together with
+        their values, and the live value-shorter-than-names shape is accepted
+        only when the owned names form a contiguous prefix so the value-to-name
+        mapping is unambiguous.  Any other layout is malformed and rejected.
+        """
+        owned = self._mux.sources[source].joints
+        owned_names = [name for name in names if name in owned]
+        if not owned_names:
+            raise ValueError(f"{source} message contains no owned joints")
+        owned_name_count = len(owned_names)
+        name_count = len(names)
+
+        def project(values: Sequence[float]) -> tuple[float, ...]:
+            if not values:
+                # Empty channels are absent, matching JointCommand defaults.
+                return ()
+            value_count = len(values)
+            if value_count == name_count:
+                # Canonical parallel arrays: value[i] belongs to name[i], so
+                # drop each unowned name together with its value.
+                return tuple(
+                    float(value) for name, value in zip(names, values) if name in owned
+                )
+            if (
+                value_count == owned_name_count
+                and owned_names == list(names[:owned_name_count])
+            ):
+                # Live shape: values are emitted only for the owned joints in
+                # name order; the prefix guard keeps this unambiguous.
+                return tuple(float(value) for value in values)
+            raise ValueError(
+                f"{source} {value_count} values do not align with "
+                f"{name_count} names / {owned_name_count} owned joints"
+            )
+
+        return JointCommand(
+            tuple(owned_names),
+            project(positions),
+            project(velocities),
+            project(efforts),
+        )
 
     def _advance_command_epoch(self) -> None:
         """Advance the gateway-owned epoch without a peer-local counter."""
