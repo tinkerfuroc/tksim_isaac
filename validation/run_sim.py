@@ -93,12 +93,16 @@ def build_occupancy_from_planning_scene(
 ) -> object:
     """Build a pure deterministic ``OccupancyMap`` from scenario box footprints.
 
-    Every PlanningScene object must be an axis-aligned box (``primitive.type ==
-    "box"`` with three finite positive ``dimensions`` and an identity
-    quaternion); any other or malformed fixture geometry is rejected rather
-    than silently inventing occupancy.  The XY footprint of each box is marked
-    occupied.  The map covers ``[-half_extent, half_extent]^2`` in world
-    coordinates so the full 40 m lidar range stays inside bounds.
+    Every PlanningScene object must be a box (``primitive.type == "box"`` with
+    three finite positive ``dimensions``, a finite pose, and a normalized
+    yaw-only quaternion — negligible roll/pitch, sign-equivalent quaternions
+    accepted).  F4.6: the XY footprint of each box is rasterized by
+    inverse-rotating each candidate cell center into box-local coordinates;
+    oriented (e.g. the canonical 45 degree z-rotated target) boxes are
+    supported deterministically.  Non-box primitives, malformed dimensions/
+    poses/quaternions, and roll/pitch rotations are rejected rather than
+    silently inventing occupancy.  The map covers ``[-half_extent, half_extent]^2``
+    in world coordinates so the full 40 m lidar range stays inside bounds.
     """
     import math
 
@@ -146,22 +150,69 @@ def build_occupancy_from_planning_scene(
         xyz = _finite_vector(pose.get("xyz"), length=3, name="pose xyz")
         quaternion = _finite_vector(pose.get("quaternion_xyzw"), length=4, name="pose quaternion")
         qx, qy, qz, qw = quaternion
-        if abs(qx) > 1.0e-6 or abs(qy) > 1.0e-6 or abs(qz) > 1.0e-6 or abs(qw - 1.0) > 1.0e-3:
+        # F4.6: normalize the quaternion (reject a non-unit quaternion outside
+        # tolerance), canonicalize sign-equivalent rotations, and require
+        # yaw-only (negligible roll/pitch).
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if not math.isfinite(norm) or abs(norm - 1.0) > 1.0e-3:
+            raise ValueError(f"box quaternion must be normalized for {record.get('id')!r}")
+        qx /= norm
+        qy /= norm
+        qz /= norm
+        qw /= norm
+        if qw < 0.0:
+            qx, qy, qz, qw = -qx, -qy, -qz, -qw
+        if abs(qx) > 1.0e-6 or abs(qy) > 1.0e-6:
             raise ValueError(
-                f"only axis-aligned box fixtures are supported for occupancy ({record.get('id')!r})"
+                f"only yaw-only box rotations are supported for occupancy ({record.get('id')!r})"
             )
+        cos_theta = 1.0 - 2.0 * qz * qz
+        sin_theta = 2.0 * qw * qz
+        cx, cy = xyz[0], xyz[1]
         half_x = dimensions[0] / 2.0
         half_y = dimensions[1] / 2.0
-        gx0 = max(int((xyz[0] - half_x - origin_x) // resolution), 0)
-        gx1 = min(int((xyz[0] + half_x - origin_x) // resolution), width - 1)
-        gy0 = max(int((xyz[1] - half_y - origin_y) // resolution), 0)
-        gy1 = min(int((xyz[1] + half_y - origin_y) // resolution), height - 1)
-        if gx0 > gx1 or gy0 > gy1:
+        # Conservative world-frame AABB of the oriented rectangle (yaw about z).
+        corners = (
+            (half_x, half_y),
+            (half_x, -half_y),
+            (-half_x, -half_y),
+            (-half_x, half_y),
+        )
+        world_corners = [
+            (
+                cx + (px * cos_theta - py * sin_theta),
+                cy + (px * sin_theta + py * cos_theta),
+            )
+            for (px, py) in corners
+        ]
+        min_wx = min(point[0] for point in world_corners)
+        max_wx = max(point[0] for point in world_corners)
+        min_wy = min(point[1] for point in world_corners)
+        max_wy = max(point[1] for point in world_corners)
+        raw_min_gx = int((min_wx - origin_x) // resolution)
+        raw_max_gx = int((max_wx - origin_x) // resolution)
+        raw_min_gy = int((min_wy - origin_y) // resolution)
+        raw_max_gy = int((max_wy - origin_y) // resolution)
+        if raw_max_gx < 0 or raw_min_gx >= width or raw_max_gy < 0 or raw_min_gy >= height:
             continue
+        gx0 = max(raw_min_gx, 0)
+        gx1 = min(raw_max_gx, width - 1)
+        gy0 = max(raw_min_gy, 0)
+        gy1 = min(raw_max_gy, height - 1)
+        # Mark each candidate cell whose center inverse-rotates inside the box
+        # half extents (small deterministic numeric tolerance).
+        fit_tol = 1.0e-6
         for gy in range(gy0, gy1 + 1):
             row = occupied[gy]
             for gx in range(gx0, gx1 + 1):
-                row[gx] = True
+                world_x = origin_x + (gx + 0.5) * resolution
+                world_y = origin_y + (gy + 0.5) * resolution
+                dx = world_x - cx
+                dy = world_y - cy
+                local_x = dx * cos_theta + dy * sin_theta
+                local_y = -dx * sin_theta + dy * cos_theta
+                if abs(local_x) <= half_x + fit_tol and abs(local_y) <= half_y + fit_tol:
+                    row[gx] = True
     return OccupancyMap(
         width,
         height,

@@ -733,15 +733,18 @@ class _LiveProviderObserver:
         self.safety_received_mono: float | None = None
         self.safety_samples = 0
         self.safety_value = False
+        self.safety_received_timestamp_ns: int | None = None
         self.fixture_received_mono: float | None = None
         self.fixture_samples = 0
         self.fixture_payload = ""
         self.operator_received_mono: float | None = None
         self.operator_samples = 0
         self.operator_value = False
+        self.operator_received_timestamp_ns: int | None = None
         self.collision_received_mono: float | None = None
         self.collision_samples = 0
         self.collision_value = False
+        self.collision_received_timestamp_ns: int | None = None
         self.cloud_received_mono: float | None = None
         self.cloud_samples = 0
         self.latest_cloud: Any = None
@@ -755,6 +758,7 @@ class _LiveProviderObserver:
         def _on_safety(message: Any) -> None:
             self.safety_samples += 1
             self.safety_received_mono = time.monotonic()
+            self.safety_received_timestamp_ns = time.time_ns()
             self.safety_value = bool(getattr(message, "data", False))
 
         def _on_fixture(message: Any) -> None:
@@ -765,11 +769,13 @@ class _LiveProviderObserver:
         def _on_operator(message: Any) -> None:
             self.operator_samples += 1
             self.operator_received_mono = time.monotonic()
+            self.operator_received_timestamp_ns = time.time_ns()
             self.operator_value = bool(getattr(message, "data", False))
 
         def _on_collision(message: Any) -> None:
             self.collision_samples += 1
             self.collision_received_mono = time.monotonic()
+            self.collision_received_timestamp_ns = time.time_ns()
             self.collision_value = bool(getattr(message, "data", False))
 
         def _on_cloud(message: Any) -> None:
@@ -1341,7 +1347,9 @@ def _build_readiness_snapshot(
             "allowlist": [False, True],
             "received": operator_received,
             "received_value": observer.operator_value,
-            "received_timestamp_ns": int(time.time() * 1_000_000_000) if operator_received else 0,
+            "received_timestamp_ns": (
+                observer.operator_received_timestamp_ns if operator_received else 0
+            ),
             "received_age_s": operator_age_s,
             "freshness_limit_s": float(thresholds.get("operator_fresh_s", thresholds.get("fixture_fresh_s", 0.25))),
         },
@@ -1353,7 +1361,9 @@ def _build_readiness_snapshot(
             "data": safety_data,
             "received": observer.safety_samples >= 1,
             "received_value": safety_data,
-            "received_timestamp_ns": int(time.time() * 1_000_000_000) if observer.safety_samples >= 1 else 0,
+            "received_timestamp_ns": (
+                observer.safety_received_timestamp_ns if observer.safety_samples >= 1 else 0
+            ),
             "sample_count": observer.safety_samples,
             "age_s": safety_age_s,
         },
@@ -1494,7 +1504,15 @@ def _logical_controller_active(controllers: Mapping[str, Any], name: str) -> boo
 
 
 def _controllers_block(node: Any, records_raw: list[Any] | None) -> dict[str, Any]:
-    """Build the ``controllers`` readiness block from live observations."""
+    """Build the ``controllers`` readiness block from live observations.
+
+    F4.8: ``manager_healthy`` means a successful valid ``ListControllers``
+    response (a list, not merely a non-None placeholder), and each required
+    logical controller's ``cardinality`` is derived from that real response.
+    Duplicate controller names produce ``cardinality > 1`` and missing names
+    produce an empty record; both fail closed against the executor's exact
+    active/``cardinality: 1`` contract.
+    """
     from integrated_gate_executor import CONTROLLER_MANAGER_NODE
 
     controller_nodes = 0
@@ -1505,19 +1523,22 @@ def _controllers_block(node: Any, records_raw: list[Any] | None) -> dict[str, An
     except Exception:  # noqa: BLE001 - live graph boundary
         controller_nodes = 0
 
+    healthy = isinstance(records_raw, list)
     logical: dict[str, Any] = {}
-    if records_raw is not None:
-        for record in records_raw:
-            name = str(getattr(record, "name", "") or "")
-            state = str(getattr(record, "state", "") or "")
-            if name in ("joint_state_broadcaster", "xarm7_traj_controller"):
-                logical[name] = {
-                    "state": state,
-                    "source_node": CONTROLLER_MANAGER_NODE,
-                    "cardinality": 1,
-                }
+    if healthy:
+        for name in ("joint_state_broadcaster", "xarm7_traj_controller"):
+            matching = [
+                record for record in records_raw
+                if str(getattr(record, "name", "") or "") == name
+            ]
+            state = str(getattr(matching[0], "state", "") or "") if matching else ""
+            logical[name] = {
+                "state": state,
+                "source_node": CONTROLLER_MANAGER_NODE,
+                "cardinality": len(matching),
+            }
     return {
-        "manager_healthy": records_raw is not None,
+        "manager_healthy": healthy,
         "manager_source_node": CONTROLLER_MANAGER_NODE,
         "manager_publisher_count": controller_nodes,
         "logical_controllers": logical,
@@ -1540,7 +1561,8 @@ def _observed_topic_qos(infos: list[Any], expected_depth: int) -> dict[str, obje
     Humble never reports depth (always 0); the journal contract depth is
     asserted from the committed constant, mirroring the production
     ``integrated_readiness`` handling.  Reliability/durability are observed
-    from the first real endpoint; a QoS mismatch therefore fails closed.
+    from the exactly one matching endpoint; a QoS mismatch therefore fails
+    closed.
     """
     if not infos:
         return {}
@@ -1550,6 +1572,25 @@ def _observed_topic_qos(infos: list[Any], expected_depth: int) -> dict[str, obje
         "durability": _normalize_qos_value(getattr(profile, "durability", "")),
         "depth": int(expected_depth),
     }
+
+
+def _select_endpoint_qos(
+    labels: list[str],
+    infos: list[Any],
+    required_label: str,
+    expected_depth: int,
+) -> dict[str, object]:
+    """Observed QoS for exactly one endpoint matching *required_label*.
+
+    F4.7: selects by the normalized observed endpoint label, never by discovery
+    order and never ``infos[0]``.  A missing or duplicated matching endpoint
+    yields ``{}`` (fail-closed); the executor's graph validator then rejects
+    the projection.
+    """
+    matching = [info for label, info in zip(labels, infos) if label == required_label]
+    if len(matching) != 1:
+        return {}
+    return _observed_topic_qos(matching, expected_depth)
 
 
 def _observe_journal_graph(executor: Any) -> dict[str, Any]:
@@ -1587,13 +1628,24 @@ def _observe_journal_graph(executor: Any) -> dict[str, Any]:
     fixture_qos = JOURNAL_FIXTURE_TOPIC_QOS
     service_qos = JOURNAL_SERVICE_QOS
 
-    def _topic_entry(name: str, expected_type: str, expected_qos: Mapping[str, Any]) -> dict[str, Any]:
+    def _topic_entry(
+        name: str,
+        expected_type: str,
+        expected_qos: Mapping[str, Any],
+        *,
+        offered_from: str,
+    ) -> dict[str, Any]:
         pub_labels, pub_infos = _publishers_for(node, name)
         sub_labels, sub_infos = _subscribers_for(node, name)
+        depth = int(expected_qos["depth"])
+        # F4.7: requested QoS comes from the actual recorder subscriber
+        # (OPERATOR_NODE); offered QoS comes from the required owner of the
+        # topic (``offered_from``).  Selection is by normalized endpoint label,
+        # never discovery order.
         return {
             "type": expected_type,
-            "requested_qos": _observed_topic_qos(sub_infos, int(expected_qos["depth"])),
-            "offered_qos": _observed_topic_qos(pub_infos, int(expected_qos["depth"])),
+            "requested_qos": _select_endpoint_qos(sub_labels, sub_infos, OPERATOR_NODE, depth),
+            "offered_qos": _select_endpoint_qos(pub_labels, pub_infos, offered_from, depth),
             "publishers": [{"node": label, "node_namespace": ""} for label in pub_labels],
             "subscribers": [{"node": label, "node_namespace": ""} for label in sub_labels],
         }
@@ -1608,14 +1660,27 @@ def _observe_journal_graph(executor: Any) -> dict[str, Any]:
             "clients": [{"node": label, "node_namespace": ""} for label in clients],
         }
 
+    # F4.7: offered QoS for the planning-scene topics is owned by /move_group;
+    # the fixture status topic is owned by /fixture_planning_scene.
+    move_group_label = "/move_group"
+    fixture_owner_label = "/fixture_planning_scene"
     return {
         "node_name": OPERATOR_NODE,
         "namespace": OPERATOR_NODE_NAMESPACE,
         "remap_table": {},
         "topics": {
-            PLANNING_SCENE_TOPIC: _topic_entry(PLANNING_SCENE_TOPIC, "moveit_msgs/msg/PlanningScene", planner_qos),
-            MONITORED_PLANNING_SCENE_TOPIC: _topic_entry(MONITORED_PLANNING_SCENE_TOPIC, "moveit_msgs/msg/PlanningScene", planner_qos),
-            FIXTURE_TOPIC: _topic_entry(FIXTURE_TOPIC, "std_msgs/msg/String", fixture_qos),
+            PLANNING_SCENE_TOPIC: _topic_entry(
+                PLANNING_SCENE_TOPIC, "moveit_msgs/msg/PlanningScene", planner_qos,
+                offered_from=move_group_label,
+            ),
+            MONITORED_PLANNING_SCENE_TOPIC: _topic_entry(
+                MONITORED_PLANNING_SCENE_TOPIC, "moveit_msgs/msg/PlanningScene", planner_qos,
+                offered_from=move_group_label,
+            ),
+            FIXTURE_TOPIC: _topic_entry(
+                FIXTURE_TOPIC, "std_msgs/msg/String", fixture_qos,
+                offered_from=fixture_owner_label,
+            ),
         },
         "services": {
             "/get_planning_scene": _service_entry("/get_planning_scene", "moveit_msgs/srv/GetPlanningScene"),
@@ -1734,19 +1799,36 @@ def _native_gripper_goal_count_provider(executor: Any) -> Callable[[], Mapping[s
     return _provider
 
 
-def _fjt_transaction_provider(executor: Any) -> Callable[[], Mapping[str, Any]]:
+def _fjt_transaction_provider(
+    executor: Any, *, expected_goal_uuid: str | None = None
+) -> Callable[[], Mapping[str, Any]]:
     """Provide FJT transactions from the observed status cache + execute recorder.
 
     F3.4: goal_uuid/status/sequence/timestamp come from the executor's newest
     fresh real ``_fjt_status_cache`` entry; the trajectory digest is the digest
     of the exact ExecuteTrajectory goal captured by the execute recorder.  No
     status-record hashing and no invented digest.
+
+    F4.3/F4.4: when *expected_goal_uuid* is supplied the newest entry for that
+    exact controller goal UUID is returned (the cancel/safety presend path
+    discovered it before the run method); the provider evidence then binds to
+    the distinct controller transaction, never to the ExecuteTrajectory UUID.
     """
 
     def _provider() -> Mapping[str, Any]:
         entries = executor._fjt_status_entries()
         if not entries:
             raise DriverError("no FJT status-topic entry observed for this transaction")
+        if expected_goal_uuid is not None:
+            filtered = [
+                entry for entry in entries if entry.get("goal_uuid") == expected_goal_uuid
+            ]
+            if not filtered:
+                raise DriverError(
+                    "no FJT status-topic entry joined the expected controller goal "
+                    f"{expected_goal_uuid}"
+                )
+            entries = filtered
         newest = entries[-1]
         goal_uuid = newest.get("goal_uuid")
         status = newest.get("status")
@@ -1895,12 +1977,68 @@ def _presend_long_motion(executor: Any, scenario_id: str) -> dict[str, Any]:
     if planned_trajectory is None:
         raise DriverError("pre-send long-motion planning produced no planned trajectory")
     execute_goal = build_execute_trajectory_goal(planned_trajectory)
+    # F4.4: the transaction baseline is captured immediately before sending the
+    # presend ExecuteTrajectory goal, so the distinct controller FJT goal that
+    # the presend spawns is windowed from here (never keyed on execute_goal_id).
+    transaction_baseline = executor._d_baseline()
     execute_goal_id, execute_goal_handle = _send_execute_retaining_handle(executor, scenario_id, execute_goal)
+    # F4.5: retain the accepted presend handle on the executor so run_driver
+    # teardown can boundedly cancel/drain it if anything fails before the run
+    # method, and the run method can cancel it on the exact handle.
+    try:
+        executor._presend_execute_handle = execute_goal_handle
+    except Exception:  # noqa: BLE001 - best-effort retention
+        pass
+    # F4.4: wait bounded for the unique new controller FJT goal to reach
+    # ACCEPTED(1) or EXECUTING(2) after the pre-send baseline.  Discovery
+    # ignores any UUID already known at baseline.
+    fjt_wait_s = float(executor._thresholds().get("fjt_wait_timeout_s", 1.0))
+    fjt_entry = executor._wait_for_fjt_status(
+        None, (1, 2), fjt_wait_s, baseline=transaction_baseline
+    )
+    if fjt_entry is None:
+        cleanup = _cleanup_retained_presend(executor)
+        discovery_reason = (
+            "no new controller FJT goal reached ACCEPTED/EXECUTING within the "
+            "bounded wait after the pre-send baseline"
+        )
+        if getattr(executor, "_last_fjt_discovery_error", None):
+            discovery_reason = f"{discovery_reason}; {executor._last_fjt_discovery_error}"
+        raise DriverError(f"{discovery_reason}; cleanup={cleanup}")
+    fjt_goal_id = str(fjt_entry.get("goal_uuid"))
     return {
         "planning_goal_id": planning_goal_id,
         "execute_goal_id": execute_goal_id,
         "execute_goal_handle": execute_goal_handle,
+        "fjt_goal_id": fjt_goal_id,
+        "transaction_baseline": dict(transaction_baseline),
     }
+
+
+def _cleanup_retained_presend(executor: Any) -> dict[str, object]:
+    """F4.5: boundedly cancel/drain any retained accepted presend execute goal.
+
+    Idempotent and no-op-safe: an absent or already-terminal handle returns a
+    summary without raising.  Cleanup errors are preserved in the returned
+    summary and never mask the caller's original status, so no uncontrolled
+    long motion survives a failed cancel/safety/provider/finalization path.
+    """
+    handle = getattr(executor, "_presend_execute_handle", None)
+    if handle is None:
+        return {"cleanup": "none", "cleanup_reason": "no-retained-presend-handle"}
+    try:
+        timeout_s = float(executor._thresholds().get("cancel_timeout_s", 10.0))
+    except Exception:  # noqa: BLE001 - defensive cleanup boundary
+        timeout_s = 5.0
+    try:
+        outcome = executor._cleanup_execute_goal(handle, timeout_s=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - preserved diagnostically
+        return {"cleanup": "error", "cleanup_error": f"{type(exc).__name__}: {exc}"}
+    try:
+        executor._presend_execute_handle = None
+    except Exception:  # noqa: BLE001 - best-effort reset
+        pass
+    return outcome
 
 
 # --------------------------------------------------------------------------- #
@@ -1995,17 +2133,26 @@ def _live_runtime_provider_factory(
         "run_cancel_sequence",
         "run_safety_sequence",
     ):
-        kwargs["fjt_transaction_provider"] = _fjt_transaction_provider(executor)
-    if method_name in ("run_cancel_sequence", "run_safety_sequence"):
-        presend = _presend_long_motion(executor, scenario_id)
-        kwargs["long_motion_provider"] = _long_motion_provider_from_presend(
-            presend["planning_goal_id"],
-            presend["execute_goal_id"],
-        )
-        if method_name == "run_cancel_sequence":
-            kwargs["planning_goal_id"] = presend["planning_goal_id"]
-            kwargs["execute_goal_id"] = presend["execute_goal_id"]
-            kwargs["execute_goal_handle"] = presend["execute_goal_handle"]
+        if method_name in ("run_cancel_sequence", "run_safety_sequence"):
+            # F4.4: the presend transaction carries the distinct controller FJT
+            # goal UUID and the pre-send baseline; the provider is bound to that
+            # exact controller goal so evidence never keys on execute_goal_id.
+            presend = _presend_long_motion(executor, scenario_id)
+            kwargs["long_motion_provider"] = _long_motion_provider_from_presend(
+                presend["planning_goal_id"],
+                presend["execute_goal_id"],
+            )
+            kwargs["fjt_transaction_provider"] = _fjt_transaction_provider(
+                executor, expected_goal_uuid=presend["fjt_goal_id"]
+            )
+            kwargs["fjt_goal_id"] = presend["fjt_goal_id"]
+            kwargs["transaction_baseline"] = presend["transaction_baseline"]
+            if method_name == "run_cancel_sequence":
+                kwargs["planning_goal_id"] = presend["planning_goal_id"]
+                kwargs["execute_goal_id"] = presend["execute_goal_id"]
+                kwargs["execute_goal_handle"] = presend["execute_goal_handle"]
+        else:
+            kwargs["fjt_transaction_provider"] = _fjt_transaction_provider(executor)
     if method_name == "run_cartesian_retreat":
         kwargs["current_tcp_pose_provider"] = _current_tcp_pose_provider(executor)
         kwargs["environment_cloud_provider"] = _environment_cloud_provider(executor)
@@ -2112,6 +2259,19 @@ def run_driver(
         record = getattr(executor, method_name)(scenario_id, **runtime_kwargs)
         status = str(record.get("status", "evidence-invalid"))
     finally:
+        # F4.5: before destroying the observer/executor, best-effort clear the
+        # operator and boundedly cancel/drain any accepted presend execute goal
+        # that remains nonterminal, so no uncontrolled long motion survives
+        # driver exit.  Cleanup outcomes are preserved diagnostically without
+        # masking the original status (the finally never raises).
+        try:
+            executor.publish_operator(False)
+        except Exception:  # pragma: no cover - best-effort operator clear
+            pass
+        try:
+            _cleanup_retained_presend(executor)
+        except Exception:  # pragma: no cover - cleanup is best-effort
+            pass
         try:
             observer = getattr(executor, "_driver_observer", None)
             if observer is not None:

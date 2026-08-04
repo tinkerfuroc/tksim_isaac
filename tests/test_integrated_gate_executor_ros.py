@@ -560,6 +560,14 @@ class _FakeMoveClient:
     def wait_for_server(self, timeout_sec=None):
         return self._server_ready
 
+    def server_is_ready(self):
+        # F4.9: the Humble provider suite stubs /move_action and then evaluates
+        # the REAL readiness snapshot, whose action block calls
+        # ``client.server_is_ready()``.  Without this the stubbed move client
+        # reads as not-ready and the D-path fails readiness before sending any
+        # goal.
+        return self._server_ready
+
     def send_goal_async(self, goal):
         self.sent_goals.append(goal)
         return _FakeFuture(self._goal_handle, ready_at=self._send_ready_at, exc=self._send_exc)
@@ -1954,6 +1962,66 @@ def _fjt_evidence(goal_uuid, status, *, digest=None, sequence=None, timestamp=No
     }
 
 
+def _last_fjt_entry(executor, goal_uuid):
+    """Return the newest seeded FJT status-cache entry for *goal_uuid*, or None."""
+    for entry in reversed(executor._fjt_status_cache):
+        if entry.get("goal_uuid") == goal_uuid:
+            return entry
+    return None
+
+
+def _fjt_evidence_from_entry(entry, *, digest=None, status=None, goal_uuid=None):
+    """F4.3: build provider evidence joined to the exact status-cache entry.
+
+    sequence/timestamp come from the seeded entry itself so
+    ``_validate_fjt_evidence``'s exact-join requirement (status/seq/received_mono
+    equal to the newest joined cache record) holds.
+    """
+    return {
+        "endpoint": FJT_ENDPOINT,
+        "goal_uuid": goal_uuid if goal_uuid is not None else str(entry.get("goal_uuid")),
+        "trajectory_digest": digest if digest is not None else _valid_digest_str(),
+        "source": "test-send-goal-service-introspection",
+        "sequence": int(entry.get("seq")),
+        "timestamp": float(entry.get("received_mono")),
+        "status": status if status is not None else int(entry.get("status")),
+    }
+
+
+def _fjt_provider_from_cache(executor, fjt_hex, status, *, digest=None):
+    """F4.3: provider evidence bound to the exact newest cache entry for fjt_hex."""
+    def _provider():
+        entry = _last_fjt_entry(executor, fjt_hex)
+        if entry is None:
+            raise AssertionError(f"no FJT cache entry seeded for {fjt_hex}")
+        return _fjt_evidence_from_entry(entry, digest=digest, status=status, goal_uuid=fjt_hex)
+
+    return _provider
+
+
+def _seed_fjt_after_execute_send(executor, fjt_hex, status, exec_client, *, seq=None):
+    """F4.3: seed an FJT entry for *fjt_hex* after the ExecuteTrajectory goal is sent.
+
+    The D-execute path discovers the distinct controller FJT goal UUID inside the
+    current window; pre-seeding before the run would make the goal baseline-known
+    and fail discovery, so the entry is injected from a background thread only
+    after the execute goal appears on *exec_client* (strictly after the run's
+    ``_d_baseline()`` is captured).
+    """
+    seeded = threading.Event()
+
+    def _worker():
+        deadline = time.monotonic() + 10.0
+        while len(exec_client.sent_goals) < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        _seed_fresh_fjt(executor, fjt_hex, status, seq=seq)
+        seeded.set()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    return seeded
+
+
 def _seed_fresh_fjt(executor, goal_uuid, status, *, seq=None, advance=False):
     """Append an FJT status entry with a seq ahead of the attempt baseline.
 
@@ -2228,6 +2296,36 @@ def test_cartesian_move_goal_rejects_wrong_frame_and_zero_quaternion():
         build_cartesian_move_goal(pose)
 
 
+def test_goal_uuid_normalization_real_humble_uuid_message(tmp_path):
+    """F4.1: a real Humble ``unique_identifier_msgs/msg/UUID`` — whose ``.uuid``
+    is a numpy ``uint8[16]`` — normalizes in the executor exactly like the
+    driver's ``_goal_id_hex`` for a real accepted goal handle."""
+    import uuid as _uuid
+
+    import integrated_gate_executor_driver as d
+    from unique_identifier_msgs.msg import UUID
+
+    from validation.integrated_gate_executor import _normalize_goal_uuid
+
+    executor, _ = _make_executor(tmp_path)
+    try:
+        raw = _uuid.uuid4().bytes
+        expected = _uuid.UUID(bytes=raw).hex
+        u = UUID()
+        u.uuid = list(raw)  # rclpy populates .uuid as a numpy uint8[16] array
+        handle = _FakeGoalHandle(
+            accepted=True, goal_id=u, status=EXECUTE_STATUS_SUCCEEDED
+        )
+        assert executor._normalize_goal_id(handle) == expected
+        assert d._goal_id_hex(handle) == expected
+        assert executor._normalize_goal_id(handle) == d._goal_id_hex(handle)
+        # The module function accepts both the message and its bare .uuid array.
+        assert _normalize_goal_uuid(u) == expected
+        assert _normalize_goal_uuid(u.uuid) == expected
+    finally:
+        executor.shutdown()
+
+
 def test_executor_run_execute_sequence_split_path_pass(tmp_path):
     import uuid as _uuid
 
@@ -2258,7 +2356,12 @@ def test_executor_run_execute_sequence_split_path_pass(tmp_path):
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+        # F4.3: the controller FJT goal is a distinct UUID from the
+        # ExecuteTrajectory goal (MoveIt forwards to the controller, which spawns
+        # its own FJT action goal).  Seed it only after the execute goal is sent
+        # so discovery observes exactly one new controller goal in the window.
+        fjt_hex = _uuid.uuid4().hex
+        _seed_fjt_after_execute_send(executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, exec_client)
 
         # F4.2: serialize the canonical planned trajectory EXACTLY ONCE at setup
         # and reuse that byte/digest snapshot for the provider's FJT evidence.
@@ -2270,8 +2373,8 @@ def test_executor_run_execute_sequence_split_path_pass(tmp_path):
         trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-joint",
-            fjt_transaction_provider=lambda: _fjt_evidence(
-                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
             ),
         )
         assert record["status"] == "diagnostic-pass"
@@ -2286,7 +2389,8 @@ def test_executor_run_execute_sequence_split_path_pass(tmp_path):
         assert _valid_goal_uuid(record["execute_goal_id"])
         assert record["planning_goal_id"] != record["execute_goal_id"]
         assert record["execute_goal_id"] == execute_hex
-        assert record["fjt_goal_uuid"] == execute_hex
+        assert record["fjt_goal_uuid"] == fjt_hex
+        assert record["fjt_goal_id"] == fjt_hex
         assert record["fjt_status"] == EXECUTE_STATUS_SUCCEEDED
         assert record["execute_result_status"] == EXECUTE_STATUS_SUCCEEDED
         assert record["execute_result_status_string"] == "succeeded"
@@ -2371,7 +2475,9 @@ def test_executor_run_execute_sequence_fjt_mismatch_fails_closed(tmp_path):
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+        # F4.3: seed the distinct controller goal after the execute goal is sent.
+        fjt_hex = _uuid.uuid4().hex
+        _seed_fjt_after_execute_send(executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, exec_client)
         trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         # Provider evidence joins to a different (unknown) UUID -> mismatch.
         provider = _fjt_evidence("d" * 32, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest)
@@ -2379,7 +2485,7 @@ def test_executor_run_execute_sequence_fjt_mismatch_fails_closed(tmp_path):
             "qualification-moveit-execute-joint", fjt_transaction_provider=lambda: provider
         )
         assert record["status"] == "evidence-invalid"
-        assert "fjt evidence goal_uuid does not join" in record.get("execute_error", "")
+        assert "does not equal the discovered controller goal UUID" in record.get("execute_error", "")
         assert len(move_client.sent_goals) == 1
         assert len(exec_client.sent_goals) == 1
     finally:
@@ -2396,25 +2502,31 @@ def test_executor_run_cancel_sequence_pass(tmp_path):
         plan_hex = _uuid.UUID(bytes=plan_uuid).hex
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _synthetic_scene(executor, contract)
+        # F4.4: the controller FJT goal is a distinct UUID from the
+        # ExecuteTrajectory goal (the live driver discovers it from the presend
+        # transaction); the direct path supplies it explicitly.
+        fjt_hex = _uuid.uuid4().hex
         # F1.4: the transaction must have started — FJT EXECUTING plus a fresh
         # joint-state frame proving motion above threshold.
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         # F1.2: real-shape accepted CancelGoal response + CANCELED terminal.
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_CANCELED)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_CANCELED)
         cancel_handle = _FakeGoalHandle(
             accepted=True, goal_id=execute_uuid, status=EXECUTE_STATUS_CANCELED,
             cancel_ready_at=0.0, cancel_response=_cancel_info_for(execute_hex),
         )
-        provider = _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED)
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=lambda: {
                 "planning_goal_id": plan_hex,
                 "execute_goal_id": execute_hex,
             },
-            fjt_transaction_provider=lambda: provider,
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_CANCELED
+            ),
             execute_goal_handle=cancel_handle,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "diagnostic-pass"
         assert record["execute_trajectory_goal_sent"] is False
@@ -2427,7 +2539,8 @@ def test_executor_run_cancel_sequence_pass(tmp_path):
         assert record["cancel_goals_canceling"] == [execute_hex]
         assert record["terminal_status"] == "canceled"
         assert record["execute_result_status"] == EXECUTE_STATUS_CANCELED
-        assert record["fjt_goal_uuid"] == execute_hex
+        assert record["fjt_goal_uuid"] == fjt_hex
+        assert record["fjt_goal_id"] == fjt_hex
         assert record["fjt_status"] == EXECUTE_STATUS_CANCELED
         assert cancel_handle.cancel_called is True
         assert cancel_handle.cancel_goal_async_calls == 1
@@ -2458,26 +2571,31 @@ def test_executor_run_safety_sequence_pass(tmp_path):
         plan_hex = _uuid.UUID(bytes=plan_uuid).hex
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
         _synthetic_scene(executor, contract)
+        # F4.4: the controller FJT goal is a distinct UUID from the
+        # ExecuteTrajectory goal; the direct path supplies it explicitly.
+        fjt_hex = _uuid.uuid4().hex
         # F1.4: the transaction must have started — FJT EXECUTING plus motion.
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         # F1.3: the old transaction reaches ABORTED after the safety assertion.
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_ABORTED)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_ABORTED)
         # F1.4/Md1: consecutive fresh post-stop bounded frames.
         for _ in range(5):
             _seed_fresh_joint(executor, [0.0] * 7)
         stop = Bool()
         stop.data = True
         executor._latest_safety_stop = stop
-        provider = _fjt_evidence(execute_hex, EXECUTE_STATUS_ABORTED)
         record = executor.run_safety_sequence(
             "qualification-moveit-safety",
             long_motion_provider=lambda: {
                 "planning_goal_id": plan_hex,
                 "execute_goal_id": execute_hex,
             },
-            fjt_transaction_provider=lambda: provider,
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_ABORTED
+            ),
             stop_timeout_s=0.1,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "diagnostic-pass"
         assert record["execute_trajectory_goal_sent"] is False
@@ -2485,7 +2603,8 @@ def test_executor_run_safety_sequence_pass(tmp_path):
         assert record["controller_endpoint"] == FJT_ENDPOINT
         assert record["plan_applicable"] is False
         assert record["terminal_status"] == "aborted"
-        assert record["fjt_goal_uuid"] == execute_hex
+        assert record["fjt_goal_uuid"] == fjt_hex
+        assert record["fjt_goal_id"] == fjt_hex
         assert record["fjt_status"] == EXECUTE_STATUS_ABORTED
         assert record["event_log"] == [
             "fixture-ready", "execution-start", "effective-stop",
@@ -5420,12 +5539,14 @@ def test_executor_cancel_missing_handle_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
             execute_goal_handle=None,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "exact live ExecuteTrajectory goal handle" in record["execute_error"]
@@ -5440,14 +5561,16 @@ def test_executor_cancel_handle_id_mismatch_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         wrong_uuid = _uuid.uuid4().bytes
         _synthetic_scene(executor, contract)
         wrong_handle = _FakeGoalHandle(accepted=True, goal_id=wrong_uuid)
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
             execute_goal_handle=wrong_handle,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "does not equal the recorded execute_goal_id" in record["execute_error"]
@@ -5462,9 +5585,10 @@ def test_executor_cancel_rejected_return_code_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         execute_bytes = _uuid.UUID(hex=execute_hex).bytes
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         handle = _FakeGoalHandle(
             accepted=True, goal_id=execute_bytes, cancel_ready_at=0.0,
@@ -5473,8 +5597,9 @@ def test_executor_cancel_rejected_return_code_fails_closed(tmp_path):
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
             execute_goal_handle=handle,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "!= ERROR_NONE" in record["execute_error"]
@@ -5491,9 +5616,10 @@ def test_executor_cancel_unknown_return_code_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         execute_bytes = _uuid.UUID(hex=execute_hex).bytes
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         handle = _FakeGoalHandle(
             accepted=True, goal_id=execute_bytes, cancel_ready_at=0.0,
@@ -5502,8 +5628,9 @@ def test_executor_cancel_unknown_return_code_fails_closed(tmp_path):
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
             execute_goal_handle=handle,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert record["cancel_response"] == "unknown"
@@ -5520,10 +5647,11 @@ def test_executor_cancel_empty_and_extra_goals_canceling_fails_closed(tmp_path):
         try:
             plan_hex = _uuid.uuid4().hex
             execute_hex = _uuid.uuid4().hex
+            fjt_hex = _uuid.uuid4().hex
             execute_bytes = _uuid.UUID(hex=execute_hex).bytes
             other_bytes = _uuid.uuid4().bytes
             _synthetic_scene(executor, contract)
-            _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+            _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
             _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
             if extra:
                 canceling = [_FakeGoalInfo(execute_bytes), _FakeGoalInfo(other_bytes)]
@@ -5536,8 +5664,9 @@ def test_executor_cancel_empty_and_extra_goals_canceling_fails_closed(tmp_path):
             record = executor.run_cancel_sequence(
                 "qualification-moveit-cancel",
                 long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-                fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+                fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
                 execute_goal_handle=handle,
+                fjt_goal_id=fjt_hex,
             )
             assert record["status"] == "evidence-invalid"
             assert "goals_canceling" in record["execute_error"]
@@ -5556,9 +5685,10 @@ def test_executor_cancel_non_canceled_terminal_fails_closed(tmp_path, terminal):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         execute_bytes = _uuid.UUID(hex=execute_hex).bytes
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         handle = _FakeGoalHandle(
             accepted=True, goal_id=execute_bytes, status=terminal,
@@ -5568,8 +5698,9 @@ def test_executor_cancel_non_canceled_terminal_fails_closed(tmp_path, terminal):
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
             execute_goal_handle=handle,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "CANCELED (5)" in record["execute_error"]
@@ -5586,9 +5717,10 @@ def test_executor_cancel_fjt_never_canceled_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         execute_bytes = _uuid.UUID(hex=execute_hex).bytes
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         # No FJT CANCELED entry is ever observed.
         handle = _FakeGoalHandle(
@@ -5599,8 +5731,9 @@ def test_executor_cancel_fjt_never_canceled_fails_closed(tmp_path):
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
             execute_goal_handle=handle,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "never reached CANCELED" in record["execute_error"]
@@ -5639,10 +5772,11 @@ def test_executor_safety_provider_exception_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_ABORTED)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_ABORTED)
         stop = Bool()
         stop.data = True
         executor._latest_safety_stop = stop
@@ -5655,6 +5789,7 @@ def test_executor_safety_provider_exception_fails_closed(tmp_path):
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
             fjt_transaction_provider=_raising,
             stop_timeout_s=0.1,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "safety fjt_transaction_provider raised" in record["execute_error"]
@@ -5673,10 +5808,11 @@ def test_executor_safety_prior_aborted_cache_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
         # Pre-baseline ABORTED entry (seq == the baseline the flow will capture).
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_ABORTED, seq=executor._fjt_receipt_sequence)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_ABORTED, seq=executor._fjt_receipt_sequence)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         stop = Bool()
         stop.data = True
@@ -5684,8 +5820,9 @@ def test_executor_safety_prior_aborted_cache_fails_closed(tmp_path):
         record = executor.run_safety_sequence(
             "qualification-moveit-safety",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_ABORTED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_ABORTED),
             stop_timeout_s=0.1,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "never reached ABORTED" in record["execute_error"]
@@ -5702,8 +5839,9 @@ def test_executor_safety_stale_no_aborted_entry_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
         stop = Bool()
         stop.data = True
@@ -5711,8 +5849,9 @@ def test_executor_safety_stale_no_aborted_entry_fails_closed(tmp_path):
         record = executor.run_safety_sequence(
             "qualification-moveit-safety",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_ABORTED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_ABORTED),
             stop_timeout_s=0.1,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "never reached ABORTED" in record["execute_error"]
@@ -5729,10 +5868,11 @@ def test_executor_safety_wrong_uuid_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_ABORTED)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_ABORTED)
         stop = Bool()
         stop.data = True
         executor._latest_safety_stop = stop
@@ -5741,9 +5881,10 @@ def test_executor_safety_wrong_uuid_fails_closed(tmp_path):
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
             fjt_transaction_provider=lambda: _fjt_evidence("d" * 32, EXECUTE_STATUS_ABORTED),
             stop_timeout_s=0.1,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
-        assert "does not join" in record["execute_error"]
+        assert "does not equal the discovered controller goal UUID" in record["execute_error"]
     finally:
         executor.shutdown()
 
@@ -5757,10 +5898,11 @@ def test_executor_safety_wrong_endpoint_source_digest_fail_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_ABORTED)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_ABORTED)
         stop = Bool()
         stop.data = True
         executor._latest_safety_stop = stop
@@ -5771,13 +5913,14 @@ def test_executor_safety_wrong_endpoint_source_digest_fail_closed(tmp_path):
             {"trajectory_digest": "not-a-hex-digest"},
         ]
         for mutation in bad_cases:
-            evidence = _fjt_evidence(execute_hex, EXECUTE_STATUS_ABORTED)
+            evidence = _fjt_evidence(fjt_hex, EXECUTE_STATUS_ABORTED)
             evidence.update(mutation)
             record = executor.run_safety_sequence(
                 "qualification-moveit-safety",
                 long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
                 fjt_transaction_provider=lambda evidence=evidence: evidence,
                 stop_timeout_s=0.1,
+                fjt_goal_id=fjt_hex,
             )
             assert record["status"] == "evidence-invalid", mutation
     finally:
@@ -5795,10 +5938,11 @@ def test_executor_safety_status_cache_mismatch_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_ABORTED)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_ABORTED)
         stop = Bool()
         stop.data = True
         executor._latest_safety_stop = stop
@@ -5806,8 +5950,9 @@ def test_executor_safety_status_cache_mismatch_fails_closed(tmp_path):
         record = executor.run_safety_sequence(
             "qualification-moveit-safety",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_EXECUTING),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_EXECUTING),
             stop_timeout_s=0.1,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "does not join" in record["execute_error"]
@@ -5902,7 +6047,7 @@ def test_wait_for_post_clear_stability_late_fresh_goal_unstable(tmp_path):
         # A fresh FJT entry for a DIFFERENT goal inside the stability window.
         _seed_fresh_fjt(executor, other_hex, EXECUTE_STATUS_EXECUTING)
         result = executor._wait_for_post_clear_stability(
-            0.2, baseline=baseline, execute_goal_id=execute_hex,
+            0.2, baseline=baseline, known_goal_id=execute_hex,
             velocity_limit=0.02, creep_limit=0.005,
         )
         assert result["stable"] is False
@@ -5921,7 +6066,7 @@ def test_wait_for_post_clear_stability_position_creep_unstable(tmp_path):
         # Fresh joint frame whose position drifts beyond safety_position_creep_rad.
         _seed_fresh_joint(executor, [0.0] * 7, positions=[0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         result = executor._wait_for_post_clear_stability(
-            0.2, baseline=baseline, execute_goal_id=execute_hex,
+            0.2, baseline=baseline, known_goal_id=execute_hex,
             velocity_limit=0.02, creep_limit=0.005,
         )
         assert result["stable"] is False
@@ -5941,7 +6086,7 @@ def test_wait_for_post_clear_stability_bounded_recovery_stable(tmp_path):
         for _ in range(5):
             _seed_fresh_joint(executor, [0.0] * 7, positions=[0.0] * 7)
         result = executor._wait_for_post_clear_stability(
-            0.2, baseline=baseline, execute_goal_id=execute_hex,
+            0.2, baseline=baseline, known_goal_id=execute_hex,
             velocity_limit=0.02, creep_limit=0.005,
         )
         assert result["stable"] is True
@@ -6104,6 +6249,7 @@ def test_executor_d_journal_snapshot_rejection_fails_closed(tmp_path):
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         _synthetic_scene(executor, contract)
 
         def _rejecting_snapshot(event):
@@ -6115,8 +6261,9 @@ def test_executor_d_journal_snapshot_rejection_fails_closed(tmp_path):
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=lambda: _fjt_evidence(fjt_hex, EXECUTE_STATUS_CANCELED),
             execute_goal_handle=_FakeGoalHandle(accepted=True, goal_id=_uuid.uuid4().bytes),
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "evidence-invalid"
         assert "execution-start journal snapshot rejected" in record["execute_error"]
@@ -6135,11 +6282,12 @@ def test_executor_cancel_pass_records_moveit_plans_null_plan_applicable(tmp_path
     try:
         plan_hex = _uuid.uuid4().hex
         execute_hex = _uuid.uuid4().hex
+        fjt_hex = _uuid.uuid4().hex
         execute_bytes = _uuid.UUID(hex=execute_hex).bytes
         _synthetic_scene(executor, contract)
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_EXECUTING)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_EXECUTING)
         _seed_fresh_joint(executor, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0])
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_CANCELED)
+        _seed_fresh_fjt(executor, fjt_hex, EXECUTE_STATUS_CANCELED)
         handle = _FakeGoalHandle(
             accepted=True, goal_id=execute_bytes, status=EXECUTE_STATUS_CANCELED,
             result_ready_at=0.0, cancel_ready_at=0.0,
@@ -6148,8 +6296,11 @@ def test_executor_cancel_pass_records_moveit_plans_null_plan_applicable(tmp_path
         record = executor.run_cancel_sequence(
             "qualification-moveit-cancel",
             long_motion_provider=_cancel_target_provider(plan_hex, execute_hex),
-            fjt_transaction_provider=lambda: _fjt_evidence(execute_hex, EXECUTE_STATUS_CANCELED),
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_CANCELED
+            ),
             execute_goal_handle=handle,
+            fjt_goal_id=fjt_hex,
         )
         assert record["status"] == "diagnostic-pass"
         assert record["plan_applicable"] is False
@@ -6327,15 +6478,18 @@ def test_executor_run_execute_sequence_pose_pass(tmp_path):
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+        # F4.3: the controller FJT goal is a distinct UUID; seed it only after
+        # the execute goal is sent so discovery observes exactly one new goal.
+        fjt_hex = _uuid.uuid4().hex
+        _seed_fjt_after_execute_send(executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, exec_client)
 
         # F4.2: serialize the planned trajectory once at setup and reuse that
         # byte/digest snapshot for the provider's FJT evidence.
         trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-pose",
-            fjt_transaction_provider=lambda: _fjt_evidence(
-                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
             ),
         )
         assert record["status"] == "diagnostic-pass"
@@ -6390,15 +6544,18 @@ def test_executor_d_visual_before_precedes_first_goal_and_after_follows(tmp_path
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+        # F4.3: the controller FJT goal is a distinct UUID; seed it only after
+        # the execute goal is sent so discovery observes exactly one new goal.
+        fjt_hex = _uuid.uuid4().hex
+        _seed_fjt_after_execute_send(executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, exec_client)
 
         # F4.2: serialize the planned trajectory once at setup and reuse that
         # byte/digest snapshot for the provider's FJT evidence.
         trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-joint",
-            fjt_transaction_provider=lambda: _fjt_evidence(
-                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
             ),
         )
         assert record["status"] == "diagnostic-pass"
@@ -6448,7 +6605,10 @@ def test_executor_d_artifact_write_failure_downgrades_all_three_streams_execute(
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+        # F4.3: the controller FJT goal is a distinct UUID; seed it only after
+        # the execute goal is sent so discovery observes exactly one new goal.
+        fjt_hex = _uuid.uuid4().hex
+        _seed_fjt_after_execute_send(executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, exec_client)
 
         # F4.2: serialize the planned trajectory once at setup and reuse that
         # byte/digest snapshot for the provider's FJT evidence.
@@ -6464,8 +6624,8 @@ def test_executor_d_artifact_write_failure_downgrades_all_three_streams_execute(
         monkeypatch.setattr(_ige, "_atomic_write_json", _flaky)
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-joint",
-            fjt_transaction_provider=lambda: _fjt_evidence(
-                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
             ),
         )
         assert record["status"] == "evidence-invalid"
@@ -6960,15 +7120,18 @@ def test_executor_execute_action_semantics_artifact(tmp_path):
         executor._action_clients["/execute_trajectory"] = exec_client
         _synthetic_scene(executor, contract)
         execute_hex = _uuid.UUID(bytes=execute_uuid).hex
-        _seed_fresh_fjt(executor, execute_hex, EXECUTE_STATUS_SUCCEEDED)
+        # F4.3: the controller FJT goal is a distinct UUID; seed it only after
+        # the execute goal is sent so discovery observes exactly one new goal.
+        fjt_hex = _uuid.uuid4().hex
+        _seed_fjt_after_execute_send(executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, exec_client)
 
         # F4.2: serialize the planned trajectory once at setup and reuse that
         # byte/digest snapshot for the provider's FJT evidence.
         trajectory_digest = hashlib.sha256(deterministic_serialize(planned)).hexdigest()
         record = executor.run_execute_sequence(
             "qualification-moveit-execute-joint",
-            fjt_transaction_provider=lambda: _fjt_evidence(
-                execute_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
+            fjt_transaction_provider=_fjt_provider_from_cache(
+                executor, fjt_hex, EXECUTE_STATUS_SUCCEEDED, digest=trajectory_digest
             ),
         )
         assert record["status"] == "diagnostic-pass"
