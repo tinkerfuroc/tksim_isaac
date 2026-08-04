@@ -314,6 +314,27 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9 — "close integrated evidence
+  artifacts"): Added deterministic reproducibility indexing and integrated
+  contact sheets.  `validation/integrated_evidence_index.py` (new) builds
+  `evidence-index.json` from real preserved artifact bytes/metadata with
+  canonical JSON (`sort_keys`, `("," ":" )`, `ensure_ascii=False`) and lowercase
+  64-hex SHA-256 digests; the index excludes only itself and repeated builds over
+  unchanged bytes are identical.  `validate_gate_f` fails closed on missing
+  commit identity, rosbag metadata/QoS/counts, planning-scene journal, required
+  artifacts, unbound captures, and absent contact sheets, and never fabricates a
+  verdict.  `validation/integrated_contact_sheets.py` (new) renders deterministic
+  `contact-sheet-integrated-agent.png` / `contact-sheet-integrated-user.png`
+  authorized only by captures already carrying exact path+digest+event/frame
+  metadata in the evidence index; blank/transparent/unindexed/stale/mismatched/
+  unbound/out-of-suite/duplicate captures and output-as-input are rejected, and
+  path traversal/symlink escape/files changing during hashing are rejected.  New
+  tests: `tests/test_integrated_evidence_index.py` (28) +
+  `tests/test_integrated_contact_sheets.py` (16) = 44 passed in the simulator
+  venv; affected ROS-free regression 369 passed.  Task 10 wires Gate F into the
+  orchestrator.  No build, no live Isaac/ROS/GPU/cuMotion; immutables and the
+  future qualification source lock untouched.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 5 — "stabilize controller
   evidence lifecycle"): Repaired the four load-bearing defects found by fresh
   coordinator repetition of fix round 4 (the positive D trio passed only 11/17

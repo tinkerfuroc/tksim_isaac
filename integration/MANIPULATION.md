@@ -363,6 +363,30 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9 — "close integrated evidence
+  artifacts"): Added deterministic reproducibility indexing and integrated
+  contact sheets.  `validation/integrated_evidence_index.py` (new) writes
+  `evidence-index.json` covering config/scenario/overlay/model fingerprint,
+  simulator and production HEAD/status/diff, dependency/source locks,
+  commands/argv/environment allowlist, ROS domain/RMW/DDS, MoveIt
+  plans/controller results/planning-scene journal, raw truth/evaluator/drain,
+  rosbag metadata/QoS/counts, verdicts/cleanup/GPU/process reports, and contact
+  sheets; it excludes only itself and repeated builds over unchanged bytes are
+  identical.  `validate_gate_f` is fail-closed (missing commit identity, rosbag
+  metadata/QoS/counts, planning-scene journal, required artifacts, unbound or
+  missing required-event captures, and absent sheets) and never fabricates a
+  verdict.  `validation/integrated_contact_sheets.py` (new) renders deterministic
+  `contact-sheet-integrated-agent.png` / `contact-sheet-integrated-user.png`
+  authorized only by captures already carrying exact path+digest+event/frame
+  metadata in the evidence index; every visual event binds to exact
+  scenario/attempt/execution-request plus `(frame_index,timestamp)`.  Agent and
+  user sheets agree on the covered event set; screenshots and PlanningScene
+  remain diagnostic only, never physical pass authority.  New tests: 28
+  evidence-index + 16 contact-sheet = 44 passed; affected ROS-free regression
+  369 passed.  Task 10 wires Gate F into the orchestrator.  No build, no live
+  Isaac/GPU/cuMotion; immutables and the future qualification source lock
+  untouched.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 5 — "stabilize controller
   evidence lifecycle"): Final repair round driven by the fix-round-4 coordinator
   result (positive D trio 11/17 fresh-process runs, one cancel transaction
