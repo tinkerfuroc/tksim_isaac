@@ -363,6 +363,48 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 2 — "wire executor
+  evidence producer"): Wired the live Humble executor evidence producer and
+  sealed finalization.  The integrated C-E lifecycle is now three-child: Isaac +
+  Humble overlay launch first; after canonical PHYSICS_READY the orchestrator
+  atomically writes the already-validated `scenario-bundle.json` (scenario id/
+  seed/declaration, planning-scene declaration + mapping, integrated mapping,
+  report identities, current attempt id + resolved path) and launches the new
+  source-run `validation/integrated_gate_executor_driver.py` as a third owned
+  child (`qualification_start_process(runner, "executor", ...)`) under the same
+  ROS domain, attempt dir, and ros-tooling environment
+  (`/usr/bin/python3`, RMW/DDS/profile, Humble overlay
+  PYTHONPATH/AMENT_PREFIX_PATH/LD_LIBRARY_PATH).  The driver loads the bundle
+  unchanged, derives dispatch for exactly the 17 canonical scenario ids,
+  constructs the real `IntegratedGateExecutor` with live readiness/join-key/
+  graph providers, dispatches one run method, and atomically writes
+  `execution-terminal.json` (cross-bound to scenario id + attempt id + attempt
+  path, `marker: executor-driver`) only after executor artifact finalization
+  (`integrated-execution.json` must exist); driver failures write a durable
+  fail-closed terminal and exit nonzero.  The orchestrator waits within a
+  config-derived terminal budget (`plan + 2*execute + cancel + scene +
+  max(cancel,30)` = exactly 305.0 s for the committed thresholds; separate from
+  the 30 s readiness budget) and fails immediately if the executor exits
+  without a current-attempt marker; a wrong-identity or stale marker is
+  rejected.  Every E transport scenario sets and reads back
+  `/pick_and_place.post_grasp_lift_m = 0.10` on the live task server and feeds
+  the observed read-back as the typed provider (fails closed otherwise).
+  `_finalize_attempt` isolates every cleanup phase (executor stop → Isaac stop →
+  exact raw/evaluator drain → Humble stop → rosbag → orphan → resource →
+  settle) so an exception in one phase is recorded and all later phases still
+  run; a whole-helper escape is guarded at both call sites and becomes durable
+  per-scenario `evidence-invalid`, never an abort.  Integrated C-E rosbag stays
+  a truthful non-load-bearing diagnostic (`not-recorded`; present valid bag
+  validated, corrupt bag fails closed); Task 9/Gate F must add/index the
+  intended recorder.  Offline regressions: 25 new driver tests + 55
+  integrated-orchestration tests, 511 passed in the broader batch, and the
+  sourced-Humble real executor/journal surface (164 + 184 passed) proving the
+  executor finalizes `integrated-execution.json`, `moveit-plans.jsonl`,
+  `controller-results.jsonl`, `planning-scene.jsonl`, and `planning-scene.json`.
+  No build, no live Isaac/ROS, no GPU-process change, no cuMotion;
+  executor/verifier/journal/overlay-launch/scenarios/configs/locks and all
+  production files are untouched.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 1 — "execute
   integrated scenario lifecycle"): Made the integrated C-E lifecycle executable
   on the real manifest/launch path.  The orchestrator no longer passes a

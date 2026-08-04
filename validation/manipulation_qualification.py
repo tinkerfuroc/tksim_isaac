@@ -1506,6 +1506,12 @@ class QualificationRunner:
             "isaac": "isaac",
             "humble": "humble",
             "rosbag": "ros-tooling",
+            # Task 8 fix round 2: the source-run Humble executor driver runs
+            # under the same ros-tooling environment as the Humble overlay so it
+            # sees the same DDS profile, ROS domain, attempt dir, and overlay
+            # PYTHONPATH/AMENT_PREFIX_PATH.  This is purely additive and never
+            # alters six-gate behavior (which uses isaac/humble/rosbag).
+            "executor": "ros-tooling",
         }.get(name)
         if role is None:
             stream.close()
