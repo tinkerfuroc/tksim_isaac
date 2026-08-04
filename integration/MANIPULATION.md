@@ -363,6 +363,33 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 3 — "make integrated
+  evidence production-real"): Made the integrated evidence pipeline accept
+  genuine live artifacts.  The evidence index (`validation/integrated_evidence_index.py`)
+  now parses the real nonempty RTX GPU inventory in `resource-cleanup.json` as a
+  physical inventory (F3.1), accepts the real nested
+  `repositories.production`/.simulator + scalar `repositories.path_scope`
+  overlay-contract shape (F3.2), requires required visual events per exact
+  attempt/scenario with the complete suite event order embedded in contact
+  sheets (F3.3), cross-binds keyframe request-time/source-sequence against the
+  canonical request (F3.5), closes manifest/config/model/source/attempt/verdict
+  identity binding with a missing-manifest failure (F3.6), rejects contact-sheet
+  output equal to any indexed evidence artifact (F3.7), and parses real rosbag
+  QoS YAML plus requires every metadata-listed storage file to exist and be
+  nonempty (F3.8).  The executor (`validation/integrated_gate_executor.py`)
+  routes every non-`"recorded"` `_append_visual_event` producer status to
+  `evidence-invalid` through the fail-dominant D/E finalization paths (F3.9);
+  `manipulation_qualification.py::_env` rejects noncanonical integrated scenario
+  ids before launch (F3.10); `qualification_visual_capture.py` seeds
+  at-most-once from durable keyframes (F3.4).  New tests drive the real runner
+  env, real executor producer, real capture consumer, and a true integrated
+  producer path (executor → consumer → index/sheets/summary → Gate F
+  `verified-pass`) plus a diagnostic-only journal fail-closed test.  `_image_stats`
+  thresholds still require live RTX calibration; Task 10 must wire Gate F and
+  launch/finalize a load-bearing integrated rosbag; no live Isaac/camera/rosbag/
+  GPU run occurred in this repair; the future qualification tooling lock remains
+  absent until after review-clean Task 10.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 2 — "produce integrated
   visual evidence"): Produced the canonical visual-capture evidence end-to-end
   and closed the validator's semantic gaps.  The integrated executor

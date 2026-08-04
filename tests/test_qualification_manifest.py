@@ -22,6 +22,8 @@ from validation.manipulation_qualification import (  # noqa: E402
     APPROVED_RECORD_TOPICS,
     CONTRACT_TOPIC,
     RAW_TRUTH_TOPIC,
+    GATES,
+    QualificationManifest,
     QualificationRunner,
     SAFETY_STOP_TOPIC,
     TRAJECTORY_CONTROLLER,
@@ -2300,6 +2302,96 @@ class QualificationManifestTest(unittest.TestCase):
             return_value=SimpleNamespace(returncode=1, stdout="usage", stderr=""),
         ):
             self.assertIsNone(_tool_version("ros2"))
+
+    # -- F3.4: integrated Isaac visual-evidence environment -------------------
+
+    @staticmethod
+    def _visual_manifest(root: Path, *, scenario_id: str | None) -> QualificationManifest:
+        return QualificationManifest(
+            attempt_id="attempt-visual",
+            attempt_dir=root / "attempts" / "visual",
+            data={
+                "environment": {
+                    "ROS_DOMAIN_ID": 130,
+                    "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp",
+                    "TINKER_SIM_DDS_PROFILE": "local",
+                },
+                "scenario": ({"id": scenario_id} if scenario_id is not None else {}),
+            },
+        )
+
+    def _env_runner(self, root: Path, gate: str) -> QualificationRunner:
+        (root / "validation").mkdir(parents=True, exist_ok=True)
+        (root / "validation/manipulation_contact_sheets.py").write_text(
+            "# contact sheets", encoding="utf-8"
+        )
+        runner = self._runner(root)
+        runner.gate = gate
+        return runner
+
+    def test_integrated_isaac_child_gets_visual_evidence_and_exact_scenario_gate(self) -> None:
+        """F3.4: the integrated Isaac child enables visual evidence with the exact
+        canonical scenario id as the qualification gate (never the bare ``integrated``
+        gate label)."""
+        from validation.integrated_qualification import QUALIFICATION_SCENARIO_NAMES
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = self._env_runner(root, "integrated")
+            canonical = next(iter(QUALIFICATION_SCENARIO_NAMES))
+            manifest = self._visual_manifest(root, scenario_id=canonical)
+            environment = runner._env(manifest, "isaac")
+            self.assertEqual(environment["TINKER_SIM_VISUAL_EVIDENCE"], "1")
+            self.assertEqual(environment["TINKER_SIM_QUALIFICATION_GATE"], canonical)
+
+    def test_integrated_isaac_child_rejects_noncanonical_scenario_before_launch(self) -> None:
+        """F3.10: a present-but-noncanonical integrated scenario id fails closed
+        before child launch using the committed canonical qualification names."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = self._env_runner(root, "integrated")
+            manifest = self._visual_manifest(root, scenario_id="not-a-canonical-scenario")
+            with self.assertRaises(ValueError) as context:
+                runner._env(manifest, "isaac")
+            self.assertIn("not a canonical qualification scenario", str(context.exception))
+
+    def test_integrated_isaac_child_rejects_missing_scenario_before_launch(self) -> None:
+        """F3.4: a missing/malformed integrated scenario identity fails closed
+        before the Isaac child can launch."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = self._env_runner(root, "integrated")
+            manifest = self._visual_manifest(root, scenario_id=None)
+            with self.assertRaises(ValueError) as context:
+                runner._env(manifest, "isaac")
+            self.assertIn("exact scenario id", str(context.exception))
+
+    def test_six_legacy_gates_keep_their_own_gate_env_unchanged(self) -> None:
+        """F3.4: each of the six legacy gates keeps its own gate id as the
+        qualification gate (never a scenario id, never ``integrated``)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, gate in enumerate(GATES):
+                gate_root = root / f"gate-{index}"
+                gate_root.mkdir(parents=True, exist_ok=True)
+                runner = self._env_runner(gate_root, gate)
+                manifest = self._visual_manifest(gate_root, scenario_id="qualification-pick-place-positive")
+                environment = runner._env(manifest, "isaac")
+                self.assertEqual(environment["TINKER_SIM_QUALIFICATION_GATE"], gate)
+                self.assertEqual(environment["TINKER_SIM_VISUAL_EVIDENCE"], "1")
+
+    def test_non_isaac_integrated_roles_never_receive_a_visual_gate(self) -> None:
+        """F3.4: humble and ros-tooling roles in an integrated attempt keep
+        ``TINKER_SIM_VISUAL_EVIDENCE=0`` and the bare ``integrated`` gate label —
+        visual evidence is only ever enabled for the integrated Isaac child."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = self._env_runner(root, "integrated")
+            manifest = self._visual_manifest(root, scenario_id="qualification-pick-place-positive")
+            for role in ("humble", "ros-tooling"):
+                environment = runner._env(manifest, role)
+                self.assertEqual(environment["TINKER_SIM_VISUAL_EVIDENCE"], "0")
+                self.assertEqual(environment["TINKER_SIM_QUALIFICATION_GATE"], "integrated")
 
 
 if __name__ == "__main__":

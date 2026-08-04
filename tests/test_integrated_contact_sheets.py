@@ -383,3 +383,97 @@ def test_contact_sheet_rejects_output_in_indexed_captures(tmp_path):
             image_paths=paths,
             output=suite_dir / entry["path"],
         )
+
+
+# --- Task 9 fix-round-3 tests (F3.7 output-as-input over EVERY evidence input)
+
+
+def test_contact_sheet_rejects_output_equal_indexed_json(tmp_path):
+    """F3.7: output equal to an indexed JSON artifact is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    for rel in (
+        "E/qualification-pick-place-positive/truth-drain.json",
+        "E/qualification-pick-place-positive/gate-verdict.json",
+    ):
+        with pytest.raises(ValueError, match="output-as-input|indexed evidence"):
+            build_contact_sheet(
+                suite_dir=suite_dir,
+                image_paths=paths,
+                output=suite_dir / rel,
+            )
+
+
+def test_contact_sheet_rejects_output_equal_indexed_jsonl(tmp_path):
+    """F3.7: output equal to an indexed JSONL journal is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    for rel in (
+        "E/qualification-pick-place-positive/physics_truth.jsonl",
+        "E/qualification-pick-place-positive/visual-keyframes.jsonl",
+        "E/qualification-pick-place-positive/planning-scene.jsonl",
+    ):
+        with pytest.raises(ValueError, match="output-as-input|indexed evidence"):
+            build_contact_sheet(
+                suite_dir=suite_dir,
+                image_paths=paths,
+                output=suite_dir / rel,
+            )
+
+
+def test_contact_sheet_rejects_output_equal_rosbag_db3(tmp_path):
+    """F3.7: output equal to an indexed rosbag DB3 storage file is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    storage = next(
+        e for e in json.loads((suite_dir / "evidence-index.json").read_text(encoding="utf-8"))["files"]
+        if e.get("category") == "rosbag-storage"
+    )
+    with pytest.raises(ValueError, match="output-as-input|indexed evidence"):
+        build_contact_sheet(
+            suite_dir=suite_dir,
+            image_paths=paths,
+            output=suite_dir / storage["path"],
+        )
+
+
+def test_contact_sheet_rejects_output_equal_metadata(tmp_path):
+    """F3.7: output equal to an indexed metadata.yaml is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    metadata = next(
+        e for e in json.loads((suite_dir / "evidence-index.json").read_text(encoding="utf-8"))["files"]
+        if e.get("category") == "rosbag-metadata"
+    )
+    with pytest.raises(ValueError, match="output-as-input|indexed evidence"):
+        build_contact_sheet(
+            suite_dir=suite_dir,
+            image_paths=paths,
+            output=suite_dir / metadata["path"],
+        )
+
+
+def test_contact_sheet_rejects_output_equal_manifest(tmp_path):
+    """F3.7: output equal to an indexed manifest is rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    manifest = next(
+        e for e in json.loads((suite_dir / "evidence-index.json").read_text(encoding="utf-8"))["files"]
+        if e.get("category") == "manifest"
+    )
+    with pytest.raises(ValueError, match="output-as-input|indexed evidence"):
+        build_contact_sheet(
+            suite_dir=suite_dir,
+            image_paths=paths,
+            output=suite_dir / manifest["path"],
+        )
+
+
+def test_contact_sheet_own_output_path_still_regenerable(tmp_path):
+    """F3.7: the sheet's own expected output path remains regenerable."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    paths = required_capture_paths(suite_dir, events={"readiness"})
+    result = build_contact_sheet(suite_dir, paths, output=suite_dir / AGENT)
+    assert result["role"] == "agent"
+    second = build_contact_sheet(suite_dir, paths, output=suite_dir / AGENT)
+    assert second["role"] == "agent"

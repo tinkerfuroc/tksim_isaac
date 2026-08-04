@@ -91,6 +91,22 @@ work.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 3 — "make integrated
+  evidence production-real"): `simulation/tinker_sim_isaac/qualification_visual_capture.py`
+  now seeds its handled-request-sequence set from the durable
+  `visual-keyframes.jsonl` journal at construction, so a restarted capture
+  consumer never re-captures an already captured request sequence (durable
+  at-most-once, F3.4).  The integrated evidence pipeline is now exercised
+  end-to-end by tests that drive the real executor producer
+  (`_append_visual_request` / `_append_visual_event`), the real capture consumer
+  (fake app/backend), the validator's index/sheets/summary, and Gate F, reaching
+  `verified-pass` only with semantically valid artifacts; a diagnostic-only
+  journal test proves consumer skip + validator ignore + required-events
+  fail-closed.  `_image_stats` thresholds still require live RTX calibration;
+  Task 10 must wire Gate F and launch/finalize a load-bearing integrated rosbag;
+  no live Isaac/camera/rosbag/GPU run occurred in this repair; the future
+  qualification tooling lock remains absent until after review-clean Task 10.
+
 - 2026-08-04 (integrated qualification Task 9, fix round 2 — "produce integrated
   visual evidence"): `simulation/tinker_sim_isaac/qualification_visual_capture.py`
   now co-tenants two request shapes in the same `visual-capture-requests.jsonl`:

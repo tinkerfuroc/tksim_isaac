@@ -65,8 +65,16 @@ PROD_COMMIT = "b" * 40
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 POSITIVE_ID = "qualification-pick-place-positive"
 CANCEL_ID = "qualification-pick-place-cancel-approach"
+CANCEL_TRANSPORT_ID = "qualification-pick-place-cancel-transport"
 SAFETY_ID = "qualification-pick-place-safety-transport"
 MISSING_FP = "0" * 64
+
+# Real RTX GPU inventory emitted by ``_gpu_processes`` (schema_version 2): the
+# ``gpus`` field is the full nvidia-smi inventory, never a survivor list.
+GPU_INVENTORY = [
+    {"index": 0, "uuid": "gpu-6f1a-0000-4a2b-0000", "memory_used_mib": 2048},
+    {"index": 1, "uuid": "gpu-6f1a-1111-4a2b-1111", "memory_used_mib": 1024},
+]
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -142,7 +150,7 @@ def _raw_frame(index: int, scenario_id: str) -> dict[str, object]:
 def _scenario_events(scenario_id: str) -> tuple[str, ...]:
     if scenario_id == POSITIVE_ID:
         return POSITIVE_EVENTS
-    if scenario_id == CANCEL_ID:
+    if scenario_id in (CANCEL_ID, CANCEL_TRANSPORT_ID):
         return CANCEL_EVENTS
     if scenario_id == SAFETY_ID:
         return SAFETY_EVENTS
@@ -157,7 +165,7 @@ def _scenario_integrated(scenario_id: str) -> dict[str, object]:
             "authority": "physics_truth",
             "execution_profile": "sim_ompl",
         }
-    if scenario_id == CANCEL_ID:
+    if scenario_id in (CANCEL_ID, CANCEL_TRANSPORT_ID):
         return {
             "acceptance": {"polarity": "negative"},
             "expected_negative": {"required": ["cancel-quiescent"], "forbidden": ["retention"]},
@@ -432,17 +440,31 @@ def _write_attempt_dir(
         },
     )
 
-    # resource-cleanup.json (real schema_version 2 producer shape).
+    # resource-cleanup.json (real schema_version 2 producer shape): on an RTX
+    # machine ``baseline.gpus``/``final.gpus`` are the FULL nvidia-smi inventory
+    # (non-empty); ``attempt_owned_pids`` is the cumulative historical PID
+    # observation set (non-empty after any child spawn), NOT a live survivor
+    # list.  Live GPU survivors live in ``attempt_owned_gpu_survivors``.
     _write_json(
         attempt_dir / "resource-cleanup.json",
         {
             "schema_version": 2,
-            "baseline": {"available": True, "gpus": [], "processes": []},
-            "final": {"available": True, "gpus": [], "processes": []},
-            "attempt_owned_pids": [],
+            "baseline": {
+                "available": True,
+                "gpus": [dict(gpu) for gpu in GPU_INVENTORY],
+                "processes": [],
+                "errors": [],
+            },
+            "final": {
+                "available": True,
+                "gpus": [dict(gpu) for gpu in GPU_INVENTORY],
+                "processes": [],
+                "errors": [],
+            },
+            "attempt_owned_pids": [1000, 1001],
             "attempt_owned_gpu_survivors": [],
             "unexplained_gpu_memory": [],
-            "memory_tolerance_mib": 512,
+            "memory_tolerance_mib": 32,
             "settle_attempts": [{"attempt": 1, "available": True, "owned_gpu_survivors": [], "unexplained_gpu_memory": []}],
             "clean": True,
             "captured_at": "2026-08-04T00:00:00+00:00",
@@ -469,6 +491,17 @@ def _write_attempt_dir(
             "/sim/status/contract": "std_msgs/msg/String",
             "/sim/status/command_gateway": "std_msgs/msg/String",
         }
+        # F3.8: realistic per-topic offered QoS.  The two
+        # ROSBAG_QOS_OVERRIDE_PROFILES topics carry keep_last/depth1/
+        # reliable/transient_local; the remaining approved publishers are
+        # RELIABLE (with VOLATILE durability) per the overlay publisher contract.
+        override_qos = "- history: 1\n  depth: 1\n  reliability: 1\n  durability: 1\n"
+        volatile_qos = "- history: 1\n  depth: 10\n  reliability: 1\n  durability: 3\n"
+        topic_qos = {
+            "/sim/hardware/safety_stop": override_qos,
+            "/sim/status/contract": override_qos,
+        }
+        storage_name = f"{scenario_id}_0.db3"
         metadata_topics = []
         for topic, topic_type in record_topic_types.items():
             metadata_topics.append(
@@ -476,9 +509,7 @@ def _write_attempt_dir(
                     "topic_metadata": {
                         "name": topic,
                         "type": topic_type,
-                        "offered_qos_profiles": (
-                            "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n"
-                        ),
+                        "offered_qos_profiles": topic_qos.get(topic, volatile_qos),
                     },
                     "message_count": 100,
                 }
@@ -488,6 +519,7 @@ def _write_attempt_dir(
                 "storage_identifier": "sqlite3",
                 "duration": {"nanoseconds": 10000000000},
                 "message_count": 900,
+                "relative_file_paths": [storage_name],
                 "topics_with_message_count": metadata_topics,
             }
         }
@@ -495,11 +527,11 @@ def _write_attempt_dir(
             yaml.safe_dump(metadata_document, sort_keys=False, default_flow_style=False),
             encoding="utf-8",
         )
-        _write_bytes(bag / f"{scenario_id}_0.db3", b"SQLite format 3\x00" + b"\x00" * 24)
+        _write_bytes(bag / storage_name, b"SQLite format 3\x00" + b"\x00" * 24)
 
     # ---- Visual two-journal transaction -------------------------------------
     events = _scenario_events(scenario_id)
-    base_frame = {"qualification-pick-place-positive": 0, CANCEL_ID: 5, SAFETY_ID: 8}[scenario_id]
+    base_frame = {"qualification-pick-place-positive": 0, CANCEL_ID: 5, SAFETY_ID: 8}.get(scenario_id, 5)
     request_rows: list[dict[str, object]] = []
     keyframe_rows: list[dict[str, object]] = []
     for event_index, event in enumerate(events):
@@ -592,22 +624,49 @@ def write_canonical_evidence_tree(
             "stages": {"F": {"cameras": list(CAMERAS)}},
         },
     )
-    # Real nested overlay-contract shape (F2.5): repositories map with
-    # implementation_identity commits + source_locks status.
+    # Real nested overlay-contract shape (F2.5/F3.2): repositories carries the
+    # scalar ``path_scope`` note next to the ``production``/``simulator``
+    # mapping records; source_locks.status is the truthful real value
+    # ``"excluded_in_task_8"`` (not a fabricated ``"pass"``).
     _write_json(
         suite_dir / "overlay-contract.json",
         {
             "schema_version": 1,
             "contract_id": "simulator-ompl-overlay-acceptance",
             "repositories": {
-                "production": {"implementation_identity": PROD_COMMIT},
-                "simulator": {"implementation_identity": SIM_COMMIT},
+                "path_scope": (
+                    "absolute checkout paths and build commands are environment "
+                    "identities for this qualification workspace, not a claim that "
+                    "the contract carries no machine-specific execution policy"
+                ),
+                "production": {
+                    "dirty_policy": "read-only runtime input",
+                    "implementation_identity": PROD_COMMIT,
+                    "path": "/repo/production",
+                },
+                "simulator": {
+                    "dirty_policy": "committed implementation identity is the clean tree",
+                    "implementation_identity": SIM_COMMIT,
+                    "path": "/repo/simulator",
+                },
             },
             "source_locks": {
-                "status": "pass",
+                "note": "Task 8 leaves source-lock creation to the lock-only phase",
+                "production_lock_path": "/repo/production/integration/source-locks.json",
                 "simulator_lock_path": "integration/source-locks.json",
-                "production_lock_path": "integration/source-locks.json",
+                "status": "excluded_in_task_8",
             },
+        },
+    )
+    _write_json(
+        suite_dir / "integration" / "source-locks.json",
+        {
+            "schema_version": 1,
+            "authorization": {"phase": "task-9b-simulator-repository-lock-only"},
+            "repository": "simulator",
+            "implementation_head": SIM_COMMIT,
+            "mode": "clean",
+            "status": "pass",
         },
     )
     # Attempt-start identity (real orchestrator producer schema).
@@ -957,7 +1016,8 @@ def test_cancel_event_missing_fails_gate_f(tmp_path):
     )
     verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
     reasons = " ".join(verdict["reasons"]).lower()
-    assert "missing required visual event" in reasons
+    assert "missing required" in reasons
+    assert CANCEL_ID in reasons
     assert "cancel-trigger" in reasons
 
 
@@ -1453,6 +1513,21 @@ def test_planning_scene_journal_without_final_fails_gate_f(tmp_path):
     assert "has a journal but no final artifact" in " ".join(verdict["reasons"])
 
 
+def test_genuine_attempt_failure_status_not_schema_domain_error(tmp_path):
+    """F3.10: a genuine attempt-failure status (``evidence-invalid``) in the
+    executor's moveit rows is a valid in-domain status, never a schema-domain
+    diagnostic -- the allowed status domain is not broadened, only kept truthful."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    moveit = suite_dir / "E" / POSITIVE_ID / "moveit-plans.jsonl"
+    rows = [json.loads(line) for line in moveit.read_text(encoding="utf-8").splitlines()]
+    rows[0]["status"] = "evidence-invalid"
+    _rewrite_jsonl(moveit, rows)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert "out-of-domain status" not in reasons
+    assert "unrecognized-capture-request-shape" not in reasons
+
+
 def test_rosbag_missing_approved_topic_fails_gate_f(tmp_path):
     """F2.7: the full 11-topic approved record set is required."""
     import yaml
@@ -1485,12 +1560,860 @@ def test_rosbag_topic_type_mismatch_fails_gate_f(tmp_path):
     assert "does not match expected" in " ".join(verdict["reasons"])
 
 
+# --- Task 9 fix-round-3 F3.8 rosbag QoS/storage closure ----------------------
+
+
+def _rosbag_document(suite_dir: Path) -> dict[str, object]:
+    import yaml
+
+    metadata = suite_dir / "E" / POSITIVE_ID / "rosbag" / "metadata.yaml"
+    document = yaml.safe_load(metadata.read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    return document
+
+
+def _write_rosbag_document(suite_dir: Path, document: object) -> None:
+    import yaml
+
+    metadata = suite_dir / "E" / POSITIVE_ID / "rosbag" / "metadata.yaml"
+    metadata.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+
+def _topic_metadata(document: dict[str, object], topic: str) -> dict[str, object]:
+    root = document["rosbag2_bagfile_information"]
+    assert isinstance(root, dict)
+    for record in root["topics_with_message_count"]:
+        assert isinstance(record, dict)
+        if record["topic_metadata"]["name"] == topic:
+            return record
+    raise AssertionError(topic)
+
+
+def test_rosbag_wrong_qos_reliability_fails_gate_f(tmp_path):
+    """F3.8: a best-effort profile on a RELIABLE publisher fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/clock")
+    record["topic_metadata"]["offered_qos_profiles"] = (
+        "- history: 1\n  depth: 10\n  reliability: 2\n  durability: 3\n"
+    )
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "no reliable QoS profile" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_malformed_qos_fails_gate_f(tmp_path):
+    """F3.8: a non-YAML-list offered_qos_profiles fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/clock")
+    record["topic_metadata"]["offered_qos_profiles"] = "not a yaml list"
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "not a YAML profile list" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_malformed_qos_rmw_fields_fails_gate_f(tmp_path):
+    """F3.8: an invalid RMW history enum value fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/clock")
+    record["topic_metadata"]["offered_qos_profiles"] = (
+        "- history: 99\n  depth: 10\n  reliability: 1\n  durability: 3\n"
+    )
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "malformed RMW QoS fields" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_override_qos_mismatch_fails_gate_f(tmp_path):
+    """F3.8: /sim/hardware/safety_stop must match the recorder override QoS."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/sim/hardware/safety_stop")
+    record["topic_metadata"]["offered_qos_profiles"] = (
+        "- history: 1\n  depth: 5\n  reliability: 1\n  durability: 1\n"
+    )
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "recorder override contract" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_missing_storage_file_fails_gate_f(tmp_path):
+    """F3.8: a metadata-listed storage file that does not exist fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    root = document["rosbag2_bagfile_information"]
+    assert isinstance(root, dict)
+    root["relative_file_paths"] = ["missing_0.db3"]
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "missing storage file" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_empty_storage_file_fails_gate_f(tmp_path):
+    """F3.8: an empty storage file fails (nonzero bytes required)."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "E" / POSITIVE_ID / "rosbag" / "qualification-pick-place-positive_0.db3").write_bytes(b"")
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "storage file is empty" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_extra_conflicting_storage_fails_gate_f(tmp_path):
+    """F3.8: a storage file not listed in metadata is a metadata/storage disagreement."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "E" / POSITIVE_ID / "rosbag" / "extra_0.db3").write_bytes(
+        b"SQLite format 3\x00" + b"\x00" * 24
+    )
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "not listed in metadata" in " ".join(verdict["reasons"])
+
+
+def test_rosbag_missing_relative_file_paths_fails_gate_f(tmp_path):
+    """F3.8: metadata without relative_file_paths is a storage-closure failure."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    document = _rosbag_document(suite_dir)
+    root = document["rosbag2_bagfile_information"]
+    assert isinstance(root, dict)
+    del root["relative_file_paths"]
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "no relative_file_paths" in " ".join(verdict["reasons"])
+
+
 def test_cleanup_clean_flag_contradiction_fails_gate_f(tmp_path):
-    """F2.8: clean=True that contradicts the recorded final/owned state fails."""
+    """F3.1: a lying clean=True that contradicts a recorded owned GPU survivor fails.
+
+    The real RTX producer shape (non-empty ``final.gpus`` inventory,
+    non-empty historical ``attempt_owned_pids``) is NOT a contradiction; a
+    ``clean:true`` claim that hides a live owned GPU survivor is.
+    """
     suite_dir = make_complete_evidence_suite(tmp_path)
     cleanup = suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json"
     value = json.loads(cleanup.read_text(encoding="utf-8"))
-    value["final"] = {"available": True, "gpus": [{"id": 0, "name": "NVIDIA"}], "processes": []}
+    value["attempt_owned_gpu_survivors"] = [{"pid": 999, "name": "isaac", "gpu_index": 0}]
     cleanup.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
     verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert "contradicts the recorded" in reasons
+
+
+# --- Task 9 fix-round-3 tests (F3.1-F3.10) -----------------------------------
+
+
+def _rewrite_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _cleanup_value(suite_dir: Path, scenario_id: str = POSITIVE_ID) -> dict[str, object]:
+    cleanup = suite_dir / "E" / scenario_id / "resource-cleanup.json"
+    value = json.loads(cleanup.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
+def test_cleanup_real_gpu_inventory_passes_gate_f(tmp_path):
+    """F3.1: the real non-empty GPU inventory with historical owned pids passes."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert "resource cleanup not clean" not in reasons
+    assert "contradicts the recorded" not in reasons
+    assert "owned pids surviving" not in reasons
+
+
+def test_cleanup_gpu_topology_identity_change_fails_gate_f(tmp_path):
+    """F3.1: a removed/added/mutated GPU identity fails (stable uuid keys)."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["final"]["gpus"] = [
+        {"index": 0, "uuid": "gpu-other-0000-4a2b-0000", "memory_used_mib": 2048},
+        {"index": 1, "uuid": "gpu-6f1a-1111-4a2b-1111", "memory_used_mib": 1024},
+    ]
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "GPU topology" in " ".join(verdict["reasons"])
+
+
+def test_cleanup_gpu_topology_removed_gpu_fails_gate_f(tmp_path):
+    """F3.1: a GPU present at baseline but absent at final is a topology change."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["final"]["gpus"] = [dict(value["baseline"]["gpus"][0])]
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "GPU topology" in " ".join(verdict["reasons"])
+
+
+def test_cleanup_owned_gpu_survivor_fails_gate_f(tmp_path):
+    """F3.1: a live attempt-owned GPU survivor fails even when clean is false."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["clean"] = False
+    value["attempt_owned_gpu_survivors"] = [{"pid": 1234, "name": "isaac", "gpu_index": 0}]
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert "resource cleanup not clean" in reasons
+    assert "owned gpu survivor" in reasons
+
+
+def test_cleanup_unexplained_gpu_memory_fails_gate_f(tmp_path):
+    """F3.1: unexplained GPU memory growth fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["unexplained_gpu_memory"] = [{"gpu": "gpu-6f1a-0000-4a2b-0000", "unexplained_growth_mib": 8192}]
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "unexplained_gpu_memory" in " ".join(verdict["reasons"])
+
+
+def test_cleanup_historical_owned_pids_do_not_fail_gate_f(tmp_path):
+    """F3.1: cumulative historical owned pids are not live survivors."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["attempt_owned_pids"] = [1000, 1001, 1002, 1003]
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "owned pids surviving" not in " ".join(verdict["reasons"])
+
+
+def test_cleanup_availability_failure_fails_gate_f(tmp_path):
+    """F3.1: a final unavailable snapshot fails even with clean flag true."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    value = _cleanup_value(suite_dir)
+    value["final"]["available"] = False
+    value["final"]["gpus"] = []
+    value["clean"] = True
+    _rewrite_json(suite_dir / "E" / POSITIVE_ID / "resource-cleanup.json", value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
     assert "contradicts the recorded" in " ".join(verdict["reasons"])
+
+
+def test_overlay_path_scope_scalar_is_accepted(tmp_path):
+    """F3.2: the real scalar ``repositories.path_scope`` is accepted."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "path_scope" not in " ".join(verdict["reasons"])
+    assert verdict["status"] == "verified-fail" or "not an object" not in " ".join(verdict["reasons"])
+
+
+def test_overlay_scalar_garbage_under_repository_key_fails(tmp_path):
+    """F3.2: a scalar under a repository mapping key still fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    value["repositories"]["production"] = "not-a-mapping"
+    _rewrite_json(overlay, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "production" in " ".join(verdict["reasons"])
+
+
+def test_overlay_missing_production_fails(tmp_path):
+    """F3.2: removing the production repository mapping fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    del value["repositories"]["production"]
+    _rewrite_json(overlay, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "production" in " ".join(verdict["reasons"])
+
+
+def test_overlay_malformed_identity_fails(tmp_path):
+    """F3.2: a non-40-hex implementation identity fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    value["repositories"]["simulator"]["implementation_identity"] = "A" * 40
+    _rewrite_json(overlay, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "40-hex" in " ".join(verdict["reasons"])
+
+
+def test_overlay_malformed_path_scope_fails(tmp_path):
+    """F3.2: a non-scalar ``path_scope`` is malformed."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    value["repositories"]["path_scope"] = {"nested": True}
+    _rewrite_json(overlay, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "path_scope" in " ".join(verdict["reasons"])
+
+
+def test_overlay_source_locks_missing_status_fails(tmp_path):
+    """F3.2: source_locks must be a mapping with a truthful non-empty status."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    overlay = suite_dir / "overlay-contract.json"
+    value = json.loads(overlay.read_text(encoding="utf-8"))
+    del value["source_locks"]["status"]
+    _rewrite_json(overlay, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "source_locks" in " ".join(verdict["reasons"])
+
+
+def test_overlay_source_locks_binding_missing_file_fails(tmp_path):
+    """F3.2: simulator_lock_path must resolve to an existing source-lock artifact."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "integration" / "source-locks.json").unlink()
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "source-locks.json" in " ".join(verdict["reasons"])
+
+
+# --- F3.3 per-attempt visual evidence closure --------------------------------
+
+
+def _add_sibling_cancel(suite_dir: Path) -> Path:
+    """Add a second cancel scenario (cancel-transport) as a full attempt dir."""
+    _write_attempt_dir(
+        suite_dir, CANCEL_TRANSPORT_ID,
+        attempt_id="attempt-cancel-transport",
+        include_rosbag=False,
+        include_planning_scene=False,
+    )
+    return suite_dir
+
+
+def test_missing_sibling_attempt_fails_per_attempt(tmp_path):
+    """F3.3: a sibling cancel attempt never satisfies another attempt's events."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    _add_sibling_cancel(suite_dir)
+    # Remove every capture/keyframe from the transport sibling: the approach
+    # sibling still has all cancel events, but transport must prove its own.
+    for keyframe in (suite_dir / "E" / CANCEL_TRANSPORT_ID / "visual-keyframes.jsonl",):
+        keyframe.unlink()
+    for png in (suite_dir / "E" / CANCEL_TRANSPORT_ID / "visual/source").glob("*.png"):
+        png.unlink()
+    index = _final_index(suite_dir)
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert verdict["status"] == "verified-fail"
+    assert CANCEL_TRANSPORT_ID in reasons
+    assert "missing required" in reasons
+
+
+def test_split_events_across_siblings_fails_per_attempt(tmp_path):
+    """F3.3: cancel events split across two siblings still fail for both."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    _add_sibling_cancel(suite_dir)
+    # Approach keeps cancel-execution-start + cancel-trigger; transport keeps
+    # cancel-velocity-compliant + cancel-terminal.  Neither has the full set.
+    approach = suite_dir / "E" / CANCEL_ID / "visual-keyframes.jsonl"
+    approach_rows = [
+        r for r in (json.loads(line) for line in approach.read_text(encoding="utf-8").splitlines())
+        if r["event"] in ("cancel-execution-start", "cancel-trigger")
+    ]
+    _rewrite_jsonl(approach, approach_rows)
+    transport = suite_dir / "E" / CANCEL_TRANSPORT_ID / "visual-keyframes.jsonl"
+    transport_rows = [
+        r for r in (json.loads(line) for line in transport.read_text(encoding="utf-8").splitlines())
+        if r["event"] in ("cancel-velocity-compliant", "cancel-terminal")
+    ]
+    _rewrite_jsonl(transport, transport_rows)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    assert verdict["status"] == "verified-fail"
+    assert CANCEL_ID in reasons and CANCEL_TRANSPORT_ID in reasons
+    assert "missing required" in reasons
+
+
+def test_duplicate_event_across_attempts_fails(tmp_path):
+    """F3.3: the same (event, camera) identity in two attempts is a duplicate."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    _add_sibling_cancel(suite_dir)
+    # Append the approach's first keyframe into the transport journal: the
+    # (event, camera) identity is now owned by two attempts.
+    approach = suite_dir / "E" / CANCEL_ID / "visual-keyframes.jsonl"
+    first = json.loads(approach.read_text(encoding="utf-8").splitlines()[0])
+    transport = suite_dir / "E" / CANCEL_TRANSPORT_ID / "visual-keyframes.jsonl"
+    with transport.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(first, sort_keys=True) + "\n")
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "duplicate-keyframe-identity" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_partial_sheet_metadata_with_complete_global_captures_fails(tmp_path):
+    """F3.3: a sheet embedding only a subset of events fails even when the global
+    capture set is complete."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    # Rewrite the agent sheet's embedded metadata to a partial event set while
+    # leaving every capture on disk untouched.
+    from PIL import Image, PngImagePlugin
+
+    from validation.integrated_contact_sheets import AGENT_NAME as AGENT_FILE
+
+    sheet_path = suite_dir / AGENT_FILE
+    with Image.open(sheet_path) as image:
+        image.load()
+        metadata = json.loads(image.text["tinker.qualification.metadata"])
+    metadata["events"] = list(POSITIVE_EVENTS)
+    pnginfo = PngImagePlugin.PngInfo()
+    pnginfo.add_text("tinker.qualification.metadata", json.dumps(metadata, sort_keys=True))
+    image_out = Image.open(sheet_path)
+    image_out.load()
+    image_out.save(sheet_path, format="PNG", pnginfo=pnginfo)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "complete required suite event sequence" in " ".join(verdict["reasons"])
+
+
+def test_contact_sheet_event_order_mismatch_fails(tmp_path):
+    """F3.3: a sheet embedding the right events in the wrong order fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    render_sheets(suite_dir)
+    from PIL import Image, PngImagePlugin
+
+    from validation.integrated_contact_sheets import AGENT_NAME as AGENT_FILE
+
+    sheet_path = suite_dir / AGENT_FILE
+    with Image.open(sheet_path) as image:
+        image.load()
+        metadata = json.loads(image.text["tinker.qualification.metadata"])
+    full = list(REQUIRED_POSITIVE_EVENTS + CANCEL_EVENTS + SAFETY_EVENTS)
+    metadata["events"] = list(reversed(full))
+    pnginfo = PngImagePlugin.PngInfo()
+    pnginfo.add_text("tinker.qualification.metadata", json.dumps(metadata, sort_keys=True))
+    image_out = Image.open(sheet_path)
+    image_out.load()
+    image_out.save(sheet_path, format="PNG", pnginfo=pnginfo)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "complete required suite event sequence" in " ".join(verdict["reasons"])
+
+
+def test_wrong_scenario_id_binding_fails(tmp_path):
+    """F3.3: a keyframe whose gate disagrees with its request/attempt fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    keyframes = suite_dir / "E" / CANCEL_ID / "visual-keyframes.jsonl"
+    rows = [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+    rows[0]["gate"] = SAFETY_ID
+    _rewrite_jsonl(keyframes, rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "keyframe-request-sequence-mismatch" in codes or "keyframe-scenario-mismatch" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+# --- F3.5 keyframe request-time / source-sequence binding --------------------
+
+
+def _first_keyframe_rows(suite_dir: Path) -> list[dict[str, object]]:
+    keyframes = suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl"
+    return [json.loads(line) for line in keyframes.read_text(encoding="utf-8").splitlines()]
+
+
+def test_keyframe_request_time_mismatch_fails(tmp_path):
+    """F3.5: requested_simulated_timestamp disagreeing with the request fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["requested_simulated_timestamp"] = float(rows[0]["requested_simulated_timestamp"]) + 0.1
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "keyframe-request-time-mismatch" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_request_frame_mismatch_fails(tmp_path):
+    """F3.5: requested_physics_frame_index disagreeing with the raw frame fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["requested_physics_frame_index"] = int(rows[0]["requested_physics_frame_index"]) + 1
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "keyframe-request-frame-mismatch" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_latency_out_of_range_fails(tmp_path):
+    """F3.5: capture_latency_frames beyond [0, MAX_CAPTURE_LATENCY_FRAMES] fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["capture_latency_frames"] = 5
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "keyframe-latency-out-of-range" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_latency_negative_fails(tmp_path):
+    """F3.5: a negative capture_latency_frames fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["capture_latency_frames"] = -1
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "keyframe-latency-out-of-range" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_keyframe_source_sequence_mismatch_fails(tmp_path):
+    """F3.5: execution_event_sequence disagreeing with source_execution_event_sequence fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[0]["execution_event_sequence"] = int(rows[0]["execution_event_sequence"]) + 1
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    assert any(d.get("code") == "keyframe-source-sequence-mismatch" for d in index.get("diagnostics", []))
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_duplicate_capture_path_fails(tmp_path):
+    """F3.5: two keyframes writing the same capture path is a duplicate.
+
+    rows[1] is readiness/manipulation_closeup; pointing it at the readiness/
+    overview PNG gives a distinct (event, camera) identity but a duplicate
+    canonical capture path.
+    """
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    rows = _first_keyframe_rows(suite_dir)
+    rows[1]["path"] = rows[0]["path"]
+    _rewrite_jsonl(suite_dir / "E" / POSITIVE_ID / "visual-keyframes.jsonl", rows)
+    index = _final_index(suite_dir)
+    codes = {d["code"] for d in index.get("diagnostics", [])}
+    assert "duplicate-capture-path" in codes
+    verdict = validate_gate_f(index, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+
+
+def test_stray_source_png_without_keyframe_fails(tmp_path):
+    """F3.5: a visual/source/*.png with no keyframe is an unbound capture."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "E" / POSITIVE_ID / "visual/source/0099-stray-extra.png").write_bytes(
+        (suite_dir / "E" / POSITIVE_ID / "visual/source/0001-readiness-overview.png").read_bytes()
+    )
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "unbound capture" in " ".join(verdict["reasons"])
+
+
+# --- F3.6 identity / relocation binding closure ------------------------------
+
+
+def test_verdict_schema_version_mismatch_fails(tmp_path):
+    """F3.6: a verdict with the wrong schema_version fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    verdict_path = suite_dir / "E" / POSITIVE_ID / "gate-verdict.json"
+    value = json.loads(verdict_path.read_text(encoding="utf-8"))
+    value["schema_version"] = 2
+    _rewrite_json(verdict_path, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "schema_version" in " ".join(verdict["reasons"])
+
+
+def test_verdict_not_pass_verified_fails(tmp_path):
+    """F3.6: a verdict that is not pass+verified fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    verdict_path = suite_dir / "E" / POSITIVE_ID / "gate-verdict.json"
+    value = json.loads(verdict_path.read_text(encoding="utf-8"))
+    value["pass"] = False
+    _rewrite_json(verdict_path, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "not pass+verified" in " ".join(verdict["reasons"])
+
+
+def test_verdict_missing_enclosing_manifest_fails(tmp_path):
+    """F3.6: a missing enclosing manifest is a failure, never a skipped check."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    (suite_dir / "E" / POSITIVE_ID / "manifest.json").unlink()
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "no enclosing manifest" in " ".join(verdict["reasons"])
+
+
+def test_bundle_scenario_relocation_fails(tmp_path):
+    """F3.6: scenario-bundle scenario_id disagreeing with manifest scenario.id fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    bundle = suite_dir / "E" / POSITIVE_ID / "scenario-bundle.json"
+    value = json.loads(bundle.read_text(encoding="utf-8"))
+    value["scenario_id"] = CANCEL_ID
+    _rewrite_json(bundle, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "does not match manifest scenario.id" in " ".join(verdict["reasons"])
+
+
+def test_config_seed_mismatch_fails(tmp_path):
+    """F3.6: a config seed disagreeing with the manifest seed fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    config = suite_dir / "config" / "integrated-ompl.json"
+    value = json.loads(config.read_text(encoding="utf-8"))
+    value["seed"] = 99
+    _rewrite_json(config, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "config seed does not match manifest seed" in " ".join(verdict["reasons"])
+
+
+def test_source_identities_overlay_mismatch_fails(tmp_path):
+    """F3.6: source-identities disagreeing with the overlay contract fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    identities = suite_dir / f"gate-b-{SUITE_ATTEMPT}" / "source-identities.json"
+    value = json.loads(identities.read_text(encoding="utf-8"))
+    value["source_identities"]["production"] = "c" * 40
+    _rewrite_json(identities, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "does not match overlay" in " ".join(verdict["reasons"])
+
+
+def test_model_fingerprint_static_mismatch_fails(tmp_path):
+    """F3.6: model-fingerprint disagreeing with the static contract fails."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    fingerprint = suite_dir / f"gate-b-{SUITE_ATTEMPT}" / "model-fingerprint.json"
+    value = json.loads(fingerprint.read_text(encoding="utf-8"))
+    value["model_fingerprint"] = "cd" * 32
+    _rewrite_json(fingerprint, value)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "model fingerprint does not match static contract" in " ".join(verdict["reasons"])
+
+
+# --------------------------------------------------------------------------- #
+# F3.4 true integrated producer path
+#
+# The end-to-end transaction is driven by the real producers, never by
+# hand-written canonical journals: the integrated executor's
+# ``_append_visual_request`` / ``_append_visual_event`` write the request journal
+# at durable checkpoints, the real ``QualificationVisualCapture`` (fake
+# app/backend) consumes those requests into source PNGs + keyframes, and the
+# validator's index/sheet/summary/Gate-F pipeline accepts the result only when
+# every artifact is semantically valid.  A separate diagnostic-only journal test
+# proves consumer skip + validator ignore + required-events fail-closed.
+# ---------------------------------------------------------------------------
+
+
+class _F34JournalStub:
+    """Producer-facing journal double exposing only the durable checkpoint count."""
+
+    def __init__(self, record_count: int = 0) -> None:
+        self.record_count = int(record_count)
+
+
+class _F34Backend:
+    """Deterministic physics-truth double for the capture-consumer backend seam."""
+
+    def __init__(self, dt: float) -> None:
+        self.dt = dt
+        self.physics_frame_index = 0
+        self.simulation_time = 0.0
+
+    def render_frame(self) -> None:
+        return None
+
+
+class _F34Sensor:
+    def __init__(self, array: object) -> None:
+        self.array = array
+
+    def get_data(self, annotator: str):
+        if annotator == "rgb":
+            return self.array, {"width": 960, "height": 540, "frames": 1}
+        return None, {}
+
+    def close(self) -> None:
+        return None
+
+
+def _f34_rgb_array():
+    import numpy as np
+
+    return (
+        np.arange(540 * 960 * 3, dtype=np.int32).reshape(540, 960, 3) % 256
+    ).astype(np.uint8)
+
+
+def _f34_producer(attempt_dir: Path, frames: list[int]):
+    """Build a real ``IntegratedGateExecutor`` harness bound to one attempt dir.
+
+    The harness reaches the real ``_join_key`` / ``_append_visual_request`` /
+    ``_append_visual_event`` producer machinery with a strictly-advancing
+    physics-truth join key and a durable journal checkpoint counter — no ROS, no
+    Isaac, no camera.  The join key is the strict current physics-truth tail and
+    the durable checkpoint count is the source execution sequence.
+    """
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.attempt_dir = Path(attempt_dir)
+    executor._emitted_visual_events = set()
+    executor._visual_event_failures = []
+    executor._visual_event_sequence = 0
+    executor._last_join_key = None
+    executor.journal = _F34JournalStub(record_count=0)
+    cursor = {"n": 0}
+
+    def _advancing_join():
+        frame = frames[cursor["n"]]
+        cursor["n"] += 1
+        return (frame, frame / PHYSICS_HZ)
+
+    executor.join_key_provider = _advancing_join
+    return executor
+
+
+def _f34_emit_positive(executor, scenario_id: str) -> list[str]:
+    """Emit the real executor diagnostic + canonical requests for a positive flow."""
+    spec = {"target_pose": None}
+    executor._append_visual_request("before", scenario_id, spec, kind="gate-e-diagnostic")
+    executor._append_visual_request("before-pick", scenario_id, spec, kind="gate-e-diagnostic")
+    statuses: list[str] = []
+    for index, event in enumerate(REQUIRED_POSITIVE_EVENTS):
+        executor.journal.record_count = 10 + index
+        key = executor._join_key()
+        assert key is not None
+        statuses.append(executor._append_visual_event(event, scenario_id))
+    executor._append_visual_request("terminal", scenario_id, spec, kind="gate-e-diagnostic")
+    return statuses
+
+
+def _f34_capture(monkeypatch, attempt_dir: Path, gate: str, backend, frames: list[int]):
+    """Drive the real ``QualificationVisualCapture`` through its env factory."""
+    from simulation.tinker_sim_isaac.qualification_visual_capture import (
+        QualificationVisualCapture,
+    )
+
+    sensors = {
+        "overview": _F34Sensor(_f34_rgb_array()),
+        "manipulation_closeup": _F34Sensor(_f34_rgb_array()),
+    }
+
+    def _fake_initialize(self):
+        self._sensors = dict(sensors)
+
+    monkeypatch.setattr(QualificationVisualCapture, "_initialize_cameras", _fake_initialize)
+    monkeypatch.setenv("TINKER_SIM_VISUAL_EVIDENCE", "1")
+    monkeypatch.setenv("TINKER_SIM_ATTEMPT_DIR", str(attempt_dir))
+    monkeypatch.setenv("TINKER_SIM_QUALIFICATION_GATE", gate)
+    capture = QualificationVisualCapture.from_environment(app=object(), backend=backend)
+    assert capture is not None
+    for frame in frames:
+        backend.physics_frame_index = frame
+        backend.simulation_time = frame / PHYSICS_HZ
+        capture.poll()
+    return capture
+
+
+def _f34_request_rows(attempt_dir: Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in (attempt_dir / "visual-capture-requests.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+
+
+def test_f34_integrated_producer_path_gate_f_verified_pass(tmp_path, monkeypatch):
+    """F3.4: real executor producer -> real capture consumer -> index/sheets/
+    summary -> Gate F ``verified-pass`` accepts genuine artifacts."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    attempt_dir = suite_dir / "E" / POSITIVE_ID
+
+    # Drop the factory-written visual transaction; it is re-produced below by the
+    # real executor producer and real capture consumer.
+    (attempt_dir / "visual-capture-requests.jsonl").unlink()
+    (attempt_dir / "visual-keyframes.jsonl").unlink()
+    for png in (attempt_dir / "visual/source").glob("*.png"):
+        png.unlink()
+
+    # 1+2. Real executor canonical requests at durable checkpoints.
+    frames = [10, 20, 30, 40, 50, 60, 70]
+    executor = _f34_producer(attempt_dir, frames)
+    statuses = _f34_emit_positive(executor, POSITIVE_ID)
+    assert statuses == ["recorded"] * len(REQUIRED_POSITIVE_EVENTS)
+
+    requests = _f34_request_rows(attempt_dir)
+    sequence_rows = [
+        r for r in requests
+        if isinstance(r.get("sequence"), int) and not isinstance(r.get("sequence"), bool)
+    ]
+    diagnostic_rows = [r for r in requests if r.get("diagnostic_only") is True]
+    assert len(sequence_rows) == len(REQUIRED_POSITIVE_EVENTS)
+    assert len(diagnostic_rows) == 3
+    for index, row in enumerate(sequence_rows):
+        assert row["schema_version"] == 1
+        assert row["sequence"] == index + 1
+        assert row["gate"] == POSITIVE_ID
+        assert row["event"] == REQUIRED_POSITIVE_EVENTS[index]
+        assert row["simulated_timestamp"] == frames[index] / PHYSICS_HZ
+        assert row["source_execution_event_sequence"] == 10 + index
+
+    # 3+4. Real capture consumer produces source PNGs + keyframes (env-derived gate).
+    backend = _F34Backend(dt=1.0 / PHYSICS_HZ)
+    capture = _f34_capture(monkeypatch, attempt_dir, POSITIVE_ID, backend, frames)
+    assert capture._errors == []
+    capture.close()
+
+    pngs = sorted((attempt_dir / "visual/source").glob("*.png"))
+    assert len(pngs) == 2 * len(REQUIRED_POSITIVE_EVENTS)
+    keyframes = [
+        json.loads(line)
+        for line in (attempt_dir / "visual-keyframes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert len(keyframes) == 2 * len(REQUIRED_POSITIVE_EVENTS)
+    by_event: dict[str, int] = {}
+    for record in keyframes:
+        assert record["gate"] == POSITIVE_ID
+        assert record["capture_latency_frames"] == 0
+        assert record["max_capture_latency_frames"] == 4
+        assert record["requested_physics_frame_index"] == record["raw_frame_index"]
+        assert (attempt_dir / record["path"]).is_file()
+        by_event[record["event"]] = by_event.get(record["event"], 0) + 1
+    assert set(by_event) == set(REQUIRED_POSITIVE_EVENTS)
+    assert all(count == 2 for count in by_event.values())
+
+    # 5. The remaining production-shaped artifacts are the factory's (raw/
+    # evaluator/drain, scene, MoveIt/controller, verdict, cleanup, rosbag,
+    # source/provenance).  6+7. Index + sheets + summary + Gate F verified-pass.
+    rebuild_index(suite_dir)
+    render_sheets(suite_dir)
+    summary = build_qualification_summary(suite_dir)
+    assert summary["status"] == "verified-pass", summary["reasons"]
+    assert summary["reasons"] == []
+    final = _final_index(suite_dir)
+    verdict = validate_gate_f(final, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-pass", verdict["reasons"]
+
+
+def test_f34_diagnostic_only_journal_fails_closed(tmp_path, monkeypatch):
+    """F3.4: an attempt whose request journal holds only executor diagnostic
+    records proves consumer skip + validator ignore + required-events fail-closed."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    attempt_dir = suite_dir / "E" / POSITIVE_ID
+
+    # Replace the real visual transaction with ONLY executor diagnostic records.
+    (attempt_dir / "visual-capture-requests.jsonl").unlink()
+    (attempt_dir / "visual-keyframes.jsonl").unlink()
+    for png in (attempt_dir / "visual/source").glob("*.png"):
+        png.unlink()
+    executor = _f34_producer(attempt_dir, [10])
+    spec = {"target_pose": None}
+    for phase in ("before", "before-pick", "after", "terminal"):
+        executor._append_visual_request(phase, POSITIVE_ID, spec, kind="gate-e-diagnostic")
+
+    # Consumer skip: polling the diagnostic-only journal never captures.
+    backend = _F34Backend(dt=1.0 / PHYSICS_HZ)
+    capture = _f34_capture(monkeypatch, attempt_dir, POSITIVE_ID, backend, [10])
+    assert capture._errors == []
+    assert capture._handled_sequences == set()
+    assert not (attempt_dir / "visual-keyframes.jsonl").exists()
+    assert not list((attempt_dir / "visual/source").glob("*.png"))
+
+    # Validator ignore: the diagnostic records are recognized, never misparsed,
+    # and never drive capture.
+    rebuild_index(suite_dir)
+    final = _final_index(suite_dir)
+    assert final.get("diagnostics") == []
+    # Required-events fail-closed: POSITIVE_ID has no canonical capture event.
+    verdict = validate_gate_f(final, suite_dir=suite_dir)
+    assert verdict["status"] == "verified-fail"
+    joined = " ".join(verdict["reasons"])
+    assert "missing required positive visual events" in joined
+    assert "unrecognized-capture-request-shape" not in joined
+    assert "capture-request-without-image" not in joined

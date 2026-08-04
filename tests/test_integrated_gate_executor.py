@@ -2352,3 +2352,762 @@ def test_post_grasp_lift_m_transport_kind_set_is_exact():
         "safety-transport",
         "occupied-place",
     }
+
+
+# ---------------------------------------------------------------------------
+# F3.9: fail-dominant visual-event producer routing.
+#
+# A required canonical visual event that cannot be durably recorded (duplicate,
+# no-join-key, invalid timestamp, rejected append, or any other non-"recorded"
+# producer status) must make the current diagnostic attempt ``evidence-invalid``
+# through the fail-dominant finalization path — never a silent pass with missing
+# visual evidence, and never a fabricated capture.  These tests drive the real
+# executor flows (E positive / E cancel / E safety and D cancel / D safety) to
+# the exact first required visual event and inject a producer failure.
+# ---------------------------------------------------------------------------
+
+
+class _JournalStub:
+    """Minimal producer-facing journal double exposing only ``record_count``."""
+
+    def __init__(self, record_count: int) -> None:
+        self.record_count = int(record_count)
+
+
+class _StubSpinner:
+    """Stand-in for ``ExecutorSingleThreadedExecutor`` (never spun in these tests)."""
+
+    def spin_once(self, timeout_sec: object = 0.05) -> None:
+        return None
+
+
+def _flow_executor(
+    tmp_path: Path,
+    scenario_name: str,
+    *,
+    required_event_order: Sequence[str],
+    forbidden_events: Sequence[str],
+):
+    """Build a real executor harness able to reach the first required visual event.
+
+    Constructs the real ``IntegratedGateExecutor`` via ``object.__new__`` with
+    every per-attempt attribute the D/E flows touch before the first
+    ``_append_visual_event`` call: a real PlanningScene journal, an advancing
+    join-key provider, a genuine passing readiness snapshot derived from the
+    scenario contract, a valid fixture scene carrying the exact declared
+    geometry projection digest, and the receipt/latch seams the reset and
+    preamble paths clear.  No ROS, no Isaac, no camera.
+    """
+    from planning_scene_journal import PlanningSceneJournal, load_model_touch_contract
+
+    from validation.integrated_gate_executor import (
+        TARGET_OBJECT_ID,
+        TASK_NAMESPACE,
+        expected_fixture_geometry_digest,
+    )
+
+    contract = scenario_report_contract(scenario_name)
+    declaration = contract["planning_scene_declaration"]
+    touch = load_model_touch_contract()
+    journal = PlanningSceneJournal(
+        fixture_revision=declaration["revision"],
+        task_namespace=TASK_NAMESPACE,
+        target_object_id=TARGET_OBJECT_ID,
+        expected_attach_link=touch["link_tcp"],
+        expected_touch_links=touch["touch_links"],
+        required_event_order=tuple(required_event_order),
+        forbidden_events=tuple(forbidden_events),
+        jsonl_path=tmp_path / "planning-scene.jsonl",
+    )
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.config = _config()
+    executor.scenario = readiness_scenario(contract)
+    executor.attempt_dir = tmp_path
+    executor.journal = journal
+    counter = {"n": 0}
+
+    def _advancing_join():
+        counter["n"] += 1
+        return (counter["n"], float(counter["n"]))
+
+    executor.join_key_provider = _advancing_join
+    executor._last_join_key = None
+    executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
+    executor.graph_observation_provider = None
+    executor._latest_planning_scene = {
+        **_valid_scene(declaration),
+        "frame_index": 0,
+        "timestamp": 0.0,
+        "fixture_geometry_digest": expected_fixture_geometry_digest(declaration),
+    }
+    executor._planning_scene_invalid = False
+    executor._scene_invalid_sequence = None
+    executor._spinner = _StubSpinner()
+    executor._tcp_pose_samples = []
+    executor._e_goal_state = {
+        "pick_sent": False,
+        "pick_goal_id": None,
+        "place_sent": False,
+        "place_goal_id": None,
+    }
+    executor._e_active_goal_handle = None
+    executor._e_native_gripper_count_provider = None
+    executor._e_native_gripper_count_baseline = None
+    executor._e_post_grasp_lift_m_provider = None
+    executor._e_post_grasp_lift_m_observed = None
+    executor._e_lift_latch_mono = None
+    executor._e_observed_fjt_trigger = None
+    executor._joint_velocity_frames = []
+    executor._fjt_status_cache = []
+    executor._fjt_receipt_sequence = 0
+    executor._joint_receipt_sequence = 0
+    executor._emitted_visual_events = set()
+    executor._visual_event_sequence = 0
+    executor._visual_event_failures = []
+    executor._reset_visual_event_state()
+    return executor
+
+
+def _tcp_provider() -> dict[str, object]:
+    return {"xyz": [0.2, 0.0, 0.5], "identity": "tcp", "age_s": 0.05}
+
+
+def _gripper_count_provider() -> dict[str, object]:
+    return {"count": 0, "age_s": 0.05}
+
+
+def _lift_m_provider() -> dict[str, object]:
+    return {"identity": "pick_and_place", "value_m": 0.10, "age_s": 0.05}
+
+
+def _fail_visual_append(executor, event: str, status: str):
+    real_append = executor._append_visual_event
+
+    def _failing_append(call_event, scenario_id):
+        if call_event == event:
+            return status
+        return real_append(call_event, scenario_id)
+
+    return _failing_append
+
+
+def test_f39_append_visual_event_producer_contract(tmp_path):
+    """F3.9/F3.4: the canonical producer emits exactly the six-key sequence shape."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.attempt_dir = tmp_path
+    executor.journal = _JournalStub(record_count=7)
+    executor._emitted_visual_events = set()
+    executor._visual_event_sequence = 0
+    executor._visual_event_failures = []
+    executor._reset_visual_event_state()
+    executor._last_join_key = (3, 2.5)
+
+    status = executor._append_visual_event(
+        "cancel-execution-start", "qualification-moveit-cancel"
+    )
+    assert status == "recorded"
+    lines = (tmp_path / "visual-capture-requests.jsonl").read_text(
+        encoding="utf-8"
+    ).strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record == {
+        "schema_version": 1,
+        "sequence": 1,
+        "gate": "qualification-moveit-cancel",
+        "event": "cancel-execution-start",
+        "simulated_timestamp": 2.5,
+        "source_execution_event_sequence": 7,
+    }
+
+
+def test_f39_append_visual_event_monotonic_sequence_and_truth_timestamps(tmp_path):
+    """F3.9: sequences advance monotonically and timestamps come from the durable
+    join key (never fabricated), with the exact source sequence bound to the
+    journal record count at emission time."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    def _new_executor(record_count, subdir):
+        executor = object.__new__(IntegratedGateExecutor)
+        executor.attempt_dir = tmp_path / subdir
+        executor.journal = _JournalStub(record_count=record_count)
+        executor._emitted_visual_events = set()
+        executor._visual_event_sequence = 0
+        executor._visual_event_failures = []
+        executor._reset_visual_event_state()
+        return executor
+
+    executor = _new_executor(record_count=2, subdir="monotonic")
+    executor._last_join_key = (1, 1.0)
+    assert executor._append_visual_event("safety-execution-start", "g") == "recorded"
+    executor._last_join_key = (2, 2.0)
+    assert executor._append_visual_event("safety-trigger", "g") == "recorded"
+    executor.journal = _JournalStub(record_count=5)
+    executor._last_join_key = (2, 2.0)
+    assert executor._append_visual_event("safety-post-clear", "g") == "recorded"
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "monotonic" / "visual-capture-requests.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert [record["sequence"] for record in records] == [1, 2, 3]
+    assert [record["simulated_timestamp"] for record in records] == [1.0, 2.0, 2.0]
+    assert [record["event"] for record in records] == [
+        "safety-execution-start",
+        "safety-trigger",
+        "safety-post-clear",
+    ]
+    assert [record["source_execution_event_sequence"] for record in records] == [2, 2, 5]
+
+
+def test_f39_append_visual_event_duplicate_no_join_key_invalid_timestamp(tmp_path):
+    """F3.9: the producer fails closed on duplicate, missing join key, and
+    invalid timestamps, recording each rejection in the per-attempt failure list
+    without writing any capture request."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    def _new_executor(subdir):
+        executor = object.__new__(IntegratedGateExecutor)
+        executor.attempt_dir = tmp_path / subdir
+        executor.journal = _JournalStub(record_count=0)
+        executor._emitted_visual_events = set()
+        executor._visual_event_sequence = 0
+        executor._visual_event_failures = []
+        executor._reset_visual_event_state()
+        return executor
+
+    # Duplicate: the same required event may only be emitted once per attempt.
+    executor = _new_executor("duplicate")
+    executor._last_join_key = (1, 1.0)
+    assert executor._append_visual_event("cancel-trigger", "g") == "recorded"
+    assert executor._append_visual_event("cancel-trigger", "g") == "duplicate"
+    assert executor._visual_event_failures == [("cancel-trigger", "duplicate")]
+    assert len(
+        (tmp_path / "duplicate" / "visual-capture-requests.jsonl")
+        .read_text().strip().splitlines()
+    ) == 1
+
+    # No join key: a required event must never emit before its durable checkpoint.
+    executor = _new_executor("nojoin")
+    assert executor._append_visual_event("cancel-execution-start", "g") == "no-join-key"
+    assert executor._visual_event_failures == [("cancel-execution-start", "no-join-key")]
+    assert not (tmp_path / "nojoin" / "visual-capture-requests.jsonl").exists()
+
+    # Invalid timestamp: garbage / non-finite / negative truth tails fail closed.
+    for index, bad in enumerate(
+        [(0, "not-a-number"), (0, float("nan")), (0, float("-inf")), (0, -1.0)]
+    ):
+        executor = _new_executor(f"invalid-{index}")
+        executor._last_join_key = bad
+        assert executor._append_visual_event("safety-trigger", "g") == "invalid-timestamp"
+        assert executor._visual_event_failures == [("safety-trigger", "invalid-timestamp")]
+        assert not (tmp_path / f"invalid-{index}" / "visual-capture-requests.jsonl").exists()
+
+
+def test_f39_append_visual_event_rejected_append_records_failure(tmp_path):
+    """F3.9: an append I/O failure surfaces as a fail-closed ``rejected:`` status
+    and is recorded in the per-attempt failure list (no capture is fabricated)."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    blocker = tmp_path / "visual-capture-requests.jsonl"
+    blocker.mkdir()  # a directory cannot be appended as a JSONL stream
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.attempt_dir = tmp_path
+    executor.journal = _JournalStub(record_count=0)
+    executor._emitted_visual_events = set()
+    executor._visual_event_sequence = 0
+    executor._visual_event_failures = []
+    executor._reset_visual_event_state()
+    executor._last_join_key = (1, 1.0)
+
+    status = executor._append_visual_event("terminal", "g")
+    assert status.startswith("rejected: ")
+    assert executor._visual_event_failures == [("terminal", status)]
+
+
+@pytest.mark.parametrize(
+    "failure_status",
+    ["duplicate", "no-join-key", "invalid-timestamp", "rejected: disk-full"],
+)
+def test_f39_e_cancel_visual_event_rejection_is_fail_dominant(
+    tmp_path, monkeypatch, failure_status
+):
+    """F3.9: every non-``recorded`` producer status for the E cancel first
+    required visual event makes the attempt ``evidence-invalid``."""
+    from validation.integrated_gate_executor import (
+        STAGE_E_FORBIDDEN_EVENTS,
+        STAGE_E_REQUIRED_EVENT_ORDER,
+    )
+
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-pick-place-cancel-approach",
+        required_event_order=STAGE_E_REQUIRED_EVENT_ORDER["cancel-approach"],
+        forbidden_events=STAGE_E_FORBIDDEN_EVENTS["cancel-approach"],
+    )
+    monkeypatch.setattr(
+        executor,
+        "_append_visual_event",
+        _fail_visual_append(executor, "cancel-execution-start", failure_status),
+    )
+    result = executor.run_pick_place_negative(
+        "qualification-pick-place-cancel-approach",
+        current_tcp_pose_provider=_tcp_provider,
+        native_gripper_goal_count_provider=_gripper_count_provider,
+    )
+    assert result["status"] == "evidence-invalid"
+    assert "cancel-execution-start" in result["reason_code"]
+    assert failure_status in result["reason_code"]
+    # The durable failure artifact is written, never a pass.
+    assert (tmp_path / "planning-scene.json").exists()
+    assert (tmp_path / "integrated-execution.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "failure_status",
+    ["duplicate", "no-join-key", "invalid-timestamp", "rejected: disk-full"],
+)
+def test_f39_e_positive_visual_event_rejection_is_fail_dominant(
+    tmp_path, monkeypatch, failure_status
+):
+    """F3.9: a rejected ``readiness`` visual event fails the E positive attempt
+    to ``evidence-invalid`` before any Pick/Place goal is sent."""
+    from validation.integrated_gate_executor import (
+        STAGE_E_FORBIDDEN_EVENTS,
+        STAGE_E_REQUIRED_EVENT_ORDER,
+    )
+
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-pick-place-positive",
+        required_event_order=STAGE_E_REQUIRED_EVENT_ORDER["positive"],
+        forbidden_events=STAGE_E_FORBIDDEN_EVENTS["positive"],
+    )
+    monkeypatch.setattr(
+        executor,
+        "_append_visual_event",
+        _fail_visual_append(executor, "readiness", failure_status),
+    )
+    result = executor.run_pick_place_positive(
+        current_tcp_pose_provider=_tcp_provider,
+        post_grasp_lift_m_provider=_lift_m_provider,
+    )
+    assert result["status"] == "evidence-invalid"
+    assert "readiness" in result["reason_code"]
+    assert failure_status in result["reason_code"]
+    assert result["pick_goal_sent"] is False
+    assert result["place_goal_sent"] is False
+
+
+def test_f39_e_safety_visual_event_rejection_is_fail_dominant(tmp_path, monkeypatch):
+    """F3.9: a rejected ``safety-execution-start`` visual event fails the E
+    safety-transport attempt to ``evidence-invalid`` before any Pick goal."""
+    from validation.integrated_gate_executor import (
+        STAGE_E_FORBIDDEN_EVENTS,
+        STAGE_E_REQUIRED_EVENT_ORDER,
+    )
+
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-pick-place-safety-transport",
+        required_event_order=STAGE_E_REQUIRED_EVENT_ORDER["safety-transport"],
+        forbidden_events=STAGE_E_FORBIDDEN_EVENTS["safety-transport"],
+    )
+    monkeypatch.setattr(
+        executor,
+        "_append_visual_event",
+        _fail_visual_append(executor, "safety-execution-start", "duplicate"),
+    )
+    result = executor.run_pick_place_negative(
+        "qualification-pick-place-safety-transport",
+        current_tcp_pose_provider=_tcp_provider,
+        post_grasp_lift_m_provider=_lift_m_provider,
+    )
+    assert result["status"] == "evidence-invalid"
+    assert "safety-execution-start" in result["reason_code"]
+    assert "duplicate" in result["reason_code"]
+    assert result["pick_goal_sent"] is False
+
+
+def test_f39_d_cancel_visual_event_rejection_is_fail_dominant(tmp_path, monkeypatch):
+    """F3.9: a rejected ``cancel-execution-start`` visual event fails the D
+    cancel attempt to ``evidence-invalid`` with the exact execute error."""
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+    )
+
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-moveit-cancel",
+        required_event_order=STAGE_D_REQUIRED_EVENT_ORDER["cancel"],
+        forbidden_events=D_FORBIDDEN_EVENTS,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_append_visual_event",
+        _fail_visual_append(executor, "cancel-execution-start", "invalid-timestamp"),
+    )
+    result = executor.run_cancel_sequence(
+        "qualification-moveit-cancel",
+        planning_goal_id="a" * 32,
+        execute_goal_id="b" * 32,
+        fjt_goal_id="c" * 32,
+        fjt_transaction_provider=lambda: {},
+    )
+    assert result["status"] == "evidence-invalid"
+    assert "cancel-execution-start" in result["execute_error"]
+    assert "invalid-timestamp" in result["execute_error"]
+
+
+def test_f39_d_safety_visual_event_rejection_is_fail_dominant(tmp_path, monkeypatch):
+    """F3.9: a rejected ``safety-execution-start`` visual event fails the D
+    safety attempt to ``evidence-invalid`` with the exact execute error."""
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+    )
+
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-moveit-safety",
+        required_event_order=STAGE_D_REQUIRED_EVENT_ORDER["safety"],
+        forbidden_events=D_FORBIDDEN_EVENTS,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_append_visual_event",
+        _fail_visual_append(executor, "safety-execution-start", "no-join-key"),
+    )
+    result = executor.run_safety_sequence(
+        "qualification-moveit-safety",
+        long_motion_provider=lambda: {
+            "planning_goal_id": "a" * 32,
+            "execute_goal_id": "b" * 32,
+        },
+        fjt_goal_id="c" * 32,
+        fjt_transaction_provider=lambda: {},
+    )
+    assert result["status"] == "evidence-invalid"
+    assert "safety-execution-start" in result["execute_error"]
+    assert "no-join-key" in result["execute_error"]
+
+
+def test_f39_visual_event_failures_reset_per_attempt(tmp_path):
+    """F3.9: the per-attempt visual-event failure list resets between attempts so
+    a reused executor never carries a previous attempt's rejections forward."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.attempt_dir = tmp_path
+    executor.journal = _JournalStub(record_count=0)
+    executor._last_join_key = None
+    executor._emitted_visual_events = set()
+    executor._visual_event_sequence = 0
+    executor._visual_event_failures = []
+    executor._reset_visual_event_state()
+    executor._last_join_key = (1, 1.0)
+    assert executor._append_visual_event("a", "g") == "recorded"
+    assert executor._append_visual_event("a", "g") == "duplicate"
+    assert executor._visual_event_failures == [("a", "duplicate")]
+
+    executor._reset_visual_event_state()
+    assert executor._visual_event_failures == []
+    assert executor._emitted_visual_events == set()
+    assert executor._visual_event_sequence == 0
+
+
+# ---------------------------------------------------------------------------
+# F3.4: qualification visual capture consumer (ROS-free, fake app/backend).
+#
+# The consumer services the executor-written ``visual-capture-requests.jsonl``
+# journal, captures each canonical request once to both cameras, co-tenants the
+# executor diagnostic records without treating them as capture requests, and
+# never re-captures a sequence — even across a consumer process restart (the
+# durable ``visual-keyframes.jsonl`` journal seeds the handled set).
+# ---------------------------------------------------------------------------
+
+
+class _FakeRenderBackend:
+    """Deterministic physics-truth double for the Isaac backend seam."""
+
+    def __init__(
+        self,
+        *,
+        dt: float = 0.01,
+        physics_frame_index: int = 102,
+        simulation_time: float = 1.02,
+    ) -> None:
+        self.dt = dt
+        self.physics_frame_index = physics_frame_index
+        self.simulation_time = simulation_time
+
+    def render_frame(self) -> None:
+        return None
+
+
+class _FakeSensor:
+    def __init__(self, array: object) -> None:
+        self.array = array
+
+    def get_data(self, annotator: str):
+        if annotator == "rgb":
+            return self.array, {"width": 960, "height": 540, "frames": 1}
+        return None, {}
+
+    def close(self) -> None:
+        return None
+
+
+def _rgb_array():
+    import numpy as np
+
+    return (
+        np.arange(540 * 960 * 3, dtype=np.int32).reshape(540, 960, 3) % 256
+    ).astype(np.uint8)
+
+
+def _make_capture(monkeypatch, tmp_path, backend, *, gate: str = "g"):
+    from simulation.tinker_sim_isaac.qualification_visual_capture import (
+        QualificationVisualCapture,
+    )
+
+    sensors = {
+        "overview": _FakeSensor(_rgb_array()),
+        "manipulation_closeup": _FakeSensor(_rgb_array()),
+    }
+
+    def _fake_initialize(self):
+        self._sensors = dict(sensors)
+
+    monkeypatch.setattr(QualificationVisualCapture, "_initialize_cameras", _fake_initialize)
+    return QualificationVisualCapture(
+        app=object(),
+        backend=backend,
+        attempt_dir=tmp_path,
+        gate=gate,
+        event_pump=None,
+    )
+
+
+def _write_visual_request(tmp_path, record: Mapping[str, object]) -> None:
+    path = tmp_path / "visual-capture-requests.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _canonical_visual_request(**overrides: object) -> dict[str, object]:
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "sequence": 1,
+        "gate": "g",
+        "event": "cancel-execution-start",
+        "simulated_timestamp": 1.0,
+        "source_execution_event_sequence": 7,
+    }
+    request.update(overrides)
+    return request
+
+
+def test_f34_consumer_captures_both_cameras_from_canonical_request(tmp_path, monkeypatch):
+    """F3.4: a canonical request drives one capture per camera (two PNGs plus two
+    durable keyframe records) with the exact six-key source binding and a latency
+    inside the bounded contract."""
+    from simulation.tinker_sim_isaac.qualification_visual_capture import (
+        MAX_CAPTURE_LATENCY_FRAMES,
+    )
+
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request())
+    capture.poll()
+
+    assert capture._errors == []
+    pngs = sorted((tmp_path / "visual/source").glob("*.png"))
+    assert len(pngs) == 2
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "visual-keyframes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert len(records) == 2
+    assert {record["camera"] for record in records} == {"overview", "manipulation_closeup"}
+    for record in records:
+        assert record["schema_version"] == 1
+        assert record["gate"] == "g"
+        assert record["event"] == "cancel-execution-start"
+        assert record["request_sequence"] == 1
+        assert record["execution_event_sequence"] == 7
+        assert record["requested_simulated_timestamp"] == 1.0
+        assert record["requested_physics_frame_index"] == 100
+        assert record["capture_latency_frames"] == 2
+        assert 0 <= record["capture_latency_frames"] <= MAX_CAPTURE_LATENCY_FRAMES
+        assert (tmp_path / record["path"]).is_file()
+        assert (tmp_path / record["path"]).stat().st_size > 0
+    assert capture._handled_sequences == {1}
+
+
+def test_f34_consumer_skips_executor_diagnostic_records(tmp_path, monkeypatch):
+    """F3.4: executor diagnostic records (diagnostic-only, no canonical
+    sequence/gate/event/timestamp) are co-tenanted but never capture-driving."""
+    backend = _FakeRenderBackend()
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "report_revision": 1,
+            "scenario_id": "qualification-moveit-cancel",
+            "phase": "before",
+            "capture": {"kind": "gate-d-diagnostic", "target": None},
+            "diagnostic_only": True,
+        },
+    )
+    capture.poll()
+    assert capture._errors == []
+    assert capture._handled_sequences == set()
+    assert not (tmp_path / "visual-keyframes.jsonl").exists()
+    assert not list((tmp_path / "visual/source").glob("*.png"))
+
+
+def test_f34_consumer_dedupes_malformed_requests(tmp_path, monkeypatch):
+    """F3.4: repeated malformed records are reported exactly once (no error loop)."""
+    backend = _FakeRenderBackend()
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    malformed = {"schema_version": 1, "event": "terminal"}  # missing sequence/timestamp
+    _write_visual_request(tmp_path, malformed)
+    _write_visual_request(tmp_path, malformed)
+    capture.poll()
+    capture.poll()
+    assert len(capture._errors) == 1
+    assert "unrecognized visual capture request record" in capture._errors[0]
+
+
+def test_f34_consumer_defers_future_timestamp_requests(tmp_path, monkeypatch):
+    """F3.4: a request whose simulated timestamp is still in the future is
+    deferred silently (never an error, never a handled sequence)."""
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(
+        tmp_path,
+        _canonical_visual_request(simulated_timestamp=99.0),
+    )
+    capture.poll()
+    assert capture._errors == []
+    assert 1 not in capture._handled_sequences
+    assert not (tmp_path / "visual-keyframes.jsonl").exists()
+
+
+def test_f34_consumer_is_at_most_once_across_polls(tmp_path, monkeypatch):
+    """F3.4: re-polling the same request journal never re-captures an already
+    handled sequence."""
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request())
+    capture.poll()
+    capture.poll()  # same file; sequence 1 already handled
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "visual-keyframes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert len(records) == 2  # one per camera, never duplicated
+
+
+def test_f34_consumer_durable_restart_seeds_handled_sequences(tmp_path, monkeypatch):
+    """F3.4: a consumer process restart seeds its handled set from the durable
+    keyframe journal, so an already-captured sequence is never re-captured."""
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    (tmp_path / "visual-keyframes.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "gate": "g",
+                "event": "cancel-trigger",
+                "request_sequence": 5,
+                "execution_event_sequence": 3,
+                "camera": "overview",
+                "path": "visual/source/0005-cancel-trigger-overview.png",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request(sequence=5))
+    capture.poll()
+    assert capture._handled_sequences == {5}
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "visual-keyframes.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    ]
+    assert len(records) == 1  # the pre-existing durable record, no re-capture
+
+
+def test_f34_consumer_gate_mismatch_is_a_capture_failure(tmp_path, monkeypatch):
+    """F3.4: a request for a different gate than the consumer's gate fails closed
+    and is durably marked handled (never captured under the wrong gate)."""
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    capture = _make_capture(monkeypatch, tmp_path, backend, gate="g")
+    _write_visual_request(tmp_path, _canonical_visual_request(gate="other-gate"))
+    capture.poll()
+    assert len(capture._errors) == 1
+    assert "does not match" in capture._errors[0]
+    assert 1 in capture._handled_sequences
+
+
+def test_f34_consumer_close_writes_summary(tmp_path, monkeypatch):
+    """F3.4: close() writes the durable visual-keyframes.json summary carrying the
+    bounded capture-latency contract, the recorded keyframes, and any errors."""
+    from simulation.tinker_sim_isaac.qualification_visual_capture import (
+        MAX_CAPTURE_LATENCY_FRAMES,
+    )
+
+    backend = _FakeRenderBackend(physics_frame_index=102, simulation_time=1.02)
+    capture = _make_capture(monkeypatch, tmp_path, backend)
+    _write_visual_request(tmp_path, _canonical_visual_request())
+    capture.poll()
+    capture.close()
+    summary = json.loads((tmp_path / "visual-keyframes.json").read_text(encoding="utf-8"))
+    assert summary["gate"] == "g"
+    assert summary["capture_latency_contract"]["max_frames"] == MAX_CAPTURE_LATENCY_FRAMES
+    assert summary["capture_latency_contract"]["unit"] == "physics_frames"
+    assert len(summary["records"]) == 2
+    assert summary["errors"] == []
+
+
+def test_f34_consumer_from_environment_disabled(monkeypatch):
+    """F3.4: from_environment returns None when visual evidence is not enabled."""
+    monkeypatch.delenv("TINKER_SIM_VISUAL_EVIDENCE", raising=False)
+    from simulation.tinker_sim_isaac.qualification_visual_capture import (
+        QualificationVisualCapture,
+    )
+
+    assert QualificationVisualCapture.from_environment(app=object(), backend=object()) is None
+
+
+def test_f34_consumer_from_environment_requires_attempt_and_gate(monkeypatch):
+    """F3.4: enabled visual evidence without the attempt dir or gate fails closed."""
+    monkeypatch.setenv("TINKER_SIM_VISUAL_EVIDENCE", "1")
+    monkeypatch.delenv("TINKER_SIM_ATTEMPT_DIR", raising=False)
+    monkeypatch.delenv("TINKER_SIM_QUALIFICATION_GATE", raising=False)
+    from simulation.tinker_sim_isaac.qualification_visual_capture import (
+        QualificationVisualCapture,
+    )
+
+    with pytest.raises(RuntimeError, match="TINKER_SIM_ATTEMPT_DIR"):
+        QualificationVisualCapture.from_environment(app=object(), backend=object())
