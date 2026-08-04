@@ -314,6 +314,42 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 1 — "execute
+  integrated scenario lifecycle"): Made the integrated C-E lifecycle executable
+  and fail-dominant on the real manifest/launch path.  Integrated scenario ids
+  are never passed to the core six-gate `_selected_gates`; the orchestrator now
+  builds the manifest at the externally allocated attempt directory via the new
+  additive `QualificationRunner.prepare_manifest_at(... gate="integrated")` and
+  starts the configured Isaac and Humble child wrappers through the real
+  `qualification_start_process` lifecycle with the exact scenario id, seed,
+  private domain, and `TINKER_SIM_ATTEMPT_DIR`/RMW/DDS environment applied to
+  the subprocesses (previously the environment dict was computed and never
+  applied, and no child was started).  Every scenario invocation gets a newly
+  created immutable attempt directory (invocation id + monotonic counter,
+  `mkdir(exist_ok=False)`), so repeated allocation yields distinct preserved
+  paths and stale pre-existing evidence cannot satisfy readiness; readiness now
+  additionally requires current-attempt manifest provenance, and a nonempty
+  attempt directory is rejected before launch.  Per scenario the producers are
+  stopped, the evaluator/raw drain is required to correlate exactly, rosbag
+  evidence is finalized, and orphan/resource cleanup runs before the independent
+  `verify_integrated_attempt` (single fail-dominant `try/finally` lifecycle,
+  so every post-launch exception still runs bounded cleanup).  C/D/E stages now
+  carry a top-level fail-dominant status (`evidence-invalid` > `verified-fail` >
+  `verified-pass`), standalone pass exits 0, `--stage all` always retains Stage
+  A and never exits 0 on Gate-B failure, and a not-implemented Stage F reports a
+  non-success overall status.  Gate B evidence is per-invocation (fresh
+  attempt-bound directory), source-lock `fail`/missing/stale/self-generated
+  artifacts are `evidence-invalid` (never `verified-fail`), producer exit 0
+  without newly written output is rejected, and Gate B's `model-fingerprint.json`
+  is cross-bound to the runtime model bundle consumed by C-E.  Stage A requires
+  the integrated config's `required_core_gates` to equal the core config gate
+  list exactly.  A malformed scenario fails closed without skipping later
+  controls.  Offline regressions: 35 integrated-orchestration tests (15 prior +
+  20 new lifecycle/status/stale-evidence tests using process doubles) and the
+  329-test broader qualification batch all pass.  No build, no live Isaac/ROS,
+  no cuMotion; production modules/scenarios/policies/executor/journal/config and
+  the two source-lock policy files are untouched.
+
 - 2026-08-04 (integrated qualification Task 8 — "orchestrate Gates A-F"):
   Added the offline orchestration/lifecycle layer over the review-clean
   six-gate core suite, the Task 6 physics-ready gate, and the Task 7

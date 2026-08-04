@@ -1,37 +1,52 @@
 #!/usr/bin/env python3
-"""Orchestrate the integrated OMPL manipulation qualification Gates A-E.
+"""Orchestrate the integrated OMPL manipulation qualification Gates A-F.
 
-Task 8 of the integrated OMPL manipulation qualification.  This module is the
-offline orchestration/lifecycle layer on top of the review-clean six-gate
-``manipulation_qualification`` runner, the Task 6 ``physics-ready`` gate, and
-the Task 7 independent ``integrated_gate_verifier``.
+Task 8 of the integrated OMPL manipulation qualification (fix round 1).  This
+module is the offline orchestration/lifecycle layer on top of the review-clean
+six-gate ``manipulation_qualification`` runner, the Task 6 ``physics-ready``
+gate, and the Task 7 independent ``integrated_gate_verifier``.
 
 Stage A runs the existing six-gate core suite (``free-space-fjt``,
 ``safety-stop``, ``free-gripper``, ``obstructed-gripper``, ``arm-collision``,
 ``retention``) and requires all six independent verdicts, exact raw/evaluator
-drains, valid rosbags, clean teardown, and the existing contact sheets.  The
-``--gate GATE_NAME`` behavior of ``manipulation_qualification.py`` is unchanged.
+drains, valid rosbags, clean teardown, and the existing contact sheets.  Before
+reporting Stage A the orchestrator requires the integrated config's
+``required_core_gates`` to equal the core config gate list exactly (order and
+uniqueness); drift is ``evidence-invalid``.
 
-Before Gate B the runner atomically writes ``outputs/integrated/attempt-start.json``
-with UTC/monotonic start identities, then invokes ``source_lock_manifest.py``
-with the config-resolved committed authorization policy and validates the
-producer exit code and output schema before invoking the offline static
-closure.  Missing, stale, self-generated, or mismatched source-lock artifacts
-make Gate B ``evidence-invalid``; the runner never falls back to capturing and
-trusting current state.
+Before Gate B the runner atomically writes a fresh per-invocation
+``attempt-start.json`` with UTC/monotonic start identities, then invokes
+``source_lock_manifest.py`` with the config-resolved committed authorization
+policy and validates the producer exit code, output schema, and output
+freshness before invoking the offline static closure.  Missing, stale,
+self-generated, mismatched, or ``fail`` source-lock artifacts all make Gate B
+``evidence-invalid``; the runner never falls back to capturing and trusting
+current state.  Gate B evidence is written to a fresh per-invocation directory
+bound to the attempt start, and its ``model-fingerprint.json`` is cross-bound to
+the same runtime model fingerprint consumed by C-E readiness/verification.
 
 Stages C-E run every listed scenario in a unique child ROS domain in ``[0,232]``
-and a unique immutable attempt directory.  Before readiness the runner
-validates the overlay's atomically written ``physics-ready.json`` against the
-exact external ``scenario_report_sha256`` of the atomically written
-``scenario-runner.json`` and the full committed identity (scenario id, seed,
-scenario-declaration digest, planning-scene digest, integrated digest, model
-fingerprint, provider-manifest digest, final ``STATE_PLAYING``, and a final
-``state=1``/``boundary=PHYSICS_READY`` operation).  A transient
+and a unique immutable attempt directory that is freshly created for the
+invocation (never reused, never a stale pre-existing directory).  The configured
+Isaac and Humble child commands are launched through the reusable
+``QualificationRunner`` lifecycle with the exact scenario id, seed, attempt
+directory, private domain, and RMW/DDS environment applied to the actual
+subprocesses.  Before readiness the runner validates the overlay's atomically
+written ``physics-ready.json`` against the exact external
+``scenario_report_sha256`` of the atomically written ``scenario-runner.json``,
+the full committed identity (scenario id, seed, scenario-declaration digest,
+planning-scene digest, integrated digest, model fingerprint, provider-manifest
+digest, final ``STATE_PLAYING``, and a final ``state=1``/``boundary=PHYSICS_READY``
+operation), and the current-attempt manifest provenance.  A transient
 ``state=PHYSICS_READY`` message without that report-byte match is insufficient.
-Execution return codes never override the independent verifier verdict.
-Teardown failures downgrade a scenario to ``evidence-invalid``; every attempt
-is preserved.
+
+For each scenario the producers are stopped and the evaluator/raw drain is
+required to correlate exactly before ``verify_integrated_attempt`` runs; rosbag,
+cleanup, and resource evidence are finalized before verification.  Execution
+return codes never override the independent verifier verdict, and a successful
+verifier never overrides failed teardown/drain/bag/resource evidence.  Teardown
+failures downgrade a scenario to ``evidence-invalid``; every attempt is
+preserved; a malformed scenario fails closed without skipping later controls.
 
 Stage F is the explicit Tasks 9-10 extension point and is not implemented here.
 
@@ -52,7 +67,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "validation"))
@@ -73,22 +88,20 @@ try:
         _ros_tooling_environment,
         _run_suite,
         _write_json_atomic,
+        qualification_gpu_processes,
+        qualification_jsonl_records,
         qualification_rosbag_final_evidence,
         qualification_rosbag_metadata_evidence,
         qualification_rosbag_output_evidence,
         qualification_rosbag_qos_profiles,
+        qualification_attempt_processes,
         qualification_compare_truth_records,
-        qualification_gpu_processes,
-        qualification_jsonl_count,
-        qualification_jsonl_records,
         qualification_record_topics,
         qualification_settle_evidence_files,
-        qualification_source_identity,
         qualification_start_process,
         qualification_stop_process,
         qualification_terminate_attempt_orphans,
         qualification_wait_for_evaluator_drain,
-        qualification_wait_for_ready,
         qualification_write_resource_evidence,
     )
 except ModuleNotFoundError:
@@ -105,33 +118,28 @@ except ModuleNotFoundError:
         _ros_tooling_environment,
         _run_suite,
         _write_json_atomic,
+        qualification_gpu_processes,
+        qualification_jsonl_records,
         qualification_rosbag_final_evidence,
         qualification_rosbag_metadata_evidence,
         qualification_rosbag_output_evidence,
         qualification_rosbag_qos_profiles,
+        qualification_attempt_processes,
         qualification_compare_truth_records,
-        qualification_gpu_processes,
-        qualification_jsonl_count,
-        qualification_jsonl_records,
         qualification_record_topics,
         qualification_settle_evidence_files,
-        qualification_source_identity,
         qualification_start_process,
         qualification_stop_process,
         qualification_terminate_attempt_orphans,
         qualification_wait_for_evaluator_drain,
-        qualification_wait_for_ready,
         qualification_write_resource_evidence,
     )
 
 from tinker_sim_bridge.integrated_readiness import (  # noqa: E402
     FINAL_SIMULATION_STATE,
     PHYSICS_READY_BOUNDARY,
-    REPORT_SCHEMA_VERSION,
     SIMULATION_STATE_PLAYING,
     ReportValidationError,
-    build_canonical_report,
-    canonical_json,
     parse_canonical_report,
     planning_scene_mapping,
     public_integrated_mapping,
@@ -189,6 +197,11 @@ SOURCE_IDENTITIES_FILENAME = "source-identities.json"
 # The maximum valid ROS domain id (the simulator's Fast DDS bound).
 MAX_ROS_DOMAIN_ID = 232
 
+# The scenario terminal markers the orchestrator accepts as durable scenario
+# completion evidence (written by the scenario executor / launch).  The
+# orchestrator never waits for its own verifier's ``gate-verdict.json``.
+TERMINAL_EVIDENCE_FILENAMES = ("execution-terminal.json", "integrated-execution.json")
+
 
 @dataclass(frozen=True)
 class AttemptAllocation:
@@ -196,8 +209,26 @@ class AttemptAllocation:
     attempt_dir: Path
 
 
+def _reduce_scenario_statuses(statuses: Sequence[str]) -> str:
+    """Fail-dominant stage status reduction over per-scenario verdicts.
+
+    ``evidence-invalid`` > ``verified-fail`` > ``verified-pass``.  Any missing,
+    empty, or malformed status is ``evidence-invalid``.
+    """
+    normalized = [str(status) for status in statuses]
+    if not normalized:
+        return STATUS_EVIDENCE_INVALID
+    if STATUS_EVIDENCE_INVALID in normalized:
+        return STATUS_EVIDENCE_INVALID
+    if STATUS_VERIFIED_FAIL in normalized:
+        return STATUS_VERIFIED_FAIL
+    if all(status == STATUS_VERIFIED_PASS for status in normalized):
+        return STATUS_VERIFIED_PASS
+    return STATUS_EVIDENCE_INVALID
+
+
 class IntegratedRunner:
-    """Offline orchestrator for the integrated OMPL qualification Gates A-E.
+    """Offline orchestrator for the integrated OMPL qualification Gates A-F.
 
     The public contract mirrors the deterministic ``IntegratedRunnerDouble``
     used by the orchestration tests: ``core_gate_names``,
@@ -228,11 +259,11 @@ class IntegratedRunner:
         command_runner: Callable[..., Any] = subprocess.run,
         popen: Callable[..., Any] = subprocess.Popen,
     ) -> None:
-        self.root = (root or ROOT).resolve()
-        self.production_root = (production_root or DEFAULT_PRODUCTION_ROOT).resolve()
-        self.config_path = (config_path or DEFAULT_CONFIG).resolve()
+        self.root = Path(root or ROOT).resolve()
+        self.production_root = Path(production_root or DEFAULT_PRODUCTION_ROOT).resolve()
+        self.config_path = Path(config_path or DEFAULT_CONFIG).resolve()
         self.seed = int(seed)
-        self.attempt_root = (attempt_root or DEFAULT_ATTEMPT_ROOT).resolve()
+        self.attempt_root = Path(attempt_root or DEFAULT_ATTEMPT_ROOT).resolve()
         self.base_domain_id = int(base_domain_id)
         self.readiness_timeout_s = float(readiness_timeout_s)
         self.bag_startup_timeout_s = float(bag_startup_timeout_s)
@@ -254,6 +285,15 @@ class IntegratedRunner:
         self.static_contract_status = STATUS_VERIFIED_PASS
         self.started_scenarios: list[str] = []
         self._stage_results: dict[str, Any] = {}
+        # Collision-proof fresh attempt allocation state (F1.2): each live
+        # scenario invocation gets a directory that did not previously exist.
+        self._run_invocation_id = uuid.uuid4().hex[:8]
+        self._attempt_counter = 0
+        # Per-attempt lifecycle bookkeeping.
+        self._scenario_manifest_store: dict[
+            Path, tuple[QualificationRunner, QualificationManifest]
+        ] = {}
+        self._gpu_baselines: dict[Path, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
     # Configuration helpers
@@ -277,6 +317,17 @@ class IntegratedRunner:
         if not isinstance(gates, Sequence) or isinstance(gates, (str, bytes)):
             raise ValueError("stage A required_core_gates must be an array")
         return [str(name) for name in gates]
+
+    def _core_config_path(self) -> Path:
+        config = self._config()
+        core_config_value = config.get("core_config")
+        if not isinstance(core_config_value, str) or not core_config_value:
+            raise ValueError("integrated qualification config has no core_config path")
+        return (
+            Path(core_config_value)
+            if Path(core_config_value).is_absolute()
+            else self.root / core_config_value
+        ).resolve()
 
     def _stage_scenarios(self, stage: str) -> list[str]:
         section = self._stages_config().get(stage)
@@ -362,6 +413,34 @@ class IntegratedRunner:
             "report_identities": dict(identities),
         }
 
+    def _allocate_attempt_dir(
+        self, attempt_root: Path, stage: str, name: str, used: set[Path]
+    ) -> Path:
+        """Create a fresh, never-previously-existing attempt directory.
+
+        The directory name carries the invocation id and a monotonic per-run
+        counter so repeated allocation for the same stage/scenario yields a
+        distinct preserved path.  ``mkdir(exist_ok=False)`` guarantees the
+        directory did not previously exist; all prior evidence is preserved.
+        """
+        attempt_root = Path(attempt_root).resolve()
+        attempt_root.mkdir(parents=True, exist_ok=True)
+        base = attempt_root / f"{stage}-{name}-{self._run_invocation_id}"
+        for counter in range(self._attempt_counter, 100000):
+            attempt_dir = base.with_name(f"{base.name}-{counter}").resolve()
+            if attempt_dir in used:
+                continue
+            try:
+                attempt_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            self._attempt_counter = counter + 1
+            return attempt_dir
+        raise RuntimeError(
+            "could not allocate a fresh integrated attempt directory for "
+            f"{stage}-{name}"
+        )
+
     def allocate_live_attempts(
         self,
         *,
@@ -369,12 +448,13 @@ class IntegratedRunner:
         base_domain_id: int,
         attempt_root: Path | str,
     ) -> list[AttemptAllocation]:
-        """Allocate a unique valid domain and unique immutable attempt dir.
+        """Allocate a unique valid domain and a fresh immutable attempt dir.
 
         Every scenario in the requested stages gets one allocation.  Domains
-        are monotonically increasing from ``base_domain_id`` and stay within
-        ``[0, 232]``.  Attempt directories are unique and derive their name
-        from the stage and scenario.
+        are monotonically increasing from ``base_domain_id``, stay within
+        ``[0, 232]``, and are unique within the batch.  Attempt directories are
+        freshly created and unique; a deterministic exhaustion error is raised
+        before any child starts when no free domain remains.
         """
         allocations: list[AttemptAllocation] = []
         next_domain = int(base_domain_id)
@@ -383,33 +463,31 @@ class IntegratedRunner:
         for stage in stages:
             for name in self._stage_scenarios(str(stage)):
                 domain = next_domain % (MAX_ROS_DOMAIN_ID + 1)
+                attempts = 0
                 while domain in used_domains:
                     next_domain += 1
                     domain = next_domain % (MAX_ROS_DOMAIN_ID + 1)
+                    attempts += 1
+                    if attempts > MAX_ROS_DOMAIN_ID:
+                        raise RuntimeError(
+                            "ROS domain exhaustion: no unique domain in "
+                            f"[0, {MAX_ROS_DOMAIN_ID}] for {stage}-{name}"
+                        )
                 used_domains.add(domain)
                 next_domain += 1
-                attempt_dir = (Path(attempt_root) / f"{stage}-{name}").resolve()
-                attempt_dir = self._unique_attempt_dir(attempt_dir, used_dirs)
+                attempt_dir = self._allocate_attempt_dir(
+                    Path(attempt_root), stage, name, used_dirs
+                )
                 used_dirs.add(attempt_dir)
                 allocations.append(AttemptAllocation(domain, attempt_dir))
         return allocations
-
-    @staticmethod
-    def _unique_attempt_dir(candidate: Path, used: set[Path]) -> Path:
-        if candidate not in used:
-            return candidate
-        for index in range(1, 1000):
-            variant = candidate.with_name(f"{candidate.name}-{index}")
-            if variant not in used:
-                return variant
-        raise RuntimeError("could not allocate a unique attempt directory")
 
     def _allocate_one(self, name: str, stage: str) -> AttemptAllocation:
         allocations = self.allocate_live_attempts(
             stages=(stage,), base_domain_id=self.base_domain_id, attempt_root=self.attempt_root
         )
         for allocation in allocations:
-            if allocation.attempt_dir.name.endswith(f"-{name}") or f"{stage}-{name}" in allocation.attempt_dir.name:
+            if allocation.attempt_dir.name.startswith(f"{stage}-{name}-"):
                 return allocation
         return allocations[0]
 
@@ -431,16 +509,16 @@ class IntegratedRunner:
             "verifier_semantics": "existing-six-gate",
         }
 
+    def _core_config_gates(self) -> list[str]:
+        core_config_path = self._core_config_path()
+        core_config = _json_file(core_config_path)
+        gates = core_config.get("gates")
+        if not isinstance(gates, Sequence) or isinstance(gates, (str, bytes)):
+            raise ValueError("core config gates must be an array")
+        return [str(name) for name in gates]
+
     def _run_core_suite(self) -> dict[str, Any]:
-        config = self._config()
-        core_config_value = config.get("core_config")
-        if not isinstance(core_config_value, str) or not core_config_value:
-            raise ValueError("integrated qualification config has no core_config path")
-        core_config_path = (
-            Path(core_config_value)
-            if Path(core_config_value).is_absolute()
-            else self.root / core_config_value
-        ).resolve()
+        core_config_path = self._core_config_path()
         result = _run_suite(
             root=self.root,
             attempt_root=self.attempt_root / "core",
@@ -466,10 +544,33 @@ class IntegratedRunner:
         duplicate_gate_names = sorted(
             {name for name in gates if gates.count(name) > 1}
         )
+        try:
+            executed_gates = self._core_config_gates()
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            return {
+                "stage": "A",
+                "status": STATUS_EVIDENCE_INVALID,
+                "invoked_gates": gates,
+                "duplicate_gate_names": duplicate_gate_names,
+                "reasons": [f"core config could not be read: {error}"],
+            }
+        if gates != executed_gates:
+            return {
+                "stage": "A",
+                "status": STATUS_EVIDENCE_INVALID,
+                "invoked_gates": gates,
+                "executed_gates": executed_gates,
+                "duplicate_gate_names": duplicate_gate_names,
+                "reasons": [
+                    "integrated config required_core_gates does not equal the "
+                    "core config gate list exactly (order and uniqueness)"
+                ],
+            }
         core = self._run_core_suite()
         return {
             "stage": "A",
             "invoked_gates": gates,
+            "executed_gates": executed_gates,
             "duplicate_gate_names": duplicate_gate_names,
             "status": str(core.get("status", STATUS_VERIFIED_PASS)),
             "attempt_dir": core.get("attempt_dir"),
@@ -481,15 +582,16 @@ class IntegratedRunner:
     # ------------------------------------------------------------------ #
 
     def _write_attempt_start(self) -> Path:
-        """Atomically write the attempt-start identity before Gate B."""
+        """Atomically write a fresh per-invocation attempt-start identity."""
         self.attempt_root.mkdir(parents=True, exist_ok=True)
-        path = self.attempt_root / ATTEMPT_START_FILENAME
+        attempt_id = (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}"
+            f"-{os.getpid()}-{uuid.uuid4().hex[:10]}"
+        )
+        path = self.attempt_root / f"attempt-start-{attempt_id}.json"
         value = {
             "schema_version": 1,
-            "attempt_id": (
-                f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}"
-                f"-{os.getpid()}-{uuid.uuid4().hex[:10]}"
-            ),
+            "attempt_id": attempt_id,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "monotonic": time.monotonic(),
             "seed": self.seed,
@@ -500,11 +602,34 @@ class IntegratedRunner:
         _write_json_atomic(path, value)
         return path
 
+    @staticmethod
+    def _wall_epoch(value: Mapping[str, Any]) -> float:
+        """Return the UTC epoch seconds of an attempt-start ``started_at``."""
+        try:
+            parsed = datetime.fromisoformat(str(value["started_at"]))
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        try:
+            return parsed.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _newly_written(path: Path, reference_epoch: float) -> bool:
+        """True only when *path* was written after the attempt start."""
+        if not path.is_file():
+            return False
+        try:
+            return path.stat().st_mtime >= reference_epoch
+        except OSError:
+            return False
+
     def _invoke_source_lock_manifest(
-        self, attempt_start_path: Path
+        self, attempt_start_path: Path, manifest_path: Path
     ) -> tuple[Path, dict[str, Any]]:
         policies = self._source_lock_policies()
-        manifest_path = self.attempt_root / SOURCE_LOCK_MANIFEST_FILENAME
         command = [
             sys.executable,
             str(self.root / "validation/source_lock_manifest.py"),
@@ -580,17 +705,18 @@ class IntegratedRunner:
             evidence["reason"] = "source-lock manifest output predates the attempt start"
             return evidence
         if status != "pass":
+            # Every non-pass status (verified-fail / evidence-invalid) is an
+            # authorization-evidence failure: the brief requires mismatched,
+            # stale, self-generated, or missing artifacts to be evidence-invalid.
             evidence["reason"] = f"source-lock manifest status is {status}"
-            evidence["status"] = (
-                STATUS_EVIDENCE_INVALID if status == "invalid" else STATUS_VERIFIED_FAIL
-            )
             return evidence
         evidence["status"] = "pass"
         evidence["manifest"] = manifest
         return evidence
 
-    def _invoke_static_contracts(self, manifest_path: Path) -> dict[str, Any]:
-        output_dir = self.attempt_root / "gate-b"
+    def _invoke_static_contracts(
+        self, manifest_path: Path, output_dir: Path, reference_epoch: float
+    ) -> dict[str, Any]:
         command = [
             sys.executable,
             str(self.root / "validation/integrated_static_contracts.py"),
@@ -634,6 +760,11 @@ class IntegratedRunner:
         if not static_path.is_file():
             evidence["reason"] = "static-contract.json is missing"
             return evidence
+        if not self._newly_written(static_path, reference_epoch):
+            evidence["reason"] = (
+                "static-contract.json was not newly produced for this invocation"
+            )
+            return evidence
         try:
             report = _json_file(static_path)
         except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -648,13 +779,23 @@ class IntegratedRunner:
             status = STATUS_EVIDENCE_INVALID
         evidence["status"] = status
         evidence["static_contract"] = report
-        if status == STATUS_VERIFIED_PASS and report.get("model_fingerprint"):
+        if status == STATUS_VERIFIED_PASS:
+            # Cross-bind Gate B's model fingerprint to the runtime model bundle
+            # consumed by C-E readiness and the verifier.
+            fingerprint = report.get("model_fingerprint")
+            if not isinstance(fingerprint, str) or fingerprint != self._model_fingerprint():
+                evidence["status"] = STATUS_EVIDENCE_INVALID
+                evidence["reason"] = (
+                    "static contract model_fingerprint does not match the runtime "
+                    "model bundle manifest"
+                )
+                return evidence
             fingerprint_path = output_dir / MODEL_FINGERPRINT_FILENAME
             fingerprint_path.write_text(
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "model_fingerprint": report["model_fingerprint"],
+                        "model_fingerprint": fingerprint,
                     },
                     sort_keys=True,
                 )
@@ -665,16 +806,31 @@ class IntegratedRunner:
 
     def _run_stage_b(self) -> dict[str, Any]:
         attempt_start_path = self._write_attempt_start()
-        manifest_path, source_lock = self._invoke_source_lock_manifest(attempt_start_path)
+        try:
+            attempt_start = _json_file(attempt_start_path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            return {
+                "stage": "B",
+                "status": STATUS_EVIDENCE_INVALID,
+                "reasons": [f"attempt-start identity is invalid: {error}"],
+            }
+        attempt_id = str(attempt_start.get("attempt_id", attempt_start_path.stem))
+        reference_epoch = self._wall_epoch(attempt_start)
+        gate_b_dir = self.attempt_root / f"gate-b-{attempt_id}"
+        gate_b_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = gate_b_dir / SOURCE_LOCK_MANIFEST_FILENAME
+        _, source_lock = self._invoke_source_lock_manifest(attempt_start_path, manifest_path)
         if source_lock.get("status") != "pass":
             self.static_contract_status = STATUS_EVIDENCE_INVALID
             return {
                 "stage": "B",
-                "status": str(source_lock.get("status", STATUS_EVIDENCE_INVALID)),
+                "status": STATUS_EVIDENCE_INVALID,
                 "source_lock": source_lock,
-                "reasons": [str(source_lock.get("reason", "source-lock manifest is not authorized"))],
+                "reasons": [
+                    str(source_lock.get("reason", "source-lock manifest is not authorized"))
+                ],
             }
-        static = self._invoke_static_contracts(manifest_path)
+        static = self._invoke_static_contracts(manifest_path, gate_b_dir, reference_epoch)
         status = str(static.get("status", STATUS_EVIDENCE_INVALID))
         self.static_contract_status = status
         result: dict[str, Any] = {
@@ -726,22 +882,15 @@ class IntegratedRunner:
     def _new_scenario_runner(
         self, allocation: AttemptAllocation, name: str
     ) -> QualificationRunner:
-        config = self._config()
-        core_config_value = config.get("core_config")
-        core_config_path = (
-            Path(core_config_value)
-            if Path(str(core_config_value)).is_absolute()
-            else self.root / str(core_config_value)
-        ).resolve()
         scenario_path = self.root / "simulation/scenarios" / f"{name}.json"
         return QualificationRunner(
             root=self.root,
-            attempt_root=allocation.attempt_dir.parent,
-            config_path=core_config_path,
+            attempt_root=self.attempt_root,
+            config_path=self._core_config_path(),
             scenario_path=scenario_path,
             artifact_path=None,
             seed=self.seed,
-            gate=name,
+            gate="integrated",
             readiness_timeout_s=self.readiness_timeout_s,
             bag_startup_timeout_s=self.bag_startup_timeout_s,
             isaac_command=self._isaac_scenario_command(name),
@@ -753,58 +902,49 @@ class IntegratedRunner:
         )
 
     def _launch_scenario(
-        self,
-        allocation: AttemptAllocation,
-        name: str,
-        stage: str,
-    ) -> dict[str, Any]:
+        self, allocation: AttemptAllocation, name: str, stage: str
+    ) -> tuple[QualificationRunner, QualificationManifest]:
+        attempt_dir = allocation.attempt_dir
+        if attempt_dir.is_dir() and any(attempt_dir.iterdir()):
+            raise ValueError(
+                f"attempt directory is not empty; refusing to reuse: {attempt_dir}"
+            )
         runner = self._new_scenario_runner(allocation, name)
-        manifest = runner.prepare_manifest()
-        self._scenario_manifests[allocation.attempt_dir] = (runner, manifest)
-        environment = self._scenario_environment(manifest, allocation)
-        return {
-            "ok": True,
-            "attempt_dir": allocation.attempt_dir,
-            "manifest": manifest,
-            "environment": environment,
-        }
-
-    def _scenario_environment(
-        self, manifest: QualificationManifest, allocation: AttemptAllocation
-    ) -> dict[str, str]:
-        environment = _ros_tooling_environment(
-            root=self.root,
-            domain_id=str(allocation.domain_id),
+        # attempt_id is tied to the freshly allocated directory so manifest,
+        # launch environment, child logs, rosbag, truth, verifier, teardown,
+        # cleanup, and the returned result all reference one directory.
+        manifest = runner.prepare_manifest_at(
+            attempt_dir.name, attempt_dir, scenario_id=name
         )
-        environment.update(
-            {
-                "ROS_DOMAIN_ID": str(allocation.domain_id),
-                "RMW_IMPLEMENTATION": str(
-                    manifest.data.get("environment", {}).get(
-                        "RMW_IMPLEMENTATION", "rmw_fastrtps_cpp"
-                    )
-                ),
-                "TINKER_SIM_ROOT": str(self.root),
-                "TINKER_SIM_ATTEMPT_DIR": str(allocation.attempt_dir),
-                "TINKER_SIM_TRUTH_JSONL": str(allocation.attempt_dir / "physics_truth.jsonl"),
-                "TINKER_SIM_EVALUATOR_JSONL": str(allocation.attempt_dir / "evaluator.jsonl"),
-                "TINKER_SIM_ROSBAG_DIR": str(allocation.attempt_dir / "rosbag"),
-                "TINKER_SIM_PHYSICS_DEVICE": "cpu",
-                "TINKER_SIM_MODEL_BUNDLE_MANIFEST": str(self.model_bundle_manifest),
-                "TINKER_SIM_PROVIDER_MANIFEST": str(self.provider_manifest_path),
-                "ISAACSIM_HEADLESS": "1",
-            }
-        )
-        return environment
+        self._scenario_manifest_store[attempt_dir] = (runner, manifest)
+        baseline = qualification_gpu_processes(runner)
+        self._gpu_baselines[attempt_dir] = baseline
+        qualification_start_process(runner, "isaac", runner.isaac_command, manifest)
+        try:
+            qualification_start_process(runner, "humble", runner.humble_command, manifest)
+        except Exception:
+            # Partial launch: the Isaac child is already owned by this runner;
+            # stop it before surfacing so the lifecycle owner is never left with
+            # an orphaned producer.
+            qualification_stop_process(runner, "isaac")
+            raise
+        return runner, manifest
 
     def _validate_physics_ready(
-        self, attempt_dir: Path, name: str
+        self,
+        attempt_dir: Path,
+        name: str,
+        *,
+        manifest: QualificationManifest | None = None,
     ) -> tuple[bool, dict[str, Any], str | None]:
         """Validate ``physics-ready.json`` against the exact report bytes/identity.
 
         A transient ``state=PHYSICS_READY`` without the exact
         ``scenario_report_sha256`` of the atomically written ``scenario-runner.json``
-        and the full committed identity is insufficient.
+        and the full committed identity is insufficient.  When *manifest* is
+        supplied (the real lifecycle), the current-attempt manifest must be
+        present and match the allocation, so a prior attempt's evidence cannot
+        satisfy readiness with zero child launches.
         """
         scenario_runner_path = attempt_dir / "scenario-runner.json"
         physics_ready_path = attempt_dir / "physics-ready.json"
@@ -819,6 +959,31 @@ class IntegratedRunner:
                 "present": physics_ready_path.is_file(),
             },
         }
+        if manifest is not None:
+            manifest_path = attempt_dir / "manifest.json"
+            if not manifest_path.is_file():
+                return (
+                    False,
+                    evidence,
+                    "attempt manifest.json is missing; refusing to trust pre-existing evidence",
+                )
+            try:
+                recorded = _json_file(manifest_path)
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                return False, evidence, f"attempt manifest.json is invalid: {error}"
+            if str(recorded.get("attempt_id")) != manifest.attempt_id:
+                return (
+                    False,
+                    evidence,
+                    "attempt manifest attempt_id does not match the current allocation",
+                )
+            if str(recorded.get("scenario", {}).get("id")) != name:
+                return False, evidence, "attempt manifest scenario id does not match"
+            evidence["manifest"] = {
+                "path": str(manifest_path),
+                "attempt_id": recorded.get("attempt_id"),
+                "scenario_id": recorded.get("scenario", {}).get("id"),
+            }
         if not scenario_runner_path.is_file():
             return False, evidence, "scenario-runner.json is missing"
         if not physics_ready_path.is_file():
@@ -848,7 +1013,10 @@ class IntegratedRunner:
             report = parse_canonical_report(report_bytes)
         except ReportValidationError as error:
             return False, evidence, f"scenario-runner.json is not the canonical report: {error}"
-        bundle = self._scenario_bundle(name)
+        try:
+            bundle = self._scenario_bundle(name)
+        except (OSError, ValueError, KeyError, FileNotFoundError) as error:
+            return False, evidence, f"scenario bundle could not be resolved: {error}"
         identities = bundle["report_identities"]
         # The canonical planning-scene report mapping (owned ids derived through
         # the authoritative Task 5 ``fixture_owned_ids`` helper) is exactly what
@@ -898,49 +1066,43 @@ class IntegratedRunner:
         return True, evidence, None
 
     def _wait_for_physics_ready(
-        self, attempt_dir: Path, name: str
+        self,
+        attempt_dir: Path,
+        name: str,
+        *,
+        manifest: QualificationManifest | None = None,
     ) -> tuple[bool, dict[str, Any], str | None]:
         deadline = time.monotonic() + self.readiness_timeout_s
-        last_evidence: dict[str, Any] = {}
-        last_reason: str | None = None
+        last: tuple[bool, dict[str, Any], str | None] = (
+            False, {}, "physics-ready timeout",
+        )
         while time.monotonic() < deadline:
-            ok, evidence, reason = self._validate_physics_ready(attempt_dir, name)
-            last_evidence = evidence
-            last_reason = reason
+            ok, evidence, reason = self._validate_physics_ready(
+                attempt_dir, name, manifest=manifest
+            )
+            last = (ok, evidence, reason)
             if ok:
                 return True, evidence, None
-            if (attempt_dir / "scenario-runner.json").is_file() and (
-                attempt_dir / "physics-ready.json"
-            ).is_file():
-                # Both files exist but validation fails: do not spin forever on
-                # a definite mismatch.
-                return False, evidence, reason
+            if manifest is not None and not (attempt_dir / "manifest.json").is_file():
+                # A missing manifest means this runner never launched the
+                # attempt: hard fail, never spin on stale evidence.
+                return False, evidence, reason or "attempt manifest is missing"
             time.sleep(0.25)
-        return False, last_evidence, last_reason or "physics-ready timeout"
+        return last
 
-    def _drain_truth(self, attempt_dir: Path, name: str) -> dict[str, Any]:
-        raw_path = attempt_dir / "physics_truth.jsonl"
-        evaluator_path = attempt_dir / "evaluator.jsonl"
-        raw_records, raw_errors = qualification_jsonl_records(raw_path)
-        evaluator_records, evaluator_errors = qualification_jsonl_records(evaluator_path)
-        correlated, mismatches = qualification_compare_truth_records(
-            raw_records,
-            evaluator_records,
-            raw_errors=raw_errors,
-            evaluator_errors=evaluator_errors,
-        )
-        evidence: dict[str, Any] = {
-            "status": "drained" if correlated else "evidence-invalid",
-            "raw_truth_frames": len(raw_records),
-            "evaluator_frames": len(evaluator_records),
-            "exact_correlation": correlated,
-            "raw_errors": raw_errors,
-            "evaluator_errors": evaluator_errors,
-            "mismatches": mismatches,
-        }
-        if not correlated:
-            evidence["reason"] = "raw/evaluator drain did not correlate exactly"
-        return evidence
+    def _wait_for_scenario_terminal(self, attempt_dir: Path, name: str) -> dict[str, Any]:
+        deadline = time.monotonic() + self.readiness_timeout_s
+        while time.monotonic() < deadline:
+            for marker_name in TERMINAL_EVIDENCE_FILENAMES:
+                marker = attempt_dir / marker_name
+                if marker.is_file():
+                    try:
+                        value = _json_file(marker)
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        value = {}
+                    return {"ok": True, "terminal": value, "marker": str(marker)}
+            time.sleep(0.25)
+        return {"ok": False, "reason": "scenario execution terminal was not observed"}
 
     def _verify_attempt(self, attempt_dir: Path, name: str, stage: str) -> dict[str, Any]:
         try:
@@ -959,87 +1121,236 @@ class IntegratedRunner:
             **dict(verdict),
         }
 
-    def _wait_for_scenario_terminal(
-        self, attempt_dir: Path, name: str
+    def _integrated_rosbag_evidence(
+        self, attempt_dir: Path
+    ) -> tuple[bool, dict[str, Any], list[str]]:
+        """Tolerantly validate any rosbag recorded in the attempt directory.
+
+        The integrated-ompl overlay does not run the six-gate recorder, so a
+        missing ``rosbag`` directory is non-load-bearing evidence.  A present
+        but unstructured/corrupt bag is a durable teardown/evidence failure that
+        downgrades the scenario to ``evidence-invalid``.
+        """
+        bag_dir = attempt_dir / "rosbag"
+        evidence: dict[str, Any] = {
+            "output_directory": bag_dir.is_dir(),
+        }
+        if not bag_dir.is_dir():
+            evidence["status"] = "not-recorded"
+            evidence["load_bearing"] = False
+            return True, evidence, []
+        metadata_path = bag_dir / "metadata.yaml"
+        if not metadata_path.is_file():
+            evidence["status"] = "invalid"
+            evidence["load_bearing"] = True
+            return (
+                False,
+                evidence,
+                ["integrated rosbag directory is present but has no metadata.yaml"],
+            )
+        try:
+            metadata = qualification_rosbag_metadata_evidence(
+                metadata_path.read_text(encoding="utf-8"),
+                minimum_message_counts=None,
+            )
+        except (OSError, ValueError) as error:
+            evidence["status"] = "invalid"
+            evidence["load_bearing"] = True
+            return False, evidence, [f"integrated rosbag metadata is unreadable: {error}"]
+        structured = bool(metadata.get("parsed"))
+        evidence["status"] = "valid" if structured else "invalid"
+        evidence["load_bearing"] = True
+        evidence["metadata"] = metadata
+        if not structured:
+            return (
+                False,
+                evidence,
+                ["integrated rosbag metadata is not structured rosbag2 metadata"],
+            )
+        return True, evidence, []
+
+    def _finalize_attempt(
+        self,
+        runner: QualificationRunner | None,
+        manifest: QualificationManifest | None,
+        gpu_baseline: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        terminal_marker = attempt_dir / "execution-terminal.json"
-        deadline = time.monotonic() + self.readiness_timeout_s
-        while time.monotonic() < deadline:
-            if terminal_marker.is_file():
-                try:
-                    value = _json_file(terminal_marker)
-                except (OSError, ValueError, json.JSONDecodeError):
-                    value = {}
-                return {"ok": True, "terminal": value, "marker": str(terminal_marker)}
-            if (attempt_dir / "gate-verdict.json").is_file():
-                return {"ok": True, "terminal": {"verdict": True}}
-            time.sleep(0.25)
-        return {"ok": False, "reason": "scenario execution terminal was not observed"}
+        """Stop producers, drain, finalize rosbag, and clean up; fail-dominant.
+
+        Mirrors the six-gate ordering: stop the Isaac producer first so the
+        evaluator consumes its final raw frames, then wait for the bounded
+        evaluator/raw drain, then stop the evaluator and recorder, finalize the
+        rosbag, terminate escaped orphans, and write cleanup/resource evidence.
+        Returns the failures list; the independent verifier runs only after this
+        is final and clean.
+        """
+        failures: list[str] = []
+        if runner is None or manifest is None:
+            return {
+                "failures": failures,
+                "drained": False,
+                "rosbag_ok": False,
+                "exit_codes": {},
+            }
+        exit_codes: dict[str, int | None] = {}
+        if "isaac" in runner._processes:
+            exit_codes["isaac"] = qualification_stop_process(runner, "isaac")
+        drained = qualification_wait_for_evaluator_drain(runner, manifest)
+        if not drained:
+            failures.append("raw/evaluator drain did not correlate exactly")
+        if "humble" in runner._processes:
+            exit_codes["humble"] = qualification_stop_process(runner, "humble")
+        if "rosbag" in runner._processes:
+            exit_codes["rosbag"] = qualification_stop_process(runner, "rosbag")
+        rosbag_ok, rosbag_evidence, rosbag_failures = self._integrated_rosbag_evidence(
+            manifest.attempt_dir
+        )
+        if rosbag_failures:
+            failures.extend(rosbag_failures)
+        orphan_initial = qualification_attempt_processes(runner)
+        if orphan_initial:
+            qualification_terminate_attempt_orphans(runner)
+            failures.append("orphan attempt processes remained after teardown")
+        resources_clean = qualification_write_resource_evidence(
+            runner, manifest, gpu_baseline or {}
+        )
+        if not resources_clean:
+            failures.append(
+                "cleanup/resource evidence reported owned survivors or GPU memory growth"
+            )
+        qualification_settle_evidence_files(runner, manifest)
+        return {
+            "failures": failures,
+            "exit_codes": exit_codes,
+            "drained": drained,
+            "rosbag_ok": rosbag_ok,
+            "rosbag_evidence": rosbag_evidence,
+            "orphan_cleanup_required": bool(orphan_initial),
+            "resources_clean": resources_clean,
+        }
+
+    def _teardown_scenario(self, allocation: AttemptAllocation) -> bool:
+        """Finalize a launched scenario; idempotent for never-launched/cleaned.
+
+        Returns False when any teardown/drain/bag/resource obligation failed so
+        ``run_scenario`` can downgrade the scenario to ``evidence-invalid``.
+        """
+        runner, manifest = self._scenario_manifest_store.pop(
+            allocation.attempt_dir, (None, None)
+        )
+        if runner is None:
+            return True
+        baseline = self._gpu_baselines.pop(allocation.attempt_dir, None)
+        finalize = self._finalize_attempt(runner, manifest, baseline)
+        return not finalize["failures"]
 
     def _execute_scenario(
         self, allocation: AttemptAllocation, name: str, stage: str
     ) -> dict[str, Any]:
         attempt_dir = allocation.attempt_dir
-        attempt_dir.mkdir(parents=True, exist_ok=True)
-        launch = self._launch_scenario(allocation, name, stage)
-        if not launch.get("ok"):
-            return {
-                "status": STATUS_EVIDENCE_INVALID,
-                "scenario": name,
-                "stage": stage,
-                "reasons": [str(launch.get("reason", "scenario launch failed"))],
-            }
-        ready_ok, ready_evidence, ready_reason = self._wait_for_physics_ready(
-            attempt_dir, name
+        runner = None
+        manifest = None
+        failure_reasons: list[str] = []
+        finalize_evidence: dict[str, Any] = {}
+        error_text: str | None = None
+        try:
+            try:
+                runner, manifest = self._launch_scenario(allocation, name, stage)
+            except Exception as error:  # noqa: BLE001 - per-scenario boundary
+                error_text = str(error)
+                failure_reasons.append(f"scenario launch failed: {error}")
+            if error_text is None:
+                try:
+                    ready_ok, _ready_evidence, ready_reason = (
+                        self._wait_for_physics_ready(attempt_dir, name, manifest=manifest)
+                    )
+                    if not ready_ok:
+                        failure_reasons.append(
+                            ready_reason or "physics readiness was not achieved"
+                        )
+                    else:
+                        terminal = self._wait_for_scenario_terminal(attempt_dir, name)
+                        if not terminal.get("ok"):
+                            failure_reasons.append(
+                                str(
+                                    terminal.get(
+                                        "reason",
+                                        "scenario execution terminal was not observed",
+                                    )
+                                )
+                            )
+                except Exception as error:  # noqa: BLE001 - fail-dominant lifecycle
+                    error_text = str(error)
+                    failure_reasons.append(f"scenario lifecycle raised: {error}")
+        finally:
+            # Every post-launch path attempts bounded cleanup: when the local
+            # runner is None (partial launch or launch failure), fall back to the
+            # registered lifecycle owner so an already-started Isaac/Humble child
+            # is still stopped, drained, and accounted.
+            stored_runner, stored_manifest = self._scenario_manifest_store.pop(
+                attempt_dir, (None, None)
+            )
+            effective_runner = runner or stored_runner
+            effective_manifest = manifest or stored_manifest
+            baseline = self._gpu_baselines.pop(attempt_dir, None)
+            finalize_evidence = self._finalize_attempt(
+                effective_runner, effective_manifest, baseline
+            )
+            failure_reasons.extend(finalize_evidence.get("failures", []))
+        if error_text is not None or failure_reasons:
+            return self._scenario_result(
+                name,
+                stage,
+                STATUS_EVIDENCE_INVALID,
+                failure_reasons,
+                finalize=finalize_evidence,
+                error=error_text,
+            )
+        try:
+            verdict = self._verify_attempt(attempt_dir, name, stage)
+        except Exception as error:  # noqa: BLE001 - durable per-scenario boundary
+            return self._scenario_result(
+                name,
+                stage,
+                STATUS_EVIDENCE_INVALID,
+                [f"verification failed: {error}"],
+                finalize=finalize_evidence,
+            )
+        return self._scenario_result(
+            name,
+            stage,
+            str(verdict.get("status", STATUS_EVIDENCE_INVALID)),
+            [],
+            verdict=verdict,
+            finalize=finalize_evidence,
         )
-        if not ready_ok:
-            return {
-                "status": STATUS_EVIDENCE_INVALID,
-                "scenario": name,
-                "stage": stage,
-                "reasons": [str(ready_reason)],
-                "readiness_evidence": ready_evidence,
-            }
-        terminal = self._wait_for_scenario_terminal(attempt_dir, name)
-        if not terminal.get("ok"):
-            return {
-                "status": STATUS_EVIDENCE_INVALID,
-                "scenario": name,
-                "stage": stage,
-                "reasons": [str(terminal.get("reason", "scenario did not reach a terminal"))],
-            }
-        drained = self._drain_truth(attempt_dir, name)
-        if drained.get("status") != "drained":
-            return {
-                "status": STATUS_EVIDENCE_INVALID,
-                "scenario": name,
-                "stage": stage,
-                "reasons": [str(drained.get("reason", "truth drain failed"))],
-                "drain": drained,
-            }
-        return self._verify_attempt(attempt_dir, name, stage)
 
-    def _teardown_scenario(self, allocation: AttemptAllocation) -> bool:
-        """Stop managed processes, terminate orphans, and settle evidence."""
-        runner, manifest = self._scenario_manifests.pop(
-            allocation.attempt_dir, (None, None)
-        )
-        if runner is None:
-            return True
-        helpers = QualificationProcessHelpers(runner)
-        ok = True
-        gpu_baseline = qualification_gpu_processes(runner)
-        for name in ("humble", "isaac"):
-            qualification_stop_process(runner, name)
-        if not qualification_wait_for_evaluator_drain(runner, manifest):
-            ok = False
-        orphans = qualification_attempt_processes(runner)
-        if orphans:
-            qualification_terminate_attempt_orphans(runner)
-        if not qualification_write_resource_evidence(runner, manifest, gpu_baseline):
-            ok = False
-        qualification_settle_evidence_files(runner, manifest)
-        return ok
+    @staticmethod
+    def _scenario_result(
+        name: str,
+        stage: str,
+        status: str,
+        reasons: Sequence[str],
+        *,
+        verdict: Mapping[str, Any] | None = None,
+        finalize: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "scenario": name,
+            "stage": stage,
+            "status": status,
+            "started": True,
+        }
+        if reasons:
+            result["reasons"] = [str(reason) for reason in reasons]
+        if verdict is not None:
+            result["verdict"] = dict(verdict)
+        if finalize is not None:
+            result["finalize"] = dict(finalize)
+        if error is not None:
+            result["error"] = error
+        return result
 
     def run_scenario(
         self,
@@ -1048,15 +1359,25 @@ class IntegratedRunner:
         stage: str,
         allocation: AttemptAllocation | None = None,
     ) -> dict[str, Any]:
-        """Run one scenario in a unique child domain and immutable attempt dir.
+        """Run one scenario in a fresh child domain and immutable attempt dir.
 
+        A malformed scenario declaration/bundle/identity fails that scenario
+        closed (``evidence-invalid``) without aborting the rest of the stage.
         The independent verifier's status is authoritative; execution return
         codes never override it.  A teardown failure downgrades the scenario to
         ``evidence-invalid``.  Every attempt directory is preserved.
         """
+        try:
+            self._scenario_bundle(name)
+        except (OSError, ValueError, KeyError, FileNotFoundError, TypeError) as error:
+            return {
+                "scenario": name,
+                "stage": stage,
+                "status": STATUS_EVIDENCE_INVALID,
+                "started": False,
+                "reasons": [f"malformed scenario data: {error}"],
+            }
         allocation = allocation or self._allocate_one(name, stage)
-        attempt_dir = allocation.attempt_dir
-        attempt_dir.mkdir(parents=True, exist_ok=True)
         self.started_scenarios.append(name)
         result = self._execute_scenario(allocation, name, stage)
         teardown_ok = self._teardown_scenario(allocation)
@@ -1074,11 +1395,32 @@ class IntegratedRunner:
 
     def _run_scenario_stage(self, stage: str) -> dict[str, Any]:
         names = self._stage_scenarios(stage)
+        # Pre-allocate the whole stage once: unique domains within the batch and
+        # one fresh immutable attempt directory per scenario.  A malformed
+        # scenario never launches, so its (empty) allocation is simply preserved.
+        allocations = self.allocate_live_attempts(
+            stages=(stage,),
+            base_domain_id=self.base_domain_id,
+            attempt_root=self.attempt_root,
+        )
         results: dict[str, Any] = {}
-        for name in names:
-            results[name] = self.run_scenario(name, stage=stage)
-            results[name]["started"] = True
-        return {"stage": stage, "scenario_names": names, **results}
+        for name, allocation in zip(names, allocations):
+            results[name] = self.run_scenario(
+                name, stage=stage, allocation=allocation
+            )
+            # A patched/double run_scenario may omit the started flag; the real
+            # runner records started=False for a malformed scenario that never
+            # launched, and that durable flag must not be overwritten.
+            if "started" not in results[name]:
+                results[name]["started"] = True
+        status = _reduce_scenario_statuses(
+            [
+                str(value.get("status", STATUS_EVIDENCE_INVALID))
+                for value in results.values()
+                if isinstance(value, Mapping)
+            ]
+        )
+        return {"stage": stage, "status": status, "scenario_names": names, **results}
 
     def _run_stage_c(self) -> dict[str, Any]:
         return self._run_scenario_stage("C")
@@ -1110,6 +1452,7 @@ class IntegratedRunner:
         self._stage_results["B"] = b
         if b.get("status") != STATUS_VERIFIED_PASS:
             return {
+                "A": a,
                 "B": b,
                 **{
                     name: {"status": STATUS_BLOCKED}
@@ -1141,43 +1484,43 @@ class IntegratedRunner:
             return self._run_all()
         raise ValueError(f"unsupported test stage: {stage}")
 
-    # -------------------------------------------------------------- #
-    # Scenario-manifest bookkeeping (per live attempt)
-    # -------------------------------------------------------------- #
-
-    @property
-    def _scenario_manifests(self) -> dict[Path, tuple[QualificationRunner, QualificationManifest]]:
-        if not hasattr(self, "_scenario_manifest_store"):
-            self._scenario_manifest_store: dict[
-                Path, tuple[QualificationRunner, QualificationManifest]
-            ] = {}
-        return self._scenario_manifest_store
-
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
 def _overall_status(result: Mapping[str, Any]) -> str:
-    statuses = [
-        str(value.get("status", ""))
-        for key, value in result.items()
-        if isinstance(value, Mapping)
-    ]
+    """Fail-dominant overall status for ``--stage all``.
+
+    Stage A is always retained.  ``blocked-by-gate-b`` child placeholders are
+    diagnostic consequences: the underlying Gate B status is the overall
+    failure cause.  While Stage F is ``not-implemented`` the overall run is not
+    a pass even when A-E pass.
+    """
+    statuses: list[str] = []
+    for key in ("A", "B", "C", "D", "E", "F"):
+        value = result.get(key)
+        if isinstance(value, Mapping):
+            statuses.append(str(value.get("status", "")))
     if not statuses:
         return STATUS_VERIFIED_FAIL
-    if STATUS_BLOCKED in statuses:
-        return STATUS_BLOCKED
     if STATUS_EVIDENCE_INVALID in statuses:
         return STATUS_EVIDENCE_INVALID
     if STATUS_VERIFIED_FAIL in statuses:
         return STATUS_VERIFIED_FAIL
+    if STATUS_BLOCKED in statuses:
+        b = result.get("B")
+        if isinstance(b, Mapping):
+            b_status = str(b.get("status", ""))
+            if b_status in {STATUS_EVIDENCE_INVALID, STATUS_VERIFIED_FAIL}:
+                return b_status
+        return STATUS_BLOCKED
     if STATUS_NOT_IMPLEMENTED in statuses:
         if all(
             status in {STATUS_VERIFIED_PASS, STATUS_NOT_IMPLEMENTED}
             for status in statuses
         ):
-            return STATUS_VERIFIED_PASS
+            return STATUS_NOT_IMPLEMENTED
         return STATUS_VERIFIED_FAIL
     if all(status == STATUS_VERIFIED_PASS for status in statuses):
         return STATUS_VERIFIED_PASS
@@ -1185,16 +1528,16 @@ def _overall_status(result: Mapping[str, Any]) -> str:
 
 
 def _exit_code_for_status(status: str) -> int:
-    if status in {STATUS_VERIFIED_PASS, STATUS_BLOCKED}:
+    if status == STATUS_VERIFIED_PASS:
         return 0
-    if status == STATUS_EVIDENCE_INVALID:
+    if status in {STATUS_EVIDENCE_INVALID, STATUS_NOT_IMPLEMENTED}:
         return 2
     return 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Orchestrate the integrated OMPL qualification Gates A-E."
+        description="Orchestrate the integrated OMPL qualification Gates A-F."
     )
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--production-root", type=Path, default=DEFAULT_PRODUCTION_ROOT)
