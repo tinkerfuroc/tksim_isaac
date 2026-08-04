@@ -10,9 +10,14 @@ Authorization contract
   sheet).  ``build_contact_sheet`` reads that index and raises ``ValueError``
   for blank, transparent, unindexed, stale/mismatched, missing, or unbound
   captures.
+- Source images are selected from the bound keyframe/index entries under
+  ``visual/source/*.png``; the CLI never reconstructs ``captures/{event}.png``.
 - Every visual event binds to exact scenario/attempt/execution-request plus
   ``(frame_index, timestamp)`` metadata from the index.  PlanningScene/action/
   screenshots are diagnostic only and are never physical pass authority.
+- Deterministic semantic metadata (role, event list, source capture records,
+  explicit reviewed state) is embedded in each PNG's text chunks so Gate F can
+  verify sheet semantics from the sheet bytes themselves.
 - Path traversal, symlink escape, duplicate canonical paths/events,
   output-as-input, and files changing during rendering are rejected.
 - Rendering is deterministic: identical inputs produce identical PNG bytes.
@@ -30,21 +35,31 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, PngImagePlugin
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from validation.integrated_evidence_index import INDEX_NAME  # noqa: E402
+from validation.integrated_evidence_index import (  # noqa: E402
+    CANCEL_EVENTS,
+    INDEX_NAME,
+    REQUIRED_POSITIVE_EVENTS,
+    SAFETY_EVENTS,
+    SUMMARY_NAME,
+)
 
 AGENT_NAME = "contact-sheet-integrated-agent.png"
 USER_NAME = "contact-sheet-integrated-user.png"
 IMAGE_SIZE = (960, 540)
+REPORT_REVISION = "2026-08-04"
 _FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
 )
+
+#: Recognized output names that a sheet must never overwrite.
+_PROTECTED_OUTPUT_NAMES = {INDEX_NAME, SUMMARY_NAME, AGENT_NAME, USER_NAME}
 
 
 def _find_font(size: int) -> ImageFont.ImageFont:
@@ -101,20 +116,31 @@ def _image_stats(data: bytes) -> dict[str, float] | None:
     }
 
 
-def _atomic_png(path: Path, image: Image.Image) -> None:
+def _atomic_png(path: Path, image: Image.Image, pnginfo: PngImagePlugin.PngInfo | None = None) -> None:
+    """Atomically write a PNG (fsync file and parent directory)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as stream:
-            image.save(stream, format="PNG", optimize=False, compress_level=9)
+            image.save(stream, format="PNG", optimize=False, compress_level=9, pnginfo=pnginfo)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-    finally:
+        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         try:
             os.unlink(temporary)
-        except FileNotFoundError:
+        except OSError:
             pass
+        raise
 
 
 def _load_index(suite_dir: Path) -> dict[str, Any]:
@@ -143,12 +169,39 @@ def _index_by_path(index: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return by_path
 
 
+def _canonical_metadata(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    """Deterministic embedded sheet metadata (F1.6)."""
+    return {
+        "schema_version": 1,
+        "report_revision": REPORT_REVISION,
+        "role": rows[0]["role"] if rows else None,
+        "diagnostic_only": True,
+        "reviewed": False,
+        "events": [row["event"] for row in rows],
+        "captures": [
+            {
+                "path": row["rel"],
+                "sha256": row["sha256"],
+                "scenario": row["scenario"],
+                "attempt": row["attempt"],
+                "execution_request": row["execution_request"],
+                "frame_index": row["frame_index"],
+                "timestamp": row["timestamp"],
+                "camera": row["camera"],
+                "event": row["event"],
+            }
+            for row in rows
+        ],
+        "captures_sha256": [row["sha256"] for row in rows],
+    }
+
+
 def _render_sheet(rows: Sequence[Mapping[str, Any]], *, user: bool) -> Image.Image:
     """Deterministic grid render; identical inputs -> identical bytes."""
     count = len(rows)
     cell_width, cell_height = 320, 240
     label_width, header_height, margin = 180, 64, 16
-    footer_height = 0 if user else 96
+    footer_height = 96
     width = margin * 2 + label_width + cell_width * count
     height = header_height + margin + cell_height + footer_height
     canvas = Image.new("RGB", (width, height), (10, 14, 20))
@@ -171,15 +224,13 @@ def _render_sheet(rows: Sequence[Mapping[str, Any]], *, user: bool) -> Image.Ima
         draw.text((x + 6, y + 6), str(row["event"]), font=small_font, fill=(245, 245, 245))
         detail = f"frame {row['frame_index']}  t={float(row['timestamp']):g}"
         draw.text((x + 6, y + cell_height - 24), detail, font=small_font, fill=(225, 225, 225))
-        if not user:
-            draw.text((x + 6, y + 24), f"{row['scenario']} / {row['attempt']}", font=small_font, fill=(200, 200, 200))
-    if not user:
-        draw.text(
-            (margin, y + cell_height + 12),
-            "diagnostic only - event metadata bound from evidence-index.json (never physical pass authority)",
-            font=small_font,
-            fill=(225, 225, 225),
-        )
+        draw.text((x + 6, y + 24), f"{row['scenario']} / {row['attempt']}", font=small_font, fill=(200, 200, 200))
+    draw.text(
+        (margin, y + cell_height + 12),
+        "diagnostic only - event metadata bound from evidence-index.json (never physical pass authority)",
+        font=small_font,
+        fill=(225, 225, 225),
+    )
     return canvas
 
 
@@ -202,6 +253,17 @@ def build_contact_sheet(
     index = _load_index(suite_resolved)
     by_path = _index_by_path(index)
 
+    try:
+        rel_output = output_resolved.relative_to(suite_resolved).as_posix()
+    except ValueError:
+        rel_output = None
+    if rel_output is not None:
+        name = rel_output.rsplit("/", 1)[-1]
+        if name in _PROTECTED_OUTPUT_NAMES and name != output_resolved.name:
+            raise ValueError(f"output-as-input: refusing to overwrite protected artifact {rel_output}")
+        if output_resolved in {suite_resolved / INDEX_NAME, suite_resolved / SUMMARY_NAME}:
+            raise ValueError(f"output-as-input: refusing to overwrite {rel_output}")
+
     rows: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
     seen_events: set[str] = set()
@@ -216,6 +278,8 @@ def build_contact_sheet(
         seen_paths.add(rel)
         if output_resolved == image_path:
             raise ValueError(f"output-as-input: refusing to overwrite source capture {rel}")
+        if rel in (INDEX_NAME, SUMMARY_NAME):
+            raise ValueError(f"output-as-input: refusing to overwrite protected artifact {rel}")
         entry = by_path.get(rel)
         if entry is None:
             raise ValueError(f"unindexed capture: {rel} is not present in {INDEX_NAME}")
@@ -232,6 +296,8 @@ def build_contact_sheet(
         for required_field in ("execution_request", "frame_index", "timestamp"):
             if entry.get(required_field) is None:
                 raise ValueError(f"capture missing {required_field} binding: {rel}")
+        if entry.get("physics_bound") is not True:
+            raise ValueError(f"capture missing physics cross-bind: {rel}")
         data = Path(image_path).read_bytes()
         stats = _image_stats(data)
         if stats is None:
@@ -255,32 +321,88 @@ def build_contact_sheet(
                 "camera": entry.get("camera"),
                 "sha256": digest,
                 "rel": rel,
+                "role": "user" if user else "agent",
             }
         )
+    if not rows:
+        raise ValueError("contact sheet requires at least one bound capture")
 
     canvas = _render_sheet(rows, user=user)
-    _atomic_png(output_resolved, canvas)
+    metadata = _canonical_metadata(rows)
+    pnginfo = PngImagePlugin.PngInfo()
+    pnginfo.add_text("tinker.qualification.metadata", json.dumps(metadata, sort_keys=True))
+    _atomic_png(output_resolved, canvas, pnginfo=pnginfo)
     return {
         "schema_version": 1,
         "kind": "integrated-contact-sheet",
         "role": "user" if user else "agent",
         "output": str(output_resolved),
-        "scenario": rows[0]["scenario"] if rows else None,
-        "attempt": rows[0]["attempt"] if rows else None,
+        "scenario": rows[0]["scenario"],
+        "attempt": rows[0]["attempt"],
         "events": [row["event"] for row in rows],
         "paths": [row["rel"] for row in rows],
         "captures_sha256": [row["sha256"] for row in rows],
         "diagnostic_only": True,
+        "reviewed": False,
+        "report_revision": REPORT_REVISION,
     }
 
 
-def _all_bound_events(suite_dir: Path) -> list[str]:
+def _read_sheet_metadata(path: Path) -> Mapping[str, Any] | None:
+    """Read embedded deterministic metadata from a sheet PNG (F1.6)."""
+    try:
+        with Image.open(path) as image:
+            text = image.text
+    except Exception:
+        return None
+    value = text.get("tinker.qualification.metadata") if isinstance(text, Mapping) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    return parsed
+
+
+def _validate_sheet_image(path: Path) -> tuple[bool, str]:
+    """Validate a sheet PNG is a real RGB/RGBA image with sane dimensions."""
+    try:
+        with Image.open(path) as image:
+            image.load()
+            if image.mode not in ("RGB", "RGBA"):
+                return False, f"unsupported mode {image.mode}"
+            if image.width < 32 or image.height < 32:
+                return False, "dimensions too small"
+            stats = _image_stats(path.read_bytes())
+            if stats is None:
+                return False, "corrupt PNG"
+            if stats["blank"]:
+                return False, "blank or transparent"
+    except Exception as error:
+        return False, str(error)
+    return True, ""
+
+
+def _all_bound_capture_entries(suite_dir: Path) -> list[dict[str, Any]]:
     index = _load_index(suite_dir)
-    events: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    seen_events: set[str] = set()
     for entry in index.get("files", []):
-        if isinstance(entry, Mapping) and entry.get("category") == "capture" and entry.get("bound") and isinstance(entry.get("event"), str):
-            events.add(entry["event"])
-    return sorted(events)
+        if (
+            isinstance(entry, Mapping)
+            and entry.get("category") == "capture"
+            and entry.get("bound")
+            and isinstance(entry.get("event"), str)
+        ):
+            event = entry["event"]
+            if event in seen_events:
+                continue
+            seen_events.add(event)
+            entries.append(dict(entry))
+    return entries
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -291,21 +413,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--events", nargs="*", default=None, help="subset of events (default: all bound events)")
     args = parser.parse_args(argv)
     suite_dir = Path(args.suite_dir).resolve()
-    if args.events:
-        paths = [suite_dir / "captures" / f"{event}.png" for event in args.events]
-    else:
-        events = _all_bound_events(suite_dir)
-        paths = [suite_dir / "captures" / f"{event}.png" for event in events]
-    if not paths:
+    events = set(args.events) if args.events is not None else None
+    entries = _all_bound_capture_entries(suite_dir)
+    if events is not None:
+        entries = [entry for entry in entries if entry["event"] in events]
+    if not entries:
         raise SystemExit("no bound capture events found in evidence index")
+    paths = [suite_dir / entry["path"] for entry in entries]
+    agent_output = Path(args.agent) if args.agent else suite_dir / AGENT_NAME
+    user_output = Path(args.user) if args.user else suite_dir / USER_NAME
     if args.agent or args.user:
         if args.agent:
-            build_contact_sheet(suite_dir, paths, output=Path(args.agent))
+            build_contact_sheet(suite_dir, paths, output=agent_output)
         if args.user:
-            build_contact_sheet(suite_dir, paths, output=Path(args.user))
+            build_contact_sheet(suite_dir, paths, output=user_output, user=True)
     else:
-        build_contact_sheet(suite_dir, paths, output=suite_dir / AGENT_NAME)
-        build_contact_sheet(suite_dir, paths, output=suite_dir / USER_NAME)
+        build_contact_sheet(suite_dir, paths, output=agent_output)
+        build_contact_sheet(suite_dir, paths, output=user_output, user=True)
     return 0
 
 

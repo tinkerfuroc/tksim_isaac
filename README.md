@@ -314,6 +314,35 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 9, fix round 1 — "bind evidence index
+  to live artifacts"): The initial 44 tests were synthetic and did not exercise
+  real Task 2-8 producer schemas, so this repair re-pinned every semantic parser
+  to the actual producer contracts.  `validation/integrated_evidence_index.py`
+  now consumes the real executor `visual-capture-requests.jsonl` +
+  capture-process `visual-keyframes.jsonl` two-journal transaction, joins each
+  keyframe to exactly one request via `request_sequence`/phase/event identity,
+  resolves `visual/source/*.png` under the attempt root, and cross-binds
+  `(frame_index,timestamp)` to exact `physics_truth.jsonl`/`evaluator.jsonl`
+  frames.  Scenario kinds come only from the canonical
+  `integrated.acceptance.polarity`/`expected_negative` contract (never
+  `integrated.kind`); the three canonical cancel ids and two safety ids require
+  their event groups.  `validate_gate_f` is now semantic: source-lock/static-
+  contract/model-fingerprint identities, per-scenario `gate-verdict.json`
+  verified-pass, nonempty raw/evaluator/drain exactness, finalized MoveIt/
+  controller/planning-scene journals, rosbag2 metadata + storage counts,
+  cleanup/process/GPU leak checks, and contact-sheet PNG/metadata/parity.  F1.5
+  index integrity recomputes the canonical checksum, re-hashes current bytes,
+  and compares the preserved-file set; the summary binds a pre-summary projection
+  checksum (never a cryptographic cycle).  F1.6 embeds deterministic PNG text
+  chunk metadata (role/ordered events/source capture records/reviewed state).
+  New tests: `tests/test_integrated_evidence_index.py` (38) +
+  `tests/test_integrated_contact_sheets.py` (20) = 58 passed in the simulator
+  venv, mutation-driven against production-shaped artifact bytes; affected
+  ROS-free regressions pass (see the task-9-report).  Documentation/staging per
+  `execution-corrections-2026-08-02.md` §6.  No build, no live Isaac/ROS/GPU/
+  cuMotion, and no rosbag/capture production ran; immutables and the future
+  qualification source lock remain untouched.
+
 - 2026-08-04 (integrated qualification Task 9 — "close integrated evidence
   artifacts"): Added deterministic reproducibility indexing and integrated
   contact sheets.  `validation/integrated_evidence_index.py` (new) builds
