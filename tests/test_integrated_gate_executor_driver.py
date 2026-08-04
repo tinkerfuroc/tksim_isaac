@@ -775,12 +775,26 @@ def test_build_occupancy_rejects_malformed_fixture_geometry():
     bad = {**base, "primitive": {"type": "cylinder", "dimensions": [0.1, 0.1, 0.1]}}
     with pytest.raises(ValueError, match="unsupported qualification fixture"):
         rs.build_occupancy_from_planning_scene([bad])
-    # Non-axis-aligned quaternion is rejected.
+    # F4.6: a yaw-only rotation (90 deg about z) is a valid oriented footprint.
+    yaw = {
+        **base,
+        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.7071068, 0.7071068]},
+    }
+    assert rs.build_occupancy_from_planning_scene([yaw]) is not None
+    # A roll rotation (rotation about x) is not representable by the 2-D
+    # development lidar and is rejected.
     bad = {
         **base,
-        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.707, 0.707]},
+        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.7071068, 0.0, 0.0, 0.7071068]},
     }
-    with pytest.raises(ValueError, match="axis-aligned"):
+    with pytest.raises(ValueError, match="yaw-only"):
+        rs.build_occupancy_from_planning_scene([bad])
+    # A non-normalized quaternion is rejected.
+    bad = {
+        **base,
+        "pose": {"xyz": [0.0, 0.0, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.5]},
+    }
+    with pytest.raises(ValueError, match="normalized"):
         rs.build_occupancy_from_planning_scene([bad])
     # Non-positive dimensions are rejected.
     bad = {**base, "primitive": {"type": "box", "dimensions": [0.0, 0.1, 0.1]}}
@@ -826,6 +840,35 @@ def test_qualification_occupancy_resolves_committed_scenario():
     assert m.occupied_at_world(0.65, 0.0) is True
     assert m.occupied_at_world(0.85, 0.0) is True
     assert m.occupied_at_world(-4.0, -4.0) is False
+
+
+def test_qualification_occupancy_resolves_all_17_canonical_scenarios():
+    # F4.6: every canonical scenario must resolve qualification occupancy
+    # without raising.  The two rotated-target pose scenarios (plan-pose /
+    # execute-pose, 45 deg about z) are exactly the B4.3 regression closed.
+    from integrated_qualification import QUALIFICATION_SCENARIO_NAMES
+
+    import math
+
+    resolved = {}
+    for name in QUALIFICATION_SCENARIO_NAMES:
+        try:
+            resolved[name] = rs.qualification_occupancy(ROOT, name)
+        except Exception as exc:  # noqa: BLE001 - fail-closed enumeration
+            raise AssertionError(
+                f"qualification_occupancy raised for canonical {name}: {exc}"
+            ) from exc
+    # The two rotated-target pose scenarios must produce usable occupancy.
+    for rotated in ("qualification-moveit-plan-pose", "qualification-moveit-execute-pose"):
+        m = resolved[rotated]
+        assert m is not None, f"{rotated} must resolve to an occupancy map"
+        assert m.resolution == 0.05
+    # The D-retreat pedestal still produces a finite +x raycast.
+    retreat = resolved["qualification-moveit-cartesian-retreat"]
+    assert retreat is not None
+    hit = retreat.raycast(0.0, 0.0, 0.0, minimum=0.3, maximum=40.0)
+    assert math.isfinite(hit)
+    assert 0.3 <= hit <= 1.5
 
 
 def test_gateway_lidar_enabled_resolution_is_exact():

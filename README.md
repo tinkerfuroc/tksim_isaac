@@ -314,6 +314,34 @@ References:
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 4 — "bind real
+  controller transactions"): Bound every Stage-D controller transaction to the
+  real FJT controller goal UUID, distinct from the MoveIt ExecuteTrajectory
+  UUID.  `_normalize_goal_uuid` now accepts real Humble rclpy `UUID` messages
+  (numpy `uint8[16]`) with a strict 16-byte rule; `_d_baseline()` tracks known
+  controller FJT goal UUIDs and `_discover_new_fjt_goal()` discovers the unique
+  new controller UUID after the ExecuteTrajectory result, failing closed on zero
+  or multiple new UUIDs (pre-baseline replays and duplicate controller goals are
+  rejected); `_validate_fjt_evidence()` gains `expected_fjt_goal_uuid` and joins
+  the provider UUID/status/sequence/timestamp to the exact fresh FJT status-topic
+  entry.  `run_execute_sequence`/`run_cancel_sequence`/`run_safety_sequence`
+  never key FJT status on `execute_goal_id`: cancel/safety pre-send
+  (`_presend_long_motion`) carries the real controller identity + pre-send
+  baseline, `run_driver` teardown guarantees presend cleanup with an operator
+  clear, and `_observe_journal_graph` selects owner-specific graph QoS rather
+  than `infos[0]`.  `run_sim.build_occupancy_from_planning_scene` rasterizes the
+  oriented (yaw-only) box footprint of all 17 canonical scenarios.  Offline
+  regressions: `test_integrated_gate_executor.py` 127 passed,
+  `test_integrated_gate_executor_driver.py` 37 passed,
+  `test_integrated_gate_executor_ros.py` 165 passed; sourced-Humble
+  `tests/ros_humble/test_integrated_gate_executor_driver_providers.py` 30 passed
+  with zero warnings (positive C/D paths commit `diagnostic-pass`, controller
+  UUID distinct from ExecuteTrajectory UUID, cancel/safety reach the real
+  presend-provider sequence, and the transaction-real negatives fail closed).
+  No build, no live Isaac/GPU/cuMotion; executor/verifier/journal/orchestrator/
+  scenarios/configs/locks/gateway/bridge/scripts and all production files
+  untouched; the future qualification source lock remains absent.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 3 — "observe live
   integrated providers"): Replaced every fabricated/placeholder provider with a
   driver-owned live observer and a real graph/service surface, and adopted

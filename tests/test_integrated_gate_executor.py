@@ -1922,6 +1922,57 @@ def test_goal_uuid_normalization_and_validity():
     assert _normalize_goal_uuid(True) is None
 
 
+def test_goal_uuid_normalization_accepts_real_uuid_containers():
+    """F4.1: a real Humble ClientGoalHandle.goal_id is a UUID message whose
+    ``.uuid`` is a numpy ``uint8[16]``; the normalizer must accept any strict
+    16-byte iterable/buffer and reject malformed element ranges/lengths."""
+    from array import array
+
+    from validation.integrated_gate_executor import _normalize_goal_uuid
+
+    raw_hex = "00112233445566778899aabbccddeeff"
+    raw = bytes.fromhex(raw_hex)
+
+    class _UUIDMsg:
+        """Stand-in for ``unique_identifier_msgs/msg/UUID`` (``.uuid`` array)."""
+
+        def __init__(self, value):
+            self.uuid = value
+
+    class _UUIDBytesMsg:
+        """A container exposing ``.bytes`` instead of ``.uuid``."""
+
+        def __init__(self, value):
+            self.bytes = value
+
+    import numpy as np
+
+    containers = [
+        np.array(list(raw), dtype=np.uint8),          # numpy uint8[16]
+        np.frombuffer(raw, dtype=np.uint8),           # numpy read-only view
+        array("B", raw),                              # array('B')
+        list(raw),                                    # list of byte integers
+        tuple(raw),                                   # tuple of byte integers
+        memoryview(raw),                              # memoryview
+        bytearray(raw),                               # bytearray
+    ]
+    for container in containers:
+        assert _normalize_goal_uuid(container) == raw_hex, type(container)
+        assert _normalize_goal_uuid(_UUIDMsg(container)) == raw_hex
+    assert _normalize_goal_uuid(_UUIDBytesMsg(raw)) == raw_hex
+    assert _normalize_goal_uuid(_UUIDMsg(np.array(list(raw), dtype=np.uint8))) == raw_hex
+
+    # Malformed element ranges/types/lengths are rejected.
+    assert _normalize_goal_uuid(_UUIDMsg(np.array([-1] + list(raw[1:]), dtype=np.int64))) is None
+    assert _normalize_goal_uuid(_UUIDMsg(np.array([256] + list(raw[1:]), dtype=np.int64))) is None
+    assert _normalize_goal_uuid(_UUIDMsg(list(raw) + [0])) is None  # 17 elements
+    assert _normalize_goal_uuid(_UUIDMsg([str(v) for v in raw])) is None  # strings
+    assert _normalize_goal_uuid(_UUIDMsg([0.0] * 16)) is None  # floats
+    assert _normalize_goal_uuid(_UUIDMsg(b"short")) is None
+    assert _normalize_goal_uuid(_UUIDMsg(True)) is None
+    assert _normalize_goal_uuid(_UUIDMsg(None)) is None
+
+
 def test_arm_velocity_within_limit_predicate():
     """D6: effective-stop bounded-velocity predicate."""
     from validation.integrated_gate_executor import _arm_velocity_within_limit

@@ -1559,12 +1559,44 @@ def stage_c_dispatch(
     }
 
 
+def _uuid_bytes_from_container(candidate: object) -> bytes | None:
+    """Strictly convert a UUID container/iterable to exactly 16 bytes, else None.
+
+    Accepts bytes, bytearray, ``array('B')``, memoryview, a numpy ``uint8[16]``
+    array, or a list/tuple of byte integers.  Rejects bools, bare ints, strings
+    (a string is treated as UUID text only by the top-level caller, never as a
+    16-byte container here), wrong-length buffers, invalid element ranges/types,
+    and any conversion exception.
+    """
+    if candidate is None or isinstance(candidate, bool):
+        return None
+    if isinstance(candidate, (bytes, bytearray)):
+        converted = bytes(candidate)
+    elif isinstance(candidate, (str, int)):
+        return None
+    else:
+        try:
+            converted = bytes(candidate)
+        except (TypeError, ValueError):
+            return None
+    if len(converted) != 16:
+        return None
+    return converted
+
+
 def _normalize_goal_uuid(raw: object) -> str | None:
     """Normalize a goal-handle UUID to lowercase 16-byte hex, else ``None``.
 
-    rclpy ``ClientGoalHandle.goal_id`` is the 16-byte ``unique_identifier_msgs``
-    bytes; a normalized lowercase hex string is the canonical qualification
-    identity.  Malformed/absent UUIDs never pass a split-path contract.
+    Humble reality: rclpy ``ClientGoalHandle.goal_id`` is a
+    ``unique_identifier_msgs/msg/UUID`` message whose ``.uuid`` field is a numpy
+    ``uint8[16]`` array (a strict 16-byte buffer).  This helper preserves
+    bytes/bytearray/string behavior and additionally accepts any UUID
+    message/object whose ``.uuid`` (or, optionally, ``.bytes``) is a strict
+    16-byte iterable/buffer: numpy ``uint8[16]``, ``array('B')``, list/tuple of
+    byte integers, or memoryview.  Conversion goes through ``bytes(candidate)``
+    and requires exactly 16 bytes.  Bools, malformed lengths, invalid element
+    ranges/types, missing values, and any exception normalize to ``None`` so a
+    split-path contract can never pass on an invalid identity.
     """
     if isinstance(raw, bool):
         return None
@@ -1574,11 +1606,18 @@ def _normalize_goal_uuid(raw: object) -> str | None:
         if isinstance(raw, str):
             return _uuid.UUID(str(raw)).hex
         candidate = getattr(raw, "uuid", None)
-        if isinstance(candidate, bytes):
-            return _uuid.UUID(bytes=bytes(candidate)).hex
-        if isinstance(candidate, str):
-            return _uuid.UUID(str(candidate)).hex
-        return None
+        if candidate is None:
+            candidate = getattr(raw, "bytes", None)
+        if candidate is None:
+            # A bare 16-byte container (numpy uint8[16], array('B'), memoryview,
+            # or a list/tuple of byte integers) is itself the payload; a
+            # malformed message without a usable payload then fails the strict
+            # container conversion and returns None.
+            candidate = raw
+        converted = _uuid_bytes_from_container(candidate)
+        if converted is None:
+            return None
+        return _uuid.UUID(bytes=converted).hex
     except (ValueError, AttributeError, TypeError):
         return None
 
@@ -2663,6 +2702,7 @@ class IntegratedGateExecutor:
         self._joint_velocity_frames: list[dict[str, object]] = []
         self._fjt_status_cache: list[dict[str, object]] = []
         self._fjt_receipt_sequence = 0
+        self._last_fjt_discovery_error: str | None = None
         self._joint_receipt_sequence = 0
         self._scene_sequence = 0
         self._last_join_key: tuple[int, float] | None = None
@@ -2988,12 +3028,68 @@ class IntegratedGateExecutor:
     # -- windowed, fresh, bounded evidence helpers (F1.4) --------------------
 
     def _d_baseline(self) -> dict[str, object]:
-        """Capture the current stream receipt positions at execution start."""
+        """Capture the current stream receipt positions at execution start.
+
+        F4.2: in addition to the FJT/joint receipt sequences and start
+        monotonic, the baseline snapshots the deterministic set of controller
+        FJT goal UUIDs already known before the transaction.  A later unique-new
+        discovery therefore ignores UUIDs present here even if an action-status
+        heartbeat republishes them after the baseline.
+        """
         return {
             "fjt_seq": self._fjt_receipt_sequence,
             "joint_seq": self._joint_receipt_sequence,
             "start_mono": float(time.monotonic()),
+            "known_fjt_goal_uuids": self._snapshot_known_fjt_goal_uuids(),
         }
+
+    def _snapshot_known_fjt_goal_uuids(self) -> tuple[str, ...]:
+        """Return the sorted distinct FJT goal UUIDs known at snapshot time."""
+        return tuple(sorted({
+            str(entry.get("goal_uuid"))
+            for entry in self._fjt_status_cache
+            if isinstance(entry, Mapping)
+            and isinstance(entry.get("goal_uuid"), str)
+            and entry.get("goal_uuid")
+        }))
+
+    def _known_fjt_goal_uuids(self, baseline: Mapping[str, object]) -> frozenset[str]:
+        """Return the baseline-known controller FJT goal UUIDs as a set."""
+        raw = baseline.get("known_fjt_goal_uuids", ())
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            return frozenset(str(value) for value in raw if value)
+        return frozenset()
+
+    def _new_fjt_goal_uuids(self, baseline: Mapping[str, object]) -> list[str]:
+        """Distinct valid controller FJT goal UUIDs first seen after *baseline*.
+
+        Only entries received after the baseline receipt sequence and carrying a
+        valid 16-byte UUID that is NOT in the baseline-known set are considered.
+        """
+        known = self._known_fjt_goal_uuids(baseline)
+        seen: set[str] = set()
+        for entry in self._fresh_fjt_entries(baseline):
+            goal_uuid = entry.get("goal_uuid")
+            if _valid_goal_uuid(goal_uuid) and goal_uuid not in known:
+                seen.add(str(goal_uuid))
+        return sorted(seen)
+
+    def _discover_new_fjt_goal(
+        self, baseline: Mapping[str, object]
+    ) -> tuple[str | None, str | None]:
+        """Discover exactly one distinct new valid controller FJT goal UUID.
+
+        Returns ``(goal_uuid, error)``.  Fails closed on zero new UUIDs (the
+        transaction's controller goal has not yet appeared) and on multiple
+        distinct new UUIDs (ambiguous transaction).  UUIDs already known at
+        *baseline* are ignored even if republished after the baseline.
+        """
+        new_uuids = self._new_fjt_goal_uuids(baseline)
+        if not new_uuids:
+            return None, "no new controller FJT goal UUID was observed after the baseline"
+        if len(new_uuids) > 1:
+            return None, f"multiple new controller FJT goal UUIDs were observed: {new_uuids}"
+        return new_uuids[0], None
 
     def _fresh_fjt_entries(
         self, baseline: Mapping[str, object], goal_uuid: object | None = None
@@ -3028,7 +3124,7 @@ class IntegratedGateExecutor:
 
     def _wait_for_fjt_status(
         self,
-        goal_uuid: str,
+        goal_uuid: str | None,
         target_statuses: Sequence[int],
         timeout_s: object,
         *,
@@ -3040,12 +3136,34 @@ class IntegratedGateExecutor:
         trimming cannot produce an inconsistent second lookup (the pre-fix
         ``and _seen() or None`` idiom could return None if the bounded cache
         trimmed between the predicate check and the re-scan).
+
+        F4.2: when *goal_uuid* is a real UUID the wait filters exactly on that
+        controller goal.  When ``None`` the wait performs unique-new-controller-
+        goal discovery: it requires exactly one distinct new valid FJT goal UUID
+        (not present in the baseline-known set) in the current window and waits
+        for that goal to reach one of *target_statuses*.  Multiple distinct new
+        UUIDs fail closed immediately (returns None).  UUIDs already known at
+        baseline are ignored even if republished after the baseline.
         """
         wanted = set(int(status) for status in target_statuses)
         captured: dict[str, object] | None = None
+        discovery_error: list[str] = []
 
         def _seen() -> bool:
             nonlocal captured
+            if goal_uuid is None:
+                discovered, error = self._discover_new_fjt_goal(baseline)
+                if discovered is None:
+                    if error is not None and "multiple" in error:
+                        # Ambiguous transaction: fail closed immediately.
+                        discovery_error.append(error)
+                        return True
+                    return False
+                for entry in reversed(self._fresh_fjt_entries(baseline, discovered)):
+                    if int(entry.get("status", -1)) in wanted:
+                        captured = entry
+                        return True
+                return False
             for entry in reversed(self._fresh_fjt_entries(baseline, goal_uuid)):
                 if int(entry.get("status", -1)) in wanted:
                     captured = entry
@@ -3054,11 +3172,14 @@ class IntegratedGateExecutor:
 
         if not self._wait_for(_seen, timeout_s):
             return None
+        if discovery_error:
+            self._last_fjt_discovery_error = "; ".join(discovery_error)
+            return None
         return captured
 
     def _wait_for_fjt_executing(
         self,
-        goal_uuid: str,
+        goal_uuid: str | None,
         timeout_s: object,
         *,
         baseline: Mapping[str, object],
@@ -3160,7 +3281,7 @@ class IntegratedGateExecutor:
         timeout_s: object,
         *,
         baseline: Mapping[str, object],
-        execute_goal_id: str,
+        known_goal_id: str,
         velocity_limit: object,
         creep_limit: object,
     ) -> dict[str, object]:
@@ -3170,6 +3291,10 @@ class IntegratedGateExecutor:
         every fresh joint frame has all velocities bounded, and every arm-joint
         position remains within *creep_limit* of the clear-time baseline.  The
         return carries the stability result plus the measured max creep.
+
+        F4.4: *known_goal_id* is the distinct controller FJT goal UUID (never
+        the ExecuteTrajectory UUID); the no-fresh-goal check allows only that
+        controller goal's terminal status.
         """
         try:
             limit = float(velocity_limit)
@@ -3187,13 +3312,13 @@ class IntegratedGateExecutor:
         terminal = False
         deadline = time.monotonic() + float(timeout_s)
         while time.monotonic() < deadline:
-            # No fresh goal UUID beyond the canceled/aborted execute goal.
+            # No fresh goal UUID beyond the terminal controller FJT goal.
             fresh = self._fresh_fjt_entries(baseline)
             if fresh:
                 for entry in reversed(fresh):
                     uuid = entry.get("goal_uuid")
                     status = int(entry.get("status", -1))
-                    if uuid != execute_goal_id:
+                    if uuid != known_goal_id:
                         terminal = True
                         seen_uuid = str(uuid)
                         break
@@ -4309,6 +4434,7 @@ class IntegratedGateExecutor:
         *,
         expected_trajectory_digest: str | None,
         baseline: Mapping[str, object] | None = None,
+        expected_fjt_goal_uuid: str | None = None,
     ) -> tuple[bool, str | None]:
         """Validate injected FJT transaction evidence and join it to status.
 
@@ -4316,10 +4442,17 @@ class IntegratedGateExecutor:
         (endpoint exactly ``/xarm7_traj_controller/follow_joint_trajectory``,
         normalized FJT goal UUID, canonical trajectory digest equal to the
         unchanged ExecuteTrajectory digest, a finite timestamp/sequence, and a
-        real observation source).  The provider UUID/status must join to the
-        actual status-topic entry received inside the current execution window
-        (after *baseline*).  Missing, stale, mismatched, extra, malformed, or
-        provider-exception evidence makes the attempt ``evidence-invalid``.
+        real observation source).
+
+        F4.3: when *expected_fjt_goal_uuid* is supplied the provider UUID must
+        equal that discovered controller goal UUID (never the ExecuteTrajectory
+        UUID).  The provider UUID/status/sequence/timestamp must join the exact
+        real status-topic cache entry for that controller transaction received
+        inside the current execution window (after *baseline*): the newest entry
+        for the provider's goal UUID must carry the provider status, sequence,
+        and timestamp exactly (not merely valid types).  Missing, stale,
+        mismatched, extra, malformed, or provider-exception evidence makes the
+        attempt ``evidence-invalid``.
         """
         if not isinstance(provider_evidence, Mapping):
             return False, "fjt_transaction_provider returned a non-mapping"
@@ -4328,6 +4461,11 @@ class IntegratedGateExecutor:
         goal_uuid = provider_evidence.get("goal_uuid")
         if not _valid_goal_uuid(goal_uuid):
             return False, "fjt evidence goal_uuid is not a valid 16-byte hex UUID"
+        if expected_fjt_goal_uuid is not None and goal_uuid != expected_fjt_goal_uuid:
+            return False, (
+                "fjt evidence goal_uuid does not equal the discovered controller "
+                "goal UUID"
+            )
         digest = provider_evidence.get("trajectory_digest")
         if not _valid_digest(digest):
             return False, "fjt evidence trajectory digest must be a valid nonzero digest"
@@ -4348,13 +4486,21 @@ class IntegratedGateExecutor:
         candidates = self._fjt_status_cache
         if baseline is not None:
             candidates = self._fresh_fjt_entries(baseline)
-        if not candidates:
-            return False, "no FJT status-topic entry was observed for this transaction within the current window"
-        newest = candidates[-1]
-        if newest.get("goal_uuid") != goal_uuid:
-            return False, "fjt evidence goal_uuid does not join to the newest status entry"
+        goal_candidates = [
+            entry for entry in candidates if entry.get("goal_uuid") == goal_uuid
+        ]
+        if not goal_candidates:
+            return False, (
+                "fjt evidence goal_uuid does not join to any status entry in the "
+                "current window"
+            )
+        newest = goal_candidates[-1]
         if newest.get("status") != provider_status:
-            return False, "fjt evidence status does not join to the newest status entry"
+            return False, "fjt evidence status does not join to the newest joined status entry"
+        if newest.get("seq") != sequence:
+            return False, "fjt evidence sequence does not join to the newest joined status entry"
+        if newest.get("received_mono") != timestamp:
+            return False, "fjt evidence timestamp does not join to the newest joined status entry"
         return True, None
 
     def _journal_snapshot_d(self, event: str) -> str:
@@ -4546,19 +4692,31 @@ class IntegratedGateExecutor:
                 )
             # F1.4/M3: bounded spin for the joined fresh FJT status entry so a
             # live status-topic arrival cannot race the result future.
+            # F4.3: the controller FJT goal UUID is distinct from the
+            # ExecuteTrajectory UUID (MoveIt forwards to the controller, which
+            # creates its own FJT action goal).  Discover the unique new
+            # controller goal UUID in the current window; never key FJT status
+            # on ``execute_goal_id``.
             fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
             joined = self._wait_for_fjt_status(
-                execute_goal_id, (execute_result_status,), fjt_wait_s, baseline=baseline
+                None, (execute_result_status,), fjt_wait_s, baseline=baseline
             )
             if joined is None:
+                discovery_reason = (
+                    f"no new controller FJT goal reached the executed terminal status "
+                    f"within the bounded wait"
+                )
+                if self._last_fjt_discovery_error:
+                    discovery_reason = f"{discovery_reason}; {self._last_fjt_discovery_error}"
                 return self._finalize_d_attempt(
                     scenario_id, spec, plan_outcome, planner_status, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
                     planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                     execute_goal_id=execute_goal_id,
                     execute_outcome=exec_outcome,
-                    execute_error="no fresh FJT status entry joined the executed goal within the bounded wait",
+                    execute_error=discovery_reason,
                 )
+            fjt_goal_id = str(joined.get("goal_uuid"))
             try:
                 provider_evidence = fjt_transaction_provider()
             except Exception as exc:
@@ -4574,6 +4732,7 @@ class IntegratedGateExecutor:
                 provider_evidence,
                 expected_trajectory_digest=executed_digest_after,
                 baseline=baseline,
+                expected_fjt_goal_uuid=fjt_goal_id,
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
@@ -4617,6 +4776,7 @@ class IntegratedGateExecutor:
                 execute_goal_id=execute_goal_id,
                 execute_outcome=exec_outcome,
                 fjt_evidence=provider_evidence,
+                fjt_goal_id=fjt_goal_id,
                 trajectory_digest=executed_digest_after,
                 controller_endpoint=FJT_ENDPOINT,
             )
@@ -4639,6 +4799,8 @@ class IntegratedGateExecutor:
         execute_goal_id: str | None = None,
         timeout_s: float | None = None,
         execute_goal_handle: Any = None,
+        fjt_goal_id: str | None = None,
+        transaction_baseline: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Run the Stage-D cancellation contract.
 
@@ -4650,6 +4812,13 @@ class IntegratedGateExecutor:
         is called on exactly that handle (never the completed MoveGroup planning
         handle).  Requires terminal CANCELED (5), requires controller
         quiescence, and never sends a later stage.
+
+        F4.4: the controller FJT transaction is keyed on the distinct
+        controller goal UUID (*fjt_goal_id*) and windowed to the supplied
+        pre-send *transaction_baseline* when the live driver presends a long
+        motion.  FJT status is never keyed on *execute_goal_id*.  A direct
+        offline path may supply an explicit seeded *fjt_goal_id* (distinct from
+        *execute_goal_id*); missing *fjt_goal_id* fails closed before cancel.
         """
         start_wall = time.monotonic()
         fixture_ready_recorded = False
@@ -4732,8 +4901,38 @@ class IntegratedGateExecutor:
                     scenario_id, "cancel-target-invalid", ["plan and execute UUIDs must differ"]
                 )
 
-            # F1.4: window the current attempt from here.
-            baseline = self._d_baseline()
+            # F4.4: the distinct controller FJT goal UUID is mandatory.  The live
+            # driver path supplies it (discovered from the pre-send transaction);
+            # a direct offline path must supply an explicit seeded controller UUID.
+            # FJT status is never keyed on ``execute_goal_id``.
+            if not _valid_goal_uuid(fjt_goal_id):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="cancel requires the distinct controller FJT goal UUID",
+                    goals_canceling=[execute_goal_id],
+                )
+            if fjt_goal_id == execute_goal_id:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="controller FJT goal UUID must differ from the ExecuteTrajectory UUID",
+                    goals_canceling=[execute_goal_id],
+                )
+
+            # F1.4: window the current attempt.  F4.4: the live presend path
+            # supplies the pre-send *transaction_baseline* (captured before the
+            # ExecuteTrajectory goal was sent); a direct offline path captures a
+            # fresh baseline from the current stream position.
+            baseline = (
+                dict(transaction_baseline)
+                if transaction_baseline is not None
+                else self._d_baseline()
+            )
             # F1.8/Md5: visual capture before the first D goal.
             self._append_visual_request("before", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("execution-start")
@@ -4791,7 +4990,7 @@ class IntegratedGateExecutor:
             fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
             motion_wait_s = float(self._thresholds().get("motion_trigger_timeout_s", 1.0))
             motion_limit = float(self._thresholds().get("cancel_motion_velocity_rad_s", 0.005))
-            if not self._wait_for_fjt_executing(execute_goal_id, fjt_wait_s, baseline=baseline):
+            if not self._wait_for_fjt_executing(fjt_goal_id, fjt_wait_s, baseline=baseline):
                 return self._finalize_d_attempt(
                     scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
@@ -4873,7 +5072,7 @@ class IntegratedGateExecutor:
             # F1.2: require the joined FJT controller goal to reach CANCELED (5)
             # within a bounded wait (windowed to the current attempt).
             fjt_terminal = self._wait_for_fjt_status(
-                execute_goal_id, (EXECUTE_STATUS_CANCELED,), fjt_wait_s, baseline=baseline
+                fjt_goal_id, (EXECUTE_STATUS_CANCELED,), fjt_wait_s, baseline=baseline
             )
             if fjt_terminal is None:
                 return self._finalize_d_attempt(
@@ -4895,7 +5094,7 @@ class IntegratedGateExecutor:
             quiescent = self._wait_for(
                 lambda: (lambda entries: bool(entries) and int(entries[-1].get("status", -1)) in (
                     EXECUTE_STATUS_SUCCEEDED, EXECUTE_STATUS_CANCELED, EXECUTE_STATUS_ABORTED
-                ))(self._fresh_fjt_entries(baseline, execute_goal_id)),
+                ))(self._fresh_fjt_entries(baseline, fjt_goal_id)),
                 fjt_wait_s,
             )
             if not quiescent:
@@ -4929,7 +5128,8 @@ class IntegratedGateExecutor:
                     },
                 )
             fjt_ok, fjt_reason = self._validate_fjt_evidence(
-                provider_evidence, expected_trajectory_digest=None, baseline=baseline
+                provider_evidence, expected_trajectory_digest=None, baseline=baseline,
+                expected_fjt_goal_uuid=fjt_goal_id,
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
@@ -4983,6 +5183,7 @@ class IntegratedGateExecutor:
                 readiness, start_wall, event_log=event_log,
                 planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                 execute_goal_id=execute_goal_id,
+                fjt_goal_id=fjt_goal_id,
                 goals_canceling=goals_canceling,
                 terminal_status="canceled",
                 fjt_evidence=provider_evidence,
@@ -5007,6 +5208,8 @@ class IntegratedGateExecutor:
         long_motion_provider: Callable[[], Mapping[str, object]] | None = None,
         fjt_transaction_provider: Callable[[], Mapping[str, object]] | None = None,
         stop_timeout_s: float | None = None,
+        fjt_goal_id: str | None = None,
+        transaction_baseline: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Run the Stage-D safety interruption contract.
 
@@ -5018,6 +5221,13 @@ class IntegratedGateExecutor:
         with every arm-joint absolute velocity bounded, publishes operator
         ``False`` after the effective-stop predicate, and sends no replacement/
         resume goal.
+
+        F4.4: the controller FJT transaction is keyed on the distinct
+        controller goal UUID (*fjt_goal_id*) and windowed to the supplied
+        pre-send *transaction_baseline* when the live driver presends a long
+        motion.  FJT status is never keyed on *execute_goal_id*.  A direct
+        offline path may supply an explicit seeded *fjt_goal_id* (distinct from
+        *execute_goal_id*); missing *fjt_goal_id* fails closed before publish.
         """
         start_wall = time.monotonic()
         fixture_ready_recorded = False
@@ -5087,8 +5297,36 @@ class IntegratedGateExecutor:
                     scenario_id, "safety-target-invalid", ["plan and execute UUIDs must differ"]
                 )
 
-            # F1.4: window the current attempt from here.
-            baseline = self._d_baseline()
+            # F4.4: the distinct controller FJT goal UUID is mandatory.  The live
+            # driver path supplies it (discovered from the pre-send transaction);
+            # a direct offline path must supply an explicit seeded controller UUID.
+            # FJT status is never keyed on ``execute_goal_id``.
+            if not _valid_goal_uuid(fjt_goal_id):
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="safety requires the distinct controller FJT goal UUID",
+                )
+            if fjt_goal_id == execute_goal_id:
+                return self._finalize_d_attempt(
+                    scenario_id, spec, None, None, "evidence-invalid",
+                    readiness, start_wall, event_log=event_log,
+                    planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
+                    execute_goal_id=execute_goal_id,
+                    execute_error="controller FJT goal UUID must differ from the ExecuteTrajectory UUID",
+                )
+
+            # F1.4: window the current attempt.  F4.4: the live presend path
+            # supplies the pre-send *transaction_baseline* (captured before the
+            # ExecuteTrajectory goal was sent); a direct offline path captures a
+            # fresh baseline from the current stream position.
+            baseline = (
+                dict(transaction_baseline)
+                if transaction_baseline is not None
+                else self._d_baseline()
+            )
             # F1.8/Md5: visual capture before the first D goal.
             self._append_visual_request("before", scenario_id, spec, kind="gate-d-diagnostic")
             event_log.append("execution-start")
@@ -5109,7 +5347,7 @@ class IntegratedGateExecutor:
             fjt_wait_s = float(self._thresholds().get("fjt_wait_timeout_s", 1.0))
             motion_wait_s = float(self._thresholds().get("motion_trigger_timeout_s", 1.0))
             motion_limit = float(self._thresholds().get("safety_motion_velocity_rad_s", 0.005))
-            if not self._wait_for_fjt_executing(execute_goal_id, fjt_wait_s, baseline=baseline):
+            if not self._wait_for_fjt_executing(fjt_goal_id, fjt_wait_s, baseline=baseline):
                 return self._finalize_d_attempt(
                     scenario_id, spec, None, None, "evidence-invalid",
                     readiness, start_wall, event_log=event_log,
@@ -5166,7 +5404,7 @@ class IntegratedGateExecutor:
             # are mandatory; a provider exception/mismatch/stale-cache fails
             # closed (never swallowed, never an unrelated cached ABORTED goal).
             aborted_entry = self._wait_for_fjt_status(
-                execute_goal_id, (EXECUTE_STATUS_ABORTED,), fjt_wait_s, baseline=baseline
+                fjt_goal_id, (EXECUTE_STATUS_ABORTED,), fjt_wait_s, baseline=baseline
             )
             if aborted_entry is None:
                 return self._finalize_d_attempt(
@@ -5187,7 +5425,8 @@ class IntegratedGateExecutor:
                     execute_error=f"safety fjt_transaction_provider raised: {exc}",
                 )
             fjt_ok, fjt_reason = self._validate_fjt_evidence(
-                provider_evidence, expected_trajectory_digest=None, baseline=baseline
+                provider_evidence, expected_trajectory_digest=None, baseline=baseline,
+                expected_fjt_goal_uuid=fjt_goal_id,
             )
             if not fjt_ok:
                 return self._finalize_d_attempt(
@@ -5283,7 +5522,7 @@ class IntegratedGateExecutor:
             stability = self._wait_for_post_clear_stability(
                 stability_wait_s,
                 baseline=clear_baseline,
-                execute_goal_id=execute_goal_id,
+                known_goal_id=fjt_goal_id,
                 velocity_limit=velocity_limit,
                 creep_limit=creep_limit,
             )
@@ -5324,6 +5563,7 @@ class IntegratedGateExecutor:
                 readiness, start_wall, event_log=event_log,
                 planning_goal_id=planning_goal_id, fixture_ready_recorded=fixture_ready_recorded,
                 execute_goal_id=execute_goal_id,
+                fjt_goal_id=fjt_goal_id,
                 terminal_status="aborted",
                 fjt_evidence=provider_evidence,
                 controller_goal_sent=True,
@@ -8787,6 +9027,7 @@ class IntegratedGateExecutor:
         execute_outcome: Mapping[str, object] | None = None,
         execute_error: str | None = None,
         fjt_evidence: object = None,
+        fjt_goal_id: object = None,
         goals_canceling: Sequence[object] | None = None,
         terminal_status: str | None = None,
         trajectory_digest: str | None = None,
@@ -8918,6 +9159,9 @@ class IntegratedGateExecutor:
             "gripper_goal_sent": gripper_goal_sent,
             "planning_goal_id": planning_goal_id,
             "execute_goal_id": execute_goal_id,
+            "fjt_goal_id": fjt_goal_id if fjt_goal_id is not None else (
+                fjt_evidence.get("goal_uuid") if isinstance(fjt_evidence, Mapping) else None
+            ),
             "goals_canceling": list(goals_canceling) if goals_canceling is not None else [],
             "planned_trajectory_digest": plan_outcome.get("trajectory_digest") if isinstance(plan_outcome, Mapping) else None,
             "executed_trajectory_digest": executed_digest,
@@ -9048,6 +9292,7 @@ class IntegratedGateExecutor:
                 "execute_trajectory_goal_sent": record.get("execute_trajectory_goal_sent"),
                 "execute_result_status": record.get("execute_result_status"),
                 "execute_result_status_string": record.get("execute_result_status_string"),
+                "fjt_goal_id": record.get("fjt_goal_id"),
                 "fjt_goal_uuid": record.get("fjt_goal_uuid"),
                 "fjt_status": record.get("fjt_status"),
                 "fjt_goal_digest": record.get("fjt_goal_digest"),
@@ -9082,6 +9327,7 @@ class IntegratedGateExecutor:
                 "planned_trajectory_digest": record.get("planned_trajectory_digest"),
                 "executed_trajectory_digest": record.get("executed_trajectory_digest"),
                 "fjt_goal_digest": record.get("fjt_goal_digest"),
+                "fjt_goal_id": record.get("fjt_goal_id"),
                 "fjt_goal_uuid": record.get("fjt_goal_uuid"),
                 "fjt_status": record.get("fjt_status"),
                 "execute_result_status": record.get("execute_result_status"),

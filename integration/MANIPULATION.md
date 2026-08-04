@@ -363,6 +363,28 @@ manipulation core is qualified.
 
 ## Changelog
 
+- 2026-08-04 (integrated qualification Task 8, fix round 4 — "bind real
+  controller transactions"): Bound every Stage-D controller transaction to the
+  real controller FJT goal UUID — never the MoveIt ExecuteTrajectory UUID.
+  Real Humble `UUID` message containers (numpy `uint8[16]`) are normalized by a
+  strict 16-byte `_normalize_goal_uuid`; `_d_baseline()` records the known FJT
+  goal UUID set and `_discover_new_fjt_goal()` requires exactly one distinct new
+  controller UUID in the execution window (no-new and multiple-new fail closed,
+  pre-baseline replays rejected); `_validate_fjt_evidence()` binds the provider
+  to the discovered controller UUID and joins its status/sequence/timestamp to
+  the exact fresh FJT status-topic entry.  The cancel/safety pre-send carries the
+  real controller identity and the pre-send baseline, `run_driver` teardown
+  guarantees presend cleanup plus an operator clear, and the journal graph
+  observation selects owner-specific QoS.  `build_occupancy_from_planning_scene`
+  rasterizes the oriented yaw-only box footprint for all 17 canonical scenarios.
+  Offline regressions: executor 127 / driver 37 / ROS 165 passed; sourced-Humble
+  provider suite 30 passed, zero warnings — the controlled C/D positive paths
+  commit `diagnostic-pass` with a controller UUID distinct from the
+  ExecuteTrajectory UUID, the D cancel/safety paths reach the real
+  presend-provider sequence, and the transaction-real negatives fail closed.  No
+  build, no live Isaac/GPU/cuMotion; all immutable production files and the
+  future qualification source lock untouched.
+
 - 2026-08-04 (integrated qualification Task 8, fix round 3 — "observe live
   integrated providers"): Made every executor provider a real live observation
   and adopted Option A+ for the qualification development LiDAR.  The driver

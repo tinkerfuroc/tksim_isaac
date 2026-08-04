@@ -97,6 +97,10 @@ from test_integrated_gate_executor import (  # noqa: E402
     scenario_report_contract,
 )
 from validation.integrated_gate_executor import (  # noqa: E402
+    EXECUTE_STATUS_ABORTED,
+    EXECUTE_STATUS_CANCELED,
+    EXECUTE_STATUS_EXECUTING,
+    EXECUTE_STATUS_SUCCEEDED,
     FJT_ENDPOINT,
     FJT_STATUS_TOPIC,
     FIXTURE_PUBLISHER_NODE,
@@ -112,6 +116,7 @@ from validation.integrated_gate_executor import (  # noqa: E402
     IntegratedGateExecutor,
     _REQUIRED_ENDPOINT_SOURCES,
     _validate_observed_graph,
+    _valid_goal_uuid,
     build_execute_trajectory_goal,
     build_joint_move_group_goal,
     evaluate_executor_readiness,
@@ -121,6 +126,11 @@ import integrated_gate_executor_driver as d  # noqa: E402
 
 Q_OUTBOUND = (0.20, -0.20, 0.15, 0.30, -0.15, 0.20, 0.15)
 _JOINTS = [f"joint{i}" for i in range(1, 8)] + ["drive_joint"]
+# F4.9: arm-joint velocity above the executor's 0.005 rad/s motion-trigger
+# threshold, published while the controlled graph is in a motion phase.  The
+# JointState message must be aligned with ``_JOINTS`` (8 names), so the velocity
+# vector carries 8 entries (7 arm joints + the base drive_joint).
+_MOTION_VELOCITY = [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0]
 _DOMAIN = 47
 
 # Each test gets a fresh ROS domain so Fast-DDS graph state from prior tests'
@@ -261,8 +271,20 @@ class _ControlledGraph:
         skip_fold_action: bool = False,
         joint_qos_best_effort: bool = False,
         publish_fixture: bool = True,
+        emit_fjt_on_execute: bool = True,
+        duplicate_fjt: bool = False,
+        attempt_dir: Path | None = None,
     ) -> None:
         self.scenario_id = scenario_id
+        # F4.8: the controlled graph mirrors the real physics-truth writer so the
+        # executor's join_key_provider (``_read_join_key`` -> attempt_dir /
+        # ``physics_truth.jsonl``) observes a continuously strictly-increasing
+        # (frame_index, timestamp) key across the whole D transaction.
+        self._attempt_dir = Path(attempt_dir) if attempt_dir is not None else None
+        self._truth_path: Path | None = None
+        self._truth_frame = 0
+        self._stop_truth = False
+        self._truth_thread: threading.Thread | None = None
         self.contract = _contract_for(scenario_id)
         self._domain = _next_domain() if domain is None else int(domain)
         self._sequence = 0
@@ -276,10 +298,25 @@ class _ControlledGraph:
         self._publish_fixture = bool(publish_fixture)
         self._execute_result_builder = None
         self._move_result_builder = None
-        self._fjt_emitter = None
         self._parameter_reject = False
         self._parameter_readback_override: float | None = None
         self._nodes: list[Node] = []
+        # F4.9: the controlled ExecuteTrajectory server emulates the MoveIt ->
+        # controller forwarding and emits FJT status with a DISTINCT controller
+        # goal UUID (never the ExecuteTrajectory UUID).  ``_execute_hold_s``
+        # holds the goal open so a real cancel/safety interruption can land
+        # before the automatic success (<=0 means immediate success).  The
+        # graph publishes arm motion only while ``_motion_active`` so the
+        # cancel/safety motion-trigger sees a real fresh moving frame.
+        self._execute_hold_s = 0.0
+        self._motion_active = False
+        self._stop_servers = False
+        # F4.9 negative controls: disable FJT emission on execute (no-new-goal),
+        # force the controller UUID to a pre-seeded value (stale-heartbeat
+        # replay), and emit a second distinct controller UUID (multiple-new).
+        self._emit_fjt_on_execute = bool(emit_fjt_on_execute)
+        self._forced_controller_uuid: str | None = None
+        self._fjt_duplicate = bool(duplicate_fjt)
 
     # -- node/publisher helpers ---------------------------------------------
 
@@ -343,6 +380,20 @@ class _ControlledGraph:
         self._scene_pub = self._make_pub(self._move_group_node, PlanningScene, PLANNING_SCENE_TOPIC, depth=100)
         self._scene_pub_monitored = self._make_pub(self._move_group_node, PlanningScene, MONITORED_PLANNING_SCENE_TOPIC, depth=100)
         self._lidar_pub = self._make_pub(self._lidar_node, PointCloud2, "/livox/lidar", best_effort=True)
+
+        # F4.9: the safety supervisor reacts to the executor's real operator
+        # publication — operator True asserts the safety stop and freezes the
+        # arm so the safety D-path can observe ABORTED + stopped frames.
+        def _on_operator(message: Any) -> None:
+            value = bool(getattr(message, "data", False))
+            self._safety_stop = value
+            if value:
+                self._motion_active = False
+
+        self._safety_node.create_subscription(
+            Bool, "/sim/safety/operator", _on_operator,
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE),
+        )
 
         # Static TF: base_link -> link_tcp and base_link -> livox360.
         import tf2_ros
@@ -432,8 +483,10 @@ class _ControlledGraph:
         # FJT status emitter (controller_manager).
         self._fjt_status_pub = self._make_pub(self._joint_pub_node, GoalStatusArray, FJT_STATUS_TOPIC, transient=True)
 
-        # Spinner.
-        self._executor = MultiThreadedExecutor(context=self._context)
+        # Spinner.  F4.9: four worker threads so a held execute goal (cancel/
+        # safety hold loop) never starves the action-server cancel/result
+        # handlers and the service servers (ListControllers, parameters).
+        self._executor = MultiThreadedExecutor(context=self._context, num_threads=4)
         for node in self._nodes:
             self._executor.add_node(node)
         self._thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -446,6 +499,42 @@ class _ControlledGraph:
         self._stop_publish = False
         self._publish_thread = threading.Thread(target=self._publish_loop, daemon=True)
         self._publish_thread.start()
+
+        # F4.8: emit a strictly-increasing physics-truth JSONL stream at the
+        # attempt_dir so the executor's join-key provider sees fresh advancing
+        # (frame_index, timestamp) keys for the entire transaction.
+        if self._attempt_dir is not None:
+            self._truth_path = self._attempt_dir / "physics_truth.jsonl"
+            self._truth_frame = 0
+            self._stop_truth = False
+            self._truth_thread = threading.Thread(target=self._truth_loop, daemon=True)
+            self._truth_thread.start()
+
+    def _truth_loop(self) -> None:
+        while not self._stop_truth:
+            try:
+                self._write_truth()
+            except Exception:  # noqa: BLE001 - daemon truth boundary
+                pass
+            time.sleep(0.002)
+
+    def _write_truth(self) -> None:
+        if self._truth_path is None:
+            return
+        self._truth_frame += 1
+        record = {
+            "frame_index": self._truth_frame,
+            "timestamp": time.monotonic(),
+            "robot": {"joint_positions": [0.0] * 8},
+            "safety_stop": bool(self._safety_stop),
+        }
+        line = json.dumps(record, sort_keys=True) + "\n"
+        # F4.8: flush every line so ``_read_join_key`` (a separate file handle)
+        # immediately observes the strictly-increasing frame, not a buffered
+        # stale tail.
+        with self._truth_path.open("a", encoding="utf-8") as stream:
+            stream.write(line)
+            stream.flush()
 
     def _publish_loop(self) -> None:
         while not self._stop_publish:
@@ -480,6 +569,14 @@ class _ControlledGraph:
 
             return GoalResponse.ACCEPT
 
+        def _accept_cancel(goal_handle):
+            # F4.9: stock rclpy's default cancel callback REJECTS all
+            # cancellations, which would make the controlled servers uncancelable
+            # (empty goals_canceling) and strand the cancel/safety presend goals.
+            from rclpy.action import CancelResponse
+
+            return CancelResponse.ACCEPT
+
         def _make_simple_execute(result_type):
             def execute(goal_handle):
                 result = result_type()
@@ -511,9 +608,57 @@ class _ControlledGraph:
             if self._execute_result_builder is not None:
                 return self._execute_result_builder(goal_handle)
             result = ExecuteTrajectory.Result()
+            if self._emit_fjt_on_execute:
+                # F4.9: MoveIt forwards the ExecuteTrajectory goal to the
+                # joint_trajectory_controller, which spawns its OWN FJT action
+                # goal with a fresh controller UUID.  The controlled server
+                # mirrors that: the FJT status stream carries a DISTINCT
+                # controller goal UUID, never the ExecuteTrajectory goal UUID.
+                if self._forced_controller_uuid is not None:
+                    controller_uuid = self._forced_controller_uuid
+                else:
+                    controller_uuid = _fresh_uuid_hex()
+                if self._fjt_duplicate:
+                    # F4.9 negative: two distinct controller goals appear in the
+                    # window, so unique-new discovery must fail closed.  The
+                    # status topic QoS is depth-1, so the first (duplicate) goal
+                    # is published and given a bounded window to be read by the
+                    # executor before the second controller goal is emitted —
+                    # otherwise the depth-1 history would coalesce them away.
+                    self.emit_fjt(_fresh_uuid_hex(), 2)
+                    time.sleep(0.25)
+                self.emit_fjt(controller_uuid, 2)  # EXECUTING
+                if self._execute_hold_s <= 0.0:
+                    self.emit_fjt(controller_uuid, 4)  # SUCCEEDED
+                    goal_handle.succeed()
+                    return result
+                deadline = time.monotonic() + float(self._execute_hold_s)
+                while time.monotonic() < deadline:
+                    if bool(getattr(goal_handle, "is_cancel_requested", False)):
+                        self.emit_fjt(controller_uuid, 5)  # CANCELED
+                        goal_handle.canceled()
+                        return result
+                    if self._safety_stop or self._stop_servers:
+                        self.emit_fjt(controller_uuid, 6)  # ABORTED
+                        goal_handle.abort()
+                        return result
+                    time.sleep(0.005)
+                self.emit_fjt(controller_uuid, 4)  # SUCCEEDED
+                goal_handle.succeed()
+                return result
+            if self._execute_hold_s <= 0.0:
+                goal_handle.succeed()
+                return result
+            deadline = time.monotonic() + float(self._execute_hold_s)
+            while time.monotonic() < deadline:
+                if bool(getattr(goal_handle, "is_cancel_requested", False)):
+                    goal_handle.canceled()
+                    return result
+                if self._stop_servers:
+                    goal_handle.abort()
+                    return result
+                time.sleep(0.005)
             goal_handle.succeed()
-            if self._fjt_emitter is not None:
-                self._fjt_emitter(goal_handle.goal_id)
             return result
 
         specs = [
@@ -536,6 +681,7 @@ class _ControlledGraph:
                 name,
                 execute_callback=execute,
                 goal_callback=_accept,
+                cancel_callback=_accept_cancel,
             )
             self._action_servers.append(server)
 
@@ -554,7 +700,11 @@ class _ControlledGraph:
         msg.header.stamp = self._joint_pub_node.get_clock().now().to_msg()
         msg.name = list(_JOINTS)
         msg.position = [0.0] * 8
-        msg.velocity = [0.0] * 8
+        # F4.9: the cancel/safety motion trigger needs a fresh arm-joint frame
+        # with absolute velocity above the 0.005 rad/s threshold.  Publish arm
+        # motion only while ``_motion_active`` (the safety supervisor freezes
+        # the arm once operator True lands).
+        msg.velocity = list(_MOTION_VELOCITY) if self._motion_active else [0.0] * 8
         msg.effort = [0.0] * 8
         self._joint_pub.publish(msg)
 
@@ -601,13 +751,23 @@ class _ControlledGraph:
         self._lidar_pub.publish(msg)
 
     def emit_fjt(self, goal_uuid_hex: str, status: int) -> None:
-        """Publish a real GoalStatusArray FJT status entry (exact action schema)."""
+        """Publish a real GoalStatusArray FJT status entry (exact action schema).
+
+        F4.9: the ``GoalInfo.goal_id`` field is a real
+        ``unique_identifier_msgs/msg/UUID`` message whose ``.uuid`` is a numpy
+        ``uint8[16]`` array (the exact shape the executor's F4.1
+        ``_normalize_goal_uuid`` accepts).  Assigning raw bytes to the field is
+        NOT serializable, so the UUID message is constructed explicitly.
+        """
         from action_msgs.msg import GoalInfo, GoalStatus, GoalStatusArray
+        from unique_identifier_msgs.msg import UUID as UUIDMsg
 
         msg = GoalStatusArray()
         status_entry = GoalStatus()
         info = GoalInfo()
-        info.goal_id = _uuid.UUID(hex=goal_uuid_hex).bytes
+        uuid_msg = UUIDMsg()
+        uuid_msg.uuid = list(_uuid.UUID(hex=goal_uuid_hex).bytes)
+        info.goal_id = uuid_msg
         status_entry.goal_info = info
         status_entry.status = status
         msg.status_list.append(status_entry)
@@ -615,6 +775,18 @@ class _ControlledGraph:
 
     def stop(self) -> None:
         self._stop_publish = True
+        self._stop_truth = True
+        truth_thread = getattr(self, "_truth_thread", None)
+        if truth_thread is not None:
+            try:
+                truth_thread.join(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+        # F4.9: break any held execute goal (cancel/safety hold loop) so its
+        # ``ActionServer._execute_goal`` coroutine terminates and is awaited
+        # before the action servers/nodes are destroyed — no leaked-coroutine
+        # or failed-response warnings at teardown.
+        self._stop_servers = True
         publish_thread = getattr(self, "_publish_thread", None)
         if publish_thread is not None:
             try:
@@ -622,6 +794,13 @@ class _ControlledGraph:
             except Exception:  # noqa: BLE001
                 pass
         if getattr(self, "_executor", None) is not None:
+            try:
+                # Give a held execute callback a bounded window to observe
+                # ``_stop_servers``, publish ABORTED, and return before the
+                # executor is shut down.
+                time.sleep(0.25)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 self._executor.shutdown()
             except Exception:
@@ -704,6 +883,41 @@ def _drive_spin(executor, *, until=None, timeout_s: float = 5.0, graph=None) -> 
         if until is not None and until():
             return
         time.sleep(0.02)
+
+
+def _assert_ready(executor, *, timeout_s: float = 5.0) -> None:
+    """F4.9: readiness must be genuinely ready; surface the failure reasons."""
+    outcome = d._wait_for_readiness(executor, timeout_s=timeout_s)
+    assert outcome.get("ready") is True, outcome.get("reasons")
+
+
+def _drain_action_goal(executor, send_future, *, timeout_s: float = 5.0) -> Any | None:
+    """F4.9: bounded drain of a sent action goal (acceptance + terminal result).
+
+    Tests that send a real action goal purely to populate a recorder/provider
+    must consume the terminal result before teardown, or the graph's action
+    server emits a ``failed to send response`` warning when the client node is
+    destroyed with a pending result.  Returns the terminal result response or
+    ``None`` on timeout (the caller asserts what it needs).
+    """
+    deadline = time.monotonic() + float(timeout_s)
+    while not send_future.done() and time.monotonic() < deadline:
+        executor._spin_once()
+    if not send_future.done():
+        return None
+    try:
+        handle = send_future.result()
+    except Exception:  # noqa: BLE001 - drain boundary
+        return None
+    if handle is None:
+        return None
+    try:
+        result_future = handle.get_result_async()
+    except Exception:  # noqa: BLE001 - drain boundary
+        return None
+    while not result_future.done() and time.monotonic() < deadline:
+        executor._spin_once()
+    return result_future.result() if result_future.done() else None
 
 
 # --------------------------------------------------------------------------- #
@@ -951,7 +1165,7 @@ def test_fjt_provider_joins_newest_status(graph, tmp_path):
         _drive_spin(executor, graph=graph, timeout_s=2.0)
         recorder = executor._execute_recorder
         goal = build_execute_trajectory_goal(_planned_trajectory())
-        recorder.send_goal_async(goal)
+        send_future = recorder.send_goal_async(goal)
         digest = recorder.last_trajectory_digest
         assert isinstance(digest, str) and len(digest) == 64
         uuid_hex = _fresh_uuid_hex()
@@ -967,6 +1181,8 @@ def test_fjt_provider_joins_newest_status(graph, tmp_path):
         # Join validates.
         ok, reason = executor._validate_fjt_evidence(record, expected_trajectory_digest=None)
         assert ok, reason
+        # F4.9: consume the execute terminal so no server response is stranded.
+        assert _drain_action_goal(executor, send_future) is not None
     finally:
         executor.shutdown()
 
@@ -977,7 +1193,7 @@ def test_fjt_digest_uuid_status_mutations_fail(graph, tmp_path):
         _drive_spin(executor, graph=graph, timeout_s=2.0)
         recorder = executor._execute_recorder
         goal = build_execute_trajectory_goal(_planned_trajectory())
-        recorder.send_goal_async(goal)
+        send_future = recorder.send_goal_async(goal)
         digest = recorder.last_trajectory_digest
         uuid_hex = _fresh_uuid_hex()
         executor._seed_fjt_status(uuid_hex, 4, seq=executor._fjt_receipt_sequence + 1)
@@ -999,6 +1215,8 @@ def test_fjt_digest_uuid_status_mutations_fail(graph, tmp_path):
         bad["status"] = 1
         ok, reason = executor._validate_fjt_evidence(bad, expected_trajectory_digest=digest)
         assert not ok and "status" in (reason or "")
+        # F4.9: consume the execute terminal so no server response is stranded.
+        assert _drain_action_goal(executor, send_future) is not None
     finally:
         executor.shutdown()
 
@@ -1070,27 +1288,51 @@ def test_native_gripper_wrapper_count_and_freshness(graph, tmp_path):
 
         goal = GripperCommand.Goal()
         goal.command.position = 0.0
-        recorder.send_goal_async(goal)
+        send_future = recorder.send_goal_async(goal)
         after = provider()
         assert after["count"] == before["count"] + 1
         assert isinstance(after["age_s"], float) and after["age_s"] >= 0.0
+        # F4.9: consume the gripper terminal so no server response is stranded.
+        assert _drain_action_goal(executor, send_future) is not None
     finally:
         executor.shutdown()
 
 
-def test_cancel_presend_returns_live_execute_goal_handle(graph, tmp_path):
-    executor = _construct_real_executor(Path(tmp_path), scenario_id="qualification-moveit-cancel")
+def test_cancel_presend_returns_live_execute_goal_handle(tmp_path):
+    scenario_id = "qualification-moveit-cancel"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    # F4.9: hold the presend goal open so the controller EXECUTING status
+    # survives the depth-1 status-topic QoS (back-to-back EXECUTING+SUCCEEDED
+    # would otherwise coalesce EXECUTING away).
+    graph._execute_hold_s = 5.0
+    graph.start()
+    executor = None
     try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
         _drive_spin(executor, graph=graph, timeout_s=2.0)
-        presend = d._presend_long_motion(executor, "qualification-moveit-cancel")
+        presend = d._presend_long_motion(executor, scenario_id)
         assert isinstance(presend["planning_goal_id"], str) and len(presend["planning_goal_id"]) == 32
         assert isinstance(presend["execute_goal_id"], str) and len(presend["execute_goal_id"]) == 32
         handle = presend["execute_goal_handle"]
         assert getattr(handle, "accepted", False) is True
         # The handle's driver-normalized id equals the recorded execute id.
         assert d._goal_id_hex(handle) == presend["execute_goal_id"]
+        # F4.4: the presend discovered the DISTINCT controller FJT goal UUID.
+        assert presend["fjt_goal_id"] != presend["execute_goal_id"]
+        # F4.9: consume the held presend goal (cancel + drain) so no response
+        # is stranded at teardown.
+        deadline = time.monotonic() + 5.0
+        cancel_future = handle.cancel_goal_async()
+        while not cancel_future.done() and time.monotonic() < deadline:
+            executor._spin_once()
+        result_future = handle.get_result_async()
+        while not result_future.done() and time.monotonic() < deadline:
+            executor._spin_once()
+        assert result_future.done()
     finally:
-        executor.shutdown()
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
 
 
 # --------------------------------------------------------------------------- #
@@ -1143,13 +1385,13 @@ def _success_result():
 
 def test_controlled_c_path_reaches_run_gate_c_plan_only(tmp_path):
     scenario_id = "qualification-moveit-plan-joint"
-    graph = _ControlledGraph(scenario_id=scenario_id)
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
     graph.start()
     executor = None
     try:
         executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
         _drive_spin(executor, graph=graph, timeout_s=2.0)
-        assert d._wait_for_readiness(executor, timeout_s=5.0)["ready"] is True
+        _assert_ready(executor)
         kwargs = d._live_runtime_provider_factory(
             executor=executor, scenario_id=scenario_id, bundle=None,
             config=_test_config(), attempt_dir=Path(tmp_path),
@@ -1157,7 +1399,9 @@ def test_controlled_c_path_reaches_run_gate_c_plan_only(tmp_path):
         assert kwargs == {}
         _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
         record = executor.run_gate_c_plan_only(scenario_id)
-        assert record["status"] in {"diagnostic-pass", "verified-pass", "evidence-invalid"}
+        # F4.9: a positive controlled path must commit the positive terminal,
+        # never ``evidence-invalid``.
+        assert record["status"] == "diagnostic-pass", record
     finally:
         if executor is not None:
             executor.shutdown()
@@ -1166,13 +1410,13 @@ def test_controlled_c_path_reaches_run_gate_c_plan_only(tmp_path):
 
 def test_controlled_d_execute_path_reaches_run_execute_sequence(tmp_path):
     scenario_id = "qualification-moveit-execute-joint"
-    graph = _ControlledGraph(scenario_id=scenario_id)
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
     graph.start()
     executor = None
     try:
         executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
         _drive_spin(executor, graph=graph, timeout_s=2.0)
-        assert d._wait_for_readiness(executor, timeout_s=5.0)["ready"] is True
+        _assert_ready(executor)
         kwargs = d._live_runtime_provider_factory(
             executor=executor, scenario_id=scenario_id, bundle=None,
             config=_test_config(), attempt_dir=Path(tmp_path),
@@ -1180,7 +1424,286 @@ def test_controlled_d_execute_path_reaches_run_execute_sequence(tmp_path):
         assert "fjt_transaction_provider" in kwargs
         _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
         record = executor.run_execute_sequence(scenario_id, **kwargs)
-        assert isinstance(record, dict) and "status" in record
+        # F4.9: the positive D-execute path must commit ``diagnostic-pass`` with
+        # the FJT evidence bound to a controller goal UUID DISTINCT from the
+        # ExecuteTrajectory UUID (MoveIt -> controller forwarding).
+        assert record["status"] == "diagnostic-pass", record
+        assert record["execute_trajectory_goal_sent"] is True
+        assert record["controller_goal_sent"] is True
+        assert record["controller_endpoint"] == FJT_ENDPOINT
+        assert record["fjt_status"] == EXECUTE_STATUS_SUCCEEDED
+        assert _valid_goal_uuid(record["fjt_goal_uuid"])
+        assert record["fjt_goal_uuid"] != record["execute_goal_id"]
+        # No FJT status entry in the live stream carries the ExecuteTrajectory
+        # UUID — the controller transaction is genuinely distinct.
+        assert all(
+            str(entry.get("goal_uuid")) != record["execute_goal_id"]
+            for entry in executor._fjt_status_cache
+        )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_cancel_path_reaches_run_cancel_sequence(tmp_path):
+    scenario_id = "qualification-moveit-cancel"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    # F4.9: hold the presend ExecuteTrajectory goal open so the real cancel
+    # lands before the automatic success; publish arm motion so the cancel
+    # motion-trigger sees a fresh moving frame.
+    graph._execute_hold_s = 5.0
+    graph._motion_active = True
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        # The live factory pre-sends the long motion and discovers the distinct
+        # controller FJT goal UUID; the run method keys FJT evidence on it
+        # (never on execute_goal_id).
+        kwargs = d._live_runtime_provider_factory(
+            executor=executor, scenario_id=scenario_id, bundle=None,
+            config=_test_config(), attempt_dir=Path(tmp_path),
+        )
+        assert "fjt_goal_id" in kwargs and "transaction_baseline" in kwargs
+        assert "execute_goal_handle" in kwargs
+        assert kwargs["fjt_goal_id"] != kwargs["execute_goal_id"]
+        record = executor.run_cancel_sequence(scenario_id, **kwargs)
+        # F4.9: the positive controlled cancel path commits diagnostic-pass.
+        assert record["status"] == "diagnostic-pass", record
+        assert record["terminal_status"] == "canceled"
+        assert record["execute_trajectory_goal_sent"] is False
+        assert record["controller_goal_sent"] is True
+        assert record["controller_endpoint"] == FJT_ENDPOINT
+        assert record["cancel_response"] == "accepted"
+        assert record["fjt_status"] == EXECUTE_STATUS_CANCELED
+        assert record["fjt_goal_uuid"] != record["execute_goal_id"]
+        assert all(
+            str(entry.get("goal_uuid")) != record["execute_goal_id"]
+            for entry in executor._fjt_status_cache
+        )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_safety_path_reaches_run_safety_sequence(tmp_path):
+    scenario_id = "qualification-moveit-safety"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    # F4.9: hold the presend goal open so the operator safety assertion aborts
+    # it; publish arm motion so the safety motion-trigger sees a moving frame.
+    graph._execute_hold_s = 5.0
+    graph._motion_active = True
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        kwargs = d._live_runtime_provider_factory(
+            executor=executor, scenario_id=scenario_id, bundle=None,
+            config=_test_config(), attempt_dir=Path(tmp_path),
+        )
+        assert "fjt_goal_id" in kwargs and "transaction_baseline" in kwargs
+        assert _valid_goal_uuid(kwargs["fjt_goal_id"])
+        record = executor.run_safety_sequence(scenario_id, **kwargs)
+        # F4.9: the positive controlled safety path commits diagnostic-pass.
+        assert record["status"] == "diagnostic-pass", record
+        assert record["terminal_status"] == "aborted"
+        assert record["controller_goal_sent"] is True
+        assert record["controller_endpoint"] == FJT_ENDPOINT
+        assert record["fjt_status"] == EXECUTE_STATUS_ABORTED
+        assert record["fjt_goal_uuid"] != record["execute_goal_id"]
+        assert all(
+            str(entry.get("goal_uuid")) != record["execute_goal_id"]
+            for entry in executor._fjt_status_cache
+        )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+# --------------------------------------------------------------------------- #
+# F4.9 — transaction-real FJT negatives: no-new / multiple-new / stale-replay /
+# uuid-mismatch / status-mismatch / presend-cleanup.
+# --------------------------------------------------------------------------- #
+
+def test_controlled_d_execute_no_new_fjt_goal_fails_closed(tmp_path):
+    scenario_id = "qualification-moveit-execute-joint"
+    graph = _ControlledGraph(scenario_id=scenario_id, emit_fjt_on_execute=False, attempt_dir=Path(tmp_path))
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        kwargs = d._live_runtime_provider_factory(
+            executor=executor, scenario_id=scenario_id, bundle=None,
+            config=_test_config(), attempt_dir=Path(tmp_path),
+        )
+        assert "fjt_transaction_provider" in kwargs
+        _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
+        record = executor.run_execute_sequence(scenario_id, **kwargs)
+        assert record["status"] == "evidence-invalid"
+        assert "no new controller FJT goal" in (record.get("execute_error") or "")
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_execute_multiple_new_fjt_goals_fails_closed(tmp_path):
+    scenario_id = "qualification-moveit-execute-joint"
+    graph = _ControlledGraph(scenario_id=scenario_id, duplicate_fjt=True, attempt_dir=Path(tmp_path))
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        kwargs = d._live_runtime_provider_factory(
+            executor=executor, scenario_id=scenario_id, bundle=None,
+            config=_test_config(), attempt_dir=Path(tmp_path),
+        )
+        _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
+        record = executor.run_execute_sequence(scenario_id, **kwargs)
+        assert record["status"] == "evidence-invalid"
+        assert "multiple new controller FJT goal" in (record.get("execute_error") or "")
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_execute_stale_pre_baseline_replay_fails_closed(tmp_path):
+    scenario_id = "qualification-moveit-execute-joint"
+    stale_uuid = _fresh_uuid_hex()
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    # The controller goal UUID is forced to a value heartbeated BEFORE the run
+    # baseline; the fresh replay of a baseline-known goal must NOT be treated
+    # as a new controller transaction.
+    graph._forced_controller_uuid = stale_uuid
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        graph.emit_fjt(stale_uuid, EXECUTE_STATUS_EXECUTING)
+        _drive_spin(executor, graph=graph, timeout_s=0.3)
+        _assert_ready(executor)
+        kwargs = d._live_runtime_provider_factory(
+            executor=executor, scenario_id=scenario_id, bundle=None,
+            config=_test_config(), attempt_dir=Path(tmp_path),
+        )
+        _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
+        record = executor.run_execute_sequence(scenario_id, **kwargs)
+        assert record["status"] == "evidence-invalid"
+        assert "no new controller FJT goal" in (record.get("execute_error") or "")
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_execute_fjt_uuid_mismatch_fails_closed(tmp_path):
+    scenario_id = "qualification-moveit-execute-joint"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
+        wrong_uuid = _fresh_uuid_hex()
+
+        def _wrong_uuid_provider():
+            digest = executor._execute_recorder.last_trajectory_digest
+            return {
+                "endpoint": FJT_ENDPOINT,
+                "goal_uuid": wrong_uuid,
+                "trajectory_digest": digest,
+                "source": "test-introspection",
+                "sequence": 1,
+                "timestamp": time.monotonic(),
+                "status": EXECUTE_STATUS_SUCCEEDED,
+            }
+
+        record = executor.run_execute_sequence(
+            scenario_id, fjt_transaction_provider=_wrong_uuid_provider
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "does not equal the discovered controller goal UUID" in (record.get("execute_error") or "")
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_controlled_d_execute_fjt_status_mismatch_fails_closed(tmp_path):
+    scenario_id = "qualification-moveit-execute-joint"
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        _stub_action_clients_for_plan_only(executor, POSITIVE_REPORT_CONTRACT)
+
+        def _wrong_status_provider():
+            # The graph emitted EXECUTING(2) then SUCCEEDED(4); report the exact
+            # newest entry but with the pre-terminal status so the join fails.
+            newest = executor._fjt_status_cache[-1]
+            digest = executor._execute_recorder.last_trajectory_digest
+            return {
+                "endpoint": FJT_ENDPOINT,
+                "goal_uuid": str(newest.get("goal_uuid")),
+                "trajectory_digest": digest,
+                "source": "test-introspection",
+                "sequence": int(newest.get("seq")),
+                "timestamp": float(newest.get("received_mono")),
+                "status": EXECUTE_STATUS_EXECUTING,
+            }
+
+        record = executor.run_execute_sequence(
+            scenario_id, fjt_transaction_provider=_wrong_status_provider
+        )
+        assert record["status"] == "evidence-invalid"
+        assert "status does not join" in (record.get("execute_error") or "")
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        graph.stop()
+
+
+def test_presend_failure_cleans_up_retained_handle(tmp_path):
+    scenario_id = "qualification-moveit-cancel"
+    graph = _ControlledGraph(scenario_id=scenario_id, emit_fjt_on_execute=False, attempt_dir=Path(tmp_path))
+    # Hold the goal open so cleanup must cancel it, not race an auto-success.
+    graph._execute_hold_s = 5.0
+    graph.start()
+    executor = None
+    try:
+        executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
+        _drive_spin(executor, graph=graph, timeout_s=2.0)
+        _assert_ready(executor)
+        with pytest.raises(d.DriverError, match="no new controller FJT goal") as exc_info:
+            d._presend_long_motion(executor, scenario_id)
+        # F4.5: the retained accepted presend handle was boundedly cleaned up.
+        assert getattr(executor, "_presend_execute_handle", None) is None
+        # The cleanup summary is embedded in the DriverError message; the goal
+        # was cancelled (terminal CANCELED), never left running.
+        cleanup_text = str(exc_info.value).split("cleanup=", 1)[1]
+        import ast
+        cleanup = ast.literal_eval(cleanup_text)
+        assert isinstance(cleanup, dict)
+        assert cleanup.get("cleanup") == "accepted"
+        assert cleanup.get("cleanup_result_status") == EXECUTE_STATUS_CANCELED
     finally:
         if executor is not None:
             executor.shutdown()
@@ -1189,13 +1712,13 @@ def test_controlled_d_execute_path_reaches_run_execute_sequence(tmp_path):
 
 def test_controlled_d_retreat_path_reaches_run_cartesian_retreat(tmp_path):
     scenario_id = "qualification-moveit-cartesian-retreat"
-    graph = _ControlledGraph(scenario_id=scenario_id)
+    graph = _ControlledGraph(scenario_id=scenario_id, attempt_dir=Path(tmp_path))
     graph.start()
     executor = None
     try:
         executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
         _drive_spin(executor, graph=graph, timeout_s=2.0)
-        assert d._wait_for_readiness(executor, timeout_s=5.0)["ready"] is True
+        _assert_ready(executor)
         kwargs = d._live_runtime_provider_factory(
             executor=executor, scenario_id=scenario_id, bundle=None,
             config=_test_config(), attempt_dir=Path(tmp_path),
@@ -1215,7 +1738,7 @@ def test_controlled_e_path_reaches_run_pick_place_sequence(graph, tmp_path):
     executor = _construct_real_executor(Path(tmp_path), scenario_id=scenario_id)
     try:
         _drive_spin(executor, graph=graph, timeout_s=2.0)
-        assert d._wait_for_readiness(executor, timeout_s=5.0)["ready"] is True
+        _assert_ready(executor)
         kwargs = d._live_runtime_provider_factory(
             executor=executor, scenario_id=scenario_id, bundle=None,
             config=_test_config(), attempt_dir=Path(tmp_path),
