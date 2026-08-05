@@ -2369,10 +2369,7 @@ class QualificationRunner:
             for record in self._attempt_processes()
             if int(record["pid"]) not in managed_pids
             and int(record["pgid"]) not in managed_pgids
-            and not (
-                isaac_live
-                and "omni.telemetry.transmitter" in str(record.get("cmdline", ""))
-            )
+            and not (isaac_live and qualification_orphan_transient(record))
         ]
 
     def _terminate_attempt_orphans(self, *, grace_s: float = 1.0) -> list[dict[str, Any]]:
@@ -3125,7 +3122,9 @@ class QualificationRunner:
                 "remaining": orphan_cleanup.get("survivors", orphan_remaining),
                 "forced": bool(orphan_cleanup.get("forced_targets", [])),
             }
-            if orphan_initial:
+            if qualification_orphan_failure(
+                orphan_initial, orphan_cleanup.get("survivors", orphan_remaining)
+            ):
                 status = "failed"
             teardown_failures = [
                 name for name, record in self._termination.items()
@@ -3137,7 +3136,14 @@ class QualificationRunner:
             resources_clean = self._write_resource_evidence(manifest, gpu_baseline)
             if not resources_clean:
                 status = "failed"
-            evidence_ready = drained and rosbag_ok and not orphan_initial and not teardown_failures
+            evidence_ready = (
+                drained
+                and rosbag_ok
+                and not qualification_orphan_failure(
+                    orphan_initial, orphan_cleanup.get("survivors", orphan_remaining)
+                )
+                and not teardown_failures
+            )
             prior_evidence_invalid = status == "evidence-invalid"
             if status in {
                 "verification-pending",
@@ -3462,6 +3468,25 @@ def qualification_stop_process(runner: QualificationRunner, name: str) -> int | 
 def qualification_attempt_processes(runner: QualificationRunner) -> list[dict[str, Any]]:
     """Find descendants that escaped a launcher process group."""
     return runner._attempt_processes()
+
+
+def qualification_orphan_transient(record: dict[str, Any]) -> bool:
+    """Return True only for the known detached telemetry-transmitter transient."""
+    return "omni.telemetry.transmitter" in str(record.get("cmdline", ""))
+
+
+def qualification_orphan_failure(
+    initial: Sequence[dict[str, Any]], survivors: Sequence[dict[str, Any]]
+) -> bool:
+    """Return True when escaped attempt processes must demote an attempt.
+
+    Any cleanup survivor demotes (the transmitter included).  A transmitter-only
+    raw scan with zero survivors does not demote, but any unexpected process seen
+    in the strict raw scan demotes even when cleanup terminates it, and a mixed
+    transmitter + unexpected initial scan is unexpected and fails.
+    """
+    unexpected = [record for record in initial if not qualification_orphan_transient(record)]
+    return bool(survivors) or bool(unexpected)
 
 
 def qualification_terminate_attempt_orphans(

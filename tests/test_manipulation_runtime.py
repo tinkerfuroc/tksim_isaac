@@ -61,6 +61,20 @@ class _FakeRobot:
                 [[[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]]], dtype=torch.float32
             ),
         )
+        # Isaac Lab articulations own actuator models keyed by group name. Each
+        # ImplicitActuator keeps its own effort_limit tensor that is re-applied on
+        # reset/reinit; the runtime effort-limit writer must keep this in sync
+        # (Isaac Lab issue #128).
+        self.actuators = {
+            "gripper": SimpleNamespace(
+                joint_names=("drive_joint",),
+                effort_limit=torch.tensor([[12.0]], dtype=torch.float32),
+            ),
+            "arm": SimpleNamespace(
+                joint_names=("joint1",),
+                effort_limit=torch.tensor([[30.0]], dtype=torch.float32),
+            ),
+        }
         self.limit_calls: list[dict[str, object]] = []
         self.gain_calls: list[tuple[str, dict[str, object]]] = []
         self.target_calls: list[tuple[str, torch.Tensor]] = []
@@ -556,6 +570,41 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._set_gripper_effort_limit(6.0)
 
         self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[6.0]])
+
+    def test_gripper_effort_limit_updates_implicit_actuator_model_entry(self) -> None:
+        """RED runtime contract: _set_gripper_effort_limit must update the actuator model.
+
+        Isaac Lab issue #128: write_joint_effort_limit_to_sim_index writes only the
+        PhysX/shared buffer. The owning ImplicitActuator keeps its own effort_limit
+        tensor, which is re-applied to the simulator on reset/reinit. If the runtime
+        call does not update that entry, the actuator re-sync clobbers the request.
+        A zero request restores the existing default and a negative request still
+        rejects without touching either writer or model entry.
+        """
+        backend = _backend()
+        gripper = backend._robot.actuators["gripper"]
+        self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
+
+        backend._set_gripper_effort_limit(6.0)
+        self.assertEqual(backend.gripper_effort_limit, 6.0)
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[6.0]])
+        self.assertEqual(
+            float(gripper.effort_limit[0, 0]),
+            6.0,
+            "drive_joint's owning implicit actuator model effort_limit must be updated "
+            "alongside the PhysX writer so an actuator re-sync does not clobber it "
+            "(Isaac Lab issue #128)",
+        )
+
+        backend._set_gripper_effort_limit(0.0)
+        self.assertEqual(backend.gripper_effort_limit, 12.0)
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[12.0]])
+        self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
+
+        with self.assertRaises(ValueError):
+            backend._set_gripper_effort_limit(-1.0)
+        self.assertEqual(backend.gripper_effort_limit, 12.0)
+        self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
 
     def test_position_only_command_clears_affected_velocity_target(self) -> None:
         backend = _backend()
@@ -1665,6 +1714,130 @@ class ManipulationRuntimeTest(unittest.TestCase):
             "arm effort_limit_sim must raise only joint4 from the inherited 30 Nm to "
             "50 Nm and preserve the existing tiers (j1-2:50, j3:30, j5:30, j6-7:20)",
         )
+
+    def test_gripper_actuator_drives_only_drive_joint_and_mimics_are_passive(self) -> None:
+        """RED source contract: the gripper actuator drives only drive_joint.
+
+        The five authored USD mimic joints (left_finger_joint, left_inner_knuckle_joint,
+        right_inner_knuckle_joint, right_outer_knuckle_joint, right_finger_joint) follow
+        drive_joint through the bundle URDF mimic constraints. They must not be actively
+        driven by the 'gripper' ImplicitActuatorCfg, or the PD loop competes with the
+        mimic constraint and the fingers fight the drive. The repair must scope the
+        'gripper' actuator to drive_joint only and assign the five mimics to a distinct
+        passive implicit actuator group with zero stiffness and zero damping. No explicit
+        mimic target propagation is required.
+        """
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(backend_source)
+
+        actuators: ast.Dict | None = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "actuators" and isinstance(keyword.value, ast.Dict):
+                    actuators = keyword.value
+        self.assertIsNotNone(
+            actuators,
+            "backend ArticulationCfg.actuators must be a dict literal of actuator groups",
+        )
+
+        gripper_universe = {
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_finger_joint",
+        }
+        mimic_joints = frozenset(gripper_universe - {"drive_joint"})
+
+        def cfg_kwargs(cfg: ast.expr) -> dict[str, object]:
+            self.assertIsInstance(
+                cfg,
+                ast.Call,
+                "each actuator group must be an ImplicitActuatorCfg(...) call",
+            )
+            assert isinstance(cfg, ast.Call)
+            call_func = cfg.func
+            if isinstance(call_func, ast.Name):
+                self.assertEqual(
+                    call_func.id,
+                    "ImplicitActuatorCfg",
+                    "actuator groups must be implicit actuator configs",
+                )
+            kwargs: dict[str, object] = {}
+            for kw in cfg.keywords:
+                if kw.arg is None:
+                    continue
+                kwargs[kw.arg] = ast.literal_eval(kw.value)
+            return kwargs
+
+        def matched_joints(exprs: object) -> set[str]:
+            self.assertIsInstance(
+                exprs, list, "joint_names_expr must be a literal list of regex strings"
+            )
+            matched: set[str] = set()
+            for pattern in exprs:
+                self.assertIsInstance(pattern, str)
+                compiled = re.compile(pattern)
+                for name in gripper_universe:
+                    if compiled.fullmatch(name) is not None:
+                        matched.add(name)
+            return matched
+
+        groups: dict[str, dict[str, object]] = {}
+        for key, value in zip(actuators.keys, actuators.values):
+            if not isinstance(key, ast.Constant):
+                continue
+            groups[str(key.value)] = cfg_kwargs(value)
+
+        self.assertIn("gripper", groups, "backend must define a 'gripper' actuator group")
+        gripper = groups["gripper"]
+        gripper_matched = matched_joints(gripper.get("joint_names_expr"))
+        self.assertEqual(
+            gripper_matched,
+            {"drive_joint"},
+            "the 'gripper' actuator must actively drive only drive_joint; it currently "
+            f"also claims {sorted(gripper_matched - {'drive_joint'})}",
+        )
+        gripper_stiffness = gripper.get("stiffness")
+        self.assertIsNotNone(
+            gripper_stiffness,
+            "the 'gripper' actuator must carry an explicit non-zero stiffness",
+        )
+        self.assertNotEqual(
+            float(gripper_stiffness),  # type: ignore[arg-type]
+            0.0,
+            "the 'gripper' actuator must keep a non-zero stiffness to actively drive drive_joint",
+        )
+
+        passive = [
+            (name, cfg)
+            for name, cfg in groups.items()
+            if matched_joints(cfg.get("joint_names_expr")) == set(mimic_joints)
+        ]
+        self.assertTrue(
+            passive,
+            "no actuator group claims exactly the five mimic joints "
+            f"{sorted(mimic_joints)}; they must live in a distinct passive group",
+        )
+        for name, cfg in passive:
+            self.assertEqual(
+                float(cfg.get("stiffness", 1.0)),  # type: ignore[arg-type]
+                0.0,
+                f"mimic passive group {name!r} must have zero stiffness",
+            )
+            self.assertEqual(
+                float(cfg.get("damping", 1.0)),  # type: ignore[arg-type]
+                0.0,
+                f"mimic passive group {name!r} must have zero damping",
+            )
 
 
 if __name__ == "__main__":

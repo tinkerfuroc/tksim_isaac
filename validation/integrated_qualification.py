@@ -106,6 +106,7 @@ try:
         qualification_rosbag_qos_profiles,
         qualification_attempt_processes,
         qualification_compare_truth_records,
+        qualification_orphan_failure,
         qualification_record_topics,
         qualification_settle_evidence_files,
         qualification_start_process,
@@ -136,6 +137,7 @@ except ModuleNotFoundError:
         qualification_rosbag_qos_profiles,
         qualification_attempt_processes,
         qualification_compare_truth_records,
+        qualification_orphan_failure,
         qualification_record_topics,
         qualification_settle_evidence_files,
         qualification_start_process,
@@ -1687,8 +1689,10 @@ class IntegratedRunner:
         orphan_initial: list[dict[str, Any]] = []
         try:
             orphan_initial = qualification_attempt_processes(runner)
-            if orphan_initial:
-                qualification_terminate_attempt_orphans(runner)
+            orphan_survivors = (
+                qualification_terminate_attempt_orphans(runner) if orphan_initial else []
+            )
+            if qualification_orphan_failure(orphan_initial, orphan_survivors):
                 failures.append("orphan attempt processes remained after teardown")
         except Exception as error:  # noqa: BLE001 - per-phase isolation
             failures.append(f"orphan termination failed: {error}")

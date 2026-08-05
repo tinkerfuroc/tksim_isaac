@@ -690,17 +690,21 @@ class RosGateExecutor:
                 end = stream.tell()
                 if end <= 0:
                     raise RuntimeError(f"physics truth evidence is empty: {self.physics_truth_path}")
-                stream.seek(end - 1)
-                if stream.read(1) != b"\n":
-                    raise RuntimeError("physics truth evidence ends with an incomplete record")
                 start = max(0, end - PHYSICS_TRUTH_TAIL_BYTES)
                 stream.seek(start)
                 tail = stream.read(end - start)
         except (OSError, UnicodeError) as exc:
             raise RuntimeError(f"physics truth evidence unavailable: {self.physics_truth_path}") from exc
-        nonblank = [line for line in tail.split(b"\n") if line.strip()]
+        # The writer appends records without a lock, so a snapshot may end in the
+        # middle of an append with a partial fragment and no trailing newline.
+        # Discard only that incomplete fragment and parse the last complete
+        # nonblank line; a snapshot with no complete line still fails closed.
+        lines = tail.split(b"\n")
+        if tail and not tail.endswith(b"\n"):
+            lines = lines[:-1]
+        nonblank = [line for line in lines if line.strip()]
         if not nonblank:
-            raise RuntimeError(f"physics truth evidence is empty: {self.physics_truth_path}")
+            raise RuntimeError(f"physics truth evidence has no complete record: {self.physics_truth_path}")
         try:
             truth = json.loads(nonblank[-1].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

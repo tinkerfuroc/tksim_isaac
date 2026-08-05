@@ -94,7 +94,7 @@
       "id": "qualification_plan_blocker",
       "class_name": "static_obstacle",
       "asset_uri": "simulation/assets/primitives/obstacle.usda",
-      "asset_sha256": "c62ade2971c0846ea8f003e471cd2b056cd86c77dfd290430a1f4ea753996db5",
+      "asset_sha256": "e90c3bdf8b7385a6540a499fa5197a01dfb5f470b5f1eb04ff8e5be0550f851f",
       "fixed": true,
       "role": "blocker",
       "owner": "sim_fixture",

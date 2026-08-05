@@ -1353,6 +1353,130 @@ def test_real_finalize_phase_exception_does_not_skip_next_scenario(inject_at):
 
 
 # --------------------------------------------------------------------------- #
+# Task 8 fix round 3 — telemetry-transmitter orphan classification
+# --------------------------------------------------------------------------- #
+
+TRANSMITTER_ORPHAN = {
+    "pid": 900_001,
+    "ppid": 1,
+    "pgid": 900_001,
+    "cmdline": "/isaac/omni.telemetry.transmitter --detached",
+}
+UNEXPECTED_ORPHAN = {
+    "pid": 900_002,
+    "ppid": 1,
+    "pgid": 900_002,
+    "cmdline": "escaped-helper",
+}
+
+
+def test_real_transient_telemetry_orphan_does_not_demote_finalize():
+    """A telemetry transmitter observed in the raw orphan scan but terminating
+    during cleanup must not demote an otherwise valid integrated attempt."""
+    popen = FakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+    scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+    baseline = runner._gpu_baselines[allocation.attempt_dir]
+
+    scans = iter([[TRANSMITTER_ORPHAN], []])
+
+    def fake_attempt_processes(rnr):
+        value = next(scans, [])
+        return [dict(record) for record in value]
+
+    def fake_terminate(rnr, *, grace_s=1.0):
+        # The transmitter terminates during cleanup; no other orphan exists.
+        return []
+
+    with patch.object(iq, "qualification_stop_process", return_value=0), patch.object(
+        iq, "qualification_wait_for_evaluator_drain", return_value=True
+    ), patch.object(iq, "qualification_attempt_processes", side_effect=fake_attempt_processes), patch.object(
+        iq, "qualification_terminate_attempt_orphans", side_effect=fake_terminate
+    ), patch.object(iq, "qualification_write_resource_evidence", return_value=True), patch.object(
+        iq, "qualification_settle_evidence_files", return_value=None
+    ):
+        finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+
+    # The raw scan included the transmitter and cleanup was required...
+    assert finalize["orphan_cleanup_required"] is True
+    # ...but the transmitter terminated during cleanup and no other orphan
+    # exists, so finalize must not report an orphan failure.
+    assert not any("orphan" in reason for reason in finalize["failures"]), finalize["failures"]
+
+
+def test_real_orphans_surviving_cleanup_still_fail():
+    """Any orphan that survives cleanup — the transmitter included — must fail."""
+    for label, survivors in [
+        ("transmitter", [TRANSMITTER_ORPHAN]),
+        ("unexpected", [UNEXPECTED_ORPHAN]),
+        ("both", [TRANSMITTER_ORPHAN, UNEXPECTED_ORPHAN]),
+    ]:
+        popen = FakePopen()
+        runner = _evidence_runner(popen=popen)
+        allocation = runner._allocate_one(SCENARIO_C, "C")
+        scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+        baseline = runner._gpu_baselines[allocation.attempt_dir]
+
+        def fake_attempt_processes(rnr):
+            return [dict(record) for record in survivors]
+
+        def fake_terminate(rnr, *, grace_s=1.0):
+            return [dict(record) for record in survivors]
+
+        with patch.object(iq, "qualification_stop_process", return_value=0), patch.object(
+            iq, "qualification_wait_for_evaluator_drain", return_value=True
+        ), patch.object(iq, "qualification_attempt_processes", side_effect=fake_attempt_processes), patch.object(
+            iq, "qualification_terminate_attempt_orphans", side_effect=fake_terminate
+        ), patch.object(iq, "qualification_write_resource_evidence", return_value=True), patch.object(
+            iq, "qualification_settle_evidence_files", return_value=None
+        ):
+            finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+
+        assert finalize["orphan_cleanup_required"] is True
+        assert any("orphan" in reason for reason in finalize["failures"]), (
+            label,
+            finalize["failures"],
+        )
+
+
+def test_real_unexpected_orphan_terminated_by_cleanup_still_fails():
+    """An unexpected orphan observed in the raw orphan scan must fail the
+    scenario even when cleanup terminates it successfully (no survivors)."""
+    popen = FakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+    scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+    baseline = runner._gpu_baselines[allocation.attempt_dir]
+
+    state = {"calls": 0}
+
+    def fake_attempt_processes(rnr):
+        # The raw scan sees the unexpected orphan; cleanup terminates it, so no
+        # later scan reports it.
+        state["calls"] += 1
+        return [dict(UNEXPECTED_ORPHAN)] if state["calls"] <= 1 else []
+
+    def fake_terminate(rnr, *, grace_s=1.0):
+        # Cleanup succeeds: the orphan is terminated, no survivors remain.
+        return []
+
+    with patch.object(iq, "qualification_stop_process", return_value=0), patch.object(
+        iq, "qualification_wait_for_evaluator_drain", return_value=True
+    ), patch.object(iq, "qualification_attempt_processes", side_effect=fake_attempt_processes), patch.object(
+        iq, "qualification_terminate_attempt_orphans", side_effect=fake_terminate
+    ), patch.object(iq, "qualification_write_resource_evidence", return_value=True), patch.object(
+        iq, "qualification_settle_evidence_files", return_value=None
+    ):
+        finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+
+    # The raw scan included the unexpected orphan and cleanup had no survivors,
+    # but the scenario must still be demoted.
+    assert finalize["orphan_cleanup_required"] is True
+    assert any("orphan" in reason for reason in finalize["failures"]), finalize["failures"]
+
+
+# --------------------------------------------------------------------------- #
 # Task 10 — Stage records and Gate F
 # --------------------------------------------------------------------------- #
 

@@ -168,9 +168,14 @@ class IsaacWholeRobotBackend:
                     damping=50.0,
                 ),
                 "gripper": ImplicitActuatorCfg(
-                    joint_names_expr=["drive_joint", ".*finger.*", ".*knuckle.*"],
+                    joint_names_expr=["drive_joint"],
                     stiffness=200.0,
                     damping=20.0,
+                ),
+                "gripper_mimic": ImplicitActuatorCfg(
+                    joint_names_expr=[".*finger.*", ".*knuckle.*"],
+                    stiffness=0.0,
+                    damping=0.0,
                 ),
                 "wheels": ImplicitActuatorCfg(
                     joint_names_expr=["front_.*_wheel_joint", "rear_.*"],
@@ -525,6 +530,23 @@ class IsaacWholeRobotBackend:
         if writer is None:
             raise RuntimeError("Isaac Lab runtime effort-limit API is unavailable")
         writer(limits=limits, joint_ids=[index], env_ids=[0])
+        # Isaac Lab issue #128: the PhysX/shared effort-limit writer updates only
+        # the simulator buffer; the owning ImplicitActuator keeps its own
+        # effort_limit tensor that is re-applied on reset/reinit.  Keep that
+        # model entry in sync using the actuator's own joint-name order, updating
+        # every environment at the local drive_joint index only.
+        for actuator in getattr(self._robot, "actuators", {}).values():
+            names = getattr(actuator, "joint_names", None)
+            if names is None:
+                continue
+            try:
+                local_index = list(names).index("drive_joint")
+            except (TypeError, ValueError):
+                continue
+            model_limits = getattr(actuator, "effort_limit", None)
+            if model_limits is None or not isinstance(model_limits, self._torch.Tensor):
+                continue
+            model_limits[:, local_index] = limit
         self._gripper_effort_limit = limit
 
     def command_joints(self, command: JointCommand) -> bool:
