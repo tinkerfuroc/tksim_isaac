@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import queue
@@ -177,6 +178,36 @@ def _protocol_gateway(epoch: int = 11) -> RosStandardGateway:
     gateway._safety_last_sample_at = time.monotonic()
     gateway._last_safety_clear_at = gateway._safety_last_sample_at
     return gateway
+
+
+def _spawn_usd_file_cfg_source(backend_source: str) -> str:
+    """Return the source text of the ``UsdFileCfg`` used as the Articulation spawn.
+
+    The backend builds ``ArticulationCfg(...)`` with a ``spawn=sim_utils.UsdFileCfg(...)``
+    keyword.  This extracts exactly that spawn call so the test can assert the
+    spawn-time joint-drive contract without importing Isaac or inspecting USD.
+    """
+    tree = ast.parse(backend_source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "spawn":
+                continue
+            value = keyword.value
+            if not isinstance(value, ast.Call):
+                continue
+            value_func = value.func
+            if not (
+                isinstance(value_func, ast.Attribute)
+                and value_func.attr == "UsdFileCfg"
+            ):
+                continue
+            return ast.get_source_segment(backend_source, value) or ""
+    return ""
 
 
 class ManipulationRuntimeTest(unittest.TestCase):
@@ -1444,6 +1475,20 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertIn("/sim/internal/physics_truth", source)
         self.assertNotIn("self.truth_pub", source)
 
+    def test_gateway_publishes_raw_truth_without_persisting_physics_truth(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        # The gateway still publishes the raw serialized payload on the internal
+        # physics-truth topic for the evaluator to consume.
+        self.assertIn('"/sim/internal/physics_truth"', source)
+        self.assertIn("physics_truth.data", source)
+        self.assertIn("self.physics_truth_pub.publish(physics_truth)", source)
+        # Raw truth persistence is owned by the evaluator callback, so the
+        # gateway must not hold a physics-truth jsonl writer (the TINKER_SIM_TRUTH_JSONL
+        # leak that double-wrote physics_truth.jsonl in the Isaac process).
+        self.assertNotIn("self._truth_writer", source)
+
     def test_physics_truth_writer_appends_sorted_finite_json_once_per_frame(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "physics_truth.jsonl"
@@ -1505,6 +1550,31 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertNotIn("filter_prim_paths_expr", backend_source)
         self.assertIn("exit_code=1 if failed else 0", run_source)
         self.assertIn("return process.wait()", cli_source)
+
+    def test_spawned_joint_drives_are_force_mode_before_articulation_init(self) -> None:
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        spawn_source = _spawn_usd_file_cfg_source(backend_source)
+        self.assertTrue(
+            spawn_source,
+            "backend must spawn Tinker through a UsdFileCfg; no spawn call found",
+        )
+        # Spawned dynamic joint drives must be force-mode before the articulation
+        # initializes, so the spawn's UsdFileCfg carries the joint-drive props.
+        self.assertIn("joint_drive_props", spawn_source)
+        self.assertIn("drive_type", spawn_source)
+        self.assertIn("force", spawn_source)
+        # The existing per-group ImplicitActuatorCfg gains remain authoritative.
+        # The arm group is authored on one line; head/gripper/wheels carry
+        # stiffness and damping as separate keyword arguments.
+        self.assertIn("stiffness=20000.0, damping=1500.0", backend_source)
+        self.assertIn("stiffness=500.0", backend_source)
+        self.assertIn("damping=50.0", backend_source)
+        self.assertIn("stiffness=200.0", backend_source)
+        self.assertIn("damping=20.0", backend_source)
+        self.assertIn("stiffness=0.0", backend_source)
+        self.assertIn("damping=200.0", backend_source)
 
 
 if __name__ == "__main__":

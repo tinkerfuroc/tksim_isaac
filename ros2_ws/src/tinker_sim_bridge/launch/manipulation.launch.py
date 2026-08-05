@@ -124,6 +124,11 @@ def _resolve(context):
         evaluator_jsonl = str(attempt_dir / "evaluator.jsonl")
     elif os.environ.get("TINKER_SIM_EVALUATOR_JSONL"):
         evaluator_jsonl = os.environ["TINKER_SIM_EVALUATOR_JSONL"]
+    raw_jsonl_path = ""
+    if attempt_dir is not None:
+        raw_jsonl_path = str(attempt_dir / "physics_truth.jsonl")
+    elif os.environ.get("TINKER_SIM_TRUTH_JSONL"):
+        raw_jsonl_path = os.environ["TINKER_SIM_TRUTH_JSONL"]
     safety_parameters = [{"use_sim_time": True}]
     evaluator_parameters = [
         {
@@ -131,6 +136,7 @@ def _resolve(context):
             "scenario": scenario,
             "task": scenario,
             "jsonl_path": evaluator_jsonl,
+            "raw_jsonl_path": raw_jsonl_path,
         }
     ]
     python_env = {"PYTHONPATH": str(root / "simulation") + os.pathsep + os.environ.get("PYTHONPATH", "")}
