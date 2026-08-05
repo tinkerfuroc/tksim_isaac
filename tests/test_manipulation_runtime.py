@@ -4,6 +4,7 @@ import ast
 import json
 import os
 import queue
+import re
 import sys
 import tempfile
 import time
@@ -1575,6 +1576,95 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertIn("damping=20.0", backend_source)
         self.assertIn("stiffness=0.0", backend_source)
         self.assertIn("damping=200.0", backend_source)
+
+    def test_arm_effort_limit_sim_resolves_to_seven_joint_tiers(self) -> None:
+        """RED source contract: joint4 must be raised to 50 Nm, all other tiers preserved.
+
+        A fresh-attempt live smoke (task43-force-truth-free-space-fjt) showed joint4
+        alone had RMS ~0.180 rad / peak 0.342 rad because the USD/vendor cap pinned it
+        at 30 Nm for ~72% of the action. The `arm` ImplicitActuatorCfg must therefore
+        carry an ``effort_limit_sim`` dict that resolves across joint1..joint7 to
+        [50, 50, 30, 50, 30, 20, 20] with a strict one-to-one match (exactly Isaac Lab's
+        ``resolve_matching_names_values`` semantics via ``re.fullmatch``). No specific
+        regex spelling is hard-coded; the keys only need full, non-overlapping coverage.
+        """
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(backend_source)
+
+        arm_call: ast.Call | None = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "actuators":
+                    continue
+                actuators = keyword.value
+                if not isinstance(actuators, ast.Dict):
+                    continue
+                for key, value in zip(actuators.keys, actuators.values):
+                    if isinstance(key, ast.Constant) and key.value == "arm":
+                        arm_call = value
+
+        self.assertIsNotNone(
+            arm_call,
+            "backend ArticulationCfg.actuators has no 'arm' ImplicitActuatorCfg",
+        )
+        self.assertIsInstance(
+            arm_call,
+            ast.Call,
+            "backend 'arm' actuator must be an ImplicitActuatorCfg(...) call",
+        )
+
+        effort_limit_sim = None
+        for keyword in arm_call.keywords:
+            if keyword.arg == "effort_limit_sim":
+                effort_limit_sim = keyword.value
+        self.assertIsNotNone(
+            effort_limit_sim,
+            "arm ImplicitActuatorCfg has no effort_limit_sim; joint4 stays pinned at "
+            "the inherited 30 Nm vendor cap for most of the action",
+        )
+
+        limits = ast.literal_eval(effort_limit_sim)
+        self.assertIsInstance(
+            limits,
+            dict,
+            "arm effort_limit_sim must be a per-joint dict[str, float] so joint4 can "
+            "be raised independently of its siblings",
+        )
+
+        joint_names = [f"joint{index}" for index in range(1, 8)]
+        match_counts = {name: 0 for name in joint_names}
+        resolved: dict[str, float] = {}
+        for pattern, value in limits.items():
+            self.assertIsInstance(
+                pattern,
+                str,
+                "arm effort_limit_sim keys must be joint-name regex strings",
+            )
+            compiled = re.compile(pattern)
+            for name in joint_names:
+                if compiled.fullmatch(name) is not None:
+                    match_counts[name] += 1
+                    resolved[name] = float(value)
+
+        self.assertEqual(
+            match_counts,
+            {name: 1 for name in joint_names},
+            "arm effort_limit_sim regex keys must cover each of joint1..joint7 exactly "
+            f"once; missing or multiply matched joints: {match_counts}",
+        )
+        self.assertEqual(
+            [resolved[name] for name in joint_names],
+            [50.0, 50.0, 30.0, 50.0, 30.0, 20.0, 20.0],
+            "arm effort_limit_sim must raise only joint4 from the inherited 30 Nm to "
+            "50 Nm and preserve the existing tiers (j1-2:50, j3:30, j5:30, j6-7:20)",
+        )
 
 
 if __name__ == "__main__":

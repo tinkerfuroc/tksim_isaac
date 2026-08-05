@@ -153,7 +153,14 @@ class IsaacWholeRobotBackend:
             init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, spawn_z)),
             actuators={
                 "arm": ImplicitActuatorCfg(
-                    joint_names_expr=["joint[1-7]"], stiffness=20000.0, damping=1500.0
+                    joint_names_expr=["joint[1-7]"], stiffness=20000.0, damping=1500.0,
+                    effort_limit_sim={
+                        "joint[1-2]": 50.0,
+                        "joint[3]": 30.0,
+                        "joint[4]": 50.0,
+                        "joint[5]": 30.0,
+                        "joint[6-7]": 20.0,
+                    },
                 ),
                 "head": ImplicitActuatorCfg(
                     joint_names_expr=["pan_joint", "tilt_joint"],

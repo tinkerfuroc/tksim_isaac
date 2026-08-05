@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (Task 48: joint4 live trajectory effort saturation)
+
+- The simulator arm actuator now applies an explicit per-joint PhysX effort
+  envelope of `[50, 50, 30, 50, 30, 20, 20]` Nm. This raises only joint4 from
+  the inherited vendor-URDF 30 Nm cap to 50 Nm while preserving every other
+  joint tier. The override addresses the live free-space FJT failure where
+  joint4 remained saturated for about 72% of the action and alone produced
+  0.180 rad RMS tracking error; the trajectory and its 0.01 rad terminal / 0.05
+  rad RMS qualification thresholds remain unchanged.
+
 ### Fixed (Task 43: live OMPL actuator settling and truth teardown)
 
 - Spawned Tinker articulations now override imported joint drives to force mode
