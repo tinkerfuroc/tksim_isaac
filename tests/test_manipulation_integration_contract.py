@@ -161,5 +161,27 @@ def test_arm_collision_uses_dedicated_static_obstacle() -> None:
     asset = (ROOT / "simulation/assets/primitives/obstacle.usda").read_text(encoding="utf-8")
     assert "simulation/assets/primitives/obstacle.usda" in scenario
     assert "task-object.usda" not in scenario
-    assert "PhysicsCollisionAPI" in asset
-    assert "PhysicsRigidBodyAPI" not in asset
+
+    # Fixture contract: the backend resolves the scenario root prim path
+    # (/World/Scenario/<id>, see validation/run_sim.py) and tracks it through
+    # PhysxManager.create_rigid_body_view (simulation/tinker_sim_isaac/backend.py),
+    # which requires a rigid body on that root prim, not on a child.  The body
+    # must be kinematic (bool physics:kinematicEnabled = true) so gravity cannot
+    # move the fixture, and the cube geometry must retain its collider.
+    xform_marker = 'def Xform "Obstacle"'
+    cube_marker = 'def Cube "Body"'
+    assert xform_marker in asset
+    assert cube_marker in asset
+    # Root prim spec header: from the Xform declaration to its opening brace.
+    xform_start = asset.index(xform_marker)
+    xform_body = asset[xform_start:]
+    root_header = xform_body[: xform_body.index("{")]
+    assert "PhysicsRigidBodyAPI" in root_header
+    # The kinematic flag is a root-level attribute: it must appear before the
+    # cube child and be set to true (present-but-false would let gravity move it).
+    cube_start = xform_body.index(cube_marker)
+    root_attrs = xform_body[:cube_start]
+    assert "bool physics:kinematicEnabled = true" in root_attrs
+    # Collision geometry stays on the fixture cube, not the root.
+    cube_header = xform_body[cube_start : xform_body.index("{", cube_start)]
+    assert "PhysicsCollisionAPI" in cube_header
