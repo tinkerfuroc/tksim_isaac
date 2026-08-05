@@ -65,6 +65,15 @@ def test_manipulation_launch_uses_installed_guard_profile_and_evaluator_path() -
     assert '"attempt_dir": str(attempt_dir or "")' not in launch
 
 
+def test_manipulation_launch_passes_attempt_physics_truth_as_raw_jsonl_path() -> None:
+    launch = (BRIDGE / "launch/manipulation.launch.py").read_text(encoding="utf-8")
+    # The evaluated record stays on evaluator.jsonl while the evaluator now
+    # receives the attempt's physics_truth.jsonl path as the raw payload path.
+    assert '"jsonl_path": evaluator_jsonl' in launch
+    assert '"raw_jsonl_path"' in launch
+    assert "physics_truth.jsonl" in launch
+
+
 def test_whole_robot_launch_has_the_same_safety_supervisor_contract() -> None:
     launch = (BRIDGE / "launch/whole_robot.launch.py").read_text(encoding="utf-8")
     assert 'executable="safety_supervisor"' in launch

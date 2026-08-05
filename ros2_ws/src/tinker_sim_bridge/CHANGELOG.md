@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (Task 43: live OMPL actuator settling and truth teardown)
+
+- Spawned Tinker articulations now override imported joint drives to force mode
+  before Isaac Lab initializes the articulation, while preserving the existing
+  arm, head, gripper, and wheel actuator gains and limits. This addresses the
+  acceleration-drive gravity sag that exceeded the xArm trajectory controller's
+  0.01 rad terminal tolerance during the live free-space FJT gate.
+- Raw physics-truth persistence now belongs to the Humble truth evaluator: the
+  Isaac gateway publishes strict finite canonical JSON only, the evaluator uses
+  RELIABLE delivery and writes the validated raw frame plus evaluated record in
+  the same callback, and both manipulation launches pass a separate
+  `raw_jsonl_path`. This eliminates the cross-process final-frame teardown race
+  without weakening exact raw/evaluator correlation.
+
 ### Added (integrated qualification executor driver — Task 8 fix round 3: observe live integrated providers)
 
 - The integrated launch now owns the `base_link -> livox360` static transform

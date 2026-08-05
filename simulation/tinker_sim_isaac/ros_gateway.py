@@ -96,7 +96,6 @@ class RosStandardGateway:
         self.rclpy = rclpy
         self.backend = backend
         self.development_lidar = development_lidar
-        self._truth_writer = PhysicsTruthJsonlWriter.from_environment()
         self.node = Node("tinker_isaac_gateway")
         # Keep commands and safety transitions in one FIFO.  Draining separate
         # queues by category can apply an old command after a stop has been
@@ -873,7 +872,9 @@ class RosStandardGateway:
             "active_epoch": self._command_epoch,
             "last_snapshot_id": self._last_logical_snapshot_id,
         }
-        physics_truth.data = self._truth_writer.append(frame)
+        physics_truth.data = json.dumps(
+            frame, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
         self.physics_truth_pub.publish(physics_truth)
         collision = self._Bool()
         collision.data = bool(self.backend.arm_scenario_collision())
@@ -922,12 +923,9 @@ class RosStandardGateway:
         return message
 
     def close(self) -> None:
-        try:
-            self._executor.shutdown()
-            self._executor_thread.join(timeout=2.0)
-            self._executor.remove_node(self.node)
-            self.node.destroy_node()
-            if self.rclpy.ok():
-                self.rclpy.shutdown()
-        finally:
-            self._truth_writer.close()
+        self._executor.shutdown()
+        self._executor_thread.join(timeout=2.0)
+        self._executor.remove_node(self.node)
+        self.node.destroy_node()
+        if self.rclpy.ok():
+            self.rclpy.shutdown()

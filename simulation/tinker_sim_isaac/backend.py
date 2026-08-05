@@ -148,6 +148,7 @@ class IsaacWholeRobotBackend:
             spawn=sim_utils.UsdFileCfg(
                 usd_path=str(usd_path.resolve()),
                 activate_contact_sensors=enable_contacts,
+                joint_drive_props=sim_utils.JointDriveBaseCfg(drive_type="force"),
             ),
             init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, spawn_z)),
             actuators={
