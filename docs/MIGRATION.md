@@ -185,9 +185,11 @@ export TINKER_WS=/home/tinker/tk25_ws
 export ROS_DOMAIN_ID=25 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export TINKER_ACCEPT_OMNIVERSE_EULA=Y
 
-# terminal 1: Isaac
-./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \
-  --scenario find-and-approach-person --seed 7
+# terminal 1: Isaac (navigation-parity is the implemented sensor smoke profile;
+# `sensor-rich` is declared but unimplemented in validation/run_sim.py, and
+# --ros is required or no ROS gateway starts for the Humble side to pair with)
+./scripts/launch-isaac --sensor-profile navigation-parity --profile parity \
+  --scenario find-and-approach-person --seed 7 --ros
 
 # terminal 2: Humble boundary
 ./scripts/launch-humble
