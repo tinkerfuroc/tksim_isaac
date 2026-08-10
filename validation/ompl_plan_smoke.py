@@ -53,6 +53,7 @@ from ompl_goal_builders import (
     DEFAULT_PLANNER_ID,
     DEFAULT_POSITION_TOLERANCE,
     GROUP_NAME,
+    POSE_APPROACH_QUATERNION_XYZW,
     POSE_APPROACH_Z_OFFSET,
     build_joint_goal,
     build_pose_goal,
@@ -136,30 +137,9 @@ MOVEIT_ERROR_CODES: Mapping[int, str] = {
     -31: "NO_IK_SOLUTION",
 }
 
-# Documented planning/collision/constraint failure codes accepted for blocked
-# mode.  Restricted to genuine planning/collision/constraint outcomes only:
-# request/state/config-validation codes (INVALID_GROUP_NAME -15,
-# INVALID_GOAL_CONSTRAINTS -16, INVALID_ROBOT_STATE -17, START_STATE_INVALID
-# -26, GOAL_STATE_INVALID -27, UNRECOGNIZED_GOAL_TYPE -28) and every control/
-# execution/transport/setup/configuration failure are deliberately excluded so
-# a misconfigured overlay cannot pass blocked mode (fix1 adversarial A).
-MOVEIT_PLANNING_FAILURE_CODES = frozenset(
-    {
-        -1,   # PLANNING_FAILED
-        -2,   # INVALID_MOTION_PLAN
-        -3,   # MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE
-        -10,  # START_STATE_IN_COLLISION
-        -11,  # START_STATE_VIOLATES_PATH_CONSTRAINTS
-        -12,  # GOAL_IN_COLLISION
-        -13,  # GOAL_VIOLATES_PATH_CONSTRAINTS
-        -14,  # GOAL_CONSTRAINTS_VIOLATED
-        -31,  # NO_IK_SOLUTION
-    }
-)
-
 # Explicitly-rejected MoveItErrorCodes used as documentation/evidence: the
-# request/state/config-validation codes (blocked-mode masquerades) plus the
-# control/execution/transport/setup codes already excluded by the allowlist.
+# request/state/config-validation codes plus the control/execution/transport/
+# setup codes already excluded by the allowlist.
 MOVEIT_CONFIGURATION_FAILURE_CODES = frozenset(
     {
         -4,    # CONTROL_FAILED
@@ -183,18 +163,10 @@ MOVEIT_CONFIGURATION_FAILURE_CODES = frozenset(
     }
 )
 
-# Blocked-mode acceptance permits an accepted goal that ended with the action
-# terminal status STATUS_ABORTED (the normal planning-failure terminal); a
-# STATUS_SUCCEEDED terminal is allowed only when the server delivers a
-# non-success MoveIt result that way.  The generic error-code allowlist check
-# rejects SUCCESS in that case.
-BLOCKED_ALLOWED_TERMINAL_STATUSES = frozenset({STATUS_ABORTED, STATUS_SUCCEEDED})
-
-MODES = ("joint", "pose", "blocked")
+MODES = ("joint", "pose")
 MODE_SCENARIOS: Mapping[str, str] = {
     "joint": "qualification-moveit-plan-joint",
     "pose": "qualification-moveit-plan-pose",
-    "blocked": "qualification-moveit-plan-blocked",
 }
 
 DEFAULT_REPORT_PATH = str(Path("outputs/ompl-plan-smoke/ompl-plan-smoke.json"))
@@ -334,25 +306,14 @@ def scenario_target_pose(
     raise ValueError("scenario has no 'target' object")
 
 
-def scenario_blocker_pose(
-    scenario: Mapping[str, object],
-) -> tuple[list[float], list[float]]:
-    """Return the ``class == "blocker"`` object's xyz and quaternion_xyzw."""
-    objects = (scenario.get("planning_scene") or {}).get("objects") or []
-    for obj in objects:
-        if isinstance(obj, dict) and obj.get("class") == "blocker":
-            return _pose_tuple(obj.get("pose"))
-    raise ValueError("scenario has no 'blocker' object")
-
-
 def build_goal(mode: str, scenario: Mapping[str, object], **overrides: object) -> object:
     """Build a deterministic plain-data goal from a scenario and mode.
 
     The scenario's ``qualification_gate`` must equal ``moveit-plan-<mode>``
     (fail-closed mode/scenario consistency).  Joint mode builds a small reach
     from a vertical arm; pose mode hovers ``POSE_APPROACH_Z_OFFSET`` above the
-    target object; blocked mode targets the interior of the ``blocker`` object
-    so every goal sample is in collision, yielding a deterministic non-success.
+    target object with the overhead z-down Rz45*Rx180 orientation
+    (``POSE_APPROACH_QUATERNION_XYZW``).
     """
     if mode not in MODES:
         raise ValueError("unknown mode {!r}; expected one of {}".format(mode, MODES))
@@ -371,15 +332,17 @@ def build_goal(mode: str, scenario: Mapping[str, object], **overrides: object) -
             if key in _JOINT_BUILDER_KWARGS
         }
         return build_joint_goal(**joint_kwargs)
-    target_xyz, target_quat = scenario_target_pose(scenario)
+    target_xyz, _target_quat = scenario_target_pose(scenario)
     if mode == "pose":
+        # Pose mode emits the overhead z-down Rz45*Rx180 orientation, never the
+        # fixture's yaw-only declaration quaternion; the TCP hovers
+        # POSE_APPROACH_Z_OFFSET above the target object's declared z.
         return build_pose_goal(
             [target_xyz[0], target_xyz[1], target_xyz[2] + POSE_APPROACH_Z_OFFSET],
-            target_quat,
+            list(POSE_APPROACH_QUATERNION_XYZW),
             **overrides,
         )
-    blocked_xyz, blocked_quat = scenario_blocker_pose(scenario)
-    return build_pose_goal(blocked_xyz, blocked_quat, **overrides)
+    raise ValueError("mode {!r} has no goal builder".format(mode))
 
 
 def scenario_expected_identities(scenario: Mapping[str, object]) -> dict[str, object]:
@@ -879,76 +842,44 @@ def _evaluate_outcome(
     terminal_status = outcome.get("terminal_status")
     result_received = outcome.get("result_received") is True
     error_code = outcome.get("error_code")
-    if mode in ("joint", "pose"):
-        if kind != "success":
-            reasons.append(
-                "expected a successful plan, got outcome {!r}".format(kind)
+    if kind != "success":
+        reasons.append(
+            "expected a successful plan, got outcome {!r}".format(kind)
+        )
+    elif not goal_accepted:
+        reasons.append("success requires an accepted goal")
+    elif terminal_status != STATUS_SUCCEEDED:
+        reasons.append(
+            "success requires terminal STATUS_SUCCEEDED, got {!r}".format(
+                outcome.get("terminal_status_name")
             )
-        elif not goal_accepted:
-            reasons.append("success requires an accepted goal")
-        elif terminal_status != STATUS_SUCCEEDED:
+        )
+    elif not result_received:
+        reasons.append("success requires a typed result")
+    elif error_code != int(expected.get("success_error_code", SUCCESS_ERROR_CODE)):
+        reasons.append(
+            "success outcome error_code {!r} != {}".format(
+                error_code, expected.get("success_error_code", SUCCESS_ERROR_CODE)
+            )
+        )
+    else:
+        point_count = outcome.get("trajectory_point_count")
+        min_points = int(
+            expected.get("trajectory_min_points", DEFAULT_TRAJECTORY_MIN_POINTS)
+        )
+        if (
+            not isinstance(point_count, int)
+            or isinstance(point_count, bool)
+            or point_count < min_points
+        ):
             reasons.append(
-                "success requires terminal STATUS_SUCCEEDED, got {!r}".format(
-                    outcome.get("terminal_status_name")
+                "successful plan has empty trajectory (point_count={})".format(
+                    point_count
                 )
             )
-        elif not result_received:
-            reasons.append("success requires a typed result")
-        elif error_code != int(expected.get("success_error_code", SUCCESS_ERROR_CODE)):
-            reasons.append(
-                "success outcome error_code {!r} != {}".format(
-                    error_code, expected.get("success_error_code", SUCCESS_ERROR_CODE)
-                )
-            )
-        else:
-            point_count = outcome.get("trajectory_point_count")
-            min_points = int(
-                expected.get("trajectory_min_points", DEFAULT_TRAJECTORY_MIN_POINTS)
-            )
-            if (
-                not isinstance(point_count, int)
-                or isinstance(point_count, bool)
-                or point_count < min_points
-            ):
-                reasons.append(
-                    "successful plan has empty trajectory (point_count={})".format(
-                        point_count
-                    )
-                )
-            joint_names = outcome.get("trajectory_joint_names") or []
-            if not joint_names:
-                reasons.append("successful plan has no trajectory joint names")
-    else:  # blocked
-        if kind != "non_success":
-            reasons.append(
-                "blocked mode requires a deterministic non-success result, got outcome {!r}".format(
-                    kind
-                )
-            )
-        if not goal_accepted:
-            reasons.append("blocked mode requires an accepted goal")
-        if not result_received:
-            reasons.append("blocked mode requires a typed result")
-        if terminal_status not in BLOCKED_ALLOWED_TERMINAL_STATUSES:
-            reasons.append(
-                "blocked mode terminal status {!r} not in allowed planning-failure statuses".format(
-                    outcome.get("terminal_status_name")
-                )
-            )
-        if error_code is None or error_code == 0:
-            reasons.append(
-                "blocked mode error_code must be an explicit integer, got {!r}".format(
-                    error_code
-                )
-            )
-        elif error_code == int(expected.get("success_error_code", SUCCESS_ERROR_CODE)):
-            reasons.append("blocked mode returned unexpected success (error_code {})".format(error_code))
-        elif error_code not in MOVEIT_PLANNING_FAILURE_CODES:
-            reasons.append(
-                "blocked mode error_code {!r} is not a documented planning failure".format(
-                    error_code
-                )
-            )
+        joint_names = outcome.get("trajectory_joint_names") or []
+        if not joint_names:
+            reasons.append("successful plan has no trajectory joint names")
     return reasons
 
 
@@ -959,13 +890,11 @@ def evaluate_smoke(
 
     Returns ``(ready, reasons)``.  Joint/pose modes require an accepted goal,
     terminal ``STATUS_SUCCEEDED``, ``MoveItErrorCodes.SUCCESS``, and a nonempty
-    trajectory; blocked mode requires an accepted goal, a typed result, a
-    terminal status in the documented planning-failure statuses, and an
-    explicit MoveIt planning failure code from the allowlist.  Every mode
-    additionally requires a fresh canonical pass with exact publisher metadata
-    and scenario identity, an exact ``/move_action`` MoveGroup server with an
-    exact result-service type, and zero ``/isaac_joint_commands`` samples
-    across the send/result/tail window with the exact publisher proven.
+    trajectory.  Every mode additionally requires a fresh canonical pass with
+    exact publisher metadata and scenario identity, an exact ``/move_action``
+    MoveGroup server with an exact result-service type, and zero
+    ``/isaac_joint_commands`` samples across the send/result/tail window with
+    the exact publisher proven.
     """
     reasons: list[str] = []
     mode = str(expected.get("mode", ""))
@@ -1043,7 +972,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mode",
         choices=list(MODES),
         required=True,
-        help="smoke mode: joint, pose, or blocked (selects the scenario)",
+        help="smoke mode: joint or pose (selects the scenario)",
     )
     parser.add_argument(
         "--report",

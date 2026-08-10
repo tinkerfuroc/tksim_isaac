@@ -56,6 +56,17 @@ JOINT_TARGET_TOLERANCES: Mapping[str, float] = {
 # box, keeping goal sampling collision-free in the free-space scenarios.
 POSE_APPROACH_Z_OFFSET = 0.10
 
+# Overhead z-down approach quaternion (Rz45*Rx180, sign-equivalent accepted)
+# applied to generated pose goals so the TCP approaches the target from above
+# instead of pointing at the collision-box center.  The fixture declaration
+# stays yaw-only; only the generated goals carry this orientation.
+POSE_APPROACH_QUATERNION_XYZW: Tuple[float, float, float, float] = (
+    0.9238795,
+    0.3826834,
+    0.0,
+    0.0,
+)
+
 
 @dataclass(frozen=True)
 class JointGoal:
@@ -267,6 +278,7 @@ __all__ = [
     "JOINT_TARGET_TOLERANCES",
     "PIPELINE_ID",
     "PLAN_ONLY",
+    "POSE_APPROACH_QUATERNION_XYZW",
     "POSE_APPROACH_Z_OFFSET",
     "JointGoal",
     "PoseGoal",

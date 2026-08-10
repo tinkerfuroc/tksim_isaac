@@ -225,6 +225,35 @@ class ScenarioRunner(Node):
             + failures[-1]
         )
 
+    def _call_state(self, request):
+        """Retry ``/set_simulation_state`` within a finite bounded budget.
+
+        F5 (round 2): a transient startup race (the previous scenario still
+        tearing down, or the controller-switch stall) can make the service call
+        time out — the live cancel run died on ``standard service timed out:
+        /set_simulation_state``.  The state transition is idempotent once the
+        server is responsive, so retry exactly like the initial reset instead of
+        letting the whole scenario_runner process die.
+        """
+        failures = []
+        for attempt in range(1, self.reset_attempts + 1):
+            try:
+                return self.call(self._state, request)
+            except _RetryableServiceError as exc:
+                failures.append(str(exc))
+                if attempt == self.reset_attempts:
+                    break
+                self.get_logger().warning(
+                    f"set_simulation_state attempt {attempt}/{self.reset_attempts} "
+                    f"did not complete: {exc}; retrying"
+                )
+                if self.reset_retry_delay_s:
+                    time.sleep(self.reset_retry_delay_s)
+        raise RuntimeError(
+            f"set_simulation_state failed after {self.reset_attempts} attempts: "
+            + failures[-1]
+        )
+
     def execute(self, operations) -> list[dict[str, object]]:
         results = []
         for index, operation in enumerate(operations):
@@ -276,7 +305,7 @@ class ScenarioRunner(Node):
                 if state not in allowed_states:
                     raise RuntimeError(f"unsupported scenario simulation state: {state}")
                 request.state = SimulationState(state=state)
-                self.call(self._state, request)
+                self._call_state(request)
             else:
                 raise RuntimeError(f"unsupported standard operation: {operation.kind}")
             result = {"operation": operation.kind, "accepted": True}

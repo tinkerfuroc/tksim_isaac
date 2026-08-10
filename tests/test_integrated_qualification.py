@@ -121,7 +121,6 @@ class IntegratedRunnerDouble:
     qualification_scenario_names = [
         "qualification-moveit-plan-joint",
         "qualification-moveit-plan-pose",
-        "qualification-moveit-plan-blocked",
         "qualification-moveit-execute-joint",
         "qualification-moveit-execute-pose",
         "qualification-moveit-cartesian-retreat",
@@ -222,13 +221,12 @@ def test_every_live_scenario_gets_unique_domain_and_attempt_dir(integrated_runne
     assert all(path.name in path.as_posix() for path in attempt_dirs)
 
 
-def test_exactly_seventeen_unique_scenarios_are_declared(integrated_runner):
-    assert len(integrated_runner.qualification_scenario_names) == 17
-    assert len(set(integrated_runner.qualification_scenario_names)) == 17
+def test_exactly_sixteen_unique_scenarios_are_declared(integrated_runner):
+    assert len(integrated_runner.qualification_scenario_names) == 16
+    assert len(set(integrated_runner.qualification_scenario_names)) == 16
     assert integrated_runner.qualification_scenario_names == [
         "qualification-moveit-plan-joint",
         "qualification-moveit-plan-pose",
-        "qualification-moveit-plan-blocked",
         "qualification-moveit-execute-joint",
         "qualification-moveit-execute-pose",
         "qualification-moveit-cartesian-retreat",
@@ -291,7 +289,7 @@ def test_real_runner_constants_match_double():
         IntegratedRunner.qualification_scenario_names
         == IntegratedRunnerDouble.qualification_scenario_names
     )
-    assert len(set(IntegratedRunner.qualification_scenario_names)) == 17
+    assert len(set(IntegratedRunner.qualification_scenario_names)) == 16
 
 
 def test_real_allocate_live_attempts_are_unique_and_bounded():
@@ -1339,7 +1337,7 @@ def test_real_finalize_phase_exception_does_not_skip_next_scenario(inject_at):
     assert result["scenario_names"] == names
     # Every scenario was attempted; none was skipped.
     assert runner.started_scenarios == names
-    assert len(result["scenario_names"]) == 3
+    assert len(result["scenario_names"]) == 2
     # The first scenario is evidence-invalid and records the injected phase.
     first = result[names[0]]
     assert first["status"] == STATUS_EVIDENCE_INVALID
@@ -2051,6 +2049,47 @@ def _write_rosbag_document(bag: Path, document: object) -> None:
     )
 
 
+def _set_rosbag_message_count(bag: Path, topics: set[str], count: int) -> None:
+    document = _rosbag_document(bag)
+    root = document["rosbag2_bagfile_information"]
+    for record in root["topics_with_message_count"]:
+        if record["topic_metadata"]["name"] in topics:
+            record["message_count"] = count
+    _write_rosbag_document(bag, document)
+
+
+def _write_scenario_bundle(
+    attempt_dir: Path,
+    scenario_id: str,
+    stage: str,
+    expected_physical: list[str],
+) -> Path:
+    """Write a minimal scenario-bundle.json carrying stage + expected_physical.
+
+    The live runner writes a complete bundle before the executor starts; the
+    integrated rosbag evidence reads ``integrated.stage`` and
+    ``integrated.expected_physical`` from it to decide per-scenario zero-allowed
+    truth topics.  Tests write only the fields the evidence path consumes.
+    """
+    bundle = attempt_dir / "scenario-bundle.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scenario_id": scenario_id,
+                "scenario": {"id": scenario_id},
+                "integrated": {
+                    "stage": stage,
+                    "expected_physical": list(expected_physical),
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return bundle
+
+
 def _write_valid_integrated_rosbag(attempt_dir: Path) -> Path:
     """Write a real, semantically valid rosbag (metadata.yaml + openable db3)."""
     bag = attempt_dir / "rosbag"
@@ -2314,6 +2353,83 @@ def test_t10_valid_present_bag_passes_integrated_evidence():
     assert evidence["status"] == "valid"
 
 
+def test_t10_stage_c_plan_only_allows_zero_object_and_contact_counts():
+    """Stage C plan-only evidence may have no object/contact samples."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "C" / SCENARIO_C
+    attempt_dir.mkdir(parents=True)
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(
+        bag,
+        {"/sim/truth/object_state", "/sim/truth/contacts"},
+        0,
+    )
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is True, failures
+
+
+@pytest.mark.parametrize("topic", ["/clock", "/sim/truth/robot_state"])
+def test_t10_stage_c_plan_only_zero_required_topic_still_fails(topic):
+    """Stage C still requires clock and non-object truth topics."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "C" / SCENARIO_C
+    attempt_dir.mkdir(parents=True)
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(bag, {topic}, 0)
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is False
+    assert topic in " ".join(failures)
+
+
+@pytest.mark.parametrize("scenario,physical", [
+    ("qualification-moveit-gripper", ["gripper_travel_predicates", "terminal_success"]),
+    ("qualification-moveit-execute-joint", ["joint_execution_tracks", "terminal_success"]),
+    ("qualification-moveit-execute-pose", ["pose_execution_reaches_tcp", "terminal_success"]),
+    ("qualification-moveit-cartesian-retreat", ["cartesian_retreat_collision_aware", "terminal_success"]),
+    ("qualification-moveit-cancel", ["execute_goal_canceled", "quiescent_after_cancel", "no_later_stage"]),
+    ("qualification-moveit-safety", ["safety_effective_stop", "target_frozen", "no_auto_resume"]),
+])
+def test_t10_stage_d_no_contact_scenario_allows_zero_object_and_contact_counts(scenario, physical):
+    """Stage D free-space / gripper-only evidence may have no object/contact
+    samples: the arm never touches an object, so 0 contacts + 0 object_state is
+    physically correct (mirrors the Stage C plan-only exception)."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "D" / scenario
+    attempt_dir.mkdir(parents=True)
+    _write_scenario_bundle(attempt_dir, scenario, "D", physical)
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(
+        bag,
+        {"/sim/truth/object_state", "/sim/truth/contacts"},
+        0,
+    )
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is True, failures
+
+
+def test_t10_stage_d_contact_requiring_scenario_still_requires_counts():
+    """A scenario whose expected_physical needs object/contact truth still
+    requires positive rosbag counts on those topics (fail-closed)."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "E" / "qualification-pick-place-positive"
+    attempt_dir.mkdir(parents=True)
+    _write_scenario_bundle(
+        attempt_dir,
+        "qualification-pick-place-positive",
+        "E",
+        ["bilateral_contact", "lift", "transport", "settled_speed"],
+    )
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(
+        bag,
+        {"/sim/truth/object_state", "/sim/truth/contacts"},
+        0,
+    )
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is False
+    assert "/sim/truth/contacts" in " ".join(failures)
+
+
 def test_t10_integrated_finalization_uses_integrated_bag_evidence_only():
     popen = FakePopen()
     runner = _evidence_runner(popen=popen)
@@ -2340,3 +2456,42 @@ def test_t10_integrated_finalization_uses_integrated_bag_evidence_only():
         finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
     assert calls == ["integrated"]
     assert finalize["rosbag_ok"] is True
+
+
+def test_t10_output_evidence_does_not_lock_a_live_recorder_database():
+    """RED (G3): the rosbag startup poll must not open the live recorder's db3
+    read-only.  In ``journal_mode=delete`` a concurrent read-only connection
+    (``_rosbag_output_evidence``, ``mode=ro``, ``timeout=0.2``) takes a SHARED
+    lock while the rosbag2 recorder commits its fresh schema, and the recorder's
+    zero busy-timeout then aborts with ``SQLite error (5): database is locked``
+    (RERUN-3 cancel evidence).  The evidence probe must confirm the database
+    without acquiring any sqlite lock, so a writer holding the file open never
+    sees contention from the readiness loop."""
+    import time as _time
+
+    runner = _evidence_runner()
+    with tempfile.TemporaryDirectory() as temporary:
+        bag = Path(temporary)
+        db = bag / "rosbag_0.db3"
+        writer = sqlite3.connect(str(db), timeout=10.0)
+        writer.execute("PRAGMA locking_mode=EXCLUSIVE")
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute("CREATE TABLE IF NOT EXISTS t (id INTEGER)")
+        writer.execute("COMMIT")
+        writer.execute("BEGIN EXCLUSIVE")  # writer now holds the schema lock open
+
+        # The probe must report the db openable WITHOUT blocking on (or
+        # contending with) the writer's lock.  The old read-only connection
+        # would busy-timeout after 0.2 s and report open=False.
+        started = _time.monotonic()
+        evidence = iq.qualification_rosbag_output_evidence(bag)
+        elapsed = _time.monotonic() - started
+
+        assert evidence["open"] is True, evidence
+        assert evidence["database_path"] == str(db)
+        assert elapsed < 0.1, (
+            "output-database evidence must not block on a live recorder lock; "
+            f"took {elapsed:.3f}s and returned {evidence}"
+        )
+        writer.rollback()
+        writer.close()

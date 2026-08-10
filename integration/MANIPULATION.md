@@ -251,7 +251,7 @@ The contract records, with exact values:
 - **Provider manifest.**  The committed
   `ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json` is
   recorded verbatim with its canonical self-hash
-  `4bc177890393b5b6d434e17aed3dc85889e55efce7cb9874a6d4c4575bc1362b` and the
+  `92e3aad9b4d45c0583c32fac17fae1c4f5aec432d224c790d7ccd96482a9afe9` and the
   raw-byte digest.  Persistent nodes, one-shot processes/lifecycle, logical
   controller resources, and publishers are distinct sections and are never
   collapsed.
@@ -360,6 +360,18 @@ live manipulation pass to report. MoveIt and cuMotion remain deferred until
 the FJT, safety, gripper/contact, collision, and retention gates are backed by
 raw physics evidence. Vision, decision, and VLA are also deferred until that
 manipulation core is qualified.
+
+## Known issues
+
+- 2026-08-09 (Stage D qualification-moveit-cancel): the cancel scenario
+  (`qualification-moveit-cancel`) does not pass live.  The `run_cancel_sequence`
+  arbitration intermittently takes ~9.4 s (goal-time abort at ~9.39 s wins the
+  race by ~20 ms, `cancel_response` return_code 3).  The safety scenario runs
+  the identical presend + FJT-executing/motion-trigger waits in ~1.8 s, so the
+  stall is intermittent.  **Deferred by decision: cancellation semantics are
+  not required for the current OMPL-goal.**  The scenario remains in the suite
+  and is tracked as a known issue, not a Stage-D blocking gate for the
+  OMPL/cuMotion integration goal.
 
 ## Integrated OMPL qualification CLI (Task 10)
 
@@ -491,6 +503,11 @@ Truthful scope:
 - cuMotion remains prohibited until Task 37's live OMPL qualification passes.
 
 ## Changelog
+
+- 2026-08-09: Recorded the Stage-D `qualification-moveit-cancel` scenario as a
+  deferred known issue (intermittent ~9.4 s cancel arbitration vs ~9.39 s
+  goal-time abort).  Cancellation semantics are out of scope for the current
+  OMPL-goal; the scenario remains tracked, not blocking.
 
 - 2026-08-05 (integrated qualification Task 10 — "document integrated
   qualification CLI"): Documented the offline integrated OMPL qualification

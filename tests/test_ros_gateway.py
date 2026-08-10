@@ -27,6 +27,7 @@ class _SnapshotBackend:
         self.pending_count = 0
         self.pending_index = 0
         self.begin_calls: list[int] = []
+        self._contact_pairs: list[dict[str, str]] = []
 
     def set_safety_stop(self, active: bool) -> None:
         self.safety_stopped = bool(active)
@@ -34,6 +35,14 @@ class _SnapshotBackend:
             self.pending.clear()
             self.pending_count = 0
             self.pending_index = 0
+
+    def contact_pairs(self) -> list[dict[str, str]]:
+        return list(self._contact_pairs)
+
+    def arm_scenario_collision(self) -> bool:
+        from tinker_sim_isaac.backend import IsaacWholeRobotBackend
+
+        return IsaacWholeRobotBackend.is_arm_scenario_collision(self.contact_pairs())
 
     def begin_command_snapshot(self, snapshot: int) -> None:
         from tinker_sim_core.command_mux import decode_snapshot_packet
@@ -318,6 +327,170 @@ class RosGatewayOrderingTest(unittest.TestCase):
         self.assertEqual(gateway._last_snapshot_packet_index, 3)
         self.assertEqual(backend.command_count, 3)
         self.assertEqual(backend.stop_calls[-2:], [True, False])
+
+
+class CollisionHeartbeatTest(unittest.TestCase):
+    """RED: collision must keep publishing while Isaac is paused.
+
+    /sim/safety/collision is the supervisor's required source with a 1.0s
+    deadline.  The physics-tick publish() is gated by is_playing(); on the
+    first cold start the timeline is still paused (world load/spawn) so the
+    collision source goes stale >1s, the supervisor asserts stop, and it
+    issues a STRICT deactivate of the freshly-activated trajectory controller
+    that the controller manager cannot satisfy — the joint-scenario
+    controller-switch storm.  A pause-independent wall-clock heartbeat must
+    keep the collision Bool fresh regardless of the timeline state.
+    """
+
+    def _gateway_with_capture(self, backend: _SnapshotBackend):
+        gateway = _gateway(backend)
+        gateway._Bool = _TestBool
+        gateway.collision_pub = _CollisionCapture()
+        return gateway
+
+    def test_heartbeat_publishes_false_when_no_collision(self) -> None:
+        backend = _SnapshotBackend()
+        gateway = self._gateway_with_capture(backend)
+        gateway.collision_pub.captured.clear()
+
+        gateway.publish_safety_heartbeat()
+
+        self.assertEqual(
+            gateway.collision_pub.captured,
+            [False],
+            "pause-independent heartbeat must publish the collision Bool",
+        )
+
+    def test_heartbeat_publishes_true_when_arm_touches_scenario(self) -> None:
+        backend = _SnapshotBackend()
+        backend._contact_pairs = [
+            {
+                "body_a": "/World/Tinker/link1",
+                "body_b": "/World/Scenario/sim_fixture/public_target",
+            }
+        ]
+        gateway = self._gateway_with_capture(backend)
+
+        gateway.publish_safety_heartbeat()
+
+        self.assertEqual(
+            gateway.collision_pub.captured,
+            [True],
+            "arm/scenario contact must surface as an active collision sample",
+        )
+
+    def test_heartbeat_ignores_arm_arm_contact(self) -> None:
+        backend = _SnapshotBackend()
+        backend._contact_pairs = [
+            {"body_a": "/World/Tinker/link_tcp", "body_b": "/World/Tinker/link7"}
+        ]
+        gateway = self._gateway_with_capture(backend)
+
+        gateway.publish_safety_heartbeat()
+
+        self.assertEqual(gateway.collision_pub.captured, [False])
+
+
+class _CollisionCapture:
+    """Stand-in for the gateway's rclpy collision publisher."""
+
+    def __init__(self) -> None:
+        self.captured: list[bool] = []
+
+    def publish(self, message: object) -> None:
+        self.captured.append(bool(message.data))
+
+
+class _TestBool:
+    """Minimal stand-in for std_msgs/msg/Bool used by object.__new__ harness."""
+
+    def __init__(self) -> None:
+        self.data = False
+
+
+class _CloudBackend:
+    """Minimal backend for the development-lidar publish path."""
+
+    def __init__(self, occupancy: object | None) -> None:
+        self.occupancy = occupancy
+        self.root_state_calls = 0
+
+    def root_state(self) -> dict[str, object]:
+        self.root_state_calls += 1
+        return {
+            "position": [0.0, 0.0, 0.0],
+            "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+        }
+
+
+def _cloud_gateway(*, development_lidar: bool, occupancy: object | None) -> RosStandardGateway:
+    from builtin_interfaces.msg import Time  # type: ignore[import-untyped]
+    from sensor_msgs.msg import PointCloud2, PointField  # type: ignore[import-untyped]
+
+    gateway = object.__new__(RosStandardGateway)
+    gateway.backend = _CloudBackend(occupancy)
+    gateway.development_lidar = development_lidar
+    gateway._tick = 0
+    gateway._lidar_stride = 1
+    gateway._PointCloud2 = PointCloud2
+    gateway._PointField = PointField
+    gateway._stamp = lambda: Time(sec=0, nanosec=0)
+    return gateway
+
+
+def _cloud_stamp() -> object:
+    from builtin_interfaces.msg import Time  # type: ignore[import-untyped]
+
+    return Time(sec=0, nanosec=0)
+
+
+class RosDevelopmentLidarTest(unittest.TestCase):
+    def test_development_lidar_publishes_without_occupancy(self) -> None:
+        """RED (R2): the development lidar cloud must publish even when the
+        backend has no occupancy map.  Live rerun-5 raised
+        ``environment_cloud_provider raised: no live environment PointCloud2 is
+        available`` because the observer received zero ``/livox/lidar`` clouds;
+        the cloud-publish gate hard-required ``backend.occupancy is not None``
+        (manipulation-core qualification has no PGM map), so the dev lidar never
+        fired.  The gate must not depend on occupancy, and
+        ``_development_point_cloud`` must emit a non-empty finite cloud from a
+        deterministic fallback."""
+        gateway = _cloud_gateway(development_lidar=True, occupancy=None)
+        self.assertTrue(
+            gateway._cloud_publish_enabled(),
+            "development lidar must publish without an occupancy map",
+        )
+        cloud = gateway._development_point_cloud(_cloud_stamp())
+        self.assertGreaterEqual(
+            cloud.width, 1, "development cloud must be non-empty when occupancy is None"
+        )
+        self.assertEqual(cloud.height, 1)
+        self.assertTrue(cloud.is_dense)
+        self.assertGreaterEqual(len(cloud.data), 12, "non-empty cloud must carry point data")
+
+    def test_development_lidar_uses_occupancy_raycast_when_present(self) -> None:
+        """The occupancy raycast path stays the primary source when a map exists."""
+        from tinker_sim_core.occupancy import OccupancyMap
+
+        occ = OccupancyMap(4, 4, 1.0, -2.0, -2.0, ((True, True, True, True),) * 4)
+        gateway = _cloud_gateway(development_lidar=True, occupancy=occ)
+        cloud = gateway._development_point_cloud(_cloud_stamp())
+        self.assertGreaterEqual(cloud.width, 1)
+
+    def test_cloud_disabled_without_development_lidar(self) -> None:
+        gateway = _cloud_gateway(development_lidar=False, occupancy=None)
+        self.assertFalse(
+            gateway._cloud_publish_enabled(),
+            "cloud must not publish when the development lidar flag is off",
+        )
+
+    def test_cloud_publish_gate_respects_stride(self) -> None:
+        gateway = _cloud_gateway(development_lidar=True, occupancy=None)
+        gateway._tick = 1
+        gateway._lidar_stride = 2
+        self.assertFalse(gateway._cloud_publish_enabled())
+        gateway._tick = 2
+        self.assertTrue(gateway._cloud_publish_enabled())
 
 
 if __name__ == "__main__":

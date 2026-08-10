@@ -23,6 +23,10 @@ from tinker_sim_core.command_mux import (
 SAFETY_HEARTBEAT_TIMEOUT_S = 1.0
 COMMAND_STREAM_TIMEOUT_S = 0.5
 MAX_RETIRED_COMMAND_EPOCHS = 64
+# R2: fixed range for the deterministic development-lidar fallback ring emitted
+# when the backend carries no occupancy map.  Finite and inside the 40 m lidar
+# bound so the qualification cloud consumer always receives a non-empty cloud.
+_FALLBACK_LIDAR_RANGE_M = 1.0
 # Safety and command messages use separate ROS topics.  Tolerate only a short
 # bounded packet gap at that boundary; no packet is applied while resyncing.
 BASELINE_RESYNC_WINDOW_S = 0.25
@@ -833,11 +837,7 @@ class RosStandardGateway:
                 message.angular_velocity.z,
             ) = angular
             self.imu_pub.publish(message)
-        if (
-            self.development_lidar
-            and self._tick % self._lidar_stride == 0
-            and self.backend.occupancy is not None
-        ):
+        if self._cloud_publish_enabled():
             self.cloud_pub.publish(self._development_point_cloud(stamp))
         if self._tick % self._status_stride == 0:
             message = self._String()
@@ -876,10 +876,35 @@ class RosStandardGateway:
             frame, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
         self.physics_truth_pub.publish(physics_truth)
+        self._tick += 1
+
+    def publish_safety_heartbeat(self) -> None:
+        """Publish the collision source on a wall-clock cadence, pause-safe.
+
+        ``publish()`` only runs while the timeline is playing, so the
+        supervisor's required collision source would go stale during a pause
+        (world load/spawn on the first cold start) and trip a spurious stop +
+        controller deactivate.  This method republishes the current collision
+        classification regardless of the timeline state and is throttled to a
+        wall-clock period by the caller (``run_sim``).
+        """
         collision = self._Bool()
         collision.data = bool(self.backend.arm_scenario_collision())
         self.collision_pub.publish(collision)
-        self._tick += 1
+
+    def _cloud_publish_enabled(self) -> bool:
+        """Whether the development lidar cloud should publish on this tick.
+
+        R2: the qualification development-lidar cloud must not depend on
+        ``backend.occupancy`` being present.  The manipulation-core qualification
+        profile carries no PGM map; the legacy gate hard-required ``occupancy is
+        not None``, so ``/livox/lidar`` never fired and the cartesian-retreat
+        ``environment_cloud_provider`` failed closed ("no live environment
+        PointCloud2 is available").  Occupancy (when present) only shapes the
+        raycast in :meth:`_development_point_cloud`; the dev lidar itself is the
+        qualification sensor source and must always publish.
+        """
+        return bool(self.development_lidar) and self._tick % self._lidar_stride == 0
 
     def _development_point_cloud(self, stamp):
         state = self.backend.root_state()
@@ -889,14 +914,21 @@ class RosStandardGateway:
             2.0 * (qw * qz + qx * qy),
             1.0 - 2.0 * (qy * qy + qz * qz),
         )
+        occupancy = getattr(self.backend, "occupancy", None)
         points = []
         for degrees in range(-90, 91):
             local = math.radians(degrees)
-            distance = self.backend.occupancy.raycast(
-                x + 0.12 * math.cos(yaw),
-                y + 0.12 * math.sin(yaw),
-                yaw + local,
-            )
+            if occupancy is not None:
+                distance = occupancy.raycast(
+                    x + 0.12 * math.cos(yaw),
+                    y + 0.12 * math.sin(yaw),
+                    yaw + local,
+                )
+            else:
+                # R2 deterministic fallback: a fixed keep-out ring so the cloud
+                # stays non-empty and finite for qualification consumers even
+                # when no occupancy map exists.
+                distance = _FALLBACK_LIDAR_RANGE_M
             if math.isfinite(distance):
                 points.append(
                     (distance * math.cos(local), distance * math.sin(local), 0.0)

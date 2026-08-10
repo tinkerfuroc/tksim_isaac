@@ -700,6 +700,67 @@ def test_graph_wrong_offered_qos_rejected():
         validate_graph_evidence(graph)
 
 
+def test_graph_non_move_group_publisher_planning_scene_input_accepted():
+    """RED: /planning_scene published by a non-/move_group node with no offered QoS.
+
+    Live MoveIt2 shows ``pick_and_place``'s internal ``pick_place_group_node``
+    publishing /planning_scene (via PlanningSceneInterface/MoveGroupInterface);
+    no /move_group publisher exists so the observed ``offered_qos`` is ``{}``.
+    The journal validator must accept ANY nonempty publisher set with
+    ``offered_qos=={}`` on /planning_scene (the requested QoS stays strict
+    RELIABLE/VOLATILE/depth 100) and preserve both the publisher and the empty
+    offered QoS.  The same input-only exception covers /monitored_planning_scene
+    (see test_graph_monitored_planning_scene_no_publisher_input_accepted).
+    """
+    graph = _valid_graph()
+    graph["topics"]["/planning_scene"]["publishers"] = [
+        {"node": "/pick_place_group_node", "node_namespace": ""}
+    ]
+    graph["topics"]["/planning_scene"]["offered_qos"] = {}
+
+    validated = validate_graph_evidence(graph)
+    entry = validated["topics"]["/planning_scene"]
+    assert entry["publishers"] == [
+        {"node": "/pick_place_group_node", "node_namespace": ""}
+    ]
+    assert entry["offered_qos"] == {}
+    assert entry["requested_qos"] == {
+        "reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100,
+    }
+
+    # Negative: /monitored_planning_scene still requires nonempty publisher
+    # metadata and exact QoS.
+    graph = _valid_graph()
+    graph["topics"]["/monitored_planning_scene"]["publishers"] = []
+    with pytest.raises(ValueError, match="endpoint"):
+        validate_graph_evidence(graph)
+
+
+def test_graph_monitored_planning_scene_no_publisher_input_accepted():
+    """RED: /monitored_planning_scene with NO publisher and empty offered QoS.
+
+    Live move_group in this production launch does NOT publish
+    /monitored_planning_scene: ``build_tinker_ompl_config`` sets no
+    planning_scene_monitor/publish_planning_scene/monitored topic, and the
+    authoritative provider-manifest publishers list omits it.  The executor
+    still subscribes to it (journal recorder), so it is a subscribed input like
+    /planning_scene.  The validator must accept the honest empty offered_qos
+    with an empty publisher set (requested QoS stays strict
+    RELIABLE/VOLATILE/depth 100), never fabricating the monitored topic's QoS.
+    """
+    graph = _valid_graph()
+    graph["topics"]["/monitored_planning_scene"]["publishers"] = []
+    graph["topics"]["/monitored_planning_scene"]["offered_qos"] = {}
+
+    validated = validate_graph_evidence(graph)
+    entry = validated["topics"]["/monitored_planning_scene"]
+    assert entry["publishers"] == []
+    assert entry["offered_qos"] == {}
+    assert entry["requested_qos"] == {
+        "reliability": "RELIABLE", "durability": "VOLATILE", "depth": 100,
+    }
+
+
 def test_graph_fixture_keeps_transient_local_depth_1():
     """F2.3: the fixture status topic stays RELIABLE/TRANSIENT_LOCAL/depth 1."""
     graph = _valid_graph()
@@ -756,9 +817,22 @@ def test_graph_fixture_wrong_publisher_source_rejected():
 
 
 def test_graph_missing_publisher_metadata_rejected():
+    # Both PlanningScene topics may honestly be subscribed inputs
+    # (publishers=[] with offered_qos={}) when move_group does not publish them
+    # live.  The load-bearing strictness guarantee is that requested QoS stays
+    # exact and that a present-but-wrong offered QoS on a PlanningScene topic
+    # still fails closed.
     graph = _valid_graph()
-    graph["topics"]["/planning_scene"]["publishers"] = []
-    with pytest.raises(ValueError, match="endpoint"):
+    graph["topics"]["/planning_scene"]["offered_qos"] = {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(graph)
+    graph = _valid_graph()
+    graph["topics"]["/monitored_planning_scene"]["offered_qos"] = {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    with pytest.raises(ValueError, match="QoS"):
         validate_graph_evidence(graph)
 
 

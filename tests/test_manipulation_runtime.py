@@ -1710,9 +1710,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(
             [resolved[name] for name in joint_names],
-            [50.0, 50.0, 30.0, 50.0, 30.0, 20.0, 20.0],
-            "arm effort_limit_sim must raise only joint4 from the inherited 30 Nm to "
-            "50 Nm and preserve the existing tiers (j1-2:50, j3:30, j5:30, j6-7:20)",
+            [100.0, 100.0, 30.0, 50.0, 30.0, 20.0, 20.0],
+            "arm effort_limit_sim must provide 100 Nm shoulder authority for the "
+            "measured 60-90 Nm grasp coupling load while preserving the elbow and "
+            "distal tiers (j3:30, j4:50, j5:30, j6-7:20)",
         )
 
     def test_gripper_actuator_drives_only_drive_joint_and_mimics_are_passive(self) -> None:

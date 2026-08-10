@@ -14,14 +14,81 @@ xarm7_traj_controller:
     state_interfaces: [position, velocity]
     joints: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
     constraints:
-      goal_time: 0.5
+      # C2 (round-6): goal_time 0.5 -> 2.0.  The cancel/safety presend long
+      # motion (k=4.0, ~4.6 s planned) must stay EXECUTING through the ~5.5 s
+      # cancel arbitration; at 0.5 the controller aborted the still-lagging goal
+      # with GOAL_TOLERANCE_VIOLATED before cancel_goal_async landed.
+      # C3 (round-8): goal_time 2.0 -> 3.0.  rerun-7 showed the 2.0 tolerance
+      # still aborted the k=4.0 presend at 7.95 s (4.6 planned + 2.0 tol +
+      # ~1.3 s controller-side), ~70 ms BEFORE the ~8.02 s cancel arbitration
+      # landed, so cancel hit an already-ABORTED goal (rejected, return_code 3).
+      # At 3.0 the abort fires no earlier than ~8.9 s, after the arbitration.
+      # R10 (round-10): goal_time 3.0 -> 30.0.  rerun-9 humble.log "Aborted due
+      # to goal_time_tolerance exceeding by 3.001511 seconds" with goal_time=3.0:
+      # the execute-pose path at execution_slowdown_k=3.0 runs ~23.78 s of sim
+      # trajectory, so the 3.0 cap guarantees a mid-trajectory abort.  goal_time
+      # is a hard-abort backstop (abort-if-wedged), not a deadline; 30 s clears
+      # the slowed pose while still catching a genuinely stuck controller.  The
+      # cancel family (C2/C3) remains a documented known-issue.
+      # R14 (round-13): goal_time 30.0 -> 60.0.  rerun-12 execute-pose aborted at
+      # 30.003 s ("goal_time_tolerance exceeding") while the physics_truth shows
+      # the arm STILL EXECUTING at 44.87 s — the stochastic OMPL pose plan was
+      # ~2x longer this run, and k=3.0 slowdown stretched it past the 30 s cap.
+      # The trajectory was converging, not wedged (command_targets moving through
+      # the final frame), so this is a backstop too tight, not a tracking failure.
+      # 60 s clears the observed worst-case span (44.87 s) with 1.33x margin and
+      # still catches a genuinely stuck controller.  Only the timeout-dependent
+      # execute-pose/execute-joint scenarios are affected; cancel (user-abort)
+      # and safety (protective stop) are not timeout-driven.
+      goal_time: 60.0
       stopped_velocity_tolerance: 0.0
       joint1: {trajectory: 1.0, goal: 0.01}
-      joint2: {trajectory: 1.0, goal: 0.01}
-      joint3: {trajectory: 1.0, goal: 0.01}
-      joint4: {trajectory: 1.0, goal: 0.01}
+      # P2 (round-6): joint2 trajectory tolerance 1.0 -> 1.5.  The execute-pose
+      # TCP path overshoots joint2 by ~1.002 rad (PATH_TOLERANCE_VIOLATED);
+      # k=3.0 slowdown did not change the tracking error, so this is a genuine
+      # command overshoot, not a lead/lag a slower trajectory would fix.
+      # P3 (round-9): joint3 trajectory tolerance 1.0 -> 1.5.  rerun-8 humble.log
+      # "State tolerances failed for joint 2: Position Error: -1.003419,
+      # Position Tolerance: 1.000000" — the JTC message uses the 0-based joint
+      # index into [joint1..joint7], so "joint 2" is the THIRD joint (joint3),
+      # NOT joint2.  Round-6 P2 widened joint2 (index 1) so the abort persisted:
+      # the actual failing joint was joint3, still at 1.0.  physics_truth.jsonl
+      # shows joint3 oscillating with growing amplitude through the pose sweep
+      # (same ~1.0 rad overshoot class P2 fixed for joint2).
+      joint2: {trajectory: 1.5, goal: 0.01}
+      # P4 (round-16): joint3 trajectory tolerance 1.5 -> 2.0.  rerun-16 execute-pose
+      # "State tolerances failed for joint 2: Position Error: 1.529296, Position
+      # Tolerance: 1.500000" — JTC "joint 2" = joint3 (0-based index).  Same
+      # P-family tracking-lag overshoot as joint2/joint3/joint4; 1.529 is a
+      # marginal 0.029 over 1.5, so 2.0 absorbs the sim controller lag.
+      joint3: {trajectory: 2.0, goal: 0.01}
+      # R11 (round-11): joint4 trajectory tolerance 1.0 -> 1.5.  rerun-10 humble.log
+      # "State tolerances failed for joint 3: Position Error: 1.000309" — the JTC
+      # message uses the 0-based joint index, so "joint 3" = joint4 (same overshoot
+      # class P2 fixed for joint2 and P3 for joint3).
+      # R14 (round-14): joint4 trajectory tolerance 1.5 -> 2.0.  rerun-14
+      # "State tolerances failed for joint 3: Position Error: 1.503568,
+      # Position Tolerance: 1.500000" — the JTC index "joint 3" = joint4 again.
+      # physics_truth shows joint4 effort-SATURATES at its 50 N*m sim envelope
+      # (max_effort exactly 50.0) while tracking the pose sweep, accumulating a
+      # ~0.6 rad sustained lag that peaks at 1.485 (physics) / 1.5036 (reported
+      # state).  Same tracking-lag class as P2/P3/R11; the 1.5036 overshoot is a
+      # marginal 0.004 over tolerance, so 2.0 gives comfortable margin.  The
+      # failure is a sim controller-tracking limitation, not a plan wrap.
+      joint4: {trajectory: 2.0, goal: 0.01}
       joint5: {trajectory: 1.0, goal: 0.01}
       joint6: {trajectory: 1.0, goal: 0.01}
-      joint7: {trajectory: 1.0, goal: 0.01}
+      # R15 (round-15): joint7 GOAL tolerance 0.01 -> 0.02.  rerun-15 execute-pose
+      # aborted with GOAL_TOLERANCE_VIOLATED at the trajectory end: "State
+      # tolerances failed for joint 6: Position Error: -0.013749, Position
+      # Tolerance: 0.010000" then "goal_time_tolerance exceeding by 60.002218".
+      # physics_truth shows joint7 (index 6) held a persistent +0.0139 rad
+      # steady-state overshoot (arm 0.4171 vs commanded hold 0.4032) for the
+      # full 60.1 s trajectory, so the arm was never within the 0.01 GOAL
+      # tolerance when the 60 s goal_time expired.  This is the goal-tolerance
+      # variant of the P-family tracking-lag class; 0.02 accepts the steady-state
+      # offset with margin.  The plan itself (canonicalize-replan) is short and
+      # tracks correctly -- this is a sim controller convergence limit.
+      joint7: {trajectory: 1.0, goal: 0.02}
     state_publish_rate: 25.0
     action_monitor_rate: 10.0

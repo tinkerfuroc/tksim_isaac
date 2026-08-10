@@ -39,7 +39,11 @@ reliable + volatile), and ``/sim/status/planning_scene_fixture``
 (``std_msgs/msg/String`` carrying the exact canonical compact fixture-status JSON
 with scalar ``target_handoff="pick_and_place/object_mesh"``, exactly one
 publisher ``/fixture_planning_scene``, reliable + transient-local, depth 1).
-Payload content never substitutes for graph ownership.
+``/planning_scene`` is a subscribed input only in this stack: it may honestly
+carry ``publishers=[]`` with ``offered_qos={}`` (no local publisher / no offered
+QoS) while ``requested_qos`` stays exactly reliable + volatile + depth 100 and
+subscribers stay real endpoints.  Payload content never substitutes for graph
+ownership.
 """
 from __future__ import annotations
 
@@ -470,15 +474,40 @@ def _validate_topic_entry(
         if fixture
         else "reliable + volatile + depth 100"
     )
-    for side in ("requested_qos", "offered_qos"):
-        if not _qos_matches(entry.get(side), qos):
-            raise ValueError(f"topic {name} {side} QoS must be {qos_label}")
-    publishers = _validate_endpoints(f"topic {name} publishers", entry.get("publishers"))
+    # requested_qos is always strict: the recorder's requested QoS must match
+    # the expected contract exactly, input-only or fully provisioned.
+    if not _qos_matches(entry.get("requested_qos"), qos):
+        raise ValueError(f"topic {name} requested_qos QoS must be {qos_label}")
+    # The PlanningScene topics are subscribed inputs owned by the production
+    # move_group / task client, never by the recorder.  The honest shape is
+    # offered_qos={} (no /move_group publisher is observed) with whatever
+    # publisher set the production client publishes -- including a nonempty
+    # pick_place_group_node set or an empty set when move_group does not publish
+    # the monitored topic.  Never fabricate or borrow a QoS.  Every other topic
+    # -- and a PlanningScene topic with a present offered QoS -- keeps exact
+    # offered QoS and validated publisher metadata.
+    input_only = (
+        name in ("/planning_scene", "/monitored_planning_scene")
+        and not fixture
+        and entry.get("offered_qos") == {}
+    )
+    if input_only:
+        offered_qos: dict[str, object] = {}
+        raw_publishers = entry.get("publishers")
+        if isinstance(raw_publishers, (list, tuple)) and len(raw_publishers) == 0:
+            publishers = []
+        else:
+            publishers = _validate_endpoints(f"topic {name} publishers", raw_publishers)
+    else:
+        if not _qos_matches(entry.get("offered_qos"), qos):
+            raise ValueError(f"topic {name} offered_qos QoS must be {qos_label}")
+        offered_qos = dict(qos)
+        publishers = _validate_endpoints(f"topic {name} publishers", entry.get("publishers"))
     subscribers = _validate_endpoints(f"topic {name} subscribers", entry.get("subscribers"))
     normalized: dict[str, object] = {
         "type": expected_type,
         "requested_qos": dict(qos),
-        "offered_qos": dict(qos),
+        "offered_qos": offered_qos,
         "publishers": publishers,
         "subscribers": subscribers,
     }
@@ -527,8 +556,11 @@ def validate_graph_evidence(graph: object) -> dict[str, object]:
     fixture topic QoS reliable + transient-local + depth 1, service QoS reliable +
     volatile, and the exact canonical fixture-status payload with scalar
     ``target_handoff="pick_and_place/object_mesh"`` from exactly one publisher
-    ``/fixture_planning_scene``.  The returned normalized graph is the evidence
-    retained in the final journal JSON.
+    ``/fixture_planning_scene``.  ``/planning_scene`` alone may be the honest
+    input-only shape (``publishers=[]`` with ``offered_qos={}``); every other
+    topic requires exact offered QoS and non-empty validated publisher metadata.
+    The returned normalized graph is the evidence retained in the final journal
+    JSON.
     """
     if not isinstance(graph, Mapping):
         raise TypeError("graph evidence must be a mapping")

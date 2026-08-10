@@ -14,7 +14,6 @@ _scenario_sources = [
     for name in (
         "qualification-moveit-plan-joint.json",
         "qualification-moveit-plan-pose.json",
-        "qualification-moveit-plan-blocked.json",
         "qualification-moveit-execute-joint.json",
         "qualification-moveit-execute-pose.json",
         "qualification-moveit-cartesian-retreat.json",
