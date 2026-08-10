@@ -110,6 +110,11 @@ def _streaming_lock(root: Path) -> Path:
 
 def _launch(config: Config, args: argparse.Namespace) -> int:
     env = clean_isaac_environment(config, dds_profile=args.dds_profile)
+    if os.environ.get("TINKER_ACCEPT_OMNIVERSE_EULA") == "Y":
+        # Kit prompts interactively without these; headless launches would
+        # abort at EOF. Mirrors bootstrap.base_environment.
+        env["ACCEPT_EULA"] = "Y"
+        env["OMNI_KIT_ACCEPT_EULA"] = "YES"
     streaming = args.sensor_profile == "streaming"
     lock: Path | None = _streaming_lock(config.root) if streaming else None
     common = ["uv", "run", "--frozen", "--no-sync"]
