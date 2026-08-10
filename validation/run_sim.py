@@ -559,7 +559,11 @@ def main() -> int:
                 ),
                 flush=True,
             )
-            while running and app.is_running():
+            while (
+                running
+                and app.is_running()
+                and (args.duration <= 0.0 or world.current_time < args.duration)
+            ):
                 world.step(render=args.sensor_profile != "physics-only")
         else:
             raise RuntimeError(f"unsupported Isaac sensor profile: {args.sensor_profile}")
