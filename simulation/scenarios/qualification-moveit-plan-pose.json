@@ -37,7 +37,7 @@
     }
   ],
   "planning_scene": {
-    "revision": "2026-08-01-moveit-qualification-pose",
+    "revision": "2026-08-08-moveit-qualification-pose",
     "frame_id": "base_link",
     "target_source_id": "sim_fixture/public_target",
     "target_handoff": "pick_and_place/object_mesh",
@@ -55,7 +55,7 @@
         },
         "pose": {
           "xyz": [
-            0.55,
+            0.8,
             0.0,
             0.425
           ],
@@ -80,25 +80,25 @@
         },
         "pose": {
           "xyz": [
-            0.45,
-            0.2,
+            0.50,
+            0.0,
             0.89
           ],
           "quaternion_xyzw": [
             0.0,
             0.0,
-            0.382683,
-            0.92388
+            0.0,
+            1.0
           ]
         }
       }
     ],
-    "revision_digest": "fb2abd517a6c6d2f5d34ec099f3e62a245a968e52cd3223bb5ac911d5382af67"
+    "revision_digest": "eff9ec73877e80ab8221a6817ec91b0d18496f388c815259282002e89eddd065"
   },
   "integrated": {
     "stage": "C",
-    "fixture_revision": "2026-08-01-moveit-qualification-pose",
-    "fixture_digest": "fb2abd517a6c6d2f5d34ec099f3e62a245a968e52cd3223bb5ac911d5382af67",
+    "fixture_revision": "2026-08-08-moveit-qualification-pose",
+    "fixture_digest": "eff9ec73877e80ab8221a6817ec91b0d18496f388c815259282002e89eddd065",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {

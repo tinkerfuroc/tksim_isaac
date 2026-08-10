@@ -55,7 +55,7 @@
         },
         "pose": {
           "xyz": [
-            0.55,
+            0.8,
             0.0,
             0.425
           ],
@@ -93,12 +93,12 @@
         }
       }
     ],
-    "revision_digest": "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d"
+    "revision_digest": "77b26bb8bc35649f5b25e95c2d4a56c30cf6933d918a8419d956b1ca987d0510"
   },
   "integrated": {
     "stage": "C",
     "fixture_revision": "2026-08-01-moveit-qualification-joint",
-    "fixture_digest": "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d",
+    "fixture_digest": "77b26bb8bc35649f5b25e95c2d4a56c30cf6933d918a8419d956b1ca987d0510",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {

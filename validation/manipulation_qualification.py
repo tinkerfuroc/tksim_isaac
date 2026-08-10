@@ -679,13 +679,27 @@ class QualificationRunner:
             "database_path": None,
             "open": False,
         }
+        # G3 (round 3): confirm the output database WITHOUT opening a sqlite
+        # connection.  The previous read-only probe (``mode=ro``, ``timeout=0.2``)
+        # took a SHARED lock on the live recorder's fresh db3 while the rosbag2
+        # recorder committed its schema in ``journal_mode=delete``; the recorder's
+        # zero busy-timeout then aborted with ``SQLite error (5): database is
+        # locked`` (RERUN-3 cancel evidence).  A valid sqlite file carries the
+        # ``SQLite format 3\0`` header once any schema page is written, and a
+        # zero-length file is a valid empty sqlite database, so checking the raw
+        # header bytes (plus the empty-file case) confirms the database without
+        # ever contending with the recorder's writer lock.
         for database in databases:
             try:
-                uri = f"file:{database}?mode=ro"
-                with sqlite3.connect(uri, uri=True, timeout=0.2) as connection:
-                    connection.execute("PRAGMA schema_version").fetchone()
-            except (OSError, sqlite3.Error) as error:
+                with open(database, "rb") as handle:
+                    header = handle.read(16)
+            except OSError as error:
                 evidence["error"] = f"output database is not openable: {error}"
+                continue
+            if len(header) != 0 and header != b"SQLite format 3\x00":
+                evidence["error"] = (
+                    f"output database is not openable: {database} is not a sqlite file"
+                )
                 continue
             evidence.update({"database_path": str(database), "open": True})
             break

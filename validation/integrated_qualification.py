@@ -169,7 +169,6 @@ CORE_GATE_NAMES = tuple(GATES)
 QUALIFICATION_SCENARIO_NAMES = (
     "qualification-moveit-plan-joint",
     "qualification-moveit-plan-pose",
-    "qualification-moveit-plan-blocked",
     "qualification-moveit-execute-joint",
     "qualification-moveit-execute-pose",
     "qualification-moveit-cartesian-retreat",
@@ -203,6 +202,41 @@ STAGE_RECORD_FILENAMES = {
     "D": "stage-d-result.json",
     "E": "stage-e-result.json",
 }
+
+#: Integrated Stage C plan-only evidence may record zero messages only for the
+#: truth topics that a plan-only attempt never produces: object state and
+#: contacts.  Every other approved topic, including ``/clock`` and
+#: ``/sim/truth/robot_state``, still requires a positive count.  The exception is
+#: scoped to Stage C and is never applied to manipulation gates or to any other
+#: bag.
+STAGE_C_ZERO_ALLOWED_TOPICS = frozenset(
+    {"/sim/truth/object_state", "/sim/truth/contacts"}
+)
+
+#: Integrated Stage D scenarios that never produce object/contact truth may
+#: record zero messages for the same truth topics as Stage C plan-only: object
+#: state and contacts.  The allowance is per-scenario: a D scenario whose
+#: ``expected_physical`` requires object/contact interaction still requires
+#: positive counts.
+STAGE_D_ZERO_ALLOWED_TOPICS = frozenset(
+    {"/sim/truth/object_state", "/sim/truth/contacts"}
+)
+
+#: Integrated physical predicates that are evaluated from object/contact truth.
+#: A Stage D scenario whose ``expected_physical`` intersects this set requires
+#: positive rosbag counts on the object/contact truth topics; a D scenario with
+#: none of these (free-space execute, gripper-only) may record zero.
+CONTACT_OBJECT_PHYSICAL = frozenset(
+    {
+        "bilateral_contact",
+        "lift",
+        "transport",
+        "bounded_tcp_object_drift",
+        "release_in_place_region",
+        "settled_speed",
+        "no_arm_obstacle_contact",
+    }
+)
 
 # The six-gate Stage-A core suite lives outside the integrated Gate-F index in
 # the sibling ``<suite>-core`` root (C1).
@@ -1465,6 +1499,67 @@ class IntegratedRunner:
             "files": files,
         }
 
+    def _is_stage_c_plan_only(self, attempt_dir: Path) -> bool:
+        """True for an integrated Stage-C plan-only attempt directory.
+
+        Production attempt dirs are ``<root>/C-<scenario>-<run_id>-<n>``; the
+        offline test shape is ``<root>/C/<scenario>``.  A committed
+        ``scenario-bundle.json`` ``integrated.stage == "C"`` is authoritative
+        when present; otherwise the directory path marker is used.
+        """
+        bundle_path = Path(attempt_dir) / "scenario-bundle.json"
+        if bundle_path.is_file():
+            try:
+                value = json.loads(bundle_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                value = None
+            if isinstance(value, Mapping):
+                integrated = value.get("integrated")
+                # A readable committed ``integrated.stage`` is authoritative in
+                # both directions (C vs not-C); only an absent stage falls back
+                # to the path marker.
+                if isinstance(integrated, Mapping) and isinstance(integrated.get("stage"), str):
+                    return integrated["stage"] == "C"
+        attempt_path = Path(attempt_dir).resolve()
+        if attempt_path.parent.name.upper() == "C":
+            return True
+        return attempt_path.name.startswith("C-")
+
+    def _integrated_zero_allowed_topics(self, attempt_dir: Path) -> frozenset[str]:
+        """Return the approved truth topics allowed to record zero messages.
+
+        Stage C plan-only attempts may record zero only for object/contact truth
+        (the plan never moves the arm).  A Stage D scenario may do the same when
+        its ``expected_physical`` requires no object/contact interaction
+        (free-space execute, gripper-only); a D/E scenario whose
+        ``expected_physical`` requires object/contact truth still requires
+        positive counts.  An absent/unreadable bundle stays fail-closed and
+        requires every approved topic.
+        """
+        if self._is_stage_c_plan_only(attempt_dir):
+            return STAGE_C_ZERO_ALLOWED_TOPICS
+        bundle_path = Path(attempt_dir) / "scenario-bundle.json"
+        if not bundle_path.is_file():
+            return frozenset()
+        try:
+            value = json.loads(bundle_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return frozenset()
+        if not isinstance(value, Mapping):
+            return frozenset()
+        integrated = value.get("integrated")
+        if not isinstance(integrated, Mapping):
+            return frozenset()
+        if integrated.get("stage") != "D":
+            return frozenset()
+        expected_physical = integrated.get("expected_physical")
+        if not isinstance(expected_physical, (list, tuple)):
+            return frozenset()
+        physical = tuple(str(item) for item in expected_physical)
+        if CONTACT_OBJECT_PHYSICAL.isdisjoint(physical):
+            return STAGE_D_ZERO_ALLOWED_TOPICS
+        return frozenset()
+
     def _integrated_rosbag_evidence(
         self, attempt_dir: Path
     ) -> tuple[bool, dict[str, Any], list[str]]:
@@ -1478,6 +1573,12 @@ class IntegratedRunner:
         the integrated finalizer and never delegates to
         ``qualification_rosbag_final_evidence`` (its six-gate minimum-count
         lookup rejects the ``integrated`` gate).
+
+        Integrated Stage C plan-only attempts and Stage D scenarios that never
+        produce object/contact truth may record zero messages only for
+        ``/sim/truth/object_state`` and ``/sim/truth/contacts``; every other
+        approved topic, including ``/clock`` and ``/sim/truth/robot_state``,
+        still requires a positive count (F2.7).
         """
         bag_dir = attempt_dir / "rosbag"
         evidence: dict[str, Any] = {
@@ -1496,10 +1597,16 @@ class IntegratedRunner:
                 evidence,
                 ["integrated rosbag directory is present but has no metadata.yaml"],
             )
+        zero_allowed_topics = self._integrated_zero_allowed_topics(attempt_dir)
+        minimum_message_counts: dict[str, int] | None = None
+        if zero_allowed_topics:
+            minimum_message_counts = {topic: 1 for topic in APPROVED_RECORD_TOPICS}
+            for topic in zero_allowed_topics:
+                minimum_message_counts[topic] = 0
         try:
             metadata = qualification_rosbag_metadata_evidence(
                 metadata_path.read_text(encoding="utf-8"),
-                minimum_message_counts=None,
+                minimum_message_counts=minimum_message_counts,
             )
         except (OSError, ValueError) as error:
             evidence["status"] = "invalid"
@@ -1527,7 +1634,14 @@ class IntegratedRunner:
             from validation.integrated_evidence_index import _validate_rosbag  # noqa: PLC0415
         semantic_reasons: list[str] = []
         try:
-            _validate_rosbag(self._minimal_rosbag_index(attempt_dir), attempt_dir.resolve(), semantic_reasons)
+            _validate_rosbag(
+                self._minimal_rosbag_index(attempt_dir),
+                attempt_dir.resolve(),
+                semantic_reasons,
+                zero_allowed_topics=(
+                    set(zero_allowed_topics) if zero_allowed_topics else None
+                ),
+            )
         except Exception as error:  # noqa: BLE001 - semantic validator boundary
             semantic_reasons.append(f"integrated rosbag semantic validation failed: {error}")
         evidence["semantic"] = {

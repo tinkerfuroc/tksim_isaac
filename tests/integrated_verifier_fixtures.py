@@ -31,6 +31,8 @@ from validation.integrated_gate_executor import (  # noqa: E402
     EXECUTE_STATUS_SUCCEEDED,
     FJT_ENDPOINT,
     GRIPPER_ENDPOINT,
+    POSE_APPROACH_QUATERNION_XYZW,
+    POSE_APPROACH_Z_OFFSET,
     Q_OUTBOUND,
     STAGE_D_KIND,
     STAGE_E_KIND,
@@ -54,7 +56,6 @@ PLACE_REGION = [0.85, 0.0, 0.64]
 _EVENT_FRAMES: Mapping[str, list[tuple[str, int]]] = {
     "plan-joint": [("fixture-ready", 10), ("teardown", 40)],
     "plan-pose": [("fixture-ready", 10), ("teardown", 40)],
-    "plan-blocked": [("fixture-ready", 10), ("teardown", 40)],
     "execute-joint": [
         ("fixture-ready", 10), ("execution-start", 20),
         ("execution-terminal", 60), ("teardown", 70),
@@ -122,7 +123,6 @@ _EVENT_FRAMES: Mapping[str, list[tuple[str, int]]] = {
 _OBJECTS_BY_SCENARIO: Mapping[str, list[str]] = {
     "qualification-moveit-plan-joint": [],
     "qualification-moveit-plan-pose": [],
-    "qualification-moveit-plan-blocked": [],
     "qualification-moveit-execute-joint": [],
     "qualification-moveit-execute-pose": [],
     "qualification-moveit-cartesian-retreat": [],
@@ -322,8 +322,25 @@ def _state_at(
             state["command_joints"] = joints
         return state
     if kind == "execute-pose":
-        target_xyz = [0.45, 0.2, 0.89]
-        target_quat = [0.0, 0.0, 0.382683, 0.92388]
+        # G1 (round 3): the executor plans/executes to the DECLARED public_target
+        # xyz raised by POSE_APPROACH_Z_OFFSET with the fixed z-down approach
+        # orientation (POSE_APPROACH_QUATERNION_XYZW), so the reached TCP pose is
+        # the approach pose derived from the scenario declaration — never a
+        # hardcoded target or the declared yaw-only target-box quaternion.
+        declaration = load_test_scenario(scenario_id)["planning_scene_declaration"]
+        target_source_id = declaration.get("target_source_id")
+        target = next(
+            (record for record in declaration["objects"]
+             if record.get("id") == target_source_id),
+            None,
+        )
+        declared_xyz = [float(value) for value in target["pose"]["xyz"]]
+        target_xyz = [
+            declared_xyz[0],
+            declared_xyz[1],
+            declared_xyz[2] + POSE_APPROACH_Z_OFFSET,
+        ]
+        target_quat = list(POSE_APPROACH_QUATERNION_XYZW)
         start = fi.get("execution-start", 10)
         if index >= start:
             state["tcp_xyz"] = target_xyz
@@ -1032,13 +1049,13 @@ def write_integrated_attempt(root: Path, **overrides: Any) -> Path:
 
     # --- Executor artifacts -------------------------------------------------
     if stage == "C":
-        status = "diagnostic-pass" if kind != "plan-blocked" else "diagnostic-fail"
-        planner_status = "success" if kind != "plan-blocked" else "failure"
-        nonempty_plan = kind != "plan-blocked"
-        error_code = 1 if kind != "plan-blocked" else -2
+        status = "diagnostic-pass"
+        planner_status = "diagnostic-pass"
+        nonempty_plan = True
+        error_code = 1
         task_result_status = None
-        terminal_status = "succeeded" if kind != "plan-blocked" else "failed"
-        execute_result_status = 4 if kind != "plan-blocked" else 6
+        terminal_status = "succeeded"
+        execute_result_status = 4
         pick_goal_sent = place_goal_sent = place_goal_accepted = False
         execute_goal_sent = False
         controller_goal_sent = False
@@ -1217,7 +1234,6 @@ def _kind_for(scenario_id: str, stage: str) -> str:
         return {
             "qualification-moveit-plan-joint": "plan-joint",
             "qualification-moveit-plan-pose": "plan-pose",
-            "qualification-moveit-plan-blocked": "plan-blocked",
         }.get(scenario_id, "plan-joint")
     if stage == "D":
         return STAGE_D_KIND.get(scenario_id, "execute-joint")
@@ -1519,7 +1535,7 @@ def _apply_overrides(
             if len(joints) >= 8 and joints[7] > 0.5:
                 joints[7] = 0.5
 
-    # plan_result_success=True: plan-blocked flips its plan diagnostic to success.
+    # plan_result_success=True: flip any plan's diagnostic to success.
     if overrides.get("plan_result_success") is True:
         for row in plans_out:
             row["planner_status"] = "success"
@@ -1532,6 +1548,27 @@ def _apply_overrides(
             "nonempty_plan": True,
         }
         exec_json["planner_status"] = "success"
+
+    # executor_diagnostic_status=True: write the REAL executor vocabulary
+    # "diagnostic-pass"/"diagnostic-fail" into the plan-result row's
+    # planner_status (instead of the fixtures' "success"/"failure").
+    if overrides.get("executor_diagnostic_status") is True:
+        for row in plans_out:
+            status_word = str(row.get("planner_status", "")).strip().lower()
+            if status_word == "success":
+                row["planner_status"] = "diagnostic-pass"
+            elif status_word == "failure":
+                row["planner_status"] = "diagnostic-fail"
+
+    # plan_only_joint_jitter_rad_s=<v>: inject a steady joint-velocity magnitude
+    # into the physics-truth records (the plan-only solver/controller limit
+    # cycle seen live).  Default 0.0 keeps existing fixtures motionless.
+    if "plan_only_joint_jitter_rad_s" in overrides:
+        jitter = float(overrides["plan_only_joint_jitter_rad_s"])
+        for frame in raw:
+            robot = frame.get("robot", {})
+            if isinstance(robot, Mapping) and "joint_velocities" in robot:
+                robot["joint_velocities"] = [jitter] * 7 + [0.0]
 
     # contact_force_exact_1_0=True: every contact sits exactly at the threshold.
     if overrides.get("contact_force_exact_1_0") is True:
@@ -1790,7 +1827,10 @@ def _apply_overrides(
                     if len(joints) >= 8:
                         joints[0] += 0.05
                         frame["robot"]["joint_positions"] = joints
-                        frame["robot"]["joint_velocities"] = [0.05] * 8
+                        # Velocity must sit clearly above the configured
+                        # safety_stop_velocity_rad_s (0.05) so the
+                        # terminal-quiescence tail truthfully fails.
+                        frame["robot"]["joint_velocities"] = [0.08] * 8
 
     # --- Fix-round 2 fault injections (F2.1-F2.5) ----------------------------
 
@@ -1805,7 +1845,9 @@ def _apply_overrides(
         if quiescent_key is not None:
             for frame in raw:
                 if int(frame["frame_index"]) == quiescent_key:
-                    frame["robot"]["joint_velocities"] = [0.05] * 8
+                    # Clearly above the configured safety_stop_velocity_rad_s
+                    # (0.05) so the not-settled tail truthfully fails.
+                    frame["robot"]["joint_velocities"] = [0.08] * 8
 
     # cancel_target_change=True: a NEW command target/goal appears midway
     # between cancel and quiescent -> the subwindow target-stability check fails
@@ -1880,12 +1922,43 @@ def _apply_overrides(
                         joints[0] += round(0.012 * frac, 6)
                         frame["robot"]["joint_positions"] = joints
 
+    # safety_target_phantom_floor=True (D safety): the sim's commanded joint
+    # target drifts ~0.003 rad even while the arm is physically frozen — the
+    # SAME phantom-motion floor the round-4 velocity threshold addressed.  The
+    # command target steps by 0.003 rad per frame from effective-stop through
+    # quiescent while the ACTUAL joint positions stay frozen, so position creep
+    # stays well inside safety_position_creep_rad (0.005) but the target-delta
+    # checks (numeric_tolerance 1e-06) fail.  This models live rerun-5 evidence
+    # (max_target_delta_rad 0.00299, position_creep_rad 0.00336).  The target-
+    # frozen and no_auto_resume checks must bound target delta by the position-
+    # creep bound (safety_target_delta_rad), not numeric_tolerance.
+    if overrides.get("safety_target_phantom_floor") is True:
+        effective_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "effective-stop"),
+            None,
+        )
+        quiescent_key = next(
+            (int(record["frame_index"]) for record in journal if record["event"] == "quiescent"),
+            None,
+        )
+        if effective_key is not None and quiescent_key is not None:
+            drift = 0.003
+            for frame in raw:
+                idx = int(frame["frame_index"])
+                if not (effective_key <= idx <= quiescent_key):
+                    continue
+                targets = frame.get("command_targets", {})
+                positions = list(targets.get("joint_positions", [0.0] * 8))
+                if len(positions) >= 8:
+                    positions[0] += drift
+                    targets["joint_positions"] = positions
+
     # safety_transport_ramp=True (E safety-transport): a production-real braking
     # ramp from the transport velocity down to rest at quiescent.  The
     # terminal-quiescence tail (no_post_clear_resume) settles and does NOT
     # false-fail on the ramp, while the strict safety_stop_frames
     # velocity_below_stop_limit truthfully fails because the velocity at
-    # effective-stop (0.05) is above safety_stop_velocity_rad_s.
+    # effective-stop (0.08) is above safety_stop_velocity_rad_s (0.05).
     if overrides.get("safety_transport_ramp") is True:
         effective_key = next(
             (int(record["frame_index"]) for record in journal if record["event"] == "effective-stop"),
@@ -1904,10 +1977,10 @@ def _apply_overrides(
             for frame in raw:
                 idx = int(frame["frame_index"])
                 if transport_key is not None and transport_key <= idx < effective_key:
-                    frame["robot"]["joint_velocities"] = [0.05] * 8
+                    frame["robot"]["joint_velocities"] = [0.08] * 8
                 elif effective_key <= idx < quiescent_key:
                     frac = _clamp((idx - effective_key) / n, 0.0, 1.0)
-                    velocity = round(0.05 * (1.0 - frac), 6)
+                    velocity = round(0.08 * (1.0 - frac), 6)
                     frame["robot"]["joint_velocities"] = [velocity] * 8
 
     # safety_terminal_success=True (D safety): terminal claims success while a

@@ -1662,12 +1662,16 @@ def test_rosbag_malformed_qos_rmw_fields_fails_gate_f(tmp_path):
 
 
 def test_rosbag_override_qos_mismatch_fails_gate_f(tmp_path):
-    """F3.8: /sim/hardware/safety_stop must match the recorder override QoS."""
+    """F3.8: /sim/hardware/safety_stop must match the recorder override QoS.
+
+    The override subset contract asserts only reliability/durability from the
+    recorded metadata (history/depth are the recorder's override YAML), so the
+    mismatch is induced with durability=volatile(2), never history/depth."""
     suite_dir = make_complete_evidence_suite(tmp_path)
     document = _rosbag_document(suite_dir)
     record = _topic_metadata(document, "/sim/hardware/safety_stop")
     record["topic_metadata"]["offered_qos_profiles"] = (
-        "- history: 1\n  depth: 5\n  reliability: 1\n  durability: 1\n"
+        "- history: 1\n  depth: 5\n  reliability: 1\n  durability: 2\n"
     )
     _write_rosbag_document(suite_dir, document)
     verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
@@ -2685,13 +2689,64 @@ def test_rosbag_nine_field_qos_passes_gate_f(tmp_path):
     assert "recorder override contract" not in " ".join(summary["reasons"])
 
 
+def test_rosbag_humble_duration_mapping_qos_is_accepted():
+    """Humble may encode rmw durations as ``{sec, nsec}`` mappings."""
+    import validation.integrated_evidence_index as index_module
+
+    qos = _nine_field_qos()
+    for field in ("deadline", "lifespan", "liveliness_lease_duration"):
+        qos = qos.replace(f"  {field}: 0\n", f"  {field}: {{sec: 0, nsec: 0}}\n")
+    profiles = index_module._parse_rosbag_qos(qos)
+    assert profiles is not None
+    assert all(index_module._rosbag_qos_fields_ok(profile) for profile in profiles)
+
+
+def test_rosbag_real_humble_override_metadata_unknown_history_depth_passes(tmp_path):
+    """F3.8/F4.2 regression: real Humble recorder metadata for the two
+    ROSBAG_QOS_OVERRIDE endpoints truthfully records the publisher's offer as
+    history=UNKNOWN(3), depth=0, reliability=RELIABLE(1),
+    durability=TRANSIENT_LOCAL(1); the recorder's keep_last/depth=1 intent is
+    proven separately by the ROSBAG_QOS_OVERRIDE_PROFILES YAML.  Recorded-
+    metadata validation must assert only reliability/durability for these
+    topics and must not reject the unknown history/depth.  Malformed/wrong
+    reliability or durability must still be rejected."""
+    suite_dir = make_complete_evidence_suite(tmp_path)
+    real_humble_offer = _nine_field_qos(
+        history=3, depth=0, reliability=1, durability=1
+    )
+    for topic in ("/sim/hardware/safety_stop", "/sim/status/contract"):
+        document = _rosbag_document(suite_dir)
+        record = _topic_metadata(document, topic)
+        record["topic_metadata"]["offered_qos_profiles"] = real_humble_offer
+        _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    reasons = " ".join(verdict["reasons"])
+    # Regression: the real Humble recorded offer must not be rejected for its
+    # unknown history/depth -- only reliability/durability are asserted here.
+    assert "recorder override contract" not in reasons
+    assert "malformed RMW QoS fields" not in reasons
+    # Preservation: a best-effort (reliability=2) offer on these topics is still
+    # rejected; the reliability assertion survives the history/depth relaxation.
+    document = _rosbag_document(suite_dir)
+    record = _topic_metadata(document, "/sim/hardware/safety_stop")
+    record["topic_metadata"]["offered_qos_profiles"] = _nine_field_qos(
+        history=3, depth=0, reliability=2, durability=1
+    )
+    _write_rosbag_document(suite_dir, document)
+    verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
+    assert "no reliable QoS profile" in " ".join(verdict["reasons"])
+
+
 def test_rosbag_override_wrong_required_field_fails(tmp_path):
-    """F4.2: an override topic with the wrong depth (still nine-field) fails the
-    recorder override subset contract."""
+    """F4.2: an override topic with the wrong durability (still nine-field) fails
+    the recorder override subset contract.  The subset contract asserts only
+    reliability/durability from recorded metadata, so the mismatch is induced
+    with durability=volatile(2); depth/history are the recorder's override YAML
+    and are never asserted here."""
     suite_dir = make_complete_evidence_suite(tmp_path)
     document = _rosbag_document(suite_dir)
     record = _topic_metadata(document, "/sim/hardware/safety_stop")
-    record["topic_metadata"]["offered_qos_profiles"] = _nine_field_qos(depth=5, durability=1)
+    record["topic_metadata"]["offered_qos_profiles"] = _nine_field_qos(durability=2)
     _write_rosbag_document(suite_dir, document)
     verdict = validate_gate_f(_final_index(suite_dir), suite_dir=suite_dir)
     assert "recorder override contract" in " ".join(verdict["reasons"])

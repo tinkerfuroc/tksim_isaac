@@ -366,6 +366,8 @@ def main() -> int:
                 flush=True,
             )
             next_step_wall = time.monotonic()
+            next_collision_heartbeat = time.monotonic()
+            collision_heartbeat_period_s = 0.1
             while (
                 running
                 and app.is_running()
@@ -374,6 +376,17 @@ def main() -> int:
                 if gateway is not None:
                     gateway.spin_once()
                 import omni.timeline
+
+                if (
+                    gateway is not None
+                    and time.monotonic() - next_collision_heartbeat
+                    >= collision_heartbeat_period_s
+                ):
+                    # The collision source must stay fresh while paused (world
+                    # load/spawn), otherwise the supervisor trips a spurious
+                    # stop + controller deactivate on the first cold start.
+                    gateway.publish_safety_heartbeat()
+                    next_collision_heartbeat = time.monotonic()
 
                 if omni.timeline.get_timeline_interface().is_playing():
                     backend.step()
@@ -477,6 +490,8 @@ def main() -> int:
                 flush=True,
             )
             next_step_wall = time.monotonic()
+            next_collision_heartbeat = time.monotonic()
+            collision_heartbeat_period_s = 0.1
             while (
                 running
                 and app.is_running()
@@ -485,6 +500,17 @@ def main() -> int:
                 if gateway is not None:
                     gateway.spin_once()
                 import omni.timeline
+
+                if (
+                    gateway is not None
+                    and time.monotonic() - next_collision_heartbeat
+                    >= collision_heartbeat_period_s
+                ):
+                    # The collision source must stay fresh while paused (world
+                    # load/spawn), otherwise the supervisor trips a spurious
+                    # stop + controller deactivate on the first cold start.
+                    gateway.publish_safety_heartbeat()
+                    next_collision_heartbeat = time.monotonic()
 
                 if omni.timeline.get_timeline_interface().is_playing():
                     backend.step()

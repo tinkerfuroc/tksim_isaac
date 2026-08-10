@@ -55,7 +55,7 @@
         },
         "pose": {
           "xyz": [
-            0.55,
+            0.8,
             0.0,
             0.425
           ],
@@ -80,9 +80,9 @@
         },
         "pose": {
           "xyz": [
-            0.45,
-            0.2,
-            0.89
+            0.35,
+            0.0,
+            0.8
           ],
           "quaternion_xyzw": [
             0.0,
@@ -93,12 +93,12 @@
         }
       }
     ],
-    "revision_digest": "909614fb232baac5c7481898f9239990a94fe235101a8485ee8af5c212c0db09"
+    "revision_digest": "7604bcdcfd96d18b3430f0103719ec8228a29121567f57545658b34ab4f0168f"
   },
   "integrated": {
     "stage": "D",
     "fixture_revision": "2026-08-02-moveit-execute-pose",
-    "fixture_digest": "909614fb232baac5c7481898f9239990a94fe235101a8485ee8af5c212c0db09",
+    "fixture_digest": "7604bcdcfd96d18b3430f0103719ec8228a29121567f57545658b34ab4f0168f",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {

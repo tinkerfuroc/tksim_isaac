@@ -164,16 +164,10 @@ def _ready_status(
 def test_joint_and_pose_share_pedestal_and_public_target_identity() -> None:
     joint = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
     pose = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-pose.json")
-    blocked = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
 
     assert fixture_owned_ids(joint) == ("sim_fixture/pedestal", "sim_fixture/public_target")
     assert fixture_owned_ids(pose) == ("sim_fixture/pedestal", "sim_fixture/public_target")
-    assert fixture_owned_ids(blocked) == (
-        "sim_fixture/pedestal",
-        "sim_fixture/public_target",
-        "sim_fixture/plan_blocker",
-    )
-    for declaration in (joint, pose, blocked):
+    for declaration in (joint, pose):
         assert declaration["frame_id"] == "base_link"
         assert declaration["target_source_id"] == "sim_fixture/public_target"
         assert declaration["target_handoff"] == "pick_and_place/object_mesh"
@@ -183,9 +177,6 @@ def test_joint_and_pose_share_pedestal_and_public_target_identity() -> None:
 
 def test_exact_task_owned_handoff_identity_constant() -> None:
     assert TARGET_HANDOFF == "pick_and_place/object_mesh"
-    assert fixture_owned_ids(
-        load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
-    )[-1] == "sim_fixture/plan_blocker"
 
 
 def test_parse_required_fixture_owned_ids_accepts_declared_owned_ids() -> None:
@@ -228,11 +219,11 @@ def test_revision_digest_is_deterministic_canonical_and_declared() -> None:
     assert revision_digest(altered) != first
 
 
-def test_blocked_scenario_digest_differs_from_joint() -> None:
+def test_pose_scenario_digest_differs_from_joint() -> None:
     joint = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
-    blocked = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
-    assert revision_digest(blocked) != revision_digest(joint)
-    assert blocked["revision_digest"] == revision_digest(blocked)
+    pose = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-pose.json")
+    assert revision_digest(pose) != revision_digest(joint)
+    assert pose["revision_digest"] == revision_digest(pose)
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +306,8 @@ def test_diff_rejects_duplicate_desired_ids() -> None:
 def test_local_and_production_spec_builders_agree() -> None:
     joint = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
     assert fixture_to_specs(joint) == fixture_to_scene(joint)
-    blocked = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
-    assert fixture_to_specs(blocked) == fixture_to_scene(blocked)
+    pose = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-pose.json")
+    assert fixture_to_specs(pose) == fixture_to_scene(pose)
 
 
 def test_diagnostic_objects_enter_collision_bodies_only_when_marked() -> None:
@@ -412,9 +403,9 @@ def test_status_sequence_is_monotonic_and_published_at_finite() -> None:
 
 def test_fixture_descriptor_sha256_is_deterministic() -> None:
     joint = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
-    blocked = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
+    pose = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-pose.json")
     assert fixture_descriptor_sha256(joint) == fixture_descriptor_sha256(joint)
-    assert fixture_descriptor_sha256(blocked) != fixture_descriptor_sha256(joint)
+    assert fixture_descriptor_sha256(pose) != fixture_descriptor_sha256(joint)
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +531,7 @@ def test_confirm_rejects_non_ready_state_and_bad_fields() -> None:
 def test_scenario_definition_loads_planning_scene_schema_v2() -> None:
     from tinker_sim_core.scenario import load_named_scenario
 
-    scenario = load_named_scenario(ROOT, "qualification-moveit-plan-blocked")
+    scenario = load_named_scenario(ROOT, "qualification-moveit-plan-pose")
     assert scenario.schema_version == 2
     assert scenario.planning_scene is not None
     assert scenario.planning_scene["revision"]
@@ -1244,7 +1235,7 @@ def test_exactly_one_apply_request_carries_atomic_add_and_remove() -> None:
     from tinker_sim_bridge.fixture_contract import build_atomic_revision_diff
 
     node = _make_node()
-    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-pose.json")
     node._specs = fixture_to_specs(declaration)
     # One stale sim_fixture id to remove; the foreign id is preserved.
     node._existing_ids = ("sim_fixture/stale_removed", "nav/foreign_kept")
@@ -1271,11 +1262,10 @@ def test_exactly_one_apply_request_carries_atomic_add_and_remove() -> None:
     assert [obj.id for obj in collision_objects] == [
         "sim_fixture/pedestal",
         "sim_fixture/public_target",
-        "sim_fixture/plan_blocker",
         "sim_fixture/stale_removed",
     ]
     assert [obj.operation for obj in collision_objects] == [
-        b"\x00", b"\x00", b"\x00", b"\x01",
+        b"\x00", b"\x00", b"\x01",
     ]
     assert all(obj.header.frame_id == "base_link" for obj in collision_objects)
     assert all("nav/" not in obj.id for obj in collision_objects)
@@ -1302,6 +1292,170 @@ def test_apply_timeout_fails_closed() -> None:
     assert node._phase == "failed"
     assert node._state == FIXTURE_STATE_FAILED
     assert "timed out" in str(node._fail_reason)
+
+
+# ---------------------------------------------------------------------------
+# ROS-free apply-timeout seam (rclpy import stub; runs under the sim venv)
+# ---------------------------------------------------------------------------
+
+
+def _stub_rclpy(monkeypatch) -> None:
+    """Provide importable rclpy stand-ins so the node module can be imported
+    without a Humble runtime (the sim venv lacks the python3.12 ``_rclpy`` C
+    extension).  Only the symbols bound at module import time are provided;
+    the test never calls into rclpy itself."""
+    import types
+
+    rclpy = types.ModuleType("rclpy")
+    rclpy.init = lambda *a, **k: None
+    rclpy.spin = lambda *a, **k: None
+    rclpy.ok = lambda *a, **k: True
+    rclpy.shutdown = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "rclpy", rclpy)
+
+    callback_groups = types.ModuleType("rclpy.callback_groups")
+    callback_groups.ReentrantCallbackGroup = object
+    monkeypatch.setitem(sys.modules, "rclpy.callback_groups", callback_groups)
+
+    node = types.ModuleType("rclpy.node")
+    node.Node = object
+    monkeypatch.setitem(sys.modules, "rclpy.node", node)
+
+    qos = types.ModuleType("rclpy.qos")
+    qos.DurabilityPolicy = type("DurabilityPolicy", (), {})
+    qos.QoSProfile = object
+    qos.ReliabilityPolicy = object
+    monkeypatch.setitem(sys.modules, "rclpy.qos", qos)
+
+
+def test_apply_request_in_flight_tolerates_startup_safe_delay(monkeypatch) -> None:
+    """The ApplyPlanningScene request must not be abandoned by the hard 5.0 s
+    request timeout while MoveGroup is still initializing: the planning-scene
+    service timeout must tolerate the equivalent startup delay (20.0 s).
+
+    Regression for the live blocked scenario where the apply step failed with
+    ``service request timed out after 5.0 s`` while MoveGroup initialized.
+    Runs ROS-free under the sim venv via a minimal rclpy import stub.
+    """
+    _stub_rclpy(monkeypatch)
+    try:
+        node = _make_node()
+        node._phase = "apply"
+        node._state = FIXTURE_STATE_PENDING
+        node._fail_reason = None
+        node._apply_state = {
+            "client": None, "future": None, "error": None, "pending": None,
+            "succeeded": False, "result": None,
+        }
+        node._start_deadline_s = 1000.0
+        node._phase_started_at = 0.0
+        node._diff_plan = object()
+        node._service_group = None
+
+        class _Future:
+            def done(self) -> bool:
+                return False
+
+        class _Client:
+            def service_is_ready(self) -> bool:
+                return True
+
+            def call_async(self, request):
+                return _Future()
+
+        node.create_client = lambda *a, **k: _Client()
+        node._build_apply_request = lambda client: object()
+
+        # First tick at t=100.0: the service is ready and the request is sent.
+        node._advance_apply(100.0)
+        assert node._phase == "apply"
+        assert node._apply_state["started_at"] == 100.0
+
+        # Second tick at t=120.0: the same request has been in flight for the
+        # full 20.0 s MoveGroup startup window.  A startup-safe planning-scene
+        # service timeout (20.0 s) must keep waiting; the hard 5.0 s timeout
+        # fails the node here.
+        node._advance_apply(120.0)
+        assert node._phase == "apply"
+        assert node._state == FIXTURE_STATE_PENDING
+        assert node._apply_state["pending"] == "request in flight"
+        assert node._apply_state["error"] is None
+        assert node._fail_reason is None
+    finally:
+        sys.modules.pop("tinker_sim_bridge.fixture_planning_scene_node", None)
+
+
+def test_apply_service_timeout_retries_transiently(monkeypatch) -> None:
+    """RED: a planning-scene service *timeout* must be transient, not fatal.
+
+    Live joint scenario (2026-08-07T17:17): on the cold start the
+    /get_planning_scene response was dropped server-side (move_group
+    ``failed to send response ... timeout``), so the fixture node's single
+    20 s attempt timed out and the whole Humble stack shut down.  The response
+    is lost, not refused — a fresh request succeeds (proven by the warm pose
+    scenario).  A timeout must therefore be retried within the per-phase
+    120 s budget, not fail the node.
+    """
+    _stub_rclpy(monkeypatch)
+    try:
+        node = _make_node()
+        node._phase = "apply"
+        node._state = FIXTURE_STATE_PENDING
+        node._fail_reason = None
+        node._apply_state = {
+            "client": None, "future": None, "error": None, "pending": None,
+            "succeeded": False, "result": None,
+        }
+        node._start_deadline_s = 120.0
+        node._phase_started_at = 0.0
+        node._diff_plan = object()
+        node._service_group = None
+
+        class _Future:
+            def done(self) -> bool:
+                return False
+
+        class _Client:
+            calls = 0
+
+            def service_is_ready(self) -> bool:
+                return True
+
+            def call_async(self, request):
+                _Client.calls += 1
+                return _Future()
+
+        node.create_client = lambda *a, **k: _Client()
+        node._build_apply_request = lambda client: object()
+
+        # First tick: request sent at t=0.
+        node._advance_apply(0.0)
+        assert node._phase == "apply"
+        assert node._apply_state["started_at"] == 0.0
+
+        # Second tick past the 20 s service timeout: the request is abandoned
+        # (client reset + error set), but the node must NOT fail — it clears the
+        # timeout as transient and stays in the apply phase for a fresh attempt.
+        node._advance_apply(100.0)
+        assert node._phase == "apply", (
+            "a service timeout must retry, not fail: phase=%s" % node._phase
+        )
+        assert node._state == FIXTURE_STATE_PENDING
+        assert node._fail_reason is None
+        assert node._apply_state["error"] is None, (
+            "timeout error must be cleared for retry: %s" % node._apply_state["error"]
+        )
+
+        # Third tick: the fresh client is re-created and a new request issued.
+        node._advance_apply(100.05)
+        assert node._phase == "apply"
+        assert node._apply_state["error"] is None
+        assert _Client.calls >= 2, (
+            "a fresh request must be re-issued after the timeout (calls=%d)"
+            % _Client.calls
+        )
+    finally:
+        sys.modules.pop("tinker_sim_bridge.fixture_planning_scene_node", None)
 
 
 def test_physics_gate_timeout_fails_closed() -> None:
@@ -1332,6 +1486,7 @@ def _confirm_with_geometry(
     objects,
     *,
     mesh_loader=None,
+    canonical_frame_id: str | None = None,
 ) -> "object":
     from tinker_sim_bridge.fixture_contract import confirm_fixture_revision, spec_geometry
     from tinker_sim_bridge.fixture_planning_scene import (
@@ -1345,7 +1500,10 @@ def _confirm_with_geometry(
     expected_geometry = {
         spec.id: spec_geometry(spec, resolve_mesh=mesh_loader) for spec in specs
     }
-    observed_geometry = [readback_geometry(obj) for obj in objects]
+    observed_geometry = [
+        readback_geometry(obj, canonical_frame_id=canonical_frame_id)
+        for obj in objects
+    ]
     status = canonical_fixture_status(
         scenario="qualification-geometry",
         revision=str(declaration["revision"]),
@@ -1385,6 +1543,32 @@ def test_confirm_geometry_roundtrip_is_ready() -> None:
     assert confirmation.ready, confirmation.reasons
     assert confirmation.geometry_consistent
     assert confirmation.geometry_reasons == ()
+
+
+def test_confirm_geometry_accepts_moveit_world_object_pose_normalization() -> None:
+    _humble()
+    from geometry_msgs.msg import Pose
+
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-joint.json")
+    objects = _geometry_objects(declaration)
+    for obj in objects:
+        shape_pose = obj.primitive_poses[0]
+        obj.header.frame_id = "world"
+        obj.pose.position.x = shape_pose.position.x
+        obj.pose.position.y = shape_pose.position.y
+        obj.pose.position.z = shape_pose.position.z
+        obj.pose.orientation.x = shape_pose.orientation.x
+        obj.pose.orientation.y = shape_pose.orientation.y
+        obj.pose.orientation.z = shape_pose.orientation.z
+        obj.pose.orientation.w = shape_pose.orientation.w
+        local_pose = Pose()
+        local_pose.orientation.w = 1.0
+        obj.primitive_poses[0] = local_pose
+
+    confirmation = _confirm_with_geometry(
+        declaration, objects, canonical_frame_id="base_link"
+    )
+    assert confirmation.ready, confirmation.reasons
 
 
 def test_confirm_geometry_wrong_frame_rejected() -> None:
@@ -1452,7 +1636,7 @@ def test_confirm_geometry_duplicate_readback_id_rejected() -> None:
 
 def test_confirm_geometry_reordered_objects_normalized() -> None:
     _humble()
-    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-blocked.json")
+    declaration = load_fixture_scenario(SCENARIOS / "qualification-moveit-plan-pose.json")
     objects = list(reversed(_geometry_objects(declaration)))
     confirmation = _confirm_with_geometry(declaration, objects)
     assert confirmation.ready, confirmation.reasons
@@ -1697,7 +1881,7 @@ def test_real_constructor_full_ready_loop_with_mock_services(ros_context) -> Non
     )
     from tinker_sim_bridge.fixture_planning_scene import fixture_to_specs
 
-    scenario_file = SCENARIOS / "qualification-moveit-plan-blocked.json"
+    scenario_file = SCENARIOS / "qualification-moveit-plan-pose.json"
     declaration = load_fixture_scenario(scenario_file)
     specs = fixture_to_specs(declaration)
     readback_objects = [

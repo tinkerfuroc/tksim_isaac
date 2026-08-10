@@ -39,10 +39,12 @@ from .integrated_readiness import (
     INTEGRATED_JOINT_STATE_NAMES,
     INTEGRATED_PUBLISHERS,
     INTEGRATED_SERVICES,
+    OPERATOR_SUB_QOS_SPEC,
     INTEGRATED_TOUCH_LINKS,
     TF_CHILD,
     TF_PARENT,
     evaluate_integrated_readiness,
+    json_safe_value,
     normalize_qos_value,
     parse_canonical_report,
     sha256_bytes,
@@ -68,6 +70,50 @@ def _endpoint_label(info: object) -> str:
     if namespace:
         return "{}/{}".format(namespace, name)
     return "/" + name
+
+
+def _canonicalize_moveit_private(label: str) -> str:
+    """Map MoveIt private-helper labels ``/move_group_private_<suffix>`` to the
+    logical ``/move_group`` owner; any other source label is returned unchanged."""
+    if label.startswith("/move_group_private_"):
+        return "/move_group"
+    return label
+
+
+def _canonicalize_joint_sample(
+    names: list[str],
+    positions: list[float],
+    velocities: list[float],
+) -> tuple[list[str], list[float], list[float]]:
+    """Canonicalize a JointState to the required name order.
+
+    Accepts any ordering of the required joint names exactly once each with no
+    unknown names; positions and velocities are reordered to the canonical order
+    using the same indices.  Any missing/duplicate/unknown/unaligned/non-finite
+    input is returned unchanged so the caller rejects it fail-closed.
+    """
+    raw_names = list(names)
+    raw_positions = [float(value) for value in positions]
+    raw_velocities = [float(value) for value in velocities]
+    if sorted(raw_names) != sorted(INTEGRATED_JOINT_STATE_NAMES):
+        return raw_names, raw_positions, raw_velocities
+    try:
+        index = {name: position for position, name in enumerate(raw_names)}
+        if len(index) != len(raw_names):
+            return raw_names, raw_positions, raw_velocities
+        if len(raw_positions) != len(INTEGRATED_JOINT_STATE_NAMES) or len(raw_velocities) != len(
+            INTEGRATED_JOINT_STATE_NAMES
+        ):
+            return raw_names, raw_positions, raw_velocities
+        if not all(math.isfinite(value) for value in raw_positions) or not all(
+            math.isfinite(value) for value in raw_velocities
+        ):
+            return raw_names, raw_positions, raw_velocities
+        ordered_positions = [raw_positions[index[name]] for name in INTEGRATED_JOINT_STATE_NAMES]
+        ordered_velocities = [raw_velocities[index[name]] for name in INTEGRATED_JOINT_STATE_NAMES]
+        return list(INTEGRATED_JOINT_STATE_NAMES), ordered_positions, ordered_velocities
+    except (TypeError, ValueError, KeyError, IndexError):
+        return raw_names, raw_positions, raw_velocities
 
 
 def _qos_profile_of(info: object) -> dict[str, object] | None:
@@ -214,6 +260,17 @@ class IntegratedReadiness(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        # J: the executor publishes /sim/safety/operator as latched state
+        # (RELIABLE/TRANSIENT_LOCAL).  Subscribe with the same durability so a
+        # late-joining subscriber receives the latched False baseline instead of
+        # failing the readiness gate with "no sample received".  safety_stop and
+        # collision keep the volatile _bool_sub_qos (their supervisors republish
+        # on a continuous heartbeat, so volatile live samples suffice).
+        self._operator_sub_qos = QoSProfile(
+            depth=OPERATOR_SUB_QOS_SPEC["depth"],
+            reliability=ReliabilityPolicy[OPERATOR_SUB_QOS_SPEC["reliability"].upper()],
+            durability=DurabilityPolicy[OPERATOR_SUB_QOS_SPEC["durability"].upper()],
+        )
         self.create_subscription(
             JointState, "/joint_states", self._on_joint_state, self._joint_sub_qos
         )
@@ -221,7 +278,7 @@ class IntegratedReadiness(Node):
             Bool, "/sim/hardware/safety_stop", self._on_safety_stop, self._bool_sub_qos
         )
         self.create_subscription(
-            Bool, "/sim/safety/operator", self._on_operator, self._bool_sub_qos
+            Bool, "/sim/safety/operator", self._on_operator, self._operator_sub_qos
         )
         self.create_subscription(
             Bool, "/sim/safety/collision", self._on_collision, self._bool_sub_qos
@@ -492,7 +549,7 @@ class IntegratedReadiness(Node):
 
     def _service_servers(self) -> dict[str, list[tuple[str, list[str]]]]:
         servers: dict[str, list[tuple[str, list[str]]]] = {}
-        for node_name, node_namespace in self.get_node_names_and_namespaces():
+        for node_name, node_namespace in self._unique_graph_pairs():
             label = _endpoint_label(
                 type("Info", (), {"node_name": node_name, "node_namespace": node_namespace})()
             )
@@ -508,7 +565,7 @@ class IntegratedReadiness(Node):
 
     def _services_by_node_label(self) -> dict[str, dict[str, list[str]]]:
         result: dict[str, dict[str, list[str]]] = {}
-        for node_name, node_namespace in self.get_node_names_and_namespaces():
+        for node_name, node_namespace in self._unique_graph_pairs():
             label = _endpoint_label(
                 type("Info", (), {"node_name": node_name, "node_namespace": node_namespace})()
             )
@@ -519,6 +576,19 @@ class IntegratedReadiness(Node):
             result[label] = {name: list(types) for name, types in by_node}
         return result
 
+    def _unique_graph_pairs(self) -> list[tuple[str, str]]:
+        """Graph node identities with duplicate ``(node_name, node_namespace)``
+        pairs removed (a launch global-remap can surface the same FQN twice)."""
+        seen: set[tuple[str, str]] = set()
+        unique: list[tuple[str, str]] = []
+        for node_name, node_namespace in self.get_node_names_and_namespaces():
+            pair = (node_name, node_namespace)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            unique.append(pair)
+        return unique
+
     def _probe_actions(self) -> dict[str, object]:
         servers = self._service_servers()
         observed: dict[str, object] = {}
@@ -528,7 +598,8 @@ class IntegratedReadiness(Node):
             result_service = "{}/_action/get_result".format(endpoint)
             goal_servers = servers.get(goal_service, [])
             result_servers = servers.get(result_service, [])
-            goal_labels = sorted({label for label, _types in goal_servers})
+            goal_labels_raw = sorted({label for label, _types in goal_servers})
+            goal_labels = sorted({_canonicalize_moveit_private(label) for label in goal_labels_raw})
             goal_types = sorted({t for _label, tlist in goal_servers for t in tlist})
             expected_source = spec["source"]
             if expected_source.startswith("controller_resource:"):
@@ -547,7 +618,7 @@ class IntegratedReadiness(Node):
                 "count": count,
                 "source": source,
                 "sources": goal_labels,
-                "observed_sources": goal_labels,
+                "observed_sources": goal_labels_raw,
                 "type": action_type,
                 "observed_types": goal_types,
                 "result_service_present": len(result_servers) >= 1,
@@ -572,9 +643,10 @@ class IntegratedReadiness(Node):
         by_node = self._services_by_node_label()
         source_map: dict[str, str] = {}
         for label, entries in by_node.items():
+            canonical_label = _canonicalize_moveit_private(label)
             for service_name in entries:
                 if service_name in INTEGRATED_SERVICES:
-                    source_map[service_name] = label
+                    source_map[service_name] = canonical_label
         for endpoint, spec in INTEGRATED_SERVICES.items():
             entries = servers.get(endpoint, [])
             count = len(entries)
@@ -700,18 +772,20 @@ class IntegratedReadiness(Node):
         publishers = self.get_publishers_info_by_topic("/joint_states")
         labels = [_endpoint_label(info) for info in publishers]
         reasons: list[str] = []
-        names = list(sample.name)
-        positions = [float(value) for value in sample.position]
-        velocities = [float(value) for value in sample.velocity]
+        names, positions, velocities = _canonicalize_joint_sample(
+            list(sample.name),
+            [float(value) for value in sample.position],
+            [float(value) for value in sample.velocity],
+        )
         if names != list(INTEGRATED_JOINT_STATE_NAMES):
             reasons.append(
                 "joint names {!r} != expected {!r}".format(names, list(INTEGRATED_JOINT_STATE_NAMES))
             )
         if len(publishers) != 1:
             reasons.append("joint_state publisher count is {}, expected 1".format(len(publishers)))
-        elif labels[0] != "/controller_manager":
+        elif labels[0] != "/joint_state_broadcaster":
             reasons.append(
-                "joint_state publisher source is {!r}, expected /controller_manager".format(
+                "joint_state publisher source is {!r}, expected /joint_state_broadcaster".format(
                     labels[0]
                 )
             )
@@ -1120,7 +1194,9 @@ class IntegratedReadiness(Node):
         self._last_status = status
         if self._create_status_publisher:
             message = String()
-            message.data = json.dumps(status, sort_keys=True, separators=(",", ":"))
+            message.data = json.dumps(
+                json_safe_value(status), sort_keys=True, separators=(",", ":")
+            )
             self._publisher.publish(message)
         if not report.ready:
             self.get_logger().warning(

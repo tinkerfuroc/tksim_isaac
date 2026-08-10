@@ -21,6 +21,7 @@ Any test that invokes a ROS-importing builder (``moveit_msgs``,
 """
 from __future__ import annotations
 
+import array
 import ast
 import copy
 import hashlib
@@ -28,6 +29,7 @@ import json
 import math
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -63,7 +65,6 @@ from validation.integrated_gate_executor import (  # noqa: E402
 SCENARIO_NAMES = (
     "qualification-moveit-plan-joint",
     "qualification-moveit-plan-pose",
-    "qualification-moveit-plan-blocked",
     "qualification-moveit-execute-joint",
     "qualification-moveit-execute-pose",
     "qualification-moveit-cartesian-retreat",
@@ -359,7 +360,7 @@ def _ready_snapshot_for_contract(contract: dict[str, object]) -> dict[str, objec
             "header_stamp_ns": 1,
             "age_s": 0.05,
             "publisher_count": 1,
-            "source_node": "/controller_manager",
+            "source_node": "/joint_state_broadcaster",
             "logical_controller": "joint_state_broadcaster",
         },
         "controllers": {
@@ -398,8 +399,8 @@ def _ready_snapshot_for_contract(contract: dict[str, object]) -> dict[str, objec
         "topics": {
             "/joint_states": {
                 "type": "sensor_msgs/msg/JointState", "publisher_count": 1,
-                "source_node": "/controller_manager",
-                "qos": {"reliability": "reliable", "durability": "volatile", "depth": 10},
+                "source_node": "/joint_state_broadcaster",
+                "qos": {"reliability": "reliable", "durability": "transient_local", "depth": 10},
                 "names": joints, "positions": [0.0] * 8, "velocities": [0.0] * 8,
                 "header_stamp_ns": 1, "age_s": 0.05,
             },
@@ -478,6 +479,55 @@ def test_positive_readiness_baseline_is_ready():
     )
     assert result["ready"] is True
     assert result["reasons"] == []
+
+
+def test_readiness_accepts_reordered_joint_state_after_driver_canonicalization():
+    """A /joint_states broadcast in live controller order is accepted once the
+    driver canonicalizes names to joint1..joint7,drive_joint with reordered
+    positions/velocities and the owning joint_state_broadcaster source."""
+    live_order = ["joint2", "joint3", "joint5", "joint6", "joint1", "joint4", "joint7", "drive_joint"]
+    live_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    live_velocities = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]
+    canonical = [f"joint{index}" for index in range(1, 8)] + ["drive_joint"]
+    snapshot = ready_executor_snapshot()
+    snapshot["joint_state"]["names"] = canonical
+    snapshot["joint_state"]["positions"] = [live_positions[live_order.index(name)] for name in canonical]
+    snapshot["joint_state"]["velocities"] = [live_velocities[live_order.index(name)] for name in canonical]
+    result = evaluate_executor_readiness(snapshot, _config(), readiness_scenario())
+    assert result["ready"] is True
+    assert result["reasons"] == []
+
+
+def test_readiness_accepts_reordered_scene_owned_ids():
+    """RED: planning-scene owned_ids must be accepted in any order (set contract).
+
+    Live MoveIt returns the planning-scene world objects alphabetically sorted
+    (e.g. ``sim_fixture/pedestal, sim_fixture/plan_blocker,
+    sim_fixture/public_target``) while the scenario declares them in a different
+    order.  The readiness scene check must compare owned_ids as a SET (same IDs
+    regardless of order) for the world-only contract; the fixture payload vs
+    scenario declaration exact-order check stays strict and is untouched here.
+    The negative case proves set-equality, not "superset": dropping one owned id
+    still fails.
+    """
+    snapshot = ready_executor_snapshot()
+    snapshot["planning_scene"]["owned_ids"] = list(
+        reversed(snapshot["planning_scene"]["owned_ids"])
+    )
+    result = evaluate_executor_readiness(snapshot, _config(), readiness_scenario())
+    assert result["ready"] is True
+    assert result["reasons"] == []
+
+    # Set-equality, not "superset": a snapshot missing one owned id still fails.
+    snapshot = ready_executor_snapshot()
+    target = snapshot["fixture"]["target_source_id"]
+    owned = list(snapshot["planning_scene"]["owned_ids"])
+    dropped = next(object_id for object_id in owned if object_id != target)
+    snapshot["planning_scene"]["owned_ids"] = [
+        object_id for object_id in owned if object_id != dropped
+    ]
+    result = evaluate_executor_readiness(snapshot, _config(), readiness_scenario())
+    assert result["ready"] is False
 
 
 def test_executor_source_has_no_isaac_command_publisher():
@@ -756,7 +806,8 @@ def test_readiness_rejects_safety_operator_wrong_source_or_allowlist():
 
 def test_readiness_rejects_legacy_nonexistent_provider_sources():
     snapshot = ready_executor_snapshot()
-    snapshot["joint_state"]["source_node"] = "/joint_state_broadcaster"
+    snapshot["joint_state"]["source_node"] = "/wrong_joint_state_source"
+    snapshot["topics"]["/joint_states"]["source_node"] = "/wrong_joint_state_source"
     snapshot["actions"]["/xarm_gripper/gripper_action"]["source_node"] = "/wrong_provider"
     result = evaluate_executor_readiness(snapshot, _config(), readiness_scenario())
     assert result["ready"] is False
@@ -834,11 +885,10 @@ def test_stage_c_readiness_baseline_is_ready(scenario_name):
     [
         ("qualification-moveit-plan-joint", "joint", "success"),
         ("qualification-moveit-plan-pose", "pose", "success"),
-        ("qualification-moveit-plan-blocked", "blocked", "non-success"),
     ],
 )
-def test_stage_c_dispatch_validates_three_scenarios(scenario_name, kind, expectation):
-    """F1.6: the three Stage-C plan-only scenarios dispatch to the exact goal
+def test_stage_c_dispatch_validates_two_scenarios(scenario_name, kind, expectation):
+    """F1.6: the two Stage-C plan-only scenarios dispatch to the exact goal
     kind and expected diagnostic polarity."""
     contract = scenario_report_contract(scenario_name)
     spec = stage_c_dispatch(scenario_name, scenario=readiness_scenario(contract))
@@ -866,6 +916,156 @@ def test_stage_c_dispatch_rejects_non_c_scenario():
         stage_c_dispatch(
             "qualification-moveit-plan-pose", scenario=readiness_scenario(contract)
         )
+
+
+def test_stage_c_plan_only_classify_success_emits_expectation():
+    """F2.4: the Stage-C plan-only classification must not raise and must carry
+    the scenario's expectation for a successful MoveGroup result.
+
+    Regression for the live ``evidence-invalid`` crash (``name 'expectation'
+    is not defined``): ``_classify_plan_only_result`` referenced ``expectation``
+    after the blocked-scenario removal deleted its binding.  A real OMPL
+    success (``error_code.val == 1`` with a nonempty trajectory) must classify
+    ``diagnostic-pass`` and report the ``success`` expectation.
+    """
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.ros = {"serialize_message": lambda message: b"serialized"}
+
+    result = types.SimpleNamespace(
+        result=types.SimpleNamespace(
+            error_code=types.SimpleNamespace(val=1),
+            planned_trajectory=types.SimpleNamespace(
+                joint_trajectory=types.SimpleNamespace(points=[object()])
+            ),
+        )
+    )
+    spec = stage_c_dispatch(
+        "qualification-moveit-plan-joint",
+        scenario=readiness_scenario(
+            scenario_report_contract("qualification-moveit-plan-joint")
+        ),
+    )
+    classified = executor._classify_plan_only_result(
+        "qualification-moveit-plan-joint", result, spec
+    )
+    assert classified["status"] == "diagnostic-pass"
+    assert classified["error_code_classification"] == "success"
+    assert classified["nonempty_plan"] is True
+    assert classified["expectation"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# Task 65 live blockers: pose approach target.
+#
+# Mirrors validation/ompl_plan_smoke.py POSE_APPROACH_Z_OFFSET=0.10: the
+# generated pose goal z is target z + 0.10 (approach hover), never the
+# collision-box center; the orientation is the overhead z-down
+# Rz45*Rx180 quaternion (approximately x=0.9238795, y=0.3826834, z=0, w=0,
+# sign-equivalent accepted), not the z-up yaw-only declaration quaternion.
+# ---------------------------------------------------------------------------
+
+def _pose_contract(spec: Mapping[str, object]) -> tuple[list[float], list[float]]:
+    pose = spec["target_pose"]
+    xyz = [float(value) for value in pose["xyz"]]
+    quat = [float(value) for value in pose["quaternion_xyzw"]]
+    return xyz, quat
+
+
+def _assert_overhead_z_down_quaternion(quat: list[float]) -> None:
+    """Assert the overhead z-down Rz45*Rx180 quaternion (sign-equivalent)."""
+    expected = [0.9238795, 0.3826834, 0.0, 0.0]
+    norm = math.sqrt(sum(float(value) ** 2 for value in quat))
+    assert abs(norm - 1.0) <= 1.0e-3, quat
+    dot = abs(sum(a * b for a, b in zip(quat, expected)))
+    assert dot > 0.999, f"orientation {quat} is not overhead z-down Rz45*Rx180"
+
+
+def test_stage_c_pose_dispatch_approaches_above_target_not_collision_center():
+    """RED: the Stage-C pose goal must hover POSE_APPROACH_Z_OFFSET above the
+    target object z, not point at the collision-box center."""
+    from validation.ompl_goal_builders import POSE_APPROACH_Z_OFFSET
+
+    contract = scenario_report_contract("qualification-moveit-plan-pose")
+    declaration = contract["planning_scene_declaration"]
+    target = next(
+        record for record in declaration["objects"]
+        if record["id"] == declaration["target_source_id"]
+    )
+    target_xyz = [float(value) for value in target["pose"]["xyz"]]
+
+    spec = stage_c_dispatch(
+        "qualification-moveit-plan-pose", scenario=readiness_scenario(contract)
+    )
+    xyz, quat = _pose_contract(spec)
+
+    assert POSE_APPROACH_Z_OFFSET == pytest.approx(0.10)
+    assert xyz[0] == pytest.approx(target_xyz[0])
+    assert xyz[1] == pytest.approx(target_xyz[1])
+    # Approach hover, not collision-box center.
+    assert xyz[2] == pytest.approx(target_xyz[2] + POSE_APPROACH_Z_OFFSET), xyz
+    _assert_overhead_z_down_quaternion(quat)
+
+
+def test_stage_d_execute_pose_dispatch_uses_approach_offset_and_overhead_orientation():
+    """RED: the Gate-D execute-pose twin shares the pose approach target
+    behavior (z + POSE_APPROACH_Z_OFFSET, overhead z-down orientation)."""
+    from validation.ompl_goal_builders import POSE_APPROACH_Z_OFFSET
+
+    contract = scenario_report_contract("qualification-moveit-execute-pose")
+    declaration = contract["planning_scene_declaration"]
+    target = next(
+        record for record in declaration["objects"]
+        if record["id"] == declaration["target_source_id"]
+    )
+    target_xyz = [float(value) for value in target["pose"]["xyz"]]
+
+    from validation.integrated_gate_executor import stage_d_dispatch
+
+    spec = stage_d_dispatch(
+        "qualification-moveit-execute-pose", scenario=readiness_scenario(contract)
+    )
+    assert spec["kind"] == "execute-pose"
+    xyz, quat = _pose_contract(spec)
+
+    assert POSE_APPROACH_Z_OFFSET == pytest.approx(0.10)
+    assert xyz[0] == pytest.approx(target_xyz[0])
+    assert xyz[1] == pytest.approx(target_xyz[1])
+    assert xyz[2] == pytest.approx(target_xyz[2] + POSE_APPROACH_Z_OFFSET), xyz
+    _assert_overhead_z_down_quaternion(quat)
+
+
+def test_qualification_pose_scenario_declares_overhead_z_down_orientation():
+    """RED: the generated pose goal (smoke ``build_goal`` pose mode) carries the
+    overhead z-down Rz45*Rx180 orientation and hovers z + POSE_APPROACH_Z_OFFSET.
+    The fixture declaration itself stays yaw-only identity; only the generated
+    goal carries the overhead orientation."""
+    from validation.ompl_goal_builders import POSE_APPROACH_Z_OFFSET
+    from validation.ompl_plan_smoke import build_goal, load_scenario
+
+    scenario = load_scenario(
+        ROOT / "simulation/scenarios/qualification-moveit-plan-pose.json"
+    )
+    declaration = scenario["planning_scene"]
+    target = next(
+        record for record in declaration["objects"]
+        if record["id"] == declaration["target_source_id"]
+    )
+    declared_quat = [float(value) for value in target["pose"]["quaternion_xyzw"]]
+    target_xyz = [float(value) for value in target["pose"]["xyz"]]
+    # Fixture stays yaw-only identity: [0, 0, 0, 1].
+    assert declared_quat[0] == pytest.approx(0.0)
+    assert declared_quat[1] == pytest.approx(0.0)
+    assert declared_quat[2] == pytest.approx(0.0)
+    assert declared_quat[3] == pytest.approx(1.0)
+    # The generated pose goal carries the overhead z-down orientation and the
+    # approach z-offset, not the fixture's yaw-only declaration quaternion.
+    goal = build_goal("pose", scenario)
+    _assert_overhead_z_down_quaternion(list(goal.orientation_xyzw))
+    assert goal.position_xyz[2] == pytest.approx(
+        target_xyz[2] + POSE_APPROACH_Z_OFFSET
+    )
 
 
 def test_journal_graph_projection_fails_closed_on_observed_graph_mutations():
@@ -913,6 +1113,173 @@ def test_journal_graph_projection_fails_closed_on_observed_graph_mutations():
     graph["node_name"] = "/wrong"
     with pytest.raises(ValueError, match="node_name"):
         build_journal_graph_projection(fixture_payload=fixture_payload, observed_graph=graph)
+
+
+def test_journal_graph_projection_accepts_no_publisher_planning_scene_input():
+    """RED: /planning_scene is a subscribed input in this stack.
+
+    The real observed shape for /planning_scene carries no local publisher
+    (``publishers=[]`` and ``offered_qos={}``); only the recorder subscribes and
+    its ``requested_qos`` must stay exactly RELIABLE/VOLATILE/depth 100.
+    No fake QoS may be borrowed for the publisher-less input.  The projection is
+    fed through the downstream ``planning_scene_journal.validate_graph_evidence``
+    so the honest input-only shape is actually accepted by the journal validator.
+    The input-only exception covers both PlanningScene topics; a present-but-wrong
+    offered QoS on /monitored_planning_scene must still fail closed downstream
+    (see test_journal_graph_projection_accepts_monitored_planning_scene_no_publisher_input).
+    """
+    from planning_scene_journal import validate_graph_evidence
+
+    from validation.integrated_gate_executor import (
+        JOURNAL_PLANNING_SCENE_TOPIC_QOS,
+    )
+
+    fixture_payload = _canonical_fixture_payload()
+    graph = copy.deepcopy(_observed_graph_double())
+    # Real shape: no local publisher -> no offered QoS on /planning_scene.
+    graph["topics"]["/planning_scene"]["publishers"] = []
+    graph["topics"]["/planning_scene"]["offered_qos"] = {}
+
+    projection = build_journal_graph_projection(
+        fixture_payload=fixture_payload, observed_graph=graph
+    )
+
+    entry = projection["topics"]["/planning_scene"]
+    assert entry["publishers"] == []
+    assert entry["offered_qos"] == {}
+    assert entry["requested_qos"] == dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS)
+    # /monitored_planning_scene keeps its observed /move_group publisher/QoS.
+    monitored = projection["topics"]["/monitored_planning_scene"]
+    assert monitored["publishers"] == [{"node": "/move_group", "node_namespace": ""}]
+    assert monitored["offered_qos"] == dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS)
+
+    # The downstream journal validator must accept the honest input-only
+    # /planning_scene projection and preserve the empty offered QoS / publishers.
+    normalized = validate_graph_evidence(projection)
+    entry = normalized["topics"]["/planning_scene"]
+    assert entry["publishers"] == []
+    assert entry["offered_qos"] == {}
+    assert entry["requested_qos"] == dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS)
+
+    # Negative: the input-only exception now covers both PlanningScene topics.
+    # A present-but-wrong offered QoS on /monitored_planning_scene must still be
+    # rejected by the downstream journal validator.
+    graph = copy.deepcopy(_observed_graph_double())
+    projection = build_journal_graph_projection(
+        fixture_payload=fixture_payload, observed_graph=graph
+    )
+    projection["topics"]["/monitored_planning_scene"]["offered_qos"] = {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(projection)
+
+
+def test_journal_graph_projection_accepts_monitored_planning_scene_no_publisher_input():
+    """RED: /monitored_planning_scene with no publisher and empty offered QoS.
+
+    Live move_group in this production launch does NOT publish
+    /monitored_planning_scene (build_tinker_ompl_config sets no monitored topic;
+    provider-manifest publishers omit it), yet the executor still subscribes to
+    it as a journal recorder.  The projection must accept the honest empty
+    offered QoS with an empty publisher set (requested QoS stays strict
+    RELIABLE/VOLATILE/depth 100), and the downstream journal validator must
+    accept it too.  A present-but-wrong offered QoS on /monitored_planning_scene
+    still fails closed.
+    """
+    from planning_scene_journal import validate_graph_evidence
+
+    from validation.integrated_gate_executor import (
+        JOURNAL_PLANNING_SCENE_TOPIC_QOS,
+    )
+
+    fixture_payload = _canonical_fixture_payload()
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/monitored_planning_scene"]["publishers"] = []
+    graph["topics"]["/monitored_planning_scene"]["offered_qos"] = {}
+
+    projection = build_journal_graph_projection(
+        fixture_payload=fixture_payload, observed_graph=graph
+    )
+    monitored = projection["topics"]["/monitored_planning_scene"]
+    assert monitored["publishers"] == []
+    assert monitored["offered_qos"] == {}
+    assert monitored["requested_qos"] == dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS)
+
+    normalized = validate_graph_evidence(projection)
+    monitored = normalized["topics"]["/monitored_planning_scene"]
+    assert monitored["publishers"] == []
+    assert monitored["offered_qos"] == {}
+    assert monitored["requested_qos"] == dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS)
+
+    # A present-but-wrong offered QoS on /monitored_planning_scene fails closed.
+    graph = copy.deepcopy(_observed_graph_double())
+    projection = build_journal_graph_projection(
+        fixture_payload=fixture_payload, observed_graph=graph
+    )
+    projection["topics"]["/monitored_planning_scene"]["offered_qos"] = {
+        "reliability": "RELIABLE", "durability": "TRANSIENT_LOCAL", "depth": 1,
+    }
+    with pytest.raises(ValueError, match="QoS"):
+        validate_graph_evidence(projection)
+
+
+def test_journal_graph_projection_accepts_non_move_group_publisher_planning_scene_input():
+    """RED: /planning_scene with a real non-/move_group publisher and no offered QoS.
+
+    Live MoveIt2 shows ``pick_and_place``'s internal ``pick_place_group_node``
+    publishing /planning_scene (via PlanningSceneInterface/MoveGroupInterface);
+    the driver's ``_select_endpoint_qos`` finds no /move_group publisher, so the
+    observed ``offered_qos`` is ``{}``.  The projection builder must accept ANY
+    nonempty publisher set with ``offered_qos=={}`` on /planning_scene (the
+    requested QoS stays strict RELIABLE/VOLATILE/depth 100) and preserve both
+    the publisher metadata and the empty offered QoS; the downstream journal
+    validator must do the same.  A /planning_scene with a present-but-WRONG
+    offered QoS still fails closed.
+    """
+    from planning_scene_journal import validate_graph_evidence
+
+    from validation.integrated_gate_executor import JOURNAL_PLANNING_SCENE_TOPIC_QOS
+
+    fixture_payload = _canonical_fixture_payload()
+    graph = copy.deepcopy(_observed_graph_double())
+    # Live pick_and_place publishes /planning_scene; no /move_group publisher
+    # exists, so the driver observes no offered QoS.
+    graph["topics"]["/planning_scene"]["publishers"] = [
+        {"node": "/pick_place_group_node", "node_namespace": ""}
+    ]
+    graph["topics"]["/planning_scene"]["offered_qos"] = {}
+
+    projection = build_journal_graph_projection(
+        fixture_payload=fixture_payload, observed_graph=graph
+    )
+    entry = projection["topics"]["/planning_scene"]
+    assert entry["publishers"] == [{"node": "/pick_place_group_node", "node_namespace": ""}]
+    assert entry["offered_qos"] == {}
+    assert entry["requested_qos"] == dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS)
+
+    # The downstream journal validator must also accept and preserve the shape.
+    normalized = validate_graph_evidence(projection)
+    entry = normalized["topics"]["/planning_scene"]
+    assert entry["publishers"] == [{"node": "/pick_place_group_node", "node_namespace": ""}]
+    assert entry["offered_qos"] == {}
+    assert entry["requested_qos"] == dict(JOURNAL_PLANNING_SCENE_TOPIC_QOS)
+
+    # Negative: a present-but-wrong offered QoS (TRANSIENT_LOCAL instead of
+    # VOLATILE) is still rejected even with a nonempty publisher set.
+    graph = copy.deepcopy(_observed_graph_double())
+    graph["topics"]["/planning_scene"]["publishers"] = [
+        {"node": "/pick_place_group_node", "node_namespace": ""}
+    ]
+    graph["topics"]["/planning_scene"]["offered_qos"] = {
+        "reliability": "RELIABLE",
+        "durability": "TRANSIENT_LOCAL",
+        "depth": 100,
+    }
+    with pytest.raises(ValueError, match="QoS"):
+        build_journal_graph_projection(
+            fixture_payload=fixture_payload, observed_graph=graph
+        )
 
 
 def _journal_for_contract(tmp_path: Path, contract: dict[str, object]):
@@ -2826,6 +3193,726 @@ def test_f39_visual_event_failures_reset_per_attempt(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# F4: Gate-D retreat/gripper success paths must record terminal evidence.
+#
+# The verifier's ``_terminal_success`` raises "execution summary has no terminal
+# evidence" when ``terminal_status``/``execute_result_status``/
+# ``task_result_status`` are all absent.  The gripper/retreat success paths
+# finalize with ``final_status="diagnostic-pass"`` but historically passed NO
+# terminal evidence, so a physically-successful gripper/retreat was rejected by
+# the verifier.  These tests pin the success-path ``_finalize_d_attempt`` call
+# to carry ``terminal_status="success"``.
+# ---------------------------------------------------------------------------
+
+
+def _f4_fake_gripper_goal(position, *, max_effort):
+    """ROS-free stand-in for ``build_gripper_goal`` (control_msgs import)."""
+    return types.SimpleNamespace(
+        command=types.SimpleNamespace(
+            position=float(position), max_effort=float(max_effort)
+        )
+    )
+
+
+class _F4SucceedingActionClient:
+    """Deterministic action client whose goals are accepted and succeed at once."""
+
+    class _Result:
+        status = 4  # EXECUTE_STATUS_SUCCEEDED
+
+    class _ResultFuture:
+        def done(self):
+            return True
+
+        def result(self):
+            return _F4SucceedingActionClient._Result()
+
+    class _GoalHandle:
+        accepted = True
+
+        def get_result_async(self):
+            return _F4SucceedingActionClient._ResultFuture()
+
+    class _SendFuture:
+        def done(self):
+            return True
+
+        def result(self):
+            return _F4SucceedingActionClient._GoalHandle()
+
+    def wait_for_server(self, timeout_sec=None):
+        return True
+
+    def send_goal_async(self, goal):
+        return self._SendFuture()
+
+
+def _f4_dummy_cloud():
+    """A structurally valid ``base_link`` PointCloud2-shaped object (duck-typed)."""
+    return types.SimpleNamespace(
+        header=types.SimpleNamespace(frame_id="base_link"),
+        width=1,
+        height=1,
+        data=b"\x00" * 8,
+        point_step=8,
+        row_step=8,
+        fields=None,
+    )
+
+
+def _f4_capture_finalize(executor, captured):
+    """Replace ``_finalize_d_attempt`` with a spy recording the finalization call."""
+
+    def _spy_finalize(*args, **kwargs):
+        captured["final_status"] = args[4] if len(args) > 4 else kwargs.get("final_status")
+        captured["terminal_status"] = kwargs.get("terminal_status")
+        captured["kind"] = args[1].get("kind") if len(args) > 1 else None
+        return {
+            "status": "diagnostic-pass",
+            "terminal_status": kwargs.get("terminal_status"),
+        }
+
+    executor._finalize_d_attempt = _spy_finalize
+    return executor
+
+
+def test_f4_gripper_success_path_records_terminal_evidence(tmp_path, monkeypatch):
+    """RED (F4): the gripper success ``_finalize_d_attempt`` call must carry
+    ``terminal_status="success"`` so the verifier accepts the terminal."""
+    import validation.integrated_gate_executor as exec_mod
+
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+    )
+
+    monkeypatch.setattr(exec_mod, "build_gripper_goal", _f4_fake_gripper_goal)
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-moveit-gripper",
+        required_event_order=STAGE_D_REQUIRED_EVENT_ORDER["gripper"],
+        forbidden_events=D_FORBIDDEN_EVENTS,
+    )
+    client = _F4SucceedingActionClient()
+    executor._action_clients = {
+        "/xarm_gripper/gripper_action": client,
+        "/cartesian_move_action": client,
+    }
+    # The real journal snapshot path is exercised elsewhere; here we only need
+    # to reach the success finalization with the terminal-evidence wiring.
+    executor._journal_snapshot_d = lambda event: "recorded"
+    captured: dict[str, object] = {}
+    _f4_capture_finalize(executor, captured)
+
+    record = executor.run_gripper_sequence("qualification-moveit-gripper")
+
+    assert captured["final_status"] == "diagnostic-pass"
+    assert captured["kind"] == "gripper"
+    assert captured["terminal_status"] == "success"
+    assert record["terminal_status"] == "success"
+
+
+def test_f4_retreat_success_path_records_terminal_evidence(tmp_path, monkeypatch):
+    """RED (F4): the retreat success ``_finalize_d_attempt`` call must carry
+    ``terminal_status="success"`` so the verifier accepts the terminal."""
+    import validation.integrated_gate_executor as exec_mod
+
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+    )
+
+    def _fake_cartesian_goal(target_pose, *, env_points=None):
+        return types.SimpleNamespace(target_pose=target_pose, env_points=env_points)
+
+    monkeypatch.setattr(exec_mod, "build_cartesian_move_goal", _fake_cartesian_goal)
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-moveit-cartesian-retreat",
+        required_event_order=STAGE_D_REQUIRED_EVENT_ORDER["retreat"],
+        forbidden_events=D_FORBIDDEN_EVENTS,
+    )
+    client = _F4SucceedingActionClient()
+    executor._action_clients = {
+        "/xarm_gripper/gripper_action": client,
+        "/cartesian_move_action": client,
+    }
+    executor._journal_snapshot_d = lambda event: "recorded"
+    executor.ros = {"serialize_message": lambda msg: b"env-cloud"}
+    captured: dict[str, object] = {}
+    _f4_capture_finalize(executor, captured)
+
+    source = {
+        "frame_id": "base_link",
+        "xyz": [0.2, 0.0, 0.72],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "identity": "tcp-observation-1",
+        "age_s": 0.05,
+    }
+    record = executor.run_cartesian_retreat(
+        "qualification-moveit-cartesian-retreat",
+        current_tcp_pose_provider=lambda: source,
+        environment_cloud_provider=_f4_dummy_cloud,
+    )
+
+    assert captured["final_status"] == "diagnostic-pass"
+    assert captured["kind"] == "retreat"
+    assert captured["terminal_status"] == "success"
+    assert record["terminal_status"] == "success"
+
+
+def test_f4_safety_cancel_presend_after_operator_clear(tmp_path, monkeypatch):
+    """RED (S2): ``_cancel_presend_after_clear`` must cancel the retained
+    ExecuteTrajectory goal on the exact handle after operator-clear so the FJT
+    controller stops streaming a commanded target into the frozen arm.  An
+    absent handle is a no-op and a rejected cancel is recorded, never raised."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.attempt_dir = tmp_path
+    executor._thresholds = lambda: {"cancel_timeout_s": 2.0}
+    handle = types.SimpleNamespace(goal_id=bytes.fromhex("d" * 32))
+    calls: dict[str, object] = {}
+
+    def _fake_normalize(goal_handle):
+        return "d" * 32
+
+    def _fake_cancel(goal_handle, *, expected_goal_uuid, timeout_s):
+        calls["handle"] = goal_handle
+        calls["uuid"] = expected_goal_uuid
+        calls["timeout_s"] = timeout_s
+        return {
+            "response": "accepted",
+            "return_code": 0,
+            "goals_canceling": [expected_goal_uuid],
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor, "_normalize_goal_id", _fake_normalize)
+    monkeypatch.setattr(executor, "_cancel_execute_goal", _fake_cancel)
+
+    outcome = executor._cancel_presend_after_clear(handle)
+    assert outcome["response"] == "accepted"
+    assert calls["handle"] is handle
+    assert calls["uuid"] == "d" * 32
+    assert calls["timeout_s"] == 2.0
+    assert executor._safety_post_clear_cancel["response"] == "accepted"
+
+
+def test_f4_safety_cancel_presend_none_handle_is_noop(tmp_path, monkeypatch):
+    """A missing presend handle must be a no-op (returns None, records nothing)."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.attempt_dir = tmp_path
+    executor._thresholds = lambda: {"cancel_timeout_s": 2.0}
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("cancel must not be called with a None handle")
+
+    monkeypatch.setattr(executor, "_cancel_execute_goal", _boom)
+    assert executor._cancel_presend_after_clear(None) is None
+
+
+def test_f4_safety_cancel_presend_rejected_never_raises(tmp_path, monkeypatch):
+    """A rejected post-clear cancel (goal already terminal after FJT ABORTED)
+    is recorded diagnostically and never raised or failed."""
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.attempt_dir = tmp_path
+    executor._thresholds = lambda: {"cancel_timeout_s": 2.0}
+    handle = types.SimpleNamespace(goal_id=bytes.fromhex("e" * 32))
+    monkeypatch.setattr(executor, "_normalize_goal_id", lambda h: "e" * 32)
+    monkeypatch.setattr(
+        executor,
+        "_cancel_execute_goal",
+        lambda h, *, expected_goal_uuid, timeout_s: {
+            "response": "rejected",
+            "return_code": 3,
+            "goals_canceling": [],
+            "error": "goal already terminated",
+        },
+    )
+    outcome = executor._cancel_presend_after_clear(handle)
+    assert outcome["response"] == "rejected"
+    assert executor._safety_post_clear_cancel["error"] == "goal already terminated"
+
+
+# ---------------------------------------------------------------------------
+# F3 — cartesian-retreat bounded retry on pick_and_place goal rejection.
+#
+# pick_and_place rejects the retreat goal when its INTERNAL runtime observation
+# is not yet ready (``refresh_live_observations`` fails — "live runtime
+# observation is not ready"), even though the executor's own readiness passed.
+# The rejection is transient (pick_and_place becomes ready within seconds), so
+# the executor must retry the send with a bounded budget instead of failing
+# closed on the first rejection.
+# ---------------------------------------------------------------------------
+
+class _F3RejectedGoalHandle:
+    accepted = False
+
+
+class _F3AcceptedGoalHandle:
+    accepted = True
+
+    class _Result:
+        status = 4  # EXECUTE_STATUS_SUCCEEDED
+
+    class _ResultFuture:
+        def done(self):
+            return True
+
+        def result(self):
+            return _F3AcceptedGoalHandle._Result()
+
+    def get_result_async(self):
+        return self._ResultFuture()
+
+
+class _F3RejectThenAcceptClient:
+    """Rejects the first ``reject_count`` sends, then accepts."""
+
+    def __init__(self, reject_count: int = 1):
+        self.reject_count = int(reject_count)
+        self.sends = 0
+
+    class _SendFuture:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def done(self):
+            return True
+
+        def result(self):
+            return self._handle
+
+    def wait_for_server(self, timeout_sec=None):
+        return True
+
+    def send_goal_async(self, goal):
+        self.sends += 1
+        if self.sends <= self.reject_count:
+            return self._SendFuture(_F3RejectedGoalHandle())
+        return self._SendFuture(_F3AcceptedGoalHandle())
+
+
+def test_f3_cartesian_retreat_retries_transient_rejection(tmp_path, monkeypatch):
+    """RED (F3): a transient pick_and_place goal rejection (internal runtime
+    observation not yet ready) must be retried with a bounded budget so the
+    retreat still reaches the success finalization."""
+    import validation.integrated_gate_executor as exec_mod
+
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+    )
+
+    def _fake_cartesian_goal(target_pose, *, env_points=None):
+        return types.SimpleNamespace(target_pose=target_pose, env_points=env_points)
+
+    monkeypatch.setattr(exec_mod, "build_cartesian_move_goal", _fake_cartesian_goal)
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-moveit-cartesian-retreat",
+        required_event_order=STAGE_D_REQUIRED_EVENT_ORDER["retreat"],
+        forbidden_events=D_FORBIDDEN_EVENTS,
+    )
+    executor.config = {
+        **executor.config,
+        "thresholds": {
+            **executor.config["thresholds"],
+            "cartesian_reject_retry_budget_s": 0.5,
+        },
+    }
+    client = _F3RejectThenAcceptClient(reject_count=1)
+    executor._action_clients = {
+        "/xarm_gripper/gripper_action": client,
+        "/cartesian_move_action": client,
+    }
+    executor._journal_snapshot_d = lambda event: "recorded"
+    executor.ros = {"serialize_message": lambda msg: b"env-cloud"}
+    captured: dict[str, object] = {}
+    _f4_capture_finalize(executor, captured)
+
+    source = {
+        "frame_id": "base_link",
+        "xyz": [0.2, 0.0, 0.72],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "identity": "tcp-observation-1",
+        "age_s": 0.05,
+    }
+    record = executor.run_cartesian_retreat(
+        "qualification-moveit-cartesian-retreat",
+        current_tcp_pose_provider=lambda: source,
+        environment_cloud_provider=_f4_dummy_cloud,
+    )
+
+    assert captured["final_status"] == "diagnostic-pass"
+    assert client.sends >= 2, (
+        "a transient rejection must be retried (observed sends "
+        f"={client.sends}, expected >= 2)"
+    )
+    assert record["status"] == "diagnostic-pass"
+
+
+def test_f3_cartesian_retreat_fails_closed_when_rejection_persists(tmp_path, monkeypatch):
+    """F3: when the rejection persists beyond the bounded retry budget the
+    retreat fails closed with the rejection reason (never retries forever)."""
+    import validation.integrated_gate_executor as exec_mod
+
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+    )
+
+    def _fake_cartesian_goal(target_pose, *, env_points=None):
+        return types.SimpleNamespace(target_pose=target_pose, env_points=env_points)
+
+    monkeypatch.setattr(exec_mod, "build_cartesian_move_goal", _fake_cartesian_goal)
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-moveit-cartesian-retreat",
+        required_event_order=STAGE_D_REQUIRED_EVENT_ORDER["retreat"],
+        forbidden_events=D_FORBIDDEN_EVENTS,
+    )
+    executor.config = {
+        **executor.config,
+        "thresholds": {
+            **executor.config["thresholds"],
+            "cartesian_reject_retry_budget_s": 0.1,
+        },
+    }
+    # Reject every send (never becomes ready).
+    client = _F3RejectThenAcceptClient(reject_count=10 ** 9)
+    executor._action_clients = {
+        "/xarm_gripper/gripper_action": client,
+        "/cartesian_move_action": client,
+    }
+    executor._journal_snapshot_d = lambda event: "recorded"
+    executor.ros = {"serialize_message": lambda msg: b"env-cloud"}
+    # Keep the real _finalize_d_attempt so the record carries the rejection error.
+    source = {
+        "frame_id": "base_link",
+        "xyz": [0.2, 0.0, 0.72],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "identity": "tcp-observation-1",
+        "age_s": 0.05,
+    }
+    record = executor.run_cartesian_retreat(
+        "qualification-moveit-cartesian-retreat",
+        current_tcp_pose_provider=lambda: source,
+        environment_cloud_provider=_f4_dummy_cloud,
+    )
+    assert record["status"] == "evidence-invalid"
+    assert "cartesian goal was rejected" in record["execute_error"]
+
+
+def test_f3_cartesian_rejection_reason_persists_to_execution_json(tmp_path, monkeypatch):
+    """RED (R2): the durable ``integrated-execution.json`` must record the
+    ``execute_error`` rejection reason.  rerun-6 showed ``execute_error: null``
+    on a 20 s cartesian-rejection attempt even though the retry loop set it —
+    ``_write_d_artifacts`` dropped the field from the JSON write.  Without the
+    reason in the durable artifact the operator/verifier cannot distinguish a
+    server-unavailable failure from a persistent pick_and_place rejection."""
+    import json as _json
+
+    import validation.integrated_gate_executor as exec_mod
+
+    from validation.integrated_gate_executor import (
+        D_FORBIDDEN_EVENTS,
+        STAGE_D_REQUIRED_EVENT_ORDER,
+    )
+
+    def _fake_cartesian_goal(target_pose, *, env_points=None):
+        return types.SimpleNamespace(target_pose=target_pose, env_points=env_points)
+
+    monkeypatch.setattr(exec_mod, "build_cartesian_move_goal", _fake_cartesian_goal)
+    executor = _flow_executor(
+        tmp_path,
+        "qualification-moveit-cartesian-retreat",
+        required_event_order=STAGE_D_REQUIRED_EVENT_ORDER["retreat"],
+        forbidden_events=D_FORBIDDEN_EVENTS,
+    )
+    executor.config = {
+        **executor.config,
+        "thresholds": {
+            **executor.config["thresholds"],
+            "cartesian_reject_retry_budget_s": 0.1,
+        },
+    }
+    # Reject every send (never becomes ready) — the real pick_and_place contract
+    # rejection (joint state topic contract invalid) persists for the full budget.
+    client = _F3RejectThenAcceptClient(reject_count=10 ** 9)
+    executor._action_clients = {
+        "/xarm_gripper/gripper_action": client,
+        "/cartesian_move_action": client,
+    }
+    executor._journal_snapshot_d = lambda event: "recorded"
+    executor.ros = {"serialize_message": lambda msg: b"env-cloud"}
+    source = {
+        "frame_id": "base_link",
+        "xyz": [0.2, 0.0, 0.72],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "identity": "tcp-observation-1",
+        "age_s": 0.05,
+    }
+    executor.run_cartesian_retreat(
+        "qualification-moveit-cartesian-retreat",
+        current_tcp_pose_provider=lambda: source,
+        environment_cloud_provider=_f4_dummy_cloud,
+    )
+    execution_path = tmp_path / "integrated-execution.json"
+    assert execution_path.exists(), "integrated-execution.json was not written"
+    payload = _json.loads(execution_path.read_text(encoding="utf-8"))
+    assert payload.get("execute_error"), (
+        "integrated-execution.json must record the execute_error rejection "
+        f"reason (got {payload.get('execute_error')!r})"
+    )
+    assert "cartesian goal was rejected" in payload["execute_error"]
+
+
+# ---------------------------------------------------------------------------
+# F1 — production-equivalent execution slowdown for execute-joint/execute-pose.
+#
+# Production pick_and_place applies ``apply_execution_slowdown(k=2.0)`` to every
+# planned trajectory AFTER planning, BEFORE execution (grasp_node.hpp): time
+# scales by k, velocities by 1/k, accelerations by 1/k^2.  The Stage-D executor
+# did NOT, so its trajectories executed twice as fast as production and the FJT
+# controller was still settling at the execution-terminal frame — the verifier
+# measured ``joint_final_error_rad`` 0.0165 > 0.01.  These tests pin the exact
+# production scaling so the qualification validates the PRODUCTION integration.
+# ---------------------------------------------------------------------------
+
+
+def _f1_point(t_sec: float, velocities, accelerations):
+    from builtin_interfaces.msg import Duration
+
+    whole = int(t_sec)
+    point = types.SimpleNamespace(
+        velocities=list(velocities),
+        accelerations=list(accelerations),
+        time_from_start=Duration(),
+    )
+    point.time_from_start.sec = whole
+    point.time_from_start.nanosec = int(round((t_sec - whole) * 1e9))
+    return point
+
+
+def _f1_trajectory(points):
+    return types.SimpleNamespace(
+        joint_trajectory=types.SimpleNamespace(points=list(points))
+    )
+
+
+def test_f1_apply_execution_slowdown_matches_production_scaling():
+    """RED (F1): the executor must expose an ``apply_execution_slowdown`` helper
+    matching production: time_from_start *= k, velocities /= k, accelerations /=
+    k^2 for every trajectory point."""
+    from validation.integrated_gate_executor import apply_execution_slowdown
+
+    pts = [
+        _f1_point(1.0, [0.4, 0.2], [0.8, 0.4]),
+        _f1_point(2.5, [0.0, 0.0], [0.0, 0.0]),
+    ]
+    apply_execution_slowdown(_f1_trajectory(pts), k=2.0)
+
+    assert pts[0].time_from_start.sec == 2
+    assert pts[0].time_from_start.nanosec == 0
+    assert pts[1].time_from_start.sec == 5
+    assert pts[1].time_from_start.nanosec == 0
+    assert pts[0].velocities == pytest.approx([0.2, 0.1])
+    assert pts[0].accelerations == pytest.approx([0.2, 0.1])
+    assert pts[1].velocities == pytest.approx([0.0, 0.0])
+    assert pts[1].accelerations == pytest.approx([0.0, 0.0])
+
+
+def test_f1_apply_execution_slowdown_noop_below_or_at_unity():
+    """A slowdown factor <= 1.0 is a no-op (production contract)."""
+    from validation.integrated_gate_executor import apply_execution_slowdown
+
+    pts = [_f1_point(1.0, [0.4], [0.8])]
+    apply_execution_slowdown(_f1_trajectory(pts), k=1.0)
+    assert pts[0].time_from_start.sec == 1
+    assert pts[0].velocities == pytest.approx([0.4])
+    assert pts[0].accelerations == pytest.approx([0.8])
+
+
+def test_p2_execute_pose_uses_pose_specific_slowdown_k():
+    """RED (P2): the Cartesian/TCP execute-pose path needs a higher execution
+    slowdown than execute-joint — the FJT controller aborts
+    PATH_TOLERANCE_VIOLATED on the pose path (live rerun-5 joint2 position error
+    -1.017 > 1.0 tolerance) while execute-joint passes at k=2.0.  The executor
+    must select a pose-specific slowdown factor (3.0) for execute-pose while
+    keeping the production k=2.0 for execute-joint."""
+    from validation.integrated_gate_executor import execution_slowdown_k
+
+    assert execution_slowdown_k({"kind": "execute-pose"}) == 3.0
+    assert execution_slowdown_k({"kind": "execute-joint"}) == 2.0
+    # Non-pose D kinds keep the production k=2.0.
+    for kind in ("execute-joint", "safety", "cancel", "retreat", "gripper"):
+        assert execution_slowdown_k({"kind": kind}) == 2.0, kind
+
+
+def _p_point(joint_positions, t_sec: float = 1.0):
+    """Build a trajectory point with a 7-joint positions array (no velocities)."""
+    point = types.SimpleNamespace(
+        positions=[float(value) for value in joint_positions],
+        velocities=[],
+        accelerations=[],
+    )
+    point.time_from_start = types.SimpleNamespace(sec=int(t_sec), nanosec=0)
+    return point
+
+
+def _p_point_array(joint_positions, t_sec: float = 1.0):
+    """Build a trajectory point exactly like ``_p_point`` but with the positions
+    stored in an ``array.array`` (the real rclpy ``JointTrajectoryPoint.positions``
+    shape), to prove the type-guarded unwrap path handles live messages."""
+    point = types.SimpleNamespace(
+        positions=array.array("d", [float(value) for value in joint_positions]),
+        velocities=[],
+        accelerations=[],
+    )
+    point.time_from_start = types.SimpleNamespace(sec=int(t_sec), nanosec=0)
+    return point
+
+
+def test_p_unwrap_joint_trajectory_removes_full_turn_wrap():
+    """RED (P): the execute-pose OMPL plan wrapped joint1 through -4.478 rad
+    (a full extra turn) instead of the equivalent +1.805 rad short path, so the
+    arm swung the long way around and the FJT controller aborted
+    PATH_TOLERANCE_VIOLATED (state tolerance, joint2 error -1.044 rad).  The
+    executor must unwrap every joint so each step stays within (-pi, pi]."""
+    from validation.integrated_gate_executor import unwrap_joint_trajectory
+
+    # Live execute-pose shape: joint1 0 -> -4.478 (wrapped), other joints small.
+    pts = [
+        _p_point([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=0.0),
+        _p_point([-4.478, 0.7, 0.0, 0.9, 0.0, 0.5, 0.0], t_sec=1.0),
+    ]
+    unwrap_joint_trajectory(_f1_trajectory(pts))
+    j1 = [point.positions[0] for point in pts]
+    # joint1 must take the short path: 0 -> +1.805 (=-4.478+2*pi), not -4.478.
+    assert abs(j1[-1] - 1.805) <= 0.001, f"joint1 not unwrapped to short path: {j1}"
+    assert abs(j1[0] - 0.0) <= 1e-9, "start position must stay at the current state"
+    # Every step within (-pi, pi].
+    for point in pts:
+        for value in point.positions:
+            assert -math.pi <= value <= math.pi, f"step not within (-pi, pi]: {value}"
+
+
+def test_p_unwrap_joint_trajectory_handles_multi_point_and_other_joints():
+    """A multi-waypoint path that wraps mid-way is unwrapped only after the jump,
+    and joints already within (-pi, pi] are left untouched."""
+    from validation.integrated_gate_executor import unwrap_joint_trajectory
+
+    pts = [
+        _p_point([0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=0.0),
+        _p_point([0.5, 0.31, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=1.0),
+        _p_point([-4.478, 0.32, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=2.0),
+        _p_point([-4.2, 0.33, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=3.0),
+    ]
+    unwrap_joint_trajectory(_f1_trajectory(pts))
+    j1 = [point.positions[0] for point in pts]
+    assert abs(j1[0] - 0.0) <= 1e-9
+    assert abs(j1[1] - 0.5) <= 1e-9
+    # After the wrap jump, subsequent points are shifted by +2*pi.
+    assert abs(j1[2] - (-4.478 + 2 * math.pi)) <= 1e-9, f"j1[2]={j1[2]}"
+    assert abs(j1[3] - (-4.2 + 2 * math.pi)) <= 1e-9, f"j1[3]={j1[3]}"
+    # Non-wrapped joint (joint2) untouched.
+    j2 = [point.positions[1] for point in pts]
+    assert j2 == pytest.approx([0.3, 0.31, 0.32, 0.33])
+
+
+def test_p_unwrap_joint_trajectory_removes_full_turn_wrap_array():
+    """RED (P): real rclpy ``JointTrajectoryPoint.positions`` is an
+    ``array.array``, not a ``list``/``tuple``, so the ``isinstance`` guards in
+    ``unwrap_joint_trajectory`` skip every point and the full-turn wrap survives.
+    With the type-guard fix the array shape must unwrap exactly like the list
+    shape (joint1 0 -> -4.478 must take the short path 0 -> +1.805)."""
+    from validation.integrated_gate_executor import unwrap_joint_trajectory
+
+    # Live execute-pose shape but stored in array.array (real message layout).
+    pts = [
+        _p_point_array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=0.0),
+        _p_point_array([-4.478, 0.7, 0.0, 0.9, 0.0, 0.5, 0.0], t_sec=1.0),
+    ]
+    unwrap_joint_trajectory(_f1_trajectory(pts))
+    j1 = [point.positions[0] for point in pts]
+    assert abs(j1[-1] - 1.805) <= 0.001, f"joint1 not unwrapped to short path: {j1}"
+    assert abs(j1[0] - 0.0) <= 1e-9, "start position must stay at the current state"
+    for point in pts:
+        for value in point.positions:
+            assert -math.pi <= value <= math.pi, f"step not within (-pi, pi]: {value}"
+
+
+def test_canonical_goal_endpoint_returns_canonical_when_wrapped():
+    """RED (P3): a pose-goal OMPL plan can sample a WRAPPED IK goal — a
+    continuous joint offset by a full 2*pi turn (joint5 -> -6.283 instead of 0,
+    joint7 -> +5.519 instead of -0.764).  Per-step unwrap cannot shorten a
+    smooth full-turn wind, so ``canonical_goal_endpoint`` must canonicalize the
+    endpoint relative to the start into (-pi, pi] for each continuous joint
+    (joint1/3/5/7) and return a re-plan goal; a short endpoint returns None."""
+    from validation.integrated_gate_executor import canonical_goal_endpoint
+
+    # joint5 winds smoothly 0 -> -6.283 (a full -2*pi turn), joint7 winds
+    # 0 -> +5.519 (a +2*pi turn short of -0.764); both stored array.array.
+    pts = [
+        _p_point_array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=0.0),
+        _p_point_array([0.0, 0.0, 0.0, 0.0, -0.5, 0.0, 0.5], t_sec=1.0),
+        _p_point_array([0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0], t_sec=2.0),
+        _p_point_array([0.0, 0.0, 0.0, 0.0, -2.0, 0.0, 2.0], t_sec=3.0),
+        _p_point_array([0.0, 0.0, 0.0, 0.0, -4.0, 0.0, 4.0], t_sec=4.0),
+        _p_point_array([0.0, 0.0, 0.0, 0.0, -6.283, 0.0, 5.519], t_sec=5.0),
+    ]
+    canonical = canonical_goal_endpoint(_f1_trajectory(pts))
+    assert canonical is not None, "wrapped endpoint must canonicalize to a re-plan goal"
+    assert len(canonical) == 7
+    # joint5: -6.283 is within (-pi, pi] of start 0 after dropping one turn -> ~0.
+    assert abs(canonical[4] - 0.0) <= 0.001, f"joint5 not canonicalized: {canonical[4]}"
+    # joint7: +5.519 minus one turn = -0.764.
+    assert abs(canonical[6] - (5.519 - 2 * math.pi)) <= 0.001, \
+        f"joint7 not canonicalized: {canonical[6]}"
+
+
+def test_canonical_goal_endpoint_none_when_short():
+    """A trajectory whose endpoint is already within (-pi, pi] of the start on
+    every continuous joint is short — no re-plan goal is needed (None)."""
+    from validation.integrated_gate_executor import canonical_goal_endpoint
+
+    pts = [
+        _p_point_array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], t_sec=0.0),
+        _p_point_array([0.5, 0.3, 0.2, 0.1, 1.5, -0.3, -0.764], t_sec=1.0),
+    ]
+    assert canonical_goal_endpoint(_f1_trajectory(pts)) is None
+
+
+def test_r1_plan_invalid_postprocessing_signature():
+    """RED (R1): the Gate-D execute sequence retries the plan-only goal ONLY on
+    the OMPL invalid-postprocessing signature — a ``diagnostic-fail`` plan that
+    still returned a NON-EMPTY ``planned_trajectory``.  rerun-7 execute-pose
+    failed exactly this way: the parallel planner found a 46-state solution, the
+    pipeline's dense ``isPathValid`` rejected the simplified path at waypoint 11
+    (link6<->base_link) with ``INVALID_MOTION_PLAN``, yet the trajectory digest
+    was populated.  A genuinely-blocked goal has an EMPTY trajectory and must
+    never be retried."""
+    from types import SimpleNamespace
+
+    from validation.integrated_gate_executor import _plan_invalid_postprocessing
+
+    with_points = SimpleNamespace(joint_trajectory=SimpleNamespace(points=[object()]))
+    empty = SimpleNamespace(joint_trajectory=SimpleNamespace(points=[]))
+    assert _plan_invalid_postprocessing("diagnostic-fail", with_points) is True
+    # Success and blocked signatures never retry.
+    assert _plan_invalid_postprocessing("diagnostic-pass", with_points) is False
+    assert _plan_invalid_postprocessing("diagnostic-fail", empty) is False
+    assert _plan_invalid_postprocessing("diagnostic-fail", None) is False
+    assert _plan_invalid_postprocessing("evidence-invalid", with_points) is False
+
+
+# ---------------------------------------------------------------------------
 # F3.4: qualification visual capture consumer (ROS-free, fake app/backend).
 #
 # The consumer services the executor-written ``visual-capture-requests.jsonl``
@@ -3327,4 +4414,200 @@ def test_f54_image_persistence_failure_cannot_append_keyframe(tmp_path, monkeypa
     assert len(capture._errors) == 1
     assert "failed" in capture._errors[0]
     capture.poll()
-    assert len(capture._errors) == 1
+
+
+def test_scene_callback_preserves_fixture_world_on_empty_diff():
+    """RED: ``_make_scene_callback`` must preserve the prior fixture world fields
+    when a diff message (``is_diff=True``) normalizes to empty owned/attached ids.
+
+    Live defect: a MoveIt ``PlanningScene`` diff carries only changes; an empty
+    ``world`` in a diff means "no world changes", not "world is now empty".
+    The callback unconditionally replaces ``_latest_planning_scene`` with the
+    normalized result, so a diff normalizing to ``owned_ids=[]`` erases the
+    fixture world (owned ids, geometry, digest).  Desired: accept the newer
+    ``scene_sequence``/``source`` and keep ``_planning_scene_invalid`` clear,
+    while preserving the prior fixture world fields (``owned_ids``,
+    ``fixture_geometry``, ``fixture_geometry_digest``).
+    """
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor._scene_sequence = 10
+    executor.fixture_revision = "r1"
+    executor.scenario = {
+        "planning_scene_declaration": {
+            "objects": [{"id": "fixture_a"}, {"id": "fixture_b"}],
+            "diagnostic_objects": [],
+        }
+    }
+    executor.ros = {"serialize_message": lambda _message: b"\x00\x01"}
+    executor._latest_planning_scene = {
+        "scene_sequence": 10,
+        "scene_timestamp": 1.0,
+        "owned_ids": ["fixture_a", "fixture_b"],
+        "attached_ids": [],
+        "attached_links": {},
+        "touch_links": {},
+        "fixture_revision": "r1",
+        "fixture_geometry_digest": "FIXTURE_DIGEST",
+        "fixture_geometry": [{"id": "fixture_a"}, {"id": "fixture_b"}],
+        "scene_revision_digest": "scene1",
+        "acm_digest": "acm1",
+        "robot_state_digest": "rs1",
+        "source": "/sim/status/planning_scene_fixture",
+    }
+    executor._planning_scene_invalid = False
+    executor._scene_invalid_sequence = None
+
+    # A diff message whose world carries no collision objects normalizes to
+    # empty owned/attached ids but a newer sequence/source.
+    message = types.SimpleNamespace(
+        is_diff=True,
+        world=types.SimpleNamespace(collision_objects=[]),
+        robot_state=types.SimpleNamespace(attached_collision_objects=[]),
+        allowed_collision_matrix=types.SimpleNamespace(),
+    )
+
+    callback = executor._make_scene_callback("/get_planning_scene")
+    callback(message)
+
+    cache = executor._latest_planning_scene
+    assert cache["scene_sequence"] == 11, cache["scene_sequence"]
+    assert cache["source"] == "/get_planning_scene", cache["source"]
+    assert executor._planning_scene_invalid is False
+    assert executor._scene_invalid_sequence is None
+    # The prior fixture world fields survive the empty diff.
+    assert cache["owned_ids"] == ["fixture_a", "fixture_b"], cache["owned_ids"]
+    assert cache["fixture_geometry_digest"] == "FIXTURE_DIGEST", cache["fixture_geometry_digest"]
+    assert cache["fixture_geometry"] == [{"id": "fixture_a"}, {"id": "fixture_b"}]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4 (F4.1): fixture geometry projection canonicalizes MoveIt's root
+# ``world`` alias back to the declared frame before digest comparison.
+# ---------------------------------------------------------------------------
+
+def test_fixture_geometry_projection_canonicalizes_moveit_world_alias_to_declared_frame():
+    """F4.1: MoveIt readback moves every object into its root ``world`` frame
+    and shifts the transform into ``CollisionObject.pose``; the executor must
+    canonicalize that exact alias to the declared frame before projecting, so
+    the F3.3 geometry digest still equals the declared fixture geometry."""
+    from validation.integrated_gate_executor import (
+        IntegratedGateExecutor,
+        expected_fixture_geometry_digest,
+    )
+
+    contract = scenario_report_contract("qualification-moveit-plan-joint")
+    declaration = contract["planning_scene_declaration"]
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor.scenario = {"planning_scene_declaration": declaration}
+
+    def _pose(x, y, z, qx, qy, qz, qw):
+        return types.SimpleNamespace(
+            position=types.SimpleNamespace(x=x, y=y, z=z),
+            orientation=types.SimpleNamespace(x=qx, y=qy, z=qz, w=qw),
+        )
+
+    # Build the message exactly as MoveIt readback canonicalizes it: every
+    # collision object carries header.frame_id == 'world', the declared object
+    # xyz/quaternion lives in CollisionObject.pose, one BOX SolidPrimitive with
+    # the declared dimensions, and an identity local primitive pose.
+    collision_objects = []
+    for record in declaration["objects"]:
+        collision_objects.append(
+            types.SimpleNamespace(
+                id=record["id"],
+                header=types.SimpleNamespace(frame_id="world"),
+                pose=_pose(*record["pose"]["xyz"], *record["pose"]["quaternion_xyzw"]),
+                primitives=[
+                    types.SimpleNamespace(
+                        type=1, dimensions=list(record["primitive"]["dimensions"])
+                    )
+                ],
+                primitive_poses=[_pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)],
+                meshes=[],
+                mesh_poses=[],
+            )
+        )
+    message = types.SimpleNamespace(
+        world=types.SimpleNamespace(collision_objects=collision_objects)
+    )
+
+    digest, descriptors = executor._fixture_geometry_projection(message)
+
+    # Every projected descriptor is bound to the declared frame ('base_link'),
+    # never MoveIt's root 'world' alias.
+    assert descriptors and [descriptor["frame_id"] for descriptor in descriptors] == [
+        declaration["frame_id"] for _ in descriptors
+    ]
+    assert all(
+        descriptor["frame_id"] == declaration["frame_id"] for descriptor in descriptors
+    )
+    assert all(descriptor["frame_id"] != "world" for descriptor in descriptors)
+    # The canonicalized projection matches the declared fixture geometry digest.
+    assert digest == expected_fixture_geometry_digest(declaration)
+
+
+def test_s_post_clear_stability_tolerates_sim_floor_oscillation():
+    """RED (S): the safety post-clear ``quiescent`` predicate must tolerate the
+    sim's measured joint-state floor oscillation.
+
+    Live Stage-D evidence (task66-ompl-stage-d-20260808T145207, safety
+    attempt) shows Isaac's ``/isaac_joint_states`` topic reports a phantom
+    ~1 Hz velocity bias (joint2 ~= -0.027 rad/s, joint4 ~= +0.016 rad/s)
+    whenever the arm is at rest without an active controller command, while
+    the arm POSITION stays frozen well inside ``safety_position_creep_rad``.
+    The configured ``safety_stop_velocity_rad_s`` must sit above that floor so
+    the executor reaches the ``quiescent`` journal anchor; the verifier's
+    safety acceptance is position-based (target_frozen / position creep), so
+    the phantom never represents a real resumed motion."""
+    import time as _time
+    import uuid as _uuid
+
+    from validation.integrated_gate_executor import IntegratedGateExecutor
+
+    config_path = ROOT / "simulation/qualification/integrated-ompl.json"
+    with config_path.open() as fh:
+        config = json.load(fh)
+    thresholds = config["thresholds"]
+    velocity_limit = float(thresholds["safety_stop_velocity_rad_s"])
+    creep_limit = float(thresholds["safety_position_creep_rad"])
+
+    # Measured post-clear joint-state frame (task66 safety attempt, t=5.33):
+    # phantom velocity bias on a frozen arm; position creep well within limit.
+    phantom_velocities = [0.001, -0.027, 0.001, 0.016, 0.007, -0.004, 0.003]
+    clear_positions = [0.0008, 0.0059, 0.0002, -0.0045, -0.0014, 0.0011, 0.0]
+    frame_positions = [0.0009, 0.0060, 0.0002, -0.0044, -0.0014, 0.0011, 0.0001]
+
+    executor = object.__new__(IntegratedGateExecutor)
+    executor._fjt_status_cache = []
+    executor._joint_velocity_frames = [
+        {
+            "seq": 500 + index,
+            "received_mono": float(_time.monotonic()),
+            "velocities": list(phantom_velocities),
+            "positions": list(frame_positions),
+        }
+        for index in range(6)
+    ]
+    executor._spinner = types.SimpleNamespace(spin_once=lambda *a, **k: None)
+
+    baseline = {
+        "fjt_seq": 0,
+        "joint_seq": 499,
+        "clear_positions": list(clear_positions),
+    }
+    result = executor._wait_for_post_clear_stability(
+        0.2,
+        baseline=baseline,
+        known_goal_id=_uuid.uuid4().hex,
+        velocity_limit=velocity_limit,
+        creep_limit=creep_limit,
+    )
+    assert result["stable"] is True, (
+        "safety post-clear stability rejected the sim floor oscillation "
+        f"(velocities {phantom_velocities}, positions {frame_positions}) with "
+        f"configured safety_stop_velocity_rad_s={velocity_limit}: "
+        f"{result.get('reason')}"
+    )

@@ -40,6 +40,7 @@ class _Runner:
     def __init__(self, outcomes, attempts=3):
         self.outcomes = iter(outcomes)
         self._reset = object()
+        self._state = object()
         self.reset_attempts = attempts
         self.reset_retry_delay_s = 0
         self.calls = 0
@@ -97,6 +98,55 @@ def test_initial_reset_exhaustion_is_bounded_and_preserves_failure_context() -> 
     assert runner.calls == 2
 
 
+def test_set_simulation_state_retries_bounded_service_startup_failures() -> None:
+    """RED (F5): /set_simulation_state is a transient startup race (the live
+    cancel run died on ``standard service timed out: /set_simulation_state``) and
+    must be retried with the same bounded budget as the initial reset."""
+    runner = _Runner(
+        [
+            scenario_runner._RetryableServiceError("timed out"),
+            scenario_runner._RetryableServiceError("unavailable"),
+            "state-ok",
+        ]
+    )
+
+    with patch.object(scenario_runner.time, "sleep") as sleep:
+        assert (
+            scenario_runner.ScenarioRunner._call_state(runner, object()) == "state-ok"
+        )
+
+    assert runner.calls == 3
+    assert runner.warnings == [
+        "set_simulation_state attempt 1/3 did not complete: timed out; retrying",
+        "set_simulation_state attempt 2/3 did not complete: unavailable; retrying",
+    ]
+    sleep.assert_not_called()
+
+
+def test_set_simulation_state_exhaustion_is_bounded_and_preserves_context() -> None:
+    """F5: a persistently failing set_simulation_state fails closed after the
+    bounded attempts with the last retryable error preserved."""
+    runner = _Runner(
+        [scenario_runner._RetryableServiceError("not ready")] * 2,
+        attempts=2,
+    )
+
+    with pytest.raises(RuntimeError, match="set_simulation_state failed after 2 attempts"):
+        scenario_runner.ScenarioRunner._call_state(runner, object())
+
+    assert runner.calls == 2
+
+
+def test_set_simulation_state_does_not_retry_strict_server_rejection() -> None:
+    """F5: a genuine non-retryable server rejection is not retried."""
+    runner = _Runner([RuntimeError("rejected")])
+
+    with pytest.raises(RuntimeError, match="rejected"):
+        scenario_runner.ScenarioRunner._call_state(runner, object())
+
+    assert runner.calls == 1
+
+
 def test_spawn_failure_is_not_retried() -> None:
     runner = object.__new__(scenario_runner.ScenarioRunner)
     runner._spawn = object()
@@ -141,7 +191,7 @@ def test_planning_scene_scenario_compiles_without_extra_spawn_operations() -> No
 
     root = Path(__file__).resolve().parents[1]
     scenario = load_named_scenario(
-        root, "qualification-moveit-plan-blocked"
+        root, "qualification-moveit-plan-pose"
     )
     assert scenario.planning_scene is not None
     operations = standard_operations(root, scenario, seed=7)
@@ -157,7 +207,7 @@ def test_planning_scene_scenario_compiles_without_extra_spawn_operations() -> No
     assert final_state["boundary"] == "PHYSICS_READY"
     # The final operation carries the immutable scenario mapping plus the
     # planning-scene and integrated mappings (Task 1), alongside seed.
-    assert final_state["scenario"]["id"] == "qualification-moveit-plan-blocked"
+    assert final_state["scenario"]["id"] == "qualification-moveit-plan-pose"
     assert final_state["scenario"]["seed"] == 7
     # The identity-free declaration carries the immutable spec (including the
     # planning-scene and integrated mappings) but never the id/seed identity keys.
@@ -165,7 +215,7 @@ def test_planning_scene_scenario_compiles_without_extra_spawn_operations() -> No
     assert "seed" not in final_state["scenario"]["declaration"]
     assert final_state["scenario"]["declaration"]["integrated"]["stage"] == "C"
     assert final_state["seed"] == 7
-    assert final_state["planning_scene"]["revision"] == "2026-08-01-moveit-qualification-blocked"
+    assert final_state["planning_scene"]["revision"] == "2026-08-08-moveit-qualification-pose"
     assert final_state["integrated"]["stage"] == "C"
 
 

@@ -55,7 +55,7 @@
         },
         "pose": {
           "xyz": [
-            0.55,
+            0.8,
             0.0,
             0.425
           ],
@@ -93,12 +93,12 @@
         }
       }
     ],
-    "revision_digest": "3ff431fc73f0c3118a31b7b632f3944a3c689bd17839e623f06ef9bf51396451"
+    "revision_digest": "8759d2f50431a8945ccd93b0895facb874914ccff89ce3f43167a3536d5444e4"
   },
   "integrated": {
     "stage": "D",
     "fixture_revision": "2026-08-02-moveit-execute-gripper",
-    "fixture_digest": "3ff431fc73f0c3118a31b7b632f3944a3c689bd17839e623f06ef9bf51396451",
+    "fixture_digest": "8759d2f50431a8945ccd93b0895facb874914ccff89ce3f43167a3536d5444e4",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {

@@ -5,7 +5,7 @@ The tests build a self-consistent fixture from scratch:
 * a real production Git repository whose immutable files (SRDF, controllers.yaml,
   C++ sources, launch, .action schemas) are committed at a real
   ``implementation_head``;
-* a simulator tree whose config, 17 configured scenario declarations, overlay
+* a simulator tree whose config, 16 configured scenario declarations, overlay
   contract, model bundle and provider manifest are internally consistent
   (hashes recomputed in the same canonical way the checker expects);
 * a produced three-entry source-lock manifest referencing the production
@@ -61,7 +61,6 @@ REAL_CONFIG = ROOT / CONFIG_REL
 SCENARIO_OWNED = {
     "qualification-moveit-plan-joint": ["sim_fixture/pedestal", "sim_fixture/public_target"],
     "qualification-moveit-plan-pose": ["sim_fixture/pedestal", "sim_fixture/public_target"],
-    "qualification-moveit-plan-blocked": ["sim_fixture/pedestal", "sim_fixture/public_target", "sim_fixture/plan_blocker"],
     "qualification-moveit-execute-joint": ["sim_fixture/pedestal", "sim_fixture/public_target"],
     "qualification-moveit-execute-pose": ["sim_fixture/pedestal", "sim_fixture/public_target"],
     "qualification-moveit-cartesian-retreat": ["sim_fixture/pedestal", "sim_fixture/public_target"],
@@ -1747,7 +1746,7 @@ def test_configured_scenario_missing_fails(tmp_path):
 
 
 def test_extra_configured_scenario_fails(tmp_path):
-    # Inject a genuinely new scenario into stage C so the unique count exceeds 17.
+    # Inject a genuinely new scenario into stage C so the unique count exceeds 16.
     fixture = make_static_contract_fixture(tmp_path)
     extra_id = "qualification-moveit-plan-extra"
     config = dict(fixture.config)
@@ -1763,7 +1762,7 @@ def test_extra_configured_scenario_fails(tmp_path):
         source_lock_manifest=fixture.source_lock_manifest,
         config=config,
     )
-    assert any("exactly 17" in reason for reason in _check(report, "fixture-ownership").reasons)
+    assert any("exactly 16" in reason for reason in _check(report, "fixture-ownership").reasons)
 
 
 def test_overlay_scenario_set_missing_fails(tmp_path):
@@ -1933,6 +1932,18 @@ def test_public_one_key_mapping_preserved(tmp_path):
     assert _check(report, "transport-contract").passed
     details = _check(report, "transport-contract").details
     assert details.get("ros_policy", {}).get("domain_id") == 25
+
+
+def test_provider_manifest_joint_states_publisher_source_and_durability():
+    """The provider manifest /joint_states publisher is owned by the logical
+    joint_state_broadcaster controller resource and offers VOLATILE QoS."""
+    manifest_path = ROOT / "ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = next(
+        item for item in manifest["publishers"] if item.get("topic") == "/joint_states"
+    )
+    assert entry["source"] == "/joint_state_broadcaster"
+    assert entry["durability"] == "VOLATILE"
 
 
 # ---------------------------------------------------------------------------

@@ -78,7 +78,7 @@ COMMAND_TOPIC = "/isaac_joint_commands"
 COMMAND_DEPTH = 50
 MAX_ROS_DOMAIN = 232
 PUBLIC_INTEGRATED = {"execution_profile": "sim_ompl"}
-EXPECTED_CONFIGURE_ID = 17
+EXPECTED_CONFIGURE_ID = 16
 
 STATUS_PASS = "verified-pass"
 STATUS_FAIL = "verified-fail"

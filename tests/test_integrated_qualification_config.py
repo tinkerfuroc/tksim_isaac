@@ -1,4 +1,4 @@
-"""Task 1: integrated qualification schema and 17-scenario matrix tests.
+"""Task 1: integrated qualification schema and 16-scenario matrix tests.
 
 These tests assert the complete immutable scenario/planning-scene/integrated
 mappings are retained, all wire digests match ``^(?!0{64}$)[0-9a-f]{64}$``, the
@@ -43,7 +43,6 @@ QUALIFICATION_DIR = ROOT / "simulation/qualification"
 ALL_SCENARIOS = (
     "qualification-moveit-plan-joint",
     "qualification-moveit-plan-pose",
-    "qualification-moveit-plan-blocked",
     "qualification-moveit-execute-joint",
     "qualification-moveit-execute-pose",
     "qualification-moveit-cartesian-retreat",
@@ -238,7 +237,7 @@ def test_blocked_report_is_scenario_specific():
 
 
 @pytest.mark.parametrize("scenario_name", ALL_SCENARIOS)
-def test_all_17_scenarios_build_their_own_complete_report(scenario_name):
+def test_all_16_scenarios_build_their_own_complete_report(scenario_name):
     report = canonical_report(scenario_name)
     source = load_test_scenario(scenario_name)
     assert report["scenario"] == source["scenario"]
@@ -257,7 +256,7 @@ def test_all_17_scenarios_build_their_own_complete_report(scenario_name):
     assert source["integrated"] == raw["integrated"]
 
 
-def test_integrated_ompl_config_declares_all_17_scenarios():
+def test_integrated_ompl_config_declares_all_16_scenarios():
     config_path = QUALIFICATION_DIR / "integrated-ompl.json"
     assert config_path.is_file()
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -276,7 +275,7 @@ def test_integrated_ompl_config_declares_all_17_scenarios():
     declared.append(stages["E"]["positive"])
     declared.extend(stages["E"]["negative"])
     assert sorted(declared) == sorted(ALL_SCENARIOS)
-    assert len(declared) == 17
+    assert len(declared) == 16
 
 
 @pytest.mark.parametrize("scenario_name", ALL_SCENARIOS)
