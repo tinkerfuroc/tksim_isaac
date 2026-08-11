@@ -1507,9 +1507,17 @@ class QualificationRunner:
         return False
 
     def _write_pre_gate_baseline(self, manifest: QualificationManifest) -> bool:
-        safety_ok, safety, safety_reason = self._safety_readiness(manifest)
-        contract_ok, contract, contract_reason = self._contract_readiness(manifest)
-        controller_ok, controller, controller_reason = self._controller_readiness(manifest)
+        # Retry briefly: each probe opens a fresh subscriber, and transient-local
+        # topics can lose the DDS discovery race on a single shot even when the
+        # main readiness poll observed them healthy moments earlier.
+        deadline = time.monotonic() + 30.0
+        while True:
+            safety_ok, safety, safety_reason = self._safety_readiness(manifest)
+            contract_ok, contract, contract_reason = self._contract_readiness(manifest)
+            controller_ok, controller, controller_reason = self._controller_readiness(manifest)
+            if (safety_ok and contract_ok and controller_ok) or time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
         evidence: dict[str, Any] = {
             "status": "ready" if safety_ok and contract_ok and controller_ok else "failed",
             "captured_at": datetime.now(timezone.utc).isoformat(),
