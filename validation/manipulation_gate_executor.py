@@ -412,8 +412,23 @@ class RosGateExecutor:
         return bool(predicate())
 
     def wait_clock(self, target: float, timeout_s: float = 30.0) -> None:
-        if not self._spin_until(lambda: self.clock is not None and self.clock >= target, timeout_s):
-            raise RuntimeError(f"timed out waiting for /clock >= {target}")
+        # timeout_s bounds wall time WITHOUT /clock progress, not total wall
+        # time: slow hosts run physics far below real time (measured ~1/12x on
+        # tkserver), and a fixed total budget conflates slow with stalled.
+        last_clock = self.clock
+        last_progress = time.monotonic()
+        while True:
+            if self.clock is not None and self.clock >= target:
+                return
+            if self.clock != last_clock:
+                last_clock = self.clock
+                last_progress = time.monotonic()
+            elif time.monotonic() - last_progress >= timeout_s:
+                raise RuntimeError(
+                    f"simulated clock stalled at {self.clock} for {timeout_s}s "
+                    f"waiting for /clock >= {target}"
+                )
+            self.ros["rclpy"].spin_once(self.node, timeout_sec=0.05)
 
     def q0(self) -> tuple[float, ...]:
         if not self._spin_until(lambda: all(name in self.joint_state for name in JOINT_NAMES), 30.0):
