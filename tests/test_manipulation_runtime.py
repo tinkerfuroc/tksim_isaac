@@ -1616,9 +1616,21 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertIn("drive_type", spawn_source)
         self.assertIn("force", spawn_source)
         # The existing per-group ImplicitActuatorCfg gains remain authoritative.
-        # The arm group is authored on one line; head/gripper/wheels carry
-        # stiffness and damping as separate keyword arguments.
-        self.assertIn("stiffness=20000.0, damping=1500.0", backend_source)
+        # The arm group carries per-joint stiffness/damping tiers as dicts;
+        # head/gripper/wheels carry stiffness and damping as scalar keyword
+        # arguments.
+        self.assertIn('"joint[1-2]": 20000.0,', backend_source)
+        self.assertIn('"joint[3]": 6000.0,', backend_source)
+        self.assertIn('"joint[4]": 7000.0,', backend_source)
+        self.assertIn('"joint[5]": 6000.0,', backend_source)
+        self.assertIn('"joint[6]": 12000.0,', backend_source)
+        self.assertIn('"joint[7]": 4000.0,', backend_source)
+        self.assertIn('"joint[1-2]": 1500.0,', backend_source)
+        self.assertIn('"joint[3]": 450.0,', backend_source)
+        self.assertIn('"joint[4]": 600.0,', backend_source)
+        self.assertIn('"joint[5]": 450.0,', backend_source)
+        self.assertIn('"joint[6]": 800.0,', backend_source)
+        self.assertIn('"joint[7]": 300.0,', backend_source)
         self.assertIn("stiffness=500.0", backend_source)
         self.assertIn("damping=50.0", backend_source)
         self.assertIn("stiffness=200.0", backend_source)
