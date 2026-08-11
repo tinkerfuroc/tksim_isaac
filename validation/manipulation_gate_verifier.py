@@ -1068,8 +1068,18 @@ def _verify_gate(gate: str, frames: Sequence[Mapping[str, Any]], execution: Sequ
         if not stop_indices:
             checks.append(_check("effective_safety_stop", False, reasons=("no effective safety stop in raw truth",)))
             raise EvidenceError("safety gate requires safety-stop samples")
-        stop_position = stop_indices[0]
-        first = next(index for index, item in enumerate(frames) if item["index"] == stop_position)
+        # Group contiguous safety-flagged frames into episodes and measure the
+        # longest one: recurring single-frame spawn transients otherwise hijack
+        # the window and hide the deliberate stop-and-restore cycle entirely.
+        flagged_positions = [index for index, item in enumerate(frames) if _safety(item["raw"])]
+        episodes: list[list[int]] = [[flagged_positions[0]]]
+        for position in flagged_positions[1:]:
+            if position == episodes[-1][-1] + 1:
+                episodes[-1].append(position)
+            else:
+                episodes.append([position])
+        first = max(episodes, key=len)[0]
+        stop_position = frames[first]["index"]
         compliant = None
         velocities: list[float] = []
         for index in range(first, len(frames)):
