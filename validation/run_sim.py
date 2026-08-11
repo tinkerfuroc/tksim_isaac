@@ -23,7 +23,8 @@ def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
     if (
         artifact.name != "robot.usd"
         or artifact.parent.parent.name != "tinker2"
-        or len(artifact.parent.name) != 16
+        # 16 = legacy truncated identity; 64 = full sha256 written by current artifact-export
+        or len(artifact.parent.name) not in (16, 64)
         or not all(character in "0123456789abcdef" for character in artifact.parent.name)
         or not artifact.is_file()
         or not manifest.is_file()
