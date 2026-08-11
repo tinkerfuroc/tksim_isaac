@@ -143,7 +143,15 @@ def _resolve(context):
     joint_state_spawner = Node(
         package="tinker_sim_bridge",
         executable="controller_reconciler",
-        arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
+        arguments=[
+            "joint_state_broadcaster",
+            "--controller-manager",
+            "/controller_manager",
+            # Isaac manipulation-core startup exceeds the 5s x 3 default budget
+            # on slower hosts (measured ~26s to controller_manager readiness).
+            "--service-timeout",
+            "15.0",
+        ],
         output="screen",
     )
     xarm_traj_spawner = Node(
