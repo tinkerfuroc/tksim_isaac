@@ -863,6 +863,9 @@ class RosGateExecutor:
 
     def run(self) -> dict[str, Any]:
         q0 = self.q0()
+        # Joint states can arrive before the first /clock sample on slow
+        # startups; every journal record needs a real simulated timestamp.
+        self.wait_clock(0.0)
         self.journal.record("gate_started", simulated_timestamp=self.clock, goals={"q0": list(q0), "actions": [item.as_dict() for item in build_gate_actions(self.gate, q0)]})
         if self.gate == "free-space-fjt":
             self._run_trajectory(
