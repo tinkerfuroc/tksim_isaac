@@ -209,6 +209,7 @@ class RosStandardGateway:
 
     def _spin_executor(self) -> None:
         from rclpy.executors import ExternalShutdownException
+        from rclpy._rclpy_pybind11 import RCLError
 
         try:
             self._executor.spin()
@@ -216,6 +217,11 @@ class RosStandardGateway:
             # The standard simulation-control node installs the process signal
             # handler and may shut down the shared rclpy context first.
             pass
+        except RCLError:
+            # rcl_shutdown() can also invalidate the context between wait-set
+            # rebuilds without raising ExternalShutdownException.
+            if self.node.context.ok():
+                raise
 
     def _stamp(self):
         from builtin_interfaces.msg import Time
@@ -890,7 +896,14 @@ class RosStandardGateway:
         """
         collision = self._Bool()
         collision.data = bool(self.backend.arm_scenario_collision())
-        self.collision_pub.publish(collision)
+        try:
+            self.collision_pub.publish(collision)
+        except Exception:
+            # Signal-driven rcl_shutdown() can invalidate the context between
+            # the caller's loop check and this publish; a heartbeat is moot
+            # once shutdown began, but a live-context failure is real.
+            if self.node.context.ok():
+                raise
 
     def _cloud_publish_enabled(self) -> bool:
         """Whether the development lidar cloud should publish on this tick.
