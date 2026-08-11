@@ -2282,9 +2282,12 @@ class QualificationRunner:
         signals_sent: list[str] = []
         forced = False
         if planned:
+            # A ros2 launch tree needs to propagate shutdown through every
+            # child; 5s+3s was measured too short on slow hosts and a forced
+            # kill poisons the attempt (teardown_failures -> verification skip).
             for sig, label, timeout in (
-                (signal.SIGINT, "SIGINT", 5),
-                (signal.SIGTERM, "SIGTERM", 3),
+                (signal.SIGINT, "SIGINT", 20),
+                (signal.SIGTERM, "SIGTERM", 10),
             ):
                 if process.poll() is not None:
                     break
