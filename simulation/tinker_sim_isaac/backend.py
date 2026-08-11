@@ -41,6 +41,8 @@ class IsaacWholeRobotBackend:
     SAFETY_HOLD_STIFFNESS = 0.0
     SAFETY_HOLD_DAMPING = 0.0
     SAFETY_HOLD_EFFORT_LIMIT = 100.0
+    # joint[1-2] tier values only; used as a degenerate fallback when live
+    # per-joint gain reads fail (see _read_joint_gain_values).
     NOMINAL_ARM_STIFFNESS = 20_000.0
     NOMINAL_ARM_DAMPING = 1_500.0
     CONTACT_FORCE_THRESHOLD = 1.0
@@ -153,7 +155,25 @@ class IsaacWholeRobotBackend:
             init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, spawn_z)),
             actuators={
                 "arm": ImplicitActuatorCfg(
-                    joint_names_expr=["joint[1-7]"], stiffness=20000.0, damping=1500.0,
+                    joint_names_expr=["joint[1-7]"],
+                    # stiffness ~200x effort cap; uniform 20000 drove all joints to
+                    # 26-76% effort-cap dwell in recorded execute-joint runs (bang-bang saturation).
+                    stiffness={
+                        "joint[1-2]": 20000.0,
+                        "joint[3]": 6000.0,
+                        "joint[4]": 7000.0,
+                        "joint[5]": 6000.0,
+                        "joint[6]": 12000.0,
+                        "joint[7]": 4000.0,
+                    },
+                    damping={
+                        "joint[1-2]": 1500.0,
+                        "joint[3]": 450.0,
+                        "joint[4]": 600.0,
+                        "joint[5]": 450.0,
+                        "joint[6]": 800.0,
+                        "joint[7]": 300.0,
+                    },
                     effort_limit_sim={
                         "joint[1-2]": 100.0,
                         "joint[3]": 30.0,
