@@ -488,6 +488,9 @@ def main() -> int:
             )
             camera_hz = min(spec.tick_rate_hz for spec in camera_specs)
             camera_stride = _streaming_update_stride(backend.dt, update_hz=camera_hz)
+            import carb.settings
+
+            kit_settings = carb.settings.get_settings()
             print(
                 json.dumps(
                     {
@@ -547,6 +550,13 @@ def main() -> int:
                         gateway.publish()
                         camera_frame_index += 1
                         if camera_frame_index % camera_stride == 0:
+                            # Rendering both RTX camera products on every
+                            # 120 Hz physics frame collapses the step rate to
+                            # ~2 Hz on this class of GPU.  Pump Kit (render,
+                            # sim_control callbacks, UI events) only at the
+                            # camera cadence, guarded so Kit cannot issue a
+                            # second physics step.
+                            _pump_streaming_app_update(app, kit_settings)
                             gateway.publish_cameras()
                     except BaseException:
                         if running:
@@ -554,7 +564,6 @@ def main() -> int:
                         break
                     if not running:
                         break
-                    app.update()
                     next_step_wall += backend.dt
                     remaining = next_step_wall - time.monotonic()
                     if remaining > 0.0:
