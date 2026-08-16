@@ -157,5 +157,26 @@ class Rgb8ArrayTest(unittest.TestCase):
             rgb8_array(np.zeros((4, 4, 3), dtype=np.uint8), 2, 3)
 
 
+from tinker_sim_isaac.camera_rig import pack_registered_cloud
+
+
+class PackRegisteredCloudTest(unittest.TestCase):
+    def test_unprojects_with_intrinsics(self) -> None:
+        depth = np.array([[2.0, np.nan]], dtype=np.float32)
+        data = pack_registered_cloud(depth, fx=100.0, fy=100.0, cx=0.5, cy=0.0)
+        self.assertEqual(len(data), 2 * 16)
+        cloud = np.frombuffer(data, dtype=np.float32).reshape(2, 4)
+        # pixel (u=0, v=0): x = (0 - 0.5)/100 * 2 = -0.01, y = 0, z = 2
+        np.testing.assert_allclose(cloud[0, :3], [-0.01, 0.0, 2.0], atol=1e-6)
+        self.assertEqual(cloud[0, 3], 0.0)  # 4-byte pad
+        self.assertTrue(np.isnan(cloud[1, :3]).all())  # invalid depth -> NaN
+
+    def test_rejects_wrong_rank(self) -> None:
+        with self.assertRaisesRegex(ValueError, "depth"):
+            pack_registered_cloud(
+                np.ones(3, dtype=np.float32), fx=1.0, fy=1.0, cx=0.0, cy=0.0
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

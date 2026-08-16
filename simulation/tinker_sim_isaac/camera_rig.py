@@ -168,3 +168,31 @@ def depth_to_16uc1_mm(value: Any):
         np.isfinite(depth) & (depth > 0.0), depth * 1000.0, 0.0
     )
     return np.clip(np.rint(millimetres), 0.0, 65535.0).astype(np.uint16)
+
+
+def pack_registered_cloud(
+    depth_value: Any, *, fx: float, fy: float, cx: float, cy: float
+) -> bytes:
+    """Organized float32 xyz+pad cloud (point_step=16) from registered depth.
+
+    Matches the real Orbbec driver layout: dense HxW rows, NaN xyz for invalid
+    depth, optical-frame axes.  This deliberately reproduces the driver's
+    4-float stride that ``door_detection``'s 5-float parser cannot read.
+    """
+    import numpy as np
+
+    depth = to_numpy(depth_value)
+    if depth.ndim == 3 and depth.shape[2] == 1:
+        depth = depth[:, :, 0]
+    if depth.ndim != 2:
+        raise ValueError(f"depth frame must be HxW: {depth.shape}")
+    depth = depth.astype(np.float32, copy=False)
+    height, width = depth.shape
+    z = np.where(np.isfinite(depth) & (depth > 0.0), depth, np.float32(np.nan))
+    columns = np.arange(width, dtype=np.float32)[None, :]
+    rows = np.arange(height, dtype=np.float32)[:, None]
+    cloud = np.zeros((height, width, 4), dtype=np.float32)
+    cloud[:, :, 0] = (columns - cx) / fx * z
+    cloud[:, :, 1] = (rows - cy) / fy * z
+    cloud[:, :, 2] = z
+    return cloud.tobytes()
