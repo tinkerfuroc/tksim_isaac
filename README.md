@@ -118,7 +118,7 @@ Example launch profiles:
 ```bash
 ./scripts/launch-isaac --sensor-profile physics-only --scenario empty
 ./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \
-  --scenario find-and-approach-person --seed 7
+  --scenario empty --seed 7 --ros
 ./scripts/launch-isaac --sensor-profile streaming --dds-profile lan
 ```
 
@@ -126,6 +126,108 @@ Streaming uses Isaac's headless WebRTC experience, explicitly disables GPU
 physics, and uses a local process lock to
 enforce one viewer per simulator instance. Restrict its ports to a trusted LAN
 or VPN. Use SSH for installation, process management, logs, tests, and bags.
+
+## Vision hardware-parity cameras
+
+The RTX camera graphs publish the same seven topics, encodings, and QoS that
+`tk26_vision` expects from real RealSense drivers, so the existing vision
+stack subscribes without modification. The contract's single source of truth
+is [`simulation/sensors/hardware-parity.json`](simulation/sensors/hardware-parity.json)
+(schema v2, `gateway_rtx_camera_publishers`), loaded fail-closed by
+[`simulation/tinker_sim_isaac/camera_rig.py`](simulation/tinker_sim_isaac/camera_rig.py) —
+including a per-camera `mount_rotation_wxyz`. The current artifact's xarm
+optical frame is authored y-up (nonstandard), so the wrist camera uses the
+rot_y(180) mount variant while the head camera uses rot_x(180).
+
+| Topic | Content | Encoding |
+| --- | --- | --- |
+| `/camera/color/image_raw` | head color | rgb8 |
+| `/camera/depth/image_raw` | head depth | 16UC1, millimetres |
+| `/camera/color/camera_info` | head intrinsics | — |
+| `/camera/xarm_camera/color/image_raw` | wrist color | rgb8 |
+| `/camera/xarm_camera/aligned_depth_to_color/image_raw` | wrist depth | 16UC1, millimetres |
+| `/camera/xarm_camera/color/camera_info` | wrist color intrinsics | — |
+| `/camera/xarm_camera/aligned_depth_to_color/camera_info` | wrist depth intrinsics | — |
+| `/camera/depth_registered/points` (optional, `--camera-pointcloud`) | organized head-camera cloud | point_step 16, x/y/z, real-driver layout |
+
+Color and depth from one capture share one identical sim-time stamp. Every
+publisher uses RELIABLE + VOLATILE + KEEP_LAST(10) QoS, matching the real
+drivers after `tk26_vision`'s `realsense_qos.yaml` override: every
+`tk26_vision` `CameraInfo` subscription is RELIABLE, so a best-effort
+publisher would deliver zero messages to it, silently.
+
+Two opt-in `launch-isaac` flags extend the stream under `--sensor-profile
+sensor-rich`: `--arena-colors` paints the occupancy walls with a
+deterministic six-hue palette from `tinker_sim_core.arena_palette` (used by
+the live acceptance run below to prove hue delivery end to end), and
+`--camera-pointcloud` additionally publishes the organized
+`/camera/depth_registered/points` topic above, derived from the head camera.
+
+Measured on this dev host (2x RTX 2080 Ti, driver 560.35.05 — below the
+595.58.03 release baseline — with an arena-streaming session co-resident):
+cameras hold 7.5–7.8 Hz wall-clock steady and `/clock` advances at roughly 30
+steps/s, i.e. physics runs at about 25% of real time under `sensor-rich` —
+the profile trades physics realtime for camera rate. The declared
+`tick_rate_hz` of 30 in the contract is real-driver parity and is achieved in
+full on a qualified host.
+
+The head camera's spawn pose aims it at the sky (the tilt joint's default),
+so its frames are uniform sky-gray at spawn — a correct render of that pose,
+not a defect. Operational use commands the pan/tilt facade before reading
+frames.
+
+### Live acceptance runbook
+
+Three terminals, all on `ROS_DOMAIN_ID=42` to isolate the run from the
+default deployment domain (`25`):
+
+Terminal A — launch the sim:
+
+```bash
+export ROS_DOMAIN_ID=42
+./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \
+  --scenario empty --seed 7 --ros --arena-colors
+```
+
+(`--sensor-profile sensor-rich` implies `--ros` when it is omitted, printing
+a note to that effect; it is passed explicitly above for clarity.)
+
+Terminal B — the Humble vision overlay, same domain:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/tk25_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
+ros2 run vision_util get_image   # optional — see the defect note below
+```
+
+Terminal C — the acceptance test:
+
+```bash
+TINKER_SIM_VISION_LIVE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python3 -m pytest -v tests/ros_humble/test_vision_get_image_live.py
+```
+
+This was run and recorded (3/3 passed, `ROS_DOMAIN_ID=42`): direct RELIABLE
+subscriptions decode both cameras with `tk26_vision` conventions, and the
+wrist frame carried all six palette hues (45.3% chromatic pixels). Evidence
+is under `reports/vision-roundtrip/` (gitignored, host-local).
+
+**Real defect found in `~/tk25_ws/src/tk26_vision`** (documented here for the
+record; out of scope to patch from this repo): `vision_util`'s `get_image`
+and `get_point_cloud` register `async def` callbacks directly on
+`message_filters`' `ApproximateTimeSynchronizer` (`get_image.py:49,65,77,81`,
+`get_point_cloud.py:43,66,100,104`). Humble's `message_filters` invokes
+callbacks synchronously, so those coroutines are never awaited, the node's
+cached frames never update, and both services always answer "No camera
+data" — on real hardware too, not only in sim. The sim run still proved that
+delivery and stamp-pairing both work: the node's own "coroutine was never
+awaited" `RuntimeWarning`s fired for both cameras. The acceptance test's
+third case probes this service directly and will fail loudly — prompting a
+test upgrade — once the node is fixed upstream.
+
+Status: development-validated with a recorded live round-trip; **not
+release-qualified**.
 
 ## Offline provisioning
 
