@@ -196,3 +196,77 @@ def pack_registered_cloud(
     cloud[:, :, 1] = (rows - cy) / fy * z
     cloud[:, :, 2] = z
     return cloud.tobytes()
+
+
+class CameraRig:
+    """Robot-mounted RTX cameras serving the hardware-parity contract.
+
+    Cameras are created as children of the robot's optical-frame prims so they
+    track pan/tilt and arm motion through physics.  Initialization is
+    fail-closed: a contract whose mounts or sensors cannot be realized must
+    not produce a silently camera-less simulator.
+    """
+
+    def __init__(self, specs: tuple[CameraStreamSpec, ...]) -> None:
+        if not specs:
+            raise ValueError("camera rig requires at least one camera spec")
+        self.specs = tuple(specs)
+        self._sensors: dict[str, Any] = {}
+
+    def initialize(self, app: Any) -> None:
+        from isaacsim.core.utils.extensions import enable_extension
+
+        enable_extension("isaacsim.sensors.experimental.rtx")
+        for _ in range(4):
+            app.update()
+
+        import omni.usd
+        from isaacsim.sensors.experimental.rtx import CameraSensor, RtxCamera
+        from pxr import Gf, Usd, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        robot = stage.GetPrimAtPath("/World/Tinker")
+        if not robot.IsValid():
+            raise RuntimeError("camera rig requires the spawned /World/Tinker robot")
+        for spec in self.specs:
+            mounts = [
+                prim
+                for prim in Usd.PrimRange(robot)
+                if prim.GetName() == spec.mount_prim
+            ]
+            if len(mounts) != 1:
+                raise RuntimeError(
+                    f"expected exactly one {spec.mount_prim!r} prim under "
+                    f"/World/Tinker, found {len(mounts)}"
+                )
+            camera_path = f"{mounts[0].GetPath().pathString}/rtx_camera"
+            camera = RtxCamera(camera_path, tick_rate=float(spec.tick_rate_hz))
+            prim = stage.GetPrimAtPath(camera_path)
+            usd_camera = UsdGeom.Camera(prim)
+            focal = focal_from_fov(spec.width, spec.horizontal_fov_deg)
+            usd_camera.GetFocalLengthAttr().Set(focal)
+            usd_camera.GetHorizontalApertureAttr().Set(HORIZONTAL_APERTURE_MM)
+            usd_camera.GetVerticalApertureAttr().Set(
+                HORIZONTAL_APERTURE_MM * spec.height / spec.width
+            )
+            usd_camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 200.0))
+            # Identity translation; rotate the USD camera into the ROS optical
+            # convention so the render looks along the frame's +Z axis.
+            xform = UsdGeom.Xformable(prim)
+            xform.ClearXformOpOrder()
+            xform.AddOrientOp().Set(Gf.Quatf(*OPTICAL_TO_USD_CAMERA_WXYZ))
+            self._sensors[spec.name] = CameraSensor(
+                camera,
+                resolution=(spec.height, spec.width),
+                annotators=[COLOR_ANNOTATOR, DEPTH_ANNOTATOR],
+            )
+        for _ in range(4):
+            app.update()
+
+    def capture(self) -> dict[str, tuple[Any, Any]]:
+        frames: dict[str, tuple[Any, Any]] = {}
+        for name, sensor in self._sensors.items():
+            rgb, _info = sensor.get_data(COLOR_ANNOTATOR)
+            depth, _info = sensor.get_data(DEPTH_ANNOTATOR)
+            frames[name] = (rgb, depth)
+        return frames
