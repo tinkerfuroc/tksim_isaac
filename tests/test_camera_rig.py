@@ -178,5 +178,19 @@ class PackRegisteredCloudTest(unittest.TestCase):
             )
 
 
+import inspect
+
+
+class BackendWallColorTest(unittest.TestCase):
+    def test_backend_accepts_wall_color_fn(self) -> None:
+        from tinker_sim_isaac import backend
+
+        self.assertEqual(backend.DEFAULT_WALL_COLOR, (0.35, 0.38, 0.42))
+        parameter = inspect.signature(
+            backend.IsaacWholeRobotBackend.__init__
+        ).parameters["wall_color_fn"]
+        self.assertIsNone(parameter.default)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from tinker_sim_core.command_mux import JointCommand, decode_snapshot_packet
 from tinker_sim_core.occupancy import OccupancyMap
+
+
+#: Uniform wall material used when no palette override is supplied.
+DEFAULT_WALL_COLOR = (0.35, 0.38, 0.42)
 
 
 def _map_metadata(path: Path) -> tuple[Path, float, float, float]:
@@ -63,6 +67,7 @@ class IsaacWholeRobotBackend:
         expected_objects: Mapping[str, Mapping[str, object]] | None = None,
         scenario: str = "",
         task: str = "",
+        wall_color_fn: Callable[[int], tuple[float, float, float]] | None = None,
     ) -> None:
         import torch
         import omni.timeline
@@ -131,13 +136,16 @@ class IsaacWholeRobotBackend:
                 pgm, resolution=resolution, origin_x=origin_x, origin_y=origin_y
             )
             for index, (x, y, sx, sy) in enumerate(self.occupancy.rectangles()):
+                color = (
+                    DEFAULT_WALL_COLOR
+                    if wall_color_fn is None
+                    else tuple(wall_color_fn(index))
+                )
                 box = sim_utils.CuboidCfg(
                     size=(sx, sy, 1.2),
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
                     collision_props=sim_utils.CollisionPropertiesCfg(),
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=(0.35, 0.38, 0.42)
-                    ),
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
                 )
                 box.func(
                     f"/World/NavigationMap/occupied_{index:04d}",
