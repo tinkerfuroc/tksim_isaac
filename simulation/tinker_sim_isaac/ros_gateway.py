@@ -968,7 +968,8 @@ class RosStandardGateway:
             color.encoding = "rgb8"
             color.is_bigendian = 0
             color.step = spec.width * 3
-            color.data = color_array.tobytes()
+            # array.array('B') takes rclpy's validated fast path; raw bytes trigger a per-element __debug__ scan that costs seconds per frame at 720p.
+            color.data = array.array("B", color_array.tobytes())
             entry["color_pub"].publish(color)
 
             depth_msg = self._Image()
@@ -979,7 +980,7 @@ class RosStandardGateway:
             depth_msg.encoding = "16UC1"
             depth_msg.is_bigendian = 0
             depth_msg.step = spec.width * 2
-            depth_msg.data = depth_array.tobytes()
+            depth_msg.data = array.array("B", depth_array.tobytes())
             entry["depth_pub"].publish(depth_msg)
 
             fields = entry["info_fields"]
@@ -1015,12 +1016,15 @@ class RosStandardGateway:
                 cloud.point_step = 16
                 cloud.row_step = 16 * spec.width
                 cloud.is_dense = False
-                cloud.data = pack_registered_cloud(
-                    depth,
-                    fx=fields["k"][0],
-                    fy=fields["k"][4],
-                    cx=fields["k"][2],
-                    cy=fields["k"][5],
+                cloud.data = array.array(
+                    "B",
+                    pack_registered_cloud(
+                        depth,
+                        fx=fields["k"][0],
+                        fy=fields["k"][4],
+                        cx=fields["k"][2],
+                        cy=fields["k"][5],
+                    ),
                 )
                 self._camera_cloud_pub.publish(cloud)
 
