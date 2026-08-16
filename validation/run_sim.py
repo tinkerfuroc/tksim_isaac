@@ -252,11 +252,16 @@ def gateway_lidar_enabled(sensor_profile: str, qualification: bool) -> bool:
     ``manipulation-core`` qualification runs enable it; ordinary
     ``manipulation-core`` and other profiles keep it disabled.
     """
-    if sensor_profile == "navigation-parity":
+    if sensor_profile in ("navigation-parity", "sensor-rich"):
         return True
     if sensor_profile == "manipulation-core":
         return bool(qualification)
     return False
+
+
+def sensor_rich_implies_ros(sensor_profile: str, ros: bool) -> bool:
+    """sensor-rich exists to serve hardware-parity topics; it forces --ros."""
+    return sensor_profile == "sensor-rich" and not ros
 
 
 def main() -> int:
@@ -275,7 +280,17 @@ def main() -> int:
     parser.add_argument("--ros", action="store_true")
     parser.add_argument("--duration", type=float, default=0.0, help="simulation seconds; 0 runs until signalled")
     parser.add_argument("--qualification", action="store_true")
+    parser.add_argument("--camera-pointcloud", action="store_true")
+    parser.add_argument("--arena-colors", action="store_true")
     args, kit_args = parser.parse_known_args()
+
+    if args.camera_pointcloud and args.sensor_profile != "sensor-rich":
+        parser.error("--camera-pointcloud is supported only with sensor-rich")
+    if args.arena_colors and args.sensor_profile != "sensor-rich":
+        parser.error("--arena-colors is supported only with sensor-rich")
+    if sensor_rich_implies_ros(args.sensor_profile, args.ros):
+        print("sensor-rich implies --ros; enabling the ROS gateway", flush=True)
+        args.ros = True
 
     from isaacsim import SimulationApp
 
@@ -419,6 +434,134 @@ def main() -> int:
                 else:
                     # Simulation-control services run on a separate executor,
                     # while Kit still needs updates to apply stage/timeline work.
+                    app.update()
+                    time.sleep(0.001)
+        elif args.sensor_profile == "sensor-rich":
+            root = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(root / "simulation"))
+            if args.artifact is None:
+                current = json.loads(
+                    (root / "artifacts/robot/tinker2/current.json").read_text()
+                )
+                manifest_path = Path(current["manifest"])
+                if not manifest_path.is_absolute():
+                    manifest_path = root / manifest_path
+                args.artifact = manifest_path.parent / "robot.usd"
+            if args.map_yaml is None:
+                args.map_yaml = args.artifact.parent / "map.yaml"
+            expected_objects = _expected_scenario_objects(root, args.scenario)
+            wall_color_fn = None
+            if args.arena_colors:
+                from tinker_sim_core.arena_palette import wall_color
+
+                wall_color_fn = lambda index: wall_color(index)[1]  # noqa: E731
+            from tinker_sim_isaac.backend import IsaacWholeRobotBackend
+
+            backend = IsaacWholeRobotBackend(
+                usd_path=args.artifact,
+                map_yaml=args.map_yaml,
+                seed=args.seed,
+                render=False,
+                enable_contacts=False,
+                add_ground_plane=True,
+                expected_objects=expected_objects,
+                scenario=args.scenario,
+                task=args.scenario,
+                wall_color_fn=wall_color_fn,
+            )
+            from tinker_sim_isaac.camera_rig import CameraRig, load_camera_specs
+
+            camera_specs = load_camera_specs(
+                root / "simulation/sensors/hardware-parity.json"
+            )
+            camera_rig = CameraRig(camera_specs)
+            camera_rig.initialize(app)
+            from tinker_sim_isaac.ros_gateway import RosStandardGateway
+
+            gateway = RosStandardGateway(
+                backend,
+                development_lidar=gateway_lidar_enabled(
+                    args.sensor_profile, args.qualification
+                ),
+                camera_rig=camera_rig,
+                camera_pointcloud=args.camera_pointcloud,
+            )
+            camera_hz = min(spec.tick_rate_hz for spec in camera_specs)
+            camera_stride = _streaming_update_stride(backend.dt, update_hz=camera_hz)
+            print(
+                json.dumps(
+                    {
+                        "artifact": str(args.artifact),
+                        "map": str(args.map_yaml),
+                        "arena_colors": args.arena_colors,
+                        "cameras": {
+                            spec.name: {
+                                "color_topic": spec.color_topic,
+                                "depth_topic": spec.depth_topic,
+                                "camera_info_topics": list(spec.camera_info_topics),
+                                "frame_id": spec.frame_id,
+                                "resolution": [spec.width, spec.height],
+                                "target_hz": camera_hz,
+                            }
+                            for spec in camera_specs
+                        },
+                        "camera_pointcloud": args.camera_pointcloud,
+                        "physics_device": backend.physics_device,
+                        "profile": "sensor-rich",
+                        "ros": args.ros,
+                        "scenario": args.scenario,
+                        "seed": args.seed,
+                        "simulation_control": "isaacsim.ros2.sim_control",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            import omni.timeline
+
+            # No external scenario runner drives this profile by default;
+            # start the timeline so cameras and physics run immediately.
+            # isaacsim.ros2.sim_control can still pause/resume it.
+            omni.timeline.get_timeline_interface().play()
+            next_step_wall = time.monotonic()
+            next_collision_heartbeat = time.monotonic()
+            collision_heartbeat_period_s = 0.1
+            camera_frame_index = 0
+            while (
+                running
+                and app.is_running()
+                and (args.duration <= 0.0 or backend.simulation_time < args.duration)
+            ):
+                gateway.spin_once()
+                if (
+                    time.monotonic() - next_collision_heartbeat
+                    >= collision_heartbeat_period_s
+                ):
+                    gateway.publish_safety_heartbeat()
+                    next_collision_heartbeat = time.monotonic()
+                if omni.timeline.get_timeline_interface().is_playing():
+                    backend.step()
+                    if not running:
+                        break
+                    try:
+                        gateway.publish()
+                        camera_frame_index += 1
+                        if camera_frame_index % camera_stride == 0:
+                            gateway.publish_cameras()
+                    except BaseException:
+                        if running:
+                            raise
+                        break
+                    if not running:
+                        break
+                    app.update()
+                    next_step_wall += backend.dt
+                    remaining = next_step_wall - time.monotonic()
+                    if remaining > 0.0:
+                        time.sleep(remaining)
+                    elif remaining < -1.0:
+                        next_step_wall = time.monotonic()
+                else:
                     app.update()
                     time.sleep(0.001)
         elif args.sensor_profile == "manipulation-core":

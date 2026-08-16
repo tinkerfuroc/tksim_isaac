@@ -66,6 +66,16 @@ def _parser() -> argparse.ArgumentParser:
     launch.add_argument("--duration", type=float, default=0.0)
     launch.add_argument("--qualification", action="store_true")
     launch.add_argument("--dds-profile", choices=("local", "lan"), default="local")
+    launch.add_argument(
+        "--camera-pointcloud",
+        action="store_true",
+        help="publish /camera/depth_registered/points under sensor-rich",
+    )
+    launch.add_argument(
+        "--arena-colors",
+        action="store_true",
+        help="color the occupancy walls with the deterministic palette",
+    )
     launch.add_argument("isaac_args", nargs=argparse.REMAINDER)
 
     lock = commands.add_parser("workspace-lock", help="capture read-only Tinker source hashes")
@@ -148,6 +158,10 @@ def _launch(config: Config, args: argparse.Namespace) -> int:
             command.extend(["--duration", str(args.duration)])
         if args.qualification:
             command.append("--qualification")
+        if args.camera_pointcloud:
+            command.append("--camera-pointcloud")
+        if args.arena_colors:
+            command.append("--arena-colors")
     command.extend(args.isaac_args)
     try:
         process = subprocess.Popen(command, cwd=config.root, env=env)
