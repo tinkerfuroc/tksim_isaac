@@ -118,6 +118,16 @@ def _streaming_lock(root: Path) -> Path:
     return lock
 
 
+def _camera_stream_arguments(args) -> list[str]:
+    """Optional sensor-rich camera flags forwarded to run_sim."""
+    flags = []
+    if args.camera_pointcloud:
+        flags.append("--camera-pointcloud")
+    if args.arena_colors:
+        flags.append("--arena-colors")
+    return flags
+
+
 def _launch(config: Config, args: argparse.Namespace) -> int:
     env = clean_isaac_environment(config, dds_profile=args.dds_profile)
     if os.environ.get("TINKER_ACCEPT_OMNIVERSE_EULA") == "Y":
@@ -158,10 +168,7 @@ def _launch(config: Config, args: argparse.Namespace) -> int:
             command.extend(["--duration", str(args.duration)])
         if args.qualification:
             command.append("--qualification")
-        if args.camera_pointcloud:
-            command.append("--camera-pointcloud")
-        if args.arena_colors:
-            command.append("--arena-colors")
+        command.extend(_camera_stream_arguments(args))
     command.extend(args.isaac_args)
     try:
         process = subprocess.Popen(command, cwd=config.root, env=env)

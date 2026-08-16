@@ -37,17 +37,16 @@ class SensorRichLaunchTest(unittest.TestCase):
                 "--arena-colors",
             ]
         )
-        command = cli._launch_command(args)
-        self.assertIn("--camera-pointcloud", command)
-        self.assertIn("--arena-colors", command)
+        self.assertEqual(
+            cli._camera_stream_arguments(args),
+            ["--camera-pointcloud", "--arena-colors"],
+        )
 
     def test_launcher_omits_camera_flags_by_default(self) -> None:
         args = _parse_cli_launch(
             ["launch", "--sensor-profile", "sensor-rich", "--ros"]
         )
-        command = cli._launch_command(args)
-        self.assertNotIn("--camera-pointcloud", command)
-        self.assertNotIn("--arena-colors", command)
+        self.assertEqual(cli._camera_stream_arguments(args), [])
 
 
 if __name__ == "__main__":
