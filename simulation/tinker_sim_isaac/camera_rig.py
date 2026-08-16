@@ -25,6 +25,7 @@ class CameraStreamSpec:
     camera_info_topics: tuple[str, ...]
     frame_id: str
     mount_prim: str
+    mount_rotation_wxyz: tuple[float, float, float, float]
     width: int
     height: int
     horizontal_fov_deg: float
@@ -43,6 +44,25 @@ def _positive_number(mapping: Mapping[str, Any], key: str, owner: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{owner}.{key} must be positive")
     return float(value)
+
+
+def _quaternion_wxyz(
+    mapping: Mapping[str, Any], key: str, owner: str
+) -> tuple[float, float, float, float]:
+    value = mapping.get(key)
+    if (
+        not isinstance(value, list)
+        or len(value) != 4
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value)
+    ):
+        raise ValueError(f"{owner}.{key} must be a list of four numbers")
+    components = tuple(float(item) for item in value)
+    if not all(math.isfinite(item) for item in components):
+        raise ValueError(f"{owner}.{key} must contain finite numbers")
+    norm = math.sqrt(sum(item * item for item in components))
+    if norm <= 0.0:
+        raise ValueError(f"{owner}.{key} must have non-zero norm")
+    return components
 
 
 def load_camera_specs(path: Path) -> tuple[CameraStreamSpec, ...]:
@@ -81,6 +101,9 @@ def load_camera_specs(path: Path) -> tuple[CameraStreamSpec, ...]:
                 camera_info_topics=tuple(info_topics),
                 frame_id=_string(camera, "frame_id", name),
                 mount_prim=_string(camera, "mount_prim", name),
+                mount_rotation_wxyz=_quaternion_wxyz(
+                    camera, "mount_rotation_wxyz", name
+                ),
                 width=int(_positive_number(camera, "width", name)),
                 height=int(_positive_number(camera, "height", name)),
                 horizontal_fov_deg=_positive_number(camera, "horizontal_fov_deg", name),
@@ -250,14 +273,20 @@ class CameraRig:
                 HORIZONTAL_APERTURE_MM * spec.height / spec.width
             )
             usd_camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 200.0))
-            # Identity translation; rotate the USD camera into the ROS optical
-            # convention so the render looks along the frame's +Z axis.
+            # Identity translation; rotate the USD camera into the mount's
+            # optical convention so the render looks along the frame's +Z
+            # axis. This is per-camera contract data, not a single constant:
+            # a proper REP-103 optical mount (z forward, y down) takes
+            # OPTICAL_TO_USD_CAMERA_WXYZ, (0, 1, 0, 0) - 180 deg about X. This
+            # artifact's xarm wrist optical frame is instead authored y-up,
+            # so it takes the y-flip variant (0, 0, 1, 0) - 180 deg about Y -
+            # to avoid rendering upside down.
             # RtxCamera authors xformOp:orient as double precision (quatd);
             # match it or AddOrientOp raises a precision-mismatch Tf error.
             xform = UsdGeom.Xformable(prim)
             xform.ClearXformOpOrder()
             xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
-                Gf.Quatd(*OPTICAL_TO_USD_CAMERA_WXYZ)
+                Gf.Quatd(*spec.mount_rotation_wxyz)
             )
             self._sensors[spec.name] = CameraSensor(
                 camera,

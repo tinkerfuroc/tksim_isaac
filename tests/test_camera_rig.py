@@ -28,6 +28,7 @@ class LoadCameraSpecsTest(unittest.TestCase):
         self.assertEqual(head.camera_info_topics, ("/camera/color/camera_info",))
         self.assertEqual(head.frame_id, "camera_color_optical_frame")
         self.assertEqual(head.mount_prim, "head_camera_color_optical_frame")
+        self.assertEqual(head.mount_rotation_wxyz, (0.0, 1.0, 0.0, 0.0))
         self.assertEqual((head.width, head.height), (1280, 720))
         self.assertEqual(head.horizontal_fov_deg, 90.0)
         self.assertEqual(head.tick_rate_hz, 30.0)
@@ -38,6 +39,7 @@ class LoadCameraSpecsTest(unittest.TestCase):
                 "/camera/xarm_camera/aligned_depth_to_color/camera_info",
             ),
         )
+        self.assertEqual(wrist.mount_rotation_wxyz, (0.0, 0.0, 1.0, 0.0))
         self.assertEqual((wrist.width, wrist.height), (848, 480))
 
     def _mutated(self, mutate) -> Path:
@@ -78,6 +80,31 @@ class LoadCameraSpecsTest(unittest.TestCase):
     def test_rejects_nonpositive_dimensions(self) -> None:
         path = self._mutated(lambda raw: raw["head_camera"].update(width=0))
         with self.assertRaisesRegex(ValueError, "positive"):
+            load_camera_specs(path)
+
+    def test_rejects_wrong_length_mount_rotation(self) -> None:
+        path = self._mutated(
+            lambda raw: raw["head_camera"].update(mount_rotation_wxyz=[0.0, 1.0, 0.0])
+        )
+        with self.assertRaisesRegex(ValueError, "mount_rotation_wxyz"):
+            load_camera_specs(path)
+
+    def test_rejects_zero_norm_mount_rotation(self) -> None:
+        path = self._mutated(
+            lambda raw: raw["head_camera"].update(
+                mount_rotation_wxyz=[0.0, 0.0, 0.0, 0.0]
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "mount_rotation_wxyz"):
+            load_camera_specs(path)
+
+    def test_rejects_non_number_mount_rotation_entry(self) -> None:
+        path = self._mutated(
+            lambda raw: raw["head_camera"].update(
+                mount_rotation_wxyz=["a", 1, 0, 0]
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "mount_rotation_wxyz"):
             load_camera_specs(path)
 
 
