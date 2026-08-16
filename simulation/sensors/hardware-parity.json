@@ -1,22 +1,52 @@
 {
-  "schema_version": 1,
-  "implementation": "isaac_omnigraph",
+  "schema_version": 2,
+  "implementation": "gateway_rtx_camera_publishers",
   "clock": {"topic": "/clock", "reset_on_stop": false},
+  "camera_qos": {
+    "reliability": "reliable",
+    "durability": "volatile",
+    "history": "keep_last",
+    "depth": 10,
+    "rationale": "Matches the real drivers (tk26_vision config/realsense_qos.yaml). Every tk26_vision CameraInfo subscription and several image subscriptions are RELIABLE; a best-effort publisher delivers zero messages to them, silently."
+  },
   "head_camera": {
     "color_topic": "/camera/color/image_raw",
     "depth_topic": "/camera/depth/image_raw",
-    "camera_info_topic": "/camera/color/camera_info",
+    "camera_info_topics": ["/camera/color/camera_info"],
     "frame_id": "camera_color_optical_frame",
-    "tick_rate_hz": 30,
-    "qos": "sensor_data"
+    "mount_prim": "head_camera_color_optical_frame",
+    "width": 1280,
+    "height": 720,
+    "horizontal_fov_deg": 90.0,
+    "tick_rate_hz": 15,
+    "color_encoding": "rgb8",
+    "depth_encoding": "16UC1",
+    "depth_unit": "millimeter"
   },
   "wrist_camera": {
     "color_topic": "/camera/xarm_camera/color/image_raw",
     "depth_topic": "/camera/xarm_camera/aligned_depth_to_color/image_raw",
-    "camera_info_topic": "/camera/xarm_camera/color/camera_info",
+    "camera_info_topics": [
+      "/camera/xarm_camera/color/camera_info",
+      "/camera/xarm_camera/aligned_depth_to_color/camera_info"
+    ],
     "frame_id": "xarm_camera_color_optical_frame",
-    "tick_rate_hz": 30,
-    "qos": "sensor_data"
+    "mount_prim": "xarm_camera_color_optical_frame",
+    "width": 848,
+    "height": 480,
+    "horizontal_fov_deg": 69.4,
+    "tick_rate_hz": 15,
+    "color_encoding": "rgb8",
+    "depth_encoding": "16UC1",
+    "depth_unit": "millimeter"
+  },
+  "point_cloud": {
+    "topic": "/camera/depth_registered/points",
+    "source": "head_camera",
+    "enabled_by_flag": "--camera-pointcloud",
+    "point_step": 16,
+    "fields": ["x", "y", "z"],
+    "organized": true
   },
   "lidar": {
     "pointcloud_topic": "/livox/lidar",
