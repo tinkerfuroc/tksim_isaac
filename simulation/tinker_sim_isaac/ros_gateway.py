@@ -18,6 +18,12 @@ from tinker_sim_core.command_mux import (
     decode_command_frame,
     decode_snapshot_packet,
 )
+from tinker_sim_isaac.camera_rig import (
+    camera_info_fields,
+    depth_to_16uc1_mm,
+    pack_registered_cloud,
+    rgb8_array,
+)
 
 
 SAFETY_HEARTBEAT_TIMEOUT_S = 1.0
@@ -79,7 +85,14 @@ class RosStandardGateway:
     API. All actuator commands arrive through one JointState topic.
     """
 
-    def __init__(self, backend: Any, *, development_lidar: bool = False) -> None:
+    def __init__(
+        self,
+        backend: Any,
+        *,
+        development_lidar: bool = False,
+        camera_rig: Any | None = None,
+        camera_pointcloud: bool = False,
+    ) -> None:
         import rclpy
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
@@ -175,6 +188,45 @@ class RosStandardGateway:
         self.contact_pub = self.node.create_publisher(
             WrenchStamped, "/sim/parity/finger_contact", reliable
         )
+        self._camera_rig = camera_rig
+        self.camera_skipped_frames = 0
+        self._camera_streams: list[dict[str, Any]] = []
+        self._camera_cloud_pub = None
+        if camera_rig is not None:
+            from sensor_msgs.msg import CameraInfo, Image
+
+            self._Image = Image
+            self._CameraInfo = CameraInfo
+            # The real drivers publish RELIABLE + VOLATILE + KEEP_LAST(10)
+            # (tk26_vision realsense_qos.yaml).  Every tk26_vision CameraInfo
+            # subscription is RELIABLE; a best-effort publisher would deliver
+            # zero messages to them, silently.
+            camera_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            for spec in camera_rig.specs:
+                self._camera_streams.append(
+                    {
+                        "spec": spec,
+                        "info_fields": camera_info_fields(spec),
+                        "color_pub": self.node.create_publisher(
+                            Image, spec.color_topic, camera_qos
+                        ),
+                        "depth_pub": self.node.create_publisher(
+                            Image, spec.depth_topic, camera_qos
+                        ),
+                        "info_pubs": [
+                            self.node.create_publisher(CameraInfo, topic, camera_qos)
+                            for topic in spec.camera_info_topics
+                        ],
+                    }
+                )
+            if camera_pointcloud:
+                self._camera_cloud_pub = self.node.create_publisher(
+                    PointCloud2, "/camera/depth_registered/points", camera_qos
+                )
         initial_collision = Bool()
         initial_collision.data = False
         self.collision_pub.publish(initial_collision)
@@ -846,18 +898,18 @@ class RosStandardGateway:
         if self._cloud_publish_enabled():
             self.cloud_pub.publish(self._development_point_cloud(stamp))
         if self._tick % self._status_stride == 0:
+            status = {
+                "physics_device": self.backend.physics_device,
+                "standard_simulation_control": True,
+                "joint_command_topic": "/isaac_joint_commands",
+                "last_command_error": self._last_command_error,
+                "development_lidar": self.development_lidar,
+                "safety_stop": bool(self.backend.safety_stopped),
+            }
+            if self._camera_rig is not None:
+                status["camera_skipped_frames"] = self.camera_skipped_frames
             message = self._String()
-            message.data = json.dumps(
-                {
-                    "physics_device": self.backend.physics_device,
-                    "standard_simulation_control": True,
-                    "joint_command_topic": "/isaac_joint_commands",
-                    "last_command_error": self._last_command_error,
-                    "development_lidar": self.development_lidar,
-                    "safety_stop": bool(self.backend.safety_stopped),
-                },
-                sort_keys=True,
-            )
+            message.data = json.dumps(status, sort_keys=True)
             self.status_pub.publish(message)
             contacts = self.backend.contact_state()
             force = sum(
@@ -883,6 +935,94 @@ class RosStandardGateway:
         )
         self.physics_truth_pub.publish(physics_truth)
         self._tick += 1
+
+    def publish_cameras(self) -> None:
+        """Publish one same-stamp color+depth+info set per camera.
+
+        A camera whose annotator has no frame this tick is skipped and counted
+        rather than fabricated; the counter keeps stalls observable.
+        """
+        if self._camera_rig is None:
+            return
+        stamp = self._stamp()
+        frames = self._camera_rig.capture()
+        for entry in self._camera_streams:
+            spec = entry["spec"]
+            rgb, depth = frames.get(spec.name, (None, None))
+            if rgb is None or depth is None:
+                self.camera_skipped_frames += 1
+                continue
+            color_array = rgb8_array(rgb, spec.height, spec.width)
+            depth_array = depth_to_16uc1_mm(depth)
+            if depth_array.shape != (spec.height, spec.width):
+                raise RuntimeError(
+                    f"{spec.name} depth resolution {depth_array.shape} does not "
+                    f"match the contract ({spec.height}, {spec.width})"
+                )
+
+            color = self._Image()
+            color.header.stamp = stamp
+            color.header.frame_id = spec.frame_id
+            color.height = spec.height
+            color.width = spec.width
+            color.encoding = "rgb8"
+            color.is_bigendian = 0
+            color.step = spec.width * 3
+            color.data = color_array.tobytes()
+            entry["color_pub"].publish(color)
+
+            depth_msg = self._Image()
+            depth_msg.header.stamp = stamp
+            depth_msg.header.frame_id = spec.frame_id
+            depth_msg.height = spec.height
+            depth_msg.width = spec.width
+            depth_msg.encoding = "16UC1"
+            depth_msg.is_bigendian = 0
+            depth_msg.step = spec.width * 2
+            depth_msg.data = depth_array.tobytes()
+            entry["depth_pub"].publish(depth_msg)
+
+            fields = entry["info_fields"]
+            info = self._CameraInfo()
+            info.header.stamp = stamp
+            info.header.frame_id = spec.frame_id
+            info.height = fields["height"]
+            info.width = fields["width"]
+            info.distortion_model = fields["distortion_model"]
+            info.d = list(fields["d"])
+            info.k = fields["k"]
+            info.r = fields["r"]
+            info.p = fields["p"]
+            for publisher in entry["info_pubs"]:
+                publisher.publish(info)
+
+            if self._camera_cloud_pub is not None and spec.name == "head_camera":
+                cloud = self._PointCloud2()
+                cloud.header.stamp = stamp
+                cloud.header.frame_id = spec.frame_id
+                cloud.height = spec.height
+                cloud.width = spec.width
+                cloud.fields = [
+                    self._PointField(
+                        name=name,
+                        offset=offset,
+                        datatype=self._PointField.FLOAT32,
+                        count=1,
+                    )
+                    for name, offset in (("x", 0), ("y", 4), ("z", 8))
+                ]
+                cloud.is_bigendian = False
+                cloud.point_step = 16
+                cloud.row_step = 16 * spec.width
+                cloud.is_dense = False
+                cloud.data = pack_registered_cloud(
+                    depth,
+                    fx=fields["k"][0],
+                    fy=fields["k"][4],
+                    cx=fields["k"][2],
+                    cy=fields["k"][5],
+                )
+                self._camera_cloud_pub.publish(cloud)
 
     def publish_safety_heartbeat(self) -> None:
         """Publish the collision source on a wall-clock cadence, pause-safe.
