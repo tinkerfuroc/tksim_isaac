@@ -81,5 +81,81 @@ class LoadCameraSpecsTest(unittest.TestCase):
             load_camera_specs(path)
 
 
+import math
+
+import numpy as np
+
+from tinker_sim_isaac.camera_rig import (
+    HORIZONTAL_APERTURE_MM,
+    camera_info_fields,
+    depth_to_16uc1_mm,
+    focal_from_fov,
+    rgb8_array,
+)
+
+
+class OpticsTest(unittest.TestCase):
+    def test_focal_matches_fov(self) -> None:
+        focal = focal_from_fov(1280, 90.0)
+        recovered = 2.0 * math.degrees(
+            math.atan(HORIZONTAL_APERTURE_MM / (2.0 * focal))
+        )
+        self.assertAlmostEqual(recovered, 90.0, places=6)
+
+    def test_camera_info_is_consistent_pinhole(self) -> None:
+        head = load_camera_specs(CONTRACT)[0]
+        fields = camera_info_fields(head)
+        fx = head.width / (2.0 * math.tan(math.radians(head.horizontal_fov_deg) / 2))
+        self.assertEqual((fields["height"], fields["width"]), (720, 1280))
+        self.assertEqual(fields["distortion_model"], "plumb_bob")
+        self.assertEqual(fields["d"], [0.0] * 5)
+        self.assertAlmostEqual(fields["k"][0], fx, places=6)
+        self.assertAlmostEqual(fields["k"][4], fx, places=6)  # square pixels
+        self.assertAlmostEqual(fields["k"][2], 640.0)
+        self.assertAlmostEqual(fields["k"][5], 360.0)
+        self.assertEqual(fields["r"], [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+        self.assertAlmostEqual(fields["p"][0], fx, places=6)
+        self.assertEqual(len(fields["p"]), 12)
+
+
+class DepthConversionTest(unittest.TestCase):
+    def test_metres_become_rounded_millimetres(self) -> None:
+        depth = np.array([[0.5, 1.2345]], dtype=np.float32)
+        result = depth_to_16uc1_mm(depth)
+        self.assertEqual(result.dtype, np.uint16)
+        self.assertEqual(result.tolist(), [[500, 1234]])  # 1234.5 rounds to even
+
+    def test_invalid_values_become_zero(self) -> None:
+        depth = np.array([[np.nan, np.inf, -1.0, 0.0]], dtype=np.float32)
+        self.assertEqual(depth_to_16uc1_mm(depth).tolist(), [[0, 0, 0, 0]])
+
+    def test_clamps_to_uint16(self) -> None:
+        self.assertEqual(depth_to_16uc1_mm(np.array([[70.0]])).tolist(), [[65535]])
+
+    def test_squeezes_trailing_channel(self) -> None:
+        depth = np.ones((2, 3, 1), dtype=np.float32)
+        self.assertEqual(depth_to_16uc1_mm(depth).shape, (2, 3))
+
+    def test_rejects_wrong_rank(self) -> None:
+        with self.assertRaisesRegex(ValueError, "depth"):
+            depth_to_16uc1_mm(np.ones(4, dtype=np.float32))
+
+
+class Rgb8ArrayTest(unittest.TestCase):
+    def test_strips_alpha_and_batch(self) -> None:
+        frame = np.zeros((1, 2, 3, 4), dtype=np.uint8)
+        result = rgb8_array(frame, 2, 3)
+        self.assertEqual(result.shape, (2, 3, 3))
+        self.assertTrue(result.flags["C_CONTIGUOUS"])
+
+    def test_scales_unit_floats(self) -> None:
+        frame = np.ones((2, 3, 3), dtype=np.float32)
+        self.assertEqual(int(rgb8_array(frame, 2, 3).max()), 255)
+
+    def test_rejects_wrong_resolution(self) -> None:
+        with self.assertRaisesRegex(ValueError, "shape"):
+            rgb8_array(np.zeros((4, 4, 3), dtype=np.uint8), 2, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

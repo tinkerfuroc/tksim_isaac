@@ -88,3 +88,83 @@ def load_camera_specs(path: Path) -> tuple[CameraStreamSpec, ...]:
             )
         )
     return tuple(specs)
+
+
+def focal_from_fov(
+    width_px: int,
+    horizontal_fov_deg: float,
+    horizontal_aperture_mm: float = HORIZONTAL_APERTURE_MM,
+) -> float:
+    """USD focal length (mm) so the render matches the declared horizontal FOV."""
+    if width_px <= 0 or not 0.0 < horizontal_fov_deg < 180.0:
+        raise ValueError("focal_from_fov requires positive width and FOV in (0, 180)")
+    return horizontal_aperture_mm / (
+        2.0 * math.tan(math.radians(horizontal_fov_deg) / 2.0)
+    )
+
+
+def camera_info_fields(spec: CameraStreamSpec) -> dict[str, Any]:
+    """Pinhole CameraInfo values consistent with the rendered FOV by construction."""
+    fx = spec.width / (2.0 * math.tan(math.radians(spec.horizontal_fov_deg) / 2.0))
+    cx = spec.width / 2.0
+    cy = spec.height / 2.0
+    return {
+        "height": spec.height,
+        "width": spec.width,
+        "distortion_model": "plumb_bob",
+        "d": [0.0] * 5,
+        "k": [fx, 0.0, cx, 0.0, fx, cy, 0.0, 0.0, 1.0],
+        "r": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        "p": [fx, 0.0, cx, 0.0, 0.0, fx, cy, 0.0, 0.0, 0.0, 1.0, 0.0],
+    }
+
+
+def to_numpy(value: Any):
+    """Normalize warp/torch/proxy buffers to a host numpy array."""
+    import numpy as np
+
+    candidate = value
+    if hasattr(candidate, "cpu"):
+        candidate = candidate.cpu()
+    if hasattr(candidate, "numpy"):
+        candidate = candidate.numpy()
+    return np.asarray(candidate)
+
+
+def rgb8_array(value: Any, height: int, width: int):
+    """Normalize an RTX rgb annotator buffer to contiguous uint8 (H, W, 3)."""
+    import numpy as np
+
+    array = to_numpy(value)
+    if array.ndim == 4 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim != 3 or array.shape[:2] != (height, width):
+        raise ValueError(f"unexpected RGB frame shape: {array.shape}")
+    if array.shape[2] < 3:
+        raise ValueError(f"RGB frame has fewer than three channels: {array.shape}")
+    array = array[:, :, :3]
+    if array.dtype.kind == "f":
+        if not np.isfinite(array).all():
+            raise ValueError("RGB frame contains non-finite values")
+        scale = 255.0 if float(array.max(initial=0.0)) <= 1.0 else 1.0
+        array = np.clip(array * scale, 0.0, 255.0).astype(np.uint8)
+    else:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(array)
+
+
+def depth_to_16uc1_mm(value: Any):
+    """Metres -> 16UC1 millimetres; NaN/Inf/non-positive -> 0; clamp 65535."""
+    import numpy as np
+
+    depth = to_numpy(value)
+    if depth.ndim == 3 and depth.shape[2] == 1:
+        depth = depth[:, :, 0]
+    if depth.ndim != 2:
+        raise ValueError(f"depth frame must be HxW: {depth.shape}")
+    if depth.dtype.kind != "f":
+        depth = depth.astype(np.float64)
+    millimetres = np.where(
+        np.isfinite(depth) & (depth > 0.0), depth * 1000.0, 0.0
+    )
+    return np.clip(np.rint(millimetres), 0.0, 65535.0).astype(np.uint16)
