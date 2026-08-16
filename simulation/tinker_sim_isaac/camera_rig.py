@@ -252,9 +252,13 @@ class CameraRig:
             usd_camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 200.0))
             # Identity translation; rotate the USD camera into the ROS optical
             # convention so the render looks along the frame's +Z axis.
+            # RtxCamera authors xformOp:orient as double precision (quatd);
+            # match it or AddOrientOp raises a precision-mismatch Tf error.
             xform = UsdGeom.Xformable(prim)
             xform.ClearXformOpOrder()
-            xform.AddOrientOp().Set(Gf.Quatf(*OPTICAL_TO_USD_CAMERA_WXYZ))
+            xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Quatd(*OPTICAL_TO_USD_CAMERA_WXYZ)
+            )
             self._sensors[spec.name] = CameraSensor(
                 camera,
                 resolution=(spec.height, spec.width),
