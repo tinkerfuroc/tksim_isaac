@@ -14,9 +14,10 @@
       "release_blockers": ["calibration_missing", "driver_below_595.58.03", "ram_below_64_gb"]
     },
     "vision": {
-      "mode": "official_rtx_graphs_and_hardware_topics",
+      "mode": "gateway_published_rtx_camera_topics",
       "truth_input": false,
-      "status": "configured_pending_live_qualification"
+      "status": "development_validated_live_roundtrip",
+      "release_blockers": ["pending_live_qualification"]
     },
     "manipulation": {
       "mode": "external_ros2_control_fjt_and_xarm_facade",
