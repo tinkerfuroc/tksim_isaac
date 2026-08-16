@@ -18,7 +18,7 @@
     "width": 1280,
     "height": 720,
     "horizontal_fov_deg": 90.0,
-    "tick_rate_hz": 15,
+    "tick_rate_hz": 30,
     "color_encoding": "rgb8",
     "depth_encoding": "16UC1",
     "depth_unit": "millimeter"
@@ -35,7 +35,7 @@
     "width": 848,
     "height": 480,
     "horizontal_fov_deg": 69.4,
-    "tick_rate_hz": 15,
+    "tick_rate_hz": 30,
     "color_encoding": "rgb8",
     "depth_encoding": "16UC1",
     "depth_unit": "millimeter"

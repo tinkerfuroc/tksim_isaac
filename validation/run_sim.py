@@ -296,7 +296,9 @@ def main() -> int:
 
     application_config = {
         "headless": args.headless,
-        "disable_viewport_updates": args.sensor_profile == "physics-only",
+        # sensor-rich renders through its RTX camera products only; the app
+        # surface would be a third ray-traced render nobody consumes.
+        "disable_viewport_updates": args.sensor_profile in ("physics-only", "sensor-rich"),
         # Isaac's full Python experience may fault after all extensions have
         # individually torn down.  Fast shutdown is the supported server
         # path and keeps launch exit status meaningful for automation.
