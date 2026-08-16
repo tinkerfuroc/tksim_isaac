@@ -30,7 +30,7 @@ class LoadCameraSpecsTest(unittest.TestCase):
         self.assertEqual(head.mount_prim, "head_camera_color_optical_frame")
         self.assertEqual((head.width, head.height), (1280, 720))
         self.assertEqual(head.horizontal_fov_deg, 90.0)
-        self.assertEqual(head.tick_rate_hz, 15.0)
+        self.assertEqual(head.tick_rate_hz, 30.0)
         self.assertEqual(
             wrist.camera_info_topics,
             (
