@@ -35,7 +35,7 @@
 **Interfaces:**
 - Produces: `WALL_PALETTE: tuple[tuple[str, tuple[float,float,float], float], ...]` (name, rgb 0–1, hue°); `wall_color(index: int) -> tuple[str, tuple[float,float,float], float]`; `expected_wall_colors(count: int) -> dict[str, int]`. Task 8 consumes `wall_color`; the smoke re-exports all three so existing tests keep working.
 
-- [ ] **Step 1: Write the failing test** — append to `tests/test_arena_vision_smoke.py`:
+- [x] **Step 1: Write the failing test** — append to `tests/test_arena_vision_smoke.py`:
 
 ```python
 class PaletteSourceTest(unittest.TestCase):
@@ -48,12 +48,12 @@ class PaletteSourceTest(unittest.TestCase):
         self.assertIs(arena_vision_smoke.wall_color, arena_palette.wall_color)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_arena_vision_smoke.PaletteSourceTest -v`
 Expected: FAIL (`ModuleNotFoundError: tinker_sim_core.arena_palette`)
 
-- [ ] **Step 3: Create `simulation/tinker_sim_core/arena_palette.py`** with exactly the palette currently in `validation/arena_vision_smoke.py`:
+- [x] **Step 3: Create `simulation/tinker_sim_core/arena_palette.py`** with exactly the palette currently in `validation/arena_vision_smoke.py`:
 
 ```python
 from __future__ import annotations
@@ -88,7 +88,7 @@ def expected_wall_colors(count: int) -> dict[str, int]:
     return tally
 ```
 
-- [ ] **Step 4: Refactor `validation/arena_vision_smoke.py`** — delete its `WALL_PALETTE`, `wall_color`, `expected_wall_colors` definitions; directly under the existing `ROOT = Path(__file__).resolve().parents[1]` line add:
+- [x] **Step 4: Refactor `validation/arena_vision_smoke.py`** — delete its `WALL_PALETTE`, `wall_color`, `expected_wall_colors` definitions; directly under the existing `ROOT = Path(__file__).resolve().parents[1]` line add:
 
 ```python
 sys.path.insert(0, str(ROOT / "simulation"))
@@ -101,12 +101,12 @@ from tinker_sim_core.arena_palette import (  # noqa: E402
 
 Then remove the now-duplicate `sys.path.insert(0, str(ROOT / "simulation"))` inside `main()` (keep the `validation` insert).
 
-- [ ] **Step 5: Run the full test file**
+- [x] **Step 5: Run the full test file**
 
 Run: `python3 -m unittest tests.test_arena_vision_smoke -v`
 Expected: all pass (existing 18 + new 1)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add simulation/tinker_sim_core/arena_palette.py validation/arena_vision_smoke.py tests/test_arena_vision_smoke.py
@@ -125,7 +125,7 @@ git commit -m "refactor: share the arena wall palette from tinker_sim_core"
 **Interfaces:**
 - Produces: `CameraStreamSpec` frozen dataclass with fields `name: str, color_topic: str, depth_topic: str, camera_info_topics: tuple[str, ...], frame_id: str, mount_prim: str, width: int, height: int, horizontal_fov_deg: float, tick_rate_hz: float`; `load_camera_specs(path: Path) -> tuple[CameraStreamSpec, ...]` (head first, then wrist); module constants `CAMERA_NAMES = ("head_camera", "wrist_camera")`, `COLOR_ANNOTATOR = "rgb"`, `DEPTH_ANNOTATOR = "distance_to_image_plane"`, `OPTICAL_TO_USD_CAMERA_WXYZ = (0.0, 1.0, 0.0, 0.0)`.
 
-- [ ] **Step 1: Rewrite `simulation/sensors/hardware-parity.json`** (full replacement; `clock`, `lidar`, `imu`, `contacts` blocks stay byte-identical to v1):
+- [x] **Step 1: Rewrite `simulation/sensors/hardware-parity.json`** (full replacement; `clock`, `lidar`, `imu`, `contacts` blocks stay byte-identical to v1):
 
 ```json
 {
@@ -201,7 +201,7 @@ git commit -m "refactor: share the arena wall palette from tinker_sim_core"
 }
 ```
 
-- [ ] **Step 2: Write the failing tests** — create `tests/test_camera_rig.py`:
+- [x] **Step 2: Write the failing tests** — create `tests/test_camera_rig.py`:
 
 ```python
 from __future__ import annotations
@@ -291,12 +291,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 3: Run tests to verify they fail**
+- [x] **Step 3: Run tests to verify they fail**
 
 Run: `python3 -m unittest tests.test_camera_rig -v`
 Expected: FAIL (`ModuleNotFoundError: tinker_sim_isaac.camera_rig`)
 
-- [ ] **Step 4: Create `simulation/tinker_sim_isaac/camera_rig.py`** (spec-loading half; Isaac class arrives in Task 6):
+- [x] **Step 4: Create `simulation/tinker_sim_isaac/camera_rig.py`** (spec-loading half; Isaac class arrives in Task 6):
 
 ```python
 from __future__ import annotations
@@ -391,12 +391,12 @@ def load_camera_specs(path: Path) -> tuple[CameraStreamSpec, ...]:
     return tuple(specs)
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `python3 -m unittest tests.test_camera_rig -v`
 Expected: PASS (6 tests)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add simulation/sensors/hardware-parity.json simulation/tinker_sim_isaac/camera_rig.py tests/test_camera_rig.py
@@ -414,7 +414,7 @@ git commit -m "feat: camera contract v2 with fail-closed spec loading"
 **Interfaces:**
 - Produces: `focal_from_fov(width_px: int, horizontal_fov_deg: float, horizontal_aperture_mm: float = HORIZONTAL_APERTURE_MM) -> float` (mm); `camera_info_fields(spec: CameraStreamSpec) -> dict` with keys `height:int, width:int, distortion_model:str, d:list[float], k:list[float] (9), r:list[float] (9), p:list[float] (12)`; `to_numpy(value) -> np.ndarray` (duck `.cpu()`/`.numpy()` then `asarray`); `rgb8_array(value, height: int, width: int) -> np.ndarray` uint8 `(H, W, 3)` C-contiguous; `depth_to_16uc1_mm(value) -> np.ndarray` uint16 `(H, W)`.
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_camera_rig.py`:
+- [x] **Step 1: Write the failing tests** — append to `tests/test_camera_rig.py`:
 
 ```python
 import math
@@ -493,12 +493,12 @@ class Rgb8ArrayTest(unittest.TestCase):
             rgb8_array(np.zeros((4, 4, 3), dtype=np.uint8), 2, 3)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m unittest tests.test_camera_rig -v`
 Expected: FAIL (ImportError on the new names)
 
-- [ ] **Step 3: Implement in `camera_rig.py`:**
+- [x] **Step 3: Implement in `camera_rig.py`:**
 
 ```python
 def focal_from_fov(
@@ -580,12 +580,12 @@ def depth_to_16uc1_mm(value: Any):
     return np.clip(np.rint(millimetres), 0.0, 65535.0).astype(np.uint16)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m unittest tests.test_camera_rig -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add simulation/tinker_sim_isaac/camera_rig.py tests/test_camera_rig.py
@@ -603,7 +603,7 @@ git commit -m "feat: camera optics and hardware-parity image conversions"
 **Interfaces:**
 - Produces: `pack_registered_cloud(depth_value, *, fx: float, fy: float, cx: float, cy: float) -> bytes` — organized H×W cloud, per-point `x, y, z, pad` float32 little-endian (`point_step=16`), NaN xyz for invalid depth, optical-frame unprojection `x=(u−cx)/fx·z`, `y=(v−cy)/fy·z`.
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_camera_rig.py`:
+- [x] **Step 1: Write the failing tests** — append to `tests/test_camera_rig.py`:
 
 ```python
 from tinker_sim_isaac.camera_rig import pack_registered_cloud
@@ -627,12 +627,12 @@ class PackRegisteredCloudTest(unittest.TestCase):
             )
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m unittest tests.test_camera_rig.PackRegisteredCloudTest -v`
 Expected: FAIL (ImportError)
 
-- [ ] **Step 3: Implement in `camera_rig.py`:**
+- [x] **Step 3: Implement in `camera_rig.py`:**
 
 ```python
 def pack_registered_cloud(
@@ -663,12 +663,12 @@ def pack_registered_cloud(
     return cloud.tobytes()
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m unittest tests.test_camera_rig -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add simulation/tinker_sim_isaac/camera_rig.py tests/test_camera_rig.py
@@ -687,7 +687,7 @@ git commit -m "feat: organized registered point-cloud packing"
 - Consumes: nothing new.
 - Produces: `IsaacWholeRobotBackend.__init__(..., wall_color_fn: Callable[[int], tuple[float, float, float]] | None = None)`; module constant `DEFAULT_WALL_COLOR = (0.35, 0.38, 0.42)`. Task 8 passes `wall_color_fn=lambda index: wall_color(index)[1]`.
 
-- [ ] **Step 1: Write the failing test** — append to `tests/test_camera_rig.py`:
+- [x] **Step 1: Write the failing test** — append to `tests/test_camera_rig.py`:
 
 ```python
 import inspect
@@ -704,12 +704,12 @@ class BackendWallColorTest(unittest.TestCase):
         self.assertIsNone(parameter.default)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_camera_rig.BackendWallColorTest -v`
 Expected: FAIL (`KeyError: 'wall_color_fn'`)
 
-- [ ] **Step 3: Implement in `backend.py`.** Add near the other module constants (below the `CHASSIS_BALLAST_*` block):
+- [x] **Step 3: Implement in `backend.py`.** Add near the other module constants (below the `CHASSIS_BALLAST_*` block):
 
 ```python
 #: Uniform wall material used when no palette override is supplied.
@@ -744,12 +744,12 @@ Replace the wall-spawn loop body (currently `visual_material=sim_utils.PreviewSu
                 )
 ```
 
-- [ ] **Step 4: Run test + full suite** (backend.py carries unrelated WIP; the suite guards against collateral damage)
+- [x] **Step 4: Run test + full suite** (backend.py carries unrelated WIP; the suite guards against collateral damage)
 
 Run: `python3 -m unittest discover -s tests -v 2>&1 | tail -5`
 Expected: OK
 
-- [ ] **Step 5: Commit (stage the backend hunks for this change only — the file also holds uncommitted ballast WIP; use `git add -p simulation/tinker_sim_isaac/backend.py` and pick only the DEFAULT_WALL_COLOR/wall_color_fn hunks, or if interleaving makes that impractical, note in the commit body that ballast WIP hunks ride along and get amended out later by their owner — prefer the selective staging)**
+- [x] **Step 5: Commit (stage the backend hunks for this change only — the file also holds uncommitted ballast WIP; use `git add -p simulation/tinker_sim_isaac/backend.py` and pick only the DEFAULT_WALL_COLOR/wall_color_fn hunks, or if interleaving makes that impractical, note in the commit body that ballast WIP hunks ride along and get amended out later by their owner — prefer the selective staging)**
 
 ```bash
 git add -p simulation/tinker_sim_isaac/backend.py
@@ -768,7 +768,7 @@ git commit -m "feat: optional deterministic wall palette for arena cuboids"
 - Consumes: `CameraStreamSpec`, `focal_from_fov`, annotator constants (Tasks 2–3).
 - Produces: `class CameraRig` with `__init__(self, specs: tuple[CameraStreamSpec, ...])`, attribute `specs`, `initialize(self, app) -> None` (creates cameras; raises on missing mounts), `capture(self) -> dict[str, tuple[Any | None, Any | None]]` (name → (rgb buffer, depth buffer), either may be None if the annotator has no frame). No unit test — Isaac-only; validated live in Task 9.
 
-- [ ] **Step 1: Append to `camera_rig.py`:**
+- [x] **Step 1: Append to `camera_rig.py`:**
 
 ```python
 class CameraRig:
@@ -845,12 +845,12 @@ class CameraRig:
         return frames
 ```
 
-- [ ] **Step 2: Run the unit suite (module must stay importable without Isaac)**
+- [x] **Step 2: Run the unit suite (module must stay importable without Isaac)**
 
 Run: `python3 -m unittest tests.test_camera_rig -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add simulation/tinker_sim_isaac/camera_rig.py
@@ -868,7 +868,7 @@ git commit -m "feat: robot-mounted RTX camera rig"
 - Consumes: `CameraRig.capture()`, `camera_info_fields`, `rgb8_array`, `depth_to_16uc1_mm`, `pack_registered_cloud` (Tasks 2–6); existing `self._stamp()`, `self.node`, QoS imports already present at lines 85–91.
 - Produces: `RosStandardGateway.__init__(self, backend, *, development_lidar: bool = False, camera_rig=None, camera_pointcloud: bool = False)`; `publish_cameras(self) -> None`; counter attribute `camera_skipped_frames: int`. Task 8's loop calls `publish_cameras()` every camera stride.
 
-- [ ] **Step 1: Add the sibling import** at the top of `ros_gateway.py` (module level, next to the existing `tinker_sim_core` imports):
+- [x] **Step 1: Add the sibling import** at the top of `ros_gateway.py` (module level, next to the existing `tinker_sim_core` imports):
 
 ```python
 from tinker_sim_isaac.camera_rig import (
@@ -879,7 +879,7 @@ from tinker_sim_isaac.camera_rig import (
 )
 ```
 
-- [ ] **Step 2: Extend the constructor.** Change the signature at line 82 to:
+- [x] **Step 2: Extend the constructor.** Change the signature at line 82 to:
 
 ```python
     def __init__(
@@ -938,7 +938,7 @@ After the existing publisher block (after `self.contact_pub = ...`), add:
 
 (`QoSProfile`, `ReliabilityPolicy`, `DurabilityPolicy`, `PointCloud2`, `PointField` are already imported in this constructor — reuse them; keep this block after those imports.)
 
-- [ ] **Step 3: Add `publish_cameras`** after the existing `publish` method:
+- [x] **Step 3: Add `publish_cameras`** after the existing `publish` method:
 
 ```python
     def publish_cameras(self) -> None:
@@ -1030,14 +1030,14 @@ After the existing publisher block (after `self.contact_pub = ...`), add:
                 self._camera_cloud_pub.publish(cloud)
 ```
 
-- [ ] **Step 4: Surface the skip counter in telemetry.** Locate the `/sim/status/isaac` payload construction (`grep -n "status_pub.publish\|sim/status" simulation/tinker_sim_isaac/ros_gateway.py`) and add `"camera_skipped_frames": self.camera_skipped_frames` to the JSON dict it serializes (only when `self._camera_rig is not None`, to leave other profiles' status payloads byte-identical).
+- [x] **Step 4: Surface the skip counter in telemetry.** Locate the `/sim/status/isaac` payload construction (`grep -n "status_pub.publish\|sim/status" simulation/tinker_sim_isaac/ros_gateway.py`) and add `"camera_skipped_frames": self.camera_skipped_frames` to the JSON dict it serializes (only when `self._camera_rig is not None`, to leave other profiles' status payloads byte-identical).
 
-- [ ] **Step 5: Run the unit suite** (ros_gateway is not unit-imported without rclpy, but the sibling import must not break `tests/test_camera_rig.py`'s import of `camera_rig`)
+- [x] **Step 5: Run the unit suite** (ros_gateway is not unit-imported without rclpy, but the sibling import must not break `tests/test_camera_rig.py`'s import of `camera_rig`)
 
 Run: `python3 -m unittest discover -s tests -v 2>&1 | tail -5`
 Expected: OK
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add simulation/tinker_sim_isaac/ros_gateway.py
@@ -1057,7 +1057,7 @@ git commit -m "feat: hardware-parity camera publishers in the ROS gateway"
 - Consumes: `IsaacWholeRobotBackend(wall_color_fn=...)` (Task 5), `CameraRig`/`load_camera_specs` (Tasks 2, 6), `RosStandardGateway(camera_rig=..., camera_pointcloud=...)` (Task 7), `wall_color` (Task 1), existing `_streaming_update_stride`, `_expected_scenario_objects`, `gateway_lidar_enabled`.
 - Produces: `sensor_rich_implies_ros(sensor_profile: str, ros: bool) -> bool` in `run_sim.py` (pure, for tests); run_sim flags `--camera-pointcloud`, `--arena-colors` (each `parser.error`s unless `sensor-rich`); cli flags of the same names forwarded verbatim; `gateway_lidar_enabled("sensor-rich", anything) == True`.
 
-- [ ] **Step 1: Write the failing tests** — append to `tests/test_arena_streaming.py`:
+- [x] **Step 1: Write the failing tests** — append to `tests/test_arena_streaming.py`:
 
 ```python
 class SensorRichLaunchTest(unittest.TestCase):
@@ -1103,12 +1103,12 @@ def _parse_cli_launch(argv):
 
 (Check the file's existing import names first — it imports the modules under `run_sim` and `tinker_sim_deploy.cli`; reuse whatever aliases it already uses.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m unittest tests.test_arena_streaming.SensorRichLaunchTest -v`
 Expected: FAIL (`AttributeError: sensor_rich_implies_ros` / flag unrecognized)
 
-- [ ] **Step 3: Implement `run_sim.py` changes.**
+- [x] **Step 3: Implement `run_sim.py` changes.**
 
 3a. Pure helper next to `gateway_lidar_enabled`:
 
@@ -1279,7 +1279,7 @@ Guards next to the livestream guards:
                     time.sleep(0.001)
 ```
 
-- [ ] **Step 4: Implement `cli.py` changes.** Launch parser (after `--dds-profile`, before `isaac_args`):
+- [x] **Step 4: Implement `cli.py` changes.** Launch parser (after `--dds-profile`, before `isaac_args`):
 
 ```python
     launch.add_argument(
@@ -1303,12 +1303,12 @@ In `_launch_command`, after the `--qualification` append and before `--livestrea
             command.append("--arena-colors")
 ```
 
-- [ ] **Step 5: Run tests to verify they pass, then the full suite** (the exact-list assertion in `test_launcher_builds_navigation_arena_stream_command` must still pass — the new flags default to False and append nothing)
+- [x] **Step 5: Run tests to verify they pass, then the full suite** (the exact-list assertion in `test_launcher_builds_navigation_arena_stream_command` must still pass — the new flags default to False and append nothing)
 
 Run: `python3 -m unittest tests.test_arena_streaming -v && python3 -m unittest discover -s tests -v 2>&1 | tail -3`
 Expected: OK both
 
-- [ ] **Step 6: Commit (both files carry unrelated WIP hunks — stage selectively)**
+- [x] **Step 6: Commit (both files carry unrelated WIP hunks — stage selectively)**
 
 ```bash
 git add -p validation/run_sim.py tools/tinker_sim_deploy/cli.py
@@ -1327,7 +1327,7 @@ git commit -m "feat: implement the sensor-rich profile with camera publishing"
 - Consumes: everything above.
 - Produces: a verified-running sensor-rich sim; measured achieved camera rate; evidence notes for Task 11.
 
-- [ ] **Step 1: Launch the sim in the background** (domain 42; does not touch the live arena session on 25):
+- [x] **Step 1: Launch the sim in the background** (domain 42; does not touch the live arena session on 25):
 
 ```bash
 cd /home/tinker/tinker-sim/6.0.1
@@ -1351,7 +1351,7 @@ uv run --frozen --no-sync python validation/run_sim.py \
 
 Expected: the startup JSON prints a `cameras` block; no traceback.
 
-- [ ] **Step 2: Verify topics from a Humble shell** (separate terminal env):
+- [x] **Step 2: Verify topics from a Humble shell** (separate terminal env):
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -1366,9 +1366,9 @@ ros2 topic echo /camera/xarm_camera/color/image_raw --once --field width  # 848
 
 Expected: 7 camera topics (no cloud — flag off), RELIABLE/VOLATILE, encodings and sizes per contract, rate ≥ 10 Hz.
 
-- [ ] **Step 3: Iterate on failures.** Likely first-run issues and their fixes: annotator returns None for the first ticks (acceptable — `camera_skipped_frames` counts them); camera looks the wrong way (fix `OPTICAL_TO_USD_CAMERA_WXYZ` usage in `CameraRig.initialize`); rate below 10 Hz (drop `tick_rate_hz` in the contract JSON and rerun — contract change + test update together). Commit each fix separately with a message naming the observed symptom.
+- [x] **Step 3: Iterate on failures.** Likely first-run issues and their fixes: annotator returns None for the first ticks (acceptable — `camera_skipped_frames` counts them); camera looks the wrong way (fix `OPTICAL_TO_USD_CAMERA_WXYZ` usage in `CameraRig.initialize`); rate below 10 Hz (drop `tick_rate_hz` in the contract JSON and rerun — contract change + test update together). Commit each fix separately with a message naming the observed symptom.
 
-- [ ] **Step 4: Record the achieved rate** (from `ros2 topic hz`) for the README in Task 11. Stop the sim (Ctrl-C / SIGINT).
+- [x] **Step 4: Record the achieved rate** (from `ros2 topic hz`) for the README in Task 11. Stop the sim (Ctrl-C / SIGINT).
 
 ---
 
@@ -1382,7 +1382,7 @@ Expected: 7 camera topics (no cloud — flag off), RELIABLE/VOLATILE, encodings 
 - Consumes: running sensor-rich sim (Task 9 recipe), `vision_util get_image` node from `~/tk25_ws`, `hue_presence` from `validation/arena_vision_smoke.py`.
 - Produces: recorded pass evidence; the test skips cleanly offline.
 
-- [ ] **Step 1: Create `tests/ros_humble/test_vision_get_image_live.py`:**
+- [x] **Step 1: Create `tests/ros_humble/test_vision_get_image_live.py`:**
 
 ```python
 """Live vision round-trip: the real vision_util get_image node against the sim.
@@ -1510,12 +1510,12 @@ def test_wrist_camera_round_trip(get_image_client) -> None:
     _save_evidence("wrist", image, depth_mm, {"note": "wrist pose has no hue gate"})
 ```
 
-- [ ] **Step 2: Verify offline skip behavior**
+- [x] **Step 2: Verify offline skip behavior**
 
 Run: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q tests/ros_humble/test_vision_get_image_live.py`
 Expected: `1 skipped` (module-level skip; no Humble needed)
 
-- [ ] **Step 3: Run the live round-trip.** Terminal A: sim as in Task 9 Step 1. Terminal B:
+- [x] **Step 3: Run the live round-trip.** Terminal A: sim as in Task 9 Step 1. Terminal B:
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -1535,11 +1535,11 @@ TINKER_SIM_VISION_LIVE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 Expected: `2 passed`; PNG + JSON evidence under `reports/vision-roundtrip/`.
 
-- [ ] **Step 4: If the head hue gate fails**, open `reports/vision-roundtrip/head-color.png` first — diagnose (camera aimed at floor/ceiling → orientation bug in Task 6; all-gray → `--arena-colors` not applied → Task 5/8 wiring) before touching thresholds. Thresholds move only with a written justification in the commit message.
+- [x] **Step 4: If the head hue gate fails**, open `reports/vision-roundtrip/head-color.png` first — diagnose (camera aimed at floor/ceiling → orientation bug in Task 6; all-gray → `--arena-colors` not applied → Task 5/8 wiring) before touching thresholds. Thresholds move only with a written justification in the commit message.
 
-- [ ] **Step 5: Also run once with `--camera-pointcloud`** and verify from Terminal B: `ros2 topic info /camera/depth_registered/points --verbose` (RELIABLE), `ros2 topic echo /camera/depth_registered/points --once --field point_step` prints `16`. Stop everything afterward.
+- [x] **Step 5: Also run once with `--camera-pointcloud`** and verify from Terminal B: `ros2 topic info /camera/depth_registered/points --verbose` (RELIABLE), `ros2 topic echo /camera/depth_registered/points --once --field point_step` prints `16`. Stop everything afterward.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tests/ros_humble/test_vision_get_image_live.py
@@ -1557,7 +1557,7 @@ git commit -m "test: live get_image round-trip acceptance for sim cameras"
 
 **Interfaces:** none — documentation of what Tasks 1–10 built and proved.
 
-- [ ] **Step 1: Update `integration/modules.json` vision entry** to:
+- [x] **Step 1: Update `integration/modules.json` vision entry** to:
 
 ```json
     "vision": {
@@ -1568,7 +1568,7 @@ git commit -m "test: live get_image round-trip acceptance for sim cameras"
     },
 ```
 
-- [ ] **Step 2: Fix the README.** Replace the broken example (`./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \ --scenario find-and-approach-person --seed 7`) with:
+- [x] **Step 2: Fix the README.** Replace the broken example (`./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \ --scenario find-and-approach-person --seed 7`) with:
 
 ```bash
 ./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \
@@ -1577,12 +1577,12 @@ git commit -m "test: live get_image round-trip acceptance for sim cameras"
 
 Add a `## Vision hardware-parity cameras` subsection containing: the topic table (7 topics + optional cloud), the QoS/encoding contract with the one-line rationale (RELIABLE because every tk26_vision CameraInfo subscription is RELIABLE), the `--camera-pointcloud` / `--arena-colors` flags, the measured achieved rate from Task 9, and the three-terminal acceptance runbook from Task 10 verbatim, noting `ROS_DOMAIN_ID=42` isolation and that `reports/vision-roundtrip/` holds the recorded evidence. State plainly: development-validated, not release-qualified.
 
-- [ ] **Step 3: Full verification**
+- [x] **Step 3: Full verification**
 
 Run: `python3 -m unittest discover -s tests -v 2>&1 | tail -3 && uv lock --check`
 Expected: OK / lock up to date
 
-- [ ] **Step 4: Check all plan checkboxes, commit**
+- [x] **Step 4: Check all plan checkboxes, commit**
 
 ```bash
 git add integration/modules.json README.md docs/superpowers/plans/2026-08-16-sim-vision-stack.md
