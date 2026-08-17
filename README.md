@@ -264,10 +264,18 @@ fail closed on a mismatch before converting anything.
 Run either importer from the simulator venv, on a host with network access
 (to clone the pinned commit) and a GPU (Isaac Sim Kit conversion), with the
 same `TINKER_ACCEPT_OMNIVERSE_EULA=Y` gate as the rest of this README's
-`.deployment.env`-sourcing bootstrap (see "Online bootstrap" above):
+`.deployment.env`-sourcing bootstrap (see "Online bootstrap" above). Both
+importers call `SimulationApp` directly rather than going through the
+deploy CLI's `launch` command, so they bypass the one place
+(`tools/tinker_sim_deploy/cli.py`) that bridges a confirmed
+`TINKER_ACCEPT_OMNIVERSE_EULA=Y` into the `ACCEPT_EULA`/`OMNI_KIT_ACCEPT_EULA`
+variables Kit itself reads; export those two explicitly, once the TINKER
+gate is confirmed, or Kit prompts interactively and a headless run aborts
+at EOF:
 
 ```bash
 source .deployment.env
+export ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES  # only after TINKER_ACCEPT_OMNIVERSE_EULA=Y above
 ./.venv/bin/python tools/arena_import.py --config config/arena-import.json
 ./.venv/bin/python tools/ycb_import.py --config config/ycb-import.json
 ```
