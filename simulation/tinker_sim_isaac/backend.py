@@ -30,6 +30,34 @@ def _map_metadata(path: Path) -> tuple[Path, float, float, float]:
     )
 
 
+def resolve_arena_inputs(
+    arena_artifact: Path | None, map_yaml: Path | None
+) -> tuple[Path | None, Path | None]:
+    """Resolve the effective ``(arena_usd, map_yaml)`` pair for the backend.
+
+    ``arena_artifact`` and an explicit ``map_yaml`` are mutually exclusive: an
+    arena artifact directory carries its own colocated ``arena.usd`` and
+    ``map.yaml``. When no arena artifact is supplied, ``map_yaml`` passes
+    through unchanged.
+    """
+    if arena_artifact is None:
+        return None, map_yaml
+    if map_yaml is not None:
+        raise ValueError(
+            "arena_artifact and map_yaml are mutually exclusive: an arena "
+            "artifact supplies its own colocated map.yaml"
+        )
+    arena_usd = arena_artifact / "arena.usd"
+    effective_map_yaml = arena_artifact / "map.yaml"
+    if not arena_usd.is_file():
+        raise FileNotFoundError(f"arena artifact missing arena.usd: {arena_usd}")
+    if not effective_map_yaml.is_file():
+        raise FileNotFoundError(
+            f"arena artifact missing map.yaml: {effective_map_yaml}"
+        )
+    return arena_usd, effective_map_yaml
+
+
 class IsaacWholeRobotBackend:
     """CPU-PhysX articulation controlled only by standard JointState commands."""
 
@@ -68,7 +96,15 @@ class IsaacWholeRobotBackend:
         scenario: str = "",
         task: str = "",
         wall_color_fn: Callable[[int], tuple[float, float, float]] | None = None,
+        arena_artifact: Path | None = None,
     ) -> None:
+        arena_usd, map_yaml = resolve_arena_inputs(arena_artifact, map_yaml)
+        if arena_artifact is not None and wall_color_fn is not None:
+            raise ValueError(
+                "arena_artifact and wall_color_fn are mutually exclusive: "
+                "wall coloring only applies to procedurally spawned cuboids"
+            )
+
         import torch
         import omni.timeline
         import isaaclab.sim as sim_utils
@@ -135,23 +171,28 @@ class IsaacWholeRobotBackend:
             self.occupancy = OccupancyMap.from_pgm(
                 pgm, resolution=resolution, origin_x=origin_x, origin_y=origin_y
             )
-            for index, (x, y, sx, sy) in enumerate(self.occupancy.rectangles()):
-                color = (
-                    DEFAULT_WALL_COLOR
-                    if wall_color_fn is None
-                    else tuple(wall_color_fn(index))
-                )
-                box = sim_utils.CuboidCfg(
-                    size=(sx, sy, 1.2),
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
-                )
-                box.func(
-                    f"/World/NavigationMap/occupied_{index:04d}",
-                    box,
-                    translation=(x, y, 0.6),
-                )
+            if arena_usd is not None:
+                from isaacsim.core.utils.stage import add_reference_to_stage
+
+                add_reference_to_stage(str(arena_usd.resolve()), "/World/Arena")
+            else:
+                for index, (x, y, sx, sy) in enumerate(self.occupancy.rectangles()):
+                    color = (
+                        DEFAULT_WALL_COLOR
+                        if wall_color_fn is None
+                        else tuple(wall_color_fn(index))
+                    )
+                    box = sim_utils.CuboidCfg(
+                        size=(sx, sy, 1.2),
+                        rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                        collision_props=sim_utils.CollisionPropertiesCfg(),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+                    )
+                    box.func(
+                        f"/World/NavigationMap/occupied_{index:04d}",
+                        box,
+                        translation=(x, y, 0.6),
+                    )
 
         robot_cfg = ArticulationCfg(
             prim_path="/World/Tinker",
