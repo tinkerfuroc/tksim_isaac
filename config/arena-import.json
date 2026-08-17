@@ -37,8 +37,6 @@
     "rcw26_door",
     "rcw26_sink"
   ],
-  "surface_furniture": ["rcw26_kitchen_table", "rcw26_shelf", "rcw26_side_table",
-                        "rcw26_laundry_desk", "rcw26_sofa"],
   "surfaces": [
     {
       "model_id": "rcw26_kitchen_table",

@@ -40,9 +40,7 @@ from tinker_sim_deploy.arena_world import (
     parse_world,
 )
 from tinker_sim_deploy.import_common import (
-    _git_head,
     _read_upstream,
-    _run_git,
     _source_record,
     _verify_pin,
     clone_pin,
@@ -143,6 +141,17 @@ def _visual_mesh_info(sdf_bytes: bytes) -> tuple[str, tuple[float, float, float]
 
 
 def _resolve_glb_path(checkout: Path, model_id: str, uri: str) -> Path:
+    """Resolve a model SDF's ``<mesh><uri>`` to a real file under ``checkout``,
+    failing closed (before any read) on either escape this join is otherwise
+    exposed to: an absolute URI remainder collapses ``checkout / "models" /
+    model_id / "/abs"`` to plain ``/abs`` (``Path.__truediv__`` discards
+    everything to the left of an absolute right operand), and a relative
+    remainder containing ``..`` segments (e.g. ``model://<id>/../../..``)
+    can walk lexically outside ``checkout`` while still passing a lexical
+    ``relative_to`` check performed before resolution. Both classes are
+    caught the same way here: resolve the joined path (collapses ``..`` and
+    symlinks) and require it be contained within the resolved checkout root.
+    """
     prefix = f"model://{model_id}/"
     if uri.startswith(prefix):
         relative = uri[len(prefix):]
@@ -150,7 +159,13 @@ def _resolve_glb_path(checkout: Path, model_id: str, uri: str) -> Path:
         raise AssetArtifactError(f"{model_id}: visual mesh references a different model: {uri!r}")
     else:
         relative = uri
-    return checkout / "models" / model_id / relative
+    checkout_root = checkout.resolve()
+    resolved = (checkout / "models" / model_id / relative).resolve()
+    if not resolved.is_relative_to(checkout_root):
+        raise AssetArtifactError(
+            f"{model_id}: visual mesh URI resolves outside the checkout: {uri!r}"
+        )
+    return resolved
 
 
 def _has_non_box_collision(sdf_bytes: bytes) -> bool:
@@ -291,7 +306,26 @@ def _furniture_payload(usd_path: Path, model_id: str) -> dict[str, bytes]:
 # --------------------------------------------------------------------------- #
 # placement surfaces / attribution
 # --------------------------------------------------------------------------- #
+def _furniture_instance_suffixes(furniture: Sequence[object]) -> dict[int, str]:
+    """Map each placement's ``id()`` to the disambiguating suffix
+    ``arena_convert.compose_arena`` would give its furniture prim: computed
+    the same way (iterate placements in order, first-seen bare, later
+    instances of the same model_id get an incrementing ``_NN`` suffix) so
+    ``placement.json`` surface_ids always name the same instance as the
+    corresponding ``arena.usd`` prim. ``id()`` is safe here because every
+    placement is a distinct object built once during ``parse_world``.
+    """
+    counts: dict[str, int] = {}
+    suffixes: dict[int, str] = {}
+    for placement in furniture:
+        counts[placement.model_id] = counts.get(placement.model_id, 0) + 1
+        count = counts[placement.model_id]
+        suffixes[id(placement)] = "" if count == 1 else f"_{count:02d}"
+    return suffixes
+
+
 def _build_surfaces(layout: ArenaLayout, surface_specs: Sequence[Mapping[str, object]]) -> list[PlacementSurface]:
+    instance_suffixes = _furniture_instance_suffixes(layout.furniture)
     surfaces: list[PlacementSurface] = []
     for spec in surface_specs:
         model_id = str(spec["model_id"])
@@ -306,6 +340,7 @@ def _build_surfaces(layout: ArenaLayout, surface_specs: Sequence[Mapping[str, ob
                     local_center=tuple(spec["local_center"]),
                     size_xy=tuple(spec["size_xy"]),
                     edge_margin=float(spec["edge_margin"]),
+                    instance_suffix=instance_suffixes[id(placement)],
                 )
             )
     return surfaces

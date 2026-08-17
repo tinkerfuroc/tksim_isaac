@@ -12,6 +12,7 @@ Isaac Sim process.
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -66,6 +67,53 @@ class ResolveArenaArtifactTest(unittest.TestCase):
         (pub.artifact_dir / "arena.usd").unlink()
         with self.assertRaises(FileNotFoundError):
             rs.resolve_arena_artifact(self.root, "rcw2026")
+
+
+class ArenaFlagSupportedTest(unittest.TestCase):
+    """Final review Finding 4: ``--arena`` was silently ignored under
+    ``--sensor-profile physics-only`` -- that branch never reads
+    ``args.arena`` at all. ``arena_flag_supported`` is the pure predicate
+    ``main()``'s parser-level guard uses (mirrors ``sensor_rich_implies_ros``/
+    ``gateway_lidar_enabled``'s existing pure-helper pattern -- ``run_sim``
+    has no Isaac imports at module level, so it is importable/testable under
+    plain system Python).
+    """
+
+    def test_physics_only_unsupported(self):
+        self.assertFalse(rs.arena_flag_supported("physics-only"))
+
+    def test_other_profiles_supported(self):
+        for profile in ("sensor-rich", "navigation-parity", "manipulation-core"):
+            self.assertTrue(rs.arena_flag_supported(profile))
+
+
+class ArenaFlagParserRejectionTest(unittest.TestCase):
+    """End-to-end proof the guard is actually wired into ``main()``'s
+    argument parsing, exercised via subprocess: the ``parser.error()`` call
+    happens before ``main()`` ever imports ``isaacsim``, so this needs no
+    GPU/Isaac Sim and runs under plain system Python (same rationale as
+    ``--help``-style parser validation).
+    """
+
+    def test_arena_with_physics_only_is_rejected_before_isaac_import(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "validation" / "run_sim.py"),
+                "--sensor-profile", "physics-only",
+                "--arena", "rcw2026",
+                "--profile", "parity",
+                "--scenario", "empty",
+                "--seed", "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "--arena requires a profile that loads the robot backend", result.stderr
+        )
 
 
 if __name__ == "__main__":

@@ -41,9 +41,7 @@ from tinker_sim_deploy.arena_artifact import (
     publish_asset_artifact,
 )
 from tinker_sim_deploy.import_common import (
-    _git_head,
     _read_upstream,
-    _run_git,
     _source_record,
     _verify_pin,
     clone_pin,
