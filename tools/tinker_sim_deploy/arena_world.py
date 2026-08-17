@@ -65,7 +65,20 @@ def _parse_pose(text: str | None, label: str) -> tuple[float, float, float, floa
     return (x, y, z, yaw)
 
 
-def parse_world(xml_bytes: bytes, model_allowlist: frozenset[str]) -> ArenaLayout:
+def _parse_static(text: str | None) -> bool:
+    """Gazebo SDF writes ``<static>`` as either the word form or 0/1; both
+    are seen across the real upstream worlds, so both must be recognized.
+    """
+    if text is None:
+        return False
+    return text.strip().lower() in ("true", "1")
+
+
+def parse_world(
+    xml_bytes: bytes,
+    model_allowlist: frozenset[str],
+    model_skiplist: frozenset[str] = frozenset(),
+) -> ArenaLayout:
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as error:
@@ -100,10 +113,12 @@ def parse_world(xml_bytes: bytes, model_allowlist: frozenset[str]) -> ArenaLayou
         if not uri.startswith("model://"):
             raise ArenaWorldError(f"include with unsupported uri: {uri!r}")
         model_id = uri[len("model://"):]
+        if model_id in model_skiplist:
+            continue
         if model_id not in model_allowlist:
             raise ArenaWorldError(f"model not on the import allowlist: {model_id}")
         x, y, z, yaw = _parse_pose(include.findtext("pose"), model_id)
-        static = (include.findtext("static") or "false").strip().lower() == "true"
+        static = _parse_static(include.findtext("static"))
         furniture.append(
             FurniturePlacement(model_id=model_id, position=(x, y, z),
                                yaw=yaw, static=static)
@@ -122,15 +137,40 @@ def parse_model_colliders(sdf_bytes: bytes) -> tuple[BoxCollider | MeshCollider,
     for collision in root.iter("collision"):
         box_size = collision.findtext("geometry/box/size")
         mesh_uri = collision.findtext("geometry/mesh/uri")
+        cylinder_radius = collision.findtext("geometry/cylinder/radius")
+        cylinder_length = collision.findtext("geometry/cylinder/length")
+        label = collision.get("name", "collision")
         if box_size is not None:
             sx, sy, sz = (float(part) for part in box_size.split())
-            cx, cy, cz, cyaw = _parse_pose(
-                collision.findtext("pose"), collision.get("name", "collision")
-            )
+            cx, cy, cz, cyaw = _parse_pose(collision.findtext("pose"), label)
             colliders.append(
                 BoxCollider(size=(sx, sy, sz), center=(cx, cy, cz), yaw=cyaw)
             )
+        elif cylinder_radius is not None and cylinder_length is not None:
+            # No downstream consumer (map rasterization, collider authoring)
+            # understands a cylinder primitive; represent it as its
+            # axis-aligned bounding box (diameter x diameter x length). This
+            # is a conservative over-approximation, not an exact match to
+            # the round footprint.
+            radius = float(cylinder_radius)
+            length = float(cylinder_length)
+            cx, cy, cz, cyaw = _parse_pose(collision.findtext("pose"), label)
+            colliders.append(
+                BoxCollider(
+                    size=(2.0 * radius, 2.0 * radius, length),
+                    center=(cx, cy, cz),
+                    yaw=cyaw,
+                )
+            )
         elif mesh_uri is not None:
+            # Mesh collisions reuse the visual mesh's own <pose> in the real
+            # upstream SDFs, including a non-zero roll that corrects the
+            # source GLB's Y-up authoring to Z-up (the same roll the
+            # <visual> element carries). MeshCollider stores no pose --
+            # author_model_colliders applies a convex hull directly to the
+            # already visually-corrected mesh prim -- so the collision
+            # <pose> is not read here and the box/cylinder roll==0
+            # restriction does not apply to it.
             colliders.append(MeshCollider(uri=mesh_uri.strip()))
         else:
             raise ArenaWorldError("collision with unsupported geometry")

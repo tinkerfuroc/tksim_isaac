@@ -1,0 +1,80 @@
+{
+  "repository": "https://github.com/TeamSOBITS/sobits_gazebo_worlds",
+  "branch": "feature/hri",
+  "commit": "293b4057d26a673c3f09ff7d8f3118234d42ba24",
+  "world": "worlds/rcw2026_arena.world.xacro",
+  "arena_id": "rcw2026",
+  "model_allowlist": [
+    "rcw26_bed",
+    "rcw26_chair",
+    "rcw26_cushion",
+    "rcw26_dishwasher_close",
+    "rcw26_dishwasher_open",
+    "rcw26_door",
+    "rcw26_kitchen_table",
+    "rcw26_laundry_basket",
+    "rcw26_laundry_desk",
+    "rcw26_plant_mid",
+    "rcw26_plant_tall",
+    "rcw26_refrigerator",
+    "rcw26_shelf",
+    "rcw26_side_table",
+    "rcw26_sink",
+    "rcw26_sofa",
+    "rcw26_stand",
+    "rcw26_trashbin",
+    "rcw26_tv",
+    "rcw26_tv_stand",
+    "rcw26_washing_machine",
+    "rcw26_washing_machine_open"
+  ],
+  "model_skiplist": [
+    "wrc_ground_plane",
+    "bag_blue",
+    "bag_black"
+  ],
+  "bounds_check_exceptions": [
+    "rcw26_door",
+    "rcw26_sink"
+  ],
+  "surface_furniture": ["rcw26_kitchen_table", "rcw26_shelf", "rcw26_side_table",
+                        "rcw26_laundry_desk", "rcw26_sofa"],
+  "surfaces": [
+    {
+      "model_id": "rcw26_kitchen_table",
+      "surface_name": "top",
+      "local_center": [0.0, 0.0, 0.724],
+      "size_xy": [0.86, 0.87],
+      "edge_margin": 0.05
+    },
+    {
+      "model_id": "rcw26_shelf",
+      "surface_name": "plate",
+      "local_center": [0.0, 0.0, 1.06],
+      "size_xy": [0.85, 0.30],
+      "edge_margin": 0.05
+    },
+    {
+      "model_id": "rcw26_side_table",
+      "surface_name": "top",
+      "local_center": [0.0, 0.0, 0.602],
+      "size_xy": [0.38, 0.38],
+      "edge_margin": 0.05
+    },
+    {
+      "model_id": "rcw26_laundry_desk",
+      "surface_name": "top",
+      "local_center": [0.0, 0.0, 0.734],
+      "size_xy": [1.15, 0.60],
+      "edge_margin": 0.05
+    },
+    {
+      "model_id": "rcw26_sofa",
+      "surface_name": "seat",
+      "local_center": [0.0, 0.0, 0.33],
+      "size_xy": [2.10, 0.90],
+      "edge_margin": 0.05
+    }
+  ],
+  "bounds_tolerance_m": 0.02
+}
