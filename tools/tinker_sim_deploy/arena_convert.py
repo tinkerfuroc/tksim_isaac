@@ -1,12 +1,15 @@
 """Kit/pxr conversion adapter for the RoboCup arena importer.
 
-Every function here is live-only: Kit/pxr are imported lazily inside each
-function body so this module can be *imported* under plain system Python
-(e.g. by ``tools/arena_import.py``'s ``--help``) without a running Isaac Sim
-process, while actually *calling* any function requires an active
-``SimulationApp`` with ``omni.kit.asset_converter`` enabled. There are no
-unit tests for this module -- it is exercised by the live import only (see
-the Task 9 report for the run log).
+Every function here that touches Kit/pxr is live-only: those imports are
+lazy, inside each function body, so this module can be *imported* under
+plain system Python (e.g. by ``tools/arena_import.py``'s ``--help``)
+without a running Isaac Sim process, while actually *calling* one of them
+requires an active ``SimulationApp`` with ``omni.kit.asset_converter``
+enabled -- exercised by the live import only (see the Task 9 report for the
+run log). A handful of pure-Python helpers with no pxr dependency
+(``_texture_relocation_target``, ``_relocatable_asset_source``) are
+extracted specifically so they can be unit-tested under system Python; see
+``tests/test_arena_convert.py``.
 
 xformOp authoring convention used throughout: ops are added in the order
 translate, then rotate, then scale. USD composes ``xformOpOrder`` so the
@@ -78,6 +81,7 @@ def convert_glb_to_usd(
 
     asyncio.get_event_loop().run_until_complete(_run())
     _rebase_converted_mesh(raw_path, usd_path, mesh_scale, mesh_pose)
+    _relocate_local_assets(usd_path, raw_path.parent, usd_path.stem)
 
 
 def _rebase_converted_mesh(
@@ -86,6 +90,34 @@ def _rebase_converted_mesh(
     scale: tuple[float, float, float],
     pose: tuple[float, float, float, float, float, float],
 ) -> None:
+    """Re-anchor the raw Kit conversion onto this codebase's metre/Z-up
+    convention, structured so both ``author_model_colliders`` (Finding 2)
+    and further referencing (``compose_arena`` referencing this whole file)
+    stay safe:
+
+        /World            plain Xform, the default prim, no xformOps of
+                           its own -- referencing *this* file elsewhere and
+                           then authoring new world-placement ops on the
+                           referencing prim must not collide with anything
+                           already authored here.
+        /World/geom       the mesh-correction ops (translate, then rotate,
+                           then scale -- see the module docstring for why
+                           that op order is correct).
+        /World/geom/mesh  references the raw conversion. A further child,
+                           not /World/geom itself: the raw stage's own
+                           default prim already carries an authored
+                           (identity) [translate, orient, scale] Kit stamps
+                           on every glTF conversion, and referencing it
+                           onto the *same* prim that already has our own
+                           translate/rotate/scale ops raises
+                           "xformOp:translate already exists in
+                           xformOpOrder" (confirmed live).
+
+    ``author_model_colliders`` later adds a sibling ``/World/Colliders``
+    subtree -- also under the default prim (so a reference to this whole
+    file composes it in too), but outside ``/World/geom`` (so colliders
+    never inherit the mesh-correction xform).
+    """
     from pxr import Gf, Usd, UsdGeom
 
     raw_stage = Usd.Stage.Open(str(raw_path))
@@ -100,20 +132,21 @@ def _rebase_converted_mesh(
     root = UsdGeom.Xform.Define(wrapper, "/World")
     wrapper.SetDefaultPrim(root.GetPrim())
 
+    geom = UsdGeom.Xform.Define(wrapper, "/World/geom")
     x, y, z, roll, pitch, yaw = pose
     # Fold the raw stage's own metersPerUnit into the authored scale so the
     # flattened result is expressed directly in metres, matching the
     # wrapper's own metersPerUnit=1.0 declared above.
     effective_scale = tuple(component * raw_meters_per_unit for component in scale)
-    xformable = UsdGeom.Xformable(root.GetPrim())
+    xformable = UsdGeom.Xformable(geom.GetPrim())
     xformable.AddTranslateOp().Set(Gf.Vec3d(x, y, z))
     xformable.AddRotateXYZOp().Set(
         Gf.Vec3f(math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
     )
     xformable.AddScaleOp().Set(Gf.Vec3f(*effective_scale))
 
-    geom = wrapper.DefinePrim("/World/geom")
-    geom.GetReferences().AddReference(str(raw_path))
+    mesh_ref = wrapper.DefinePrim("/World/geom/mesh")
+    mesh_ref.GetReferences().AddReference(str(raw_path))
 
     # Flatten: the published artifact only ever carries usd_path's bytes,
     # never the *.raw.usd sibling, so the reference above must not survive
@@ -122,21 +155,140 @@ def _rebase_converted_mesh(
     flattened.Export(str(usd_path))
 
 
+def _texture_relocation_target(model_id: str, filename: str) -> str:
+    """Deterministic, artifact-relative destination for a texture/material
+    file Kit extracted alongside the raw GLB conversion -- relative to
+    ``usd_path`` itself, since both end up siblings under the published
+    ``furniture/`` directory (``furniture/<model_id>.usd`` next to
+    ``furniture/textures/<model_id>/<filename>``). Namespaced per model_id
+    so two different models' textures can never collide in the shared
+    payload even if Kit ever reused a filename across sources.
+    """
+    return f"./textures/{model_id}/{filename}"
+
+
+def _relocatable_asset_source(raw_asset_path: str | None, search_root: Path) -> Path | None:
+    """Return the resolved source ``Path`` if ``raw_asset_path`` is a local
+    file Kit extracted under ``search_root`` (the scratch conversion
+    directory for this model), or ``None`` if it is not a relocation
+    candidate -- e.g. a bare, non-absolute reference into Kit's built-in
+    MDL shader library such as ``"gltf/pbr.mdl"``, which is not a real
+    filesystem path at authoring time and must be left untouched (it
+    resolves via Kit's own MDL search path wherever the USD is later
+    opened, not something this importer controls or should bundle).
+    """
+    if not raw_asset_path:
+        return None
+    source = Path(raw_asset_path)
+    if not source.is_absolute():
+        return None
+    try:
+        source.relative_to(search_root)
+    except ValueError:
+        return None
+    if not source.is_file():
+        return None
+    return source
+
+
+def _resave_fresh(stage, usd_path: Path) -> None:
+    """Replace ``usd_path`` with a freshly re-serialized export of
+    ``stage``'s root layer, rather than an in-place ``Stage.Save()``.
+
+    Confirmed live (see the Task 9 fix report, Finding 1): ``Save()``
+    performs an incremental update of the existing crate file and does
+    *not* purge its string pool -- a previously-authored-then-overwritten
+    value (e.g. a texture path ``_relocate_local_assets`` rewrites from an
+    absolute scratch path to a relative one) can remain physically present
+    in the file's raw bytes even though the live scene graph reads back
+    correctly. That both defeats grepping the published payload for a
+    leaked scratch path and breaks publish-determinism (the stale bytes
+    differ by the random per-run tempdir suffix even though nothing
+    observable changed). A fresh ``Export()`` rebuilds the string pool
+    from only the current field values, with nothing left over.
+    """
+    fresh_path = usd_path.with_name(usd_path.stem + ".fresh.usd")
+    stage.GetRootLayer().Export(str(fresh_path))
+    fresh_path.replace(usd_path)
+
+
+def _relocate_local_assets(usd_path: Path, search_root: Path, model_id: str) -> None:
+    """Copy any texture/material files Kit extracted as local files under
+    ``search_root`` into the payload directory next to ``usd_path``, and
+    rewrite the absolute scratch paths ``Stage.Flatten()`` bakes into
+    asset-valued attributes (composition arcs get resolved away by
+    ``Flatten()``, but asset-path-typed *values* like a shader's
+    ``inputs:texture`` do not -- they get anchored absolute instead) to a
+    path relative to ``usd_path``.
+
+    Without this, every published furniture USD embeds the random per-run
+    scratch tempdir path: textures resolve nowhere once that directory is
+    deleted (confirmed live -- no PNG bytes embedded, no texture files in
+    the payload, textures pointing into an already-deleted directory), and
+    re-running the same import against the same pin/config produces
+    different bytes (a different random tempdir suffix baked into the
+    texture path) for what should be an identical, idempotent artifact.
+    """
+    from pxr import Sdf, Usd
+
+    stage = Usd.Stage.Open(str(usd_path))
+    dest_dir = usd_path.parent / "textures" / model_id
+    relocated: dict[str, str] = {}
+    changed = False
+    for prim in stage.Traverse():
+        for attr in prim.GetAttributes():
+            if attr.GetTypeName() != Sdf.ValueTypeNames.Asset:
+                continue
+            value = attr.Get()
+            if value is None:
+                continue
+            source = _relocatable_asset_source(value.path, search_root)
+            if source is None:
+                continue
+            key = str(source)
+            if key not in relocated:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                (dest_dir / source.name).write_bytes(source.read_bytes())
+                relocated[key] = _texture_relocation_target(model_id, source.name)
+            attr.Set(Sdf.AssetPath(relocated[key]))
+            changed = True
+    if changed:
+        _resave_fresh(stage, usd_path)
+
+
 def author_model_colliders(
     usd_path: Path, colliders: tuple[BoxCollider | MeshCollider, ...]
 ) -> None:
     """Author collider prims for one converted furniture USD, in place.
 
-    Box colliders become invisible ``UsdGeom.Cube`` prims under a top-level
-    ``/Colliders`` scope (a sibling of the converter's default prim, so it
-    never inherits ``convert_glb_to_usd``'s mesh-correction xform and never
-    contributes to ``measure_bounds``, which measures only the default
-    prim's subtree). Mesh colliders get a convex-hull ``MeshCollisionAPI``
-    applied directly to every imported ``UsdGeom.Mesh`` prim.
+    Box colliders become invisible ``UsdGeom.Cube`` prims under
+    ``<default prim>/Colliders`` -- a *sibling* of the mesh-correction
+    ``.../geom`` subtree (colliders never inherit that xform), but still
+    *under* the default prim itself, so a reference to this whole file
+    (e.g. ``compose_arena`` referencing ``./furniture/<id>.usd``) composes
+    in both the visual mesh and its colliders together.
+
+    An earlier version put colliders at a root-level ``/Colliders``, a
+    sibling of the default prim entirely: USD reference semantics only
+    compose the *referenced prim's own subtree*, so anything outside the
+    default prim is silently dropped by every reference. That left ~14 of
+    20 furniture models (every strict-box model plus the cylinder/mesh
+    ``kitchen_table``/``door``/``sink``) with no physics at all once
+    referenced into the composed arena -- an object placed on
+    ``kitchen_table#top`` would fall straight through. Found live via a
+    structural pxr check on the composed ``arena.usd``, fixed here.
+
+    Mesh colliders get a convex-hull ``MeshCollisionAPI`` applied directly
+    to every imported ``UsdGeom.Mesh`` prim (works regardless of nesting
+    depth -- ``Traverse()`` walks the whole stage).
     """
     from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
     stage = Usd.Stage.Open(str(usd_path))
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError(f"{usd_path}: no default prim to author colliders under")
+
     if any(isinstance(collider, MeshCollider) for collider in colliders):
         for prim in stage.Traverse():
             if prim.IsA(UsdGeom.Mesh):
@@ -146,9 +298,10 @@ def author_model_colliders(
 
     box_colliders = [collider for collider in colliders if isinstance(collider, BoxCollider)]
     if box_colliders:
-        UsdGeom.Scope.Define(stage, "/Colliders")
+        colliders_path = default_prim.GetPath().AppendChild("Colliders")
+        UsdGeom.Scope.Define(stage, colliders_path)
         for index, collider in enumerate(box_colliders):
-            cube = UsdGeom.Cube.Define(stage, f"/Colliders/box_{index:02d}")
+            cube = UsdGeom.Cube.Define(stage, colliders_path.AppendChild(f"box_{index:02d}"))
             cube.CreateSizeAttr(1.0)
             xform = UsdGeom.Xformable(cube.GetPrim())
             xform.AddTranslateOp().Set(Gf.Vec3d(*collider.center))
@@ -156,7 +309,7 @@ def author_model_colliders(
             xform.AddScaleOp().Set(Gf.Vec3f(*collider.size))
             UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
             UsdGeom.Imageable(cube.GetPrim()).MakeInvisible()
-    stage.Save()
+    _resave_fresh(stage, usd_path)
 
 
 def _bind_gray_material(stage, prim, materials_scope: str) -> None:
@@ -214,19 +367,22 @@ def compose_arena(
         # get a disambiguating suffix.
         suffix = "" if count == 1 else f"_{count:02d}"
         prim_path = f"{furniture_scope.GetPath()}/{item.model_id}{suffix}"
-        # The referenced furniture USD's own default prim may already carry
-        # xformOps (convert_glb_to_usd's mesh_scale/mesh_pose correction);
-        # referencing composes those onto whatever prim holds the
-        # reference, so world-placement ops must live on a *wrapper* prim
-        # with the reference on a child -- authoring translate/rotateZ
-        # directly on the referencing prim itself collides with the
-        # inherited xformOpOrder ("xformOp:translate already exists").
+        # The referenced furniture USD's default prim (/World) is a plain,
+        # op-free Xform by construction (see arena_convert's own
+        # _rebase_converted_mesh), but world-placement ops still go on a
+        # *wrapper* prim with the reference on a child ("content", not
+        # "geom" -- the referenced file's own default prim already has a
+        # "geom" child, and nesting "geom/geom" would be needlessly
+        # confusing) rather than the wrapper itself, out of caution: this
+        # is exactly the "xformOp:translate already exists" shape of bug
+        # that hit _rebase_converted_mesh once already, and the reference
+        # brings in the whole subtree either way.
         wrapper = UsdGeom.Xform.Define(stage, prim_path)
         xform = UsdGeom.Xformable(wrapper.GetPrim())
         xform.AddTranslateOp().Set(Gf.Vec3d(*item.position))
         xform.AddRotateZOp().Set(math.degrees(item.yaw))
-        geom_prim = stage.DefinePrim(f"{prim_path}/geom")
-        geom_prim.GetReferences().AddReference(f"./{furniture_dir_name}/{item.model_id}.usd")
+        content_prim = stage.DefinePrim(f"{prim_path}/content")
+        content_prim.GetReferences().AddReference(f"./{furniture_dir_name}/{item.model_id}.usd")
 
     stage.Save()
 
@@ -236,11 +392,13 @@ def measure_bounds(
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """Return the (min, max) world-space AABB of ``usd_path``'s default prim.
 
-    Uses default ``ignoreVisibility=False`` so invisible collider prims
-    authored by ``author_model_colliders`` never contribute (they also live
-    outside the default prim's subtree, so this is a second, independent
-    guard against the map slice / bounds check ever seeing collider
-    geometry instead of the visual mesh).
+    Uses default ``ignoreVisibility=False``, which prunes invisible
+    *descendants* from the computed bound regardless of nesting depth --
+    confirmed live with a direct pxr check before relying on it -- so the
+    invisible ``.../Colliders/box_NN`` cubes ``author_model_colliders``
+    adds under the same default prim never contribute here, even though
+    (per Finding 2's fix) they now live inside the default prim's subtree
+    rather than outside it.
     """
     from pxr import Usd, UsdGeom
 

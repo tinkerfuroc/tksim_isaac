@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -157,14 +158,21 @@ class StubHooks:
     behaves exactly like the brief's original stub.
     """
 
-    def __init__(self, measure_bounds_return=((-0.6, -0.3, 0.0), (0.6, 0.3, 0.74))):
+    def __init__(self, measure_bounds_return=((-0.6, -0.3, 0.0), (0.6, 0.3, 0.74)), write_texture=False):
         self._measure_bounds_return = measure_bounds_return
+        self._write_texture = write_texture
         self.convert_calls: list[dict[str, object]] = []
 
     def convert_glb_to_usd(self, glb, usd, *, mesh_scale=(1.0, 1.0, 1.0), mesh_pose=(0.0,) * 6):
         self.convert_calls.append({"glb": glb, "usd": usd, "mesh_scale": mesh_scale, "mesh_pose": mesh_pose})
         usd.parent.mkdir(parents=True, exist_ok=True)
         usd.write_bytes(b"stub-usd:" + glb.name.encode())
+        if self._write_texture:
+            # Mirrors arena_convert._relocate_local_assets's real layout:
+            # usd.parent / "textures" / <model_id> / <filename>.
+            texture_dir = usd.parent / "textures" / usd.stem
+            texture_dir.mkdir(parents=True, exist_ok=True)
+            (texture_dir / "tex0.png").write_bytes(b"fake-png-bytes")
 
     def author_model_colliders(self, usd, colliders):
         pass
@@ -258,6 +266,69 @@ class RunImportTest(unittest.TestCase):
 
         publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks)
 
+        self.assertEqual(arena_artifact.verify_asset_artifact(publication.artifact_dir), [])
+
+    def test_second_visual_mesh_fails_closed(self):
+        # _visual_mesh_info returned on the *first* <visual> match found by
+        # root.iter("visual") -- a model with two visual meshes would
+        # silently lose the second mesh's geometry and its GLB would never
+        # enter the source lock. Must fail closed instead.
+        sdf_with_two_visuals = _MODEL_SDF.replace(
+            b"</link>",
+            b"""<visual name="visual2">
+        <pose>0 0 0.1 1.5708 0 0</pose>
+        <geometry><mesh><uri>model://rcw26_kitchen_table/meshes/extra.glb</uri></mesh></geometry>
+      </visual>
+    </link>""",
+        )
+        with self.assertRaises(arena_artifact.AssetArtifactError):
+            arena_import._visual_mesh_info(sdf_with_two_visuals)
+
+    def test_source_lock_glb_path_is_the_resolved_file_not_a_naming_guess(self):
+        # _relative_glb_record_path used to fabricate "models/<id>/meshes/
+        # <name>" instead of deriving the path from the file actually
+        # resolved and read -- indistinguishable from ground truth in the
+        # original fixture (which happens to live exactly one level under
+        # meshes/), so this fixture nests the glb one level deeper to prove
+        # the recorded path is derived from the real resolved location.
+        nested_sdf = _MODEL_SDF.replace(
+            b"model://rcw26_kitchen_table/meshes/x.glb",
+            b"model://rcw26_kitchen_table/meshes/nested/x.glb",
+        )
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        checkout = _build_checkout(root)
+        model_dir = checkout / "models" / "rcw26_kitchen_table"
+        (model_dir / "model.sdf").write_bytes(nested_sdf)
+        (model_dir / "meshes" / "nested").mkdir()
+        (model_dir / "meshes" / "nested" / "x.glb").write_bytes(b"fake-glb-bytes")
+        _git(checkout, "add", "-A")
+        _git(checkout, "commit", "-q", "-m", "nest the glb one level deeper")
+        commit = _git_head(checkout)
+
+        config = _base_config(commit)
+        hooks = StubHooks()
+        publication = arena_import.run_import(config, self.repo_root, checkout, hooks)
+
+        lock = json.loads((publication.artifact_dir / "source-lock.json").read_bytes())
+        recorded_paths = {record["path"] for record in lock["records"]}
+        self.assertIn("models/rcw26_kitchen_table/meshes/nested/x.glb", recorded_paths)
+        self.assertNotIn("models/rcw26_kitchen_table/meshes/x.glb", recorded_paths)
+
+    def test_relocated_textures_are_published_alongside_their_usd(self):
+        # arena_convert.convert_glb_to_usd relocates any texture/material
+        # files Kit extracted to usd.parent/"textures"/<model_id>/ (see the
+        # Task 9 fix report, Finding 1) -- run_import must republish those
+        # alongside the referencing USD or the relative path it rewrote
+        # them to resolves to nothing in the artifact.
+        config = _base_config(self.commit)
+        hooks = StubHooks(write_texture=True)
+
+        publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks)
+
+        texture_path = publication.artifact_dir / "furniture" / "textures" / "rcw26_kitchen_table" / "tex0.png"
+        self.assertTrue(texture_path.is_file())
+        self.assertEqual(texture_path.read_bytes(), b"fake-png-bytes")
         self.assertEqual(arena_artifact.verify_asset_artifact(publication.artifact_dir), [])
 
 
