@@ -229,6 +229,130 @@ test upgrade — once the node is fixed upstream.
 Status: development-validated with a recorded live round-trip; **not
 release-qualified**.
 
+## RoboCup 2026 arena
+
+`--arena rcw2026` replaces the procedurally generated occupancy world with an
+imported RoboCup 2026 @Home-style arena: 20 furniture models across 32
+placements (kitchen table, sofa, shelf, sink, washing machine, and so on)
+plus the room's wall layout, converted from the real upstream Gazebo world.
+A companion importer publishes ten graspable YCB tabletop objects (cracker
+box, sugar box, potted meat can, mustard bottle, pudding box, tomato soup
+can, banana, bleach cleanser, bowl, mug) for pick/place work. Both are
+pulled from pinned upstream commits and published as immutable,
+content-addressed asset artifacts, mirroring the existing robot-artifact
+convention: `artifacts/arena/rcw2026/<identity>/` and
+`artifacts/objects/ycb/<identity>/`, each with a `current.json` pointer, a
+`manifest.json`, a `source-lock.json` (per consumed upstream file: relative
+path, size, sha256), and an `ATTRIBUTION.md`. Re-running an importer against
+unchanged upstream content and config is a byte-identical no-op (proven live
+by two consecutive runs of each importer publishing under the same
+identity, the second with no filesystem writes).
+
+Provenance: the arena is converted from
+[`TeamSOBITS/sobits_gazebo_worlds`](https://github.com/TeamSOBITS/sobits_gazebo_worlds)
+at `feature/hri`, pinned to commit `293b4057d26a673c3f09ff7d8f3118234d42ba24`
+(BSD-3-Clause; `ATTRIBUTION.md` carries the upstream `LICENSE` text plus the
+per-file source records). The YCB objects are converted from
+[`TeamSOBITS/tmc_wrs_gz`](https://github.com/TeamSOBITS/tmc_wrs_gz) at
+`jazzy-devel`, pinned to commit `48157eec99bfc50f8d24ad95736d4d10bb344c14`
+(`ATTRIBUTION.md` carries a CC BY 4.0 attribution block naming the
+Yale-CMU-Berkeley (YCB) Object and Model Set, the license obligation for
+that content, plus the Clear BSD text for the `tmc_wrs_gz` wrapper itself).
+Both importers verify the checkout's `HEAD` against the pinned commit and
+fail closed on a mismatch before converting anything.
+
+Run either importer from the simulator venv, on a host with network access
+(to clone the pinned commit) and a GPU (Isaac Sim Kit conversion), with the
+same `TINKER_ACCEPT_OMNIVERSE_EULA=Y` gate as the rest of this README's
+`.deployment.env`-sourcing bootstrap (see "Online bootstrap" above):
+
+```bash
+source .deployment.env
+./.venv/bin/python tools/arena_import.py --config config/arena-import.json
+./.venv/bin/python tools/ycb_import.py --config config/ycb-import.json
+```
+
+`config/arena-import.json` carries the pin, the furniture allowlist, a
+`model_skiplist` for benign non-furniture includes, `bounds_check_exceptions`
+for the two models whose upstream SDF deliberately under-sizes the collision
+box (see Status below), the placement-surface definitions, and
+`bounds_tolerance_m`. `config/ycb-import.json` carries the pin, `models_root`,
+and the object allowlist. Both accept `--checkout <path>` to reuse an
+existing pinned checkout instead of cloning fresh; `tools/arena_import.py`
+additionally accepts `--report-bounds` to print per-model measured bounds and
+exit without publishing. Every Kit/pxr call is isolated behind a converter
+adapter in
+[`tools/tinker_sim_deploy/arena_convert.py`](tools/tinker_sim_deploy/arena_convert.py),
+so the importers' own orchestration logic is unit-tested under plain system
+Python with no GPU or Isaac Sim installed; the adapter itself is exercised
+only by the live import.
+
+The arena's `map.yaml`/`map.pgm` (ROS `map_server` PGM/YAML, resolution
+0.05m, trinary mode) is derived, not hand-authored: it rasterizes the same
+pinned world file's wall and furniture collision footprints, sliced at the
+tinker2 Livox sensor's mounted height (read from the robot URDF's
+`livox_joint` origin) — the pinned world file is the single source of truth
+for both the 3D scene and the 2D navigation map. `placement.json` records
+world-frame placement surfaces (for example `kitchen_table#top`, the
+`rcw26_` model-id prefix stripped) for tabletop object spawning.
+
+Select the arena on launch with `--arena rcw2026`, forwarded like any other
+`validation/run_sim.py` flag through `./scripts/launch-isaac`. `--arena` is
+mutually exclusive with `--map` (`--arena and --map are mutually exclusive`)
+and with `--arena-colors` (`--arena-colors applies only to occupancy cuboid
+walls` — that flag colors the procedurally generated occupancy walls, which
+the imported arena's real geometry replaces), both enforced at
+argument-parse time. A scenario selects the same arena declaratively via
+`world: {"mode": "arena", "arena": "rcw2026"}`; validated fail-closed by
+`tinker_sim_core.scenario.validate_world_selection`, which requires the
+declared `arena` to be a non-empty string matching the launcher's `--arena`
+value exactly (missing, mismatched, or combined with a `uri` key all raise
+`ValueError`) — `mode: "current"`, or `mode` absent, is unaffected regardless
+of `--arena`.
+
+The streaming wrapper `scripts/launch-arena-streaming` and `--livestream`
+forwarding in the deploy CLI are **not** part of this branch — they live in
+separate, uncommitted work. The headless streaming smoke recorded below was
+therefore run by invoking `validation/run_sim.py` directly, not through
+either wrapper.
+
+Offline bundling does not pick up arena/object USDs automatically: register
+`arena.usd`'s path and sha256 under the optional `generated_arena_usds`
+array, and each object's `object.usd` path and sha256 under
+`generated_object_usds`, in `artifacts/asset-manifest.json`
+([`tools/tinker_sim_deploy/assets.py`](tools/tinker_sim_deploy/assets.py)).
+Both groups are optional — an absent group is fine — but every entry is
+hash-verified when either group is present.
+
+Validation performed on this branch (development-validated only):
+
+- unit suites are green, with a stable failing/erroring name-set matched
+  against this repo's pre-existing environmental failures (see "Developer
+  verification" below);
+- both artifacts hash-verify clean (`verify_asset_artifact(...) == []`) and
+  re-import is a proven byte-identical no-op;
+- visual/collision AABB agreement was spot-verified: within 1.4mm on three
+  YCB objects (cracker box, mug, bowl); arena furniture bounds were checked
+  against the upstream SDF within the configured 0.02m tolerance, with two
+  documented per-model exceptions (`rcw26_door`, `rcw26_sink`) whose upstream
+  SDFs deliberately under-size the collision box (a trimmed door-panel depth
+  and a floor-anchored sink height, both for gripper-reach affordance, not
+  data errors);
+- a headless streaming smoke (`validation/run_sim.py --sensor-profile
+  navigation-parity --profile parity --scenario empty --seed 7 --headless
+  --livestream --arena rcw2026 --duration 45`) ran the full 45 simulated
+  seconds to a clean exit, with only headless-windowing/driver diagnostic
+  warnings in the log and no importer-scratch-path leakage.
+
+Not yet validated (open):
+
+- textured-frame visual confirmation by a human viewer;
+- physics interaction (an object resting on arena furniture);
+- sensor-rich camera imagery of the arena's furniture;
+- AMCL convergence on the derived map.
+
+Status: development-validated only, **not release-qualified**.
+
 ## Offline provisioning
 
 Run a complete online bootstrap first. Add generated robot USDs and their
@@ -545,6 +669,53 @@ References:
 - [Isaac Lab installation](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)
 
 ## Changelog
+
+- 2026-08-17 (RoboCup 2026 arena import, Tasks 1-11 — "import, launch, and
+  document the RoboCup 2026 arena and YCB objects"): Added a RoboCup 2026
+  arena importer (`tools/arena_import.py`, `config/arena-import.json`,
+  pinned `TeamSOBITS/sobits_gazebo_worlds@feature/hri`
+  `293b4057d26a673c3f09ff7d8f3118234d42ba24`) and a YCB tabletop-object
+  importer (`tools/ycb_import.py`, `config/ycb-import.json`, pinned
+  `TeamSOBITS/tmc_wrs_gz@jazzy-devel`
+  `48157eec99bfc50f8d24ad95736d4d10bb344c14`), sharing pin-verification/
+  clone/source-record helpers in new `tools/tinker_sim_deploy/import_common.py`
+  and a new Kit conversion adapter `tools/tinker_sim_deploy/arena_convert.py`.
+  New library modules parse the pinned Gazebo world and its model colliders
+  (`tools/tinker_sim_deploy/arena_world.py`), rasterize a derived
+  `map.yaml`/`map.pgm` from the wall/furniture collision footprints sliced
+  at the tinker2 Livox scan height (`arena_map.py`), and record world-frame
+  placement surfaces (`arena_surfaces.py`, `placement.json`). Publication
+  reuses the existing content-addressed artifact machinery
+  (`arena_artifact.py`) under `artifacts/arena/rcw2026/` and
+  `artifacts/objects/ycb/`, each with a `current.json` pointer,
+  `source-lock.json`, and `ATTRIBUTION.md` (arena: SOBITS BSD-3-Clause;
+  YCB: CC BY 4.0 attribution to the Yale-CMU-Berkeley Object and Model Set
+  plus the Toyota `tmc_wrs_gz` wrapper's Clear BSD).
+  `validation/run_sim.py` gained a `--arena` flag (mutually exclusive with
+  `--map` and with `--arena-colors`) and
+  `simulation/tinker_sim_core/scenario.py` gained `validate_world_selection`,
+  validating a scenario's `world: {"mode": "arena", "arena": "rcw2026"}`
+  declaration fail-closed against the launcher's `--arena` value;
+  `simulation/tinker_sim_isaac/backend.py` gained an opt-in `arena_artifact`
+  construction path. `tools/tinker_sim_deploy/assets.py` gained optional,
+  validated-when-present `generated_arena_usds`/`generated_object_usds`
+  asset-manifest groups for offline bundling. Both importers were live-run
+  on the dev host to a hash-verified artifact
+  (`verify_asset_artifact(...) == []`) proven byte-identical on re-import;
+  visual/collision AABB agreement was spot-verified (within 1.4mm on three
+  YCB objects; arena furniture within the configured 0.02m of its
+  SDF-declared collision box, with two documented per-model exceptions,
+  `rcw26_door`/`rcw26_sink`); a headless streaming smoke with `--arena
+  rcw2026` ran 45 simulated seconds to a clean exit, invoking
+  `validation/run_sim.py` directly on this dev host — the
+  `scripts/launch-arena-streaming` wrapper and the deploy-CLI's
+  `--livestream` forwarding are separate, uncommitted work and are not part
+  of this branch. Textured-frame visual confirmation by a human viewer,
+  physics interaction with arena furniture, sensor-rich camera imagery of
+  the arena, and AMCL convergence on the derived map remain unvalidated.
+  New `README.md` "RoboCup 2026 arena" section documents provenance, import
+  commands, launch usage, and this status. Status: development-validated
+  only, **not release-qualified**.
 
 - 2026-08-05 (integrated qualification Task 10 — "document integrated
   qualification CLI"): Documented the offline integrated OMPL qualification
