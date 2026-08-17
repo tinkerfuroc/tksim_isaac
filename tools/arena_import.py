@@ -81,7 +81,7 @@ class ConverterHooks(Protocol):
 @dataclass(frozen=True)
 class _FurnitureConversion:
     model_id: str
-    usd_bytes: bytes
+    payload: dict[str, bytes]
     map_colliders: tuple[BoxCollider, ...]
     source_records: tuple[dict[str, object], ...]
 
@@ -135,18 +135,30 @@ def _read_upstream(checkout: Path, relative: str) -> bytes:
 
 
 def _visual_mesh_info(sdf_bytes: bytes) -> tuple[str, tuple[float, float, float], tuple[float, ...]]:
-    """Return (mesh uri, mesh scale, visual pose) from the model SDF's first
+    """Return (mesh uri, mesh scale, visual pose) from the model SDF's one
     visual mesh. The upstream RCW26 GLBs are unit-normalized and Y-up; the
     SDF's ``<mesh><scale>`` and ``<visual><pose>`` (with a 90-degree roll)
     are what bring them to real-world size/orientation in Gazebo, and the
     importer must reproduce that when converting to USD (see the Task 9
     report for why ``convert_glb_to_usd`` grew ``mesh_scale``/``mesh_pose``).
+
+    Fails closed if the model SDF declares more than one visual mesh: the
+    importer only converts a single GLB per model (``convert_furniture_model``
+    produces exactly one ``furniture/<id>.usd``), so silently picking the
+    first match would drop the second mesh's geometry and its GLB would
+    never enter the source lock.
     """
     root = ET.fromstring(sdf_bytes)
+    found: tuple[str, tuple[float, float, float], tuple[float, ...]] | None = None
     for visual in root.iter("visual"):
         uri = visual.findtext("geometry/mesh/uri")
         if not uri:
             continue
+        if found is not None:
+            raise AssetArtifactError(
+                "model SDF declares more than one visual mesh; the importer "
+                "only supports a single visual mesh per model"
+            )
         scale_text = visual.findtext("geometry/mesh/scale")
         scale = tuple(float(part) for part in scale_text.split()) if scale_text else _IDENTITY_SCALE
         pose_text = visual.findtext("pose")
@@ -155,8 +167,10 @@ def _visual_mesh_info(sdf_bytes: bytes) -> tuple[str, tuple[float, float, float]
             raise AssetArtifactError(f"visual pose must have 6 values, got {pose_text!r}")
         if len(scale) != 3:
             raise AssetArtifactError(f"visual mesh scale must have 3 values, got {scale_text!r}")
-        return uri.strip(), scale, pose
-    raise AssetArtifactError("model SDF has no visual mesh")
+        found = (uri.strip(), scale, pose)
+    if found is None:
+        raise AssetArtifactError("model SDF has no visual mesh")
+    return found
 
 
 def _resolve_glb_path(checkout: Path, model_id: str, uri: str) -> Path:
@@ -243,8 +257,13 @@ def _convert_model(
     return usd_path, sdf_bytes, colliders, uri, glb_path
 
 
-def _relative_glb_record_path(model_id: str, glb_path: Path) -> str:
-    return f"models/{model_id}/meshes/{glb_path.name}"
+def _relative_glb_record_path(checkout: Path, glb_path: Path) -> str:
+    """Source-lock path for a resolved GLB: derived from the file actually
+    resolved and read, not guessed from a naming convention -- a fabricated
+    ``models/<id>/meshes/<name>`` string would silently diverge from the
+    real path for any model whose mesh URI nests deeper than one directory.
+    """
+    return glb_path.relative_to(checkout).as_posix()
 
 
 def convert_furniture_model(
@@ -273,11 +292,31 @@ def convert_furniture_model(
     glb_bytes = glb_path.read_bytes()
     records = (
         _source_record(f"models/{model_id}/model.sdf", sdf_bytes),
-        _source_record(_relative_glb_record_path(model_id, glb_path), glb_bytes),
+        _source_record(_relative_glb_record_path(checkout, glb_path), glb_bytes),
     )
     return _FurnitureConversion(
-        model_id=model_id, usd_bytes=usd_path.read_bytes(), map_colliders=map_colliders, source_records=records
+        model_id=model_id,
+        payload=_furniture_payload(usd_path, model_id),
+        map_colliders=map_colliders,
+        source_records=records,
     )
+
+
+def _furniture_payload(usd_path: Path, model_id: str) -> dict[str, bytes]:
+    """The published payload entries for one furniture model: its ``.usd``
+    plus any texture/material files ``convert_glb_to_usd`` relocated to
+    ``usd_path.parent / "textures" / model_id`` (see
+    ``arena_convert._relocate_local_assets`` -- without republishing those
+    files alongside the USD that now references them by a relative path,
+    every texture would resolve to nothing in the published artifact).
+    """
+    payload = {f"furniture/{model_id}.usd": usd_path.read_bytes()}
+    textures_dir = usd_path.parent / "textures" / model_id
+    if textures_dir.is_dir():
+        for texture_file in sorted(textures_dir.iterdir()):
+            if texture_file.is_file():
+                payload[f"furniture/textures/{model_id}/{texture_file.name}"] = texture_file.read_bytes()
+    return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -360,7 +399,7 @@ def run_import(
             conversion = convert_furniture_model(
                 checkout, scratch, model_id, converter, tolerance, bounds_check_exceptions
             )
-            payload[f"furniture/{model_id}.usd"] = conversion.usd_bytes
+            payload.update(conversion.payload)
             map_colliders[model_id] = conversion.map_colliders
             records.extend(conversion.source_records)
 
