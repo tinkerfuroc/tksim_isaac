@@ -378,9 +378,10 @@ def _square_room() -> arena_world.ArenaLayout:
 class RasterizeTest(unittest.TestCase):
     COLLIDERS = {
         "rcw26_kitchen_table": (
+            # tabletop: entirely ABOVE the 0.195 scan plane, must not mark cells
             arena_world.BoxCollider(size=(0.8, 0.4, 0.04), center=(0.0, 0.0, 0.72), yaw=0.0),
-            # plinth below the scan plane: must NOT appear in the map
-            arena_world.BoxCollider(size=(0.8, 0.4, 0.10), center=(0.0, 0.0, 0.05), yaw=0.0),
+            # leg/body box spanning z [0.0, 0.70]: crosses the scan plane, marks cells
+            arena_world.BoxCollider(size=(0.7, 0.3, 0.70), center=(0.0, 0.0, 0.35), yaw=0.0),
         )
     }
 
@@ -413,14 +414,15 @@ class RasterizeTest(unittest.TestCase):
         self.assertFalse(grid.occupied_at_world(0.0, 0.0))   # centre is free
         self.assertFalse(grid.occupied_at_world(-1.5, -1.5)) # corner floor free
 
-    def test_below_scan_plane_not_marked(self):
-        colliders = {
-            "rcw26_kitchen_table": (
-                arena_world.BoxCollider(size=(0.8, 0.4, 0.10), center=(0.0, 0.0, 0.05), yaw=0.0),
-            )
-        }
-        grid = self._load(colliders)
-        self.assertFalse(grid.occupied_at_world(1.0, 1.0))
+    def test_outside_scan_plane_not_marked(self):
+        for center_z, size_z in ((0.05, 0.10), (0.72, 0.04)):  # plinth below, top above
+            colliders = {
+                "rcw26_kitchen_table": (
+                    arena_world.BoxCollider(size=(0.8, 0.4, size_z), center=(0.0, 0.0, center_z), yaw=0.0),
+                )
+            }
+            grid = self._load(colliders)
+            self.assertFalse(grid.occupied_at_world(1.0, 1.0))
 ```
 
 (Import `OccupancyMap` from `tinker_sim_core.occupancy` using the same bootstrap the tests use for `tinker_sim_core` elsewhere — see `tests/test_command_mux.py` header if `test_artifact_export.py` does not import it.)
