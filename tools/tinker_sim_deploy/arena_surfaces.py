@@ -41,13 +41,23 @@ def world_surface(
     local_center: tuple[float, float, float],
     size_xy: tuple[float, float],
     edge_margin: float,
+    instance_suffix: str = "",
 ) -> PlacementSurface:
+    """Build one world-frame ``PlacementSurface``.
+
+    ``instance_suffix`` disambiguates a model placed more than once in the
+    arena (e.g. two side tables) -- it must mirror
+    ``arena_convert.compose_arena``'s own furniture prim-naming scheme
+    (``""`` for the first instance, ``"_NN"`` for later ones) so a
+    surface_id always names the same furniture instance as the arena.usd
+    prim it sits on.
+    """
     lx, ly, lz = local_center
     cos_y, sin_y = math.cos(furniture.yaw), math.sin(furniture.yaw)
     wx = furniture.position[0] + cos_y * lx - sin_y * ly
     wy = furniture.position[1] + sin_y * lx + cos_y * ly
     wz = furniture.position[2] + lz
-    surface_id = f"{_short_furniture_id(furniture.model_id)}#{surface_name}"
+    surface_id = f"{_short_furniture_id(furniture.model_id)}{instance_suffix}#{surface_name}"
     return PlacementSurface(
         surface_id=surface_id,
         furniture_id=furniture.model_id,

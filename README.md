@@ -245,8 +245,9 @@ convention: `artifacts/arena/rcw2026/<identity>/` and
 `manifest.json`, a `source-lock.json` (per consumed upstream file: relative
 path, size, sha256), and an `ATTRIBUTION.md`. Re-running an importer against
 unchanged upstream content and config is a byte-identical no-op (proven live
-by two consecutive runs of each importer publishing under the same
-identity, the second with no filesystem writes).
+by two consecutive runs of each importer publishing under the same identity:
+the second run reports `created=False` and atomically rewrites `current.json`
+with identical bytes).
 
 Provenance: the arena is converted from
 [`TeamSOBITS/sobits_gazebo_worlds`](https://github.com/TeamSOBITS/sobits_gazebo_worlds)

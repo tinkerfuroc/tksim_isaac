@@ -85,8 +85,6 @@ part of deployment/runtime). All inputs come from one pinned-source config
   "world": "worlds/rcw2026_arena.world.xacro",
   "arena_id": "rcw2026",
   "model_allowlist": ["rcw26_bed", "rcw26_chair", "..."],
-  "surface_furniture": ["rcw26_kitchen_table", "rcw26_shelf", "rcw26_side_table",
-                        "rcw26_laundry_desk", "rcw26_sofa"],
   "bounds_tolerance_m": 0.01
 }
 ```
@@ -137,10 +135,20 @@ and navigation:
 - Default furniture collider: re-authored from that model's `model.sdf`
   collision geometry — boxes pass through as USD box colliders; mesh
   colliders become convex-hull approximations.
-- Furniture listed in `surface_furniture` additionally gets hand-verified
-  box colliders for each flat placement surface, measured from the mesh by
-  the importer and checked against the SDF-declared bounds (§4 step 6),
-  because manipulation correctness depends on exact surface heights.
+- **Amended post-implementation (2026-08-17, final review):** the original
+  plan additionally called for hand-verified box colliders authored for
+  each flat placement surface of `surface_furniture` models, on the
+  premise that manipulation correctness needs exact surface heights. That
+  work was never implemented, and live evidence now shows the plain
+  SDF-derived colliders above are already sufficient: a physics drop test
+  rested a cube on `kitchen_table#top` at z=0.745 against the declared
+  z=0.749 (~4mm of penetration/rest-height slop), and the importer's
+  measured-bounds self-check (§4 step 6 -- converted-USD bounds vs.
+  SDF-declared collider bounds within `bounds_tolerance_m`) already guards
+  every model against a silent regression in that agreement. Hand-authored
+  per-surface box colliders remain a documented follow-up, not part of
+  this increment; the `surface_furniture` config key that named their
+  targets has been deleted as dead config.
 - `placement.json` (in the artifact) records every placement surface in the
   world frame:
 

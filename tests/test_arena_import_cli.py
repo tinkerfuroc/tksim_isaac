@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import arena_import  # noqa: E402
-from tinker_sim_deploy import arena_artifact  # noqa: E402
+from tinker_sim_deploy import arena_artifact, arena_world  # noqa: E402
 
 _ROBOT_URDF = b"""<robot name="t">
   <joint name="livox_joint" type="fixed">
@@ -136,7 +136,6 @@ def _base_config(commit: str) -> dict[str, object]:
         "model_allowlist": ["rcw26_kitchen_table"],
         "model_skiplist": [],
         "bounds_check_exceptions": [],
-        "surface_furniture": ["rcw26_kitchen_table"],
         "surfaces": [
             {
                 "model_id": "rcw26_kitchen_table",
@@ -330,6 +329,94 @@ class RunImportTest(unittest.TestCase):
         self.assertTrue(texture_path.is_file())
         self.assertEqual(texture_path.read_bytes(), b"fake-png-bytes")
         self.assertEqual(arena_artifact.verify_asset_artifact(publication.artifact_dir), [])
+
+    def test_duplicate_placements_get_distinct_surface_ids(self):
+        # Two placements of the same model_id (e.g. two kitchen tables) must
+        # not collide on surface_id -- world_surface's instance_suffix must
+        # mirror arena_convert.compose_arena's own furniture prim-naming
+        # scheme (bare model_id for the first instance, "_NN" for later
+        # ones) so a surface_id always names the same instance as its
+        # arena.usd prim (Final review Finding 2 -- live placement.json had
+        # "shelf#plate" and "side_table#top" duplicated for real).
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        checkout = _build_checkout(root)
+        world_with_two_tables = _WORLD_XACRO.replace(
+            b"</world>",
+            b"""<include>
+      <uri>model://rcw26_kitchen_table</uri>
+      <name>kitchen_table_2</name>
+      <pose>-2.0 1.0 0 0 0 0</pose>
+      <static>1</static>
+    </include>
+  </world>""",
+        )
+        (checkout / "worlds" / "rcw2026_arena.world.xacro").write_bytes(world_with_two_tables)
+        _git(checkout, "add", "-A")
+        _git(checkout, "commit", "-q", "-m", "duplicate kitchen table placement")
+        commit = _git_head(checkout)
+
+        config = _base_config(commit)
+        hooks = StubHooks()
+        publication = arena_import.run_import(config, self.repo_root, checkout, hooks)
+
+        placement = json.loads((publication.artifact_dir / "placement.json").read_bytes())
+        surface_ids = sorted(record["surface_id"] for record in placement["surfaces"])
+        self.assertEqual(surface_ids, ["kitchen_table#top", "kitchen_table_02#top"])
+
+
+class FurnitureInstanceSuffixTest(unittest.TestCase):
+    def test_first_instance_bare_later_instances_numbered(self):
+        first = arena_world.FurniturePlacement(
+            model_id="rcw26_side_table", position=(0.0, 0.0, 0.0), yaw=0.0, static=True,
+        )
+        second = arena_world.FurniturePlacement(
+            model_id="rcw26_side_table", position=(1.0, 0.0, 0.0), yaw=0.0, static=True,
+        )
+        other = arena_world.FurniturePlacement(
+            model_id="rcw26_shelf", position=(2.0, 0.0, 0.0), yaw=0.0, static=True,
+        )
+        suffixes = arena_import._furniture_instance_suffixes((first, second, other))
+        self.assertEqual(suffixes[id(first)], "")
+        self.assertEqual(suffixes[id(second)], "_02")
+        self.assertEqual(suffixes[id(other)], "")
+
+
+class ResolveGlbPathTest(unittest.TestCase):
+    """Final review Finding 3: ``_resolve_glb_path`` must fail closed, before
+    any read, on either shape of checkout escape -- an absolute URI
+    remainder (``Path.__truediv__`` discards the joined prefix in favor of
+    an absolute right operand) or a lexical ``..`` traversal.
+    """
+
+    def setUp(self) -> None:
+        self.checkout = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.checkout, ignore_errors=True)
+
+    def test_absolute_uri_remainder_is_rejected(self):
+        # "model://rcw26_kitchen_table//etc/passwd" strips to the absolute
+        # remainder "/etc/passwd" -- naive Path.__truediv__ joining collapses
+        # checkout/models/<id>/"/etc/passwd" straight down to "/etc/passwd".
+        outside = Path("/etc/passwd")
+        with self.assertRaises(arena_artifact.AssetArtifactError):
+            arena_import._resolve_glb_path(
+                self.checkout, "rcw26_kitchen_table", f"model://rcw26_kitchen_table/{outside}"
+            )
+
+    def test_dotdot_traversal_is_rejected(self):
+        with self.assertRaises(arena_artifact.AssetArtifactError):
+            arena_import._resolve_glb_path(
+                self.checkout, "rcw26_kitchen_table", "model://rcw26_kitchen_table/../../../etc/passwd"
+            )
+
+    def test_ordinary_relative_uri_still_resolves(self):
+        model_dir = self.checkout / "models" / "rcw26_kitchen_table" / "meshes"
+        model_dir.mkdir(parents=True)
+        (model_dir / "x.glb").write_bytes(b"glb-bytes")
+        resolved = arena_import._resolve_glb_path(
+            self.checkout, "rcw26_kitchen_table", "model://rcw26_kitchen_table/meshes/x.glb"
+        )
+        self.assertEqual(resolved, (model_dir / "x.glb").resolve())
 
 
 if __name__ == "__main__":

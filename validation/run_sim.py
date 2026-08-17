@@ -296,6 +296,18 @@ def sensor_rich_implies_ros(sensor_profile: str, ros: bool) -> bool:
     return sensor_profile == "sensor-rich" and not ros
 
 
+def arena_flag_supported(sensor_profile: str) -> bool:
+    """``--arena`` requires a profile that loads the robot backend.
+
+    ``physics-only`` builds a bare ``isaacsim.core.api.World`` with no
+    ``IsaacWholeRobotBackend``/``IsaacNavigationBackend`` to reference an
+    arena artifact into -- the physics-only branch never even reads
+    ``args.arena``, so passing it there was silently ignored rather than
+    rejected (Final review Finding 4).
+    """
+    return sensor_profile != "physics-only"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -321,6 +333,8 @@ def main() -> int:
         parser.error("--camera-pointcloud is supported only with sensor-rich")
     if args.arena_colors and args.sensor_profile != "sensor-rich":
         parser.error("--arena-colors is supported only with sensor-rich")
+    if args.arena and not arena_flag_supported(args.sensor_profile):
+        parser.error("--arena requires a profile that loads the robot backend")
     if args.arena and args.map_yaml is not None:
         parser.error("--arena and --map are mutually exclusive")
     if args.arena and args.arena_colors:
@@ -410,6 +424,7 @@ def main() -> int:
             print(
                 json.dumps(
                     {
+                        "arena": args.arena,
                         "artifact": str(args.artifact),
                         "map": str(args.map_yaml),
                         "calibration": calibration.status.value,
@@ -541,6 +556,7 @@ def main() -> int:
             print(
                 json.dumps(
                     {
+                        "arena": args.arena,
                         "artifact": str(args.artifact),
                         "map": str(args.map_yaml),
                         "arena_colors": args.arena_colors,

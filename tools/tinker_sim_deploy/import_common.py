@@ -40,6 +40,19 @@ def _verify_pin(checkout: Path, expected_commit: str) -> None:
         raise AssetArtifactError(
             f"checkout HEAD {actual!r} does not match pinned commit {expected_commit!r}"
         )
+    # Matching HEAD alone does not prove the working tree still holds exactly
+    # the pinned bytes -- an uncommitted local edit (tampered or merely
+    # dirty) is invisible to a HEAD check but would silently feed different
+    # content into the importer than the source lock claims to record. Fail
+    # closed instead of trusting an unclean tree.
+    status = _run_git(["status", "--porcelain"], cwd=checkout)
+    if status.returncode != 0:
+        raise AssetArtifactError(f"could not read checkout status: {status.stderr.strip()}")
+    if status.stdout.strip():
+        raise AssetArtifactError(
+            f"checkout has uncommitted changes despite matching pinned commit "
+            f"{expected_commit!r}; refusing to import from a dirty working tree"
+        )
 
 
 def clone_pin(repository: str, commit: str, checkout: Path) -> None:
