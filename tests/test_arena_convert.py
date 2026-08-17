@@ -35,6 +35,78 @@ class TextureRelocationTargetTest(unittest.TestCase):
         self.assertNotEqual(first, second)
 
 
+class PatchDaeMissingUnitTest(unittest.TestCase):
+    """Task 10: every allowlisted YCB object's ``textured.dae`` omits the
+    optional COLLADA ``<unit>`` element, which segfaults Kit's asset
+    converter live (confirmed against the real pinned ``tmc_wrs_gz``
+    checkout -- see the Task 10 report). ``_patch_dae_missing_unit`` is the
+    pure-Python decision logic for that workaround; no pxr/Kit dependency,
+    so it is unit-tested here.
+    """
+
+    def test_missing_unit_gets_the_collada_spec_default_injected(self):
+        dae = b'<COLLADA><asset><up_axis>Y_UP</up_axis></asset></COLLADA>'
+
+        patched = arena_convert._patch_dae_missing_unit(dae)
+
+        self.assertIsNotNone(patched)
+        self.assertIn(b'<unit name="meter" meter="1"/>', patched)
+        # inserted strictly before <up_axis>, inside the same <asset> block
+        self.assertLess(patched.index(b"<unit"), patched.index(b"<up_axis>"))
+
+    def test_existing_unit_element_is_left_untouched(self):
+        dae = b'<COLLADA><asset><unit meter="0.01" name="centimeter"/><up_axis>Y_UP</up_axis></asset></COLLADA>'
+
+        self.assertIsNone(arena_convert._patch_dae_missing_unit(dae))
+
+    def test_no_up_axis_anchor_is_left_untouched(self):
+        dae = b"<COLLADA><asset></asset></COLLADA>"
+
+        self.assertIsNone(arena_convert._patch_dae_missing_unit(dae))
+
+
+class PrepareDaeInputTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_dae_with_unit_element_is_returned_unchanged(self):
+        mesh_dir = self.root / "meshes"
+        mesh_dir.mkdir()
+        dae_path = mesh_dir / "textured.dae"
+        dae_path.write_bytes(b'<COLLADA><asset><unit meter="1"/><up_axis>Y_UP</up_axis></asset></COLLADA>')
+
+        result = arena_convert._prepare_dae_input(dae_path, self.root / "scratch")
+
+        self.assertEqual(result, dae_path)
+
+    def test_dae_missing_unit_is_mirrored_with_siblings_preserved(self):
+        mesh_dir = self.root / "meshes"
+        mesh_dir.mkdir()
+        dae_path = mesh_dir / "textured.dae"
+        dae_path.write_bytes(
+            b'<COLLADA><asset><up_axis>Y_UP</up_axis></asset>'
+            b'<library_images><image><init_from>tex.png</init_from></image></library_images></COLLADA>'
+        )
+        texture_path = mesh_dir / "tex.png"
+        texture_path.write_bytes(b"fake-png-bytes")
+        (mesh_dir / "nontextured.stl").write_bytes(b"fake-stl-bytes")
+
+        scratch_dir = self.root / "scratch"
+        result = arena_convert._prepare_dae_input(dae_path, scratch_dir)
+
+        self.assertNotEqual(result, dae_path)
+        self.assertEqual(result.parent, scratch_dir / "_dae_input")
+        self.assertIn(b'<unit name="meter" meter="1"/>', result.read_bytes())
+        # sibling texture (referenced by relative <init_from>) is mirrored
+        # alongside the patched DAE so the relative reference still resolves
+        self.assertTrue((scratch_dir / "_dae_input" / "tex.png").is_file())
+        self.assertEqual((scratch_dir / "_dae_input" / "tex.png").read_bytes(), b"fake-png-bytes")
+        # the original upstream file is never mutated in place
+        self.assertNotIn(b"<unit", dae_path.read_bytes())
+
+
 class RelocatableAssetSourceTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
