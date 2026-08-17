@@ -387,6 +387,247 @@ def compose_arena(
     stage.Save()
 
 
+def _axis_correction(raw_path: Path, *, trust_stage_metadata: bool) -> float:
+    """Return the uniform scale factor that re-anchors one raw single-source
+    conversion's units onto this codebase's metre convention. No rotation
+    is ever applied here -- see below for why that differs from
+    ``convert_glb_to_usd``'s furniture path.
+
+    Unlike ``convert_glb_to_usd`` (which always corrects for a *known*,
+    single source convention -- Kit's own Y-up/cm glTF default, folded with
+    an SDF-declared scale/pose the caller supplies), ``convert_object_to_usd``
+    has two independent single-mesh sources (DAE, STL) with no SDF-declared
+    scale/pose to lean on (every allowlisted YCB object's model SDF declares
+    an identity visual/collision pose and no mesh scale -- confirmed against
+    the real pinned checkout).
+
+    ``trust_stage_metadata`` encodes a live-confirmed, format-specific split
+    (see the Task 10 report for the full measurement, done against two
+    different objects): Kit's COLLADA importer genuinely reads a DAE's own
+    declared ``<unit>`` and reports it faithfully via
+    ``GetStageMetersPerUnit`` on the raw conversion -- the resulting
+    geometry, scaled by that reported value, lines up (to within a
+    fraction of a millimetre, axis by axis) with the sibling STL's raw
+    points. Kit's STL importer, by contrast, performs **no** unit
+    reconciliation at all: STL as a format carries no unit metadata, the
+    raw imported points pass through completely unmodified, and the raw
+    stage is nonetheless stamped with the same nominal
+    ``metersPerUnit=0.01`` default Kit stamps on *any* freshly created
+    stage regardless of content. Applying that stamp as a scale correction
+    to an STL conversion was confirmed live to shrink the collision mesh to
+    roughly 1/100th of the matching visual mesh's size -- STL-sourced
+    conversions must use scale=1.0 instead, trusting the raw STL point data
+    as already expressed directly in metres.
+
+    Rotation was tested and dropped: both raw conversions report
+    ``upAxis=Y`` (again Kit's own default stamp, not a reflection of
+    actual content orientation), but a live per-axis bounds comparison
+    across two different objects (cracker box, mug) showed the raw DAE and
+    STL points already agree axis-for-axis with **no** rotation applied at
+    all -- both source pipelines in this dataset (unlike the furniture
+    GLBs, which really are Y-up per their own SDF-declared roll) already
+    author directly in this codebase's Z-up target frame, since the whole
+    ``tmc_wrs_gz`` repo targets Gazebo (itself Z-up) natively. Applying the
+    Y-up-implied 90-degree correction here, as the furniture path does,
+    was confirmed live to *misalign* the two meshes (their Y/Z extents no
+    longer matched at all), not fix them.
+    """
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.Open(str(raw_path))
+    if not stage.GetDefaultPrim():
+        raise RuntimeError(f"{raw_path}: converted USD has no default prim")
+    if not trust_stage_metadata:
+        return 1.0
+    return UsdGeom.GetStageMetersPerUnit(stage)
+
+
+def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: Path) -> None:
+    """Wrap the two independent raw conversions (DAE visual, STL collision)
+    into one flattened ``usd_path``, structured per the collider-placement
+    rule confirmed in Task 9 (Finding 2 -- USD reference composition only
+    ever pulls in the *referenced prim's own subtree*):
+
+        /World             plain Xform, the default prim, no xformOps of
+                            its own -- so a later reference to this whole
+                            file composes in both children below together.
+        /World/geom         visual: per-source unit-scale correction op
+                             (no rotation -- see ``_axis_correction``),
+                             referencing the raw DAE conversion on a child
+                             (not itself, to avoid the "xformOp:translate
+                             already exists" collision documented for
+                             ``_rebase_converted_mesh``).
+        /World/collision     collision: same shape, referencing the raw STL
+                              conversion. A *sibling* of ``geom``, so making
+                              it invisible never touches the visual mesh's
+                              own visibility.
+
+    Both children live under the default prim, satisfying the structure
+    rule this whole importer follows: colliders and visual content both
+    reachable from a single reference to the composed file.
+    """
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    visual_scale = _axis_correction(raw_visual_path, trust_stage_metadata=True)
+    collision_scale = _axis_correction(raw_collision_path, trust_stage_metadata=False)
+
+    wrapper = Usd.Stage.CreateInMemory()
+    UsdGeom.SetStageMetersPerUnit(wrapper, 1.0)
+    UsdGeom.SetStageUpAxis(wrapper, UsdGeom.Tokens.z)
+    root = UsdGeom.Xform.Define(wrapper, "/World")
+    wrapper.SetDefaultPrim(root.GetPrim())
+
+    geom = UsdGeom.Xform.Define(wrapper, "/World/geom")
+    geom_xform = UsdGeom.Xformable(geom.GetPrim())
+    geom_xform.AddScaleOp().Set(Gf.Vec3f(visual_scale, visual_scale, visual_scale))
+    visual_ref = wrapper.DefinePrim("/World/geom/mesh")
+    visual_ref.GetReferences().AddReference(str(raw_visual_path))
+
+    collision = UsdGeom.Xform.Define(wrapper, "/World/collision")
+    collision_xform = UsdGeom.Xformable(collision.GetPrim())
+    collision_xform.AddScaleOp().Set(Gf.Vec3f(collision_scale, collision_scale, collision_scale))
+    collision_ref = wrapper.DefinePrim("/World/collision/mesh")
+    collision_ref.GetReferences().AddReference(str(raw_collision_path))
+
+    # Flatten: the published artifact only ever carries usd_path's bytes,
+    # never the *.raw.usd siblings, so the references above must not
+    # survive into the final file.
+    flattened = wrapper.Flatten()
+    flattened.Export(str(usd_path))
+
+    # Author collision physics + invisibility on the flattened result, then
+    # re-export fresh (see _resave_fresh's docstring for why an in-place
+    # Save() is unsafe: leftover string-pool bytes from the just-flattened
+    # export would defeat both the scratch-path grep and publish
+    # determinism).
+    stage = Usd.Stage.Open(str(usd_path))
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError(f"{usd_path}: no default prim to author collision on")
+    collision_root = stage.GetPrimAtPath(default_prim.GetPath().AppendChild("collision"))
+    found_mesh = False
+    for prim in Usd.PrimRange(collision_root):
+        if prim.IsA(UsdGeom.Mesh):
+            found_mesh = True
+            api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+            api.CreateApproximationAttr("convexDecomposition")
+            UsdPhysics.CollisionAPI.Apply(prim)
+    if not found_mesh:
+        raise RuntimeError(f"{usd_path}: no collision mesh geometry found under {collision_root.GetPath()}")
+    UsdGeom.Imageable(collision_root).MakeInvisible()
+    _resave_fresh(stage, usd_path)
+
+
+def _patch_dae_missing_unit(dae_bytes: bytes) -> bytes | None:
+    """Work around a live-confirmed native crash in Kit's asset-converter
+    COLLADA importer: every allowlisted YCB object's ``textured.dae``
+    (VCGLab/MeshLab-authored, confirmed against the real pinned
+    ``tmc_wrs_gz`` checkout) declares an ``<asset>`` block with
+    ``<up_axis>`` but no ``<unit>`` element, and feeding one of these files
+    to ``omni.kit.asset_converter`` segfaults the whole Kit process --
+    backtrace bottoms out in ``libusd_convert_asset.so`` calling into
+    ``tinyxml2::XMLElement::FindAttribute`` (i.e. the importer looks up the
+    ``<unit>`` element's ``meter`` attribute without null-checking that the
+    optional element exists at all). COLLADA 1.4.1's own spec default for a
+    missing ``<unit>`` is exactly ``meter="1.0"`` -- the value injected here
+    -- so this only makes an already-implied default explicit; it changes
+    no semantic content of the mesh. Confirmed live: the unpatched file
+    segfaults the Kit process (exit 139) at ``wait_until_finished()``; the
+    byte-patched copy converts cleanly to the identical geometry.
+
+    Returns ``None`` (nothing to patch) if a ``<unit>`` element is already
+    present, or if no ``<up_axis>`` anchor is found to insert one before
+    (a DAE shaped differently enough that this targeted fix does not apply
+    -- callers must use the original bytes unchanged in that case, not
+    silently produce a mismatched file).
+    """
+    text = dae_bytes.decode("utf-8")
+    if "<unit" in text:
+        return None
+    marker = "<up_axis>"
+    if marker not in text:
+        return None
+    return text.replace(marker, '<unit name="meter" meter="1"/>' + marker, 1).encode("utf-8")
+
+
+def _prepare_dae_input(dae_path: Path, scratch_dir: Path) -> Path:
+    """Return the path Kit's asset converter should actually read for
+    ``dae_path``: the original file, unless ``_patch_dae_missing_unit``
+    finds the crash-triggering missing ``<unit>`` element, in which case a
+    sibling-preserving mirror of ``dae_path``'s directory is built under
+    ``scratch_dir / "_dae_input"`` (so any relative ``<init_from>`` texture
+    reference the DAE makes still resolves against a sibling file, exactly
+    as it would next to the original) with only the DAE's own bytes
+    patched. The mirror lives outside both ``usd_path`` itself and the
+    ``textures/`` directory ``_relocate_local_assets`` populates, so it is
+    never swept into the published payload.
+    """
+    dae_bytes = dae_path.read_bytes()
+    patched = _patch_dae_missing_unit(dae_bytes)
+    if patched is None:
+        return dae_path
+    mirror_dir = scratch_dir / "_dae_input"
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    for sibling in dae_path.parent.iterdir():
+        if sibling.is_file() and sibling.name != dae_path.name:
+            (mirror_dir / sibling.name).write_bytes(sibling.read_bytes())
+    patched_path = mirror_dir / dae_path.name
+    patched_path.write_bytes(patched)
+    return patched_path
+
+
+def convert_object_to_usd(dae_path: Path, stl_path: Path, usd_path: Path) -> None:
+    """Convert one YCB object's textured visual DAE and non-textured
+    collision STL into a single composed ``usd_path``: visual mesh visible
+    under ``<default prim>/geom``, collision mesh invisible under
+    ``<default prim>/collision`` with ``UsdPhysics.MeshCollisionAPI``
+    (``convexDecomposition`` approximation) applied, both reachable from a
+    single reference to the whole file (see ``_compose_object``).
+
+    Structurally the same two-phase shape as ``convert_glb_to_usd``: convert
+    each source via the same ``omni.kit.asset_converter`` task used for
+    furniture GLBs (it accepts COLLADA/``.dae`` and ``.stl`` sources too),
+    then re-anchor onto this codebase's metre/Z-up convention -- except here
+    there are *two* independent raw conversions to re-anchor (see
+    ``_axis_correction``'s docstring for why each is corrected
+    independently rather than assuming a shared convention), and no
+    SDF-declared scale/pose to fold in (every allowlisted object's SDF
+    declares identity visual/collision poses -- confirmed against the real
+    pinned checkout, so unlike furniture this importer never reads a model
+    SDF at all). See ``_patch_dae_missing_unit`` for a live-discovered Kit
+    crash workaround applied to the DAE input before conversion.
+    """
+    import asyncio
+
+    import omni.kit.asset_converter as asset_converter
+
+    usd_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_visual_path = usd_path.with_name(usd_path.stem + ".visual.raw.usd")
+    raw_collision_path = usd_path.with_name(usd_path.stem + ".collision.raw.usd")
+    dae_input_path = _prepare_dae_input(dae_path, usd_path.parent)
+
+    async def _run() -> None:
+        instance = asset_converter.get_instance()
+        visual_task = instance.create_converter_task(str(dae_input_path), str(raw_visual_path))
+        if not await visual_task.wait_until_finished():
+            raise RuntimeError(
+                f"asset conversion failed for {dae_path}: {visual_task.get_error_message()}"
+            )
+        collision_task = instance.create_converter_task(str(stl_path), str(raw_collision_path))
+        if not await collision_task.wait_until_finished():
+            raise RuntimeError(
+                f"asset conversion failed for {stl_path}: {collision_task.get_error_message()}"
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+    _compose_object(raw_visual_path, raw_collision_path, usd_path)
+    # object_id: usd_path is always scratch/<object_id>/object.usd (see
+    # ycb_import.convert_ycb_object), so the parent directory name is the
+    # object id -- namespaces any relocated texture files the same way
+    # convert_glb_to_usd namespaces furniture textures by model_id.
+    _relocate_local_assets(usd_path, raw_visual_path.parent, usd_path.parent.name)
+
+
 def measure_bounds(
     usd_path: Path,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:

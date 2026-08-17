@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/TeamSOBITS/tmc_wrs_gz",
+  "branch": "jazzy-devel",
+  "commit": "48157eec99bfc50f8d24ad95736d4d10bb344c14",
+  "models_root": "tmc_wrs_gz_worlds/models",
+  "object_allowlist": [
+    "ycb_001_cheez-it",
+    "ycb_002_sugar_box",
+    "ycb_005_spam",
+    "ycb_006_mustard_bottle",
+    "ycb_008_pudding_box",
+    "ycb_010_tomato_soup_can",
+    "ycb_011_banana",
+    "ycb_021_bleach_cleanser",
+    "ycb_024_bowl",
+    "ycb_025_mug"
+  ]
+}
