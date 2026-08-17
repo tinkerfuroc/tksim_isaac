@@ -8,6 +8,7 @@ independent verifier that re-derives identity from on-disk bytes.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -126,6 +127,32 @@ class PublicationTest(unittest.TestCase):
         manifest = json.loads((pub.artifact_dir / "manifest.json").read_text())
         self.assertEqual(manifest["identity"], pub.identity)
 
+    def test_symlinked_identity_dir_rejected(self):
+        # Plant a symlink at the exact path a future publish would use as
+        # its content-addressed destination, pointing at some other real
+        # directory. Publishing the same payload again must not silently
+        # treat the symlink as "already published" (created=False) and
+        # point current.json at it -- it must fail loudly instead, mirroring
+        # workspace.py's export_tinker2 destination-safety guard.
+        root = self.root
+        pub = self._publish(root)
+        real_dir = pub.artifact_dir
+        decoy = real_dir.parent / "decoy-not-the-real-artifact"
+        decoy.mkdir()
+        shutil.rmtree(real_dir)
+        real_dir.symlink_to(decoy, target_is_directory=True)
+
+        with self.assertRaises(arena_artifact.AssetArtifactError):
+            self._publish(root)
+
+        # the pointer from the first (pre-symlink) publish must not have
+        # been silently repointed at the decoy by the rejected attempt
+        pointer_path = root / "artifacts" / "arena" / "rcw2026" / "current.json"
+        pointer = json.loads(pointer_path.read_text())
+        self.assertEqual(
+            pointer["manifest"], f"artifacts/arena/rcw2026/{pub.identity}/manifest.json"
+        )
+
     def test_verify_detects_mutation(self):
         pub = self._publish(self.root)
         (pub.artifact_dir / "arena.usd").write_bytes(b"tampered")
@@ -134,6 +161,55 @@ class PublicationTest(unittest.TestCase):
     def test_verify_clean(self):
         pub = self._publish(self.root)
         self.assertEqual(arena_artifact.verify_asset_artifact(pub.artifact_dir), [])
+
+    def test_verify_rejects_absolute_path_in_manifest(self):
+        # manifest.json is part of the audited (possibly tampered) directory
+        # contents. An absolute-path payload key must never be joined onto
+        # artifact_dir and opened -- Path.__truediv__ discards the left
+        # operand when the right is absolute, so an unguarded verifier would
+        # read arbitrary out-of-tree files such as /etc/passwd.
+        pub = self._publish(self.root)
+        manifest_path = pub.artifact_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["payload"] = {"/etc/passwd": "0" * 64}
+        manifest_path.write_text(json.dumps(manifest))
+
+        errors = arena_artifact.verify_asset_artifact(pub.artifact_dir)
+
+        self.assertTrue(errors)
+        self.assertTrue(any("/etc/passwd" in error for error in errors))
+        # the violation must be reported directly, never disguised as a
+        # hash mismatch for a file that was actually opened and read
+        self.assertFalse(
+            any("payload hash mismatch for /etc/passwd" in error for error in errors)
+        )
+
+    def test_verify_rejects_traversal_path_in_manifest(self):
+        pub = self._publish(self.root)
+        # Plant a real file at exactly the traversal target
+        # (artifact_dir/../../escape.txt) so an unguarded verifier would
+        # actually open and hash it instead of failing closed with a
+        # generic "missing payload file" -- proving the read never happens
+        # rather than merely happening to land on a nonexistent path.
+        escape_target = pub.artifact_dir.parent.parent / "escape.txt"
+        escape_target.write_bytes(b"outside-the-artifact-directory")
+        manifest_path = pub.artifact_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["payload"] = {"../../escape.txt": "0" * 64}
+        manifest_path.write_text(json.dumps(manifest))
+
+        errors = arena_artifact.verify_asset_artifact(pub.artifact_dir)
+
+        self.assertTrue(errors)
+        self.assertTrue(
+            any("unsafe payload path" in error and "../../escape.txt" in error for error in errors)
+        )
+        self.assertFalse(
+            any("payload hash mismatch for ../../escape.txt" in error for error in errors)
+        )
+        self.assertFalse(
+            any("missing payload file: ../../escape.txt" in error for error in errors)
+        )
 
     def test_reserved_payload_names_rejected(self):
         with self.assertRaises(arena_artifact.AssetArtifactError):

@@ -74,20 +74,35 @@ def _validate_segment(value: str, label: str) -> str:
     return value
 
 
-def _validate_payload_name(name: object) -> str:
+def _payload_name_violation(name: object) -> str | None:
+    """Return a human-readable violation message, or ``None`` if ``name`` is safe.
+
+    Used on both the publish path (where a violation raises) and the verify
+    path (where a violation is reported as a finding string and the name is
+    never used to build a filesystem path) -- the same rules must reject the
+    same names on both paths, since ``verify_asset_artifact`` audits a
+    ``manifest.json`` whose payload keys may themselves be tampered.
+    """
     if not isinstance(name, str) or not name:
-        raise AssetArtifactError(f"invalid payload path: {name!r}")
+        return f"invalid payload path: {name!r}"
     if name in _RESERVED_PAYLOAD_NAMES:
-        raise AssetArtifactError(f"reserved payload path: {name!r}")
+        return f"reserved payload path: {name!r}"
     if name.startswith("/") or "\\" in name or "\x00" in name:
-        raise AssetArtifactError(f"invalid payload path: {name!r}")
+        return f"invalid payload path: {name!r}"
     path = Path(name)
     if path.is_absolute():
-        raise AssetArtifactError(f"invalid payload path: {name!r}")
+        return f"invalid payload path: {name!r}"
     parts = path.parts
     if not parts or ".." in parts or any(part in {"", "."} for part in parts):
-        raise AssetArtifactError(f"invalid payload path: {name!r}")
-    return name
+        return f"invalid payload path: {name!r}"
+    return None
+
+
+def _validate_payload_name(name: object) -> str:
+    violation = _payload_name_violation(name)
+    if violation is not None:
+        raise AssetArtifactError(violation)
+    return name  # type: ignore[return-value]
 
 
 def publish_asset_artifact(
@@ -144,6 +159,8 @@ def publish_asset_artifact(
     with _publication_lock(artifact_root):
         _recover_staging(artifact_root)
         final_dir = artifact_root / identity
+        if final_dir.exists() and (final_dir.is_symlink() or not final_dir.is_dir()):
+            raise AssetArtifactError(f"content-addressed artifact path is unsafe: {final_dir}")
         created = not final_dir.is_dir()
         if created:
             stage = Path(tempfile.mkdtemp(prefix=".artifact-stage-", dir=str(artifact_root)))
@@ -199,6 +216,14 @@ def verify_asset_artifact(artifact_dir: Path) -> list[str]:
         lock_bytes = b""
 
     for name, expected_hash in payload_hashes.items():
+        # manifest.json is itself part of the audited (possibly tampered)
+        # directory contents, so a payload key must be validated exactly
+        # like the publish path before it is ever joined onto artifact_dir --
+        # an absolute or ".."-traversing key must never be opened for read.
+        violation = _payload_name_violation(name)
+        if violation is not None:
+            errors.append(f"unsafe payload path in manifest.json: {violation}")
+            continue
         target = artifact_dir / name
         try:
             data = target.read_bytes()
