@@ -27,9 +27,7 @@ converter) can run under system Python with no Isaac Sim installed.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -41,6 +39,14 @@ from tinker_sim_deploy.arena_artifact import (
     AssetPublication,
     attribution_markdown,
     publish_asset_artifact,
+)
+from tinker_sim_deploy.import_common import (
+    _git_head,
+    _read_upstream,
+    _run_git,
+    _source_record,
+    _verify_pin,
+    clone_pin,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,52 +77,16 @@ class _ObjectConversion:
 
 
 # --------------------------------------------------------------------------- #
-# git / pin helpers (identical pattern to tools/arena_import.py)
+# git / pin helpers and source-record helpers are shared with
+# arena_import.py via tinker_sim_deploy.import_common (Task 10 review fix
+# round, Finding 3 -- was byte-identical duplicated boilerplate); imported
+# at module top.
 # --------------------------------------------------------------------------- #
-def _run_git(args: Sequence[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=False
-    )
-
-
-def _git_head(checkout: Path) -> str:
-    result = _run_git(["rev-parse", "HEAD"], cwd=checkout)
-    if result.returncode != 0:
-        raise AssetArtifactError(f"could not read checkout HEAD: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-def _verify_pin(checkout: Path, expected_commit: str) -> None:
-    actual = _git_head(checkout)
-    if actual != expected_commit:
-        raise AssetArtifactError(
-            f"checkout HEAD {actual!r} does not match pinned commit {expected_commit!r}"
-        )
-
-
-def clone_pin(repository: str, commit: str, checkout: Path) -> None:
-    """``git init`` + ``fetch`` + ``checkout FETCH_HEAD`` -- works for any
-    reachable commit, not just branch tips. Verifies HEAD before returning.
-    """
-    checkout.mkdir(parents=True, exist_ok=True)
-    for args in (["init", "-q"], ["fetch", "-q", repository, commit], ["checkout", "-q", "FETCH_HEAD"]):
-        result = _run_git(args, cwd=checkout)
-        if result.returncode != 0:
-            raise AssetArtifactError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
-    _verify_pin(checkout, commit)
 
 
 # --------------------------------------------------------------------------- #
 # per-object conversion
 # --------------------------------------------------------------------------- #
-def _source_record(path: str, data: bytes) -> dict[str, object]:
-    return {"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-
-
-def _read_upstream(checkout: Path, relative: str) -> bytes:
-    return (checkout / relative).read_bytes()
-
-
 def _object_mesh_paths(checkout: Path, models_root: str, object_id: str) -> tuple[Path, Path]:
     model_dir = checkout / models_root / object_id
     return model_dir / "meshes" / "textured.dae", model_dir / "meshes" / "nontextured.stl"
