@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+from .arena_artifact import AssetArtifactError
 from .arena_world import ArenaLayout, BoxCollider, MeshCollider
 
 _IDENTITY_SCALE = (1.0, 1.0, 1.0)
@@ -442,6 +443,50 @@ def _axis_correction(raw_path: Path, *, trust_stage_metadata: bool) -> float:
     return UsdGeom.GetStageMetersPerUnit(stage)
 
 
+def _check_bounds_overlap(
+    geom_bound: tuple[tuple[float, float, float], tuple[float, float, float]],
+    collision_bound: tuple[tuple[float, float, float], tuple[float, float, float]],
+    *,
+    min_ratio: float = 0.5,
+    max_ratio: float = 2.0,
+) -> None:
+    """Fail closed unless the composed visual and collision AABBs are
+    plausibly co-located and similarly sized on every axis.
+
+    Pure Python (no pxr) so it is unit-testable directly -- extracted from
+    ``_compose_object`` specifically for that (Task 10 review round,
+    Finding 1). Nothing in ``_axis_correction``'s "STL scale=1.0, no
+    rotation, trust DAE metersPerUnit" decision was otherwise checked at
+    runtime before this: a future re-pin or allowlist addition whose STL
+    is not already metre-expressed (or that genuinely needs a rotation,
+    unlike every object measured so far) would previously have published a
+    misaligned or wildly mis-scaled collision mesh with no error at all.
+    The 0.5x-2.0x per-axis size-ratio tolerance mirrors the same check this
+    task's own report used to manually verify alignment live (cracker box,
+    mug, bowl all agreed to within a fraction of a millimetre against that
+    same ratio window) -- loose enough to tolerate the two meshes' genuine
+    shape differences (STL is typically a coarser decimation of the same
+    scan than the textured DAE) while still catching the ~100x scale error
+    and ~90-degree rotation mismatch this task hit live during development.
+    """
+    (gmin, gmax), (cmin, cmax) = geom_bound, collision_bound
+    for axis in range(3):
+        gsize = gmax[axis] - gmin[axis]
+        csize = cmax[axis] - cmin[axis]
+        if gsize <= 0 or csize <= 0:
+            raise AssetArtifactError(
+                f"visual/collision bounds check failed: degenerate extent on axis "
+                f"{axis} (geom_bound={geom_bound}, collision_bound={collision_bound})"
+            )
+        ratio = csize / gsize
+        if not (min_ratio <= ratio <= max_ratio):
+            raise AssetArtifactError(
+                f"visual/collision bounds check failed: collision/visual size ratio "
+                f"{ratio:.4f} on axis {axis} is outside [{min_ratio}, {max_ratio}] -- "
+                f"geom_bound={geom_bound}, collision_bound={collision_bound}"
+            )
+
+
 def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: Path) -> None:
     """Wrap the two independent raw conversions (DAE visual, STL collision)
     into one flattened ``usd_path``, structured per the collider-placement
@@ -504,6 +549,7 @@ def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: P
     default_prim = stage.GetDefaultPrim()
     if not default_prim:
         raise RuntimeError(f"{usd_path}: no default prim to author collision on")
+    geom_root = stage.GetPrimAtPath(default_prim.GetPath().AppendChild("geom"))
     collision_root = stage.GetPrimAtPath(default_prim.GetPath().AppendChild("collision"))
     found_mesh = False
     for prim in Usd.PrimRange(collision_root):
@@ -515,10 +561,27 @@ def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: P
     if not found_mesh:
         raise RuntimeError(f"{usd_path}: no collision mesh geometry found under {collision_root.GetPath()}")
     UsdGeom.Imageable(collision_root).MakeInvisible()
+
+    # Fail-closed runtime guard (Task 10 review round, Finding 1): nothing
+    # up to this point actually checks that "STL scale=1.0, no rotation,
+    # trust DAE metersPerUnit" (_axis_correction's decision) produced two
+    # meshes that are genuinely co-located and similarly sized -- a future
+    # re-pin or allowlist addition whose STL is not already metre-expressed
+    # (or that needs a rotation none of the objects measured so far needed)
+    # would otherwise publish a silently misaligned collision mesh.
+    # ignoreVisibility=True: collision_root was just made invisible above,
+    # and its bound must still be measured regardless.
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"], False, True)
+    geom_range = cache.ComputeWorldBound(geom_root).ComputeAlignedRange()
+    collision_range = cache.ComputeWorldBound(collision_root).ComputeAlignedRange()
+    geom_bound = (tuple(geom_range.GetMin()), tuple(geom_range.GetMax()))
+    collision_bound = (tuple(collision_range.GetMin()), tuple(collision_range.GetMax()))
+    _check_bounds_overlap(geom_bound, collision_bound)
+
     _resave_fresh(stage, usd_path)
 
 
-def _patch_dae_missing_unit(dae_bytes: bytes) -> bytes | None:
+def _patch_dae_missing_unit(dae_bytes: bytes, source_label: str) -> bytes | None:
     """Work around a live-confirmed native crash in Kit's asset-converter
     COLLADA importer: every allowlisted YCB object's ``textured.dae``
     (VCGLab/MeshLab-authored, confirmed against the real pinned
@@ -535,18 +598,33 @@ def _patch_dae_missing_unit(dae_bytes: bytes) -> bytes | None:
     segfaults the Kit process (exit 139) at ``wait_until_finished()``; the
     byte-patched copy converts cleanly to the identical geometry.
 
+    ``source_label`` is only used to name the file in the error message
+    below -- pass ``str(dae_path)`` (this function itself has no filesystem
+    access, so it cannot discover a path on its own).
+
     Returns ``None`` (nothing to patch) if a ``<unit>`` element is already
-    present, or if no ``<up_axis>`` anchor is found to insert one before
-    (a DAE shaped differently enough that this targeted fix does not apply
-    -- callers must use the original bytes unchanged in that case, not
-    silently produce a mismatched file).
+    present. Raises ``AssetArtifactError`` (fail closed, not ``None``) if no
+    ``<unit>`` is present *and* no ``<up_axis>`` anchor is found to insert
+    one before -- an ``<asset>`` block shaped differently than every
+    allowlisted object's real DAE, which this targeted workaround does not
+    know how to fix. Review fix (Task 10 review round, Finding 2): an
+    earlier version returned ``None`` here, silently falling through to
+    feed the original, still crash-triggering bytes straight to Kit --
+    exactly the native segfault this function exists to prevent, just
+    deferred and with a far less actionable failure (a raw process crash
+    instead of a Python exception naming the file and the missing anchor).
     """
     text = dae_bytes.decode("utf-8")
     if "<unit" in text:
         return None
     marker = "<up_axis>"
     if marker not in text:
-        return None
+        raise AssetArtifactError(
+            f"{source_label}: DAE <asset> block has neither <unit> nor <up_axis> -- "
+            "the missing-<unit> Kit-crash workaround (see _patch_dae_missing_unit) "
+            "does not know how to patch this file; refusing to feed it to the "
+            "converter unpatched"
+        )
     return text.replace(marker, '<unit name="meter" meter="1"/>' + marker, 1).encode("utf-8")
 
 
@@ -563,7 +641,7 @@ def _prepare_dae_input(dae_path: Path, scratch_dir: Path) -> Path:
     never swept into the published payload.
     """
     dae_bytes = dae_path.read_bytes()
-    patched = _patch_dae_missing_unit(dae_bytes)
+    patched = _patch_dae_missing_unit(dae_bytes, str(dae_path))
     if patched is None:
         return dae_path
     mirror_dir = scratch_dir / "_dae_input"
