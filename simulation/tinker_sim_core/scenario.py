@@ -444,3 +444,25 @@ def _records(
     if any(not isinstance(record, dict) for record in value):
         raise ValueError(f"{path}: every {key} entry must be an object")
     return tuple(value)
+
+
+def validate_world_selection(scenario: ScenarioDefinition, arena_id: str | None) -> None:
+    """Fail closed when a scenario's declared world does not match the launch."""
+    mode = scenario.world.get("mode", "current")
+    if mode == "current":
+        return
+    if mode != "arena":
+        raise ValueError(f"{scenario.scenario_id}: unsupported world mode {mode!r}")
+    if "uri" in scenario.world:
+        raise ValueError(f"{scenario.scenario_id}: world mode 'arena' must not carry uri")
+    declared = scenario.world.get("arena")
+    if not isinstance(declared, str) or not declared:
+        raise ValueError(f"{scenario.scenario_id}: world mode 'arena' requires an arena id")
+    if arena_id is None:
+        raise ValueError(
+            f"{scenario.scenario_id}: scenario requires arena {declared!r}; launch with --arena"
+        )
+    if declared != arena_id:
+        raise ValueError(
+            f"{scenario.scenario_id}: scenario requires arena {declared!r}, launcher selected {arena_id!r}"
+        )
