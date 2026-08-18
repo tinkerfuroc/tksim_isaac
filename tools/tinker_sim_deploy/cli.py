@@ -46,7 +46,14 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("destination", type=Path)
     restore.add_argument("--profile", choices=("whole_robot", "physics_only"), default="whole_robot")
 
-    launch = commands.add_parser("launch", help="launch through the isolated Isaac ROS boundary")
+    # allow_abbrev=False: --arena is a prefix of --arena-colors, and any
+    # future run_sim flag not mirrored here must fail loudly instead of
+    # being silently rewritten onto its nearest prefix match.
+    launch = commands.add_parser(
+        "launch",
+        help="launch through the isolated Isaac ROS boundary",
+        allow_abbrev=False,
+    )
     launch.add_argument(
         "--sensor-profile",
         choices=(
@@ -80,6 +87,11 @@ def _parser() -> argparse.ArgumentParser:
         "--arena-colors",
         action="store_true",
         help="color the occupancy walls with the deterministic palette",
+    )
+    launch.add_argument(
+        "--arena",
+        default=None,
+        help="load the named content-addressed arena artifact (e.g. rcw2026)",
     )
     launch.add_argument("isaac_args", nargs=argparse.REMAINDER)
 
@@ -171,6 +183,8 @@ def _launch_command(args: argparse.Namespace) -> list[str]:
             command.extend(["--duration", str(args.duration)])
         if args.qualification:
             command.append("--qualification")
+        if args.arena:
+            command.extend(["--arena", args.arena])
         command.extend(_camera_stream_arguments(args))
         if args.livestream:
             command.append("--livestream")
