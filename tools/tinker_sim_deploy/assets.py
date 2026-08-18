@@ -20,6 +20,18 @@ def _asset_path(root: Path, value: object) -> Path:
     return root / relative
 
 
+def _verify_entries(root: Path, group: str, entries: list) -> None:
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+            raise RuntimeError(f"asset manifest entry is invalid: {group}")
+        path = _asset_path(root, entry["path"])
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"asset is missing or symlinked: {entry['path']}")
+        actual = sha256_file(path)
+        if actual != entry["sha256"]:
+            raise RuntimeError(f"asset checksum mismatch: {entry['path']}")
+
+
 def verify_assets(config: Config) -> dict[str, object]:
     root = config.root.resolve()
     manifest_path = config.path("artifacts") / "asset-manifest.json"
@@ -31,13 +43,12 @@ def verify_assets(config: Config) -> dict[str, object]:
         entries = manifest.get(group)
         if not isinstance(entries, list) or not entries:
             raise RuntimeError(f"asset manifest group must be non-empty: {group}")
-        for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
-                raise RuntimeError(f"asset manifest entry is invalid: {group}")
-            path = _asset_path(root, entry["path"])
-            if path.is_symlink() or not path.is_file():
-                raise RuntimeError(f"asset is missing or symlinked: {entry['path']}")
-            actual = sha256_file(path)
-            if actual != entry["sha256"]:
-                raise RuntimeError(f"asset checksum mismatch: {entry['path']}")
+        _verify_entries(root, group, entries)
+    for group in ("generated_arena_usds", "generated_object_usds"):
+        entries = manifest.get(group)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            raise RuntimeError(f"asset manifest group must be a list: {group}")
+        _verify_entries(root, group, entries)
     return manifest
