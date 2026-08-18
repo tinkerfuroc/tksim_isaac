@@ -65,6 +65,11 @@ def _parser() -> argparse.ArgumentParser:
     launch.add_argument("--ros", action=argparse.BooleanOptionalAction, default=False)
     launch.add_argument("--duration", type=float, default=0.0)
     launch.add_argument("--qualification", action="store_true")
+    launch.add_argument(
+        "--livestream",
+        action="store_true",
+        help="stream the navigation-parity arena through NVIDIA WebRTC",
+    )
     launch.add_argument("--dds-profile", choices=("local", "lan"), default="local")
     launch.add_argument(
         "--camera-pointcloud",
@@ -128,17 +133,15 @@ def _camera_stream_arguments(args) -> list[str]:
     return flags
 
 
-def _launch(config: Config, args: argparse.Namespace) -> int:
-    env = clean_isaac_environment(config, dds_profile=args.dds_profile)
-    if os.environ.get("TINKER_ACCEPT_OMNIVERSE_EULA") == "Y":
-        # Kit prompts interactively without these; headless launches would
-        # abort at EOF. Mirrors bootstrap.base_environment.
-        env["ACCEPT_EULA"] = "Y"
-        env["OMNI_KIT_ACCEPT_EULA"] = "YES"
-    streaming = args.sensor_profile == "streaming"
-    lock: Path | None = _streaming_lock(config.root) if streaming else None
+def _launch_command(args: argparse.Namespace) -> list[str]:
+    if args.livestream:
+        if args.sensor_profile != "navigation-parity":
+            raise RuntimeError("--livestream is supported only with navigation-parity")
+        if not args.headless:
+            raise RuntimeError("--livestream requires --headless")
+
     common = ["uv", "run", "--frozen", "--no-sync"]
-    if streaming:
+    if args.sensor_profile == "streaming":
         command = common + [
             "isaacsim",
             "isaacsim.exp.full.streaming",
@@ -169,7 +172,22 @@ def _launch(config: Config, args: argparse.Namespace) -> int:
         if args.qualification:
             command.append("--qualification")
         command.extend(_camera_stream_arguments(args))
+        if args.livestream:
+            command.append("--livestream")
     command.extend(args.isaac_args)
+    return command
+
+
+def _launch(config: Config, args: argparse.Namespace) -> int:
+    command = _launch_command(args)
+    env = clean_isaac_environment(config, dds_profile=args.dds_profile)
+    if os.environ.get("TINKER_ACCEPT_OMNIVERSE_EULA") == "Y":
+        # Kit prompts interactively without these; headless launches would
+        # abort at EOF. Mirrors bootstrap.base_environment.
+        env["ACCEPT_EULA"] = "Y"
+        env["OMNI_KIT_ACCEPT_EULA"] = "YES"
+    streaming = args.sensor_profile == "streaming" or args.livestream
+    lock: Path | None = _streaming_lock(config.root) if streaming else None
     try:
         process = subprocess.Popen(command, cwd=config.root, env=env)
         try:

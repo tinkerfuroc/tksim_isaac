@@ -9,6 +9,40 @@ from tinker_sim_core.command_mux import JointCommand, decode_snapshot_packet
 from tinker_sim_core.occupancy import OccupancyMap
 
 
+CHASSIS_BALLAST_SOURCE_MASS_KG = 20.0
+CHASSIS_BALLAST_ADDED_MASS_KG = 10.0
+CHASSIS_BALLAST_TARGET_MASS_KG = (
+    CHASSIS_BALLAST_SOURCE_MASS_KG + CHASSIS_BALLAST_ADDED_MASS_KG
+)
+CHASSIS_BALLAST_SOURCE_DIAGONAL_INERTIA = (0.22, 0.30, 0.22)
+CHASSIS_BALLAST_TARGET_DIAGONAL_INERTIA = tuple(
+    value * CHASSIS_BALLAST_TARGET_MASS_KG / CHASSIS_BALLAST_SOURCE_MASS_KG
+    for value in CHASSIS_BALLAST_SOURCE_DIAGONAL_INERTIA
+)
+
+
+def chassis_ballast_target_properties(
+    current_mass_kg: float,
+) -> tuple[float, tuple[float, float, float]]:
+    """Return the idempotent low-mounted ballast override for Tinker 2.
+
+    The source USD carries the original 20 kg batteries/electronics ballast.
+    Accept either that source value or an artifact that already contains this
+    10 kg addition, but reject an unknown mass instead of silently replacing a
+    newer physical model.
+    """
+    mass = float(current_mass_kg)
+    if not math.isfinite(mass) or not (
+        math.isclose(mass, CHASSIS_BALLAST_SOURCE_MASS_KG, abs_tol=1.0e-4)
+        or math.isclose(mass, CHASSIS_BALLAST_TARGET_MASS_KG, abs_tol=1.0e-4)
+    ):
+        raise ValueError(
+            "Tinker chassis ballast must be the 20 kg source mass or the "
+            "30 kg augmented mass"
+        )
+    return CHASSIS_BALLAST_TARGET_MASS_KG, CHASSIS_BALLAST_TARGET_DIAGONAL_INERTIA
+
+
 #: Uniform wall material used when no palette override is supplied.
 DEFAULT_WALL_COLOR = (0.35, 0.38, 0.42)
 
@@ -215,6 +249,7 @@ class IsaacWholeRobotBackend:
             },
         )
         self._robot = Articulation(robot_cfg)
+        self.chassis_ballast_mass_kg = self._apply_chassis_ballast_mass()
         self._robot_view_identity: int | None = None
         self._clock_step_origin = 0
         import omni.kit.app
@@ -241,6 +276,28 @@ class IsaacWholeRobotBackend:
             )
             if self._contact_report_subscription is None:
                 raise RuntimeError("manipulation-core requires PhysX contact reporting")
+
+    def _apply_chassis_ballast_mass(self) -> float:
+        """Add 10 kg to the existing low-mounted chassis ballast before reset."""
+        import omni.usd
+        from pxr import Gf, UsdPhysics
+
+        prim_path = "/World/Tinker/ballast"
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim.IsValid() or not prim.HasAPI(UsdPhysics.MassAPI):
+            raise RuntimeError(f"Tinker chassis ballast rigid body is missing: {prim_path}")
+        mass_api = UsdPhysics.MassAPI(prim)
+        current_mass = mass_api.GetMassAttr().Get()
+        if current_mass is None:
+            raise RuntimeError(f"Tinker chassis ballast has no authored mass: {prim_path}")
+        try:
+            target_mass, target_inertia = chassis_ballast_target_properties(current_mass)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"unsupported Tinker chassis ballast at {prim_path}: {error}") from error
+        mass_api.GetMassAttr().Set(target_mass)
+        mass_api.GetDiagonalInertiaAttr().Set(Gf.Vec3f(*target_inertia))
+        return target_mass
 
     def _refresh_robot_handles(self) -> bool:
         """Refresh tensors after a standard stop/reset/play lifecycle."""
@@ -1053,6 +1110,7 @@ class IsaacWholeRobotBackend:
             "robot": self._robot_truth_state(),
             "command_targets": self.command_target_state(),
             "physics_device": self.physics_device,
+            "chassis_ballast_mass_kg": self.chassis_ballast_mass_kg,
             "seed": self.seed,
             "contacts": self.contact_pairs(),
             "contact_state": self.contact_state(),
