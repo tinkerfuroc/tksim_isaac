@@ -3,11 +3,145 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
 import traceback
 from pathlib import Path
+
+
+STREAM_SIGNAL_PORT = 49100
+STREAM_MEDIA_PORT = 47998
+STREAM_RESOLUTION = (1280, 720)
+STREAM_UPDATE_HZ = 10.0
+STREAM_READY_FILE = Path("/tmp/tinker-sim-arena-streaming.ready.json")
+
+
+def _streaming_application_config(kit_args: list[str]) -> dict[str, object]:
+    width, height = STREAM_RESOLUTION
+    return {
+        "headless": True,
+        "hide_ui": False,
+        "renderer": "RaytracedLighting",
+        # WebRTC's primary app stream captures the application surface, while
+        # Isaac's renderer and window have independent size settings. Start
+        # them at the same size, then let the primary client resize the app
+        # surface through Isaac's supported dynamic-resize path.
+        "width": width,
+        "height": height,
+        "window_width": width,
+        "window_height": height,
+        "multi_gpu": False,
+        "max_gpu_count": 1,
+        "physics_gpu": -1,
+        "extra_args": [
+            "--/physics/useGpu=false",
+            "--/physics/cudaDevice=-1",
+            "--/exts/omni.kit.livestream.app/primaryStream/allowDynamicResize=true",
+            "--/exts/omni.kit.livestream.app/primaryStream/publicIp=127.0.0.1",
+            f"--/exts/omni.kit.livestream.app/primaryStream/signalPort={STREAM_SIGNAL_PORT}",
+            f"--/exts/omni.kit.livestream.app/primaryStream/streamPort={STREAM_MEDIA_PORT}",
+            *kit_args,
+        ],
+    }
+
+
+def _streaming_experience(isaacsim_package: Path) -> Path:
+    experience = isaacsim_package.resolve().parent / "apps" / "isaacsim.exp.full.streaming.kit"
+    if not experience.is_file():
+        raise RuntimeError(f"Isaac streaming experience is missing: {experience}")
+    return experience
+
+
+def _pump_streaming_app_update(app: object, settings: object) -> None:
+    """Pump one Kit frame so livestream input reaches the headless UI.
+
+    Isaac Lab owns the explicit physics step in this process.  Kit's livestream
+    extension, however, consumes remote mouse/keyboard events during PreUpdate.
+    Temporarily disable Kit-owned simulation stepping around ``app.update()`` so
+    input and UI events are processed without advancing PhysX a second time.
+    This mirrors Isaac Lab's KitVisualizer update boundary.
+    """
+    play_simulations = "/app/player/playSimulations"
+    settings.set_bool(play_simulations, False)
+    try:
+        app.update()
+    finally:
+        settings.set_bool(play_simulations, True)
+
+
+def _streaming_update_stride(
+    physics_dt: float,
+    update_hz: float = STREAM_UPDATE_HZ,
+) -> int:
+    """Return the number of physics frames between streamed Kit updates.
+
+    Rendering the full application surface on every 120 Hz CPU-PhysX frame
+    couples simulation time to the much slower ray-traced stream. Keep physics
+    authoritative and service UI/input/video at its own bounded cadence.
+    """
+    if physics_dt <= 0.0 or update_hz <= 0.0:
+        raise ValueError("physics_dt and streaming update_hz must be positive")
+    return max(1, round(1.0 / (physics_dt * update_hz)))
+
+
+class _StreamingSessionLifecycle:
+    """Track the primary client's real connection lifecycle.
+
+    The WebRTC extension can emit disconnect notifications for abandoned
+    connection attempts. Only a disconnect after its matching first successful
+    connection ends this single-viewer application session.
+    """
+
+    def __init__(self) -> None:
+        self.connected = False
+        self.ended = False
+        self.ready = False
+
+    def mark_ready(self) -> None:
+        self.ready = True
+
+    def on_connected(self, _event: object) -> None:
+        self.connected = True
+
+    def on_disconnected(self, _event: object) -> None:
+        if self.connected and self.ready:
+            self.ended = True
+        self.connected = False
+
+
+def _write_stream_ready_file(path: Path = STREAM_READY_FILE) -> None:
+    payload = {
+        "media_port_udp": STREAM_MEDIA_PORT,
+        "pid": os.getpid(),
+        "signal_port_tcp": STREAM_SIGNAL_PORT,
+        "state": "ready",
+    }
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _clear_stream_ready_file(path: Path = STREAM_READY_FILE) -> None:
+    path.unlink(missing_ok=True)
+
+
+def _arena_camera_pose(occupancy: object) -> tuple[list[float], list[float], list[float]]:
+    width = int(getattr(occupancy, "width"))
+    height = int(getattr(occupancy, "height"))
+    resolution = float(getattr(occupancy, "resolution"))
+    origin_x = float(getattr(occupancy, "origin_x"))
+    origin_y = float(getattr(occupancy, "origin_y"))
+    if width <= 0 or height <= 0 or resolution <= 0.0:
+        raise ValueError("arena occupancy dimensions and resolution must be positive")
+    size_x = width * resolution
+    size_y = height * resolution
+    span = max(size_x, size_y)
+    center = [origin_x + size_x / 2.0, origin_y + size_y / 2.0, 0.5]
+    eye = [center[0] - 0.75 * span, center[1] - 0.75 * span, 0.90 * span]
+    bounds = [origin_x, origin_y, origin_x + size_x, origin_y + size_y]
+    return eye, center, bounds
 
 
 def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
@@ -280,10 +414,15 @@ def main() -> int:
     parser.add_argument("--ros", action="store_true")
     parser.add_argument("--duration", type=float, default=0.0, help="simulation seconds; 0 runs until signalled")
     parser.add_argument("--qualification", action="store_true")
+    parser.add_argument("--livestream", action="store_true")
     parser.add_argument("--camera-pointcloud", action="store_true")
     parser.add_argument("--arena-colors", action="store_true")
     args, kit_args = parser.parse_known_args()
 
+    if args.livestream and args.sensor_profile != "navigation-parity":
+        parser.error("--livestream is supported only with navigation-parity")
+    if args.livestream and not args.headless:
+        parser.error("--livestream requires --headless")
     if args.camera_pointcloud and args.sensor_profile != "sensor-rich":
         parser.error("--camera-pointcloud is supported only with sensor-rich")
     if args.arena_colors and args.sensor_profile != "sensor-rich":
@@ -292,6 +431,13 @@ def main() -> int:
         print("sensor-rich implies --ros; enabling the ROS gateway", flush=True)
         args.ros = True
 
+    stream_ready_file = Path(
+        os.environ.get("TINKER_SIM_STREAM_READY_FILE", str(STREAM_READY_FILE))
+    )
+    if args.livestream:
+        _clear_stream_ready_file(stream_ready_file)
+
+    import isaacsim
     from isaacsim import SimulationApp
 
     application_config = {
@@ -309,6 +455,10 @@ def main() -> int:
             *kit_args,
         ],
     }
+    experience = ""
+    if args.livestream:
+        experience = str(_streaming_experience(Path(isaacsim.__file__)))
+        application_config.update(_streaming_application_config(kit_args))
     if args.sensor_profile == "manipulation-core" and args.qualification:
         application_config.update(
             {
@@ -317,12 +467,32 @@ def main() -> int:
                 "height": 540,
             }
         )
-    app = SimulationApp(
-        {
-            **application_config,
-        }
-    )
+    app = SimulationApp({**application_config}, experience=experience)
+    streaming_settings = None
+    if args.livestream:
+        import carb.settings
+
+        streaming_settings = carb.settings.get_settings()
     running = True
+    streaming_lifecycle = None
+    streaming_event_subscriptions: list[object] = []
+    if args.livestream:
+        import carb.eventdispatcher
+
+        streaming_lifecycle = _StreamingSessionLifecycle()
+        dispatcher = carb.eventdispatcher.get_eventdispatcher()
+        streaming_event_subscriptions = [
+            dispatcher.observe_event(
+                observer_name="tinker-sim.streaming-client-connected",
+                event_name="omni.kit.livestream.client_connected:immediate",
+                on_event=streaming_lifecycle.on_connected,
+            ),
+            dispatcher.observe_event(
+                observer_name="tinker-sim.streaming-client-disconnected",
+                event_name="omni.kit.livestream.client_disconnected:immediate",
+                on_event=streaming_lifecycle.on_disconnected,
+            ),
+        ]
 
     def stop(_signum: int, _frame: object) -> None:
         nonlocal running
@@ -357,8 +527,34 @@ def main() -> int:
             from tinker_sim_isaac.backend import IsaacNavigationBackend
             backend = IsaacNavigationBackend(
                 usd_path=args.artifact, map_yaml=args.map_yaml, seed=args.seed,
-                render=not args.headless, enable_contacts=False,
+                render=args.livestream or not args.headless, enable_contacts=False,
             )
+            arena_camera_eye = None
+            arena_camera_target = None
+            arena_bounds = None
+            arena_collider_count = 0
+            viewport_ready = None
+            if backend.occupancy is not None:
+                arena_collider_count = len(backend.occupancy.rectangles())
+            if args.livestream:
+                if backend.occupancy is None:
+                    raise RuntimeError("arena streaming requires a loaded occupancy map")
+                from isaacsim.core.rendering_manager import ViewportManager
+
+                arena_camera_eye, arena_camera_target, arena_bounds = _arena_camera_pose(
+                    backend.occupancy
+                )
+                camera = ViewportManager.get_camera()
+                ViewportManager.set_camera_view(
+                    camera,
+                    eye=arena_camera_eye,
+                    target=arena_camera_target,
+                )
+                viewport_ready, _ = ViewportManager.wait_for_viewport(max_frames=120)
+                if not viewport_ready:
+                    raise RuntimeError("arena streaming viewport did not become ready")
+                for _ in range(4):
+                    backend.render_frame()
             if args.ros:
                 from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
@@ -366,14 +562,39 @@ def main() -> int:
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
                 )
+            stream_update_stride = 1
+            stream_physics_frames = 0
+            if args.livestream:
+                # The guarded Kit update below renders the app stream. Avoid a
+                # second full render inside every SimulationContext step.
+                backend.render = False
+                stream_update_stride = _streaming_update_stride(backend.dt)
             print(
                 json.dumps(
                     {
                         "artifact": str(args.artifact),
                         "map": str(args.map_yaml),
+                        "arena": {
+                            "bounds_xy": arena_bounds,
+                            "camera_eye": arena_camera_eye,
+                            "camera_target": arena_camera_target,
+                            "collider_count": arena_collider_count,
+                            "id": "robocup-arena3",
+                        },
                         "calibration": calibration.status.value,
+                        "livestream": {
+                            "dynamic_resize": args.livestream,
+                            "enabled": args.livestream,
+                            "media_port_udp": STREAM_MEDIA_PORT if args.livestream else None,
+                            "quit_on_session_end": True if args.livestream else None,
+                            "resolution": list(STREAM_RESOLUTION) if args.livestream else None,
+                            "signal_port_tcp": STREAM_SIGNAL_PORT if args.livestream else None,
+                            "update_hz": STREAM_UPDATE_HZ if args.livestream else None,
+                            "viewport_ready": viewport_ready,
+                        },
                         "ros": args.ros,
                         "physics_device": backend.physics_device,
+                        "chassis_ballast_mass_kg": backend.chassis_ballast_mass_kg,
                         "timeline_end_time": backend.timeline_end_time,
                         "simulation_control": (
                             "isaacsim.ros2.sim_control" if args.ros else "disabled"
@@ -383,12 +604,18 @@ def main() -> int:
                 ),
                 flush=True,
             )
+            if args.livestream:
+                if streaming_lifecycle is None:
+                    raise RuntimeError("livestream session lifecycle was not initialized")
+                streaming_lifecycle.mark_ready()
+                _write_stream_ready_file(stream_ready_file)
             next_step_wall = time.monotonic()
             next_collision_heartbeat = time.monotonic()
             collision_heartbeat_period_s = 0.1
             while (
                 running
                 and app.is_running()
+                and not (streaming_lifecycle is not None and streaming_lifecycle.ended)
                 and (args.duration <= 0.0 or backend.simulation_time < args.duration)
             ):
                 if gateway is not None:
@@ -419,6 +646,13 @@ def main() -> int:
                             break
                         if not running:
                             break
+                    if args.livestream:
+                        stream_physics_frames += 1
+                        if stream_physics_frames % stream_update_stride == 0:
+                            # Service remote input and stream video without
+                            # letting Kit issue a second physics step.
+                            _pump_streaming_app_update(app, streaming_settings)
+                    elif gateway is not None:
                         # SimulationContext performs a direct headless PhysX
                         # step.  NVIDIA's simulation-control callbacks run on
                         # Kit's asyncio loop, so pump one Kit update per ROS
@@ -728,6 +962,10 @@ def main() -> int:
         failed = True
         traceback.print_exc()
     finally:
+        if args.livestream:
+            _clear_stream_ready_file(stream_ready_file)
+        for subscription in streaming_event_subscriptions:
+            subscription.reset()
         if visual_capture is not None:
             visual_capture.close()
         if gateway is not None:
