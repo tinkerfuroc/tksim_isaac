@@ -169,13 +169,45 @@ def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
     return artifact
 
 
-def _expected_scenario_objects(root: Path, scenario_name: str) -> dict[str, dict[str, object]]:
+def resolve_arena_artifact(root: Path, arena_id: str) -> Path:
+    """Resolve ``--arena <arena_id>`` to its content-addressed artifact dir.
+
+    Mirrors the robot-artifact pointer consumption above (``current.json`` ->
+    manifest -> payload directory), fixed to the arena asset kind. Fails
+    closed with ``FileNotFoundError``/``ValueError`` on a missing pointer
+    file, a missing or invalid ``manifest`` key, a missing manifest file, or
+    a missing ``arena.usd``/``map.yaml`` payload in the resolved directory.
+    """
+    pointer_path = root / "artifacts/arena" / arena_id / "current.json"
+    if not pointer_path.is_file():
+        raise FileNotFoundError(f"missing arena artifact pointer: {pointer_path}")
+    current = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_value = current.get("manifest")
+    if not isinstance(manifest_value, str) or not manifest_value:
+        raise ValueError(f"arena artifact pointer missing 'manifest': {pointer_path}")
+    manifest_path = Path(manifest_value)
+    if not manifest_path.is_absolute():
+        manifest_path = root / manifest_path
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing arena artifact manifest: {manifest_path}")
+    artifact_dir = manifest_path.parent
+    if not (artifact_dir / "arena.usd").is_file():
+        raise FileNotFoundError(f"arena artifact missing arena.usd: {artifact_dir}")
+    if not (artifact_dir / "map.yaml").is_file():
+        raise FileNotFoundError(f"arena artifact missing map.yaml: {artifact_dir}")
+    return artifact_dir
+
+
+def _expected_scenario_objects(
+    root: Path, scenario_name: str, arena_id: str | None = None
+) -> dict[str, dict[str, object]]:
     if scenario_name == "empty":
         return {}
     sys.path.insert(0, str(root / "simulation"))
-    from tinker_sim_core.scenario import load_named_scenario
+    from tinker_sim_core.scenario import load_named_scenario, validate_world_selection
 
     scenario = load_named_scenario(root, scenario_name)
+    validate_world_selection(scenario, arena_id)
     expected: dict[str, dict[str, object]] = {}
     for record in scenario.objects:
         pose = record.get("pose", {})
@@ -398,6 +430,18 @@ def sensor_rich_implies_ros(sensor_profile: str, ros: bool) -> bool:
     return sensor_profile == "sensor-rich" and not ros
 
 
+def arena_flag_supported(sensor_profile: str) -> bool:
+    """``--arena`` requires a profile that loads the robot backend.
+
+    ``physics-only`` builds a bare ``isaacsim.core.api.World`` with no
+    ``IsaacWholeRobotBackend``/``IsaacNavigationBackend`` to reference an
+    arena artifact into -- the physics-only branch never even reads
+    ``args.arena``, so passing it there was silently ignored rather than
+    rejected (Final review Finding 4).
+    """
+    return sensor_profile != "physics-only"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -411,6 +455,7 @@ def main() -> int:
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--map", dest="map_yaml", type=Path)
+    parser.add_argument("--arena")
     parser.add_argument("--ros", action="store_true")
     parser.add_argument("--duration", type=float, default=0.0, help="simulation seconds; 0 runs until signalled")
     parser.add_argument("--qualification", action="store_true")
@@ -427,6 +472,12 @@ def main() -> int:
         parser.error("--camera-pointcloud is supported only with sensor-rich")
     if args.arena_colors and args.sensor_profile != "sensor-rich":
         parser.error("--arena-colors is supported only with sensor-rich")
+    if args.arena and not arena_flag_supported(args.sensor_profile):
+        parser.error("--arena requires a profile that loads the robot backend")
+    if args.arena and args.map_yaml is not None:
+        parser.error("--arena and --map are mutually exclusive")
+    if args.arena and args.arena_colors:
+        parser.error("--arena-colors applies only to occupancy cuboid walls")
     if sensor_rich_implies_ros(args.sensor_profile, args.ros):
         print("sensor-rich implies --ros; enabling the ROS gateway", flush=True)
         args.ros = True
@@ -522,12 +573,16 @@ def main() -> int:
                 if not manifest_path.is_absolute():
                     manifest_path = root / manifest_path
                 args.artifact = manifest_path.parent / "robot.usd"
-            if args.map_yaml is None:
+            arena_dir = None
+            if args.arena:
+                arena_dir = resolve_arena_artifact(root, args.arena)
+            elif args.map_yaml is None:
                 args.map_yaml = args.artifact.parent / "map.yaml"
             from tinker_sim_isaac.backend import IsaacNavigationBackend
             backend = IsaacNavigationBackend(
                 usd_path=args.artifact, map_yaml=args.map_yaml, seed=args.seed,
                 render=args.livestream or not args.headless, enable_contacts=False,
+                arena_artifact=arena_dir,
             )
             arena_camera_eye = None
             arena_camera_target = None
@@ -572,6 +627,7 @@ def main() -> int:
             print(
                 json.dumps(
                     {
+                        "arena": args.arena,
                         "artifact": str(args.artifact),
                         "map": str(args.map_yaml),
                         "arena": {
@@ -683,9 +739,12 @@ def main() -> int:
                 if not manifest_path.is_absolute():
                     manifest_path = root / manifest_path
                 args.artifact = manifest_path.parent / "robot.usd"
-            if args.map_yaml is None:
+            arena_dir = None
+            if args.arena:
+                arena_dir = resolve_arena_artifact(root, args.arena)
+            elif args.map_yaml is None:
                 args.map_yaml = args.artifact.parent / "map.yaml"
-            expected_objects = _expected_scenario_objects(root, args.scenario)
+            expected_objects = _expected_scenario_objects(root, args.scenario, args.arena)
             wall_color_fn = None
             if args.arena_colors:
                 from tinker_sim_core.arena_palette import wall_color
@@ -704,6 +763,7 @@ def main() -> int:
                 scenario=args.scenario,
                 task=args.scenario,
                 wall_color_fn=wall_color_fn,
+                arena_artifact=arena_dir,
             )
             from tinker_sim_isaac.camera_rig import CameraRig, load_camera_specs
 
@@ -730,6 +790,7 @@ def main() -> int:
             print(
                 json.dumps(
                     {
+                        "arena": args.arena,
                         "artifact": str(args.artifact),
                         "map": str(args.map_yaml),
                         "arena_colors": args.arena_colors,
@@ -819,8 +880,11 @@ def main() -> int:
             if not profile.get("contacts"):
                 raise RuntimeError("manipulation-core profile must enable contacts")
             artifact = _content_addressed_tinker_usd(root, args.artifact)
-            expected_objects = _expected_scenario_objects(root, args.scenario)
+            expected_objects = _expected_scenario_objects(root, args.scenario, args.arena)
             sys.path.insert(0, str(root / "simulation"))
+            arena_dir = None
+            if args.arena:
+                arena_dir = resolve_arena_artifact(root, args.arena)
             from tinker_sim_isaac.backend import IsaacWholeRobotBackend
 
             backend = IsaacWholeRobotBackend(
@@ -833,6 +897,7 @@ def main() -> int:
                 expected_objects=expected_objects,
                 scenario=args.scenario,
                 task=args.scenario,
+                arena_artifact=arena_dir,
             )
             if backend.physics_device != "cpu":
                 raise RuntimeError("manipulation-core selected a non-CPU physics device")
