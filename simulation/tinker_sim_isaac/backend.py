@@ -293,6 +293,10 @@ class IsaacWholeRobotBackend:
                     joint_names_expr=["pan_joint", "tilt_joint"],
                     stiffness=500.0,
                     damping=50.0,
+                    # The URDF's effort="1.0" is a hand-authored placeholder
+                    # (massless stub links, no ros2_control entry); 1 Nm cannot
+                    # move the head against default-assigned inertias.
+                    effort_limit_sim=10.0,
                 ),
                 "gripper": ImplicitActuatorCfg(
                     joint_names_expr=["drive_joint"],
