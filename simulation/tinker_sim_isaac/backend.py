@@ -43,6 +43,20 @@ def chassis_ballast_target_properties(
     return CHASSIS_BALLAST_TARGET_MASS_KG, CHASSIS_BALLAST_TARGET_DIAGONAL_INERTIA
 
 
+# Wheel radius 0.0525 m => 60 rad/s^2 ~= 3.1 m/s^2 linear. Deliberately above
+# Nav2's acc_lim (~2.5 m/s^2) so planner-shaped profiles pass through; this is
+# the floor-level bound for non-planner commanders and stale-target transients.
+WHEEL_VELOCITY_SLEW_RAD_S2 = 60.0
+WHEEL_JOINT_NAMES = frozenset(
+    {
+        "front_left_wheel_joint",
+        "front_right_wheel_joint",
+        "rear_left_wheel_joint",
+        "rear_right_wheel_joint",
+    }
+)
+
+
 def slew_velocity_target(current: float, target: float, max_delta: float) -> float:
     """Move a velocity target toward ``target`` by at most ``max_delta``.
 
@@ -402,6 +416,12 @@ class IsaacWholeRobotBackend:
             self._contact_pairs_by_key.clear()
         self.joint_names = tuple(self._robot.data.joint_names)
         self._joint_index = {name: index for index, name in enumerate(self.joint_names)}
+        self._wheel_indices = tuple(
+            self._joint_index[name]
+            for name in sorted(WHEEL_JOINT_NAMES)
+            if name in self._joint_index
+        )
+        self._applied_wheel_velocities = {index: 0.0 for index in self._wheel_indices}
         self._safety_joint_ids = tuple(
             self._joint_index[name]
             for name in (f"joint{index}" for index in range(1, 8))
@@ -488,6 +508,9 @@ class IsaacWholeRobotBackend:
             self._position_targets = self._safety_snapshot.clone()
             self._velocity_targets.zero_()
             self._effort_targets.zero_()
+            self._applied_wheel_velocities = {
+                index: 0.0 for index in getattr(self, "_wheel_indices", ())
+            }
             return
         self._restore_safety_actuator_gains()
         self._safety_stopped = False
@@ -849,6 +872,14 @@ class IsaacWholeRobotBackend:
             self._robot.set_joint_position_target(self._position_targets)
             self._robot.set_joint_velocity_target(self._velocity_targets)
         else:
+            max_delta = WHEEL_VELOCITY_SLEW_RAD_S2 * self.dt
+            for index in self._wheel_indices:
+                commanded = float(self._velocity_targets[0, index])
+                applied = slew_velocity_target(
+                    self._applied_wheel_velocities[index], commanded, max_delta
+                )
+                self._applied_wheel_velocities[index] = applied
+                self._velocity_targets[0, index] = applied
             self._robot.set_joint_velocity_target(self._velocity_targets)
             self._robot.set_joint_position_target(self._position_targets)
         effort_writer = getattr(self._robot, "set_joint_effort_target", None)
