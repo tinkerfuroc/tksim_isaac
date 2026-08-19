@@ -92,6 +92,28 @@ def resolve_arena_inputs(
     return arena_usd, effective_map_yaml
 
 
+def validate_spawn_xy(spawn_xy: object) -> tuple[float, float]:
+    """Validate an ``(x, y)`` robot spawn override.
+
+    The default arena spawn of world (0, 0) lands inside shelf_02's physical
+    and rasterized footprint in the rcw2026 arena, so navigation work needs an
+    explicit free-space spawn. Fails closed on malformed or non-finite input.
+    """
+    try:
+        x_raw, y_raw = spawn_xy  # type: ignore[misc]
+    except (TypeError, ValueError):
+        raise ValueError("spawn_xy must be a two-element (x, y) pair")
+    if isinstance(x_raw, bool) or isinstance(y_raw, bool):
+        raise ValueError("spawn_xy values must be numbers")
+    try:
+        x, y = float(x_raw), float(y_raw)
+    except (TypeError, ValueError):
+        raise ValueError("spawn_xy values must be numbers")
+    if not (math.isfinite(x) and math.isfinite(y)):
+        raise ValueError("spawn_xy values must be finite")
+    return x, y
+
+
 class IsaacWholeRobotBackend:
     """CPU-PhysX articulation controlled only by standard JointState commands."""
 
@@ -131,7 +153,9 @@ class IsaacWholeRobotBackend:
         task: str = "",
         wall_color_fn: Callable[[int], tuple[float, float, float]] | None = None,
         arena_artifact: Path | None = None,
+        spawn_xy: tuple[float, float] = (0.0, 0.0),
     ) -> None:
+        spawn_x, spawn_y = validate_spawn_xy(spawn_xy)
         arena_usd, map_yaml = resolve_arena_inputs(arena_artifact, map_yaml)
         if arena_artifact is not None and wall_color_fn is not None:
             raise ValueError(
@@ -235,7 +259,7 @@ class IsaacWholeRobotBackend:
                 activate_contact_sensors=enable_contacts,
                 joint_drive_props=sim_utils.JointDriveBaseCfg(drive_type="force"),
             ),
-            init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, spawn_z)),
+            init_state=ArticulationCfg.InitialStateCfg(pos=(spawn_x, spawn_y, spawn_z)),
             actuators={
                 "arm": ImplicitActuatorCfg(
                     joint_names_expr=["joint[1-7]"],

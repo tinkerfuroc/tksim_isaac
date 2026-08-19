@@ -406,6 +406,21 @@ value exactly (missing, mismatched, or combined with a `uri` key all raise
 `ValueError`) — `mode: "current"`, or `mode` absent, is unaffected regardless
 of `--arena`.
 
+The robot's default spawn is world (0, 0), which in the rcw2026 arena lies
+inside `shelf_02`'s physical and rasterized footprint: the robot stands under
+the shelf plate, the planar lidar sees a self-hit/obstruction ring, wheel
+odometry accumulates contact slip, and AMCL is initialized inside an occupied
+map cell. Navigation work in this arena therefore passes
+`--spawn-xy=X,Y` (world metres; use the `=` form — argparse treats a
+separate `-2.0,-2.0` token as an option string) to place the robot on a free
+map cell, e.g. `--spawn-xy=-2.0,-2.0` (1.0 m clearance on the derived map).
+The override is validated fail-closed (two finite comma-separated numbers)
+and requires a profile that loads the robot backend, like `--arena` itself.
+On the Humble side, `./scripts/launch-humble navigation
+map_yaml:=/abs/path/to/artifacts/arena/rcw2026/<identity>/map.yaml` points
+AMCL's map server at the arena's derived map instead of the robot artifact's
+colocated default; the override fails closed on a missing file.
+
 The streaming wrapper `scripts/launch-arena-streaming` and `--livestream`
 forwarding in the deploy CLI are **not** part of this branch — they live in
 separate, uncommitted work. The headless streaming smoke recorded below was
@@ -438,14 +453,50 @@ Validation performed on this branch (development-validated only):
   navigation-parity --profile parity --scenario empty --seed 7 --headless
   --livestream --arena rcw2026 --duration 45`) ran the full 45 simulated
   seconds to a clean exit, with only headless-windowing/driver diagnostic
-  warnings in the log and no importer-scratch-path leakage.
+  warnings in the log and no importer-scratch-path leakage;
+- a live end-to-end `./scripts/launch-arena-streaming --arena rcw2026` run
+  (2026-08-18) reached streaming readiness — ready file written, TCP 49100
+  listening, `viewport_ready: true`, arena `robocup-arena3` with 38
+  colliders loaded — and stayed up awaiting a client;
+- sensor-rich camera imagery of the arena's furniture: head and wrist
+  hardware-parity color/depth frames captured live against `--arena
+  rcw2026` (shelf close-ups plus a base-rotation panorama showing the TV
+  cabinet, trash bin, door, tiled floor, and plant), with per-frame content
+  statistics — `reports/arena-sensor-rich-2026-08-18/`; the wrist camera's
+  mount/intrinsics and arm-following viewpoint were verified separately in
+  `reports/arena-arm-camera-2026-08-18/`;
+- AMCL convergence on the derived map: with the spawn moved to a free cell
+  (`--spawn-xy=-2.0,-2.0`) and the Humble stack pointed at the arena map
+  (`map_yaml:=...`), AMCL locked to physics-truth within 0.07 m after
+  seeding and, over truth-validated gentle-motion runs, contracted to
+  position variance 0.035/0.050 m² (std ~0.2 m) at 0.14 rad yaw error —
+  `reports/arena-amcl-2026-08-18/SUMMARY.md`, which also records two real
+  findings: the default (0, 0) arena spawn sits inside `shelf_02`'s
+  footprint (hence the new `--spawn-xy` override), and sustained in-place
+  skid-steer rotation accumulates wheel-odometry yaw slip that drags the
+  filter (a base-odometry characteristic, not a map defect).
 
 Not yet validated (open):
 
-- textured-frame visual confirmation by a human viewer;
-- physics interaction (an object resting on arena furniture);
-- sensor-rich camera imagery of the arena's furniture;
-- AMCL convergence on the derived map.
+- textured-frame visual confirmation by a human viewer (the streaming
+  session above is up for exactly this; connect with NVIDIA's client);
+- physics interaction (an object resting on arena furniture) — a live drop
+  test was reported closed in the 2026-08-18 session handoff
+  (`docs/simulation-handoff-2026-08-18.md`), but no evidence file is
+  committed, so it stays listed here until one is.
+
+Known arena limitations (development findings, 2026-08-18):
+
+- the default robot spawn (0, 0) lies inside `shelf_02`'s physical and
+  rasterized footprint — use `--spawn-xy` for navigation work (see launch
+  docs above);
+- head `pan_joint`/`tilt_joint` drives inherit the URDF's 1.0 Nm effort cap
+  (the backend overrides `effort_limit_sim` for arm and wheels only), so
+  commanded pan/tilt motion creeps at ~0.01 rad/s: re-aim the camera by
+  rotating the base, or extend the backend's `head` actuator group;
+- under `sensor-rich`, the planar lidar cloud includes a dense self-hit
+  ring at ~0.3 m that dominates the `/scan` conversion; AMCL/navigation
+  validation used `navigation-parity`'s deterministic raycaster instead.
 
 Status: development-validated only, **not release-qualified**.
 
@@ -765,6 +816,38 @@ References:
 - [Isaac Lab installation](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)
 
 ## Changelog
+
+- 2026-08-18 (RoboCup arena validation evidence + spawn/map overrides —
+  "run the arena streaming launch and capture the outstanding validation
+  evidence"): Ran `./scripts/launch-arena-streaming --arena rcw2026` end to
+  end to streaming readiness; captured sensor-rich head/wrist camera
+  evidence of the arena furniture
+  (`reports/arena-sensor-rich-2026-08-18/`), verified the wrist camera's
+  mount, intrinsics, and arm-following viewpoint
+  (`reports/arena-arm-camera-2026-08-18/`), and validated AMCL on the
+  derived arena map against `/sim/internal/physics_truth`
+  (`reports/arena-amcl-2026-08-18/SUMMARY.md`). Two defects surfaced and
+  were addressed: the default arena spawn (0, 0) sits inside `shelf_02`'s
+  physical/rasterized footprint — fixed by an opt-in, fail-closed
+  `--spawn-xy X,Y` override threaded `deploy CLI -> run_sim.py ->
+  IsaacWholeRobotBackend.spawn_xy` (defaults unchanged;
+  `tests/test_spawn_override.py`, 11 tests) — and
+  `navigation.launch.py` hard-wired AMCL's map to the robot artifact's
+  colocated `map.yaml` — fixed by an optional fail-closed `map_yaml:=`
+  launch argument (`resolve_map_yaml`;
+  `tests/test_navigation_launch_map.py`, 5 tests). Documented findings:
+  head pan/tilt effort starvation (1.0 Nm URDF cap, no backend
+  `effort_limit_sim` override), sensor-rich lidar self-hit ring, and
+  skid-steer rotational odometry yaw slip. Focused arena/CLI suites pass
+  78/78; full `unittest discover` failing set is environmental/external
+  only (system PIL lacks `Image.Resampling`, `torch`/`tinker_sim_bridge`
+  unavailable to system Python, and `test_provenance` pins a
+  `tk25_manipulation` commit unreachable while that workspace sits on
+  `collision-aware-grasp`), plus the pre-existing uncommitted
+  `tests/test_base_velocity_slew.py`, which imports a
+  `slew_velocity_target` that no commit implements (in-progress task50
+  work). Textured-frame human confirmation remains the open item; the
+  streaming session is left up for it.
 
 - 2026-08-17 (RoboCup 2026 arena import, Tasks 1-11 — "import, launch, and
   document the RoboCup 2026 arena and YCB objects"): Added a RoboCup 2026

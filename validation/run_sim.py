@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -442,6 +443,24 @@ def arena_flag_supported(sensor_profile: str) -> bool:
     return sensor_profile != "physics-only"
 
 
+def parse_spawn_xy(text: str) -> tuple[float, float]:
+    """Parse ``--spawn-xy X,Y`` strictly.
+
+    The default arena spawn (0, 0) sits inside shelf_02's footprint in the
+    rcw2026 arena; navigation runs pass an explicit free-space spawn instead.
+    """
+    parts = text.split(",")
+    if len(parts) != 2:
+        raise ValueError("--spawn-xy must be two comma-separated numbers: X,Y")
+    try:
+        x, y = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise ValueError("--spawn-xy values must be numbers")
+    if not (math.isfinite(x) and math.isfinite(y)):
+        raise ValueError("--spawn-xy values must be finite")
+    return x, y
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -456,6 +475,7 @@ def main() -> int:
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--map", dest="map_yaml", type=Path)
     parser.add_argument("--arena")
+    parser.add_argument("--spawn-xy")
     parser.add_argument("--ros", action="store_true")
     parser.add_argument("--duration", type=float, default=0.0, help="simulation seconds; 0 runs until signalled")
     parser.add_argument("--qualification", action="store_true")
@@ -478,6 +498,14 @@ def main() -> int:
         parser.error("--arena and --map are mutually exclusive")
     if args.arena and args.arena_colors:
         parser.error("--arena-colors applies only to occupancy cuboid walls")
+    if args.spawn_xy is not None and not arena_flag_supported(args.sensor_profile):
+        parser.error("--spawn-xy requires a profile that loads the robot backend")
+    spawn_xy = (0.0, 0.0)
+    if args.spawn_xy is not None:
+        try:
+            spawn_xy = parse_spawn_xy(args.spawn_xy)
+        except ValueError as error:
+            parser.error(str(error))
     if sensor_rich_implies_ros(args.sensor_profile, args.ros):
         print("sensor-rich implies --ros; enabling the ROS gateway", flush=True)
         args.ros = True
@@ -582,7 +610,7 @@ def main() -> int:
             backend = IsaacNavigationBackend(
                 usd_path=args.artifact, map_yaml=args.map_yaml, seed=args.seed,
                 render=args.livestream or not args.headless, enable_contacts=False,
-                arena_artifact=arena_dir,
+                arena_artifact=arena_dir, spawn_xy=spawn_xy,
             )
             arena_camera_eye = None
             arena_camera_target = None
@@ -764,6 +792,7 @@ def main() -> int:
                 task=args.scenario,
                 wall_color_fn=wall_color_fn,
                 arena_artifact=arena_dir,
+                spawn_xy=spawn_xy,
             )
             from tinker_sim_isaac.camera_rig import CameraRig, load_camera_specs
 
@@ -898,6 +927,7 @@ def main() -> int:
                 scenario=args.scenario,
                 task=args.scenario,
                 arena_artifact=arena_dir,
+                spawn_xy=spawn_xy,
             )
             if backend.physics_device != "cpu":
                 raise RuntimeError("manipulation-core selected a non-CPU physics device")

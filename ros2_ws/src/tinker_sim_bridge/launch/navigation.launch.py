@@ -20,6 +20,17 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
+def resolve_map_yaml(map_override: str, artifact_dir: Path) -> Path:
+    """Choose the AMCL map: an explicit ``map_yaml:=`` override or the robot
+    artifact's colocated ``map.yaml``. Fails closed on a missing file so a
+    mistyped override cannot silently localize against the default map."""
+    value = (map_override or "").strip()
+    map_yaml = Path(value).expanduser().resolve() if value else artifact_dir / "map.yaml"
+    if not map_yaml.is_file():
+        raise RuntimeError(f"navigation map does not exist: {map_yaml}")
+    return map_yaml
+
+
 def _resolve(context):
     root = Path(LaunchConfiguration("project_root").perform(context)).resolve()
     workspace_value = LaunchConfiguration("tinker_workspace").perform(context).strip()
@@ -37,6 +48,9 @@ def _resolve(context):
             path = workspace / record["path"]
             if not path.is_file():
                 raise RuntimeError(f"qualification blocked by missing Tinker source: {path}")
+    map_yaml = resolve_map_yaml(
+        LaunchConfiguration("map_yaml").perform(context), artifact
+    )
     calibration = root / "simulation/calibration/tinker2-missing.json"
     calibration_raw = json.loads(calibration.read_text(encoding="utf-8"))
     if qualification and calibration_raw.get("status") != "calibrated":
@@ -89,7 +103,7 @@ def _resolve(context):
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(str(nav_share / "launch/localization_no_ekf_launch.py")),
             launch_arguments={
-                "use_sim_time": "True", "map": str(artifact / "map.yaml"),
+                "use_sim_time": "True", "map": str(map_yaml),
                 "params_file": str(workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
@@ -119,6 +133,7 @@ def generate_launch_description():
         DeclareLaunchArgument("tinker_workspace", default_value=os.environ.get("TINKER_WS", "")),
 
         DeclareLaunchArgument("qualification", default_value="false"),
+        DeclareLaunchArgument("map_yaml", default_value=""),
         SetEnvironmentVariable("ROBOT_NAME", "tinker2"),
         OpaqueFunction(function=_resolve),
     ])
