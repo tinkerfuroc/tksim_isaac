@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -79,6 +80,44 @@ class DeployCliSpawnForwardingTest(unittest.TestCase):
         self.assertFalse(
             any(token.startswith("--spawn-xy") for token in _launch_command(args))
         )
+
+
+def _write_arena_map(directory: Path, rows: list[str]) -> None:
+    # '#' -> occupied (0), '.' -> free (254); row 0 = TOP of image (world max y)
+    width, height = len(rows[0]), len(rows)
+    header = f"P5\n{width} {height}\n255\n".encode()
+    payload = bytes(0 if ch == "#" else 254 for row in rows for ch in row)
+    (directory / "map.pgm").write_bytes(header + payload)
+    (directory / "map.yaml").write_text(
+        "image: map.pgm\nresolution: 0.1\norigin: [0.0, 0.0, 0]\n"
+    )
+
+
+class ValidateArenaSpawnTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.arena = Path(self.temporary.name)
+
+    def test_clear_spawn_passes(self):
+        _write_arena_map(self.arena, ["." * 20] * 20)
+        from run_sim import validate_arena_spawn
+        validate_arena_spawn(self.arena, (1.0, 1.0))  # no raise
+
+    def test_occupied_spawn_fails_with_suggestion(self):
+        rows = ["." * 20 for _ in range(20)]
+        for r in range(8, 12):
+            rows[r] = rows[r][:8] + "####" + rows[r][12:]
+        _write_arena_map(self.arena, rows)
+        from run_sim import validate_arena_spawn
+        with self.assertRaisesRegex(RuntimeError, r"--spawn-xy="):
+            validate_arena_spawn(self.arena, (1.0, 1.0))
+
+    def test_fully_occupied_map_fails_without_suggestion_crash(self):
+        _write_arena_map(self.arena, ["#" * 6] * 6)
+        from run_sim import validate_arena_spawn
+        with self.assertRaisesRegex(RuntimeError, "no free cell"):
+            validate_arena_spawn(self.arena, (0.3, 0.3))
 
 
 if __name__ == "__main__":
