@@ -476,14 +476,29 @@ Validation performed on this branch (development-validated only):
   skid-steer rotation accumulates wheel-odometry yaw slip that drags the
   filter (a base-odometry characteristic, not a map defect).
 
+- physics interaction (an object resting on arena furniture): the
+  pick-deliver-place `delivery_object` (0.08 m cube), spawned via the
+  standard `spawn_entity` path at its declared z=0.8 pose, fell onto and
+  came to rest statically (zero twist across 387 truth samples) on a 0.5 m
+  board of `rcw26_shelf` —
+  `reports/arena-scenario-spawn-2026-08-19/object-spawn-verification.md`;
+- scenario entity spawning in the arena: `scenario_runner` executed
+  find-and-approach-person and pick-deliver-place against an `--arena
+  rcw2026` sim with every operation accepted; the person capsule and task
+  cube spawn at their exact declared world poses (verified via
+  `/get_entities`/`/get_entity_state` and `expected_objects` truth
+  correlation), and spawned entities are live rigid bodies
+  (`/set_entity_state` round-trips) —
+  `reports/arena-scenario-spawn-2026-08-19/`. Caveats: nothing implements
+  scenario `events` (the person's `actor_path_start` walk never runs), and
+  scenario poses were authored for the procedural world (the arena has no
+  pedestal at the object spawn; the person's declared pose sits in
+  furniture-dense space).
+
 Not yet validated (open):
 
 - textured-frame visual confirmation by a human viewer (the streaming
-  session above is up for exactly this; connect with NVIDIA's client);
-- physics interaction (an object resting on arena furniture) — a live drop
-  test was reported closed in the 2026-08-18 session handoff
-  (`docs/simulation-handoff-2026-08-18.md`), but no evidence file is
-  committed, so it stays listed here until one is.
+  session above is up for exactly this; connect with NVIDIA's client).
 
 Known arena limitations (development findings, 2026-08-18):
 
@@ -816,6 +831,22 @@ References:
 - [Isaac Lab installation](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)
 
 ## Changelog
+
+- 2026-08-19 (arena scenario entity spawning — "verify person and object
+  spawn"): Verified the standard scenario spawn path inside `--arena
+  rcw2026`: `scenario_runner` ran find-and-approach-person and
+  pick-deliver-place with every operation accepted; the person capsule and
+  delivery cube spawn at their exact declared world poses (checked via
+  `/get_entities`, `/get_entity_state`, and the physics-truth
+  `expected_objects` prim correlation), spawned entities are live rigid
+  bodies (`/set_entity_state` round-trips), and the delivery cube fell from
+  its declared z=0.8 onto a 0.5 m `rcw26_shelf` board and came to rest
+  statically — closing the "object resting on arena furniture" physics
+  item. Evidence: `reports/arena-scenario-spawn-2026-08-19/` (gitignored,
+  dev host). Findings recorded there: scenario `events` (actor paths) are
+  not implemented by any component, scenario poses were authored for the
+  procedural world rather than the arena, and an idle base coasts ~1.5 m
+  after a rotation sweep before settling.
 
 - 2026-08-18 (RoboCup arena validation evidence + spawn/map overrides —
   "run the arena streaming launch and capture the outstanding validation
