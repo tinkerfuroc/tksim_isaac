@@ -70,6 +70,14 @@ def _resolve(context):
             parameters=[str(bridge_share / "config/command_gateway.yaml")],
             additional_env=env,
         ),
+        Node(
+            package="tinker_sim_bridge", executable="safety_supervisor", output="screen",
+            parameters=[{
+                "manage_controllers": False,
+                "required_sources": ["collision"],
+            }],
+            additional_env=env,
+        ),
         Node(package="tinker_sim_bridge", executable="contract_guard", output="screen"),
         Node(
             package="tinker_sim_bridge", executable="initial_pose", output="screen",
