@@ -94,3 +94,41 @@ class OccupancyMap:
                 return distance
             distance += step
         return float("inf")
+
+    def free_with_clearance(self, x: float, y: float, clearance_m: float) -> bool:
+        if clearance_m < 0.0:
+            raise ValueError("clearance must be non-negative")
+        step = self.resolution
+        steps = int(clearance_m / step) + 1
+        for gx in range(-steps, steps + 1):
+            for gy in range(-steps, steps + 1):
+                dx = gx * step
+                dy = gy * step
+                if dx * dx + dy * dy > clearance_m * clearance_m:
+                    continue
+                if self.occupied_at_world(x + dx, y + dy):
+                    return False
+        return True
+
+    def nearest_free_world(
+        self, x: float, y: float, clearance_m: float, max_radius_m: float = 5.0
+    ) -> "tuple[float, float] | None":
+        if self.free_with_clearance(x, y, clearance_m):
+            return (x, y)
+        step = self.resolution
+        ring = 1
+        while ring * step <= max_radius_m:
+            candidates = []
+            for gx in range(-ring, ring + 1):
+                for gy in range(-ring, ring + 1):
+                    if max(abs(gx), abs(gy)) != ring:
+                        continue
+                    cx = x + gx * step
+                    cy = y + gy * step
+                    if self.free_with_clearance(cx, cy, clearance_m):
+                        candidates.append((gx * gx + gy * gy, cx, cy))
+            if candidates:
+                _, cx, cy = min(candidates)
+                return (round(cx, 3), round(cy, 3))
+            ring += 1
+        return None
