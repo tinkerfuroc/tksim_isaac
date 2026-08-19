@@ -83,5 +83,23 @@ class EventValidationTest(unittest.TestCase):
         self._load(raw)  # no raise
 
 
+class ArenaScenarioPoseTest(unittest.TestCase):
+    ARTIFACT = ROOT / "artifacts/arena/rcw2026/d2b559b43207c8d54ae2609f638dca1cc36ee8b7adc7e4d94aee86e7fb56729c"
+
+    def test_person_scenario_poses_are_free_on_derived_map(self):
+        from tinker_sim_core.occupancy import OccupancyMap
+        occupancy = OccupancyMap.from_pgm(
+            self.ARTIFACT / "map.pgm", resolution=0.05, origin_x=-5.05, origin_y=-6.0
+        )
+        raw = json.loads(
+            (ROOT / "simulation/scenarios/find-and-approach-person-rcw2026.json").read_text()
+        )
+        rx, ry, _ = raw["robot"]["initial_pose"]
+        self.assertTrue(occupancy.free_with_clearance(rx, ry, 0.35))
+        actor = raw["actors"][0]
+        for x, y in actor["path"]:
+            self.assertTrue(occupancy.free_with_clearance(x, y, 0.4))
+
+
 if __name__ == "__main__":
     unittest.main()
