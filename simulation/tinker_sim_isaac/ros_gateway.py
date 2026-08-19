@@ -1072,24 +1072,29 @@ class RosStandardGateway:
             1.0 - 2.0 * (qy * qy + qz * qz),
         )
         occupancy = getattr(self.backend, "occupancy", None)
+        origin_x = x + 0.12 * math.cos(yaw)
+        origin_y = y + 0.12 * math.sin(yaw)
+        # R4: a sensor origin inside an occupied cell (e.g. spawned inside
+        # furniture) has no valid returns; every ray would otherwise report
+        # the raycast minimum, producing a fake 0.3 m ring that poisons AMCL.
+        origin_occupied = (
+            occupancy is not None and occupancy.occupied_at_world(origin_x, origin_y)
+        )
         points = []
-        for degrees in range(-90, 91):
-            local = math.radians(degrees)
-            if occupancy is not None:
-                distance = occupancy.raycast(
-                    x + 0.12 * math.cos(yaw),
-                    y + 0.12 * math.sin(yaw),
-                    yaw + local,
-                )
-            else:
-                # R2 deterministic fallback: a fixed keep-out ring so the cloud
-                # stays non-empty and finite for qualification consumers even
-                # when no occupancy map exists.
-                distance = _FALLBACK_LIDAR_RANGE_M
-            if math.isfinite(distance):
-                points.append(
-                    (distance * math.cos(local), distance * math.sin(local), 0.0)
-                )
+        if not origin_occupied:
+            for degrees in range(-90, 91):
+                local = math.radians(degrees)
+                if occupancy is not None:
+                    distance = occupancy.raycast(origin_x, origin_y, yaw + local)
+                else:
+                    # R2 deterministic fallback: a fixed keep-out ring so the
+                    # cloud stays non-empty and finite for qualification
+                    # consumers even when no occupancy map exists.
+                    distance = _FALLBACK_LIDAR_RANGE_M
+                if math.isfinite(distance):
+                    points.append(
+                        (distance * math.cos(local), distance * math.sin(local), 0.0)
+                    )
         message = self._PointCloud2()
         message.header.stamp = stamp
         message.header.frame_id = "livox360"

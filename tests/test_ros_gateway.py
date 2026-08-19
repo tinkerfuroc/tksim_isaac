@@ -469,10 +469,16 @@ class RosDevelopmentLidarTest(unittest.TestCase):
         self.assertGreaterEqual(len(cloud.data), 12, "non-empty cloud must carry point data")
 
     def test_development_lidar_uses_occupancy_raycast_when_present(self) -> None:
-        """The occupancy raycast path stays the primary source when a map exists."""
+        """The occupancy raycast path stays the primary source when a map
+        exists. The sensor origin's own cell must be free (unlike
+        ``test_development_lidar_empty_when_origin_occupied``) so this
+        exercises the raycast path rather than the occupied-origin guard."""
         from tinker_sim_core.occupancy import OccupancyMap
 
-        occ = OccupancyMap(4, 4, 1.0, -2.0, -2.0, ((True, True, True, True),) * 4)
+        rows = tuple(
+            tuple(not (gy == 2 and gx == 2) for gx in range(4)) for gy in range(4)
+        )
+        occ = OccupancyMap(4, 4, 1.0, -2.0, -2.0, rows)
         gateway = _cloud_gateway(development_lidar=True, occupancy=occ)
         cloud = gateway._development_point_cloud(_cloud_stamp())
         self.assertGreaterEqual(cloud.width, 1)
@@ -483,6 +489,30 @@ class RosDevelopmentLidarTest(unittest.TestCase):
             gateway._cloud_publish_enabled(),
             "cloud must not publish when the development lidar flag is off",
         )
+
+    def test_development_lidar_empty_when_origin_occupied(self) -> None:
+        """A sensor origin inside an occupied cell has no valid returns; the
+        cloud must be empty rather than a fake ring at the raycast floor."""
+
+        class _OccupiedEverywhere:
+            def occupied_at_world(self, x: float, y: float) -> bool:
+                return True
+
+            def raycast(
+                self,
+                x: float,
+                y: float,
+                angle: float,
+                minimum: float = 0.3,
+                maximum: float = 40.0,
+            ) -> float:
+                return minimum
+
+        gateway = _cloud_gateway(
+            development_lidar=True, occupancy=_OccupiedEverywhere()
+        )
+        message = gateway._development_point_cloud(_cloud_stamp())
+        self.assertEqual(message.width, 0)
 
     def test_cloud_publish_gate_respects_stride(self) -> None:
         gateway = _cloud_gateway(development_lidar=True, occupancy=None)
