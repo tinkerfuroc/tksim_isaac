@@ -93,6 +93,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="load the named content-addressed arena artifact (e.g. rcw2026)",
     )
+    launch.add_argument(
+        "--spawn-xy",
+        default=None,
+        help="override the robot spawn as X,Y world metres (e.g. -2.0,-2.0)",
+    )
     launch.add_argument("isaac_args", nargs=argparse.REMAINDER)
 
     lock = commands.add_parser("workspace-lock", help="capture read-only Tinker source hashes")
@@ -185,6 +190,10 @@ def _launch_command(args: argparse.Namespace) -> list[str]:
             command.append("--qualification")
         if args.arena:
             command.extend(["--arena", args.arena])
+        if args.spawn_xy:
+            # "=" form: a separate "-2.0,-2.0" token would be parsed by
+            # run_sim's argparse as an option string, not a value.
+            command.append(f"--spawn-xy={args.spawn_xy}")
         command.extend(_camera_stream_arguments(args))
         if args.livestream:
             command.append("--livestream")
