@@ -43,6 +43,24 @@ def chassis_ballast_target_properties(
     return CHASSIS_BALLAST_TARGET_MASS_KG, CHASSIS_BALLAST_TARGET_DIAGONAL_INERTIA
 
 
+def slew_velocity_target(current: float, target: float, max_delta: float) -> float:
+    """Move a velocity target toward ``target`` by at most ``max_delta``.
+
+    Wheel targets were previously applied verbatim (README: upstream owns
+    acceleration limits — nothing upstream did). This bounds every wheel
+    transient, including stale-held-target windows, without overshooting.
+    """
+    values = (current, target, max_delta)
+    if any(isinstance(v, bool) or not math.isfinite(float(v)) for v in values):
+        raise ValueError("slew inputs must be finite numbers")
+    if max_delta < 0.0:
+        raise ValueError("max_delta must be non-negative")
+    delta = target - current
+    if abs(delta) <= max_delta:
+        return float(target)
+    return float(current + math.copysign(max_delta, delta))
+
+
 #: Uniform wall material used when no palette override is supplied.
 DEFAULT_WALL_COLOR = (0.35, 0.38, 0.42)
 
@@ -455,6 +473,10 @@ class IsaacWholeRobotBackend:
 
     def set_safety_stop(self, active: bool) -> None:
         """Latch a physical hold target and invalidate all pre-stop commands."""
+        if bool(active) == self._safety_stopped:
+            # A repeated identical sample must return before it clears the
+            # acceleration-limited wheel state (see tests/test_base_velocity_slew.py).
+            return
         active = bool(active)
         if active:
             self._pending_snapshot_id = None
