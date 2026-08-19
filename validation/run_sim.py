@@ -461,6 +461,42 @@ def parse_spawn_xy(text: str) -> tuple[float, float]:
     return x, y
 
 
+SPAWN_CLEARANCE_M = 0.35  # robot inscribed radius 0.25 m + margin
+
+
+def validate_arena_spawn(arena_dir: Path, spawn_xy: tuple[float, float]) -> None:
+    """Fail closed when the robot spawn lacks clearance on the arena map.
+
+    The rcw2026 default spawn (0, 0) sits inside shelf_02's rasterized
+    footprint; a spawn inside furniture corrupts odometry, lidar, and AMCL.
+    The error names the nearest free cell so the user can retry.
+
+    Every caller reaches this after resolving ``arena_dir`` via
+    ``resolve_arena_artifact``, which already put ``root/simulation`` on
+    ``sys.path``, so the imports below resolve without any path surgery here.
+    """
+    from tinker_sim_core.occupancy import OccupancyMap
+    from tinker_sim_isaac.backend import _map_metadata
+
+    pgm, resolution, origin_x, origin_y = _map_metadata(arena_dir / "map.yaml")
+    occupancy = OccupancyMap.from_pgm(
+        pgm, resolution=resolution, origin_x=origin_x, origin_y=origin_y
+    )
+    x, y = spawn_xy
+    if occupancy.free_with_clearance(x, y, SPAWN_CLEARANCE_M):
+        return
+    suggestion = occupancy.nearest_free_world(x, y, SPAWN_CLEARANCE_M)
+    if suggestion is None:
+        raise RuntimeError(
+            f"arena spawn ({x}, {y}) is obstructed and no free cell was found "
+            f"within 5 m on the derived map"
+        )
+    raise RuntimeError(
+        f"arena spawn ({x}, {y}) lacks {SPAWN_CLEARANCE_M} m clearance on the "
+        f"derived map; try --spawn-xy={suggestion[0]},{suggestion[1]}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -606,6 +642,8 @@ def main() -> int:
                 arena_dir = resolve_arena_artifact(root, args.arena)
             elif args.map_yaml is None:
                 args.map_yaml = args.artifact.parent / "map.yaml"
+            if arena_dir is not None:
+                validate_arena_spawn(arena_dir, spawn_xy)
             from tinker_sim_isaac.backend import IsaacNavigationBackend
             backend = IsaacNavigationBackend(
                 usd_path=args.artifact, map_yaml=args.map_yaml, seed=args.seed,
@@ -772,6 +810,8 @@ def main() -> int:
                 arena_dir = resolve_arena_artifact(root, args.arena)
             elif args.map_yaml is None:
                 args.map_yaml = args.artifact.parent / "map.yaml"
+            if arena_dir is not None:
+                validate_arena_spawn(arena_dir, spawn_xy)
             expected_objects = _expected_scenario_objects(root, args.scenario, args.arena)
             wall_color_fn = None
             if args.arena_colors:
@@ -914,6 +954,8 @@ def main() -> int:
             arena_dir = None
             if args.arena:
                 arena_dir = resolve_arena_artifact(root, args.arena)
+            if arena_dir is not None:
+                validate_arena_spawn(arena_dir, spawn_xy)
             from tinker_sim_isaac.backend import IsaacWholeRobotBackend
 
             backend = IsaacWholeRobotBackend(
