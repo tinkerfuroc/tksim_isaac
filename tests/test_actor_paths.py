@@ -83,8 +83,15 @@ class EventValidationTest(unittest.TestCase):
         self._load(raw)  # no raise
 
 
+_ARENA_ARTIFACT = ROOT / "artifacts/arena/rcw2026/d2b559b43207c8d54ae2609f638dca1cc36ee8b7adc7e4d94aee86e7fb56729c"
+
+
+@unittest.skipUnless(
+    (_ARENA_ARTIFACT / "map.pgm").exists(),
+    "rcw2026 arena artifact not present in this checkout (artifacts/ is gitignored)",
+)
 class ArenaScenarioPoseTest(unittest.TestCase):
-    ARTIFACT = ROOT / "artifacts/arena/rcw2026/d2b559b43207c8d54ae2609f638dca1cc36ee8b7adc7e4d94aee86e7fb56729c"
+    ARTIFACT = _ARENA_ARTIFACT
 
     def test_person_scenario_poses_are_free_on_derived_map(self):
         from tinker_sim_core.occupancy import OccupancyMap
