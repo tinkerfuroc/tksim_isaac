@@ -86,9 +86,17 @@ class ScenarioDefinition:
                 raise ValueError(f"{path}: every {group_name} record requires an id")
             if len(identifiers) != len(set(identifiers)):
                 raise ValueError(f"{path}: duplicate {group_name} id")
+        actor_ids = {str(record.get("id")) for record in self.actors}
         for event in self.events:
             if "at_sim_time" not in event and "trigger" not in event:
                 raise ValueError(f"{path}: event requires at_sim_time or trigger")
+            if event.get("type") == "actor_path_start":
+                actor_id = event.get("actor")
+                if actor_id not in actor_ids:
+                    raise ValueError(f"{path}: event names unknown actor: {actor_id!r}")
+                actor = next(r for r in self.actors if str(r.get("id")) == actor_id)
+                from .actor_path import validate_path
+                validate_path(actor.get("path", ()))
         for item in self.dialogue:
             for key in ("endpoint", "actor", "outcome"):
                 if key not in item:
