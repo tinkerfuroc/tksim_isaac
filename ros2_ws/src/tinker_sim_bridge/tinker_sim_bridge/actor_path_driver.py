@@ -22,12 +22,15 @@ class ActorPathDriver(Node):
     def __init__(self, timeout_s: float) -> None:
         super().__init__("tinker_sim_actor_path_driver")
         self._sim_time: float | None = None
-        self.create_subscription(Clock, "/clock", self._clock, 10)
+        # NOT self._clock: rclpy.node.Node.__init__ binds self._clock to a
+        # ROSClock instance, which would shadow a method of that name and get
+        # registered as the callback (TypeError on the first /clock message).
+        self.create_subscription(Clock, "/clock", self._on_clock, 10)
         self._client = self.create_client(SetEntityState, "/set_entity_state")
         if not self._client.wait_for_service(timeout_sec=timeout_s):
             raise RuntimeError("/set_entity_state is not available")
 
-    def _clock(self, message: Clock) -> None:
+    def _on_clock(self, message: Clock) -> None:
         self._sim_time = message.clock.sec + message.clock.nanosec * 1e-9
 
     def wait_sim_time(self, at_least: float, timeout_s: float) -> bool:
