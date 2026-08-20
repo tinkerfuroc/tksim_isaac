@@ -651,6 +651,7 @@ def main() -> int:
                 render=args.livestream or not args.headless, enable_contacts=False,
                 arena_artifact=arena_dir, spawn_xy=spawn_xy,
                 expected_objects=expected_objects, scenario=args.scenario,
+                task=args.scenario,
             )
             arena_camera_eye = None
             arena_camera_target = None
