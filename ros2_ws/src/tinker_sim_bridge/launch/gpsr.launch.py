@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -72,6 +73,19 @@ def _resolve(context):
     scenario_file = root / "simulation/scenarios" / f"{scenario}.json"
     if not scenario_file.is_file():
         raise RuntimeError(f"scenario not found: {scenario_file}")
+
+    # Seed AMCL from the scenario's own spawn pose rather than a hardcoded
+    # (0, 0, 0) -- scenarios such as gpsr-rcw2026 spawn the robot away from
+    # the map origin, and an unseeded AMCL can start inside occupied space.
+    # Fall back to (0, 0, 0) if the scenario doesn't specify one.
+    initial_pose_xyz = (0.0, 0.0, 0.0)
+    try:
+        scenario_data = json.loads(scenario_file.read_text(encoding="utf-8"))
+        robot_initial_pose = scenario_data.get("robot", {}).get("initial_pose")
+        if isinstance(robot_initial_pose, list) and len(robot_initial_pose) >= 3:
+            initial_pose_xyz = tuple(float(v) for v in robot_initial_pose[:3])
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
 
     resolved_artifact = resolve_current_artifact(root)
     artifact = resolved_artifact.artifact_dir
@@ -277,7 +291,14 @@ def _resolve(context):
             package="tinker_sim_bridge",
             executable="initial_pose",
             output="screen",
-            parameters=[{"use_sim_time": True, "x": 0.0, "y": 0.0, "yaw": 0.0}],
+            parameters=[
+                {
+                    "use_sim_time": True,
+                    "x": initial_pose_xyz[0],
+                    "y": initial_pose_xyz[1],
+                    "yaw": initial_pose_xyz[2],
+                }
+            ],
         ),
         # Match the physical Livox driver contract. The robot URDF's visual
         # sensor link is named livox_frame, while hardware messages and Nav2
