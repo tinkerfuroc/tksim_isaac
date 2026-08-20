@@ -471,6 +471,12 @@ class IsaacWholeRobotBackend:
         self._velocity_targets = self._torch.zeros_like(self._robot.data.joint_vel)
         self._position_targets = self._robot.data.joint_pos.clone()
         self._effort_targets = self._torch.zeros_like(self._robot.data.joint_vel)
+        # Cached once here (only rebuilt when the articulation view changes,
+        # not per physics step) so the vectorised wheel slew in step() never
+        # pays for a fresh tensor allocation on the hot path.
+        self._wheel_index_tensor = self._torch.tensor(
+            self._wheel_indices, dtype=self._torch.long, device=self._velocity_targets.device
+        )
         if self._safety_stopped:
             self._safety_snapshot = self._position_targets.clone()
         try:
@@ -878,6 +884,33 @@ class IsaacWholeRobotBackend:
             )
         self._pending_snapshot_index = packet_index
 
+    def _slew_wheel_targets(self) -> None:
+        """Vectorised replacement for the former per-wheel scalar slew loop.
+
+        Applies ``applied_next = applied + clip(target - applied, -max_delta,
+        +max_delta)`` to every wheel joint in one torch expression instead of
+        pulling each wheel's target out to a Python float and writing a
+        scalar back (the old loop paid that tensor<->float round trip four
+        times per step). This is exactly `slew_velocity_target` per wheel --
+        see tests/test_wheel_slew_vectorisation.py.
+        """
+        wheel_index = self._wheel_index_tensor
+        if wheel_index.numel() == 0:
+            return
+        max_delta = WHEEL_VELOCITY_SLEW_RAD_S2 * self.dt
+        commanded = self._velocity_targets[0, wheel_index]
+        if not bool(self._torch.isfinite(commanded).all()):
+            raise ValueError("wheel velocity targets must be finite")
+        applied = self._torch.tensor(
+            [self._applied_wheel_velocities[index] for index in self._wheel_indices],
+            dtype=commanded.dtype,
+            device=commanded.device,
+        )
+        updated = applied + self._torch.clamp(commanded - applied, -max_delta, max_delta)
+        self._velocity_targets[0, wheel_index] = updated
+        for index, value in zip(self._wheel_indices, updated.tolist()):
+            self._applied_wheel_velocities[index] = value
+
     def step(self) -> None:
         if self.step_profile["enabled"]:
             self.step_profile["_mark"] = self.step_profile["_clock"]()
@@ -902,14 +935,7 @@ class IsaacWholeRobotBackend:
             self._robot.set_joint_position_target(self._position_targets)
             self._robot.set_joint_velocity_target(self._velocity_targets)
         else:
-            max_delta = WHEEL_VELOCITY_SLEW_RAD_S2 * self.dt
-            for index in self._wheel_indices:
-                commanded = float(self._velocity_targets[0, index])
-                applied = slew_velocity_target(
-                    self._applied_wheel_velocities[index], commanded, max_delta
-                )
-                self._applied_wheel_velocities[index] = applied
-                self._velocity_targets[0, index] = applied
+            self._slew_wheel_targets()
             self._robot.set_joint_velocity_target(self._velocity_targets)
             self._robot.set_joint_position_target(self._position_targets)
         _sp = self.step_profile
