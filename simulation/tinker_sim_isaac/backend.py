@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from tinker_sim_isaac.physics_rate import resolve_physics_hz
 from tinker_sim_core.command_mux import JointCommand, decode_snapshot_packet
 from tinker_sim_core.occupancy import OccupancyMap
 
@@ -211,6 +212,15 @@ class IsaacWholeRobotBackend:
         from pxr import PhysicsSchemaTools
 
         self._torch = torch
+        # Opt-in override; unset, the validated 120 Hz above is used.
+        # See simulation/tinker_sim_isaac/physics_rate.py for why the
+        # override may only lower the rate.
+        import os as _os
+
+        physics_hz = resolve_physics_hz(
+            physics_hz, _os.environ.get("TINKER_SIM_PHYSICS_HZ")
+        )
+        self.physics_hz = physics_hz
         self.dt = 1.0 / physics_hz
         self.render = render
         # Opt-in per-step wall-time attribution (TINKER_SIM_PROFILE=1). Splits
