@@ -128,6 +128,23 @@ export ROS_DOMAIN_ID=42
   --headless
 ```
 
+### Camera cadence under a live stack
+
+Export `TINKER_SIM_CAMERA_HZ=15` before Stage 1 for any run with the full
+GPSR stack attached.
+
+The simulator holds RTF ~0.30 on its own, but drops to ~0.06 once real
+subscribers attach: Kit is pumped (both RTX cameras rendered) once per camera
+stride, and the image payloads are serialised on the same beat, all inside the
+step loop. At that speed Nav2 cannot service its lifecycle bonds and tears its
+own stack down — `Switch controller timed out after 2.000000 seconds`, then
+every navigation node deactivates, leaving no `map -> odom` and an unusable TF
+tree. Halving the cadence halves both costs.
+
+`simulation/sensors/hardware-parity.json` stays authoritative and unedited:
+unset, its 30 Hz is used. The override may only *lower* the rate — publishing
+faster than the real camera would be a parity violation, and is refused.
+
 Only the `sensor-rich` profile loads `simulation/sensors/hardware-parity.json`
 and publishes the real-named camera topics GPSR's vision stack needs (valid
 `--sensor-profile` values are `physics-only | sensor-rich | navigation-parity
@@ -204,6 +221,29 @@ ros2 run camera_server camera_server_node --ros-args \
   -p color_info_topic:=/camera/color/camera_info \
   -p depth_info_topic:=/camera/color/camera_info
 ```
+
+**Also start the pan/tilt state publisher.** Stage 1's sim publishes
+`/pan_tilt_controller/state` exactly as the hardware pan-tilt driver does, but
+nothing converts it into `/joint_states` unless this node runs:
+
+```bash
+ros2 run pan_tilt state_publisher --ros-args -p use_sim_time:=true
+```
+
+On hardware this node ships inside `vision_driver.launch.py`, which this
+runbook tells you *not* to launch (it would start the physical Orbbec and
+pan-tilt drivers). Skipping the whole launch file also skips this node, and
+`pan_joint`/`tilt_joint` then never reach `robot_state_publisher` — the
+`joint_state_broadcaster` only publishes the arm joints it claims interfaces
+for. The entire head-camera subtree (`tilt_link -> camera_link ->
+head_camera_*`) is then a **second, disconnected TF tree**: MoveIt logs
+"Unable to transform object from frame 'camera_link' to planning frame
+'world'" for every head frame, and any vision result that has to be expressed
+in `map` fails to transform. Verified 2026-08-20: with this node running,
+`base_link -> camera_link` resolves to `[-0.265, 0.029, 1.544]`.
+
+This is a bring-up gap, not a simulator gap — do not "fix" it by changing
+what the simulator publishes.
 
 **Run the camera server as `head_camera_server`, not bare.** Every
 service-backend vision consumer resolves frames through
@@ -342,6 +382,28 @@ To drive a single command instead of the interactive REPL, also export
 ---
 
 ## Teardown discipline (verbatim)
+
+**On a shared host, tear down by domain, never by pattern.** Pattern-only
+teardown (`pgrep -f tinker_sim_bridge`, bare `move_group`, `cumotion`,
+`pick_and_place`) is domain-blind and will kill a concurrent session's nodes.
+Every process is filtered by its own `ROS_DOMAIN_ID`:
+
+```bash
+scripts/kill-domain-nodes 42            # dry run: lists what WOULD be killed
+scripts/kill-domain-nodes 42 --force    # SIGTERM, then SIGKILL survivors
+```
+
+Confirm other domains are untouched before and after (`scripts/kill-domain-nodes
+<other-domain>` dry-run should report the same count both times).
+
+**`cumotion_goal_set_planner_node` must be killed explicitly.** It holds
+~6.6 GB of GPU and outlives a careless teardown, so the next run OOMs.
+
+**Relaunch the decision stack after any dependency restarts.** The GPSR
+orchestrator caches action-server goal handles; if the bridge, vision,
+manipulation, or navigation stack restarts underneath it, it stalls on a stale
+handle rather than reconnecting. Stage 6 always comes last, and always fresh.
+
 
 SIGINT every recorded PID **in reverse bring-up order** (Stage 6 first, Stage
 1 last), wait 10 s, SIGKILL survivors, then confirm the GPU is clear:
