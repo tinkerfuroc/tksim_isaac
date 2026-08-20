@@ -10,7 +10,12 @@ from tinker_sim_core.occupancy import OccupancyMap
 
 
 CHASSIS_BALLAST_SOURCE_MASS_KG = 20.0
-CHASSIS_BALLAST_ADDED_MASS_KG = 10.0
+# 10.0 -> 30.0 (sim_cumotion campaign): at 30 kg total the base tipped over
+# (75 deg pitch, kN gripper<->ground contacts) under full-speed or full-reach
+# arm motion — the real chassis is heavier, so 30 kg under-modeled the
+# hardware's static stability. 50 kg total holds the arm's full 0.45 m
+# forward reach upright (hardware-parity direction chosen by the operator).
+CHASSIS_BALLAST_ADDED_MASS_KG = 30.0
 CHASSIS_BALLAST_TARGET_MASS_KG = (
     CHASSIS_BALLAST_SOURCE_MASS_KG + CHASSIS_BALLAST_ADDED_MASS_KG
 )
@@ -28,7 +33,7 @@ def chassis_ballast_target_properties(
 
     The source USD carries the original 20 kg batteries/electronics ballast.
     Accept either that source value or an artifact that already contains this
-    10 kg addition, but reject an unknown mass instead of silently replacing a
+    30 kg addition, but reject an unknown mass instead of silently replacing a
     newer physical model.
     """
     mass = float(current_mass_kg)
@@ -38,7 +43,7 @@ def chassis_ballast_target_properties(
     ):
         raise ValueError(
             "Tinker chassis ballast must be the 20 kg source mass or the "
-            "30 kg augmented mass"
+            "50 kg augmented mass"
         )
     return CHASSIS_BALLAST_TARGET_MASS_KG, CHASSIS_BALLAST_TARGET_DIAGONAL_INERTIA
 
@@ -208,6 +213,29 @@ class IsaacWholeRobotBackend:
         self._torch = torch
         self.dt = 1.0 / physics_hz
         self.render = render
+        # Opt-in per-step wall-time attribution (TINKER_SIM_PROFILE=1). Splits
+        # the PhysX solve from the Isaac Lab tensor/Python work around it.
+        import os as _os
+        import time as _time
+
+        # Physics steps between attempts to resolve not-yet-found scenario
+        # objects (each miss costs a full USD stage traversal). 60 steps is
+        # 0.5 s at the default 120 Hz. Set to 1 to restore per-step retry.
+        self._object_discovery_interval = max(
+            1, int(_os.environ.get("TINKER_SIM_OBJECT_DISCOVERY_INTERVAL", "60"))
+        )
+        self._object_discovery_step = 0
+        self.step_profile = {
+            "enabled": _os.environ.get("TINKER_SIM_PROFILE", "") == "1",
+            "_clock": _time.monotonic,
+            "_mark": _time.monotonic(),
+            "targets": 0.0,
+            "write_data": 0.0,
+            "physx": 0.0,
+            "robot_update": 0.0,
+            "object_views": 0.0,
+            "n": 0,
+        }
         self.seed = int(seed)
         self.physics_device = "cpu"
         self.contacts_enabled = bool(enable_contacts)
@@ -851,6 +879,8 @@ class IsaacWholeRobotBackend:
         self._pending_snapshot_index = packet_index
 
     def step(self) -> None:
+        if self.step_profile["enabled"]:
+            self.step_profile["_mark"] = self.step_profile["_clock"]()
         if not self._refresh_robot_handles():
             # PHYSICS_READY is dispatched on the first update after a standard
             # STOP -> PLAY transition.  Advance Kit once without touching an
@@ -882,6 +912,11 @@ class IsaacWholeRobotBackend:
                 self._velocity_targets[0, index] = applied
             self._robot.set_joint_velocity_target(self._velocity_targets)
             self._robot.set_joint_position_target(self._position_targets)
+        _sp = self.step_profile
+        _t = _sp["_clock"] if _sp["enabled"] else None
+        if _t is not None:
+            _sp["targets"] += _t() - _sp["_mark"]
+            _sp["_mark"] = _t()
         effort_writer = getattr(self._robot, "set_joint_effort_target", None)
         if effort_writer is None:
             if self._safety_stopped:
@@ -899,9 +934,42 @@ class IsaacWholeRobotBackend:
                 f"playing={self._timeline.is_playing()}, "
                 f"initialized={self._robot.is_initialized})"
             ) from error
+        if _t is not None:
+            _sp["write_data"] += _t() - _sp["_mark"]
+            _sp["_mark"] = _t()
         self._sim.step(render=self.render)
+        if _t is not None:
+            _sp["physx"] += _t() - _sp["_mark"]
+            _sp["_mark"] = _t()
         self._robot.update(self.dt)
+        if _t is not None:
+            _sp["robot_update"] += _t() - _sp["_mark"]
+            _sp["_mark"] = _t()
         self._refresh_object_views()
+        if _t is not None:
+            _sp["object_views"] += _t() - _sp["_mark"]
+            _sp["n"] += 1
+
+    def step_profile_snapshot(self) -> dict:
+        """Return per-step wall-time attribution (ms) and reset the window.
+
+        Only meaningful when TINKER_SIM_PROFILE=1. Separates the PhysX solve
+        from the Isaac Lab / Python work wrapped around it, which is the
+        distinction that decides whether a physics backend change (e.g. GPU
+        PhysX) could help at all.
+        """
+        sp = self.step_profile
+        n = max(1, sp["n"])
+        out = {
+            key: round(1000.0 * sp[key] / n, 3)
+            for key in ("targets", "write_data", "physx", "robot_update", "object_views")
+        }
+        out["steps"] = sp["n"]
+        out["total_ms"] = round(sum(v for k, v in out.items() if k not in ("steps",)), 3)
+        for key in ("targets", "write_data", "physx", "robot_update", "object_views"):
+            sp[key] = 0.0
+        sp["n"] = 0
+        return out
 
     def render_frame(self) -> None:
         """Render current transforms without issuing another physics step."""
@@ -921,6 +989,21 @@ class IsaacWholeRobotBackend:
     def _refresh_object_views(self) -> None:
         if not self._expected_objects:
             return
+        # Every expected object that has already resolved is skipped below, so
+        # the only work left is DISCOVERY of the ones that have not -- and the
+        # fallback for those is a full stage.Traverse(). Running that on every
+        # physics step costs more than the PhysX solve itself: measured
+        # 2026-08-20 at 10.4 ms of a 23.7 ms step (44%) with four unresolved
+        # scenario objects, against 5.7-6.1 ms for PhysX. Discovery is a
+        # startup concern, so retry a few times a second instead. Objects that
+        # spawn late are still picked up; only the polling rate changes.
+        if all(name in self._object_views for name in self._expected_objects):
+            return
+        interval = self._object_discovery_interval
+        if interval > 1 and self._object_discovery_step % interval != 0:
+            self._object_discovery_step += 1
+            return
+        self._object_discovery_step += 1
         try:
             import omni.usd
             from isaaclab_physx.physics import PhysxManager
