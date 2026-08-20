@@ -14,7 +14,7 @@ domain="${1:?usage: kill-domain-nodes <ROS_DOMAIN_ID> [--force]}"
 force="${2:-}"
 
 # Node patterns this project starts. Extend rather than broadening to bare names.
-patterns='run_sim[.]py|tinker_sim_bridge|move_group|cumotion|pick_and_place|grasp_action|robot_state_publisher|static_transform_publisher|lifecycle_manager|controller_manager|ros2_control_node|amcl|bt_navigator|planner_server|controller_server|behavior_server|velocity_smoother|waypoint_follower|map_server|ekf_node|pointcloud_to_laserscan|camera_server|camera_compat_bridge|generalist_node|yolo_seg_node|door_detection|person_track_server|waving_person_server|feature_recognition|approach_planner|orientation_angle|gpsr-orchestrator|behavior_tree'
+patterns='run_sim[.]py|tinker_sim_bridge|move_group|cumotion|pick_and_place|grasp_action|robot_state_publisher|static_transform_publisher|lifecycle_manager|controller_manager|ros2_control_node|amcl|bt_navigator|planner_server|controller_server|behavior_server|velocity_smoother|waypoint_follower|map_server|ekf_node|pointcloud_to_laserscan|camera_server|camera_compat_bridge|generalist_node|yolo_seg_node|door_detection|person_track_server|waving_person_server|feature_recognition|approach_planner|orientation_angle|gpsr-orchestrator|behavior_tree|pan_tilt|state_publisher'
 
 mapfile -t candidates < <(pgrep -f "$patterns" 2>/dev/null || true)
 
