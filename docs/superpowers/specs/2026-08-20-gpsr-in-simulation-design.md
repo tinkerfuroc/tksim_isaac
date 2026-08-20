@@ -53,7 +53,7 @@ Six stacks on one machine, `ROS_DOMAIN_ID=42`:
 
 | Layer | Process | Provides to GPSR |
 | --- | --- | --- |
-| Sim | `run_sim.py --arena rcw2026 --spawn-xy=-2.0,-2.0`, hardware-parity cameras | real-named camera topics + QoS |
+| Sim | `run_sim.py --sensor-profile sensor-rich --arena rcw2026 --spawn-xy=-2.0,-2.0` | real-named camera topics + QoS (the `sensor-rich` branch loads `simulation/sensors/hardware-parity.json`; `hardware-parity` is a camera-spec file, not a profile name) |
 | Sim bridge | `gripper_facade`, `pan_tilt_facade`, `audio_fixtures`, `ros2_control` | `/xarm_gripper/gripper_action`, `/pan_tilt_controller/*`, `announce` |
 | Nav | tinker-sim `navigation.launch.py` (Nav2 + AMCL on the derived arena map) | `navigate_to_pose`, `map`→`base_link` TF for `START_POSE` |
 | tk26_navigation | `approach_planner`, `orientation_angle_service` | `go_to_approach`, `find_approach_pose`, `orientation_angle_service` |
@@ -62,8 +62,9 @@ Six stacks on one machine, `ROS_DOMAIN_ID=42`:
 
 `mock_config.json` for sim runs: `vision=false`, `manipulation=false`, `navigation=false`
 (real Nav2, not the shipped default), `announcement=false` (sim `announce`),
-`audio_input=true` — audio input is the single mocked subsystem, since command intake uses
-`BT_GPSR_CMD` injection and no simulated ASR exists.
+`audio_input=false` — nothing is mocked. The sim's `audio_fixtures` node answers `listen_action`
+and friends deterministically from scenario dialogue, and command intake additionally uses
+`BT_GPSR_CMD` injection.
 
 ## Components
 
@@ -86,8 +87,10 @@ A `gpsr.launch.py` composes the manipulation bridge and navigation stack over on
 hardware-parity sim instance.
 
 ### 4. Scenario and objects (`tinker-sim`)
-A `gpsr-rcw2026` scenario places graspable objects on arena furniture, plus a `listen_action`
-fixture beside `audio_fixtures` so `ask_person` does not hang.
+A `gpsr-rcw2026` scenario places YCB objects on arena furniture. **No new audio fixture is
+needed**: `audio_fixtures.py` already serves `listen_action`, `announce`, `wait_for_start`,
+`doorbell_action`, `question_answer_service` and `get_confirmation_service`, each driven by the
+scenario's `dialogue` array — so injected speech is scenario data, not code.
 
 **Object assets already exist — nothing to source or author.** A teammate's YCB importer
 (`tools/ycb_import.py`, pinned allowlist `config/ycb-import.json`) has already published ten
@@ -121,7 +124,7 @@ set follows only once this passes.
 
 ## Out of scope
 
-- Simulated ASR (`listen_action` is a fixture; command intake is injected).
+- Simulated ASR (`listen_action` is an existing scenario-driven fixture; command intake is injected).
 - The GPSR mission supervisor (`GPSR_SUPERVISION_MODE`), which needs dual-camera production context.
 - Any change to `tk25_decision`'s competition `constants.json`.
 - Credential handling of any kind — `.env` keys are consumed as-is and never read, printed, or moved.
