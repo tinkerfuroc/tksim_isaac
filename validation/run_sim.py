@@ -644,11 +644,13 @@ def main() -> int:
                 args.map_yaml = args.artifact.parent / "map.yaml"
             if arena_dir is not None:
                 validate_arena_spawn(arena_dir, spawn_xy)
+            expected_objects = _expected_scenario_objects(root, args.scenario, args.arena)
             from tinker_sim_isaac.backend import IsaacNavigationBackend
             backend = IsaacNavigationBackend(
                 usd_path=args.artifact, map_yaml=args.map_yaml, seed=args.seed,
                 render=args.livestream or not args.headless, enable_contacts=False,
                 arena_artifact=arena_dir, spawn_xy=spawn_xy,
+                expected_objects=expected_objects, scenario=args.scenario,
             )
             arena_camera_eye = None
             arena_camera_target = None
