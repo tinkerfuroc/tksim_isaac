@@ -839,6 +839,24 @@ class IsaacWholeRobotBackend:
             if command.efforts and name == "drive_joint":
                 self._set_gripper_effort_limit(command.efforts[offset])
 
+    def discard_command_snapshot_staging(self) -> None:
+        """Drop a partially staged snapshot without touching physical state.
+
+        `set_safety_stop(True)` also clears staging, but it early-returns when
+        the stop is already active so that a repeated identical sample cannot
+        wipe the acceleration-limited wheel state (see
+        tests/test_base_velocity_slew.py). The gateway needs a reset that runs
+        unconditionally -- it replays the same packet list twice around its
+        preflight pass, and strict packet ordering refuses the second pass
+        otherwise. This is bookkeeping only: command buffers, the applied
+        wheel velocities, and the last completed snapshot ID (anti-replay) are
+        all left alone.
+        """
+        self._pending_snapshot_id = None
+        self._pending_snapshot_count = 0
+        self._pending_snapshot_index = 0
+        self._pending_snapshot_commands = []
+
     def begin_command_snapshot(self, snapshot_id: int) -> None:
         """Start a complete mux snapshot, staging multi-packet snapshots."""
         if (
