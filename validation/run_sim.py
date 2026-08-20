@@ -131,6 +131,37 @@ def _streaming_update_stride(
     return max(1, round(1.0 / (physics_dt * update_hz)))
 
 
+def _resolve_camera_hz(parity_hz: float, override: str | None) -> float:
+    """Resolve the camera cadence, honouring an explicit opt-in override.
+
+    `simulation/sensors/hardware-parity.json` states what the real cameras do
+    and stays authoritative: with no override its value is returned unchanged.
+    `TINKER_SIM_CAMERA_HZ` lets a simulation run publish at a lower rate the
+    hardware also sustains, which halves both the Kit render pump and the image
+    payload per simulated second -- the two dominant costs once real
+    subscribers are attached. Raising the rate above the hardware's is refused;
+    that would be a parity violation, not an optimisation.
+    """
+    if override is None or not str(override).strip():
+        return float(parity_hz)
+    try:
+        value = float(str(override).strip())
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"TINKER_SIM_CAMERA_HZ must be a number, got {override!r}"
+        ) from None
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"TINKER_SIM_CAMERA_HZ must be finite and positive, got {override!r}"
+        )
+    if value > float(parity_hz):
+        raise ValueError(
+            f"TINKER_SIM_CAMERA_HZ={value} exceeds the hardware rate "
+            f"{parity_hz}; the simulation must not out-run the real camera"
+        )
+    return value
+
+
 class _StreamingSessionLifecycle:
     """Track the primary client's real connection lifecycle.
 
@@ -898,7 +929,10 @@ def main() -> int:
                 camera_rig=camera_rig,
                 camera_pointcloud=args.camera_pointcloud,
             )
-            camera_hz = min(spec.tick_rate_hz for spec in camera_specs)
+            camera_hz = _resolve_camera_hz(
+                min(spec.tick_rate_hz for spec in camera_specs),
+                os.environ.get("TINKER_SIM_CAMERA_HZ"),
+            )
             camera_stride = _streaming_update_stride(backend.dt, update_hz=camera_hz)
             import carb.settings
 
