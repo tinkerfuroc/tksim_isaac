@@ -107,6 +107,21 @@ def _resolve(context):
         LaunchConfiguration("safety_source_deadline_s").perform(context)
     )
 
+    # Which arm controller profile ros2_control loads. Defaults to the shipped
+    # controllers.yaml; pass an absolute path to override. config/
+    # controllers.sim-clock.yaml disables path-tolerance enforcement for hosts
+    # where the sim's real-time factor is low enough that a MoveIt trajectory
+    # (parameterised for real-speed execution) aborts mid-flight with
+    # PATH_TOLERANCE_VIOLATED before the arm can converge.
+    controllers_value = LaunchConfiguration("controllers_file").perform(context).strip()
+    controllers_file = (
+        str(Path(controllers_value).expanduser().resolve())
+        if controllers_value
+        else str(bridge_share / "config/controllers.yaml")
+    )
+    if not Path(controllers_file).is_file():
+        raise RuntimeError(f"controllers file not found: {controllers_file}")
+
     python_env = {"PYTHONPATH": str(root / "simulation") + os.pathsep + os.environ.get("PYTHONPATH", "")}
 
     joint_state_spawner = Node(
@@ -192,7 +207,7 @@ def _resolve(context):
             output="screen",
             parameters=[
                 {"robot_description": robot_description, "use_sim_time": True},
-                str(bridge_share / "config/controllers.yaml"),
+                controllers_file,
             ],
         ),
         joint_state_spawner,
@@ -396,6 +411,17 @@ def generate_launch_description():
             DeclareLaunchArgument("seed", default_value="0"),
             DeclareLaunchArgument(
                 "safety_source_deadline_s", default_value="1.0"
+            ),
+            DeclareLaunchArgument(
+                "controllers_file",
+                default_value="",
+                description=(
+                    "Absolute path to the ros2_control controller profile. "
+                    "Empty uses config/controllers.yaml. Use "
+                    "config/controllers.sim-clock.yaml on hosts where the "
+                    "sim's real-time factor makes the arm abort with "
+                    "PATH_TOLERANCE_VIOLATED."
+                ),
             ),
             SetEnvironmentVariable("ROBOT_NAME", "tinker2"),
             OpaqueFunction(function=_resolve),

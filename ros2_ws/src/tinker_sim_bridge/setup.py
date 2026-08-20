@@ -55,6 +55,7 @@ setup(
                 "config/base_facade.yaml",
                 "config/command_gateway.yaml",
                 "config/controllers.yaml",
+                "config/controllers.sim-clock.yaml",
                 "config/pointcloud_to_laserscan.yaml",
                 "config/tinker_topic_control.ros2_control.xacro",
             ],
