@@ -440,6 +440,9 @@ class RosStandardGateway:
             # rollback boundary for a backend without a stopped-state command
             # transaction API.
             self.backend.set_safety_stop(True)
+            # set_safety_stop early-returns when the stop is already active,
+            # so it cannot be relied on to drop staging on the abort path.
+            self._discard_backend_snapshot_staging()
         except Exception as stop_error:
             error = RuntimeError(
                 f"{error}; failed to reassert safety stop: {stop_error}"
@@ -449,6 +452,16 @@ class RosStandardGateway:
         get_logger = getattr(node, "get_logger", None)
         if get_logger is not None:
             get_logger().error(f"rejected command baseline: {error}")
+
+    def _discard_backend_snapshot_staging(self) -> None:
+        """Drop the backend's partial snapshot staging, if it supports it.
+
+        Older backends without the API keep the previous behaviour rather
+        than failing the transaction.
+        """
+        discard = getattr(self.backend, "discard_command_snapshot_staging", None)
+        if discard is not None:
+            discard()
 
     def _commit_staged_baseline(
         self, packets_to_apply: list[tuple[Any, int, float]]
@@ -478,7 +491,14 @@ class RosStandardGateway:
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
                 self._validate_staged_command(staged_command)
-            self.backend.set_safety_stop(True)
+            # `set_safety_stop(True)` cannot serve as this reset: the backend
+            # is already stopped here, and its early return on a repeated
+            # identical sample means the call is a no-op.  Preflight has left
+            # the staging index at `packet_count`, so without an explicit
+            # discard the commit pass below restarts at packet one and strict
+            # ordering refuses it ("expected packet count+1, got 1"), which
+            # fails every multi-packet baseline permanently.
+            self._discard_backend_snapshot_staging()
 
             # This is the only non-atomic portion for the legacy backend.  No
             # physics step can interleave with this single gateway turn, and
