@@ -47,18 +47,65 @@ This **MUST be empty**. If it is not, wait — do not contend for the GPU.
   `TINKER_ACCEPT_OMNIVERSE_EULA` and `RMW_IMPLEMENTATION`; never print or
   copy its contents.
 
-## One known prerequisite: rebuild `tinker_vision_msgs_26` before Stage 3
+## Prerequisites before Stage 3 — verified against a real 2026-08-20 bring-up
 
-The **installed** `tinker_vision_msgs_26` (built 2026-05-31) predates the
-`.action` definitions for `FeatureExtraction`/`DetectWaving` added to source
-on 2026-08-18 — the installed package exports neither as an action. tk26_vision
-serves both as ActionServers (`feature_recognition.py`,
-`waving_person_server.py`), so `describe_person` and waving detection will
-hang against the stale install. Rebuild once, before the first live run:
+The `tk25_ws` install tree lags tk26_vision's source by months, and **every**
+symptom below presents as "the interface simply isn't there" rather than as a
+build error. Do all of this once, before the first live run.
+
+### 1. Rebuild `tinker_vision_msgs_26`
+
+The **installed** package (built 2026-05-31) predates the `.action` definitions
+for `FeatureExtraction`/`DetectWaving` added to source on 2026-08-18 — it
+exports neither as an action. tk26_vision serves both as ActionServers
+(`feature_recognition.py`, `waving_person_server.py`), so `describe_person` and
+waving detection hang against the stale install.
 
 ```bash
 cd /home/tinker/tk25_ws
 colcon build --packages-select tinker_vision_msgs_26
+```
+
+### 2. Build `camera_provider`, then rebuild the stale vision packages
+
+`camera_provider` had **never** been built, and it is a dependency of six
+packages (`object_detection_generalist`, `object_detection_new`,
+`kimi_api`, `tk_vision_specialized`, `vision_util`, `monocular_depth`) plus
+`vision_bringup`. Until it exists, rebuilding any of them fails with
+`Failed to find .../camera_provider/share/camera_provider/package.sh`.
+
+The installed `kimi_api`/`tk_vision_specialized` also still used
+`create_service()` for `feature_extraction_service`/`detect_waving_persons`
+— the srv→action conversion was never built in, so the census reports both
+actions missing while the *services* show up. `vision_util` was likewise stale
+(missing `action_queue`, which the converted servers import), and the installed
+`object_detection_generalist` still defaulted `orbbec_depth_image_topic` to
+`/camera/depth_to_color/image_raw` — a topic nothing publishes, since
+tk26_vision commit `39de423` moved it to `/camera/depth/image_raw` (which is
+what both the real driver bringup and the sim use). That mismatch surfaces as
+`No orbbec camera data within sync threshold`, never as an error.
+
+Use tk26_vision's own wrapper — plain `colcon build` writes `#!/usr/bin/python3`
+shebangs that cannot see venv-only deps:
+
+```bash
+cd /home/tinker/tk25_ws/src/tk26_vision
+./scripts/build.sh --packages-select camera_provider
+./scripts/build.sh --packages-select kimi_api tk_vision_specialized vision_util \
+    object_detection_generalist object_detection_new vision_track camera_server \
+    --allow-overriding kimi_api tk_vision_specialized vision_util \
+    object_detection_generalist object_detection_new vision_track
+```
+
+### 3. Install `py_trees_ros` (required by the GPSR orchestrator)
+
+`GPSR/gpsr_orchestrator.py` imports `py_trees` and `py_trees_ros` at module
+scope. Neither is present for `/usr/bin/python3`, which is the shebang of the
+installed `gpsr-orchestrator` entry point. One apt package supplies both
+(it depends on `ros-humble-py-trees`):
+
+```bash
+sudo apt install -y ros-humble-py-trees-ros
 ```
 
 ---
@@ -145,10 +192,41 @@ export ROS_DOMAIN_ID=42
 source /opt/ros/humble/setup.bash
 source /home/tinker/tk25_ws/install/setup.bash
 
-ros2 launch vision_bringup vision_bringup.launch.py enable_gpsr:=true &
+ros2 launch vision_bringup vision_bringup.launch.py enable_gpsr:=true \
+  use_sim_time:=true &
 
-ros2 run camera_server camera_server_node
+# The node NAME is load-bearing, not cosmetic -- see below.
+ros2 run camera_server camera_server_node --ros-args \
+  -r __node:=head_camera_server \
+  -p use_sim_time:=true \
+  -p color_topic:=/camera/color/image_raw \
+  -p depth_topic:=/camera/depth/image_raw \
+  -p color_info_topic:=/camera/color/camera_info \
+  -p depth_info_topic:=/camera/color/camera_info
 ```
+
+**Run the camera server as `head_camera_server`, not bare.** Every
+service-backend vision consumer resolves frames through
+`default_endpoint='/head_camera_server'` (e.g. `door_detection.py`), and
+`camera_server/src/compat_bridge_node.cpp` "owns no camera subscriptions; all
+payloads are forwarded to the per-camera C++ servers" at its `head_server`
+parameter, which defaults to `/head_camera_server`. A bare
+`ros2 run camera_server camera_server_node` registers as `/camera_server`, so
+nothing serves that endpoint and every consumer starves — reporting
+`No camera data or intrinsic.` rather than an error naming the real cause. The
+real robot launches it under exactly this name and parameter set
+(`vision_bringup/launch/vision_driver.launch.py`, node `head_camera_server`).
+
+**Pass `use_sim_time:=true` to every Stage 3 node.** The sim publishes `/clock`
+and stamps frames in simulation time, while a node left on wall-clock time sees
+each frame as ~1.8 billion seconds stale and silently rejects all of them —
+again surfacing as `No orbbec camera data within sync threshold` rather than a
+clock error. Stages 4 and 5 already pass it; Stage 3 needs it too.
+
+**Headless hosts:** `waving_person_server` defaults to `show_window:=true` and
+opens a `cv2` window, aborting with `Available platform plugins are: xcb` when
+there is no display. Start it with `-p show_window:=false` (or export
+`QT_QPA_PLATFORM=offscreen`) on a headless run.
 
 Do **not** additionally launch `vision_driver.launch.py` — that starts the
 physical pan-tilt/Orbbec/FoundationStereo hardware drivers, and Stage 1's
@@ -164,10 +242,12 @@ per-node, e.g. `grocery_categorize.py`, `waving_person_server.py`,
 `object_match_all_server.py`) — so either `camera_server_node` runs (as
 above) to serve that backend, or every vision node needs an explicit
 `-p camera_backend:=subscription` override to read frames straight off the
-topics instead. Bare `ros2 run camera_server camera_server_node` is correct
-here without parameters: its defaults (`/camera/color/image_raw`,
+topics instead. The camera server's topic defaults (`/camera/color/image_raw`,
 `/camera/depth/image_raw`, `/camera/color/camera_info` for both color and
-depth info) are exactly the head-camera topic set GPSR uses.
+depth info) already match the head-camera topic set GPSR uses, but it must
+still be started under the `head_camera_server` node name as shown above —
+the parameters are spelled out there to mirror the real robot's launch
+exactly.
 
 ## Stage 4 — tk25_manipulation
 

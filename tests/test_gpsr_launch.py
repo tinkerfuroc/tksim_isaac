@@ -68,5 +68,56 @@ class GpsrLaunchInstallTest(unittest.TestCase):
         )
 
 
+class GpsrLaunchWorldFrameTest(unittest.TestCase):
+    """The composite must make `world` reachable for the manipulation stack.
+
+    `pick_and_place.cpp::transform_chain_ready()` rejects every joint-move goal
+    unless BOTH `world -> base_link` and `base_link -> link_tcp` resolve. The
+    robot URDF supplies a fixed `world -> base_link` joint, but this composite
+    also runs navigation, which publishes a dynamic `odom -> base_link`. A frame
+    cannot have two parents, so tf2 keeps `odom -> base_link` and drops the
+    `world` edge entirely — `world` becomes unreachable and manipulation is dead
+    on arrival with "tf chain lookup unavailable".
+
+    Attaching `world` above the tree root (`map` has no parent, while `odom` is
+    already owned by AMCL) restores the chain without creating a second parent
+    for any frame. Measured live on 2026-08-20: with this edge published,
+    can_transform(base_link <- world) flips 0 -> 1 and pick_and_place accepts
+    goals immediately.
+    """
+
+    def setUp(self):
+        self.assertTrue(LAUNCH.is_file(), f"{LAUNCH} does not exist")
+        self.source = LAUNCH.read_text(encoding="utf-8")
+        self.tree = ast.parse(self.source)
+
+    def test_publishes_world_frame_for_manipulation_tf_chain(self):
+        self.assertIn(
+            "world", self.source,
+            "the composite must publish a `world` edge; without it "
+            "pick_and_place rejects every joint-move goal",
+        )
+        static_tf_names = [
+            kw.value.value
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Node"
+            for kw in node.keywords
+            if kw.arg == "name" and isinstance(kw.value, ast.Constant)
+        ]
+        self.assertIn(
+            "world_static_tf", static_tf_names,
+            "expected a static_transform_publisher named world_static_tf",
+        )
+
+    def test_world_is_parented_above_the_map_root_not_base_link(self):
+        """`world -> map`, never `world -> base_link` (that double-parents)."""
+        self.assertIn('"--child-frame-id", "map"', self.source)
+        self.assertNotIn(
+            '"--frame-id", "world", "--child-frame-id", "base_link"', self.source,
+            "world must not parent base_link — navigation already owns "
+            "odom -> base_link and tf2 would drop one of the two edges",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
