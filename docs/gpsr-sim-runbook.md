@@ -222,6 +222,33 @@ ros2 run camera_server camera_server_node --ros-args \
   -p depth_info_topic:=/camera/color/camera_info
 ```
 
+**Point the head before expecting anything from vision.** From a pristine
+spawn the head camera looks at the robot's own deck, so `door_detection_srv`
+returns `is_open=0` forever and the GPSR door gate never clears.
+
+`camera_mount_joint` bakes a **-45.5 deg pitch** into the head
+(`rpy="0.0406 -0.79457 3.0833"`). The head is a pan-*tilt* unit whose
+`tilt_joint` runs -30..+90 deg, so the camera only points forward once
+something commands roughly +45 deg of tilt. On hardware the pan-tilt controller
+does that, and it lives in `vision_driver.launch.py` — the launch file this
+runbook tells you not to start — so in simulation nothing ever commands it.
+
+Verified 2026-08-20: a ~180 deg base rotation changed only 15% of the head
+camera's pixels (the geometry rotates with the robot because it *is* the
+robot), depth was 0.66–1.65 m across the frame with 39% valid pixels, and the
+lidar map showed the 1.5 m ahead of the spawn as free. Publishing
+
+```bash
+ros2 topic pub -1 /pan_tilt_controller/cmd tinker_vision_msgs_26/msg/PanTiltCommand \
+  '{mode: 0, pan_rad: 0.0, tilt_rad: 0.9}'
+```
+
+moved the head and took the valid depth fraction from 0.39 to 0.88 — the camera
+started seeing a room instead of itself. The simulator already accepts these
+commands through `pan_tilt_facade`; what the resting head pose should be, and
+whether the GPSR stack or this bring-up owns setting it, is a robot-behaviour
+decision — do not hardcode a guess here.
+
 **Also start the pan/tilt state publisher.** Stage 1's sim publishes
 `/pan_tilt_controller/state` exactly as the hardware pan-tilt driver does, but
 nothing converts it into `/joint_states` unless this node runs:
