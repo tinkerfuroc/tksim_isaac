@@ -300,6 +300,38 @@ def _resolve(context):
                 }
             ],
         ),
+        # Make `world` reachable for the manipulation stack.
+        #
+        # pick_and_place.cpp::transform_chain_ready() rejects EVERY joint-move
+        # goal unless both `world -> base_link` and `base_link -> link_tcp`
+        # resolve. The robot URDF supplies a fixed `world -> base_link` joint,
+        # which is correct for a fixed-base manipulation-only sim -- but this
+        # composite also runs navigation, which publishes a dynamic
+        # `odom -> base_link`. A frame cannot have two parents: tf2 keeps
+        # `odom -> base_link` and silently drops the `world` edge, so `world`
+        # becomes unreachable and manipulation fails with the unhelpful
+        # "tf chain lookup unavailable".
+        #
+        # Attach `world` ABOVE the tree root instead of re-parenting anything:
+        # `map` has no parent, while `odom` is already owned by AMCL. That
+        # yields world -> map -> odom -> base_link -> ... -> link_tcp with no
+        # frame gaining a second parent. The real robot expresses the same
+        # intent as `fix_odom_to_world` (world -> odom, NOT world -> base_link)
+        # in tinker_urdf/src/mobile_manipulator.urdf.xacro.
+        #
+        # Measured live 2026-08-20: without this edge
+        # can_transform(base_link <- world) == 0 and pick_and_place rejected
+        # every goal; with it the transform resolves and goals are accepted.
+        Node(
+            package="tf2_ros", executable="static_transform_publisher", name="world_static_tf",
+            arguments=[
+                "--x", "0", "--y", "0", "--z", "0",
+                "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
+                "--frame-id", "world", "--child-frame-id", "map",
+            ],
+            parameters=[{"use_sim_time": True}],
+            output="screen",
+        ),
         # Match the physical Livox driver contract. The robot URDF's visual
         # sensor link is named livox_frame, while hardware messages and Nav2
         # intentionally use the separate livox360 frame.
