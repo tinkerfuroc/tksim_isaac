@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = ROOT / "ros2_ws/src/tinker_sim_bridge/launch/gpsr.launch.py"
+SETUP_PY = ROOT / "ros2_ws/src/tinker_sim_bridge/setup.py"
 
 
 def _executables(tree: ast.AST) -> list[str]:
@@ -46,6 +47,25 @@ class GpsrLaunchTest(unittest.TestCase):
         self.assertIn("required_sources", source)
         self.assertNotIn('"manage_controllers": False', source,
                          "the composite owns the arm, so controllers must be managed")
+
+
+class GpsrLaunchInstallTest(unittest.TestCase):
+    """Regression guard: gpsr.launch.py must be registered for installation.
+
+    Task 3 added the composite launch source but omitted it from setup.py's
+    data_files, so a colcon build would never install it and
+    `ros2 launch tinker_sim_bridge gpsr.launch.py` would fail with
+    "file not found" even though the source file existed and parsed fine.
+    """
+
+    def test_gpsr_launch_is_registered_in_setup_py_data_files(self):
+        self.assertTrue(SETUP_PY.is_file(), f"{SETUP_PY} does not exist")
+        source = SETUP_PY.read_text(encoding="utf-8")
+        self.assertIn(
+            "launch/gpsr.launch.py", source,
+            "gpsr.launch.py must be listed in setup.py's data_files so it "
+            "gets installed under share/tinker_sim_bridge/launch",
+        )
 
 
 if __name__ == "__main__":

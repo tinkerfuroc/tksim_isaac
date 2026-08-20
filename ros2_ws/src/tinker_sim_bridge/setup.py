@@ -42,6 +42,7 @@ setup(
             "share/" + package_name + "/launch",
             [
                 "launch/fixtures.launch.py",
+                "launch/gpsr.launch.py",
                 "launch/integrated_ompl_manipulation.launch.py",
                 "launch/manipulation.launch.py",
                 "launch/navigation.launch.py",
