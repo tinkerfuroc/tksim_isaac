@@ -11,9 +11,6 @@ from rclpy.node import Node
 from rosgraph_msgs.msg import Clock
 from simulation_interfaces.srv import SetEntityState
 
-from tinker_sim_core.actor_path import path_length, path_pose_at
-from tinker_sim_core.scenario import load_named_scenario
-
 
 class ActorPathDriver(Node):
     """Drive scenario actors along their declared paths via /set_entity_state.
@@ -70,6 +67,18 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--speed-mps and --rate-hz must be positive")
 
     root = arguments.root.resolve()
+    # --root has to be sufficient on its own. This node is documented and run as
+    # `ros2 run tinker_sim_bridge actor_path_driver --root $PWD --scenario ...`,
+    # and a bare `ros2 run` does not carry the PYTHONPATH that the launch files
+    # set via additional_env. Importing tinker_sim_core after the path insert
+    # makes the CLI and launch paths behave identically; the insert is a no-op
+    # when PYTHONPATH already provides it.
+    simulation_root = str(root / "simulation")
+    if simulation_root not in sys.path:
+        sys.path.insert(0, simulation_root)
+    from tinker_sim_core.actor_path import path_length, path_pose_at
+    from tinker_sim_core.scenario import load_named_scenario
+
     scenario = load_named_scenario(root, arguments.scenario)
     actor_records = {str(record["id"]): record for record in scenario.actors}
     walks = []
