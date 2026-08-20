@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Kill ROS processes belonging to ONE ROS_DOMAIN_ID and nothing else.
+#
+# Pattern-only teardown (pgrep -f tinker_sim_bridge, move_group, cumotion, ...)
+# is domain-blind: on a shared host it kills a concurrent session's nodes too.
+# Every process here is filtered by its own ROS_DOMAIN_ID environment variable,
+# so a run on another domain is never touched.
+#
+#   scripts/kill-domain-nodes 71            # dry run: list what WOULD be killed
+#   scripts/kill-domain-nodes 71 --force    # actually send SIGTERM, then SIGKILL
+set -euo pipefail
+
+domain="${1:?usage: kill-domain-nodes <ROS_DOMAIN_ID> [--force]}"
+force="${2:-}"
+
+# Node patterns this project starts. Extend rather than broadening to bare names.
+patterns='run_sim[.]py|tinker_sim_bridge|move_group|cumotion|pick_and_place|grasp_action|robot_state_publisher|static_transform_publisher|lifecycle_manager|controller_manager|ros2_control_node|amcl|bt_navigator|planner_server|controller_server|behavior_server|velocity_smoother|waypoint_follower|map_server|ekf_node|pointcloud_to_laserscan|camera_server|camera_compat_bridge|generalist_node|yolo_seg_node|door_detection|person_track_server|waving_person_server|feature_recognition|approach_planner|orientation_angle|gpsr-orchestrator|behavior_tree'
+
+mapfile -t candidates < <(pgrep -f "$patterns" 2>/dev/null || true)
+
+targets=()
+for pid in "${candidates[@]:-}"; do
+  [ -z "$pid" ] && continue
+  [ -d "/proc/$pid" ] || continue
+  # Never match this script or its own shell.
+  [ "$pid" = "$$" ] && continue
+  pid_domain="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -m1 '^ROS_DOMAIN_ID=' | cut -d= -f2 || true)"
+  [ "$pid_domain" = "$domain" ] || continue
+  targets+=("$pid")
+done
+
+if [ "${#targets[@]}" -eq 0 ]; then
+  echo "no processes on ROS_DOMAIN_ID=$domain"
+  exit 0
+fi
+
+for pid in "${targets[@]}"; do
+  printf '  %s  %-20s %s\n' "$pid" "$(ps -o comm= -p "$pid" 2>/dev/null)" "$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')s"
+done
+
+if [ "$force" != "--force" ]; then
+  echo "(dry run: ${#targets[@]} process(es) on domain $domain; pass --force to kill)"
+  exit 0
+fi
+
+kill "${targets[@]}" 2>/dev/null || true
+sleep 8
+survivors=()
+for pid in "${targets[@]}"; do [ -d "/proc/$pid" ] && survivors+=("$pid"); done
+if [ "${#survivors[@]}" -gt 0 ]; then
+  kill -9 "${survivors[@]}" 2>/dev/null || true
+fi
+echo "killed ${#targets[@]} process(es) on domain $domain"

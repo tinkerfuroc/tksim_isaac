@@ -72,6 +72,50 @@ def _pump_streaming_app_update(app: object, settings: object) -> None:
         settings.set_bool(play_simulations, True)
 
 
+def _emit_step_profile(prof: dict, backend_breakdown: dict | None = None) -> None:
+    """Print where sensor-rich wall time actually goes, then reset the window.
+
+    Opt-in via TINKER_SIM_PROFILE=1. The sensor-rich loop is latency-bound
+    rather than compute-bound (the GPU idles at a few percent while stepping
+    collapses to single-digit Hz), so the only way to target an optimisation
+    is to attribute wall time across the four things the loop does per camera
+    cycle: the PhysX step, the lightweight ROS publish, the Kit app update
+    that renders both RTX products, and the camera capture/convert/publish.
+    """
+    import json
+    import sys
+
+    cycles = max(1, prof["cycles"])
+    steps = max(1, prof["physics_n"])
+    total = prof["physics"] + prof["publish"] + prof["kit_pump"] + prof["cameras"]
+    payload = {
+        "step_profile": {
+            "cycles": prof["cycles"],
+            "physics_steps": prof["physics_n"],
+            "ms_per_physics_step": round(1000.0 * prof["physics"] / steps, 3),
+            "ms_per_cycle": {
+                "physics": round(1000.0 * prof["physics"] / cycles, 2),
+                "publish": round(1000.0 * prof["publish"] / cycles, 2),
+                "kit_pump": round(1000.0 * prof["kit_pump"] / cycles, 2),
+                "cameras": round(1000.0 * prof["cameras"] / cycles, 2),
+                "total": round(1000.0 * total / cycles, 2),
+            },
+            "share_pct": {
+                key: round(100.0 * prof[key] / total, 1) if total > 0 else 0.0
+                for key in ("physics", "publish", "kit_pump", "cameras")
+            },
+        }
+    }
+    if backend_breakdown is not None:
+        payload["step_profile"]["physics_breakdown_ms"] = backend_breakdown
+    print(json.dumps(payload, sort_keys=True), flush=True)
+    sys.stdout.flush()
+    for key in ("physics", "publish", "kit_pump", "cameras"):
+        prof[key] = 0.0
+    prof["cycles"] = 0
+    prof["physics_n"] = 0
+
+
 def _streaming_update_stride(
     physics_dt: float,
     update_hz: float = STREAM_UPDATE_HZ,
@@ -899,6 +943,25 @@ def main() -> int:
             next_collision_heartbeat = time.monotonic()
             collision_heartbeat_period_s = 0.1
             camera_frame_index = 0
+            # Opt-in wall-time attribution for the sensor-rich loop; see
+            # _emit_step_profile. Off by default so production runs are
+            # unaffected.
+            _profile = os.environ.get("TINKER_SIM_PROFILE", "") == "1"
+            _profile_every = max(1, int(os.environ.get("TINKER_SIM_PROFILE_EVERY", "10")))
+            _prof = {
+                "physics": 0.0,
+                "publish": 0.0,
+                "kit_pump": 0.0,
+                "cameras": 0.0,
+                "cycles": 0,
+                "physics_n": 0,
+            }
+            if _profile:
+                print(
+                    f"step profiling on: reporting every {_profile_every} camera "
+                    f"cycles (stride={camera_stride}, camera_hz={camera_hz})",
+                    flush=True,
+                )
             while (
                 running
                 and app.is_running()
@@ -912,11 +975,18 @@ def main() -> int:
                     gateway.publish_safety_heartbeat()
                     next_collision_heartbeat = time.monotonic()
                 if omni.timeline.get_timeline_interface().is_playing():
+                    _t0 = time.monotonic() if _profile else 0.0
                     backend.step()
+                    if _profile:
+                        _prof["physics"] += time.monotonic() - _t0
+                        _prof["physics_n"] += 1
                     if not running:
                         break
                     try:
+                        _t0 = time.monotonic() if _profile else 0.0
                         gateway.publish()
+                        if _profile:
+                            _prof["publish"] += time.monotonic() - _t0
                         camera_frame_index += 1
                         if camera_frame_index % camera_stride == 0:
                             # Rendering both RTX camera products on every
@@ -925,8 +995,24 @@ def main() -> int:
                             # sim_control callbacks, UI events) only at the
                             # camera cadence, guarded so Kit cannot issue a
                             # second physics step.
+                            _t0 = time.monotonic() if _profile else 0.0
                             _pump_streaming_app_update(app, kit_settings)
+                            _t1 = time.monotonic() if _profile else 0.0
                             gateway.publish_cameras()
+                            if _profile:
+                                _t2 = time.monotonic()
+                                _prof["kit_pump"] += _t1 - _t0
+                                _prof["cameras"] += _t2 - _t1
+                                _prof["cycles"] += 1
+                                if _prof["cycles"] % _profile_every == 0:
+                                    _emit_step_profile(
+                                        _prof,
+                                        backend_breakdown=(
+                                            backend.step_profile_snapshot()
+                                            if hasattr(backend, "step_profile_snapshot")
+                                            else None
+                                        ),
+                                    )
                     except BaseException:
                         if running:
                             raise
