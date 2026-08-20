@@ -972,6 +972,43 @@ All runs: ROS_DOMAIN_ID=42, arena `rcw2026`, spawn `--spawn-xy=-2.0,-2.0`, launc
 - [ ] **Step 3: Commit docs** `git add README.md docs/simulation-handoff-2026-08-18.md && git commit -m "docs: record arena-findings fixes, corrected lidar mechanism, nav safety mode"`
 - [ ] **Step 4: Report** — summarize per-fix evidence paths and any deviations.
 
+---
+
+### Task 14: Scenario objects tracked in physics truth under navigation-parity
+
+Added 2026-08-20 after the live wave, at the user's direction that spawned-object
+physics be resolved on this branch rather than deferred as a known limitation.
+
+**Finding:** `/sim/internal/physics_truth` never reported scenario-spawned
+objects — `objects` always `[]`, `object` null, `expected_objects` `{}`,
+`scenario` `""` across 499 messages. Evidence
+`reports/arena-fixes-2026-08-19/object-on-table.json`. This supersedes the
+2026-08-19 note closing the "object rests on furniture" item; that evidence came
+from `/get_entity_state`, not physics truth.
+
+**Root cause (from source):** `run_sim.py`'s `sensor-rich` (815, 830-831) and
+`manipulation-core` (952, 968-969) branches both pass `expected_objects=` and
+`scenario=`; the `navigation-parity` branch (627-652) passes neither. Backend
+defaults are `expected_objects=None`, `scenario=""` (`backend.py:188-189`), so
+`_refresh_object_views()` returns on its first line
+(`if not self._expected_objects: return`, `backend.py:927-928`) and no rigid-body
+views are ever created. The wave ran its object test under `navigation-parity`.
+
+**Fix:** pass `_expected_scenario_objects(root, args.scenario, args.arena)` and
+`args.scenario` through the `navigation-parity` branch, matching the other two.
+Guard it with a source-structure test asserting all three backend construction
+sites pass both keywords, so a future branch cannot omit them.
+
+**Deliberately separated:** the object also never settled the ~0.01 m from its
+0.734 spawn to the 0.724 tabletop, with Isaac logging `Physics tensor entity not
+valid for rigid body` — suggesting post-`sim.reset()` spawns fall outside the
+PhysX tensor view and are not simulated. That was observed through a run which
+could not see objects at all, so it may be wholly explained by the above. It is
+confirmed or ruled out by a live re-run under a profile that wires objects, NOT
+by speculative repair.
+
+Full brief: `.superpowers/sdd/vast-strolling-parrot/task-14-brief.md`.
+
 ## Self-review notes
 
 - Spec coverage: A→Tasks 2-5, B→6-7, C→8-10, D→11; evidence→12; docs→13. tk25_ws stays untouched (user decision).
