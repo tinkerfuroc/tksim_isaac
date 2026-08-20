@@ -10,9 +10,6 @@ import argparse
 import json
 import sys
 
-import rclpy
-from rclpy.node import Node
-
 SERVICES = {
     "sim bridge": [("announce", "tinker_audio_msgs/srv/TextToSpeech")],
     "tk26_vision": [
@@ -45,7 +42,19 @@ TOPICS = {
 }
 
 
+def _action_present(name: str, have_actions: set[str]) -> bool:
+    """True if `name` (bare or leading-slash) is in `have_actions`.
+
+    Graph action names are always fully-qualified with a leading slash
+    (e.g. "/listen_action"), so normalize to that form before comparing.
+    """
+    return ("/" + name.lstrip("/")) in have_actions
+
+
 def main() -> int:
+    import rclpy
+    from rclpy.node import Node
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
@@ -81,7 +90,7 @@ def main() -> int:
 
     for stack, names in ACTIONS.items():
         for name in names:
-            if name not in have_actions and name.lstrip("/") not in have_actions:
+            if not _action_present(name, have_actions):
                 miss(stack, f"action {name}")
 
     for stack, entries in TOPICS.items():
