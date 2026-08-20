@@ -41,7 +41,9 @@ work is wiring, coordinate data, and two genuine bug fixes — not new subsystem
 5. **GPSR's world model is bound to a different arena.** `GPSR/constants.json` hardcodes 23
    waypoints for the RoboCup Incheon 2026 map. The planner LLM is prompted to emit only names
    from this file, so an arena remap is data, not code.
-6. **Open-vocabulary recognition is available.** `object_detection_generalist` chains
+6. **Textured YCB objects are already published in this repo** (see Components §4), so real
+   vision has recognizable targets without any asset work.
+7. **Open-vocabulary recognition is available.** `object_detection_generalist` chains
    YOLO-World + MobileSAM + a Gemini/Qwen VLM, so object recognition is not limited to COCO
    classes — but it still needs assets that read as the object they represent.
 
@@ -87,12 +89,16 @@ hardware-parity sim instance.
 A `gpsr-rcw2026` scenario places graspable objects on arena furniture, plus a `listen_action`
 fixture beside `audio_fixtures` so `ask_person` does not hang.
 
-**Object assets are sourced, not authored.** Priority order:
-1. Isaac's own YCB props pack (native USD, physics-ready; not in the local 1.8 MB cache, needs fetching).
-2. Google Scanned Objects (CC-BY scanned household items; OBJ→USD conversion).
-3. Author textured primitives only if 1 and 2 both fail.
-Recognition rides on `object_detection_generalist`'s open-vocabulary VLM path, so assets must
-read plausibly as their object but need not match a COCO class.
+**Object assets already exist — nothing to source or author.** A teammate's YCB importer
+(`tools/ycb_import.py`, pinned allowlist `config/ycb-import.json`) has already published ten
+textured, physics-ready YCB objects as a content-addressed artifact under
+`artifacts/objects/ycb/d2d5ccd2.../`: cheez-it, sugar box, spam, mustard bottle, pudding box,
+tomato soup can, banana, bleach cleanser, bowl, mug. Each is an `object.usd` with a texture
+directory, referenced from a scenario as a repo-root-relative `asset_uri`
+(resolved by `_uri(root, asset_uri)`, `simulation/tinker_sim_core/orchestration.py:59`).
+Recognition rides on `object_detection_generalist`'s open-vocabulary VLM path, which suits
+scanned YCB objects well: they are real photographed products, so a VLM prompted for
+"tomato soup can" or "mug" has a genuine chance where a COCO classifier would not.
 
 ## Verification
 
