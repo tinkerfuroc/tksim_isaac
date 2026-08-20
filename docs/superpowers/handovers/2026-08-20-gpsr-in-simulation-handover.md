@@ -23,7 +23,7 @@ The ledger is the recovery map. It holds the pre-flight conflict table, every
 | Repo | Branch | BASE at plan start | Now |
 | --- | --- | --- | --- |
 | `/home/tinker/tinker-sim/6.0.1` | `task50-stage-a-repair` | `08b29bb` | unchanged by this plan so far |
-| `/home/tinker/tk25_ws/src/tk25_decision` | `gpsr-two-layer-orchestrator` | `3dc3ea7` | `43c0522` (Task 1) |
+| `/home/tinker/tk25_ws/src/tk25_decision` | `gpsr-two-layer-orchestrator` | `3dc3ea7` | `95ce4a7` (Task 1 complete) |
 
 Tasks 1, 2 land in tk25_decision. Tasks 3, 4, 5, 6, 7 land in tinker-sim.
 Never mix the two in one commit.
@@ -46,7 +46,7 @@ Never mix the two in one commit.
 
 | # | Task | Repo | Status |
 | --- | --- | --- | --- |
-| 1 | Vision nodes `ServiceHandler` → `ActionHandler` | decision | Implemented (`bb71eda`, `43c0522`); **task review in flight** |
+| 1 | Vision nodes `ServiceHandler` → `ActionHandler` | decision | **Complete** — `bb71eda`, `43c0522`, `95ce4a7`; review Approved/Approved |
 | 2 | `constants.rcw2026.json` + `GPSR_CONSTANTS_PATH` | decision | Not started — pre-derived, see below |
 | 3 | Composite `gpsr.launch.py` | tinker-sim | Not started — two plan defects found, see below |
 | 4 | `gpsr-rcw2026` scenario with YCB objects | tinker-sim | Not started — preconditions verified |
@@ -72,7 +72,16 @@ copy pattern, including its mock-mode `MockFuture` guard.
 
 The implementer flagged that `messages.py` still imported both names from
 `.srv`, so the new `.Goal()` calls would `AttributeError` once mock mode is off.
-Verified and fixed in round 1: those two names now come from `.action`.
+Verified and fixed in round 1 (`43c0522`): those two names now come from `.action`.
+
+The task review then found a second instance of the same class of bug, in
+`mock_messages.py`: its `FeatureExtraction`/`DetectWaving` derived from
+`MockService` (Request/Response only), so a node forced NO_MOCK while the real
+`tinker_vision_msgs_26` was unavailable would still hit `AttributeError` on
+`.Goal()`. Closed as a fast-follow (`95ce4a7`) — both now inherit
+`(MockService, MockAction)`, which keeps Request/Response resolution
+byte-identical while adding Goal/Result. Review verdicts were Approved on both
+spec compliance and quality.
 
 ### Known-open item — MUST do before any live GPSR run
 
@@ -179,11 +188,10 @@ Every ROS interface GPSR needs is already served by something real:
 ## Resuming
 
 1. Read `.superpowers/sdd/2026-08-20-gpsr-in-simulation/progress.md` end to end.
-2. Check whether Task 1's review landed:
-   `.superpowers/sdd/2026-08-20-gpsr-in-simulation/task-1-review.md`. If it has
-   findings, run the fix loop before Task 2 — both touch `tk25_decision`, so they
-   must not run concurrently.
-3. Dispatch Task 2 with BASE = tk25_decision `HEAD` at that moment, handing the
-   implementer the pre-derived pose table above.
+2. Task 1's review is done and its one Major finding is closed — see
+   `.superpowers/sdd/2026-08-20-gpsr-in-simulation/task-1-review.md`. Nothing is
+   outstanding on it; start at Task 2.
+3. Dispatch Task 2 with BASE = tk25_decision `95ce4a7`, handing the implementer
+   the pre-derived pose table above.
 4. Tasks 3, 4, 5 in order (3 before 5 — the runbook documents 3's argument names).
 5. When the GPU frees: rebuild `tinker_vision_msgs_26` first, then Tasks 6 and 7.
