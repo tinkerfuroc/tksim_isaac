@@ -26,6 +26,7 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
 )
 from tinker_sim_isaac.backend import IsaacWholeRobotBackend
+from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
 from manipulation_qualification import QualificationManifest, QualificationRunner
 from run_sim import _content_addressed_tinker_usd, _expected_scenario_objects
@@ -163,6 +164,14 @@ def _backend() -> IsaacWholeRobotBackend:
     )
     backend.render = False
     backend.dt = 1.0 / 120.0
+    backend.physics_dt = 1.0 / 120.0
+    backend.physics_hz = 120.0
+    backend.control_hz = 120.0
+    backend.physics_substeps = 1
+    backend._target_write_gate = TargetWriteGate()
+    backend.step_profile = {"enabled": False, "target_writes": 0}
+    backend.chassis_ballast_mass_kg = 0.0
+    backend._object_views = {}
     backend._refresh_object_views = lambda: None
     return backend
 
@@ -401,22 +410,30 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 3.7, places=4)
         self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.25)
         self.assertAlmostEqual(float(backend._position_targets[0, 1]), -0.4)
-        self.assertEqual(backend._robot.write_count, 2)
+        # The measured state did not change between the two steps, so the
+        # recomputed effort target is identical and the write gate skips the
+        # second push (PhysX holds the target it already has).
+        self.assertEqual(backend._robot.write_count, 1)
+        # The hold's drive configuration (ceiling, stiffness 0, damping 0) is
+        # constant for the whole hold and is written once on entry; each of
+        # those is a PhysX model-property write (measured 2.9 ms per step when
+        # repeated). The effort target is still recomputed and pushed every
+        # step, see the target_calls assertions below.
         self.assertEqual(
             [name for name, _ in backend._robot.gain_calls],
-            ["stiffness", "damping", "stiffness", "damping"],
+            ["stiffness", "damping"],
         )
         self.assertEqual(
-            [call["limits"].tolist() for call in backend._robot.limit_calls[-2:]],
-            [[[100.0]], [[100.0]]],
+            [call["limits"].tolist() for call in backend._robot.limit_calls[-1:]],
+            [[[100.0]]],
         )
         self.assertEqual(
             [call["stiffness"] for name, call in backend._robot.gain_calls if name == "stiffness"],
-            [IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS] * 2,
+            [IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS],
         )
         self.assertEqual(
             [call["damping"] for name, call in backend._robot.gain_calls if name == "damping"],
-            [IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING] * 2,
+            [IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING],
         )
         self.assertEqual(
             [kind for kind, _ in backend._robot.target_calls[-3:]],
@@ -424,12 +441,12 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(
             [kind for kind, _ in backend._robot.target_calls],
-            ["position", "velocity", "effort"] * 2,
+            ["position", "velocity", "effort"],
         )
         effort_targets = [
             target for kind, target in backend._robot.target_calls if kind == "effort"
         ]
-        self.assertEqual(len(effort_targets), 2)
+        self.assertEqual(len(effort_targets), 1)
         for target in effort_targets:
             self.assertAlmostEqual(float(target[0, 0]), 0.0)
             self.assertAlmostEqual(float(target[0, 1]), 3.7, places=4)
@@ -538,6 +555,63 @@ class ManipulationRuntimeTest(unittest.TestCase):
             backend._robot.limit_calls[-1]["limits"].tolist(),
             [[11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0]],
         )
+
+    def test_safety_hold_writes_drive_config_once_per_hold(self) -> None:
+        """Ceiling/stiffness/damping are constant for a hold: written on entry only."""
+        backend = _backend()
+        backend.set_safety_stop(True)
+        for index in range(5):
+            # A moving measured state changes the PD term every step.
+            backend._robot.data.joint_vel = torch.tensor(
+                [[0.1, -0.2 + 0.01 * index]], dtype=torch.float32
+            )
+            backend.step()
+
+        self.assertEqual(len(backend._robot.gain_calls), 2)
+        self.assertEqual(
+            [call["limits"].tolist() for call in backend._robot.limit_calls],
+            [[[100.0]]],
+        )
+        # ...while the effort target was recomputed and pushed on every step.
+        self.assertEqual(backend._robot.write_count, 5)
+        self.assertEqual(
+            [kind for kind, _ in backend._robot.target_calls].count("effort"), 5
+        )
+
+        # Clearing restores nominal gains exactly once; a second hold writes
+        # the hold configuration again.
+        backend.set_safety_stop(False)
+        self.assertEqual(
+            [name for name, _ in backend._robot.gain_calls[-2:]],
+            ["stiffness", "damping"],
+        )
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[30.0]])
+        backend.set_safety_stop(True)
+        backend.step()
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 6)
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[100.0]])
+
+    def test_safety_hold_rewrites_drive_config_after_view_refresh(self) -> None:
+        """A re-resolved articulation view carries the actuator model's nominal
+        gains, so the hold configuration must be pushed again after one."""
+        backend = _backend()
+        backend.set_safety_stop(True)
+        backend.step()
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 2)
+
+        # Standard STOP -> PLAY: Isaac Lab recreates the root view.
+        backend._robot.root_view = object()
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 4)
+        self.assertEqual(
+            [name for name, _ in backend._robot.gain_calls[-2:]],
+            ["stiffness", "damping"],
+        )
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[100.0]])
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 4)
 
     def test_safety_effort_rejects_missing_nonfinite_and_malformed_gravity(self) -> None:
         for gravity in (
