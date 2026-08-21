@@ -43,6 +43,20 @@ class PathPoseTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             path_pose_at([[0.0, 0.0], [float("nan"), 1.0]], 0.0)
 
+    def test_rejects_nonfinite_distance(self):
+        # A non-finite distance must fail closed, not silently resolve to the
+        # path START (which would contradict the "clamped to its end"
+        # contract for +inf).
+        with self.assertRaises(ValueError):
+            path_pose_at(self.PATH, float("inf"))
+        with self.assertRaises(ValueError):
+            path_pose_at(self.PATH, float("nan"))
+
+    def test_negative_distance_clamps_to_start(self):
+        x, y, yaw = path_pose_at(self.PATH, -5.0)
+        self.assertAlmostEqual(x, 0.0)
+        self.assertAlmostEqual(y, 0.0)
+
 
 def _scenario_raw(events, actors):
     return {
@@ -82,6 +96,17 @@ class EventValidationTest(unittest.TestCase):
         )
         self._load(raw)  # no raise
 
+    def test_actor_path_start_rejects_trigger_only_event(self):
+        # actor_path_driver has no way to wait on a trigger; a trigger-keyed
+        # actor_path_start would silently start the walk at t=0 instead of
+        # failing loudly, so scenario load must reject it up front.
+        actor = {"id": "a", "asset_uri": "x.usda", "path": [[0.0, 0.0], [1.0, 0.0]]}
+        raw = _scenario_raw(
+            [{"trigger": "door_opened", "type": "actor_path_start", "actor": "a"}], [actor]
+        )
+        with self.assertRaisesRegex(ValueError, "at_sim_time"):
+            self._load(raw)
+
 
 _ARENA_ARTIFACT = ROOT / "artifacts/arena/rcw2026/d2b559b43207c8d54ae2609f638dca1cc36ee8b7adc7e4d94aee86e7fb56729c"
 
@@ -106,6 +131,20 @@ class ArenaScenarioPoseTest(unittest.TestCase):
         actor = raw["actors"][0]
         for x, y in actor["path"]:
             self.assertTrue(occupancy.free_with_clearance(x, y, 0.4))
+
+    def test_pick_scenario_spawn_is_free_on_derived_map(self):
+        # Guards against the pick scenario's committed spawn silently drifting
+        # off the map: it happens to match the person scenario's spawn today,
+        # but nothing asserted that until now.
+        from tinker_sim_core.occupancy import OccupancyMap
+        occupancy = OccupancyMap.from_pgm(
+            self.ARTIFACT / "map.pgm", resolution=0.05, origin_x=-5.05, origin_y=-6.0
+        )
+        raw = json.loads(
+            (ROOT / "simulation/scenarios/pick-deliver-place-rcw2026.json").read_text()
+        )
+        rx, ry, _ = raw["robot"]["initial_pose"]
+        self.assertTrue(occupancy.free_with_clearance(rx, ry, 0.35))
 
 
 class ActorPathDriverNodeAttributeTest(unittest.TestCase):

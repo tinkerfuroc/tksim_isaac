@@ -472,7 +472,34 @@ class RosDevelopmentLidarTest(unittest.TestCase):
         """The occupancy raycast path stays the primary source when a map
         exists. The sensor origin's own cell must be free (unlike
         ``test_development_lidar_empty_when_origin_occupied``) so this
-        exercises the raycast path rather than the occupied-origin guard."""
+        exercises the raycast path rather than the occupied-origin guard.
+
+        This asserts a geometry-derived point, not just non-emptiness: a
+        regression that reinstated the raycast-floor ring (every ray at the
+        0.3 m minimum) would still satisfy a bare ``width >= 1`` check with
+        181 fake points, so that alone is not a real guard on the dev-lidar
+        occupied-origin fix (``0a42eec``).
+
+        Geometry, independent of the implementation under test:
+        ``_CloudBackend.root_state`` fixes position (0, 0, 0) and an identity
+        orientation, so yaw = 0 and the sensor origin sits 0.12 m ahead of
+        the robot at world (0.12, 0.0) -- see the 0.12 m mount offset in
+        ``_development_point_cloud``. The fixture's ``OccupancyMap`` is 4x4
+        at 1.0 m resolution with origin (-2.0, -2.0), free (not occupied)
+        only at grid cell (gx=2, gy=2) -- i.e. world x in [0, 1), y in
+        [0, 1) -- and occupied everywhere else (including out of bounds).
+        The sensor origin (0.12, 0.0) falls inside that one free cell.
+
+        The straight-ahead ray (local angle 0, i.e. index 90 of the 181 rays
+        for degrees -90..90) walks outward from ``minimum=0.3`` in
+        ``step = resolution / 2 = 0.5`` increments along +x: 0.3 -> world
+        x=0.42 (still inside the free cell, x in [0,1)) -> 0.8 -> world
+        x=0.92 (still inside) -> 1.3 -> world x=1.42, grid cell (gx=3, gy=2),
+        which is occupied. So the ray must stop at distance 1.3 m, landing
+        the point at local (1.3, 0.0, 0.0) in the sensor frame.
+        """
+        import struct
+
         from tinker_sim_core.occupancy import OccupancyMap
 
         rows = tuple(
@@ -481,7 +508,14 @@ class RosDevelopmentLidarTest(unittest.TestCase):
         occ = OccupancyMap(4, 4, 1.0, -2.0, -2.0, rows)
         gateway = _cloud_gateway(development_lidar=True, occupancy=occ)
         cloud = gateway._development_point_cloud(_cloud_stamp())
-        self.assertGreaterEqual(cloud.width, 1)
+        self.assertEqual(cloud.width, 181, "every ray must resolve inside the 4x4 grid")
+
+        straight_ahead_index = 90  # degrees == 0 within range(-90, 91)
+        offset = straight_ahead_index * cloud.point_step
+        px, py, pz = struct.unpack_from("<fff", cloud.data, offset)
+        self.assertAlmostEqual(px, 1.3, places=5)
+        self.assertAlmostEqual(py, 0.0, places=5)
+        self.assertAlmostEqual(pz, 0.0, places=5)
 
     def test_cloud_disabled_without_development_lidar(self) -> None:
         gateway = _cloud_gateway(development_lidar=False, occupancy=None)

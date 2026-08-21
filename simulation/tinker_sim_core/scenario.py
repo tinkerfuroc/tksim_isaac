@@ -91,6 +91,13 @@ class ScenarioDefinition:
             if "at_sim_time" not in event and "trigger" not in event:
                 raise ValueError(f"{path}: event requires at_sim_time or trigger")
             if event.get("type") == "actor_path_start":
+                if "at_sim_time" not in event:
+                    raise ValueError(
+                        f"{path}: actor_path_start event requires at_sim_time "
+                        "(trigger-keyed actor_path_start is not supported; the "
+                        "driver has no way to wait on a trigger and would start "
+                        "the walk immediately)"
+                    )
                 actor_id = event.get("actor")
                 if actor_id not in actor_ids:
                     raise ValueError(f"{path}: event names unknown actor: {actor_id!r}")
