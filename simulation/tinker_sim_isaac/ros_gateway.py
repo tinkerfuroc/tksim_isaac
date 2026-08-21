@@ -1113,10 +1113,21 @@ class RosStandardGateway:
                 cloud.point_step = 16
                 cloud.row_step = 16 * spec.width
                 cloud.is_dense = False
+                # depth is CameraRig.capture()'s output: since be05e61 it
+                # was pinned-buffer metres float32, straight off the
+                # annotator; the GPU depth kernel (camera_rig.py) now
+                # converts depth to 16UC1 millimetres before this function
+                # ever sees it, so pack_registered_cloud (which projects
+                # metres) needs it back: mm/1000 -> metres, and 0mm (its
+                # invalid marker) becomes 0.0, which pack_registered_cloud's
+                # own ``depth > 0.0`` check already treats as invalid.
+                # depth_array is exactly this uint16 mm frame (identical
+                # values to `depth` post-conversion; depth_to_16uc1_mm is a
+                # passthrough for it), so reuse it instead of converting twice.
                 cloud.data = array.array(
                     "B",
                     pack_registered_cloud(
-                        depth,
+                        depth_array.astype("float32") * 0.001,
                         fx=fields["k"][0],
                         fy=fields["k"][4],
                         cx=fields["k"][2],

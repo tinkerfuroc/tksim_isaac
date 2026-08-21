@@ -265,6 +265,14 @@ def depth_to_16uc1_mm(value: Any):
     passes, which measurably wins at 1280x720 despite adding a per-call
     dispatch fixed cost that a plain ``np.where`` does not pay (see the
     micro-benchmark referenced in the commit message).
+
+    ``CameraRig.capture()`` now runs this exact metres->mm conversion on the
+    GPU (a Warp kernel; see ``CameraRig._DEPTH_KERNEL``) and hands back an
+    already-converted uint16 (H, W) buffer. A uint16 (H, W) input is
+    therefore treated as pre-converted and passed through contiguous with no
+    recomputation -- detected by dtype alone, so any uint16 (H, W) array
+    (not just one produced by the GPU kernel) takes this path. Float (and
+    other non-uint16) input is converted exactly as before.
     """
     import numpy as np
 
@@ -273,6 +281,8 @@ def depth_to_16uc1_mm(value: Any):
         depth = depth[:, :, 0]
     if depth.ndim != 2:
         raise ValueError(f"depth frame must be HxW: {depth.shape}")
+    if depth.dtype == np.uint16:
+        return np.ascontiguousarray(depth)
     shape = depth.shape
     if depth.dtype.kind != "f":
         upcast = _scratch("depth_upcast", shape, shape, np.float64)
@@ -322,6 +332,48 @@ def pack_registered_cloud(
     return cloud.tobytes()
 
 
+#: Lazily-built Warp kernel for the metres->16UC1-mm depth conversion,
+#: cached at module scope so every ``CameraRig`` shares one compiled kernel.
+#: Built lazily (not with a module-level ``@wp.kernel``) so importing this
+#: module never requires ``warp`` to be installed -- only ``CameraRig``
+#: (Isaac-only) touches it; ``depth_to_16uc1_mm``/tests run under plain
+#: system Python with no ``warp`` available.
+#:
+#: Semantics mirror ``_depth_to_16uc1_mm_reference`` exactly for a single
+#: scalar: NaN/Inf/non-positive -> 0, else round-half-to-even (``wp.rint``,
+#: matching ``numpy.rint``; ``wp.round`` is round-half-away-from-zero and
+#: disagrees at exact .5mm ties -- see outputs/bench/probe_gpu_depth_rgba.py)
+#: then clamp to [0, 65535] before the uint16 cast. Proven bit-identical to
+#: the reference on 120 real annotator frames plus a hand-picked edge set
+#: (NaN, +-Inf, -1, 0, 65.5345, 65.5355, 0.0005, 0.0015, 1e-45, 70000) in
+#: that probe; re-verified here in
+#: ``tests/test_camera_publish_equivalence.py`` by running this exact
+#: kernel (not a numpy re-implementation) on Warp's CPU device.
+_DEPTH_KERNEL: Any = None
+
+
+def _depth_to_mm_u16_kernel() -> Any:
+    global _DEPTH_KERNEL
+    if _DEPTH_KERNEL is None:
+        import warp as wp
+
+        @wp.kernel
+        def depth_to_mm_u16(
+            depth: wp.array(dtype=wp.float32), out_arr: wp.array(dtype=wp.uint16)
+        ):
+            i = wp.tid()
+            x = depth[i]
+            mm = wp.float32(0.0)
+            if wp.isfinite(x) and x > wp.float32(0.0):
+                mm = x * wp.float32(1000.0)
+                mm = wp.rint(mm)
+                mm = wp.clamp(mm, wp.float32(0.0), wp.float32(65535.0))
+            out_arr[i] = wp.uint16(mm)
+
+        _DEPTH_KERNEL = depth_to_mm_u16
+    return _DEPTH_KERNEL
+
+
 class CameraRig:
     """Robot-mounted RTX cameras serving the hardware-parity contract.
 
@@ -337,10 +389,16 @@ class CameraRig:
         self.specs = tuple(specs)
         self._sensors: dict[str, Any] = {}
         #: Per-camera (rgb, depth) pinned host wp.array buffers, sized to the
-        #: exact post-conversion shape. Reused every ``capture()`` call so
+        #: exact post-conversion shape (depth is post metres->16UC1-mm, done
+        #: on the GPU; see ``capture()``). Reused every ``capture()`` call so
         #: the per-frame D2H copy lands in existing pinned memory instead of
-        #: a fresh pageable allocation (see ``capture()``).
+        #: a fresh pageable allocation.
         self._pinned: dict[str, tuple[Any, Any]] = {}
+        #: Per-camera device-side uint16 scratch the depth kernel writes
+        #: into, sized (height, width); copied to the pinned host uint16
+        #: buffer above. Kept device-resident between frames like the pinned
+        #: host buffers are.
+        self._depth_gpu_out: dict[str, Any] = {}
 
     def initialize(self, app: Any) -> None:
         from isaacsim.core.utils.extensions import enable_extension
@@ -401,14 +459,25 @@ class CameraRig:
                 annotators=[COLOR_ANNOTATOR, DEPTH_ANNOTATOR],
             )
             # Pinned (page-locked) host buffers, sized to what rgb8_array/
-            # depth_to_16uc1_mm expect (post RGBA->RGB slice, post channel
-            # squeeze). Pinned memory lets the D2H copy in capture() run as
+            # depth_to_16uc1_mm expect (post RGBA->RGB slice for rgb; already
+            # metres->16UC1-mm converted, on the GPU, for depth -- see
+            # capture()). Pinned memory lets the D2H copy in capture() run as
             # a real async DMA instead of the synchronous-by-necessity copy
             # a pageable destination forces.
             self._pinned[spec.name] = (
                 wp.empty((spec.height, spec.width, 3), dtype=wp.uint8, device="cpu", pinned=True),
-                wp.empty((spec.height, spec.width), dtype=wp.float32, device="cpu", pinned=True),
+                wp.empty((spec.height, spec.width), dtype=wp.uint16, device="cpu", pinned=True),
             )
+            self._depth_gpu_out[spec.name] = wp.zeros(
+                (spec.height, spec.width), dtype=wp.uint16, device="cuda"
+            )
+        # JIT-compile the depth kernel now, on a throwaway array, so the
+        # first real frame doesn't pay Warp's first-launch compile cost.
+        _warm_kernel = _depth_to_mm_u16_kernel()
+        _warm_in = wp.zeros(1, dtype=wp.float32, device="cuda")
+        _warm_out = wp.zeros(1, dtype=wp.uint16, device="cuda")
+        wp.launch(_warm_kernel, dim=1, inputs=[_warm_in, _warm_out])
+        wp.synchronize_device(_warm_in.device)
         for _ in range(4):
             app.update()
 
@@ -416,20 +485,30 @@ class CameraRig:
         """Fetch each camera's RGB+depth into reused pinned host buffers.
 
         ``sensor.get_data`` returns a GPU-side wp.array (a strided RGBA->RGB
-        view for rgb, a contiguous buffer for depth); each is copied with
-        ``wp.copy`` into this rig's pinned host scratch for that camera
-        instead of letting ``to_numpy()`` do its usual
+        view for rgb, a contiguous buffer for depth); rgb is copied with
+        ``wp.copy`` straight into this rig's pinned host scratch for that
+        camera instead of letting ``to_numpy()`` do its usual
         ``warp.clone(device="cpu")`` (a fresh pageable allocation every
-        frame). Because the pinned destination makes the D2H copy a real
-        async DMA, all four copies (two cameras x rgb/depth) are enqueued
-        before a single ``wp.synchronize_stream`` blocks for all of them,
-        instead of each ``to_numpy()`` call synchronizing on its own.
+        frame). depth instead runs through ``_depth_to_mm_u16_kernel()`` on
+        the GPU first (metres -> 16UC1 mm, byte-identical to
+        ``depth_to_16uc1_mm``/``_depth_to_16uc1_mm_reference`` -- see that
+        kernel's docstring and ``tests/test_camera_publish_equivalence.py``)
+        into this camera's device uint16 scratch, and only the uint16
+        result -- half the bytes of the float32 source -- is D2H-copied into
+        the pinned host buffer. Because the pinned destination makes the D2H
+        copy a real async DMA, all four copies/launches (two cameras x
+        rgb/depth) are enqueued before a single ``wp.synchronize_stream``
+        blocks for all of them, instead of each ``to_numpy()`` call
+        synchronizing on its own.
 
         Deliberately ``synchronize_stream``, not ``synchronize_device``:
         ``wp.copy`` with a non-CUDA destination runs on the *source*
         array's current stream (see ``warp.copy``), the same stream the RTX
-        annotator pipeline enqueues its own GPU work on, so waiting for
-        just that stream to drain already makes the copied data valid.
+        annotator pipeline enqueues its own GPU work on; a kernel launched
+        with no explicit ``stream=``/``device=`` also runs on that array's
+        device's current stream, so it lands on the same stream as the
+        annotator's own work and the pinned copies that follow it. Waiting
+        for just that stream to drain already makes the copied data valid.
         ``wp.synchronize_device`` instead blocks on the whole CUDA context
         -- every other stream Kit has outstanding work on too, including
         the renderer's passes for frames we don't even want yet -- which a
@@ -437,10 +516,14 @@ class CameraRig:
         ``synchronize_stream`` for the exact same copies, i.e. worse than
         the ``to_numpy()`` baseline this is meant to beat.
 
-        The returned arrays are byte-identical to what ``to_numpy()`` would
-        have produced from the un-pinned GPU array (same underlying gather
-        + copy); only the destination allocation and synchronization scope
-        change.
+        The returned rgb array is byte-identical to what ``to_numpy()``
+        would have produced from the un-pinned GPU array (same underlying
+        gather + copy); only the destination allocation and synchronization
+        scope change. The returned depth array is byte-identical to what
+        ``depth_to_16uc1_mm(to_numpy(<un-pinned GPU depth array>))`` would
+        have produced; ``depth_to_16uc1_mm`` treats a uint16 (H, W) array as
+        already converted and passes it through unchanged, so callers keep
+        calling it exactly as before.
         """
         import warp as wp
 
@@ -455,7 +538,14 @@ class CameraRig:
                 sync_device = rgb.device
                 rgb = rgb_pinned
             if depth is not None:
-                wp.copy(depth_pinned, depth)
+                depth_gpu_out = self._depth_gpu_out[name]
+                n = depth_gpu_out.size
+                wp.launch(
+                    _depth_to_mm_u16_kernel(),
+                    dim=n,
+                    inputs=[depth.reshape(n), depth_gpu_out.reshape(n)],
+                )
+                wp.copy(depth_pinned, depth_gpu_out)
                 sync_device = depth.device
                 depth = depth_pinned
             frames[name] = (rgb, depth)
