@@ -159,6 +159,112 @@ def validate_spawn_xy(spawn_xy: object) -> tuple[float, float]:
     return x, y
 
 
+def _fused_apply_actuator_model(self) -> None:
+    """Replacement for ``Articulation._apply_actuator_model`` that launches once.
+
+    Isaac Lab's stock implementation runs, for every actuator group, the
+    group's ``compute()`` and then two Warp launches (``update_targets`` and
+    ``update_actuator_state_model``) that scatter the group's slice into the
+    articulation-wide staging buffers. With this robot's five implicit groups
+    that is ten launches per target push; measured 2026-08-21 on CPU PhysX
+    the launches are ~3.2 ms of a ~3.6 ms push, the five ``compute()`` calls
+    ~0.3 ms.
+
+    This version keeps the per-group ``compute()`` exactly as stock -- every
+    group's own stiffness/damping/effort-limit tensors and its
+    ``computed_effort``/``applied_effort`` buffers are used and updated the
+    same way, so telemetry and the runtime gripper effort-limit sync are
+    unchanged -- and then issues each kernel once over the concatenation of
+    all groups' joint indices. The staging and data buffers receive the same
+    values at the same joints; no joint belongs to two groups, so ordering
+    cannot matter. Bound per instance (Isaac Lab's factory classes refuse
+    subclassing outside the package); any group with a gear ratio falls back
+    to the stock loop.
+    """
+    import torch
+    import warp as wp
+    from isaaclab_physx.assets.articulation import kernels as articulation_kernels
+    from isaaclab.utils.types import ArticulationActions
+
+    actuators = list(self.actuators.values())
+    if not actuators or any(hasattr(actuator, "gear_ratio") for actuator in actuators):
+        return type(self)._apply_actuator_model(self)
+    fused = getattr(self, "_tinker_fused_indices", None)
+    if fused is None:
+        pieces = []
+        for actuator in actuators:
+            joint_indices = actuator.joint_indices
+            if joint_indices == slice(None) or joint_indices is None:
+                pieces.append(torch.arange(self.num_joints, dtype=torch.int32, device=self.device))
+            else:
+                pieces.append(torch.as_tensor(joint_indices, device=self.device).to(torch.int32))
+        fused_torch = torch.cat(pieces)
+        fused = (
+            fused_torch.to(torch.long),
+            wp.array(fused_torch.cpu().numpy(), dtype=wp.int32, device=self.device),
+            [piece.to(torch.long) for piece in pieces],
+        )
+        self._tinker_fused_indices = fused
+    fused_long, fused_wp, group_long = fused
+
+    joint_pos_target = self._data.joint_pos_target.torch
+    joint_vel_target = self._data.joint_vel_target.torch
+    joint_effort_target = self._data.joint_effort_target.torch
+    joint_pos = self._data.joint_pos.torch
+    joint_vel = self._data.joint_vel.torch
+    computed = []
+    applied = []
+    vel_limits = []
+    for actuator, idx in zip(actuators, group_long):
+        control_action = ArticulationActions(
+            joint_positions=joint_pos_target[:, idx],
+            joint_velocities=joint_vel_target[:, idx],
+            joint_efforts=joint_effort_target[:, idx],
+            joint_indices=actuator.joint_indices,
+        )
+        actuator.compute(control_action, joint_pos=joint_pos[:, idx], joint_vel=joint_vel[:, idx])
+        computed.append(actuator.computed_effort)
+        applied.append(actuator.applied_effort)
+        vel_limits.append(actuator.velocity_limit)
+    wp.launch(
+        articulation_kernels.update_targets,
+        dim=(self.num_instances, fused_long.shape[0]),
+        inputs=[
+            joint_pos_target[:, fused_long].contiguous(),
+            joint_vel_target[:, fused_long].contiguous(),
+            joint_effort_target[:, fused_long].contiguous(),
+            fused_wp,
+        ],
+        outputs=[self._joint_pos_target_sim, self._joint_vel_target_sim, self._joint_effort_target_sim],
+        device=self.device,
+    )
+    wp.launch(
+        articulation_kernels.update_actuator_state_model,
+        dim=(self.num_instances, fused_long.shape[0]),
+        inputs=[
+            torch.cat(computed, dim=1).contiguous(),
+            torch.cat(applied, dim=1).contiguous(),
+            None,
+            torch.cat(vel_limits, dim=1).contiguous(),
+            fused_wp,
+        ],
+        outputs=[
+            self._data.computed_torque,
+            self._data.applied_torque,
+            self._data.gear_ratio,
+            self._data.soft_joint_vel_limits,
+        ],
+        device=self.device,
+    )
+
+
+def bind_fused_actuator_model(robot: Any) -> None:
+    """Bind `_fused_apply_actuator_model` on this articulation instance."""
+    import types
+
+    robot._apply_actuator_model = types.MethodType(_fused_apply_actuator_model, robot)
+
+
 class IsaacWholeRobotBackend:
     """CPU-PhysX articulation controlled only by standard JointState commands."""
 
@@ -453,6 +559,9 @@ class IsaacWholeRobotBackend:
             },
         )
         self._robot = Articulation(robot_cfg)
+        # Ten Warp launches per target push -> two; see _fused_apply_actuator_model.
+        if _os.environ.get("TINKER_SIM_STOCK_ACTUATOR_MODEL", "") != "1":
+            bind_fused_actuator_model(self._robot)
         self.chassis_ballast_mass_kg = self._apply_chassis_ballast_mass()
         self._robot_view_identity: int | None = None
         self._clock_step_origin = 0
