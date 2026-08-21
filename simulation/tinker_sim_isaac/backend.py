@@ -277,8 +277,15 @@ class IsaacWholeRobotBackend:
     # the measured stop position latched without relying on an implicit drive.
     SAFETY_STOP_POSITION_GAIN = 600.0
     SAFETY_STOP_VELOCITY_GAIN = 80.0
-    SAFETY_HOLD_STIFFNESS = 0.0
-    SAFETY_HOLD_DAMPING = 0.0
+    # The hold is PhysX's own joint drive at the latched pose: stiffness and
+    # damping are the hold PD gains, evaluated by the solver at every substep
+    # rather than by Python at the control rate (which, with zero drive
+    # damping, limit-cycled: measured 2026-08-21 joint1 pinned at -100 Nm).
+    SAFETY_HOLD_STIFFNESS = SAFETY_STOP_POSITION_GAIN
+    SAFETY_HOLD_DAMPING = SAFETY_STOP_VELOCITY_GAIN
+    # Control steps between gravity feed-forward refreshes while held. The
+    # held pose is static, so the compensation changes only with slow sag.
+    SAFETY_HOLD_GRAVITY_REFRESH_STEPS = 30
     SAFETY_HOLD_EFFORT_LIMIT = 100.0
     # joint[1-2] tier values only; used as a degenerate fallback when live
     # per-joint gain reads fail (see _read_joint_gain_values).
@@ -391,6 +398,8 @@ class IsaacWholeRobotBackend:
         self._safety_nominal_damping: tuple[float, ...] = ()
         self._safety_nominal_effort_limits: tuple[float, ...] = ()
         self._safety_gains_applied = False
+        self._safety_hold_steps = 0
+        self._safety_hold_effort: Any | None = None
         self._command_snapshot_id: int | None = None
         self._pending_snapshot_id: int | None = None
         self._pending_snapshot_count = 0
@@ -800,6 +809,40 @@ class IsaacWholeRobotBackend:
                 "env_ids": [0],
             }
         )
+        self._sync_actuator_model_parameter(
+            {"stiffness": "stiffness", "damping": "damping", "limits": "effort_limit"}[
+                keyword
+            ],
+            values,
+        )
+
+    def _sync_actuator_model_parameter(
+        self, attribute: str, values: float | tuple[float, ...]
+    ) -> None:
+        """Mirror a PhysX gain/limit write into the owning actuator models.
+
+        Isaac Lab issue #128: the ``write_joint_*_to_sim_index`` writers update
+        only the simulator buffers. Each ImplicitActuator keeps its own
+        stiffness/damping/effort-limit tensors, which (a) are re-applied on
+        reset/reinit and (b) are what ``applied_torque`` telemetry -- the
+        published joint effort -- is computed from. Without this mirror the
+        hold reported ``20000 * error`` (the nominal arm stiffness) while
+        PhysX was actually applying ``600 * error``.
+        """
+        ids = tuple(self._safety_joint_ids)
+        if isinstance(values, tuple):
+            per_joint = {joint_id: float(v) for joint_id, v in zip(ids, values)}
+        else:
+            per_joint = {joint_id: float(values) for joint_id in ids}
+        for actuator in getattr(self._robot, "actuators", {}).values():
+            names = getattr(actuator, "joint_names", None)
+            tensor = getattr(actuator, attribute, None)
+            if names is None or not isinstance(tensor, self._torch.Tensor):
+                continue
+            for local_index, name in enumerate(names):
+                joint_id = self._joint_index.get(name)
+                if joint_id in per_joint:
+                    tensor[:, local_index] = per_joint[joint_id]
 
     def _write_safety_effort_limit(self, values: float | tuple[float, ...]) -> None:
         self._write_safety_joint_gain(
@@ -816,29 +859,6 @@ class IsaacWholeRobotBackend:
         if not math.isfinite(ceiling) or ceiling < 0.0:
             raise RuntimeError("safety stop has an invalid finite effort ceiling")
         return tuple(ceiling for _ in self._safety_joint_ids)
-
-    def _safety_measured_state(self) -> tuple[Any, Any]:
-        """Read finite measured joint state in the command tensor format."""
-        target = self._position_targets
-        expected_shape = tuple(int(value) for value in target.shape)
-        tensors: list[Any] = []
-        for attribute in ("joint_pos", "joint_vel"):
-            try:
-                value = self._torch_value(getattr(self._robot.data, attribute))
-                shape = tuple(int(item) for item in value.shape)
-                if shape != expected_shape:
-                    raise ValueError(
-                        f"{attribute} shape {shape} does not match {expected_shape}"
-                    )
-                value = value.to(dtype=target.dtype, device=target.device)
-                if not bool(self._torch.isfinite(value).all().item()):
-                    raise ValueError(f"{attribute} contains non-finite values")
-            except Exception as error:
-                raise RuntimeError(
-                    f"safety stop cannot read finite {attribute} state"
-                ) from error
-            tensors.append(value)
-        return tensors[0], tensors[1]
 
     def _safety_gravity_efforts(self) -> Any:
         """Read gravity compensation for arm joints, including base-DoF offset."""
@@ -879,22 +899,17 @@ class IsaacWholeRobotBackend:
             ) from error
 
     def _compute_safety_efforts(self) -> Any:
-        """Compute gravity compensation plus bounded measured-state PD effort."""
+        """Gravity feed-forward for the arm hold, bounded by the hold ceiling.
+
+        The position/velocity correction is PhysX's drive (stiffness
+        ``SAFETY_HOLD_STIFFNESS``, damping ``SAFETY_HOLD_DAMPING`` at the
+        latched pose, effort limit ``SAFETY_HOLD_EFFORT_LIMIT``); only the
+        gravity term is fed forward as an explicit effort.
+        """
         if self._safety_snapshot is None:
             raise RuntimeError("safety stop has no latched measured position")
-        measured_pos, measured_vel = self._safety_measured_state()
-        latched_pos = self._safety_snapshot.to(
-            dtype=measured_pos.dtype,
-            device=measured_pos.device,
-        )
         joint_ids = list(self._safety_joint_ids)
-        gravity = self._safety_gravity_efforts()
-        position_error = latched_pos[:, joint_ids] - measured_pos[:, joint_ids]
-        correction = (
-            self.SAFETY_STOP_POSITION_GAIN * position_error
-            - self.SAFETY_STOP_VELOCITY_GAIN * measured_vel[:, joint_ids]
-        )
-        raw_effort = gravity + correction
+        raw_effort = self._safety_gravity_efforts()
         limits = self._torch.tensor(
             [self._safety_effort_limits()],
             dtype=raw_effort.dtype,
@@ -913,34 +928,41 @@ class IsaacWholeRobotBackend:
         return result
 
     def _apply_safety_actuator_hold(self) -> None:
-        """Apply the explicit gravity-compensated arm hold before every step.
+        """Hold the arm with PhysX's drive at the latched pose.
 
-        The hold has two parts. The arm drive configuration -- effort ceiling
-        100 Nm, stiffness 0, damping 0 -- is constant for the whole hold, and
-        each of those writes is a PhysX *model property* write (Warp launch,
-        CPU clone, `set_dof_*` on the view; measured 2.9 ms per step plus a
-        deferred ~3.8 ms flush). It is therefore written once, on hold entry,
-        and again only after the articulation view was re-resolved
-        (`_refresh_robot_handles` clears `_safety_gains_applied`, since a
-        fresh view carries the actuator model's nominal gains). The effort
-        target -- gravity compensation plus the bounded PD correction -- does
-        depend on the measured state and is recomputed and pushed every step.
+        On hold entry (and again after the articulation view was re-resolved,
+        which clears ``_safety_gains_applied``) the arm drive is configured
+        once: effort ceiling ``SAFETY_HOLD_EFFORT_LIMIT``, stiffness
+        ``SAFETY_HOLD_STIFFNESS`` and damping ``SAFETY_HOLD_DAMPING``. With the
+        position target latched and the velocity target zero, PhysX then
+        applies ``clip(k_p (q_hold - q) - k_d qdot + g, +-ceiling)`` at every
+        solver substep -- the same law the former Python hold evaluated at
+        the control rate, minus its limit cycle. The gravity feed-forward
+        ``g`` is written on entry and refreshed every
+        ``SAFETY_HOLD_GRAVITY_REFRESH_STEPS`` control steps; between refreshes
+        nothing is pushed (the write gate sees unchanged targets).
         """
-        effort = self._compute_safety_efforts()
         if not self._safety_gains_applied:
             self._write_safety_effort_limit(self._safety_effort_limits())
             self._write_safety_joint_gain(
                 "write_joint_stiffness_to_sim_index",
                 "stiffness",
-                0.0,
+                float(self.SAFETY_HOLD_STIFFNESS),
             )
             self._write_safety_joint_gain(
                 "write_joint_damping_to_sim_index",
                 "damping",
-                0.0,
+                float(self.SAFETY_HOLD_DAMPING),
             )
             self._safety_gains_applied = True
-        self._effort_targets.copy_(effort)
+            self._safety_hold_steps = 0
+        if self._safety_hold_steps % self.SAFETY_HOLD_GRAVITY_REFRESH_STEPS == 0:
+            self._safety_hold_effort = self._compute_safety_efforts()
+        # step() zeroes the effort buffer before the hold runs; re-assert the
+        # cached feed-forward so the gate sees an unchanged target between
+        # refreshes and nothing is pushed.
+        self._effort_targets.copy_(self._safety_hold_effort)
+        self._safety_hold_steps += 1
 
     def _restore_safety_actuator_gains(self) -> None:
         if not getattr(self, "_safety_gains_applied", False):
