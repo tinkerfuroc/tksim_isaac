@@ -93,6 +93,12 @@ def _emit_step_profile(
     cycles = max(1, prof["cycles"])
     steps = max(1, prof["physics_n"])
     total = prof["physics"] + prof["publish"] + prof["kit_pump"] + prof["cameras"]
+    # Wall time per cycle not covered by the four buckets: gateway.spin_once,
+    # the heartbeat, pacing sleeps and anything the GIL gave away to the
+    # gateway's executor thread. This is where a live stack's cost hides.
+    spin = prof.get("spin", 0.0)
+    wall = prof.get("wall", 0.0)
+    other = max(0.0, wall - total - spin)
     payload = {
         "step_profile": {
             "cycles": prof["cycles"],
@@ -104,6 +110,9 @@ def _emit_step_profile(
                 "kit_pump": round(1000.0 * prof["kit_pump"] / cycles, 2),
                 "cameras": round(1000.0 * prof["cameras"] / cycles, 2),
                 "total": round(1000.0 * total / cycles, 2),
+                "spin": round(1000.0 * spin / cycles, 2),
+                "unaccounted": round(1000.0 * other / cycles, 2),
+                "wall": round(1000.0 * wall / cycles, 2),
             },
             "share_pct": {
                 key: round(100.0 * prof[key] / total, 1) if total > 0 else 0.0
@@ -119,7 +128,7 @@ def _emit_step_profile(
         payload["step_profile"]["camera_breakdown_ms"] = camera_breakdown
     print(json.dumps(payload, sort_keys=True), flush=True)
     sys.stdout.flush()
-    for key in ("physics", "publish", "kit_pump", "cameras"):
+    for key in ("physics", "publish", "kit_pump", "cameras", "spin", "wall"):
         prof[key] = 0.0
     prof["cycles"] = 0
     prof["physics_n"] = 0
@@ -998,6 +1007,9 @@ def main() -> int:
                 "publish": 0.0,
                 "kit_pump": 0.0,
                 "cameras": 0.0,
+                "spin": 0.0,
+                "wall": 0.0,
+                "_wall_mark": time.monotonic(),
                 "cycles": 0,
                 "physics_n": 0,
             }
@@ -1012,6 +1024,7 @@ def main() -> int:
                 and app.is_running()
                 and (args.duration <= 0.0 or backend.simulation_time < args.duration)
             ):
+                _tl = time.monotonic() if _profile else 0.0
                 gateway.spin_once()
                 if (
                     time.monotonic() - next_collision_heartbeat
@@ -1019,6 +1032,8 @@ def main() -> int:
                 ):
                     gateway.publish_safety_heartbeat()
                     next_collision_heartbeat = time.monotonic()
+                if _profile:
+                    _prof["spin"] += time.monotonic() - _tl
                 if omni.timeline.get_timeline_interface().is_playing():
                     _t0 = time.monotonic() if _profile else 0.0
                     backend.step()
@@ -1048,6 +1063,8 @@ def main() -> int:
                                 _t2 = time.monotonic()
                                 _prof["kit_pump"] += _t1 - _t0
                                 _prof["cameras"] += _t2 - _t1
+                                _prof["wall"] += _t2 - _prof["_wall_mark"]
+                                _prof["_wall_mark"] = _t2
                                 _prof["cycles"] += 1
                                 if _prof["cycles"] % _profile_every == 0:
                                     _emit_step_profile(
