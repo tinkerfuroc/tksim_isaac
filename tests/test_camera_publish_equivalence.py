@@ -29,6 +29,19 @@ from tinker_sim_isaac.camera_rig import (  # noqa: E402
     rgb8_array,
 )
 
+#: warp is installed only under ./.venv (Isaac Sim's Python), not under
+#: plain system python; the real-kernel equivalence test below needs it to
+#: run the exact CameraRig.capture() kernel (see camera_rig._depth_to_mm_u16_kernel),
+#: not a numpy re-implementation, so it must skip cleanly (not fail) when
+#: warp isn't importable.
+try:
+    import warp as wp
+
+    _WARP_AVAILABLE = True
+except ImportError:
+    wp = None  # type: ignore[assignment]
+    _WARP_AVAILABLE = False
+
 #: (width, height) for head_camera and wrist_camera, from hardware-parity.json.
 RESOLUTIONS = ((1280, 720), (848, 480))
 
@@ -206,11 +219,62 @@ class DepthEquivalenceTest(unittest.TestCase):
             depth = rng.integers(-5, 200, size=(height, width), dtype=np.int32)
             self._check(depth)
 
-    def test_uint16_input(self) -> None:
+    def test_uint16_input_is_passthrough_not_reprocessed(self) -> None:
+        """A uint16 (H, W) array is now CameraRig.capture()'s depth output
+        shape: already converted to 16UC1 mm on the GPU (see
+        camera_rig._depth_to_mm_u16_kernel), so depth_to_16uc1_mm detects
+        the dtype and returns it unchanged instead of running it back
+        through the metres->mm pipeline.
+
+        This is a deliberate divergence from ``_depth_to_16uc1_mm_reference``
+        for this one dtype: the reference has no such special case and would
+        upcast + multiply by 1000 + clamp like any other non-float input
+        (see ``test_integer_input_upcasts``). Do not use ``_check`` here --
+        it asserts equality with the reference, which is exactly the
+        behavior this test must show does NOT happen any more. See
+        ``test_uint16_passthrough_matches_converted_float_frame`` below for
+        the passthrough's actual equivalence guarantee.
+        """
         rng = np.random.default_rng(15)
         for width, height in RESOLUTIONS:
             depth = rng.integers(0, 1000, size=(height, width), dtype=np.uint16)
-            self._check(depth)
+            optimized = depth_to_16uc1_mm(depth)
+            self.assertEqual(optimized.dtype, np.uint16)
+            self.assertEqual(optimized.shape, depth.shape)
+            self.assertTrue(np.array_equal(optimized, depth))
+            self.assertEqual(bytes(optimized.tobytes()), bytes(depth.tobytes()))
+            # Sanity: confirm this genuinely differs from what the
+            # reference's generic-numeric-upcast path would have produced,
+            # so this test cannot pass "by accident".
+            reference = _depth_to_16uc1_mm_reference(depth)
+            if np.any(depth != 0):
+                self.assertFalse(np.array_equal(optimized, reference))
+
+    def test_uint16_passthrough_matches_converted_float_frame(self) -> None:
+        """Simulates CameraRig.capture(): the uint16 array handed to
+        depth_to_16uc1_mm is exactly what converting the *original* float
+        metres frame would have produced (that is what the GPU kernel
+        guarantees, see camera_rig._depth_to_mm_u16_kernel and
+        DepthKernelWarpCpuEquivalenceTest below); the passthrough must
+        return those same bytes unchanged, i.e. identical to converting the
+        source float frame directly.
+        """
+        rng = np.random.default_rng(21)
+        for width, height in RESOLUTIONS:
+            depth_metres = rng.random(size=(height, width)).astype(np.float32) * 50.0
+            depth_metres[0, 0] = np.nan
+            depth_metres[0, 1] = np.inf
+            depth_metres[0, 2] = -np.inf
+            depth_metres[0, 3] = 0.0
+            depth_metres[0, 4] = 70.0
+            converted_from_float = depth_to_16uc1_mm(depth_metres)
+            passthrough = depth_to_16uc1_mm(converted_from_float)
+            self.assertEqual(passthrough.dtype, np.uint16)
+            self.assertEqual(passthrough.shape, converted_from_float.shape)
+            self.assertTrue(np.array_equal(passthrough, converted_from_float))
+            self.assertEqual(
+                bytes(passthrough.tobytes()), bytes(converted_from_float.tobytes())
+            )
 
     def test_half_even_rounding_boundary(self) -> None:
         for width, height in RESOLUTIONS:
@@ -257,6 +321,93 @@ class DepthEquivalenceTest(unittest.TestCase):
             reference = _depth_to_16uc1_mm_reference(depth)
             optimized = depth_to_16uc1_mm(_FakePinnedHostArray(depth))
             _assert_identical(self, reference, optimized)
+
+
+@unittest.skipUnless(_WARP_AVAILABLE, "warp is not importable under this interpreter")
+class DepthKernelWarpCpuEquivalenceTest(unittest.TestCase):
+    """Runs the *real* Warp kernel ``CameraRig.capture()`` launches on the
+    GPU (``camera_rig._depth_to_mm_u16_kernel()``) on Warp's CPU device
+    instead, and checks its output is bit-identical to
+    ``_depth_to_16uc1_mm_reference``.
+
+    Deliberately not a numpy re-implementation of the kernel's semantics --
+    that would only prove two independent implementations agree with each
+    other, not that this exact kernel (the one ``CameraRig`` actually
+    launches on CUDA) is correct. Running it on ``device="cpu"`` instead of
+    ``"cuda"`` exercises the identical kernel object/logic without needing a
+    GPU in this test process; GPU-side byte-identity against real annotator
+    frames is covered separately by ``outputs/bench/probe_depth_kernel_final.py``
+    (see that script/its JSON for the >=60-real-frame-per-camera result).
+
+    Requires ``warp`` (installed only under ``./.venv``, Isaac Sim's
+    Python); skips cleanly under plain system Python.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        wp.init()
+
+    def _run_kernel(self, depth: np.ndarray) -> np.ndarray:
+        from tinker_sim_isaac.camera_rig import _depth_to_mm_u16_kernel
+
+        flat = np.ascontiguousarray(depth.reshape(-1), dtype=np.float32)
+        n = int(flat.shape[0])
+        depth_in = wp.array(flat, dtype=wp.float32, device="cpu")
+        depth_out = wp.zeros(n, dtype=wp.uint16, device="cpu")
+        wp.launch(
+            _depth_to_mm_u16_kernel(), dim=n, inputs=[depth_in, depth_out], device="cpu"
+        )
+        return depth_out.numpy().reshape(depth.shape)
+
+    def _check(self, depth: np.ndarray) -> None:
+        expected = _depth_to_16uc1_mm_reference(depth)
+        actual = self._run_kernel(depth)
+        self.assertEqual(actual.dtype, expected.dtype)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(
+            np.array_equal(actual, expected),
+            msg="Warp kernel output does not match _depth_to_16uc1_mm_reference",
+        )
+        self.assertEqual(bytes(actual.tobytes()), bytes(expected.tobytes()))
+
+    def test_edge_value_set(self) -> None:
+        # The exact edge set outputs/bench/probe_gpu_depth_rgba.py proved
+        # bit-identical on the GPU: NaN, +-Inf, negative, zero, the two
+        # tie-to-even boundaries the reference and wp.round disagree on,
+        # sub-mm ties, a denormal, and an out-of-range value that must clamp.
+        edge_values = np.array(
+            [
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+                -1.0,
+                0.0,
+                65.5345,  # *1000 = 65534.5 tie -> even (65534)
+                65.5355,  # *1000 = 65535.5 tie -> even (65536) -> clamp 65535
+                0.0005,  # *1000 = 0.5 tie -> even (0)
+                0.0015,  # *1000 = 1.5 tie -> even (2)
+                1e-45,
+                70000.0,
+                1.234567,
+                0.0009999,
+            ],
+            dtype=np.float32,
+        ).reshape(1, -1)
+        self._check(edge_values)
+
+    def test_random_frames_both_resolutions(self) -> None:
+        rng = np.random.default_rng(101)
+        for width, height in RESOLUTIONS:
+            depth = (rng.random(size=(height, width)).astype(np.float32) * 80.0) - 5.0
+            depth[0, 0] = np.nan
+            depth[0, 1] = np.inf
+            depth[0, 2] = -np.inf
+            depth[0, 3] = 0.0
+            depth[0, 4] = 65.535
+            depth[0, 5] = 65.5345
+            depth[0, 6] = 65.5355
+            depth[0, 7] = 70.0
+            self._check(depth)
 
 
 if __name__ == "__main__":
