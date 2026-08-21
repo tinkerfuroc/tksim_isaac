@@ -952,7 +952,7 @@ References:
   (`0a42eec`); the head `pan_joint`/`tilt_joint` actuator group now gets
   the same `effort_limit_sim` override as arm/wheels (`5e07c5c`);
   `slew_velocity_target` plus safety-stop idempotence (`e72574d`) and a
-  per-tick vectorised wheel-velocity slew bound of 60 rad/s² (`86ec363`);
+  per-tick wheel-velocity slew bound of 60 rad/s² (`86ec363`);
   actor-path interpolation with fail-closed `actor_path_start` validation
   (`e780295`) and an `actor_path_driver` node that executes those paths via
   `/set_entity_state` (`46ac8ae`); two arena-native scenario variants with
