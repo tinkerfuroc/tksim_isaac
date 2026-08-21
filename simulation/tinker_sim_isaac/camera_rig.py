@@ -336,6 +336,11 @@ class CameraRig:
             raise ValueError("camera rig requires at least one camera spec")
         self.specs = tuple(specs)
         self._sensors: dict[str, Any] = {}
+        #: Per-camera (rgb, depth) pinned host wp.array buffers, sized to the
+        #: exact post-conversion shape. Reused every ``capture()`` call so
+        #: the per-frame D2H copy lands in existing pinned memory instead of
+        #: a fresh pageable allocation (see ``capture()``).
+        self._pinned: dict[str, tuple[Any, Any]] = {}
 
     def initialize(self, app: Any) -> None:
         from isaacsim.core.utils.extensions import enable_extension
@@ -345,6 +350,7 @@ class CameraRig:
             app.update()
 
         import omni.usd
+        import warp as wp
         from isaacsim.sensors.experimental.rtx import CameraSensor, RtxCamera
         from pxr import Gf, Usd, UsdGeom
 
@@ -394,13 +400,65 @@ class CameraRig:
                 resolution=(spec.height, spec.width),
                 annotators=[COLOR_ANNOTATOR, DEPTH_ANNOTATOR],
             )
+            # Pinned (page-locked) host buffers, sized to what rgb8_array/
+            # depth_to_16uc1_mm expect (post RGBA->RGB slice, post channel
+            # squeeze). Pinned memory lets the D2H copy in capture() run as
+            # a real async DMA instead of the synchronous-by-necessity copy
+            # a pageable destination forces.
+            self._pinned[spec.name] = (
+                wp.empty((spec.height, spec.width, 3), dtype=wp.uint8, device="cpu", pinned=True),
+                wp.empty((spec.height, spec.width), dtype=wp.float32, device="cpu", pinned=True),
+            )
         for _ in range(4):
             app.update()
 
     def capture(self) -> dict[str, tuple[Any, Any]]:
+        """Fetch each camera's RGB+depth into reused pinned host buffers.
+
+        ``sensor.get_data`` returns a GPU-side wp.array (a strided RGBA->RGB
+        view for rgb, a contiguous buffer for depth); each is copied with
+        ``wp.copy`` into this rig's pinned host scratch for that camera
+        instead of letting ``to_numpy()`` do its usual
+        ``warp.clone(device="cpu")`` (a fresh pageable allocation every
+        frame). Because the pinned destination makes the D2H copy a real
+        async DMA, all four copies (two cameras x rgb/depth) are enqueued
+        before a single ``wp.synchronize_stream`` blocks for all of them,
+        instead of each ``to_numpy()`` call synchronizing on its own.
+
+        Deliberately ``synchronize_stream``, not ``synchronize_device``:
+        ``wp.copy`` with a non-CUDA destination runs on the *source*
+        array's current stream (see ``warp.copy``), the same stream the RTX
+        annotator pipeline enqueues its own GPU work on, so waiting for
+        just that stream to drain already makes the copied data valid.
+        ``wp.synchronize_device`` instead blocks on the whole CUDA context
+        -- every other stream Kit has outstanding work on too, including
+        the renderer's passes for frames we don't even want yet -- which a
+        probe measured (outputs/bench/probe_camera.py) as 4-7x slower than
+        ``synchronize_stream`` for the exact same copies, i.e. worse than
+        the ``to_numpy()`` baseline this is meant to beat.
+
+        The returned arrays are byte-identical to what ``to_numpy()`` would
+        have produced from the un-pinned GPU array (same underlying gather
+        + copy); only the destination allocation and synchronization scope
+        change.
+        """
+        import warp as wp
+
         frames: dict[str, tuple[Any, Any]] = {}
+        sync_device = None
         for name, sensor in self._sensors.items():
             rgb, _info = sensor.get_data(COLOR_ANNOTATOR)
             depth, _info = sensor.get_data(DEPTH_ANNOTATOR)
+            rgb_pinned, depth_pinned = self._pinned[name]
+            if rgb is not None:
+                wp.copy(rgb_pinned, rgb)
+                sync_device = rgb.device
+                rgb = rgb_pinned
+            if depth is not None:
+                wp.copy(depth_pinned, depth)
+                sync_device = depth.device
+                depth = depth_pinned
             frames[name] = (rgb, depth)
+        if sync_device is not None:
+            wp.synchronize_stream(sync_device)
         return frames
