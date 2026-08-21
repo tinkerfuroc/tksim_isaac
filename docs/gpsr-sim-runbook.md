@@ -145,6 +145,63 @@ tree. Halving the cadence halves both costs.
 unset, its 30 Hz is used. The override may only *lower* the rate — publishing
 faster than the real camera would be a parity violation, and is refused.
 
+### Control cadence under a live stack (`TINKER_SIM_CONTROL_HZ`)
+
+Export `TINKER_SIM_CONTROL_HZ=60` (with `TINKER_SIM_CAMERA_HZ=15`) before
+Stage 1 for live-stack runs. Do **not** use `TINKER_SIM_PHYSICS_HZ=60` for
+that purpose any more.
+
+The simulator has two rates. The *physics* rate (`TINKER_SIM_PHYSICS_HZ`,
+default 120, may only be lowered) is PhysX's solver step — the thing every
+contact/grasp result was validated at. The *control* rate
+(`TINKER_SIM_CONTROL_HZ`, default = physics rate) is how often Isaac Lab,
+the joint-target writes, the wheel slew, the gateway publish and `/clock`
+run. With the control rate lowered, each control step runs
+`physics_hz / control_hz` explicit solver substeps of the validated
+1/120 s, so the solver trajectory is unchanged while every per-step wrapper
+cost is paid 60 times a second instead of 120. The control rate must divide
+the physics rate evenly and has a 30 Hz floor. Note omni.physx's
+`IPhysxSimulation.simulate(elapsed)` does *not* substep on its own — it
+integrates exactly `elapsed` — which is why the substeps are explicit and
+why simply lowering `dt` was a fidelity change, not an optimisation.
+
+Measured 2026-08-21 (gpsr-rcw2026, rcw2026 arena, GPU 1, RTF =
+simulated / wall):
+
+| run | physics-only (no ROS, no cameras) | sensor-rich + ROS, cameras 15 Hz |
+|---|---|---|
+| default 120 / control 120 | 0.75 | 0.40 (0.35 before the lidar fix below) |
+| `TINKER_SIM_CONTROL_HZ=60` | 1.18 | 0.51 |
+| `TINKER_SIM_CONTROL_HZ=30` | 1.88 | 0.60 |
+| `TINKER_SIM_PHYSICS_HZ=60` (old advice) | 1.61 | 0.51 (before the lidar fix) |
+
+Robot root position after 10 s idle agreed with the default to within
+0.5 mm at control 60/30 and drifted 5 mm at physics 60 — the substepped runs
+keep the validated solver trajectory, the lowered physics rate does not.
+Lower control rates also lower the IMU (200 Hz parity) and base-state
+(50 Hz) publish cadences, which are derived from the control step: at 60 Hz
+they publish at 60 Hz, at 30 Hz they publish at 30 Hz.
+
+What still bounds RTF under the live stack, per simulated second at control
+60: the PhysX solve itself (~10 ms per control step, 32 authored position
+iterations), the Kit render pump for both RTX cameras (~30 ms per camera
+frame) and the image capture/publish (~22 ms per camera frame). Two further
+opt-in knobs exist: `TINKER_SIM_SOLVER_POSITION_ITERATIONS` /
+`TINKER_SIM_SOLVER_VELOCITY_ITERATIONS` override the robot USD's articulation
+solver iteration counts (32 / 1); 8 position iterations measured RTF 0.52
+at control 60 but *changes drive and contact convergence*, so it is not
+recommended for anything that produces evidence. PhysX worker-thread count
+(`--/persistent/physics/numThreads`, default 8) made no measurable
+difference at 4 or 16.
+
+With `TINKER_SIM_PROFILE=1`, every profile line now also carries
+`physics_breakdown_ms.physx_substeps` and a `publish_breakdown_ms`
+(clock / joint_state / imu / cloud / status / truth per `publish()` call).
+That breakdown is how the development-lidar ray-cast was found to cost
+~35 ms per lidar frame (~350 ms per simulated second); it is now vectorised
+and bit-identical (`OccupancyMap.raycast_many`), at ~2–5 ms per frame;
+that alone took the default sensor-rich run from RTF 0.35 to 0.40.
+
 Only the `sensor-rich` profile loads `simulation/sensors/hardware-parity.json`
 and publishes the real-named camera topics GPSR's vision stack needs (valid
 `--sensor-profile` values are `physics-only | sensor-rich | navigation-parity

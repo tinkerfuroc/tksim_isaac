@@ -6,7 +6,12 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from tinker_sim_isaac.physics_rate import resolve_physics_hz
+from tinker_sim_isaac.physics_rate import (
+    physics_substeps,
+    resolve_control_hz,
+    resolve_physics_hz,
+    resolve_solver_iterations,
+)
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_core.command_mux import JointCommand, decode_snapshot_packet
 from tinker_sim_core.occupancy import OccupancyMap
@@ -223,7 +228,23 @@ class IsaacWholeRobotBackend:
             physics_hz, _os.environ.get("TINKER_SIM_PHYSICS_HZ")
         )
         self.physics_hz = physics_hz
-        self.dt = 1.0 / physics_hz
+        # The control step (target writes, wheel slew, Articulation.update,
+        # gateway strides, /clock) may be a whole multiple of the PhysX solver
+        # step: each control step then runs `physics_substeps` Isaac Lab
+        # physics steps of the validated 1/physics_hz, so contact fidelity is
+        # unchanged while every per-step wrapper cost is paid control_hz times
+        # a second. (omni.physx's IPhysxSimulation.simulate(elapsed) does NOT
+        # substep -- measured 2026-08-21: one 1/60 s solver step for a 1/60 s
+        # call even with timeStepsPerSecond=120 -- so the substeps are
+        # explicit.) Opt-in via TINKER_SIM_CONTROL_HZ; unset, control_hz ==
+        # physics_hz and the loop is exactly what it was.
+        control_hz = resolve_control_hz(
+            physics_hz, _os.environ.get("TINKER_SIM_CONTROL_HZ")
+        )
+        self.control_hz = control_hz
+        self.physics_substeps = physics_substeps(physics_hz, control_hz)
+        self.dt = 1.0 / control_hz
+        self.physics_dt = 1.0 / physics_hz
         self.render = render
         # Opt-in per-step wall-time attribution (TINKER_SIM_PROFILE=1). Splits
         # the PhysX solve from the Isaac Lab tensor/Python work around it.
@@ -286,12 +307,26 @@ class IsaacWholeRobotBackend:
         self._contact_event_persist = ContactEventType.CONTACT_PERSIST
         self._contact_report_subscription: Any | None = None
         self._sim = SimulationContext(
-            SimulationCfg(dt=self.dt, device=self.physics_device, render_interval=1)
+            SimulationCfg(
+                dt=self.physics_dt, device=self.physics_device, render_interval=1
+            )
         )
         self._timeline = omni.timeline.get_timeline_interface()
         if str(self._sim.device) != self.physics_device:
             raise RuntimeError(
                 f"behavior validation requires CPU physics; Isaac selected {self._sim.device}"
+            )
+        if self.physics_substeps > 1:
+            print(
+                json.dumps(
+                    {
+                        "physics_hz": self.physics_hz,
+                        "control_hz": self.control_hz,
+                        "physx_substeps": self.physics_substeps,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
             )
 
         if add_ground_plane:
@@ -329,12 +364,35 @@ class IsaacWholeRobotBackend:
                         translation=(x, y, 0.6),
                     )
 
+        # Opt-in articulation solver iteration override; unset, the USD's
+        # authored counts (32 position / 1 velocity for tinker2) apply.
+        solver_position = resolve_solver_iterations(
+            "position", _os.environ.get("TINKER_SIM_SOLVER_POSITION_ITERATIONS")
+        )
+        solver_velocity = resolve_solver_iterations(
+            "velocity", _os.environ.get("TINKER_SIM_SOLVER_VELOCITY_ITERATIONS")
+        )
+        self.solver_iterations = {
+            "position": solver_position,
+            "velocity": solver_velocity,
+        }
+        articulation_props = None
+        if solver_position is not None or solver_velocity is not None:
+            articulation_props = sim_utils.ArticulationRootPropertiesCfg(
+                solver_position_iteration_count=solver_position,
+                solver_velocity_iteration_count=solver_velocity,
+            )
+            print(
+                json.dumps({"solver_iterations": self.solver_iterations}, sort_keys=True),
+                flush=True,
+            )
         robot_cfg = ArticulationCfg(
             prim_path="/World/Tinker",
             spawn=sim_utils.UsdFileCfg(
                 usd_path=str(usd_path.resolve()),
                 activate_contact_sensors=enable_contacts,
                 joint_drive_props=sim_utils.JointDriveBaseCfg(drive_type="force"),
+                articulation_props=articulation_props,
             ),
             init_state=ArticulationCfg.InitialStateCfg(pos=(spawn_x, spawn_y, spawn_z)),
             actuators={
@@ -422,6 +480,17 @@ class IsaacWholeRobotBackend:
             )
             if self._contact_report_subscription is None:
                 raise RuntimeError("manipulation-core requires PhysX contact reporting")
+
+    def _step_simulation(self) -> None:
+        """One control step: ``physics_substeps`` solver steps of ``physics_dt``.
+
+        Each Isaac Lab ``step()`` is one ``IPhysxSimulation.simulate(dt)`` +
+        ``fetch_results()`` at the validated solver dt; Kit is rendered (when
+        enabled) only after the last substep.
+        """
+        last = self.physics_substeps - 1
+        for index in range(self.physics_substeps):
+            self._sim.step(render=self.render and index == last)
 
     def _apply_chassis_ballast_mass(self) -> float:
         """Add 10 kg to the existing low-mounted chassis ballast before reset."""
@@ -520,8 +589,10 @@ class IsaacWholeRobotBackend:
         # simulation-control extension loaded, Kit's presentation timeline may
         # remain at its first frame even while physics advances.  Isaac Lab's
         # public monotonic counter is therefore the authoritative /clock.
+        # Isaac Lab counts solver steps; with substepping several make up one
+        # control step, so the clock advances by physics_dt per counted step.
         steps = self._sim.get_physics_step_count() - self._clock_step_origin
-        return float(max(0, steps)) * self.dt
+        return float(max(0, steps)) * self.physics_dt
 
     @property
     def physics_frame_index(self) -> int:
@@ -531,7 +602,9 @@ class IsaacWholeRobotBackend:
         steps = simulation.get_physics_step_count() - getattr(
             self, "_clock_step_origin", 0
         )
-        return max(0, int(steps))
+        # One frame per control step (the cadence truth is published on), so
+        # frame indices stay contiguous under substepping.
+        return max(0, int(steps)) // max(1, getattr(self, "physics_substeps", 1))
 
     @property
     def timeline_end_time(self) -> float:
@@ -1020,7 +1093,7 @@ class IsaacWholeRobotBackend:
         if _t is not None:
             _sp["write_data"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
-        self._sim.step(render=self.render)
+        self._step_simulation()
         if _t is not None:
             _sp["physx"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
@@ -1052,6 +1125,9 @@ class IsaacWholeRobotBackend:
         # How many of those steps actually pushed targets to PhysX; the rest
         # were byte-identical re-sends the write gate skipped.
         out["target_writes"] = sp["target_writes"]
+        # PhysX solver steps per control step (1 unless TINKER_SIM_CONTROL_HZ
+        # lowered the control rate below physics_hz).
+        out["physx_substeps"] = self.physics_substeps
         for key in ("targets", "write_data", "physx", "robot_update", "object_views"):
             sp[key] = 0.0
         sp["target_writes"] = 0
