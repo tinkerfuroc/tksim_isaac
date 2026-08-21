@@ -872,6 +872,16 @@ References:
   `robot.usd` (URDF `<mimic>` lost in conversion) and swing freely.
   `tests/test_manipulation_runtime.py`'s fixture had silently errored 15
   tests since `b6b6f0f`; repaired.
+  Later the same day: cameras at 12 Hz (`TINKER_SIM_CAMERA_HZ=12`, exact at
+  control 60/120) measured RTF 0.77 at control 60; the Kit render pump
+  (~30 ms per camera frame) was probed and is not render-mode, GI,
+  async-rendering or readback bound (each <1 ms) -- it is Kit's
+  per-render-product pipeline at the parity resolutions, so no result-neutral
+  lever remains there; depth metres->mm conversion moved to a Warp kernel on
+  the GPU (banker's rounding, byte-identical): RTF 0.80 at control 60 /
+  12 Hz, simulator VRAM peak 2.6 GB (old code 2.7-3.6 GB). The optional
+  `--camera-pointcloud` cloud is now built from millimetre depth (1 mm
+  quantisation).
 
 - 2026-08-19 (arena scenario entity spawning — "verify person and object
   spawn"): Verified the standard scenario spawn path inside `--arena

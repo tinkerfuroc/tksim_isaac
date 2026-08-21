@@ -147,9 +147,13 @@ faster than the real camera would be a parity violation, and is refused.
 
 ### Control cadence under a live stack (`TINKER_SIM_CONTROL_HZ`)
 
-Export `TINKER_SIM_CONTROL_HZ=60` (with `TINKER_SIM_CAMERA_HZ=15`) before
-Stage 1 for live-stack runs. Do **not** use `TINKER_SIM_PHYSICS_HZ=60` for
-that purpose any more.
+Export `TINKER_SIM_CONTROL_HZ=60` (with `TINKER_SIM_CAMERA_HZ=12`; 15 if the
+vision stack needs it) before Stage 1 for live-stack runs. Do **not** use
+`TINKER_SIM_PHYSICS_HZ=60` for that purpose any more. 12 Hz is exact at
+control 120 and 60 (strides 10 and 5); at control 30 it rounds to 15 Hz.
+Measured 2026-08-21 at control 60: cameras 15 Hz RTF 0.70, 12 Hz 0.77, and
+0.80 once depth conversion moved to the GPU. Simulator VRAM on that run:
+peak 2.6 GB, steady 2.3 GB (the 2026-08-20 code ran 2.7-3.6 GB).
 
 The simulator has two rates. The *physics* rate (`TINKER_SIM_PHYSICS_HZ`,
 default 120, may only be lowered) is PhysX's solver step — the thing every
@@ -188,9 +192,15 @@ Lower control rates also lower the IMU (200 Hz parity) and base-state
 they publish at 60 Hz, at 30 Hz they publish at 30 Hz.
 
 What still bounds RTF under the live stack, per simulated second at control
-60: the PhysX solve itself (~10 ms per control step, 32 authored position
-iterations), the Kit render pump for both RTX cameras (~30 ms per camera
-frame) and the image capture/publish (~22 ms per camera frame). Two further
+60: the PhysX solve itself (~9 ms per control step, 32 authored position
+iterations) and the Kit render pump for both RTX cameras (~30 ms per camera
+frame). The pump was probed on 2026-08-21 and is *not* render-mode, GI,
+async-rendering or readback bound: `RaytracedLighting` instead of the
+default `RealTimePathTracing`, `/app/asyncRendering=true`, and
+reflections/indirect-diffuse/AO off each changed it by <1 ms; an empty Kit
+update is ~2 ms, and the cost scales with camera pixel count (~19 ms head,
+~7 ms wrist). It is Kit's per-render-product frame pipeline at the parity
+resolutions, and the only remaining levers are structural. Two further
 opt-in knobs exist: `TINKER_SIM_SOLVER_POSITION_ITERATIONS` /
 `TINKER_SIM_SOLVER_VELOCITY_ITERATIONS` override the robot USD's articulation
 solver iteration counts (32 / 1); 8 position iterations measured RTF 0.52
@@ -221,9 +231,15 @@ With `TINKER_SIM_PROFILE=1`, every profile line now also carries
   each kernel once over all groups -- bit-identical staging and telemetry
   buffers, push 4.3-6.4 -> 1.8 ms. `TINKER_SIM_STOCK_ACTUATOR_MODEL=1`
   restores Isaac Lab's loop.
-- **Camera conversions.** `rgb8_array`/`depth_to_16uc1_mm` reuse scratch
-  buffers and write in place (byte-identical, proven by
-  `tests/test_camera_publish_equivalence.py`); ~14% off the conversion time.
+- **Camera conversions.** Frames are copied into pinned host buffers with one
+  stream sync per cycle, RGB conversion writes into reused scratch buffers,
+  and depth metres->16UC1 mm is a Warp kernel on the GPU (`wp.rint`, i.e.
+  banker's rounding like `np.rint`); all byte-identical to the reference
+  implementations kept in `camera_rig.py`, proven by
+  `tests/test_camera_publish_equivalence.py` on synthetic edge cases and 120
+  real frames. Camera stage 23 -> 13 ms per cycle. Note: with the optional
+  `--camera-pointcloud` flag (off in this runbook) the cloud is now built
+  from the millimetre depth, i.e. quantised to 1 mm.
   With `TINKER_SIM_PROFILE=1` the profile line now also carries a
   `camera_breakdown_ms` (capture / rgb_convert / depth_convert / image_fill /
   image_publish / info).
