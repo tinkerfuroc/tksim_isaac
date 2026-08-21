@@ -804,21 +804,34 @@ class IsaacWholeRobotBackend:
         return result
 
     def _apply_safety_actuator_hold(self) -> None:
-        """Apply one explicit gravity-compensated arm actuator before every step."""
+        """Apply the explicit gravity-compensated arm hold before every step.
+
+        The hold has two parts. The arm drive configuration -- effort ceiling
+        100 Nm, stiffness 0, damping 0 -- is constant for the whole hold, and
+        each of those writes is a PhysX *model property* write (Warp launch,
+        CPU clone, `set_dof_*` on the view; measured 2.9 ms per step plus a
+        deferred ~3.8 ms flush). It is therefore written once, on hold entry,
+        and again only after the articulation view was re-resolved
+        (`_refresh_robot_handles` clears `_safety_gains_applied`, since a
+        fresh view carries the actuator model's nominal gains). The effort
+        target -- gravity compensation plus the bounded PD correction -- does
+        depend on the measured state and is recomputed and pushed every step.
+        """
         effort = self._compute_safety_efforts()
-        self._write_safety_effort_limit(self._safety_effort_limits())
-        self._write_safety_joint_gain(
-            "write_joint_stiffness_to_sim_index",
-            "stiffness",
-            0.0,
-        )
-        self._write_safety_joint_gain(
-            "write_joint_damping_to_sim_index",
-            "damping",
-            0.0,
-        )
+        if not self._safety_gains_applied:
+            self._write_safety_effort_limit(self._safety_effort_limits())
+            self._write_safety_joint_gain(
+                "write_joint_stiffness_to_sim_index",
+                "stiffness",
+                0.0,
+            )
+            self._write_safety_joint_gain(
+                "write_joint_damping_to_sim_index",
+                "damping",
+                0.0,
+            )
+            self._safety_gains_applied = True
         self._effort_targets.copy_(effort)
-        self._safety_gains_applied = True
 
     def _restore_safety_actuator_gains(self) -> None:
         if not getattr(self, "_safety_gains_applied", False):
