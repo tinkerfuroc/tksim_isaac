@@ -28,8 +28,9 @@ def path_length(path: Sequence[Sequence[float]]) -> float:
 def path_pose_at(path: Sequence[Sequence[float]], distance: float) -> tuple[float, float, float]:
     """(x, y, yaw) at ``distance`` metres along the polyline, clamped to its end."""
     points = validate_path(path)
-    if not math.isfinite(distance) or distance < 0.0:
-        distance = max(0.0, float(distance)) if math.isfinite(distance) else 0.0
+    if not math.isfinite(distance):
+        raise ValueError("actor path distance must be finite")
+    distance = max(0.0, float(distance))
     remaining = distance
     for start, end in zip(points, points[1:]):
         segment = math.dist(start, end)
@@ -42,4 +43,6 @@ def path_pose_at(path: Sequence[Sequence[float]], distance: float) -> tuple[floa
                 yaw,
             )
         remaining -= segment
-    return (*points[-1], 0.0)
+    # Unreachable: points has >= 2 elements (validate_path enforces this), so
+    # the loop's last iteration always hits the (start, end) == (points[-2],
+    # points[-1]) arm above and returns before falling out of the loop.
