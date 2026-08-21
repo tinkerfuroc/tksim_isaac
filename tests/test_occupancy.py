@@ -46,6 +46,11 @@ class OccupancyClearanceTest(unittest.TestCase):
         grid = _grid_map(["....", "...."])
         self.assertFalse(grid.free_with_clearance(-1.0, 0.0, 0.1))
 
+    def test_free_with_clearance_rejects_negative_clearance(self):
+        grid = _grid_map(["....", "...."])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            grid.free_with_clearance(0.1, 0.1, -0.1)
+
     def test_nearest_free_world_finds_adjacent_cell(self):
         # NOTE: grid enlarged relative to the brief's 8x4 fixture (which had
         # only a 1-cell free margin between the obstacle and the map edge on
