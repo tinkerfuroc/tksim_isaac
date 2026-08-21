@@ -832,6 +832,31 @@ References:
 
 ## Changelog
 
+- 2026-08-21 (physics step cadence for live parity — "optimize its physics
+  step frequency for more live parity"): Split the simulator's single rate
+  into a PhysX solver rate (`TINKER_SIM_PHYSICS_HZ`, default 120, unchanged)
+  and an opt-in control rate (`TINKER_SIM_CONTROL_HZ`, default = physics
+  rate) at which Isaac Lab, target writes, wheel slew, gateway publish and
+  `/clock` run; each control step runs explicit `physics_hz / control_hz`
+  solver substeps of the validated 1/120 s. Measured (gpsr-rcw2026, RTF):
+  physics-only 0.75 -> 1.18 at control 60 (1.88 at 30) with the robot root
+  within 0.5 mm of the default after 10 s, versus 5 mm drift for the old
+  `TINKER_SIM_PHYSICS_HZ=60` advice; sensor-rich with ROS and 15 Hz cameras
+  0.35 -> 0.40 by default and 0.51 at control 60 (0.60 at 30) once combined
+  with the lidar fix below. Found along the way via a new
+  `publish_breakdown_ms` in the `TINKER_SIM_PROFILE=1` output that the
+  development-lidar ray-cast cost ~35 ms per lidar frame (~350 ms per
+  simulated second); `OccupancyMap.raycast_many` now casts all 181 rays
+  vectorised with chunked early exit, proven bit-identical to the scalar
+  loop (`tests/test_occupancy_raycast_vectorised.py`), ~2-5 ms per frame.
+  Also opt-in `TINKER_SIM_SOLVER_POSITION_ITERATIONS` /
+  `TINKER_SIM_SOLVER_VELOCITY_ITERATIONS` (robot USD authors 32 / 1;
+  fidelity-affecting, not for evidence runs). Measured non-results: omni.physx
+  `simulate(elapsed)` does not substep (a `timeStepsPerSecond` override
+  silently integrates at the control dt — caught by a step-count check and
+  replaced by explicit substeps), and PhysX worker-thread count (4/8/16)
+  changes nothing. Runbook: "Control cadence under a live stack".
+
 - 2026-08-19 (arena scenario entity spawning — "verify person and object
   spawn"): Verified the standard scenario spawn path inside `--arena
   rcw2026`: `scenario_runner` ran find-and-approach-person and

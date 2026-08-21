@@ -258,6 +258,15 @@ class RosStandardGateway:
         self._imu_stride = max(1, round((1.0 / 200.0) / backend.dt))
         self._status_stride = max(1, round((1.0 / 2.0) / backend.dt))
         self._tick = 0
+        # Opt-in wall-time attribution of publish() (TINKER_SIM_PROFILE=1,
+        # read through the backend's profile flag so the two stay in step).
+        self._publish_profile_enabled = bool(
+            getattr(backend, "step_profile", {}).get("enabled", False)
+        )
+        self._publish_profile = {
+            "clock": 0.0, "joint_state": 0.0, "imu": 0.0, "cloud": 0.0,
+            "status": 0.0, "truth": 0.0, "n": 0,
+        }
 
     def _spin_executor(self) -> None:
         from rclpy.executors import ExternalShutdownException
@@ -888,11 +897,37 @@ class RosStandardGateway:
                 self._last_command_error = str(error)
                 self.node.get_logger().error(f"rejected joint command: {error}")
 
+    def publish_profile_snapshot(self) -> dict:
+        """Per-call ms attribution of publish(); resets the window."""
+        prof = self._publish_profile
+        n = max(1, prof["n"])
+        out = {
+            key: round(1000.0 * prof[key] / n, 3)
+            for key in ("clock", "joint_state", "imu", "cloud", "status", "truth")
+        }
+        out["calls"] = prof["n"]
+        for key in ("clock", "joint_state", "imu", "cloud", "status", "truth"):
+            prof[key] = 0.0
+        prof["n"] = 0
+        return out
+
     def publish(self) -> None:
+        _prof = self._publish_profile if self._publish_profile_enabled else None
+        _t = time.monotonic if _prof is not None else None
+        _mark = _t() if _t else 0.0
+
+        def _lap(key: str) -> None:
+            nonlocal _mark
+            if _t is not None:
+                now = _t()
+                _prof[key] += now - _mark
+                _mark = now
+
         stamp = self._stamp()
         clock = self._Clock()
         clock.clock = stamp
         self.clock_pub.publish(clock)
+        _lap("clock")
         if self._tick % self._state_stride == 0:
             names, positions, velocities, efforts = self.backend.joint_state()
             message = self._JointState()
@@ -902,6 +937,7 @@ class RosStandardGateway:
             message.velocity = velocities
             message.effort = efforts
             self.joint_pub.publish(message)
+        _lap("joint_state")
         if self._tick % self._imu_stride == 0:
             state = self.backend.root_state()
             message = self._Imu()
@@ -915,8 +951,10 @@ class RosStandardGateway:
                 message.angular_velocity.z,
             ) = angular
             self.imu_pub.publish(message)
+        _lap("imu")
         if self._cloud_publish_enabled():
             self.cloud_pub.publish(self._development_point_cloud(stamp))
+        _lap("cloud")
         if self._tick % self._status_stride == 0:
             status = {
                 "physics_device": self.backend.physics_device,
@@ -942,6 +980,7 @@ class RosStandardGateway:
             contact.header.frame_id = "link_tcp"
             contact.wrench.force.z = float(force)
             self.contact_pub.publish(contact)
+        _lap("status")
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {
@@ -954,6 +993,9 @@ class RosStandardGateway:
             frame, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
         self.physics_truth_pub.publish(physics_truth)
+        _lap("truth")
+        if _prof is not None:
+            _prof["n"] += 1
         self._tick += 1
 
     def publish_cameras(self) -> None:
@@ -1102,16 +1144,21 @@ class RosStandardGateway:
         )
         points = []
         if not origin_occupied:
-            for degrees in range(-90, 91):
-                local = math.radians(degrees)
-                if occupancy is not None:
-                    distance = occupancy.raycast(origin_x, origin_y, yaw + local)
-                else:
-                    # R2 deterministic fallback: a fixed keep-out ring so the
-                    # cloud stays non-empty and finite for qualification
-                    # consumers even when no occupancy map exists.
-                    distance = _FALLBACK_LIDAR_RANGE_M
-                if math.isfinite(distance):
+            locals_ = [math.radians(degrees) for degrees in range(-90, 91)]
+            if occupancy is not None:
+                # One vectorised cast for all 181 rays; bit-identical to the
+                # per-ray `raycast` loop it replaces (see
+                # tests/test_occupancy_raycast_vectorised.py), ~35 ms -> <1 ms
+                # per lidar frame.
+                distances = occupancy.raycast_many(
+                    origin_x, origin_y, [yaw + local for local in locals_]
+                )
+            else:
+                # R2 deterministic fallback: a fixed keep-out ring so the
+                # cloud stays non-empty and finite for qualification
+                # consumers even when no occupancy map exists.
+                distances = [_FALLBACK_LIDAR_RANGE_M] * len(locals_)
+            for local, distance in zip(locals_, distances):
                     points.append(
                         (distance * math.cos(local), distance * math.sin(local), 0.0)
                     )
