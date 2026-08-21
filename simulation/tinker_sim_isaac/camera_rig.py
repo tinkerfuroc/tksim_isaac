@@ -154,8 +154,11 @@ def to_numpy(value: Any):
     return np.asarray(candidate)
 
 
-def rgb8_array(value: Any, height: int, width: int):
-    """Normalize an RTX rgb annotator buffer to contiguous uint8 (H, W, 3)."""
+def _rgb8_array_reference(value: Any, height: int, width: int):
+    """Reference semantics for ``rgb8_array``; kept verbatim for equivalence tests.
+
+    Normalize an RTX rgb annotator buffer to contiguous uint8 (H, W, 3).
+    """
     import numpy as np
 
     array = to_numpy(value)
@@ -176,8 +179,11 @@ def rgb8_array(value: Any, height: int, width: int):
     return np.ascontiguousarray(array)
 
 
-def depth_to_16uc1_mm(value: Any):
-    """Metres -> 16UC1 millimetres; NaN/Inf/non-positive -> 0; clamp 65535."""
+def _depth_to_16uc1_mm_reference(value: Any):
+    """Reference semantics for ``depth_to_16uc1_mm``; kept verbatim for tests.
+
+    Metres -> 16UC1 millimetres; NaN/Inf/non-positive -> 0; clamp 65535.
+    """
     import numpy as np
 
     depth = to_numpy(value)
@@ -191,6 +197,101 @@ def depth_to_16uc1_mm(value: Any):
         np.isfinite(depth) & (depth > 0.0), depth * 1000.0, 0.0
     )
     return np.clip(np.rint(millimetres), 0.0, 65535.0).astype(np.uint16)
+
+
+#: Per-(bucket, shape) scratch buffers reused across frames so the steady
+#: state of ``rgb8_array``/``depth_to_16uc1_mm`` allocates nothing. Safe only
+#: because the camera publish loop is single-threaded and converts each
+#: returned buffer to bytes before the next call for that bucket/shape lands
+#: (see ``RosStandardGateway.publish_cameras``); nothing else retains a
+#: reference to the arrays these functions return.
+_SCRATCH: dict[str, dict[Any, Any]] = {}
+
+
+def _scratch(bucket: str, key: Any, shape: tuple[int, ...], dtype: Any) -> Any:
+    """Return the cached ndarray for ``(bucket, key)``, (re)allocating on mismatch."""
+    import numpy as np
+
+    store = _SCRATCH.setdefault(bucket, {})
+    array = store.get(key)
+    if array is None or array.shape != shape or array.dtype != dtype:
+        array = np.empty(shape, dtype=dtype)
+        store[key] = array
+    return array
+
+
+def rgb8_array(value: Any, height: int, width: int):
+    """Normalize an RTX rgb annotator buffer to contiguous uint8 (H, W, 3).
+
+    Byte-identical to ``_rgb8_array_reference`` (see
+    ``tests/test_camera_publish_equivalence.py``); avoids per-frame
+    allocation by writing into a cached (height, width, 3) uint8 buffer and
+    fusing the trailing clip+cast into that single write.
+    """
+    import numpy as np
+
+    array = to_numpy(value)
+    if array.ndim == 4 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim != 3 or array.shape[:2] != (height, width):
+        raise ValueError(f"unexpected RGB frame shape: {array.shape}")
+    if array.shape[2] < 3:
+        raise ValueError(f"RGB frame has fewer than three channels: {array.shape}")
+    channels = array[:, :, :3]
+    out_shape = (height, width, 3)
+    out = _scratch("rgb_out", out_shape, out_shape, np.uint8)
+    if channels.dtype.kind == "f":
+        if not np.isfinite(channels).all():
+            raise ValueError("RGB frame contains non-finite values")
+        scale = 255.0 if float(channels.max(initial=0.0)) <= 1.0 else 1.0
+        scaled = _scratch("rgb_scaled", out_shape, out_shape, channels.dtype)
+        np.multiply(channels, scale, out=scaled)
+        np.clip(scaled, 0.0, 255.0, out=out, casting="unsafe")
+    else:
+        np.clip(channels, 0, 255, out=out, casting="unsafe")
+    return out
+
+
+def depth_to_16uc1_mm(value: Any):
+    """Metres -> 16UC1 millimetres; NaN/Inf/non-positive -> 0; clamp 65535.
+
+    Byte-identical to ``_depth_to_16uc1_mm_reference`` (see
+    ``tests/test_camera_publish_equivalence.py``); replaces the per-frame
+    ``isfinite``/``&``/``where``/``rint``/``clip``/``astype`` temporaries with
+    cached scratch buffers and in-place ``out=`` writes. The scale step uses
+    the ``multiply`` ufunc's ``where=`` mask directly against a pre-zeroed
+    buffer instead of computing a full ``scaled`` temporary and selecting
+    into it with ``copyto`` — one fused masked pass instead of two full
+    passes, which measurably wins at 1280x720 despite adding a per-call
+    dispatch fixed cost that a plain ``np.where`` does not pay (see the
+    micro-benchmark referenced in the commit message).
+    """
+    import numpy as np
+
+    depth = to_numpy(value)
+    if depth.ndim == 3 and depth.shape[2] == 1:
+        depth = depth[:, :, 0]
+    if depth.ndim != 2:
+        raise ValueError(f"depth frame must be HxW: {depth.shape}")
+    shape = depth.shape
+    if depth.dtype.kind != "f":
+        upcast = _scratch("depth_upcast", shape, shape, np.float64)
+        np.multiply(depth, 1.0, out=upcast, casting="unsafe")
+        depth = upcast
+    work_dtype = depth.dtype
+    finite_mask = _scratch("depth_finite", shape, shape, np.bool_)
+    positive_mask = _scratch("depth_positive", shape, shape, np.bool_)
+    millimetres = _scratch("depth_mm", shape, shape, work_dtype)
+    out = _scratch("depth_out", shape, shape, np.uint16)
+
+    np.isfinite(depth, out=finite_mask)
+    np.greater(depth, 0.0, out=positive_mask)
+    np.logical_and(finite_mask, positive_mask, out=finite_mask)
+    millimetres.fill(0.0)
+    np.multiply(depth, 1000.0, out=millimetres, where=finite_mask)
+    np.rint(millimetres, out=millimetres)
+    np.clip(millimetres, 0.0, 65535.0, out=out, casting="unsafe")
+    return out
 
 
 def pack_registered_cloud(
