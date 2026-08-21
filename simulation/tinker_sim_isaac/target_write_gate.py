@@ -12,11 +12,10 @@ target is semantically identical to re-writing it.
 The gate is deliberately biased toward writing: the expensive failure is a
 wasted write, the incorrect one is a missed write.
 
-Note that a safety-stopped backend writes on *every* step by design:
-``_apply_safety_actuator_hold`` recomputes a gravity-compensating arm effort
-from the current joint state, so the effort target genuinely changes each step.
-The gate only pays off once a command stream is live and the stop is cleared,
-which is the state a real run spends its time in.
+A safety-stopped backend is the gate's best case: the hold is PhysX's own
+drive at the latched pose (``_apply_safety_actuator_hold``), so the targets
+only change on hold entry and at each gravity feed-forward refresh
+(``SAFETY_HOLD_GRAVITY_REFRESH_STEPS``); every other stopped step is skipped.
 """
 
 from __future__ import annotations

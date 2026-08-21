@@ -74,6 +74,8 @@ class _FakeRobot:
             "arm": SimpleNamespace(
                 joint_names=("joint1",),
                 effort_limit=torch.tensor([[30.0]], dtype=torch.float32),
+                stiffness=torch.tensor([[20000.0]], dtype=torch.float32),
+                damping=torch.tensor([[1500.0]], dtype=torch.float32),
             ),
         }
         self.limit_calls: list[dict[str, object]] = []
@@ -148,6 +150,7 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._safety_nominal_damping = (1500.0,)
     backend._safety_nominal_effort_limits = (30.0,)
     backend._safety_gains_applied = False
+    backend._safety_hold_steps = 0
     backend._pending_snapshot_id = None
     backend._pending_snapshot_count = 0
     backend._pending_snapshot_index = 0
@@ -407,7 +410,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 0.0]])
         self.assertAlmostEqual(float(backend._effort_targets[0, 0]), 0.0)
-        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 3.7, places=4)
+        # Gravity feed-forward only (fake gravity 1.5 at base-DoF-offset index 3);
+        # the position/velocity correction is PhysX's drive.
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 1.5, places=4)
         self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.25)
         self.assertAlmostEqual(float(backend._position_targets[0, 1]), -0.4)
         # The measured state did not change between the two steps, so the
@@ -449,7 +454,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(len(effort_targets), 1)
         for target in effort_targets:
             self.assertAlmostEqual(float(target[0, 0]), 0.0)
-            self.assertAlmostEqual(float(target[0, 1]), 3.7, places=4)
+            self.assertAlmostEqual(float(target[0, 1]), 1.5, places=4)
 
         backend.set_safety_stop(False)
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 0.0]])
@@ -467,10 +472,13 @@ class ManipulationRuntimeTest(unittest.TestCase):
             backend.command_joints(JointCommand(("joint1",), positions=(0.75,)))
         )
 
-    def test_safety_hold_uses_explicit_drive_and_restores_nominal_gain(self) -> None:
+    def test_safety_hold_uses_physx_drive_and_restores_nominal_gain(self) -> None:
+        """The hold is PhysX's drive: hold gains on entry, gravity fed forward."""
         backend = _backend()
         backend.set_safety_stop(True)
         backend.step()
+        self.assertEqual(IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS, 600.0)
+        self.assertEqual(IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING, 80.0)
 
         self.assertEqual(
             [call["stiffness"] for name, call in backend._robot.gain_calls if name == "stiffness"],
@@ -481,7 +489,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             [IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING],
         )
         self.assertEqual(backend._robot.target_calls[-1][0], "effort")
-        self.assertAlmostEqual(float(backend._robot.target_calls[-1][1][0, 1]), 17.5)
+        self.assertAlmostEqual(float(backend._robot.target_calls[-1][1][0, 1]), 1.5)
         self.assertAlmostEqual(float(backend._robot.target_calls[-1][1][0, 0]), 0.0)
 
         backend.set_safety_stop(False)
@@ -511,10 +519,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend.step()
 
         # The arm joint is data index 1, and gravity index 1 + num_base_dofs.
-        # The measured error is -0.01 rad and velocity is +0.01 rad/s.
-        # -0.5 + 600(-0.01) - 80(0.01) = -7.3.
+        # Only gravity (-0.5) is fed forward; the -0.01 rad error and the
+        # +0.01 rad/s velocity are corrected by PhysX's drive at 600 / 80.
         self.assertAlmostEqual(float(backend._effort_targets[0, 0]), 0.0)
-        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), -7.3, places=4)
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), -0.5, places=4)
 
     def test_safety_effort_clips_to_100_nm_ceiling_and_zeroes_non_arm_joints(self) -> None:
         backend = _backend()
@@ -530,7 +538,11 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._robot.data.gravity_compensation_forces = torch.tensor(
             [[-1000.0, -1000.0, -1000.0, -1000.0]], dtype=torch.float32
         )
-        backend.step()
+        # The feed-forward is refreshed every SAFETY_HOLD_GRAVITY_REFRESH_STEPS
+        # control steps; until then the entry value is held.
+        self.assertEqual(backend._effort_targets.tolist(), [[0.0, 100.0]])
+        for _ in range(IsaacWholeRobotBackend.SAFETY_HOLD_GRAVITY_REFRESH_STEPS):
+            backend.step()
         self.assertEqual(backend._effort_targets.tolist(), [[0.0, -100.0]])
         self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[100.0]])
 
@@ -556,12 +568,32 @@ class ManipulationRuntimeTest(unittest.TestCase):
             [[11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0]],
         )
 
+    def test_safety_hold_mirrors_gains_into_the_actuator_model(self) -> None:
+        """applied_torque telemetry and reset re-sync come from the actuator
+        model's own tensors (Isaac Lab issue #128), so the hold gains and the
+        nominal restore must be mirrored there, not only written to PhysX."""
+        backend = _backend()
+        arm = backend._robot.actuators["arm"]
+        backend.set_safety_stop(True)
+        backend.step()
+        self.assertEqual(float(arm.stiffness[0, 0]), IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS)
+        self.assertEqual(float(arm.damping[0, 0]), IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING)
+        self.assertEqual(float(arm.effort_limit[0, 0]), 100.0)
+        # The gripper group owns drive_joint only; it must be untouched.
+        self.assertEqual(float(backend._robot.actuators["gripper"].effort_limit[0, 0]), 12.0)
+
+        backend.set_safety_stop(False)
+        self.assertEqual(float(arm.stiffness[0, 0]), 20000.0)
+        self.assertEqual(float(arm.damping[0, 0]), 1500.0)
+        self.assertEqual(float(arm.effort_limit[0, 0]), 30.0)
+
     def test_safety_hold_writes_drive_config_once_per_hold(self) -> None:
         """Ceiling/stiffness/damping are constant for a hold: written on entry only."""
         backend = _backend()
         backend.set_safety_stop(True)
         for index in range(5):
-            # A moving measured state changes the PD term every step.
+            # A moving measured state is PhysX's business now: the drive
+            # corrects it at every substep without a Python push.
             backend._robot.data.joint_vel = torch.tensor(
                 [[0.1, -0.2 + 0.01 * index]], dtype=torch.float32
             )
@@ -572,11 +604,27 @@ class ManipulationRuntimeTest(unittest.TestCase):
             [call["limits"].tolist() for call in backend._robot.limit_calls],
             [[[100.0]]],
         )
-        # ...while the effort target was recomputed and pushed on every step.
-        self.assertEqual(backend._robot.write_count, 5)
+        # One push on entry (latched pose, zero velocity, gravity feed-forward),
+        # then nothing while the hold is steady.
+        self.assertEqual(backend._robot.write_count, 1)
         self.assertEqual(
-            [kind for kind, _ in backend._robot.target_calls].count("effort"), 5
+            [kind for kind, _ in backend._robot.target_calls].count("effort"), 1
         )
+        # The gravity feed-forward is refreshed every
+        # SAFETY_HOLD_GRAVITY_REFRESH_STEPS control steps.
+        backend._robot.data.gravity_compensation_forces = torch.tensor(
+            [[0.1, 0.2, 0.3, 2.5]], dtype=torch.float32
+        )
+        refresh = IsaacWholeRobotBackend.SAFETY_HOLD_GRAVITY_REFRESH_STEPS
+        for _ in range(refresh - 5):
+            backend.step()
+        # Still the entry value one step before the refresh boundary...
+        self.assertEqual(backend._robot.write_count, 1)
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 1.5, places=4)
+        backend.step()
+        # ...and refreshed (one push) on it.
+        self.assertEqual(backend._robot.write_count, 2)
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 2.5, places=4)
 
         # Clearing restores nominal gains exactly once; a second hold writes
         # the hold configuration again.
