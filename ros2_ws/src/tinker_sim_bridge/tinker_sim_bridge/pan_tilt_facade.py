@@ -28,11 +28,11 @@ class PanTiltFacade(Node):
             JointState, "/isaac_joint_states", self._joint_state, 20
         )
         # The hardware pan-tilt controller drives its own startup pose
-        # (initial_pan_deg / initial_tilt_deg in tk26_vision's pan_tilt.yaml).
-        # This facade stands in for that controller, so it takes the same
-        # knobs. The default tilt cancels camera_mount_joint's -45.53 deg
-        # pitch: left at zero the head camera points into the robot's own deck,
-        # which starves door detection and every other head-camera consumer.
+        # (initial_pan_deg / initial_tilt_deg in tk26_vision's pan_tilt.yaml,
+        # both 0.0 -- at tilt 0 the head camera looks about level). This facade
+        # stands in for that controller, so it takes the same knobs and the
+        # same default. Holding the pose matters because nothing else in a
+        # simulation bring-up commands the head.
         self.declare_parameter("initial_pan_deg", float("nan"))
         self.declare_parameter("initial_tilt_deg", float("nan"))
         self._initial_pan, self._initial_tilt = resolve_initial_head_pose(
@@ -60,8 +60,7 @@ class PanTiltFacade(Node):
             self._initial_pose_reached = True
             self.get_logger().info(
                 f"head at initial pose: pan={self._initial_pan:.4f} rad "
-                f"tilt={self._initial_tilt:.4f} rad "
-                "(cancels the camera mount pitch)"
+                f"tilt={self._initial_tilt:.4f} rad"
             )
             return
         command = JointState()

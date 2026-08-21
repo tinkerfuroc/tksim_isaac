@@ -1,31 +1,29 @@
-"""Resting pose of the simulated pan-tilt head.
+"""Startup pose of the simulated pan-tilt head.
 
-`camera_mount_joint` fixes the head camera to `tilt_link` with a -45.53 deg
-pitch. That pitch is real -- it is on the hardware too -- and the pan-tilt
-mechanism is what compensates for it, so a head left at tilt 0 points its
-optical axis 45 deg down into the robot's own deck rather than at the room.
+The hardware pan-tilt controller drives its own startup pose from
+``initial_pan_deg`` / ``initial_tilt_deg`` (tk26_vision
+``pan_tilt/config/pan_tilt.yaml``), both **0.0**. At tilt 0 the head camera
+looks approximately level: the -45.5 deg pitch in ``camera_mount_joint`` is
+already accounted for downstream of the joint, so it is *not* something the
+tilt joint has to cancel.
 
-On hardware the pan-tilt controller drives its own startup pose
-(`initial_pan_deg` / `initial_tilt_deg` in tk26_vision's pan_tilt.yaml). This
-module gives the simulated facade the same knobs, defaulting to the tilt that
-cancels the mount pitch exactly.
+The simulated facade stands in for that controller, so it takes the same two
+parameters and the same 0/0 default. Holding the pose matters because nothing
+else in a simulation bring-up commands the head, and an uncommanded joint is
+free to drift.
 """
 
 from __future__ import annotations
 
 import math
 
-# camera_mount_joint rpy pitch, radians (see the simulator's full URDF).
-HEAD_CAMERA_MOUNT_PITCH_RAD = -0.79457
-
-# tilt_joint limits from the same URDF: -30 deg .. +90 deg about +Y.
+# tilt_joint limits from the simulator's full URDF: -30 deg .. +90 deg about +Y.
 TILT_JOINT_LOWER_RAD = -0.523598775598299
 TILT_JOINT_UPPER_RAD = 1.570796326794897
 
-
-def level_tilt_rad() -> float:
-    """The tilt that puts the optical axis level with the floor."""
-    return -HEAD_CAMERA_MOUNT_PITCH_RAD
+# Hardware's pan_tilt.yaml startup pose.
+DEFAULT_PAN_DEG = 0.0
+DEFAULT_TILT_DEG = 0.0
 
 
 def _checked(value: float, name: str) -> float:
@@ -40,17 +38,16 @@ def resolve_initial_head_pose(
 ) -> tuple[float, float]:
     """Return the startup ``(pan_rad, tilt_rad)`` for the head.
 
-    ``None`` means "use the default": pan straight ahead, and the tilt that
-    cancels the mount pitch. An out-of-range tilt raises rather than clamping --
-    clamping would silently leave the camera pointing somewhere the caller did
-    not ask for, which is exactly the failure this module exists to prevent.
+    ``None`` means "use the hardware default", which is 0/0 -- roughly level.
+    An out-of-range tilt raises rather than clamping: clamping would silently
+    leave the camera pointing somewhere the caller did not ask for.
     """
-    pan = 0.0 if pan_deg is None else math.radians(_checked(pan_deg, "initial_pan_deg"))
-    if tilt_deg is None:
-        tilt = level_tilt_rad()
-    else:
-        tilt = math.radians(_checked(tilt_deg, "initial_tilt_deg"))
-    _checked(pan, "initial_pan_deg")
+    pan = math.radians(
+        _checked(DEFAULT_PAN_DEG if pan_deg is None else pan_deg, "initial_pan_deg")
+    )
+    tilt = math.radians(
+        _checked(DEFAULT_TILT_DEG if tilt_deg is None else tilt_deg, "initial_tilt_deg")
+    )
     if not (TILT_JOINT_LOWER_RAD <= tilt <= TILT_JOINT_UPPER_RAD):
         raise ValueError(
             f"initial_tilt_deg={math.degrees(tilt):.3f} is outside the tilt_joint "
