@@ -728,6 +728,23 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(backend.gripper_effort_limit, 12.0)
         self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
 
+    def test_repeated_identical_gripper_effort_limit_writes_once(self) -> None:
+        """The bridge re-sends the gripper packet at 150 Hz; an unchanged ceiling
+        must not reach the PhysX writer again (each write costs a physics step)."""
+        backend = _backend()
+        backend._set_gripper_effort_limit(6.0)
+        writes = len(backend._robot.limit_calls)
+        for _ in range(5):
+            backend._set_gripper_effort_limit(6.0)
+        self.assertEqual(len(backend._robot.limit_calls), writes)
+        self.assertEqual(backend.gripper_effort_limit_writes, 1)
+        backend._set_gripper_effort_limit(0.0)
+        self.assertEqual(len(backend._robot.limit_calls), writes + 1)
+        self.assertEqual(backend.gripper_effort_limit, 12.0)
+        # A zero request that restores the default is also a no-op when repeated.
+        backend._set_gripper_effort_limit(0.0)
+        self.assertEqual(len(backend._robot.limit_calls), writes + 1)
+
     def test_position_only_command_clears_affected_velocity_target(self) -> None:
         backend = _backend()
 

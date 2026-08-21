@@ -271,6 +271,12 @@ class RosStandardGateway:
             "capture": 0.0, "rgb_convert": 0.0, "depth_convert": 0.0,
             "image_fill": 0.0, "image_publish": 0.0, "info": 0.0, "n": 0,
         }
+        # spin_once() attribution: events drained, command packets applied and
+        # the wall time spent inside backend.command_joints (the only part of
+        # the drain that touches PhysX buffers).
+        self._spin_profile = {
+            "events": 0, "commands": 0, "safety": 0, "command_joints_s": 0.0, "n": 0,
+        }
 
     def _spin_executor(self) -> None:
         from rclpy.executors import ExternalShutdownException
@@ -520,7 +526,10 @@ class RosStandardGateway:
             self.backend.set_safety_stop(False)
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
+                _cj_t0 = time.perf_counter()
                 accepted = self.backend.command_joints(staged_command)
+                self._spin_stats()['command_joints_s'] += time.perf_counter() - _cj_t0
+                self._spin_stats()['commands'] += 1
                 if accepted is False:
                     raise RuntimeError("command rejected during baseline commit")
         except Exception as error:
@@ -633,12 +642,15 @@ class RosStandardGateway:
     def spin_once(self) -> None:
         self._enforce_safety_deadline()
         self._enforce_command_deadline()
+        self._spin_stats()["n"] += 1
         while True:
             try:
                 event_type, payload = self._incoming_events.get_nowait()
             except queue.Empty:
                 return
+            self._spin_stats()["events"] += 1
             if event_type == "safety_stop":
+                self._spin_stats()["safety"] += 1
                 if isinstance(payload, tuple):
                     active, received_at = payload[:2]
                     sequence = payload[2] if len(payload) > 2 else None
@@ -693,7 +705,10 @@ class RosStandardGateway:
                         continue
                     begin_snapshot(snapshot)
                     self._last_snapshot_id = snapshot
+                _cj_t0 = time.perf_counter()
                 accepted = self.backend.command_joints(command)
+                self._spin_stats()['command_joints_s'] += time.perf_counter() - _cj_t0
+                self._spin_stats()['commands'] += 1
                 if accepted is False:
                     self._last_command_error = (
                         "command ignored while safety stop is active"
@@ -881,7 +896,10 @@ class RosStandardGateway:
                     if self._command_stream_lost:
                         self.backend.set_safety_stop(False)
                         self._command_stream_lost = False
+                    _cj_t0 = time.perf_counter()
                     accepted = self.backend.command_joints(staged_command)
+                    self._spin_stats()['command_joints_s'] += time.perf_counter() - _cj_t0
+                    self._spin_stats()['commands'] += 1
                     if accepted is False:
                         self._command_stream_lost = True
                         self._last_command_error = (
@@ -900,6 +918,34 @@ class RosStandardGateway:
             except Exception as error:
                 self._last_command_error = str(error)
                 self.node.get_logger().error(f"rejected joint command: {error}")
+
+    def _spin_stats(self) -> dict:
+        """spin_once() counters; created lazily so gateways built without
+        __init__ (tests) still account."""
+        prof = self.__dict__.get("_spin_profile")
+        if prof is None:
+            prof = self._spin_profile = {
+                "events": 0, "commands": 0, "safety": 0, "command_joints_s": 0.0, "n": 0,
+            }
+        return prof
+
+    def spin_profile_snapshot(self) -> dict:
+        """spin_once() attribution since the last snapshot; resets the window."""
+        prof = self._spin_stats()
+        out = {
+            "calls": prof["n"],
+            "events": prof["events"],
+            "commands": prof["commands"],
+            "safety": prof["safety"],
+            "command_joints_ms": round(1000.0 * prof["command_joints_s"], 3),
+            "gripper_limit_writes": int(
+                getattr(self.backend, "gripper_effort_limit_writes", 0)
+            ),
+        }
+        for key in ("events", "commands", "safety", "n"):
+            prof[key] = 0
+        prof["command_joints_s"] = 0.0
+        return out
 
     def publish_profile_snapshot(self) -> dict:
         """Per-call ms attribution of publish(); resets the window."""

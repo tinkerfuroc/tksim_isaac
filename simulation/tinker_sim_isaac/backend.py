@@ -407,6 +407,10 @@ class IsaacWholeRobotBackend:
         self._pending_snapshot_commands: list[JointCommand] = []
         self._default_gripper_effort_limit = self.DEFAULT_GRIPPER_EFFORT_LIMIT
         self._gripper_effort_limit = self._default_gripper_effort_limit
+        # The first commanded limit always reaches PhysX; later identical
+        # requests are no-ops (see _set_gripper_effort_limit).
+        self._gripper_effort_limit_written = False
+        self.gripper_effort_limit_writes = 0
         self._expected_objects = {
             str(name): dict(value) for name, value in (expected_objects or {}).items()
         }
@@ -996,6 +1000,15 @@ class IsaacWholeRobotBackend:
         index = self._joint_index.get("drive_joint")
         if index is None:
             raise RuntimeError("Tinker articulation lacks drive_joint")
+        if limit == self._gripper_effort_limit and getattr(
+            self, "_gripper_effort_limit_written", False
+        ):
+            # The bridge re-sends the gripper packet on every 150 Hz tick.  The
+            # PhysX effort-limit write plus the actuator-model mirror cost on
+            # the order of a physics step each, so only repeat them when the
+            # ceiling actually changes.  Safety hold only rewrites joint1-7.
+            return
+        self.gripper_effort_limit_writes = getattr(self, "gripper_effort_limit_writes", 0) + 1
         dtype = getattr(self._robot.data.joint_pos, "dtype", None)
         if not isinstance(dtype, self._torch.dtype):
             dtype = self._torch.float32
@@ -1022,6 +1035,7 @@ class IsaacWholeRobotBackend:
                 continue
             model_limits[:, local_index] = limit
         self._gripper_effort_limit = limit
+        self._gripper_effort_limit_written = True
 
     def command_joints(self, command: JointCommand) -> bool:
         if self._safety_stopped:
@@ -1067,18 +1081,43 @@ class IsaacWholeRobotBackend:
                 raise ValueError("drive_joint effort limit must be non-negative")
 
     def _apply_joint_command(self, command: JointCommand) -> None:
+        # Gather in Python, then write each target tensor once.  Every torch
+        # element write releases the GIL; under a live bridge the gateway's
+        # executor thread takes it each time, and a 7-joint packet applied
+        # element-wise was measured at ~0.9 ms (vs ~0.03 ms uncontended).
+        # Joint names within a packet are unique (JointCommand.validate), so
+        # the gathered index lists never repeat an index.
+        position_index: list[int] = []
+        position_values: list[float] = []
+        velocity_index: list[int] = []
+        velocity_values: list[float] = []
         for offset, name in enumerate(command.names):
             index = self._joint_index[name]
             if command.positions and math.isfinite(command.positions[offset]):
-                self._position_targets[0, index] = command.positions[offset]
+                position_index.append(index)
+                position_values.append(command.positions[offset])
                 if not command.velocities:
                     # A position-only packet takes ownership of this joint's
                     # control mode and must retire an older velocity target.
-                    self._velocity_targets[0, index] = 0.0
+                    velocity_index.append(index)
+                    velocity_values.append(0.0)
             if command.velocities and math.isfinite(command.velocities[offset]):
-                self._velocity_targets[0, index] = command.velocities[offset]
+                velocity_index.append(index)
+                velocity_values.append(command.velocities[offset])
             if command.efforts and name == "drive_joint":
                 self._set_gripper_effort_limit(command.efforts[offset])
+        if position_index:
+            self._position_targets[0, position_index] = self._torch.tensor(
+                position_values,
+                dtype=self._position_targets.dtype,
+                device=self._position_targets.device,
+            )
+        if velocity_index:
+            self._velocity_targets[0, velocity_index] = self._torch.tensor(
+                velocity_values,
+                dtype=self._velocity_targets.dtype,
+                device=self._velocity_targets.device,
+            )
 
     def discard_command_snapshot_staging(self) -> None:
         """Drop a partially staged snapshot without touching physical state.
