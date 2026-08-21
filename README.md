@@ -989,8 +989,9 @@ References:
   `_on_clock`, with two new AST regression guards (`de95b71`); and Task 14
   fixed the `navigation-parity` backend construction to pass
   `expected_objects`/`scenario` like its sibling branches (`02d1785`,
-  `bddc0f9`), closing the H1 cause of the physics-truth blindness —
-  `tests/test_scenario_object_tracking.py`. A second, suspected cause (H2:
+  `bddc0f9`), closing the H1 cause of the physics-truth blindness **in code
+  only — unit-proven by `tests/test_scenario_object_tracking.py`, not yet
+  re-run live**. A second, suspected cause (H2:
   the object's pose and zero velocities looking frozen rather than
   settled) remains unconfirmed — it was observed through a run that could
   not see the object in physics truth at all, so it may be an artifact of
