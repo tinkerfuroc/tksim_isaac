@@ -128,32 +128,29 @@ export ROS_DOMAIN_ID=42
   --headless
 ```
 
-### Camera cadence under a live stack
+### Camera cadence under a live stack (`TINKER_SIM_CAMERA_HZ`)
 
-Export `TINKER_SIM_CAMERA_HZ=15` before Stage 1 for any run with the full
-GPSR stack attached.
-
-The simulator holds RTF ~0.30 on its own, but drops to ~0.06 once real
-subscribers attach: Kit is pumped (both RTX cameras rendered) once per camera
-stride, and the image payloads are serialised on the same beat, all inside the
-step loop. At that speed Nav2 cannot service its lifecycle bonds and tears its
-own stack down — `Switch controller timed out after 2.000000 seconds`, then
-every navigation node deactivates, leaving no `map -> odom` and an unusable TF
-tree. Halving the cadence halves both costs.
-
+Export `TINKER_SIM_CAMERA_HZ=12` before Stage 1 for any run with the GPSR
+stack attached (15 if the vision stack needs it). Kit renders both RTX
+cameras and serialises the images once per camera stride inside the step
+loop, so the camera rate is the single largest RTF lever.
 `simulation/sensors/hardware-parity.json` stays authoritative and unedited:
-unset, its 30 Hz is used. The override may only *lower* the rate — publishing
-faster than the real camera would be a parity violation, and is refused.
+unset, its 30 Hz is used. The override may only *lower* the rate —
+publishing faster than the real camera would be a parity violation, and is
+refused. 12 Hz is exact at control 120 and 60 (strides 10 and 5); at control
+30 it rounds to 15 Hz.
+
+If RTF falls too low, Nav2 cannot service its lifecycle bonds in wall time
+and tears its own stack down — `Switch controller timed out after 2.000000
+seconds`, then every navigation node deactivates, leaving no `map -> odom`
+and an unusable TF tree. Treat that log line as "the simulator is too slow",
+not as a navigation fault.
 
 ### Control cadence under a live stack (`TINKER_SIM_CONTROL_HZ`)
 
-Export `TINKER_SIM_CONTROL_HZ=60` (with `TINKER_SIM_CAMERA_HZ=12`; 15 if the
-vision stack needs it) before Stage 1 for live-stack runs. Do **not** use
-`TINKER_SIM_PHYSICS_HZ=60` for that purpose any more. 12 Hz is exact at
-control 120 and 60 (strides 10 and 5); at control 30 it rounds to 15 Hz.
-Measured 2026-08-21 at control 60: cameras 15 Hz RTF 0.70, 12 Hz 0.77, and
-0.80 once depth conversion moved to the GPU. Simulator VRAM on that run:
-peak 2.6 GB, steady 2.3 GB (the 2026-08-20 code ran 2.7-3.6 GB).
+Export `TINKER_SIM_CONTROL_HZ=60` (with `TINKER_SIM_CAMERA_HZ=12`) before
+Stage 1 for live-stack runs. Do **not** use `TINKER_SIM_PHYSICS_HZ=60` for
+that purpose.
 
 The simulator has two rates. The *physics* rate (`TINKER_SIM_PHYSICS_HZ`,
 default 120, may only be lowered) is PhysX's solver step — the thing every
@@ -161,99 +158,45 @@ contact/grasp result was validated at. The *control* rate
 (`TINKER_SIM_CONTROL_HZ`, default = physics rate) is how often Isaac Lab,
 the joint-target writes, the wheel slew, the gateway publish and `/clock`
 run. With the control rate lowered, each control step runs
-`physics_hz / control_hz` explicit solver substeps of the validated
-1/120 s, so the solver trajectory is unchanged while every per-step wrapper
-cost is paid 60 times a second instead of 120. The control rate must divide
-the physics rate evenly and has a 30 Hz floor. Note omni.physx's
-`IPhysxSimulation.simulate(elapsed)` does *not* substep on its own — it
-integrates exactly `elapsed` — which is why the substeps are explicit and
-why simply lowering `dt` was a fidelity change, not an optimisation.
+`physics_hz / control_hz` explicit solver substeps of the validated 1/120 s,
+so the solver trajectory is unchanged while every per-step wrapper cost is
+paid fewer times per simulated second. The control rate must divide the
+physics rate evenly and has a 30 Hz floor. Lower control rates also lower
+the IMU (200 Hz parity) and base-state (50 Hz) publish cadences, which are
+derived from the control step.
 
-Measured 2026-08-21 (gpsr-rcw2026, rcw2026 arena, GPU 1, RTF =
-simulated / wall):
+Expected RTF (simulated / wall; gpsr-rcw2026, rcw2026 arena, this host):
 
-| run | physics-only (no ROS, no cameras) | sensor-rich + ROS, cameras 15 Hz, start of day | same, end of day (all fixes below) |
+| setting | physics-only (no ROS, no cameras) | sensor-rich + ROS, cameras 12 Hz, robot safety-stopped | same, Stage 2 bridge attached and idle |
 |---|---|---|---|
-| default 120 / control 120 | 0.75 | 0.35 | **0.64** |
-| `TINKER_SIM_CONTROL_HZ=60` | 1.18 | 0.44 | **0.70** |
-| `TINKER_SIM_CONTROL_HZ=30` | 1.88 | 0.50 | **0.78** |
-| `TINKER_SIM_PHYSICS_HZ=60` (old advice) | 1.61 | 0.51 | — (not needed any more) |
+| default 120 / control 120 | 0.75 | ~0.64 | — |
+| `TINKER_SIM_CONTROL_HZ=60` | 1.18 | **0.77-0.80** | **~0.71** |
+| `TINKER_SIM_CONTROL_HZ=30` | 1.88 | ~0.85 | — |
 
-The sensor-rich numbers are with the robot safety-stopped (no bridge
-attached), which is the state a run spends its start-up and every
-command-loss interval in; the "end of day" column includes the lidar,
-safety-hold, actuator-launch and camera fixes described further down.
+What bounds RTF at control 60 is the PhysX solve (~9 ms per control step)
+and Kit's render pump for both RTX cameras (~30 ms per camera frame, scaling
+with pixel count); neither has a safe knob left. Two opt-in knobs exist but
+are **not recommended for anything that produces evidence**:
+`TINKER_SIM_SOLVER_POSITION_ITERATIONS` / `TINKER_SIM_SOLVER_VELOCITY_ITERATIONS`
+override the robot USD's articulation solver iteration counts (32 / 1) and
+change drive and contact convergence.
 
-Robot root position after 10 s idle agreed with the default to within
-0.5 mm at control 60/30 and drifted 5 mm at physics 60 — the substepped runs
-keep the validated solver trajectory, the lowered physics rate does not.
-Lower control rates also lower the IMU (200 Hz parity) and base-state
-(50 Hz) publish cadences, which are derived from the control step: at 60 Hz
-they publish at 60 Hz, at 30 Hz they publish at 30 Hz.
+### Profiling and actuator-model knobs
 
-What still bounds RTF under the live stack, per simulated second at control
-60: the PhysX solve itself (~9 ms per control step, 32 authored position
-iterations) and the Kit render pump for both RTX cameras (~30 ms per camera
-frame). The pump was probed on 2026-08-21 and is *not* render-mode, GI,
-async-rendering or readback bound: `RaytracedLighting` instead of the
-default `RealTimePathTracing`, `/app/asyncRendering=true`, and
-reflections/indirect-diffuse/AO off each changed it by <1 ms; an empty Kit
-update is ~2 ms, and the cost scales with camera pixel count (~19 ms head,
-~7 ms wrist). It is Kit's per-render-product frame pipeline at the parity
-resolutions, and the only remaining levers are structural. Two further
-opt-in knobs exist: `TINKER_SIM_SOLVER_POSITION_ITERATIONS` /
-`TINKER_SIM_SOLVER_VELOCITY_ITERATIONS` override the robot USD's articulation
-solver iteration counts (32 / 1); 8 position iterations measured RTF 0.52
-at control 60 but *changes drive and contact convergence*, so it is not
-recommended for anything that produces evidence. PhysX worker-thread count
-(`--/persistent/physics/numThreads`, default 8) made no measurable
-difference at 4 or 16.
-
-With `TINKER_SIM_PROFILE=1`, every profile line now also carries
-`physics_breakdown_ms.physx_substeps` and a `publish_breakdown_ms`
-(clock / joint_state / imu / cloud / status / truth per `publish()` call).
-### Per-step costs fixed on 2026-08-21 (no knobs, result-neutral)
-
-- **Safety hold.** While stopped, the backend used to disable the arm's
-  PhysX drive and push a gravity-compensated PD effort from Python every
-  control step; at the control rate that PD limit-cycled (joint1 pinned at
-  -100 Nm, arm never at rest) and cost ~8 ms per step. The hold is now
-  PhysX's own drive at the latched pose (stiffness 600, damping 80, 100 Nm
-  ceiling) with only the gravity term fed forward and refreshed every 30
-  control steps. Stopped step 13.3 -> 4.5 ms; the arm sits within 0.005 rad
-  at ~zero velocity, and the published joint efforts during a hold are now
-  computed with the hold gains (they used to report the nominal 20 000
-  stiffness).
-- **Target pushes.** Isaac Lab applies actuator groups with two Warp launches
-  per group; tinker2 has five, so every target push (arm trajectories, the
-  wheel slew ramp, hold refreshes) paid ten launches, ~3.2 ms of a ~3.6 ms
-  push. The backend now binds a fused `_apply_actuator_model` that launches
-  each kernel once over all groups -- bit-identical staging and telemetry
-  buffers, push 4.3-6.4 -> 1.8 ms. `TINKER_SIM_STOCK_ACTUATOR_MODEL=1`
-  restores Isaac Lab's loop.
-- **Camera conversions.** Frames are copied into pinned host buffers with one
-  stream sync per cycle, RGB conversion writes into reused scratch buffers,
-  and depth metres->16UC1 mm is a Warp kernel on the GPU (`wp.rint`, i.e.
-  banker's rounding like `np.rint`); all byte-identical to the reference
-  implementations kept in `camera_rig.py`, proven by
-  `tests/test_camera_publish_equivalence.py` on synthetic edge cases and 120
-  real frames. Camera stage 23 -> 13 ms per cycle. Note: with the optional
-  `--camera-pointcloud` flag (off in this runbook) the cloud is now built
-  from the millimetre depth, i.e. quantised to 1 mm.
-  With `TINKER_SIM_PROFILE=1` the profile line now also carries a
-  `camera_breakdown_ms` (capture / rgb_convert / depth_convert / image_fill /
-  image_publish / info).
+`TINKER_SIM_PROFILE=1` prints a `step_profile` line every
+`TINKER_SIM_PROFILE_EVERY` camera cycles with per-cycle wall time split into
+physics / publish / kit_pump / cameras / spin / unaccounted, plus
+`physics_breakdown_ms`, `publish_breakdown_ms`, `camera_breakdown_ms` and
+`spin_breakdown`. `TINKER_SIM_STOCK_ACTUATOR_MODEL=1` restores Isaac Lab's
+stock actuator loop (slower; for A/B checks only). With the optional
+`--camera-pointcloud` flag (off in this runbook) the cloud is built from the
+millimetre depth, i.e. quantised to 1 mm.
 
 Known model defect found on the way (not fixed here): the gripper's five
 finger/knuckle joints carry no mimic constraint in `robot.usd` (the URDF's
 `<mimic>` tags did not survive conversion), so they swing freely in normal
 operation; grasp evidence should treat finger poses accordingly until the
 conversion is fixed.
-
-That breakdown is how the development-lidar ray-cast was found to cost
-~35 ms per lidar frame (~350 ms per simulated second); it is now vectorised
-and bit-identical (`OccupancyMap.raycast_many`), at ~2–5 ms per frame;
-that alone took the default sensor-rich run from RTF 0.35 to 0.40.
 
 Only the `sensor-rich` profile loads `simulation/sensors/hardware-parity.json`
 and publishes the real-named camera topics GPSR's vision stack needs (valid
@@ -268,6 +211,18 @@ the `scenario` used in Stage 2. `--spawn-xy=-2.0,-2.0` matches the scenario's
 omitted (`run_sim.py`'s `sensor_rich_implies_ros`), but pass it explicitly for
 clarity. Use the `=` form for `--spawn-xy`; a space-separated negative value
 is parsed by argparse as a flag, not a value.
+
+### Running with the Stage 2 bridge attached
+
+Expected RTF with the bridge up and the stack idle: ~0.71 at
+`TINKER_SIM_CONTROL_HZ=60`, `TINKER_SIM_CAMERA_HZ=12` (0.77 standalone).
+`command_gateway` publishes a full snapshot only on change or every 50 ms
+(`CommandGateway.KEEPALIVE_PERIOD_S`). If RTF is much lower with the bridge
+attached, run with `TINKER_SIM_PROFILE=1` and read `spin_breakdown.commands`:
+more than ~100 commands per 100-step window while idle means the bridge is
+streaming unchanged snapshots. Opt-in knobs, defaults unchanged:
+`TINKER_SIM_GIL_SWITCH_INTERVAL_MS` (e.g. 0.5) and `TINKER_SIM_CPU_THREADS`
+(caps Kit's worker pool).
 
 ## Stage 2 — Composite bridge launch (`gpsr.launch.py`)
 
@@ -286,7 +241,6 @@ ros2 launch tinker_sim_bridge gpsr.launch.py \
   project_root:=/home/tinker/tinker-sim/6.0.1 \
   tinker_workspace:=/home/tinker/tk25_ws \
   scenario:=gpsr-rcw2026 \
-  map_yaml:="" \
   seed:=0 \
   safety_source_deadline_s:=1.0
 ```

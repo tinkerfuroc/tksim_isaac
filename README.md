@@ -943,6 +943,23 @@ References:
 
 ## Changelog
 
+- 2026-08-21 (ROS bridge RTF collapse — "check the accompanying ros bridge as
+  it slows the rtf down to ~0.2 when ROS stacks are active"): Measured and
+  fixed. With the Stage 2 bridge attached and idle the simulator fell from
+  RTF 0.77 to 0.23 because `command_gateway` re-sent every mux packet as a
+  full snapshot on its 150 Hz tick (~300-600 JointState/s), and each packet
+  cost the simulator ~0.9 ms plus a GIL tax on every other bucket. The
+  gateway now publishes only on change or every 50 ms (`KEEPALIVE_PERIOD_S`,
+  well inside the simulator's 0.5 s command watchdog): bridge-attached RTF
+  **0.71** (0.77 standalone). Simulator side: batched target apply, gripper
+  effort-limit dedup, `spin`/`unaccounted`/`wall` and `spin_breakdown` in the
+  step profile, opt-in `TINKER_SIM_GIL_SWITCH_INTERVAL_MS` and
+  `TINKER_SIM_CPU_THREADS`. Ruled out by measurement: CPU oversubscription,
+  GPU sharing, Fast DDS synchronous publish, camera fan-out. Runbook: the
+  Stage 2 command no longer passes `map_yaml:=""` (shell-expands to a
+  malformed argument that `ros2 launch` rejects); the default already
+  resolves to the artifact map. Tests: `tests/test_command_gateway_keepalive.py`,
+  gripper dedup in `tests/test_manipulation_runtime.py`.
 - 2026-08-21 (physics step cadence for live parity — "optimize its physics
   step frequency for more live parity"): Split the simulator's single rate
   into a PhysX solver rate (`TINKER_SIM_PHYSICS_HZ`, default 120, unchanged)

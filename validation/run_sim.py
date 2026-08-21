@@ -77,6 +77,7 @@ def _emit_step_profile(
     backend_breakdown: dict | None = None,
     publish_breakdown: dict | None = None,
     camera_breakdown: dict | None = None,
+    spin_breakdown: dict | None = None,
 ) -> None:
     """Print where sensor-rich wall time actually goes, then reset the window.
 
@@ -126,6 +127,8 @@ def _emit_step_profile(
         payload["step_profile"]["publish_breakdown_ms"] = publish_breakdown
     if camera_breakdown is not None:
         payload["step_profile"]["camera_breakdown_ms"] = camera_breakdown
+    if spin_breakdown is not None:
+        payload["step_profile"]["spin_breakdown"] = spin_breakdown
     print(json.dumps(payload, sort_keys=True), flush=True)
     sys.stdout.flush()
     for key in ("physics", "publish", "kit_pump", "cameras", "spin", "wall"):
@@ -665,6 +668,21 @@ def main() -> int:
             *kit_args,
         ],
     }
+    switch_interval = os.environ.get("TINKER_SIM_GIL_SWITCH_INTERVAL_MS")
+    if switch_interval:
+        # The ROS gateway's executor thread competes for the GIL with the
+        # simulation loop.  Every GIL release in the loop (PhysX, Kit, Warp,
+        # rcl publish) can then stall for a full switch interval (5 ms by
+        # default) while a command backlog is being drained.
+        import sys as _sys
+        _sys.setswitchinterval(max(0.05, float(switch_interval)) / 1000.0)
+        print(json.dumps({"gil_switch_interval_ms": _sys.getswitchinterval() * 1000.0}), flush=True)
+    cpu_threads = os.environ.get("TINKER_SIM_CPU_THREADS")
+    if cpu_threads:
+        # Kit defaults to min(cpu_count, 32) worker threads.  Under a live ROS
+        # stack that leaves no cores for the stack, so allow an explicit cap.
+        application_config["limit_cpu_threads"] = max(1, int(cpu_threads))
+        print(json.dumps({"kit_cpu_threads": application_config["limit_cpu_threads"]}), flush=True)
     experience = ""
     if args.livestream:
         experience = str(_streaming_experience(Path(isaacsim.__file__)))
@@ -1082,6 +1100,11 @@ def main() -> int:
                                         camera_breakdown=(
                                             gateway.camera_profile_snapshot()
                                             if hasattr(gateway, "camera_profile_snapshot")
+                                            else None
+                                        ),
+                                        spin_breakdown=(
+                                            gateway.spin_profile_snapshot()
+                                            if hasattr(gateway, "spin_profile_snapshot")
                                             else None
                                         ),
                                     )

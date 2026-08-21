@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import Sequence
 
@@ -25,6 +26,7 @@ from tinker_sim_core.command_mux import (
 class CommandGateway(Node):
     """The only ROS publisher allowed to command the Isaac articulation."""
 
+    KEEPALIVE_PERIOD_S = 1.0 / 20.0
     SOURCE_TOPICS = {
         "base": "/sim/controller/base_commands",
         "ros2_control": "/sim/controller/ros2_control_commands",
@@ -85,6 +87,15 @@ class CommandGateway(Node):
             self._command_session_id, self._command_generation
         )
         self._snapshot_id = 0
+        # The 150 Hz tick still evaluates deadlines and composes the snapshot,
+        # but an unchanged snapshot is only re-sent at the keepalive cadence.
+        # Every packet the simulator receives costs it main-loop time (GIL
+        # hand-off plus a PhysX target write), and resending four identical
+        # packets 150 times a second was measured to cut its real-time factor
+        # from ~0.8 to ~0.23.  The simulator's command-stream watchdog is 0.5 s,
+        # so a 20 Hz keepalive keeps a 10x margin.
+        self._last_published_commands: tuple | None = None
+        self._last_publish_at = -math.inf
         reliable = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -226,6 +237,9 @@ class CommandGateway(Node):
         # A clear boundary starts a fresh command baseline.  Stopped packets
         # published during discovery cannot consume the post-clear sequence.
         self._snapshot_id = 0
+        # A new epoch must reach the simulator on the next tick even if the
+        # composed packets are unchanged.
+        self._last_published_commands = None
 
     def _enforce_safety_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -239,6 +253,9 @@ class CommandGateway(Node):
         self._advance_command_epoch()
         self._mux.stop(True)
         self._snapshot_id = 0
+        # A new epoch must reach the simulator on the next tick even if the
+        # composed packets are unchanged.
+        self._last_published_commands = None
         self._rejected["safety"] = "safety heartbeat expired"
 
     def _joint_state(self, message: JointState) -> None:
@@ -251,7 +268,16 @@ class CommandGateway(Node):
 
     def _publish(self) -> None:
         self._enforce_safety_deadline()
-        commands = self._mux.compose(time.monotonic())
+        now = time.monotonic()
+        commands = tuple(self._mux.compose(now))
+        if (
+            commands == getattr(self, "_last_published_commands", None)
+            and now - getattr(self, "_last_publish_at", -math.inf)
+            < self.KEEPALIVE_PERIOD_S
+        ):
+            return
+        self._last_published_commands = commands
+        self._last_publish_at = now
         snapshot_id = self._snapshot_id
         self._snapshot_id += 1
         packet_count = len(commands)
