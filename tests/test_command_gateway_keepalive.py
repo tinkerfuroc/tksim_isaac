@@ -82,6 +82,7 @@ def test_unchanged_snapshot_is_resent_after_keepalive_period() -> None:
 def test_changed_command_is_sent_immediately() -> None:
     gateway = _gateway()
     gateway._publish()
+    gateway._last_publish_at -= CommandGateway.MIN_PUBLISH_PERIOD_S
     gateway._mux.accept(
         "arm", JointCommand(("joint1",), positions=(0.5,)), time.monotonic()
     )
@@ -90,11 +91,28 @@ def test_changed_command_is_sent_immediately() -> None:
     assert list(gateway._publisher.messages[-1].position) == [0.5]
 
 
+def test_changes_are_rate_limited_to_the_control_rate() -> None:
+    gateway = _gateway()
+    gateway._publish()
+    for i in range(5):  # five changes inside one 60 Hz period
+        gateway._mux.accept(
+            "arm", JointCommand(("joint1",), positions=(0.3 + 0.01 * i,)), time.monotonic()
+        )
+        gateway._publish()
+    assert len(gateway._publisher.messages) == 1
+    gateway._last_publish_at -= CommandGateway.MIN_PUBLISH_PERIOD_S
+    gateway._publish()
+    # The latest value goes out, not the intermediate ones.
+    assert len(gateway._publisher.messages) == 2
+    assert abs(gateway._publisher.messages[-1].position[0] - 0.34) < 1e-9
+    assert CommandGateway.MIN_PUBLISH_PERIOD_S <= 1.0 / 60.0 + 1e-12
+
+
 def test_safety_stop_transition_is_sent_immediately() -> None:
     gateway = _gateway()
     gateway._publish()
     gateway._mux.stop(True)
-    gateway._publish()
+    gateway._publish()  # inside the rate-limit window: still sent at once
     assert len(gateway._publisher.messages) == 2
 
 

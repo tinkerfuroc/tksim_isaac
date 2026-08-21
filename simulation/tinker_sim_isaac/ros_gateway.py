@@ -230,7 +230,7 @@ class RosStandardGateway:
         initial_collision = Bool()
         initial_collision.data = False
         self.collision_pub.publish(initial_collision)
-        self.node.create_subscription(
+        command_subscription = self.node.create_subscription(
             JointState, "/isaac_joint_commands", self._joint_command, reliable
         )
         safety_qos = QoSProfile(
@@ -238,21 +238,37 @@ class RosStandardGateway:
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.node.create_subscription(
+        safety_subscription = self.node.create_subscription(
             Bool, "/sim/hardware/safety_stop", self._safety_stop, safety_qos
         )
-        # NVIDIA's simulation-control extension owns a MultiThreadedExecutor.
-        # Never use rclpy's global executor here: spin_once may execute
-        # unrelated work and block the Kit/physics thread.  DDS callbacks run
-        # in this private executor and only enqueue immutable commands.
-        self._executor = SingleThreadedExecutor()
-        self._executor.add_node(self.node)
-        self._executor_thread = threading.Thread(
-            target=self._spin_executor,
-            name="tinker-isaac-ros-gateway",
-            daemon=True,
+        # Inbound messages are taken on the simulation thread, inside
+        # spin_once(), straight from the DDS readers (see _take_pending).  A
+        # private executor thread used to do this, but it could only take one
+        # message per wait-set pass and each pass had to win the GIL back from
+        # the simulation loop: under a live bridge it fell behind the command
+        # stream, the reliable transport buffered the surplus, and the
+        # simulator then re-executed a 20 s-old arm trajectory ~40 s late
+        # (2026-08-21, docs/developer-log.md).  TINKER_SIM_GATEWAY_EXECUTOR=1
+        # restores the thread for comparison.
+        self._intake_subscriptions = (
+            (command_subscription, self._joint_command),
+            (safety_subscription, self._safety_stop),
         )
-        self._executor_thread.start()
+        self._executor = None
+        self._executor_thread = None
+        if os.environ.get("TINKER_SIM_GATEWAY_EXECUTOR") == "1":
+            # NVIDIA's simulation-control extension owns a MultiThreadedExecutor.
+            # Never use rclpy's global executor here: spin_once may execute
+            # unrelated work and block the Kit/physics thread.
+            self._intake_subscriptions = ()
+            self._executor = SingleThreadedExecutor()
+            self._executor.add_node(self.node)
+            self._executor_thread = threading.Thread(
+                target=self._spin_executor,
+                name="tinker-isaac-ros-gateway",
+                daemon=True,
+            )
+            self._executor_thread.start()
         self._state_stride = max(1, round((1.0 / 50.0) / backend.dt))
         self._lidar_stride = max(1, round((1.0 / 10.0) / backend.dt))
         self._imu_stride = max(1, round((1.0 / 200.0) / backend.dt))
@@ -316,6 +332,24 @@ class RosStandardGateway:
             self._incoming_events.put(
                 ("command", (command, epoch, snapshot, time.monotonic()))
             )
+            _st = self._spin_stats()
+            _st["received"] = _st.get("received", 0) + 1
+            try:
+                _logical, _count, _index = decode_snapshot_packet(snapshot)
+                _by = _st.setdefault("by_index", {})
+                _by[_index] = _by.get(_index, 0) + 1
+                if "first_logical" not in _st:
+                    _st["first_logical"] = _logical
+                _st["last_logical"] = _logical
+                _newest = _st.get("newest_snapshot", -1)
+                if _logical > _newest:
+                    _st["newest_snapshot"] = _logical
+                else:
+                    _lag = _newest - _logical
+                    if _lag > _st.get("max_snapshot_lag", 0):
+                        _st["max_snapshot_lag"] = _lag
+            except Exception:
+                pass
         except Exception as error:
             self._last_command_error = str(error)
             self.node.get_logger().error(f"rejected joint command: {error}")
@@ -639,7 +673,58 @@ class RosStandardGateway:
                     f"failed to apply safety heartbeat timeout: {error}"
                 )
 
+    # Upper bound on messages taken per subscription per spin_once; a
+    # backlog larger than this is drained over the following steps.
+    INTAKE_BATCH_LIMIT = 512
+
+    def _take_pending(self) -> int:
+        """Take every waiting message from the gateway's DDS readers.
+
+        Runs on the simulation thread.  Each take is a direct reader call (no
+        wait set), so a 150 Hz command stream costs a few tens of microseconds
+        per control step and never queues up behind the GIL.
+        """
+        taken = 0
+        for subscription, handler in getattr(self, "_intake_subscriptions", ()):
+            handle = subscription.handle
+            for _ in range(self.INTAKE_BATCH_LIMIT):
+                with handle:
+                    message_info = handle.take_message(
+                        subscription.msg_type, subscription.raw
+                    )
+                if message_info is None:
+                    break
+                self._note_message_info(message_info)
+                handler(message_info[0])
+                taken += 1
+        return taken
+
+    def _note_message_info(self, message_info) -> None:
+        """Profile-only: source-timestamp age and distinct writer GIDs."""
+        try:
+            info = message_info[1]
+            source_ns = None
+            gid = None
+            if isinstance(info, dict):
+                source_ns = info.get("source_timestamp")
+                gid = info.get("publisher_gid")
+            else:
+                source_ns = getattr(info, "source_timestamp", None)
+                gid = getattr(info, "publisher_gid", None)
+            stats = self._spin_stats()
+            if source_ns:
+                age_ms = (time.time_ns() - int(source_ns)) / 1e6
+                stats["source_age_max_ms"] = max(stats.get("source_age_max_ms", 0.0), age_ms)
+                stats["source_age_min_ms"] = min(stats.get("source_age_min_ms", 1e12), age_ms)
+            if gid is not None:
+                gids = stats.setdefault("writer_gids", set())
+                if len(gids) < 8:
+                    gids.add(bytes(gid).hex() if not isinstance(gid, str) else gid)
+        except Exception:
+            pass
+
     def spin_once(self) -> None:
+        self._take_pending()
         self._enforce_safety_deadline()
         self._enforce_command_deadline()
         self._spin_stats()["n"] += 1
@@ -681,6 +766,13 @@ class RosStandardGateway:
                     )
                 continue
             command, epoch, snapshot, received_at = payload
+            _st = self._spin_stats()
+            _age = time.monotonic() - float(received_at)
+            if _age > _st.get("max_age_s", 0.0):
+                _st["max_age_s"] = _age
+            _st["queue_depth_max"] = max(
+                _st.get("queue_depth_max", 0), self._incoming_events.qsize()
+            )
             if not getattr(self, "_session_protocol_enabled", False):
                 if epoch != self._command_epoch:
                     self._last_command_error = (
@@ -891,6 +983,8 @@ class RosStandardGateway:
                 self._last_command_error = "rejected command: backend lacks snapshot boundary"
                 continue
             try:
+                _stats = self._spin_stats()
+                _stats["replayed"] = _stats.get("replayed", 0) + max(0, len(packets_to_apply) - 1)
                 for staged_command, staged_snapshot, _ in packets_to_apply:
                     begin_snapshot(staged_snapshot)
                     if self._command_stream_lost:
@@ -941,7 +1035,30 @@ class RosStandardGateway:
             "gripper_limit_writes": int(
                 getattr(self.backend, "gripper_effort_limit_writes", 0)
             ),
+            "replayed": prof.get("replayed", 0),
+            "received": prof.get("received", 0),
+            "max_age_ms": round(1000.0 * prof.get("max_age_s", 0.0), 1),
+            "queue_depth_max": prof.get("queue_depth_max", 0),
+            "by_index": dict(prof.get("by_index", {})),
+            "max_snapshot_lag": prof.get("max_snapshot_lag", 0),
+            "source_age_ms": [
+                round(prof.get("source_age_min_ms", 0.0), 1),
+                round(prof.get("source_age_max_ms", 0.0), 1),
+            ],
+            "writers": len(prof.get("writer_gids", ())),
+            "logical_span": [prof.get("first_logical"), prof.get("last_logical")],
         }
+        prof.pop("first_logical", None)
+        prof.pop("last_logical", None)
+        prof["source_age_min_ms"] = 1e12
+        prof["source_age_max_ms"] = 0.0
+        prof["writer_gids"] = set()
+        prof["by_index"] = {}
+        prof["max_snapshot_lag"] = 0
+        prof["replayed"] = 0
+        prof["received"] = 0
+        prof["max_age_s"] = 0.0
+        prof["queue_depth_max"] = 0
         for key in ("events", "commands", "safety", "n"):
             prof[key] = 0
         prof["command_joints_s"] = 0.0
@@ -1278,9 +1395,10 @@ class RosStandardGateway:
         return message
 
     def close(self) -> None:
-        self._executor.shutdown()
-        self._executor_thread.join(timeout=2.0)
-        self._executor.remove_node(self.node)
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor_thread.join(timeout=2.0)
+            self._executor.remove_node(self.node)
         self.node.destroy_node()
         if self.rclpy.ok():
             self.rclpy.shutdown()

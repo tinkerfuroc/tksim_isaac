@@ -167,11 +167,14 @@ derived from the control step.
 
 Expected RTF (simulated / wall; gpsr-rcw2026, rcw2026 arena, this host):
 
-| setting | physics-only (no ROS, no cameras) | sensor-rich + ROS, cameras 12 Hz, robot safety-stopped | same, Stage 2 bridge attached and idle |
+| setting | physics-only (no ROS, no cameras) | sensor-rich + ROS, cameras 12 Hz, robot safety-stopped | Stage 2 bridge attached: idle / base driving / arm trajectory |
 |---|---|---|---|
 | default 120 / control 120 | 0.75 | ~0.64 | — |
-| `TINKER_SIM_CONTROL_HZ=60` | 1.18 | **0.77-0.80** | **~0.71** |
+| `TINKER_SIM_CONTROL_HZ=60` | 1.18 | **0.77-0.80** | **0.81 / 0.68 / 0.63** |
 | `TINKER_SIM_CONTROL_HZ=30` | 1.88 | ~0.85 | — |
+
+Adding `TINKER_SIM_CPU_THREADS=16` (Kit's worker pool; default 32 on this
+host) is worth ~0.03-0.05 on every bridge-attached figure and is safe.
 
 What bounds RTF at control 60 is the PhysX solve (~9 ms per control step)
 and Kit's render pump for both RTX cameras (~30 ms per camera frame, scaling
@@ -214,15 +217,21 @@ is parsed by argparse as a flag, not a value.
 
 ### Running with the Stage 2 bridge attached
 
-Expected RTF with the bridge up and the stack idle: ~0.71 at
-`TINKER_SIM_CONTROL_HZ=60`, `TINKER_SIM_CAMERA_HZ=12` (0.77 standalone).
-`command_gateway` publishes a full snapshot only on change or every 50 ms
-(`CommandGateway.KEEPALIVE_PERIOD_S`). If RTF is much lower with the bridge
-attached, run with `TINKER_SIM_PROFILE=1` and read `spin_breakdown.commands`:
-more than ~100 commands per 100-step window while idle means the bridge is
-streaming unchanged snapshots. Opt-in knobs, defaults unchanged:
-`TINKER_SIM_GIL_SWITCH_INTERVAL_MS` (e.g. 0.5) and `TINKER_SIM_CPU_THREADS`
-(caps Kit's worker pool).
+Expected RTF with the bridge up at `TINKER_SIM_CONTROL_HZ=60`,
+`TINKER_SIM_CAMERA_HZ=12`: ~0.81 idle, ~0.68 while the base drives, ~0.63
+while the arm follows a trajectory (0.77-0.80 standalone). `command_gateway`
+publishes a full snapshot only on change (at most 60 Hz,
+`CommandGateway.MIN_PUBLISH_PERIOD_S`) or every 50 ms
+(`KEEPALIVE_PERIOD_S`). The simulator takes inbound ROS messages on its
+simulation thread inside `spin_once()`; `TINKER_SIM_GATEWAY_EXECUTOR=1`
+restores the former executor thread for A/B checks only. If RTF is much
+lower with the bridge attached, run with `TINKER_SIM_PROFILE=1` and read
+`spin_breakdown.commands`: more than ~100 commands per 100-step window
+while idle means the bridge is streaming unchanged snapshots. Attribute
+profile windows by their `wall_time` field, not by `/clock`: the simulator
+re-zeroes `/clock` when the bridge's `ResetSimulation` lands. Opt-in knobs,
+defaults unchanged: `TINKER_SIM_CPU_THREADS` (16 recommended for live-stack
+runs) and `TINKER_SIM_GIL_SWITCH_INTERVAL_MS`.
 
 ## Stage 2 — Composite bridge launch (`gpsr.launch.py`)
 

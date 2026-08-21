@@ -1246,6 +1246,8 @@ class IsaacWholeRobotBackend:
                 "safety stop requires Isaac Lab set_joint_effort_target"
             )
         if _write_targets:
+            if self.step_profile["enabled"]:
+                self._profile_changed_targets()
             self._robot.set_joint_position_target(self._position_targets)
             self._robot.set_joint_velocity_target(self._velocity_targets)
         _sp = self.step_profile
@@ -1289,6 +1291,25 @@ class IsaacWholeRobotBackend:
             _sp["object_views"] += _t() - _sp["_mark"]
             _sp["n"] += 1
 
+    def _profile_changed_targets(self) -> None:
+        """Profile-only: count which joints' targets differ from the last push."""
+        last = getattr(self, "_profile_last_pushed", None)
+        current = (
+            self._position_targets.clone(),
+            self._velocity_targets.clone(),
+            self._effort_targets.clone(),
+        )
+        self._profile_last_pushed = current
+        if last is None:
+            return
+        hist = self.step_profile.setdefault("changed_targets", {})
+        names = {index: name for name, index in self._joint_index.items()}
+        for label, before, after in zip(("pos", "vel", "eff"), last, current):
+            diff = (before != after)[0].nonzero().flatten().tolist()
+            for index in diff:
+                key = f"{label}:{names.get(index, index)}"
+                hist[key] = hist.get(key, 0) + 1
+
     def step_profile_snapshot(self) -> dict:
         """Return per-step wall-time attribution (ms) and reset the window.
 
@@ -1308,6 +1329,11 @@ class IsaacWholeRobotBackend:
         # How many of those steps actually pushed targets to PhysX; the rest
         # were byte-identical re-sends the write gate skipped.
         out["target_writes"] = sp["target_writes"]
+        if sp.get("changed_targets"):
+            out["changed_targets"] = dict(
+                sorted(sp["changed_targets"].items(), key=lambda kv: -kv[1])[:8]
+            )
+            sp["changed_targets"] = {}
         # PhysX solver steps per control step (1 unless TINKER_SIM_CONTROL_HZ
         # lowered the control rate below physics_hz).
         out["physx_substeps"] = self.physics_substeps
