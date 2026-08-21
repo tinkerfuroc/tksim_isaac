@@ -267,6 +267,10 @@ class RosStandardGateway:
             "clock": 0.0, "joint_state": 0.0, "imu": 0.0, "cloud": 0.0,
             "status": 0.0, "truth": 0.0, "n": 0,
         }
+        self._camera_profile = {
+            "capture": 0.0, "rgb_convert": 0.0, "depth_convert": 0.0,
+            "image_fill": 0.0, "image_publish": 0.0, "info": 0.0, "n": 0,
+        }
 
     def _spin_executor(self) -> None:
         from rclpy.executors import ExternalShutdownException
@@ -911,6 +915,18 @@ class RosStandardGateway:
         prof["n"] = 0
         return out
 
+    def camera_profile_snapshot(self) -> dict:
+        """Per-call ms attribution of publish_cameras(); resets the window."""
+        prof = self._camera_profile
+        n = max(1, prof["n"])
+        keys = ("capture", "rgb_convert", "depth_convert", "image_fill", "image_publish", "info")
+        out = {key: round(1000.0 * prof[key] / n, 3) for key in keys}
+        out["calls"] = prof["n"]
+        for key in keys:
+            prof[key] = 0.0
+        prof["n"] = 0
+        return out
+
     def publish(self) -> None:
         _prof = self._publish_profile if self._publish_profile_enabled else None
         _t = time.monotonic if _prof is not None else None
@@ -1006,8 +1022,20 @@ class RosStandardGateway:
         """
         if self._camera_rig is None:
             return
+        _prof = self._camera_profile if self._publish_profile_enabled else None
+        _t = time.monotonic if _prof is not None else None
+        _mark = _t() if _t else 0.0
+
+        def _lap(key: str) -> None:
+            nonlocal _mark
+            if _t is not None:
+                now = _t()
+                _prof[key] += now - _mark
+                _mark = now
+
         stamp = self._stamp()
         frames = self._camera_rig.capture()
+        _lap("capture")
         for entry in self._camera_streams:
             spec = entry["spec"]
             rgb, depth = frames.get(spec.name, (None, None))
@@ -1015,7 +1043,9 @@ class RosStandardGateway:
                 self.camera_skipped_frames += 1
                 continue
             color_array = rgb8_array(rgb, spec.height, spec.width)
+            _lap("rgb_convert")
             depth_array = depth_to_16uc1_mm(depth)
+            _lap("depth_convert")
             if depth_array.shape != (spec.height, spec.width):
                 raise RuntimeError(
                     f"{spec.name} depth resolution {depth_array.shape} does not "
@@ -1032,7 +1062,9 @@ class RosStandardGateway:
             color.step = spec.width * 3
             # array.array('B') takes rclpy's validated fast path; raw bytes trigger a per-element __debug__ scan that costs seconds per frame at 720p.
             color.data = array.array("B", color_array.tobytes())
+            _lap("image_fill")
             entry["color_pub"].publish(color)
+            _lap("image_publish")
 
             depth_msg = self._Image()
             depth_msg.header.stamp = stamp
@@ -1043,7 +1075,9 @@ class RosStandardGateway:
             depth_msg.is_bigendian = 0
             depth_msg.step = spec.width * 2
             depth_msg.data = array.array("B", depth_array.tobytes())
+            _lap("image_fill")
             entry["depth_pub"].publish(depth_msg)
+            _lap("image_publish")
 
             fields = entry["info_fields"]
             info = self._CameraInfo()
@@ -1058,6 +1092,7 @@ class RosStandardGateway:
             info.p = fields["p"]
             for publisher in entry["info_pubs"]:
                 publisher.publish(info)
+            _lap("info")
 
             if self._camera_cloud_pub is not None and spec.name == "head_camera":
                 cloud = self._PointCloud2()
@@ -1090,6 +1125,8 @@ class RosStandardGateway:
                 )
                 self._camera_cloud_pub.publish(cloud)
 
+        if _prof is not None:
+            _prof["n"] += 1
     def publish_safety_heartbeat(self) -> None:
         """Publish the collision source on a wall-clock cadence, pause-safe.
 

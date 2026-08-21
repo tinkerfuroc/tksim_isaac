@@ -33,6 +33,27 @@ from tinker_sim_isaac.camera_rig import (  # noqa: E402
 RESOLUTIONS = ((1280, 720), (848, 480))
 
 
+class _FakePinnedHostArray:
+    """Duck-types the ``.numpy()`` surface ``to_numpy()`` relies on.
+
+    ``CameraRig.capture()`` (simulation/tinker_sim_isaac/camera_rig.py) now
+    hands ``rgb8_array``/``depth_to_16uc1_mm`` a pinned host ``wp.array``
+    instead of the GPU-side array ``to_numpy()`` used to clone itself. A
+    real ``wp.array`` already on the CPU makes ``.numpy()`` a zero-copy view
+    (see ``warp.array.to``: same-device ``to()`` is a no-op), not a fresh
+    clone -- this fake reproduces exactly that surface (a ``.numpy()``
+    method returning the backing ndarray, no ``.cpu()`` method) without
+    requiring warp/Isaac Sim to be importable, so this equivalence coverage
+    runs under plain system Python too.
+    """
+
+    def __init__(self, array: np.ndarray) -> None:
+        self._array = array
+
+    def numpy(self) -> np.ndarray:
+        return self._array
+
+
 def _assert_identical(case: unittest.TestCase, reference: np.ndarray, optimized: np.ndarray) -> None:
     case.assertEqual(optimized.dtype, reference.dtype)
     case.assertEqual(optimized.shape, reference.shape)
@@ -132,6 +153,18 @@ class RgbEquivalenceTest(unittest.TestCase):
             self._check(frame0, h0, w0)
             self._check(frame1, h1, w1)
 
+    def test_pinned_host_array_input_matches_plain_ndarray(self) -> None:
+        # CameraRig.capture()'s pinned-buffer path hands rgb8_array a
+        # wp.array-like object (``.numpy()``, no ``.cpu()``) already sized
+        # to (height, width, 3) uint8 rather than a bare (H, W, 4) ndarray;
+        # both must convert identically.
+        rng = np.random.default_rng(7)
+        for width, height in RESOLUTIONS:
+            frame = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+            reference = _rgb8_array_reference(frame, height, width)
+            optimized = rgb8_array(_FakePinnedHostArray(frame), height, width)
+            _assert_identical(self, reference, optimized)
+
 
 class DepthEquivalenceTest(unittest.TestCase):
     def _check(self, frame: np.ndarray) -> None:
@@ -211,6 +244,19 @@ class DepthEquivalenceTest(unittest.TestCase):
             _depth_to_16uc1_mm_reference(bad)
         with self.assertRaises(ValueError):
             depth_to_16uc1_mm(bad)
+
+    def test_pinned_host_array_input_matches_plain_ndarray(self) -> None:
+        # Same pinned-buffer duck type as the RGB case, but for depth: an
+        # (H, W) float32 wp.array-like already squeezed to 2D (capture()'s
+        # depth pinned buffer has no trailing channel dim to strip).
+        rng = np.random.default_rng(17)
+        for width, height in RESOLUTIONS:
+            depth = rng.random(size=(height, width)).astype(np.float32) * 10.0
+            depth[0, 0] = np.nan
+            depth[0, 1] = np.inf
+            reference = _depth_to_16uc1_mm_reference(depth)
+            optimized = depth_to_16uc1_mm(_FakePinnedHostArray(depth))
+            _assert_identical(self, reference, optimized)
 
 
 if __name__ == "__main__":
