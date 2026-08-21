@@ -76,6 +76,7 @@ def _emit_step_profile(
     prof: dict,
     backend_breakdown: dict | None = None,
     publish_breakdown: dict | None = None,
+    camera_breakdown: dict | None = None,
 ) -> None:
     """Print where sensor-rich wall time actually goes, then reset the window.
 
@@ -114,6 +115,8 @@ def _emit_step_profile(
         payload["step_profile"]["physics_breakdown_ms"] = backend_breakdown
     if publish_breakdown is not None:
         payload["step_profile"]["publish_breakdown_ms"] = publish_breakdown
+    if camera_breakdown is not None:
+        payload["step_profile"]["camera_breakdown_ms"] = camera_breakdown
     print(json.dumps(payload, sort_keys=True), flush=True)
     sys.stdout.flush()
     for key in ("physics", "publish", "kit_pump", "cameras"):
@@ -1055,6 +1058,11 @@ def main() -> int:
                                         publish_breakdown=(
                                             gateway.publish_profile_snapshot()
                                             if hasattr(gateway, "publish_profile_snapshot")
+                                            else None
+                                        ),
+                                        camera_breakdown=(
+                                            gateway.camera_profile_snapshot()
+                                            if hasattr(gateway, "camera_profile_snapshot")
                                             else None
                                         ),
                                     )
