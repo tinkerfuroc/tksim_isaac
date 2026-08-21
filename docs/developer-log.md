@@ -4,6 +4,63 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-08-21 — Bridge attached while driving and while the arm moves
+
+Exercise: `/cmd_vel` 0.15 m/s + 0.25 rad/s at 15 Hz for 45 s (Nav2's
+controller rate, no localisation needed), then `JointTrajectory` goals to
+`xarm7_traj_controller` alternating two poses every 5 s for 45 s; motion
+verified from `/isaac_joint_states`. Bench scripts in the `ros-bridge-rtf`
+worktree `outputs/bench/` (`run_with_bridge_exercise.sh`, `exercise.py`,
+`record2.py`, `show_phases_wall.py`).
+
+| bridge attached, control 60, cameras 12 Hz | old intake | main-thread intake + 60 Hz cap |
+|---|---|---|
+| idle | 0.71 | **0.81** |
+| base driving | 0.59 | **0.68** |
+| arm trajectories | 0.50 | **0.63** |
+
+What the remaining cost is: driving pushes no new targets (the wheel
+velocity targets are constant) — it is PhysX contact/rolling work, +15 ms
+per camera cycle; a 45 s circle in the rcw2026 arena ends with the robot
+against props, and that contact cost persists afterwards (physics 54 vs 41
+ms/cycle), which is the scenario, not the bridge. Arm trajectories push
+targets on ~70% of control steps (JTC rewrites the command each cycle) and
+the moving drives cost PhysX ~3 ms/step more.
+
+Three changes came out of this:
+
+- **Main-thread intake.** The gateway's private executor thread is gone.
+  `spin_once()` now takes messages straight from the two DDS readers
+  (`_take_pending`, rclpy `handle.take_message`, up to 512 per reader per
+  step). The thread could only take one message per wait-set pass and each
+  pass had to win the GIL back from the simulation loop; removing it took
+  `publish` from 24 back to 15 ms/cycle and idle RTF from 0.71 to 0.81.
+  `TINKER_SIM_GATEWAY_EXECUTOR=1` restores the thread for comparison.
+- **60 Hz cap on changed snapshots** in `command_gateway`
+  (`MIN_PUBLISH_PERIOD_S`): ros2_control rewrites the arm command every
+  150 Hz cycle during a trajectory; the simulator applies targets 60 times
+  a second, so anything faster was pure overhead. Safety-stop snapshots and
+  epoch bumps are never delayed.
+- **Profile lines carry `wall_time` and `sim_time`.** Attribute phases by
+  wall time. The simulator re-zeroes `/clock` when the bridge's
+  `ResetSimulation` (STOP -> PLAY) lands, by design (Isaac Lab recreates the
+  articulation view on PHYSICS_READY and that boundary is the new zero), so
+  `/clock` and a step counter started at process launch differ by the
+  attach time (~34 s here). Six runs of this investigation chased a
+  "stale trajectory replayed 30 s late" that was entirely this offset: the
+  snapshot ids received by the simulator matched the bridge's live
+  publish counter once compared on wall time, and every message's DDS
+  source timestamp was < 70 ms old. Ruled out on the way, each by
+  measurement: DDS shared-memory transport (UDP-only identical), reliable
+  repair (BEST_EFFORT identical), Kit worker-thread starvation (16 threads
+  identical), a second publisher (one `command_gateway` process, one
+  writer), a gateway replay path (none exists).
+
+Side finding: `TINKER_SIM_CPU_THREADS=16` (Kit's default is 32 on this
+32-thread host) gave idle 0.81 -> 0.82-0.84 and arm 0.63 -> 0.66 with
+physics 44 -> 40 ms/cycle; the TBB workers otherwise spin at ~30% each.
+Worth recommending for live-stack runs; not made the default.
+
 ## 2026-08-21 — ROS bridge attached: RTF 0.77 -> 0.23 -> 0.71
 
 

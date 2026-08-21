@@ -78,6 +78,7 @@ def _emit_step_profile(
     publish_breakdown: dict | None = None,
     camera_breakdown: dict | None = None,
     spin_breakdown: dict | None = None,
+    sim_time: float | None = None,
 ) -> None:
     """Print where sensor-rich wall time actually goes, then reset the window.
 
@@ -100,8 +101,12 @@ def _emit_step_profile(
     spin = prof.get("spin", 0.0)
     wall = prof.get("wall", 0.0)
     other = max(0.0, wall - total - spin)
+    import time as _time
+
     payload = {
         "step_profile": {
+            "wall_time": round(_time.time(), 3),
+            "sim_time": None if sim_time is None else round(float(sim_time), 3),
             "cycles": prof["cycles"],
             "physics_steps": prof["physics_n"],
             "ms_per_physics_step": round(1000.0 * prof["physics"] / steps, 3),
@@ -1107,6 +1112,7 @@ def main() -> int:
                                             if hasattr(gateway, "spin_profile_snapshot")
                                             else None
                                         ),
+                                        sim_time=getattr(backend, "simulation_time", None),
                                     )
                     except BaseException:
                         if running:

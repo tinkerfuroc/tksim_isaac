@@ -943,6 +943,20 @@ References:
 
 ## Changelog
 
+- 2026-08-21 (bridge attached while driving / arm moving — "test when the
+  robot actually drives, and then when the arm moves"): Measured with a
+  `/cmd_vel` drive and `xarm7_traj_controller` trajectories: idle 0.71 ->
+  **0.81**, driving 0.59 -> **0.68**, arm 0.50 -> **0.63**. The simulator's
+  ROS gateway now takes inbound messages on the simulation thread
+  (`spin_once` -> `_take_pending`) instead of a private executor thread
+  (`TINKER_SIM_GATEWAY_EXECUTOR=1` restores it); `command_gateway` caps
+  changed snapshots at 60 Hz (`MIN_PUBLISH_PERIOD_S`); profile lines carry
+  `wall_time`/`sim_time` and a `spin_breakdown` with reception counters.
+  `TINKER_SIM_CPU_THREADS=16` recommended for live-stack runs. Remaining
+  cost while moving is PhysX (contact while driving, drives + target pushes
+  while the arm moves). Tests: `MainThreadIntakeTest` in
+  `tests/test_ros_gateway.py`, rate-limit cases in
+  `tests/test_command_gateway_keepalive.py`.
 - 2026-08-21 (ROS bridge RTF collapse — "check the accompanying ros bridge as
   it slows the rtf down to ~0.2 when ROS stacks are active"): Measured and
   fixed. With the Stage 2 bridge attached and idle the simulator fell from

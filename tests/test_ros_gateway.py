@@ -559,3 +559,80 @@ class RosDevelopmentLidarTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeHandle:
+    """Mimics rclpy's subscription handle: a context manager with take_message."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.takes = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def take_message(self, msg_type, raw):
+        self.takes += 1
+        if not self._messages:
+            return None
+        return (self._messages.pop(0), {"fake": True})
+
+
+class _FakeSubscription:
+    def __init__(self, messages):
+        self.handle = _FakeHandle(messages)
+        self.msg_type = object
+        self.raw = False
+
+
+class MainThreadIntakeTest(unittest.TestCase):
+    """spin_once takes inbound messages straight from the DDS readers.
+
+    An executor thread could only take one message per wait-set pass and had
+    to win the GIL back from the simulation loop each time; under a live
+    bridge it fell behind the command stream and the reliable transport
+    replayed a stale arm trajectory tens of seconds later.
+    """
+
+    def test_take_pending_drains_every_reader_in_one_call(self) -> None:
+        gateway = _gateway()
+        seen = []
+        commands = _FakeSubscription([f"c{i}" for i in range(5)])
+        safety = _FakeSubscription(["s0"])
+        gateway._intake_subscriptions = (
+            (commands, lambda m: seen.append(("command", m))),
+            (safety, lambda m: seen.append(("safety", m))),
+        )
+        self.assertEqual(gateway._take_pending(), 6)
+        self.assertEqual([m for kind, m in seen if kind == "command"], [f"c{i}" for i in range(5)])
+        self.assertEqual([m for kind, m in seen if kind == "safety"], ["s0"])
+        # One extra take per reader to observe the empty reader.
+        self.assertEqual(commands.handle.takes, 6)
+        self.assertEqual(safety.handle.takes, 2)
+        self.assertEqual(gateway._take_pending(), 0)
+
+    def test_take_pending_bounds_a_single_pass(self) -> None:
+        gateway = _gateway()
+        limit = RosStandardGateway.INTAKE_BATCH_LIMIT
+        flood = _FakeSubscription(range(limit + 10))
+        gateway._intake_subscriptions = ((flood, lambda m: None),)
+        self.assertEqual(gateway._take_pending(), limit)
+        self.assertEqual(gateway._take_pending(), 10)
+
+    def test_spin_once_takes_before_draining_events(self) -> None:
+        gateway = _gateway()
+        gateway._safety_active = False
+        received = []
+        gateway._intake_subscriptions = (
+            (_FakeSubscription(["only"]), lambda m: received.append(m)),
+        )
+        gateway.spin_once()
+        self.assertEqual(received, ["only"])
+
+    def test_gateway_without_intake_attribute_still_spins(self) -> None:
+        gateway = _gateway()
+        gateway._safety_active = False
+        gateway.spin_once()  # no _intake_subscriptions: nothing to take

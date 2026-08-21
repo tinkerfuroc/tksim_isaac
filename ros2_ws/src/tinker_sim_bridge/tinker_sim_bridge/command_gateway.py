@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from typing import Sequence
 
@@ -27,6 +28,11 @@ class CommandGateway(Node):
     """The only ROS publisher allowed to command the Isaac articulation."""
 
     KEEPALIVE_PERIOD_S = 1.0 / 20.0
+    # Changed snapshots are sent no faster than the simulator's control rate.
+    # ros2_control rewrites the arm command on every 150 Hz cycle while a
+    # trajectory runs, which would otherwise burst two packets per cycle
+    # (~300 msg/s) at a consumer that applies targets 60 times a second.
+    MIN_PUBLISH_PERIOD_S = 1.0 / 60.0
     SOURCE_TOPICS = {
         "base": "/sim/controller/base_commands",
         "ros2_control": "/sim/controller/ros2_control_commands",
@@ -270,14 +276,25 @@ class CommandGateway(Node):
         self._enforce_safety_deadline()
         now = time.monotonic()
         commands = tuple(self._mux.compose(now))
-        if (
-            commands == getattr(self, "_last_published_commands", None)
-            and now - getattr(self, "_last_publish_at", -math.inf)
-            < self.KEEPALIVE_PERIOD_S
+        since_last = now - getattr(self, "_last_publish_at", -math.inf)
+        last_published = getattr(self, "_last_published_commands", None)
+        if last_published is not None and commands == last_published:
+            if since_last < self.KEEPALIVE_PERIOD_S:
+                return
+        elif (
+            last_published is not None
+            and since_last < self.MIN_PUBLISH_PERIOD_S
+            and not self._mux.safety_stop
         ):
+            # Rate-limit changes; the next tick re-composes the latest state.
+            # A safety-stop snapshot is never delayed.
             return
         self._last_published_commands = commands
         self._last_publish_at = now
+        _probe = getattr(self, "_publish_probe", None)
+        if _probe is None and os.environ.get("TINKER_SIM_GATEWAY_PROBE") == "1":
+            _probe = self._publish_probe = {"t": now, "n": 0, "max_s": 0.0, "sum_s": 0.0}
+        _t0 = time.perf_counter() if _probe is not None else 0.0
         snapshot_id = self._snapshot_id
         self._snapshot_id += 1
         packet_count = len(commands)
@@ -308,6 +325,20 @@ class CommandGateway(Node):
             sort_keys=True,
         )
         self._status.publish(status)
+        if _probe is not None:
+            _dt = time.perf_counter() - _t0
+            _probe["n"] += 1
+            _probe["sum_s"] += _dt
+            _probe["max_s"] = max(_probe["max_s"], _dt)
+            if now - _probe["t"] >= 1.0:
+                print(
+                    f"gateway_probe t={time.time():.1f} snapshot_id={snapshot_id} "
+                    f"publishes/s={_probe['n']} packets={packet_count} "
+                    f"publish_ms max={1000 * _probe['max_s']:.1f} "
+                    f"mean={1000 * _probe['sum_s'] / max(1, _probe['n']):.2f}",
+                    flush=True,
+                )
+                _probe.update({"t": now, "n": 0, "max_s": 0.0, "sum_s": 0.0})
 
 
 def main() -> None:
