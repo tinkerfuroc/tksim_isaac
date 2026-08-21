@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import math
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
+
+from tinker_sim_bridge.head_pose import resolve_initial_head_pose
 
 
 class PanTiltFacade(Node):
@@ -23,6 +27,48 @@ class PanTiltFacade(Node):
         self.create_subscription(
             JointState, "/isaac_joint_states", self._joint_state, 20
         )
+        # The hardware pan-tilt controller drives its own startup pose
+        # (initial_pan_deg / initial_tilt_deg in tk26_vision's pan_tilt.yaml).
+        # This facade stands in for that controller, so it takes the same
+        # knobs. The default tilt cancels camera_mount_joint's -45.53 deg
+        # pitch: left at zero the head camera points into the robot's own deck,
+        # which starves door detection and every other head-camera consumer.
+        self.declare_parameter("initial_pan_deg", float("nan"))
+        self.declare_parameter("initial_tilt_deg", float("nan"))
+        self._initial_pan, self._initial_tilt = resolve_initial_head_pose(
+            self._optional_degrees("initial_pan_deg"),
+            self._optional_degrees("initial_tilt_deg"),
+        )
+        # Re-assert until the mechanism reports it arrived: a single publish
+        # would be lost to a timeline reset, and the facade has no other way to
+        # know the head actually moved.
+        self._initial_pose_reached = False
+        self.create_timer(0.5, self._drive_initial_pose)
+
+    def _optional_degrees(self, name: str) -> float | None:
+        """NaN is this node's "unset" -- rclpy has no optional double."""
+        value = float(self.get_parameter(name).value)
+        return None if math.isnan(value) else value
+
+    def _drive_initial_pose(self) -> None:
+        if self._initial_pose_reached:
+            return
+        if (
+            abs(self._pan - self._initial_pan) < 0.02
+            and abs(self._tilt - self._initial_tilt) < 0.02
+        ):
+            self._initial_pose_reached = True
+            self.get_logger().info(
+                f"head at initial pose: pan={self._initial_pan:.4f} rad "
+                f"tilt={self._initial_tilt:.4f} rad "
+                "(cancels the camera mount pitch)"
+            )
+            return
+        command = JointState()
+        command.header.stamp = self.get_clock().now().to_msg()
+        command.name = ["pan_joint", "tilt_joint"]
+        command.position = [self._initial_pan, self._initial_tilt]
+        self._commands.publish(command)
 
     def _command(self, message: PanTiltCommand) -> None:
         if message.mode == PanTiltCommand.RELATIVE:
