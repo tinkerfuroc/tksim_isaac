@@ -1,27 +1,20 @@
-"""The simulated head must start at a pose that cancels its mount pitch.
+"""The simulated head must start at the hardware's startup pose.
 
-`camera_mount_joint` fixes the head camera to `tilt_link` with
-rpy="0.0406528 -0.79457 3.0833" -- a **-45.53 deg pitch** that exists on the
-real robot too. The pan-tilt mechanism is what compensates for it: `tilt_joint`
-turns about +Y over [-30, +90] deg, so a tilt of +45.53 deg brings the optical
-axis back to level.
+The hardware pan-tilt controller drives its own startup pose from
+``initial_pan_deg`` / ``initial_tilt_deg`` (tk26_vision
+``pan_tilt/config/pan_tilt.yaml``), both **0.0**. At tilt 0 the head camera
+looks approximately level -- the -45.5 deg pitch in ``camera_mount_joint`` is
+accounted for downstream of the joint, not something the tilt joint cancels.
 
-On hardware the pan-tilt controller drives that pose itself -- it takes
-`initial_pan_deg` / `initial_tilt_deg` (tk26_vision pan_tilt/config/pan_tilt.yaml)
-and `follow_head` homes to `home_tilt_deg: 30.0`. In simulation
-`pan_tilt_facade` stands in for that controller but had no startup pose at all,
-so the head sat at ~0 and the camera stared 45 deg down into the robot's own
-deck.
+In simulation ``pan_tilt_facade`` stands in for that controller and had no
+startup pose at all, so nothing held the head. These tests pin the default to
+hardware's 0/0 and keep the joint-limit guard.
 
-Measured 2026-08-20 (domain 71, gpsr-rcw2026), with the head uncommanded:
-`door_detection_srv` returned `is_open=0` forever at a centre depth of ~1.03 m
-while the lidar map showed the 1.5 m ahead of the spawn as free; a ~180 deg base
-rotation changed only 15% of the head-camera pixels, because the geometry in
-frame was the robot. Publishing a tilt command took the valid depth fraction
-from 0.39 to 0.88.
-
-Parameter names mirror the hardware controller's on purpose: the simulated
-facade is the stand-in for that node, so it should be configured the same way.
+An earlier version of this module defaulted the tilt to +45.5 deg on the theory
+that it had to cancel the mount pitch. That aimed the camera at the sky: the
+head camera returned a blank frame with 0.000 valid depth at every tilt from
+0.00 up, while the lidar reported arena walls at 2.4-3.6 m. Hence the explicit
+test below that the default is level.
 """
 
 from __future__ import annotations
@@ -35,56 +28,45 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
 
 from tinker_sim_bridge.head_pose import (  # noqa: E402
-    HEAD_CAMERA_MOUNT_PITCH_RAD,
+    DEFAULT_PAN_DEG,
+    DEFAULT_TILT_DEG,
     TILT_JOINT_LOWER_RAD,
     TILT_JOINT_UPPER_RAD,
-    level_tilt_rad,
     resolve_initial_head_pose,
 )
 
-URDF = ROOT / "integration/model-bundle-r2/simulator_full_urdf/source-tinker-full.urdf"
-
 
 class HeadInitialPoseTest(unittest.TestCase):
-    def test_mount_pitch_matches_the_urdf(self):
-        """The constant must not drift from the model it compensates."""
-        text = URDF.read_text(encoding="utf-8")
-        start = text.index('<joint name="camera_mount_joint"')
-        block = text[start : start + 400]
-        rpy = block.split('rpy="')[1].split('"')[0].split()
-        self.assertAlmostEqual(
-            float(rpy[1]), HEAD_CAMERA_MOUNT_PITCH_RAD, places=6,
-            msg="camera_mount_joint pitch changed; update the constant",
-        )
+    def test_default_matches_the_hardware_startup_pose(self):
+        """tk26_vision pan_tilt.yaml: initial_pan_deg 0.0, initial_tilt_deg 0.0."""
+        self.assertEqual(DEFAULT_PAN_DEG, 0.0)
+        self.assertEqual(DEFAULT_TILT_DEG, 0.0)
 
-    def test_level_tilt_cancels_the_mount_pitch(self):
-        self.assertAlmostEqual(
-            level_tilt_rad() + HEAD_CAMERA_MOUNT_PITCH_RAD, 0.0, places=12
-        )
-
-    def test_level_tilt_is_about_forty_five_degrees(self):
-        self.assertAlmostEqual(math.degrees(level_tilt_rad()), 45.526, places=2)
-
-    def test_level_tilt_is_reachable(self):
-        self.assertGreater(level_tilt_rad(), TILT_JOINT_LOWER_RAD)
-        self.assertLess(level_tilt_rad(), TILT_JOINT_UPPER_RAD)
-
-    def test_default_pose_is_level_and_forward(self):
+    def test_default_pose_is_level(self):
+        """A non-zero default tilt aimed the camera at the sky; pin it to 0."""
         pan, tilt = resolve_initial_head_pose(None, None)
-        self.assertAlmostEqual(pan, 0.0, places=12)
-        self.assertAlmostEqual(tilt, level_tilt_rad(), places=12)
+        self.assertEqual(pan, 0.0)
+        self.assertEqual(tilt, 0.0)
 
     def test_explicit_degrees_are_honoured(self):
-        """Hardware's follow_head home (30 deg) must be expressible."""
+        """follow_head's home (30 deg) must remain expressible."""
         pan, tilt = resolve_initial_head_pose(0.0, 30.0)
         self.assertAlmostEqual(math.degrees(tilt), 30.0, places=9)
         self.assertAlmostEqual(pan, 0.0, places=12)
 
+    def test_negative_tilt_within_range_is_honoured(self):
+        _, tilt = resolve_initial_head_pose(None, -20.0)
+        self.assertAlmostEqual(math.degrees(tilt), -20.0, places=9)
+
     def test_tilt_outside_the_joint_limit_is_refused(self):
-        """Silently clamping would leave the camera pointing somewhere else."""
+        """Silently clamping would leave the camera somewhere else."""
         for bad_deg in (95.0, -45.0):
             with self.assertRaises(ValueError, msg=f"accepted {bad_deg}"):
                 resolve_initial_head_pose(0.0, bad_deg)
+
+    def test_joint_limits_match_the_urdf(self):
+        self.assertAlmostEqual(math.degrees(TILT_JOINT_LOWER_RAD), -30.0, places=6)
+        self.assertAlmostEqual(math.degrees(TILT_JOINT_UPPER_RAD), 90.0, places=6)
 
     def test_non_finite_is_refused(self):
         for bad in (float("nan"), float("inf")):
