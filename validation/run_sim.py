@@ -555,9 +555,11 @@ def validate_arena_spawn(arena_dir: Path, spawn_xy: tuple[float, float]) -> None
     footprint; a spawn inside furniture corrupts odometry, lidar, and AMCL.
     The error names the nearest free cell so the user can retry.
 
-    Every caller reaches this after resolving ``arena_dir`` via
-    ``resolve_arena_artifact``, which already put ``root/simulation`` on
-    ``sys.path``, so the imports below resolve without any path surgery here.
+    Every caller reaches this from one of the three sensor-profile branch
+    preambles in ``main()`` (``navigation-parity``, ``sensor-rich``,
+    ``manipulation-core``), each of which already puts ``root/simulation`` on
+    ``sys.path`` before calling this function, so the imports below resolve
+    without any path surgery here.
     """
     from tinker_sim_core.occupancy import OccupancyMap
     from tinker_sim_isaac.backend import _map_metadata

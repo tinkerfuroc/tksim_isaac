@@ -9,6 +9,7 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rosgraph_msgs.msg import Clock
+from simulation_interfaces.msg import Result
 from simulation_interfaces.srv import SetEntityState
 
 
@@ -53,7 +54,15 @@ class ActorPathDriver(Node):
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline and not future.done():
             rclpy.spin_once(self, timeout_sec=0.1)
-        return future.done() and future.result() is not None
+        if not future.done() or future.result() is None:
+            return False
+        response = future.result()
+        if response.result.result != Result.RESULT_OK:
+            raise RuntimeError(
+                f"{self._client.srv_name} rejected operation "
+                f"({response.result.result}): {response.result.error_message}"
+            )
+        return True
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -101,8 +110,9 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     rclpy.init(args=argv)
-    node = ActorPathDriver(timeout_s=arguments.timeout)
+    node = None
     try:
+        node = ActorPathDriver(timeout_s=arguments.timeout)
         for at_sim_time, prim_path, path in sorted(walks):
             if not node.wait_sim_time(at_sim_time, arguments.timeout):
                 raise SystemExit(f"sim time {at_sim_time} not reached")
@@ -119,7 +129,8 @@ def main(argv: list[str] | None = None) -> None:
                 time.sleep(period)
             print(f"actor {prim_path} completed {total:.2f} m path")
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
