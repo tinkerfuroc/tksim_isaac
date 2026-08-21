@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from tinker_sim_isaac.physics_rate import resolve_physics_hz
+from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_core.command_mux import JointCommand, decode_snapshot_packet
 from tinker_sim_core.occupancy import OccupancyMap
 
@@ -235,6 +237,10 @@ class IsaacWholeRobotBackend:
             1, int(_os.environ.get("TINKER_SIM_OBJECT_DISCOVERY_INTERVAL", "60"))
         )
         self._object_discovery_step = 0
+        self._target_write_gate = TargetWriteGate(
+            always_write=_os.environ.get("TINKER_SIM_ALWAYS_WRITE_TARGETS", "")
+            == "1"
+        )
         self.step_profile = {
             "enabled": _os.environ.get("TINKER_SIM_PROFILE", "") == "1",
             "_clock": _time.monotonic,
@@ -244,6 +250,7 @@ class IsaacWholeRobotBackend:
             "physx": 0.0,
             "robot_update": 0.0,
             "object_views": 0.0,
+            "target_writes": 0,
             "n": 0,
         }
         self.seed = int(seed)
@@ -445,6 +452,9 @@ class IsaacWholeRobotBackend:
         identity = id(self._robot.root_view)
         if identity == self._robot_view_identity:
             return True
+        # A freshly resolved PhysX view holds no drive targets yet, so the next
+        # step must push them even if the buffers are unchanged.
+        self._target_write_gate.force_next()
         if self._robot_view_identity is not None:
             # Standard ResetSimulation performs STOP -> PLAY.  Isaac Lab
             # recreates the articulation view on PHYSICS_READY; use that
@@ -542,6 +552,10 @@ class IsaacWholeRobotBackend:
             # acceleration-limited wheel state (see tests/test_base_velocity_slew.py).
             return
         active = bool(active)
+        # A real stop transition must reach PhysX even if the target buffers
+        # happen to compare equal to what was last written. A repeated
+        # identical sample returned above and is deliberately not a transition.
+        self._target_write_gate.force_next()
         if active:
             self._pending_snapshot_id = None
             self._pending_snapshot_commands.clear()
@@ -960,34 +974,49 @@ class IsaacWholeRobotBackend:
             self._velocity_targets.zero_()
             self._effort_targets.zero_()
             self._apply_safety_actuator_hold()
-            self._robot.set_joint_position_target(self._position_targets)
-            self._robot.set_joint_velocity_target(self._velocity_targets)
         else:
             self._slew_wheel_targets()
-            self._robot.set_joint_velocity_target(self._velocity_targets)
+        # Physics runs at 120 Hz while commands arrive far slower, so most
+        # steps would re-send byte-identical targets. PhysX drive targets
+        # persist until changed and this backend uses implicit (stateless)
+        # actuators with no external wrenches, so skipping an unchanged write
+        # is semantically identical -- and it was 6.8 ms of a 12.2 ms step.
+        _write_targets = self._target_write_gate.should_write(
+            (self._position_targets, self._velocity_targets, self._effort_targets)
+        )
+        effort_writer = getattr(self._robot, "set_joint_effort_target", None)
+        if effort_writer is None and self._safety_stopped:
+            raise RuntimeError(
+                "safety stop requires Isaac Lab set_joint_effort_target"
+            )
+        if _write_targets:
             self._robot.set_joint_position_target(self._position_targets)
+            self._robot.set_joint_velocity_target(self._velocity_targets)
         _sp = self.step_profile
         _t = _sp["_clock"] if _sp["enabled"] else None
         if _t is not None:
             _sp["targets"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
-        effort_writer = getattr(self._robot, "set_joint_effort_target", None)
-        if effort_writer is None:
-            if self._safety_stopped:
+        if _write_targets:
+            if effort_writer is not None:
+                effort_writer(self._effort_targets)
+            try:
+                self._robot.write_data_to_sim()
+            except Exception as error:
                 raise RuntimeError(
-                    "safety stop requires Isaac Lab set_joint_effort_target"
+                    "articulation tensor view failed "
+                    f"(time={self.simulation_time:.6f}, end={self.timeline_end_time:.6f}, "
+                    f"playing={self._timeline.is_playing()}, "
+                    f"initialized={self._robot.is_initialized})"
+                ) from error
+            self._target_write_gate.note_written(
+                (
+                    self._position_targets.clone(),
+                    self._velocity_targets.clone(),
+                    self._effort_targets.clone(),
                 )
-        else:
-            effort_writer(self._effort_targets)
-        try:
-            self._robot.write_data_to_sim()
-        except Exception as error:
-            raise RuntimeError(
-                "articulation tensor view failed "
-                f"(time={self.simulation_time:.6f}, end={self.timeline_end_time:.6f}, "
-                f"playing={self._timeline.is_playing()}, "
-                f"initialized={self._robot.is_initialized})"
-            ) from error
+            )
+            self.step_profile["target_writes"] += 1
         if _t is not None:
             _sp["write_data"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
@@ -1020,8 +1049,12 @@ class IsaacWholeRobotBackend:
         }
         out["steps"] = sp["n"]
         out["total_ms"] = round(sum(v for k, v in out.items() if k not in ("steps",)), 3)
+        # How many of those steps actually pushed targets to PhysX; the rest
+        # were byte-identical re-sends the write gate skipped.
+        out["target_writes"] = sp["target_writes"]
         for key in ("targets", "write_data", "physx", "robot_update", "object_views"):
             sp[key] = 0.0
+        sp["target_writes"] = 0
         sp["n"] = 0
         return out
 
