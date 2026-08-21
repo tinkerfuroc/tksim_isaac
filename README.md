@@ -842,8 +842,9 @@ References:
   physics-only 0.75 -> 1.18 at control 60 (1.88 at 30) with the robot root
   within 0.5 mm of the default after 10 s, versus 5 mm drift for the old
   `TINKER_SIM_PHYSICS_HZ=60` advice; sensor-rich with ROS and 15 Hz cameras
-  0.35 -> 0.40 by default and 0.51 at control 60 (0.60 at 30) once combined
-  with the lidar fix below. Found along the way via a new
+  0.35 -> 0.64 by default and 0.70 at control 60 (0.78 at 30) once combined
+  with the lidar, hold, actuator-launch and camera fixes below. Found along
+  the way via a new
   `publish_breakdown_ms` in the `TINKER_SIM_PROFILE=1` output that the
   development-lidar ray-cast cost ~35 ms per lidar frame (~350 ms per
   simulated second); `OccupancyMap.raycast_many` now casts all 181 rays
@@ -856,6 +857,21 @@ References:
   silently integrates at the control dt — caught by a step-count check and
   replaced by explicit substeps), and PhysX worker-thread count (4/8/16)
   changes nothing. Runbook: "Control cadence under a live stack".
+  Follow-up the same day (result-neutral, no knobs): the safety hold is now
+  PhysX's own drive at the latched pose (stiffness 600 / damping 80 / 100 Nm
+  ceiling, gravity fed forward and refreshed every 30 control steps) instead
+  of a Python PD pushed every step that limit-cycled (joint1 pinned at
+  -100 Nm) -- stopped control step 13.3 -> 4.5 ms, arm within 0.005 rad at
+  rest, hold telemetry computed with the hold gains; actuator groups are
+  applied with two Warp launches instead of ten per target push
+  (bit-identical buffers, push 4.3-6.4 -> 1.8 ms,
+  `TINKER_SIM_STOCK_ACTUATOR_MODEL=1` restores Isaac Lab's loop); camera
+  RGB/depth conversions reuse scratch buffers (byte-identical,
+  `tests/test_camera_publish_equivalence.py`). Found, not fixed: the
+  gripper's five finger/knuckle joints have no mimic constraint in
+  `robot.usd` (URDF `<mimic>` lost in conversion) and swing freely.
+  `tests/test_manipulation_runtime.py`'s fixture had silently errored 15
+  tests since `b6b6f0f`; repaired.
 
 - 2026-08-19 (arena scenario entity spawning — "verify person and object
   spawn"): Verified the standard scenario spawn path inside `--arena

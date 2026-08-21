@@ -168,12 +168,17 @@ why simply lowering `dt` was a fidelity change, not an optimisation.
 Measured 2026-08-21 (gpsr-rcw2026, rcw2026 arena, GPU 1, RTF =
 simulated / wall):
 
-| run | physics-only (no ROS, no cameras) | sensor-rich + ROS, cameras 15 Hz |
-|---|---|---|
-| default 120 / control 120 | 0.75 | 0.40 (0.35 before the lidar fix below) |
-| `TINKER_SIM_CONTROL_HZ=60` | 1.18 | 0.51 |
-| `TINKER_SIM_CONTROL_HZ=30` | 1.88 | 0.60 |
-| `TINKER_SIM_PHYSICS_HZ=60` (old advice) | 1.61 | 0.51 (before the lidar fix) |
+| run | physics-only (no ROS, no cameras) | sensor-rich + ROS, cameras 15 Hz, start of day | same, end of day (all fixes below) |
+|---|---|---|---|
+| default 120 / control 120 | 0.75 | 0.35 | **0.64** |
+| `TINKER_SIM_CONTROL_HZ=60` | 1.18 | 0.44 | **0.70** |
+| `TINKER_SIM_CONTROL_HZ=30` | 1.88 | 0.50 | **0.78** |
+| `TINKER_SIM_PHYSICS_HZ=60` (old advice) | 1.61 | 0.51 | — (not needed any more) |
+
+The sensor-rich numbers are with the robot safety-stopped (no bridge
+attached), which is the state a run spends its start-up and every
+command-loss interval in; the "end of day" column includes the lidar,
+safety-hold, actuator-launch and camera fixes described further down.
 
 Robot root position after 10 s idle agreed with the default to within
 0.5 mm at control 60/30 and drifted 5 mm at physics 60 — the substepped runs
@@ -197,6 +202,38 @@ difference at 4 or 16.
 With `TINKER_SIM_PROFILE=1`, every profile line now also carries
 `physics_breakdown_ms.physx_substeps` and a `publish_breakdown_ms`
 (clock / joint_state / imu / cloud / status / truth per `publish()` call).
+### Per-step costs fixed on 2026-08-21 (no knobs, result-neutral)
+
+- **Safety hold.** While stopped, the backend used to disable the arm's
+  PhysX drive and push a gravity-compensated PD effort from Python every
+  control step; at the control rate that PD limit-cycled (joint1 pinned at
+  -100 Nm, arm never at rest) and cost ~8 ms per step. The hold is now
+  PhysX's own drive at the latched pose (stiffness 600, damping 80, 100 Nm
+  ceiling) with only the gravity term fed forward and refreshed every 30
+  control steps. Stopped step 13.3 -> 4.5 ms; the arm sits within 0.005 rad
+  at ~zero velocity, and the published joint efforts during a hold are now
+  computed with the hold gains (they used to report the nominal 20 000
+  stiffness).
+- **Target pushes.** Isaac Lab applies actuator groups with two Warp launches
+  per group; tinker2 has five, so every target push (arm trajectories, the
+  wheel slew ramp, hold refreshes) paid ten launches, ~3.2 ms of a ~3.6 ms
+  push. The backend now binds a fused `_apply_actuator_model` that launches
+  each kernel once over all groups -- bit-identical staging and telemetry
+  buffers, push 4.3-6.4 -> 1.8 ms. `TINKER_SIM_STOCK_ACTUATOR_MODEL=1`
+  restores Isaac Lab's loop.
+- **Camera conversions.** `rgb8_array`/`depth_to_16uc1_mm` reuse scratch
+  buffers and write in place (byte-identical, proven by
+  `tests/test_camera_publish_equivalence.py`); ~14% off the conversion time.
+  With `TINKER_SIM_PROFILE=1` the profile line now also carries a
+  `camera_breakdown_ms` (capture / rgb_convert / depth_convert / image_fill /
+  image_publish / info).
+
+Known model defect found on the way (not fixed here): the gripper's five
+finger/knuckle joints carry no mimic constraint in `robot.usd` (the URDF's
+`<mimic>` tags did not survive conversion), so they swing freely in normal
+operation; grasp evidence should treat finger poses accordingly until the
+conversion is fixed.
+
 That breakdown is how the development-lidar ray-cast was found to cost
 ~35 ms per lidar frame (~350 ms per simulated second); it is now vectorised
 and bit-identical (`OccupancyMap.raycast_many`), at ~2–5 ms per frame;
