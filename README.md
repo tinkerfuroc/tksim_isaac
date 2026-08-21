@@ -407,10 +407,13 @@ value exactly (missing, mismatched, or combined with a `uri` key all raise
 of `--arena`.
 
 The robot's default spawn is world (0, 0), which in the rcw2026 arena lies
-inside `shelf_02`'s physical and rasterized footprint: the robot stands under
-the shelf plate, the planar lidar sees a self-hit/obstruction ring, wheel
-odometry accumulates contact slip, and AMCL is initialized inside an occupied
-map cell. Navigation work in this arena therefore passes
+inside `shelf_02`'s physical and rasterized footprint: the robot would stand
+under the shelf plate, the dev lidar's occupied sensor origin would publish
+an empty cloud rather than useful returns, wheel odometry would accumulate
+contact slip, and AMCL would be initialized inside an occupied map cell. The
+launch now fails closed on this instead of spawning into it — see "the
+default robot spawn" under Known arena limitations below for the exact
+error and its evidence. Navigation work in this arena therefore passes
 `--spawn-xy=X,Y` (world metres; use the `=` form — argparse treats a
 separate `-2.0,-2.0` token as an option string) to place the robot on a free
 map cell, e.g. `--spawn-xy=-2.0,-2.0` (1.0 m clearance on the derived map).
@@ -419,7 +422,55 @@ and requires a profile that loads the robot backend, like `--arena` itself.
 On the Humble side, `./scripts/launch-humble navigation
 map_yaml:=/abs/path/to/artifacts/arena/rcw2026/<identity>/map.yaml` points
 AMCL's map server at the arena's derived map instead of the robot artifact's
-colocated default; the override fails closed on a missing file.
+colocated default; the override fails closed on a missing file. See
+"Navigation launch and scenario execution" immediately below for how
+`navigation.launch.py` now manages its own safety source.
+
+**Navigation launch and scenario execution.** `navigation.launch.py` now
+starts its own `safety_supervisor` node (`manage_controllers:=false
+required_sources:=["collision"]`), so the workflow that previously needed a
+separate 10 Hz CLI heartbeat to keep `/sim/safety/operator` cleared no
+longer applies when launching navigation this way. **This path is
+code-complete but not yet live-verified**: the live-wave step meant to prove
+it (asserting `/sim/status/command_gateway` reports `"safety_stop": false`
+with the arena nav stack up on the Isaac-side domain) never validly ran — it
+was misconfigured onto `ROS_DOMAIN_ID=25` while Isaac ran on 42, so the two
+halves of the stack never shared a domain and never spoke to each other (see
+the `ROS_DOMAIN_ID` trap under Known arena limitations).
+
+Two arena-native scenario variants exercise the arena directly:
+`find-and-approach-person-rcw2026` and `pick-deliver-place-rcw2026`
+(`simulation/scenarios/`), declaring `world: {"mode": "arena", "arena":
+"rcw2026"}` with poses verified against the committed derived occupancy map.
+Run either with `scenario_runner`:
+
+```bash
+PYTHONPATH=$PWD/simulation:$PYTHONPATH \
+  ros2 run tinker_sim_bridge scenario_runner \
+  --root $PWD --scenario find-and-approach-person-rcw2026 --seed 7
+```
+
+(`scenario_runner` imports `tinker_sim_core` at module level, so a bare
+`ros2 run` needs the `PYTHONPATH` above — see Known arena limitations.) A
+scenario's `actor_path_start` events (for example the person walking toward
+the robot) are executed separately by `actor_path_driver`, a one-shot node
+that drives actors along their declared paths via `/set_entity_state`:
+
+```bash
+ros2 run tinker_sim_bridge actor_path_driver \
+  --root $PWD --scenario find-and-approach-person-rcw2026
+```
+
+`actor_path_driver` resolves `tinker_sim_core` from `--root` itself (commit
+`bd4b553`) and does not need `PYTHONPATH` set. Both commands require
+`ROS_DOMAIN_ID` to match the Isaac-side domain the arena sim was launched
+on (`42` in the live acceptance runbook above). `actor_path_driver` itself
+is NOT proven live: the 2026-08-20 wave found it crashed immediately on the
+first `/clock` message (`TypeError: 'ROSClock' object is not callable`,
+`reports/arena-fixes-2026-08-19/person-walk.json`) because its callback
+shadowed an `rclpy.node.Node` instance attribute; that bug is fixed (commit
+`de95b71`, with AST regression guards), but the fix itself has not been
+re-run live.
 
 The streaming wrapper `scripts/launch-arena-streaming` and `--livestream`
 forwarding in the deploy CLI are **not** part of this branch — they live in
@@ -476,12 +527,25 @@ Validation performed on this branch (development-validated only):
   skid-steer rotation accumulates wheel-odometry yaw slip that drags the
   filter (a base-odometry characteristic, not a map defect).
 
+- head pan/tilt effort override: with the backend's `effort_limit_sim`
+  override extended to the `head` actuator group, commanded pan/tilt
+  converged from spawn to within the 0.05 rad tolerance of a (1.0, -0.3)
+  rad target — final (0.9506, -0.2853) rad at sim t=0.317 s — closing the
+  2026-08-18 finding that pan/tilt drives inherited the URDF's 1.0 Nm
+  effort cap. Live-proven:
+  `reports/arena-fixes-2026-08-19/head-tracking.json`;
 - physics interaction (an object resting on arena furniture): the
   pick-deliver-place `delivery_object` (0.08 m cube), spawned via the
   standard `spawn_entity` path at its declared z=0.8 pose, fell onto and
   came to rest statically (zero twist across 387 truth samples) on a 0.5 m
   board of `rcw26_shelf` —
-  `reports/arena-scenario-spawn-2026-08-19/object-spawn-verification.md`;
+  `reports/arena-scenario-spawn-2026-08-19/object-spawn-verification.md`.
+  **Superseded 2026-08-20**: this evidence came from `/get_entity_state`
+  polling, not physics truth; a later run under a profile that reports
+  physics truth found no trace of the object in it at all. See "Scenario-
+  spawned objects may not be physics-simulated" under Known arena
+  limitations below — that finding is SUSPECTED, not confirmed, so treat
+  this bullet as open again rather than either closed or refuted;
 - scenario entity spawning in the arena: `scenario_runner` executed
   find-and-approach-person and pick-deliver-place against an `--arena
   rcw2026` sim with every operation accepted; the person capsule and task
@@ -500,18 +564,65 @@ Not yet validated (open):
 - textured-frame visual confirmation by a human viewer (the streaming
   session above is up for exactly this; connect with NVIDIA's client).
 
-Known arena limitations (development findings, 2026-08-18):
+Known arena limitations (development findings, 2026-08-18 through 2026-08-20):
 
 - the default robot spawn (0, 0) lies inside `shelf_02`'s physical and
-  rasterized footprint — use `--spawn-xy` for navigation work (see launch
-  docs above);
-- head `pan_joint`/`tilt_joint` drives inherit the URDF's 1.0 Nm effort cap
-  (the backend overrides `effort_limit_sim` for arm and wheels only), so
-  commanded pan/tilt motion creeps at ~0.01 rad/s: re-aim the camera by
-  rotating the base, or extend the backend's `head` actuator group;
-- under `sensor-rich`, the planar lidar cloud includes a dense self-hit
-  ring at ~0.3 m that dominates the `/scan` conversion; AMCL/navigation
-  validation used `navigation-parity`'s deterministic raycaster instead.
+  rasterized footprint. The launch now fails closed on this instead of
+  spawning into it: `validate_arena_spawn()` exits non-zero and names the
+  nearest free cell in the error (`arena spawn (0.0, 0.0) lacks 0.35 m
+  clearance on the derived map; try --spawn-xy=-0.4,0.4`) — pass the
+  suggested `--spawn-xy` for navigation work (see launch docs above).
+  Live-proven: `reports/arena-fixes-2026-08-19/spawn-fail-closed.log`
+  (exit 1, suggestion printed);
+- under `sensor-rich`, an occupied dev-lidar sensor origin (for example the
+  spawn-in-`shelf_02` case above) used to publish a dense ring at ~0.3 m
+  for every ray. The 2026-08-18 note here misdescribed this as an RTX-lidar
+  self-hit; there is no RTX lidar in this path, and the ring was the
+  occupancy raycast's minimum-range floor being returned when every ray
+  starts inside an occupied cell. An occupied ray origin now publishes an
+  empty cloud instead. Unit-proven only, no live run has targeted this
+  path: `tests/test_ros_gateway.py`
+  (`RosDevelopmentLidarTest.test_development_lidar_empty_when_origin_occupied`);
+- wheel-velocity commands are slew-limited to 60 rad/s² (≈3.1 m/s² linear
+  at the 0.0525 m wheel radius), set deliberately ABOVE Nav2's `acc_lim`
+  (~2.5 m/s²) so planner-shaped velocity profiles pass through unchanged —
+  the bound exists to floor non-planner commanders and stale-target
+  transients, not to shape Nav2 output. Live-proven: after a 30 s in-place
+  rotation, an idle base commanded to coast drifted only 8.0e-05 m in XY
+  over the following 30 s, far inside the 0.1 m bound —
+  `reports/arena-fixes-2026-08-19/coast.json`;
+- sustained in-place skid-steer rotation accumulates wheel-odometry yaw
+  slip (a base-odometry characteristic, not a map defect — see the AMCL
+  validation note above). This is a dead end for IMU fusion: the sim IMU
+  publishes only world-frame angular velocity, marks
+  `orientation_covariance[0] = -1.0` (REP-145 "orientation not provided"),
+  and never populates linear acceleration, so fusing it into an EKF would
+  only duplicate odom's own vyaw rather than correct it.
+
+Found on 2026-08-20, while the live evidence wave was closing out the
+fixes above:
+
+1. **Scenario-spawned objects may not be physics-simulated.** Isaac logs
+   `Physics tensor entity not valid for rigid body /World/Scenario/<id>`
+   and the object was observed holding its exact spawn pose with
+   fabricated zero velocities. This is SUSPECTED, not confirmed: it was
+   seen through a run whose profile could not report objects at all
+   (fixed since, commit `02d1785`), so it may prove to be an artifact of
+   that. This supersedes the 2026-08-19 claim above that the "object
+   rests on furniture" item was closed — that evidence came from
+   `/get_entity_state`, not physics truth. Evidence:
+   `reports/arena-fixes-2026-08-19/object-on-table.json`.
+2. **`ROS_DOMAIN_ID` trap.** `.deployment.env` sets `ROS_DOMAIN_ID=25` and
+   `scripts/launch-humble` defaults to `${ROS_DOMAIN_ID:-25}`, so sourcing
+   `.deployment.env` silently overrides the 42 that live arena runs use.
+   Export 42 AFTER sourcing, in every shell, including the one that runs
+   `launch-humble`. `.deployment.env` must still be sourced — it carries
+   the Isaac EULA acceptance variable.
+3. **`scenario_runner` needs `PYTHONPATH` under a bare `ros2 run`.** It
+   imports `tinker_sim_core` at module level (`scenario_runner.py:22`),
+   so CLI invocations need `PYTHONPATH=$PWD/simulation:$PYTHONPATH`.
+   `actor_path_driver` does NOT need this — it resolves
+   `tinker_sim_core` from `--root` as of commit `bd4b553`.
 
 Status: development-validated only, **not release-qualified**.
 
@@ -831,6 +942,90 @@ References:
 - [Isaac Lab installation](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)
 
 ## Changelog
+
+- 2026-08-21 (arena-findings fixes wrap-up — "Tasks 1-14 of the
+  arena-findings plan"): Landed eleven fixes against the arena findings
+  documented below: occupancy clearance and nearest-free-cell search
+  helpers; fail-closed arena spawn validation with a nearest-free
+  `--spawn-xy` suggestion (`b311a5b`); the dev lidar now publishes an empty
+  cloud from an occupied sensor origin instead of a raycast-floor ring
+  (`0a42eec`); the head `pan_joint`/`tilt_joint` actuator group now gets
+  the same `effort_limit_sim` override as arm/wheels (`5e07c5c`);
+  `slew_velocity_target` plus safety-stop idempotence (`e72574d`) and a
+  per-tick vectorised wheel-velocity slew bound of 60 rad/s² (`86ec363`);
+  actor-path interpolation with fail-closed `actor_path_start` validation
+  (`e780295`) and an `actor_path_driver` node that executes those paths via
+  `/set_entity_state` (`46ac8ae`); two arena-native scenario variants with
+  map-verified poses, `find-and-approach-person-rcw2026` and
+  `pick-deliver-place-rcw2026` (`9abaa74`, guarded for artifact-less
+  checkouts by `d0e36d4`); and a supervisor navigation mode so
+  `navigation.launch.py` runs its own `safety_supervisor` with
+  parameterized sources (`e36f606`).
+
+  A live evidence wave (2026-08-19/20, `reports/arena-fixes-2026-08-19/`)
+  then tried to prove all of the above, plus the navigation-safety and
+  object-resting claims, live. It confirmed three: the head-effort fix
+  converged to 0.9506/-0.2853 rad against a 1.0/-0.3 rad target, within
+  0.05 rad at sim t=0.317 s (`head-tracking.json`); the fail-closed spawn
+  check exited 1 with the `try --spawn-xy=` suggestion
+  (`spawn-fail-closed.log`); and the wheel-slew/coast bound held an idle
+  base to 8.0e-05 m of XY drift over 30 s post-rotation, far inside the
+  0.1 m bound (`coast.json`). It also found two real regressions and left
+  one step unrun: `actor_path_driver` crashed on its first `/clock`
+  message because its callback shadowed an `rclpy.node.Node` instance
+  attribute (`person-walk.json`); the pick-deliver-place object never
+  appeared in `/sim/internal/physics_truth` at all, because the
+  `navigation-parity` backend construction never passed
+  `expected_objects`/`scenario` (`object-on-table.json`), with Isaac
+  separately logging `Physics tensor entity not valid for rigid body` for
+  it on every query; and the navigation-safety-clear step never validly
+  ran because the nav stack was misconfigured onto `ROS_DOMAIN_ID=25`
+  while Isaac ran on 42.
+
+  Three post-wave repairs followed: `actor_path_driver` resolves
+  `tinker_sim_core` from `--root` instead of importing it at module level,
+  so a bare `ros2 run ... --root $PWD` is self-sufficient (`bd4b553`); the
+  `/clock` callback was renamed off the shadowed `_clock` attribute to
+  `_on_clock`, with two new AST regression guards (`de95b71`); and Task 14
+  fixed the `navigation-parity` backend construction to pass
+  `expected_objects`/`scenario` like its sibling branches (`02d1785`,
+  `bddc0f9`), closing the H1 cause of the physics-truth blindness —
+  `tests/test_scenario_object_tracking.py`. A second, suspected cause (H2:
+  the object's pose and zero velocities looking frozen rather than
+  settled) remains unconfirmed — it was observed through a run that could
+  not see the object in physics truth at all, so it may be an artifact of
+  that, and needs its own live re-run to separate from H1.
+
+  Remaining unverified on this branch: `actor_path_driver`'s path-execution
+  fix (the crash is fixed; the walk itself has not been re-run live);
+  Task 14's fix (unit-proven — the gate suite went from 111 to 113 passing
+  — but not live-verified, since the wave that would have re-run this step
+  was stopped by the user); and the navigation-profile safety-clear
+  path (code-complete, never validly run). The dev-lidar occupied-origin
+  fix and the occupancy/safety-gating/actor-path helper suites remain
+  unit-proven only.
+
+  Test gates: the 13-file focused arena/CLI/safety suite under
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest` — 113 passed;
+  `tests/test_safety_contract.py` run separately — 20 passed, 1
+  pre-existing failure
+  (`test_stopped_command_packets_are_blocked_before_parse_without_error_logging`,
+  a teammate gateway rework predating this branch, report-don't-fix, not
+  this plan's regression); `python3 -m unittest discover -s tests` — 601
+  tests, 19 failures (all `test_provenance.Task8OMPLOverlayProvenanceTest`,
+  the known `tk25_ws` branch-state issue) and 22 errors (19 PIL
+  `Resampling` failures on `ManipulationContactSheetsTest`, plus 3 loader
+  errors for `test_manipulation_runtime`/`test_actuator_safety_startup`/
+  `test_scenario_runner` — torch and `tinker_sim_bridge` unavailable under
+  system Python). `test_base_velocity_slew.py` and `test_safety_contract.py`
+  define module-level pytest functions, not `unittest.TestCase` subclasses,
+  so `unittest discover` cannot collect them; their status is the pytest
+  results above, not the discovery run. `tests/test_chassis_ballast.py`
+  fails 6/6 against currently committed code
+  (`CHASSIS_BALLAST_ADDED_MASS_KG` raised to 30.0 by a different, concurrent
+  workstream on this shared branch, whose 50 kg total the test's 30 kg
+  assertion no longer matches) — an external branch condition, not a
+  regression from this plan's work.
 
 - 2026-08-19 (arena scenario entity spawning — "verify person and object
   spawn"): Verified the standard scenario spawn path inside `--arena
