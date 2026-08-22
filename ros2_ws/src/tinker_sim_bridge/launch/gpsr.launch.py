@@ -381,6 +381,26 @@ def _resolve(context):
             parameters=[{"use_sim_time": True}],
             output="screen",
         ),
+        # Same contract gap as the Livox one below, for the head camera. The
+        # robot description calls the link head_camera_color_optical_frame;
+        # the real Orbbec driver stamps its images camera_color_optical_frame
+        # and publishes that frame itself. Without this the frame the sim's
+        # images advertise does not exist in TF, and a consumer that asks for
+        # a detection in map silently drops it -- GPSR run16 detected the
+        # person at conf 1.0 and returned zero objects for exactly that
+        # reason. Identity: the URDF link already is the optical frame.
+        Node(
+            package="tf2_ros", executable="static_transform_publisher",
+            name="head_camera_optical_alias_tf",
+            arguments=[
+                "--x", "0", "--y", "0", "--z", "0",
+                "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
+                "--frame-id", "head_camera_color_optical_frame",
+                "--child-frame-id", "camera_color_optical_frame",
+            ],
+            parameters=[{"use_sim_time": True}],
+            output="screen",
+        ),
         # Match the physical Livox driver contract. The robot URDF's visual
         # sensor link is named livox_frame, while hardware messages and Nav2
         # intentionally use the separate livox360 frame.

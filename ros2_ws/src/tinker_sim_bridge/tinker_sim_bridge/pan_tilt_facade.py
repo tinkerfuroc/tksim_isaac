@@ -7,7 +7,11 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
 
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
+
 from tinker_sim_bridge.head_pose import resolve_initial_head_pose
+from tinker_sim_bridge.head_tf import head_transforms
 
 
 class PanTiltFacade(Node):
@@ -18,6 +22,7 @@ class PanTiltFacade(Node):
         self._commands = self.create_publisher(
             JointState, "/sim/controller/pan_tilt_commands", 20
         )
+        self._tf = TransformBroadcaster(self)
         self._states = self.create_publisher(
             PanTiltState, "/pan_tilt_controller/state", 20
         )
@@ -97,6 +102,35 @@ class PanTiltFacade(Node):
         state.connected = True
         state.feedback_ok = True
         self._states.publish(state)
+        self._broadcast_head_tf(message.header)
+
+    def _broadcast_head_tf(self, header) -> None:
+        """Publish the two transforms robot_state_publisher cannot.
+
+        The head joints are not ros2_control joints, so they never appear in
+        /joint_states and RSP never emits base_link -> pan_link or
+        pan_link -> tilt_link. Everything below them is fixed and therefore
+        does reach /tf_static, which leaves the whole head camera subtree
+        floating unconnected from base_link -- and any detection asked for in
+        map is silently dropped. Adding a second /joint_states publisher is
+        not an option here (pick_and_place accepts exactly one), so the
+        facade, which already owns this state, closes the chain itself.
+        """
+        for transform in head_transforms(self._pan, self._tilt):
+            message = TransformStamped()
+            message.header.stamp = header.stamp
+            message.header.frame_id = transform.parent
+            message.child_frame_id = transform.child
+            message.transform.translation.x = transform.xyz[0]
+            message.transform.translation.y = transform.xyz[1]
+            message.transform.translation.z = transform.xyz[2]
+            (
+                message.transform.rotation.x,
+                message.transform.rotation.y,
+                message.transform.rotation.z,
+                message.transform.rotation.w,
+            ) = transform.quaternion_xyzw
+            self._tf.sendTransform(message)
 
 
 def main() -> None:
