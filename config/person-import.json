@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/TeamSOBITS/sobits_gazebo_worlds",
+  "branch": "feature/hri",
+  "commit": "293b4057d26a673c3f09ff7d8f3118234d42ba24",
+  "models_root": "models",
+  "person_allowlist": [
+    "person_standing"
+  ],
+  "collision_box_m": {
+    "person_standing": {
+      "min": [
+        -0.28,
+        -0.26,
+        0.0
+      ],
+      "max": [
+        0.27,
+        0.12,
+        1.91
+      ]
+    }
+  }
+}
