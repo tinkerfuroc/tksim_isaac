@@ -960,6 +960,26 @@ def main() -> int:
             camera_specs = load_camera_specs(
                 root / "simulation/sensors/hardware-parity.json"
             )
+            # Opt-in, sim-only correction for the head camera's aim. The robot
+            # description points it 14-48 deg above the horizon everywhere in
+            # the reachable pan/tilt range, so the head camera sees only wall
+            # and sky; this lets GPSR be exercised until that is fixed in the
+            # description. Deliberately a workaround, and deliberately off
+            # unless asked for -- see tinker_sim_isaac.head_camera_aim.
+            from tinker_sim_isaac.head_camera_aim import (
+                HEAD_AIM_ENV,
+                apply_head_aim_correction,
+                resolve_head_aim_correction,
+            )
+
+            head_aim = resolve_head_aim_correction(os.environ.get(HEAD_AIM_ENV))
+            if head_aim is not None:
+                camera_specs = apply_head_aim_correction(camera_specs, head_aim)
+                print(
+                    f"[sim] {HEAD_AIM_ENV} active: head camera aim corrected in "
+                    "simulation only -- hardware parity is deliberately broken",
+                    flush=True,
+                )
             camera_rig = CameraRig(camera_specs)
             camera_rig.initialize(app)
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
