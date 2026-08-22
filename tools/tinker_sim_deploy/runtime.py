@@ -252,6 +252,47 @@ def resolve_current_artifact(project_root: Path) -> ArtifactResolution:
     raise RuntimeError("current artifact pointer schema is unsupported")
 
 
+def scenario_arena_id(scenario_data: object) -> str | None:
+    """Return the arena id a scenario's ``world`` block names, if any."""
+    if not isinstance(scenario_data, dict):
+        return None
+    world = scenario_data.get("world")
+    if not isinstance(world, dict):
+        return None
+    arena = world.get("arena")
+    if not isinstance(arena, str) or not arena.strip():
+        return None
+    return arena.strip()
+
+
+def resolve_arena_map_yaml(project_root: Path, arena_id: str) -> Path:
+    """Resolve ``artifacts/arena/<arena_id>/<current>/map.yaml``.
+
+    Mirrors ``validation/run_sim.py``'s ``resolve_arena_artifact``: the
+    ``current.json`` pointer names the selected manifest, and the map is
+    colocated with it.  This is the map the simulator raycasts its synthetic
+    lidar against, so it is the only map AMCL can localize on when the
+    simulator runs with ``--arena``; the robot artifact's own ``map.yaml`` is
+    the hardware arena and shares no occupied cell with it.
+    """
+    if not arena_id or "/" in arena_id or "\\" in arena_id or arena_id in {".", ".."}:
+        raise RuntimeError(f"unsafe arena id: {arena_id!r}")
+    pointer = Path(project_root) / "artifacts" / "arena" / arena_id / "current.json"
+    if not pointer.is_file():
+        raise RuntimeError(f"arena artifact pointer does not exist: {pointer}")
+    current = json.loads(pointer.read_text(encoding="utf-8"))
+    manifest_value = current.get("manifest") if isinstance(current, dict) else None
+    if not isinstance(manifest_value, str) or not manifest_value:
+        raise RuntimeError(f"arena artifact pointer has no manifest: {pointer}")
+    manifest = Path(manifest_value)
+    if not manifest.is_absolute():
+        manifest = Path(project_root) / manifest
+    map_yaml = manifest.parent / "map.yaml"
+    if not map_yaml.is_file():
+        raise RuntimeError(f"arena artifact missing map.yaml: {map_yaml}")
+    return map_yaml
+
+
 def topic_control_description(urdf: str | bytes) -> str:
     raw = urdf.decode("utf-8") if isinstance(urdf, bytes) else urdf
     root = ET.fromstring(raw)

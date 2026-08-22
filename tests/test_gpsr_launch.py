@@ -33,6 +33,13 @@ class GpsrLaunchTest(unittest.TestCase):
                 f"{name} must appear exactly once; found {self.executables.count(name)}",
             )
 
+    def test_map_defaults_to_the_scenario_arena_map(self):
+        """A blank map_yaml must resolve the scenario's arena map, not the
+        robot artifact's hardware map (they share no occupied cell)."""
+        source = LAUNCH.read_text(encoding="utf-8")
+        self.assertIn("scenario_arena_id(", source)
+        self.assertIn("resolve_arena_map_yaml(", source)
+
     def test_manipulation_side_is_present(self):
         for name in ("ros2_control_node", "xarm_facade", "gripper_facade",
                      "pan_tilt_facade", "audio_fixtures"):

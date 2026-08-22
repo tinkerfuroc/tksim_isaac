@@ -10,7 +10,12 @@ _tools = _project_root / "tools"
 if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
-from tinker_sim_deploy.runtime import resolve_current_artifact, topic_control_description
+from tinker_sim_deploy.runtime import (
+    resolve_arena_map_yaml,
+    resolve_current_artifact,
+    scenario_arena_id,
+    topic_control_description,
+)
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -79,6 +84,7 @@ def _resolve(context):
     # the map origin, and an unseeded AMCL can start inside occupied space.
     # Fall back to (0, 0, 0) if the scenario doesn't specify one.
     initial_pose_xyz = (0.0, 0.0, 0.0)
+    scenario_data = {}
     try:
         scenario_data = json.loads(scenario_file.read_text(encoding="utf-8"))
         robot_initial_pose = scenario_data.get("robot", {}).get("initial_pose")
@@ -95,8 +101,18 @@ def _resolve(context):
     robot_description = topic_control_description(resolved_artifact.robot_urdf)
 
     calibration = root / "simulation/calibration/tinker2-missing.json"
+    # AMCL must localize on the arena the simulator raycasts its lidar
+    # against.  The robot artifact's colocated map.yaml is the hardware arena
+    # (no occupied cell in common with rcw2026), so a scenario that names an
+    # arena selects that arena artifact's map unless map_yaml:= overrides it.
     map_yaml_value = LaunchConfiguration("map_yaml").perform(context).strip()
-    map_yaml = Path(map_yaml_value).expanduser().resolve() if map_yaml_value else artifact / "map.yaml"
+    arena_id = scenario_arena_id(scenario_data)
+    if map_yaml_value:
+        map_yaml = Path(map_yaml_value).expanduser().resolve()
+    elif arena_id:
+        map_yaml = resolve_arena_map_yaml(root, arena_id)
+    else:
+        map_yaml = artifact / "map.yaml"
     if not map_yaml.is_file():
         raise RuntimeError(f"navigation map does not exist: {map_yaml}")
 
