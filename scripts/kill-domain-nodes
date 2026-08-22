@@ -53,11 +53,35 @@ if [ "$force" != "--force" ]; then
   exit 0
 fi
 
-kill "${targets[@]}" 2>/dev/null || true
-sleep 8
-survivors=()
-for pid in "${targets[@]}"; do [ -d "/proc/$pid" ] && survivors+=("$pid"); done
-if [ "${#survivors[@]}" -gt 0 ]; then
-  kill -9 "${survivors[@]}" 2>/dev/null || true
+# SIGINT first, and give it real time. rclpy/rclcpp install SIGINT handlers
+# that shut the context down and release DDS resources -- including the
+# FastDDS shared-memory segments and their port locks under /dev/shm. SIGTERM
+# is not handled by default, so a TERM-first teardown leaves those segments
+# orphaned; the next run then fails with "Failed init_port fastrtps_portNNNNN:
+# open_and_lock_file failed" and sees a half-populated ROS graph.
+alive() {
+  local out=() pid
+  for pid in "$@"; do [ -d "/proc/$pid" ] && out+=("$pid"); done
+  printf '%s\n' "${out[@]:-}"
+}
+
+kill -INT "${targets[@]}" 2>/dev/null || true
+for _ in $(seq 1 15); do
+  sleep 1
+  mapfile -t remaining < <(alive "${targets[@]}")
+  [ -z "${remaining[0]:-}" ] && break
+done
+
+mapfile -t remaining < <(alive "${targets[@]}")
+if [ -n "${remaining[0]:-}" ]; then
+  echo "  ${#remaining[@]} did not exit on SIGINT; escalating to SIGTERM"
+  kill -TERM "${remaining[@]}" 2>/dev/null || true
+  sleep 5
+  mapfile -t remaining < <(alive "${remaining[@]}")
+fi
+
+if [ -n "${remaining[0]:-}" ]; then
+  echo "  ${#remaining[@]} did not exit on SIGTERM; escalating to SIGKILL (may orphan /dev/shm segments)"
+  kill -KILL "${remaining[@]}" 2>/dev/null || true
 fi
 echo "killed ${#targets[@]} process(es) on domain $domain"
