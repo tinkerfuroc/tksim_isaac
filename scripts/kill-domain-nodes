@@ -14,7 +14,7 @@ domain="${1:?usage: kill-domain-nodes <ROS_DOMAIN_ID> [--force]}"
 force="${2:-}"
 
 # Node patterns this project starts. Extend rather than broadening to bare names.
-patterns='run_sim[.]py|tinker_sim_bridge|move_group|cumotion|pick_and_place|grasp_action|robot_state_publisher|static_transform_publisher|lifecycle_manager|controller_manager|ros2_control_node|amcl|bt_navigator|planner_server|controller_server|behavior_server|velocity_smoother|waypoint_follower|map_server|ekf_node|pointcloud_to_laserscan|camera_server|camera_compat_bridge|generalist_node|yolo_seg_node|door_detection|person_track_server|waving_person_server|feature_recognition|approach_planner|orientation_angle|gpsr-orchestrator|behavior_tree|pan_tilt|state_publisher'
+patterns='run_sim[.]py|tinker_sim_bridge|move_group|cumotion|pick_and_place|grasp_action|robot_state_publisher|static_transform_publisher|lifecycle_manager|controller_manager|ros2_control_node|amcl|bt_navigator|planner_server|controller_server|behavior_server|velocity_smoother|waypoint_follower|map_server|ekf_node|pointcloud_to_laserscan|camera_server|camera_compat_bridge|generalist_node|yolo_seg_node|door_detection|person_track_server|waving_person_server|feature_recognition|approach_planner|orientation_angle|gpsr-orchestrator|behavior_tree|pan_tilt|state_publisher|smoother_server|joint_state_publisher|tf2_echo|tf2_monitor|view_frames'
 
 mapfile -t candidates < <(pgrep -f "$patterns" 2>/dev/null || true)
 
@@ -24,7 +24,17 @@ for pid in "${candidates[@]:-}"; do
   [ -d "/proc/$pid" ] || continue
   # Never match this script or its own shell.
   [ "$pid" = "$$" ] && continue
-  pid_domain="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -m1 '^ROS_DOMAIN_ID=' | cut -d= -f2 || true)"
+  environ="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true)"
+  if printf '%s\n' "$environ" | grep -q '^ROS_DOMAIN_ID='; then
+    pid_domain="$(printf '%s\n' "$environ" | grep -m1 '^ROS_DOMAIN_ID=' | cut -d= -f2)"
+  else
+    # ROS treats an unset ROS_DOMAIN_ID as domain 0. Without this, processes
+    # that never exported it are invisible to every domain -- which is how
+    # three orphaned smoother_servers and a robot_state_publisher survived a
+    # full teardown on 2026-08-22 and then poisoned DDS discovery for the
+    # next run.
+    pid_domain=0
+  fi
   [ "$pid_domain" = "$domain" ] || continue
   targets+=("$pid")
 done
