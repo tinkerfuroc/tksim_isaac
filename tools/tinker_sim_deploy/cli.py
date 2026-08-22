@@ -77,7 +77,9 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="stream the navigation-parity arena through NVIDIA WebRTC",
     )
-    launch.add_argument("--dds-profile", choices=("local", "lan"), default="local")
+    launch.add_argument(
+        "--dds-profile", choices=("local", "lan", "large-images"), default="local"
+    )
     launch.add_argument(
         "--camera-pointcloud",
         action="store_true",

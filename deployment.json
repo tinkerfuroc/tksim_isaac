@@ -40,7 +40,8 @@
     "rmw_implementation": "rmw_fastrtps_cpp",
     "dds_profiles": {
       "local": null,
-      "lan": "config/fastdds-lan.xml"
+      "lan": "config/fastdds-lan.xml",
+      "large-images": "config/fastdds-large-images.xml"
     },
     "allowed_interfaces": [
       "builtin_interfaces",
