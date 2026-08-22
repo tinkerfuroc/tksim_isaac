@@ -17,6 +17,11 @@ from tinker_sim_deploy.runtime import (
     topic_control_description,
 )
 
+from tinker_sim_bridge.nav_params_overlay import (
+    default_destination,
+    write_prior_map_params,
+)
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -118,6 +123,19 @@ def _resolve(context):
 
     bridge_share = Path(FindPackageShare("tinker_sim_bridge").perform(context))
     nav_share = Path(FindPackageShare("navigation_bringup").perform(context))
+
+    # Hardware's nav2_dwb_params.yaml sets the global costmap up for SLAM
+    # without a prior map: a rolling 10x10 m window and no static_layer. This
+    # launch localizes with AMCL against the arena map instead, and under the
+    # rolling window every goal more than 5 m away is off the costmap -- the
+    # planner rejects it without searching. Apply the rollback the upstream
+    # file documents to a copy; the upstream file itself is hardware's.
+    upstream_nav_params = (
+        workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"
+    )
+    nav_params = write_prior_map_params(
+        upstream_nav_params, default_destination(upstream_nav_params)
+    )
 
     safety_source_deadline_s = float(
         LaunchConfiguration("safety_source_deadline_s").perform(context)
@@ -388,7 +406,7 @@ def _resolve(context):
             PythonLaunchDescriptionSource(str(nav_share / "launch/localization_no_ekf_launch.py")),
             launch_arguments={
                 "use_sim_time": "True", "map": str(map_yaml),
-                "params_file": str(workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"),
+                "params_file": str(nav_params),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
         ),
@@ -404,7 +422,7 @@ def _resolve(context):
             PythonLaunchDescriptionSource(str(nav_share / "launch/navigation_dwb_launch.py")),
             launch_arguments={
                 "use_sim_time": "True",
-                "params_file": str(workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"),
+                "params_file": str(nav_params),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
         ),
