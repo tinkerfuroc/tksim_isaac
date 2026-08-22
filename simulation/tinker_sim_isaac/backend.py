@@ -68,6 +68,20 @@ WHEEL_JOINT_NAMES = frozenset(
         "rear_right_wheel_joint",
     }
 )
+#: Isaac Lab ``joint_names_expr`` for the velocity-driven wheel group: the two
+#: front drive wheels only.
+WHEEL_ACTUATOR_JOINT_PATTERNS = ("front_.*_wheel_joint",)
+#: The rear casters (swivel + 0.03 m wheel) are passive on the real base, and
+#: must be passive here too.  The URDF importer bakes a stiffness-625,
+#: unlimited-force position drive (target 0) onto every continuous joint, so
+#: an unconfigured swivel is rigidly held straight; and a caster wheel driven
+#: at the front wheels' angular velocity (base_facade commands all four) is
+#: wrong by the radius ratio, so its damping-200 drive saturates as a brake:
+#: forward driving ran the fronts at 3.1 rad/s against a 3.8 target, and an
+#: in-place turn reached ~20% of the commanded yaw rate with the fronts
+#: stalled and chattering (wheel odometry garbage -> Nav2 stalls at the
+#: goal).  A zero-gain group overrides the baked drives and frees them.
+CASTER_JOINT_PATTERNS = ("rear_.*_swivel_joint", "rear_.*_wheel_joint")
 
 
 def slew_velocity_target(current: float, target: float, max_delta: float) -> float:
@@ -562,8 +576,13 @@ class IsaacWholeRobotBackend:
                     stiffness=0.0,
                     damping=0.0,
                 ),
+                "casters": ImplicitActuatorCfg(
+                    joint_names_expr=list(CASTER_JOINT_PATTERNS),
+                    stiffness=0.0,
+                    damping=0.0,
+                ),
                 "wheels": ImplicitActuatorCfg(
-                    joint_names_expr=["front_.*_wheel_joint", "rear_.*"],
+                    joint_names_expr=list(WHEEL_ACTUATOR_JOINT_PATTERNS),
                     stiffness=0.0,
                     damping=200.0,
                     velocity_limit_sim=30.0,

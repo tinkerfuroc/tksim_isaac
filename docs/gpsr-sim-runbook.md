@@ -271,6 +271,16 @@ gives GPSR `/xarm_gripper/gripper_action`, `/pan_tilt_controller/*`,
 and `navigate_to_pose` + `map`→`base_link` TF (via Nav2/AMCL) in one process
 group.
 
+**Which map AMCL gets.** With `map_yaml` blank, `gpsr.launch.py` resolves the
+map from the scenario's `world.arena` (`artifacts/arena/<arena>/current.json`
+→ that artifact's `map.yaml`) — the same map the simulator raycasts its
+synthetic lidar against. Only a scenario with no arena falls back to the
+robot artifact's colocated `map.yaml`, which is the **hardware** arena
+(`0701_robocup_arena3`) and shares no occupied cell with `rcw2026`.
+`navigation.launch.py` has no scenario, so pass `arena:=rcw2026` (or an
+explicit `map_yaml:=`) whenever Stage 1 ran with `--arena`. An explicit
+`map_yaml:=` always wins.
+
 ## Stage 3 — tk26_vision
 
 ```bash

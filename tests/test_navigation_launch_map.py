@@ -56,6 +56,34 @@ class NavigationLaunchMapTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "navigation map does not exist"):
             self.module.resolve_map_yaml(str(missing), self.artifact)
 
+    def test_arena_map_wins_over_the_artifact_map(self) -> None:
+        (self.artifact / "map.yaml").write_text("image: hardware.pgm\n")
+        arena_map = Path(self.temporary.name) / "arena" / "map.yaml"
+        arena_map.parent.mkdir()
+        arena_map.write_text("image: arena.pgm\n")
+        resolved = self.module.resolve_map_yaml("", self.artifact, arena_map)
+        self.assertEqual(resolved, arena_map)
+
+    def test_explicit_override_wins_over_the_arena_map(self) -> None:
+        override = Path(self.temporary.name) / "override.yaml"
+        override.write_text("image: override.pgm\n")
+        arena_map = Path(self.temporary.name) / "arena" / "map.yaml"
+        arena_map.parent.mkdir()
+        arena_map.write_text("image: arena.pgm\n")
+        resolved = self.module.resolve_map_yaml(str(override), self.artifact, arena_map)
+        self.assertEqual(resolved, override.resolve())
+
+    def test_missing_arena_map_fails_closed(self) -> None:
+        (self.artifact / "map.yaml").write_text("image: hardware.pgm\n")
+        missing = Path(self.temporary.name) / "arena" / "map.yaml"
+        with self.assertRaisesRegex(RuntimeError, "navigation map does not exist"):
+            self.module.resolve_map_yaml("", self.artifact, missing)
+
+    def test_launch_declares_an_arena_argument(self) -> None:
+        source = (ROOT / "ros2_ws/src/tinker_sim_bridge/launch/navigation.launch.py").read_text()
+        self.assertIn('DeclareLaunchArgument("arena"', source)
+        self.assertIn("resolve_arena_map_yaml(", source)
+
 
 if __name__ == "__main__":
     unittest.main()

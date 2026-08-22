@@ -4,6 +4,95 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-08-22 — GPSR `goto_command_point` stall: two root causes in the sim, one residual
+
+Starting point: `reports/gpsr-sim-2026-08-20/NAV-HANDOFF.md` — Nav2 never
+left the first goal, `controller_server` aborted with `Failed to make
+progress` every ~13 s (57×), recoveries ran 8×, `/amcl_pose` wandered in and
+out of the 0.1 m tolerance. The handoff suspected `min_theta_velocity_threshold`
+and the progress checker. Neither was the cause (`min_theta_velocity_threshold`
+filters *odometry*, not commands). Everything below was measured on the same
+stack (`sensor-rich`, `gpsr-rcw2026`, `--arena rcw2026 --spawn-xy=-2,-2`,
+`navigation.launch.py`, domain 71) with `/sim/internal/physics_truth` as ground
+truth; probe scripts lived in the job's tmp dir, numbers are in the text.
+
+**Reproduced first.** Nav-only stack, goal = the scenario spawn (−2, −2, yaw 0):
+same 13 s abort cadence, same recoveries. Truth vs estimate showed the
+*physical* robot turning at −0.1…−0.2 rad/s for a −0.6 command while wheel
+odometry reported +0.2…+1.3 rad/s, the estimate "moving" 0.5 m in 6 s, and
+the robot physically 1.2 m off the goal while AMCL (cov 0.012) put it 0.1 m
+away. Open-loop `/cmd_vel` without Nav2 isolated it: forward 0.2 m/s was fine
+(truth 0.17, fronts 3.1 vs 3.8 rad/s target); **rotate ±0.5 rad/s gave truth
+0.11 / −0.09 rad/s**, front wheels stalled and chattering (−0.24±0.66 vs
+−1.19 target), odom yaw rate garbage.
+
+**Root cause 1 — the rear casters were driven and held (fixed).** The URDF's
+rear wheels (r = 0.03 m) sit on free swivel joints; `base_facade` commands
+all four wheel joints with the front wheels' angular velocity and the
+backend's `wheels` actuator group matched `rear_.*`, so (a) the caster wheels
+got a damping-200 velocity drive at a target wrong by the radius ratio —
+forward they were braked (the front drive saturated, 3.1 vs 3.8 rad/s), in a
+turn they were skids — and (b) the caster *swivels* were caught by the same
+group (damping 200 toward zero). Narrowing the group to the wheels only made
+it worse: the URDF importer bakes a stiffness-625, unlimited-force position
+drive (target 0) onto every continuous joint, so an unconfigured swivel is
+rigidly held straight (swivel position stayed within ±0.0006 rad through an
+8 s turn). Fix: drive only `front_.*_wheel_joint`; `rear_.*_swivel_joint`
+and `rear_.*_wheel_joint` form an explicit zero-gain `casters` group
+(`CASTER_JOINT_PATTERNS`). Result: forward 0.20 m/s at 3.76/3.80 rad/s (no
+saturation), casters free-roll at 6.6 rad/s (= 0.2/0.03), **rotate ±0.5 →
+0.28 / −0.27 rad/s and odom yaw rate now tracks truth** (0.29 / −0.33).
+`tests/test_wheel_actuator_patterns.py`.
+
+**Root cause 2 — AMCL was given the wrong map (fixed).** The `sensor-rich`
+lidar is not a rendered sensor: `ros_gateway.py` raycasts 181 rays over ±90°
+against the simulator's occupancy grid from the truth pose, i.e. against
+`artifacts/arena/rcw2026/<current>/map.yaml`. `navigation.launch.py` and
+`gpsr.launch.py` default `map_yaml` to the *robot artifact's* colocated
+`map.yaml`, which the manifest traces to `0701_robocup_arena3` — the hardware
+arena. The two maps share **zero** occupied cells in world coordinates (even
+under a ±2 m shift search). The 2026-08-18 AMCL study passed the arena map
+explicitly, which is why it found AMCL healthy. With the arena map and
+passive casters, AMCL tracks truth: 0.03 m at rest, 0.13–0.26 m through
+in-place rotation, 0.09 m after 1.5 m of driving, yaw within 0.10 rad. Fix:
+`gpsr.launch.py` resolves the map from the scenario's `world.arena`;
+`navigation.launch.py` takes `arena:=`; explicit `map_yaml:=` still wins
+(`runtime.resolve_arena_map_yaml`, `scenario_arena_id`;
+`tests/test_arena_map_resolution.py`, `test_navigation_launch_map.py`).
+
+**Residual (not fixed) — low-speed yaw deadband.** With both fixes the robot
+physically arrives within 0.16–0.21 m of the goal and the estimate within
+0.1 m, but the final yaw trim never completes: estimated yaw error 0.12–0.16
+rad against a 0.1 rad tolerance, DWB commands ~0.09 rad/s, and the base does
+not move. Measured response (truth yaw rate vs command): **0.1 → 0.00, 0.2 →
+0.07, 0.3 → 0.13, 0.5 → 0.27, 0.8 → 0.50**; under small commands the wheel
+joints read exactly 0.0 with the drive effort at its cap. Then
+`SimpleProgressChecker` (XY only, 0.5 m in 10 s) aborts, the spin recovery
+adds ±1.57 rad, and it repeats — the loop the handoff described, now on top
+of a real base deficiency. Ruled out, one variable at a time: drive effort
+cap (10 N·m vs 80 N·m: identical response), articulation velocity solver
+iterations (8 vs the authored 1: identical), caster swivel damping (above).
+The deficit is independent of drive torque, so it is a contact-solution
+effect, not a force limit. Next hypothesis, untested: PhysX stabilization /
+sleep thresholds on the articulation freezing slow contacts
+(`ArticulationRootPropertiesCfg(stabilization_threshold=0.0,
+sleep_threshold=0.0)`); after that, the wheel collider (plain `Cylinder`
+prims, no physics material).
+
+**Nav2-side observations for the navigation owners** (tk26_navigation, not
+this repo): `tracking_goal_checker` (`yaw_goal_tolerance: 3.14`) exists in
+`nav2_dwb_params.yaml` but is commented out of `goal_checker_plugins`; with a
+≥0.15 rad/s deadband a 0.1 rad yaw tolerance cannot be met in sim, and the
+XY-only progress checker converts every station-keeping yaw trim into a
+recovery.
+
+**Also learned.** A stack launched with `&` from a non-interactive shell
+inherits SIGINT=ignored, so `ros2 launch` never sees a later SIGINT — reset
+the disposition in a wrapper before exec. Tear the Nav2 launch down *before*
+the simulator: its nodes run on sim time and hang in shutdown on a frozen
+clock. The robot artifact's `map.yaml` is the hardware map by design; the
+`(−2, −2)` scenario spawn cell is "unknown", not "free", in both maps.
+
 ## 2026-08-21 — Bridge attached while driving and while the arm moves
 
 Exercise: `/cmd_vel` 0.15 m/s + 0.25 rad/s at 15 Hz for 45 s (Nav2's
