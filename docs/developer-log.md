@@ -9,8 +9,8 @@ took the shape it did. Operational instructions live in
 Exercise: `/cmd_vel` 0.15 m/s + 0.25 rad/s at 15 Hz for 45 s (Nav2's
 controller rate, no localisation needed), then `JointTrajectory` goals to
 `xarm7_traj_controller` alternating two poses every 5 s for 45 s; motion
-verified from `/isaac_joint_states`. Bench scripts in the `ros-bridge-rtf`
-worktree `outputs/bench/` (`run_with_bridge_exercise.sh`, `exercise.py`,
+verified from `/isaac_joint_states`. Bench scripts in the main checkout's gitignored
+`outputs/bench/` (`run_with_bridge_exercise.sh`, `exercise.py`,
 `record2.py`, `show_phases_wall.py`).
 
 | bridge attached, control 60, cameras 12 Hz | old intake | main-thread intake + 60 Hz cap |
