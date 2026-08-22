@@ -60,31 +60,52 @@ in-place rotation, 0.09 m after 1.5 m of driving, yaw within 0.10 rad. Fix:
 (`runtime.resolve_arena_map_yaml`, `scenario_arena_id`;
 `tests/test_arena_map_resolution.py`, `test_navigation_launch_map.py`).
 
-**Residual (not fixed) — low-speed yaw deadband.** With both fixes the robot
-physically arrives within 0.16–0.21 m of the goal and the estimate within
-0.1 m, but the final yaw trim never completes: estimated yaw error 0.12–0.16
-rad against a 0.1 rad tolerance, DWB commands ~0.09 rad/s, and the base does
-not move. Measured response (truth yaw rate vs command): **0.1 → 0.00, 0.2 →
-0.07, 0.3 → 0.13, 0.5 → 0.27, 0.8 → 0.50**; under small commands the wheel
-joints read exactly 0.0 with the drive effort at its cap. Then
-`SimpleProgressChecker` (XY only, 0.5 m in 10 s) aborts, the spin recovery
-adds ±1.57 rad, and it repeats — the loop the handoff described, now on top
-of a real base deficiency. Ruled out, one variable at a time: drive effort
-cap (10 N·m vs 80 N·m: identical response), articulation velocity solver
-iterations (8 vs the authored 1: identical), caster swivel damping (above).
-The deficit is independent of drive torque, so it is a contact-solution
-effect, not a force limit. Next hypothesis, untested: PhysX stabilization /
-sleep thresholds on the articulation freezing slow contacts
-(`ArticulationRootPropertiesCfg(stabilization_threshold=0.0,
-sleep_threshold=0.0)`); after that, the wheel collider (plain `Cylinder`
-prims, no physics material).
+**Root cause 3 — the wheel colliders' line contact locked the turn (fixed).**
+With the first two fixes the robot physically arrived within 0.16–0.21 m of
+the goal and the estimate within 0.1 m, but the final yaw trim never
+completed: DWB commanded ~0.09 rad/s and the base did not move, so
+`SimpleProgressChecker` (XY only, 0.5 m in 10 s) aborted, the spin recovery
+added ±1.57 rad, and it repeated. Measured truth yaw rate vs command:
+**0.1 → 0.00, 0.2 → 0.07, 0.3 → 0.13, 0.5 → 0.27, 0.8 → 0.50**, wheel joints
+reading exactly 0.0 under small commands with the drive at its cap; in a
+turn the wheels lagged their targets by a near-constant 0.2–0.5 rad/s, a
+dry-friction-like resistance of 40–80 N·m per wheel. Ruled out one variable
+at a time: drive effort cap (10 vs 80 N·m: identical), articulation velocity
+solver iterations (8 vs 1: identical), PGS instead of TGS (chatter gone,
+0.5 → 0.36, deadband unchanged), articulation `sleep_threshold=0` (wheels
+then read −0.03 rad/s — awake, still stuck), and the PhysX-side drive gains
+(read back through the tensor view: stiffness 0, damping 200, max force 80,
+force-type — the drive is what the config says). The casters do align
+(swivels at −120°/−68°, the tangential trailing angles). What did move the
+needle was the wheel *collider*: the importer's `Cylinder` prims are exact
+custom-geometry cylinders (`/physics/collisionApproximateCylinders` is
+already false; forcing convex hulls made it worse, 0.3 → 0.002), and a
+cylinder's line contact across the 63 mm tread cannot roll on a 0.125 m
+turn radius — the inner and outer edges need different speeds, so the patch
+locks. Replacing the cylinder with a **sphere of the same radius** on the
+drive wheels gave 0.2 → 0.20, 0.3 → 0.29, 0.5 → 0.49 (0.1 still dead: the
+caster wheels had the same patch); on all four wheels, on the stock TGS
+solver with default sleep settings, **0.1 → 0.099, 0.2 → 0.197, 0.3 →
+0.298, 0.5 → 0.498, 0.8 → 0.795** with steady wheel speeds, forward driving
+unchanged (0.20 m/s at 3.77 rad/s), `/clock` still ~48 Hz. Fix:
+`_apply_wheel_sphere_colliders` (runtime override at spawn like the chassis
+ballast — artifact untouched; deactivates `<wheel>/collisions/mesh_0`,
+authors `<wheel>/collisions/sphere` with the cylinder's own radius, fails
+closed on a missing wheel or collider); `TINKER_SIM_WHEEL_COLLIDER=cylinder`
+restores the authored collider for A/B; `tests/test_wheel_colliders.py`.
+
+**End to end.** Nav-only stack (`navigation.launch.py map_yaml:=<rcw2026
+arena map>`), AMCL seeded at truth, robot 1.0 m from the goal and facing
+away: `Reached the goal!` / `Goal succeeded` in 13 s with the stock
+tk26_navigation parameters, truth 0.11 m / 0.12 rad from (−2, −2, 0),
+estimate within 0.07 m of truth throughout, zero `Failed to make progress`.
 
 **Nav2-side observations for the navigation owners** (tk26_navigation, not
-this repo): `tracking_goal_checker` (`yaw_goal_tolerance: 3.14`) exists in
-`nav2_dwb_params.yaml` but is commented out of `goal_checker_plugins`; with a
-≥0.15 rad/s deadband a 0.1 rad yaw tolerance cannot be met in sim, and the
-XY-only progress checker converts every station-keeping yaw trim into a
-recovery.
+this repo, no change needed now): `tracking_goal_checker` (`yaw_goal_tolerance:
+3.14`) exists in `nav2_dwb_params.yaml` but is commented out of
+`goal_checker_plugins`; the XY-only `SimpleProgressChecker` converts any
+station-keeping yaw trim slower than 10 s into a recovery, which is what
+amplified the base defect above into a 13-minute stall.
 
 **Also learned.** A stack launched with `&` from a non-interactive shell
 inherits SIGINT=ignored, so `ros2 launch` never sees a later SIGINT — reset
