@@ -621,12 +621,12 @@ class IsaacWholeRobotBackend:
                     damping=0.0,
                 ),
                 "casters": ImplicitActuatorCfg(
-                    joint_names_expr=list(CASTER_JOINT_PATTERNS),
+                    joint_names_expr=["rear_.*_swivel_joint", "rear_.*_wheel_joint"],
                     stiffness=0.0,
                     damping=0.0,
                 ),
                 "wheels": ImplicitActuatorCfg(
-                    joint_names_expr=list(WHEEL_ACTUATOR_JOINT_PATTERNS),
+                    joint_names_expr=["front_.*_wheel_joint"],
                     stiffness=0.0,
                     damping=200.0,
                     velocity_limit_sim=30.0,

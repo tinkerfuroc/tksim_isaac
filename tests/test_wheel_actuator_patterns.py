@@ -44,3 +44,28 @@ def test_caster_group_frees_swivels_and_caster_wheels() -> None:
         assert _matches(CASTER_JOINT_PATTERNS, name), name
     for name in DRIVE_WHEEL_JOINTS:
         assert not _matches(CASTER_JOINT_PATTERNS, name), name
+
+
+def _actuator_joint_names_expr(group: str) -> list[str]:
+    """Read ``joint_names_expr`` of one ``actuators`` entry from backend source.
+
+    The entries are kept as literal lists (not ``list(CONSTANT)``) because
+    ``test_manipulation_runtime`` ``ast.literal_eval``s every actuator kwarg.
+    """
+    import ast
+
+    source = (ROOT / "simulation" / "tinker_sim_isaac" / "backend.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == group:
+                for kw in value.keywords:
+                    if kw.arg == "joint_names_expr":
+                        return ast.literal_eval(kw.value)
+    raise AssertionError(f"actuator group {group!r} not found")
+
+
+def test_backend_actuator_literals_match_exported_patterns() -> None:
+    assert _actuator_joint_names_expr("wheels") == list(WHEEL_ACTUATOR_JOINT_PATTERNS)
+    assert _actuator_joint_names_expr("casters") == list(CASTER_JOINT_PATTERNS)
