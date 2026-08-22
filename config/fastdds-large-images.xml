@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Shared memory sized for 720p camera streams with many subscribers.
+
+  The sim publishes a 2.76 MB colour frame and a 1.84 MB depth frame back to
+  back, and the vision stack attaches about six subscribers to each. Against
+  Fast DDS's default 512 KB shared memory segment that starves whichever
+  topic is published second: measured at one consumer, colour held 3.28 Hz
+  while depth collapsed to 0.05 Hz, and the generalist failed with
+  "No orbbec camera data within sync threshold" on 65 percent of scans.
+
+  Pairing measured against subscriber count showed the mechanism:
+    one subscriber per topic (two processes) gave 90 percent of frames paired
+    two subscribers in one process gave 25 percent
+    the full vision stack gave close to zero
+
+  Unlike fastdds-lan.xml this keeps shared memory ON (it is the fast path for
+  same host traffic) and only gives it room. UDPv4 stays alongside it for
+  discovery and any off host peer.
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>TinkerShmLarge</transport_id>
+        <type>SHM</type>
+        <segment_size>134217728</segment_size>
+        <maxMessageSize>8388608</maxMessageSize>
+        <port_queue_capacity>2048</port_queue_capacity>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>TinkerUdpV4</transport_id>
+        <type>UDPv4</type>
+        <sendBufferSize>16777216</sendBufferSize>
+        <receiveBufferSize>16777216</receiveBufferSize>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="tinker_sim_large_images" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>TinkerShmLarge</transport_id>
+          <transport_id>TinkerUdpV4</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>
