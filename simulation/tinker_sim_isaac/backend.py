@@ -82,6 +82,50 @@ WHEEL_ACTUATOR_JOINT_PATTERNS = ("front_.*_wheel_joint",)
 #: stalled and chattering (wheel odometry garbage -> Nav2 stalls at the
 #: goal).  A zero-gain group overrides the baked drives and frees them.
 CASTER_JOINT_PATTERNS = ("rear_.*_swivel_joint", "rear_.*_wheel_joint")
+#: Wheel links whose authored cylinder collider is replaced by a sphere of the
+#: same radius at spawn (see ``_apply_wheel_sphere_colliders``).  The exact
+#: cylinder's line contact across the 63 mm tread cannot roll on a 0.125 m
+#: turn radius (inner and outer edges need different speeds), so the contact
+#: patch locks and an in-place turn reached 0% of the command below
+#: 0.2 rad/s and ~55% at 0.5 rad/s -- independent of drive effort, solver
+#: type, iteration count and sleep settings.  A single contact point rolls:
+#: measured truth yaw rate 0.098/0.197/0.298/0.497/0.795 for commands of
+#: 0.1/0.2/0.3/0.5/0.8 rad/s.  The sphere touches the floor where the
+#: cylinder did, so base height and odometry ``wheel_radius_m`` are unchanged.
+WHEEL_COLLIDER_LINKS = (
+    "front_left_wheel",
+    "front_right_wheel",
+    "rear_left_wheel",
+    "rear_right_wheel",
+)
+WHEEL_COLLIDER_MODES = ("sphere", "cylinder")
+
+
+def resolve_wheel_collider_mode(value: str | None) -> str:
+    """Parse ``TINKER_SIM_WHEEL_COLLIDER``: ``sphere`` (default) or the
+    authored ``cylinder`` for A/B runs."""
+    mode = (value or "").strip().lower()
+    if not mode:
+        return "sphere"
+    if mode not in WHEEL_COLLIDER_MODES:
+        raise ValueError(
+            "TINKER_SIM_WHEEL_COLLIDER must be one of "
+            + ", ".join(WHEEL_COLLIDER_MODES)
+            + f", got {value!r}"
+        )
+    return mode
+
+
+def wheel_sphere_radius(cylinder_radius: object) -> float:
+    """Sphere radius for a wheel: exactly the authored cylinder radius."""
+    if isinstance(cylinder_radius, bool) or not isinstance(cylinder_radius, (int, float)):
+        raise TypeError("wheel cylinder radius must be a number")
+    radius = float(cylinder_radius)
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError(f"wheel cylinder radius must be positive and finite, got {radius!r}")
+    return radius
+
+
 
 
 def slew_velocity_target(current: float, target: float, max_delta: float) -> float:
@@ -603,6 +647,13 @@ class IsaacWholeRobotBackend:
         # articulation tensor view.  Without this update, sim_control applies
         # the deferred contact-prim changes on the first physics frame.
         omni.kit.app.get_app().update()
+        self.wheel_collider_mode = resolve_wheel_collider_mode(
+            _os.environ.get("TINKER_SIM_WHEEL_COLLIDER")
+        )
+        if self.wheel_collider_mode == "sphere":
+            self._apply_wheel_sphere_colliders()
+            omni.kit.app.get_app().update()
+        print(json.dumps({"wheel_collider": self.wheel_collider_mode}, sort_keys=True), flush=True)
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
         # playback range.  Override it only after every USD has been authored.
@@ -654,6 +705,56 @@ class IsaacWholeRobotBackend:
         mass_api.GetMassAttr().Set(target_mass)
         mass_api.GetDiagonalInertiaAttr().Set(Gf.Vec3f(*target_inertia))
         return target_mass
+
+    def _apply_wheel_sphere_colliders(self) -> None:
+        """Replace each wheel's authored cylinder collider with a sphere before reset.
+
+        Runtime override of the spawned stage, like the chassis ballast: the
+        artifact USD is untouched.  The cylinder under ``<wheel>/collisions/
+        mesh_0`` is deactivated and ``<wheel>/collisions/sphere`` is authored
+        with the cylinder's own radius (``wheel_sphere_radius``).  Fails
+        closed on a missing wheel or collider so a renamed artifact cannot
+        silently keep the locking line contact.
+        """
+        import omni.usd
+        from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath("/World/Tinker")
+        if not root.IsValid():
+            raise RuntimeError("wheel collider override requires the spawned /World/Tinker robot")
+        for link in WHEEL_COLLIDER_LINKS:
+            wheel = next(
+                (
+                    prim
+                    for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
+                    if prim.GetName() == link
+                ),
+                None,
+            )
+            if wheel is None:
+                raise RuntimeError(f"wheel link missing under /World/Tinker: {link}")
+            wheel_path = wheel.GetPath()
+            # The importer marks the collision subtree instanceable; editing
+            # an instance proxy is an error, so de-instance this wheel only.
+            ancestor = wheel
+            while ancestor and ancestor.GetPath() != Sdf.Path("/"):
+                if ancestor.IsInstance():
+                    ancestor.SetInstanceable(False)
+                ancestor = ancestor.GetParent()
+            for descendant in list(Usd.PrimRange(stage.GetPrimAtPath(wheel_path))):
+                if descendant.IsInstance():
+                    descendant.SetInstanceable(False)
+            collisions = stage.GetPrimAtPath(wheel_path.AppendChild("collisions"))
+            cylinder = stage.GetPrimAtPath(collisions.GetPath().AppendPath("mesh_0/cylinder"))
+            if not collisions.IsValid() or not cylinder.IsValid() or not cylinder.IsA(UsdGeom.Cylinder):
+                raise RuntimeError(f"wheel {link} has no authored cylinder collider under {wheel_path}")
+            radius = wheel_sphere_radius(UsdGeom.Cylinder(cylinder).GetRadiusAttr().Get())
+            stage.GetPrimAtPath(collisions.GetPath().AppendChild("mesh_0")).SetActive(False)
+            sphere = UsdGeom.Sphere.Define(stage, collisions.GetPath().AppendChild("sphere"))
+            sphere.CreateRadiusAttr(radius)
+            sphere.CreatePurposeAttr(UsdGeom.Tokens.guide)
+            UsdPhysics.CollisionAPI.Apply(sphere.GetPrim())
 
     def _refresh_robot_handles(self) -> bool:
         """Refresh tensors after a standard stop/reset/play lifecycle."""
