@@ -130,8 +130,8 @@ One script, tier as a flag, corpus as input, JSON report as output:
 ### What changes where
 
 tk25_decision (small, mostly additive):
-1. `GPSR/gpsr_runs/run_battery_commands.py` — corpus generator + template-stratified sampling + edge corpus. This is the module `test/test_gpsr_battery_contract.py` already imports (`COMMANDS`/`EXPECT`) but which does not exist in the repo, so landing it here also un-breaks that test.
-2. `GPSR/gpsr_bench.py` — tiers 0/1 runner, and the tier 2/3 client half (launch orchestrator with env, parse `events.jsonl`, SIGINT on `run.finished` — the orchestrator idles forever after its last task, `gpsr_orchestrator.py:150`).
+1. `GPSR/bench/corpus.py` — corpus generator + template-stratified sampling + edge corpus. (Not `gpsr_runs/run_battery_commands.py`: `test/test_gpsr_battery_contract.py` imports that missing module but expects a hand-written battery plus `validate_target_contract`, a different artifact; that test stays a separate pre-existing breakage.)
+2. `GPSR/bench/{events,tier0,tier1,report}.py` + `GPSR/gpsr_bench.py` CLI — tiers 0/1 runner, and the tier 2/3 client half (launch orchestrator with env, parse `events.jsonl`, SIGINT on `run.finished` — the orchestrator idles forever after its last task, `gpsr_orchestrator.py:150`).
 3. Nothing in telemetry: `task.finished` already carries `status ∈ {succeeded, failed, incomplete}` + reason; `step.finished`, `plan.committed`, `run.finished` exist. The bench only parses them.
 4. **One orchestrator fix found by scouting:** `GPSR_OFFLINE_PLANNER` is honoured only by the legacy single-layer `BtNode_PlanActions`; the production `GPSRPlanner` (`planner.py:597`) consults `BT_MOCK_MODE` directly, so T1 (mock execution, real LLM) is currently impossible via the documented switch. Small fix + test.
 5. T1 needs a `mock_config.bench.json` where the mocked node classes resolve `IMMEDIATE` rather than `KEYPRESS` (shipped `mock_config.json` waits for a keypress per goto/scan/grasp).
