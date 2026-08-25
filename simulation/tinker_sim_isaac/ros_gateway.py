@@ -21,6 +21,7 @@ from tinker_sim_core.command_mux import (
 from tinker_sim_isaac.camera_rig import (
     camera_info_fields,
     depth_to_16uc1_mm,
+    is_color_only,
     pack_registered_cloud,
     rgb8_array,
 )
@@ -214,8 +215,12 @@ class RosStandardGateway:
                         "color_pub": self.node.create_publisher(
                             Image, spec.color_topic, camera_qos
                         ),
-                        "depth_pub": self.node.create_publisher(
-                            Image, spec.depth_topic, camera_qos
+                        "depth_pub": (
+                            None
+                            if is_color_only(spec)
+                            else self.node.create_publisher(
+                                Image, spec.depth_topic, camera_qos
+                            )
                         ),
                         "info_pubs": [
                             self.node.create_publisher(CameraInfo, topic, camera_qos)
@@ -1201,19 +1206,21 @@ class RosStandardGateway:
         _lap("capture")
         for entry in self._camera_streams:
             spec = entry["spec"]
+            color_only = entry["depth_pub"] is None
             rgb, depth = frames.get(spec.name, (None, None))
-            if rgb is None or depth is None:
+            if rgb is None or (not color_only and depth is None):
                 self.camera_skipped_frames += 1
                 continue
             color_array = rgb8_array(rgb, spec.height, spec.width)
             _lap("rgb_convert")
-            depth_array = depth_to_16uc1_mm(depth)
-            _lap("depth_convert")
-            if depth_array.shape != (spec.height, spec.width):
-                raise RuntimeError(
-                    f"{spec.name} depth resolution {depth_array.shape} does not "
-                    f"match the contract ({spec.height}, {spec.width})"
-                )
+            if not color_only:
+                depth_array = depth_to_16uc1_mm(depth)
+                _lap("depth_convert")
+                if depth_array.shape != (spec.height, spec.width):
+                    raise RuntimeError(
+                        f"{spec.name} depth resolution {depth_array.shape} does not "
+                        f"match the contract ({spec.height}, {spec.width})"
+                    )
 
             color = self._Image()
             color.header.stamp = stamp
@@ -1229,18 +1236,19 @@ class RosStandardGateway:
             entry["color_pub"].publish(color)
             _lap("image_publish")
 
-            depth_msg = self._Image()
-            depth_msg.header.stamp = stamp
-            depth_msg.header.frame_id = spec.frame_id
-            depth_msg.height = spec.height
-            depth_msg.width = spec.width
-            depth_msg.encoding = "16UC1"
-            depth_msg.is_bigendian = 0
-            depth_msg.step = spec.width * 2
-            depth_msg.data = array.array("B", depth_array.tobytes())
-            _lap("image_fill")
-            entry["depth_pub"].publish(depth_msg)
-            _lap("image_publish")
+            if entry["depth_pub"] is not None and depth is not None:
+                depth_msg = self._Image()
+                depth_msg.header.stamp = stamp
+                depth_msg.header.frame_id = spec.frame_id
+                depth_msg.height = spec.height
+                depth_msg.width = spec.width
+                depth_msg.encoding = "16UC1"
+                depth_msg.is_bigendian = 0
+                depth_msg.step = spec.width * 2
+                depth_msg.data = array.array("B", depth_array.tobytes())
+                _lap("image_fill")
+                entry["depth_pub"].publish(depth_msg)
+                _lap("image_publish")
 
             fields = entry["info_fields"]
             info = self._CameraInfo()
