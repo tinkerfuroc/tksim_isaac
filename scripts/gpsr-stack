@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Bring up / tear down / status-check the six-stack GPSR-in-simulation stack.
+
+Automates docs/gpsr-sim-runbook.md, Stages 1-5 (Stage 6 -- the GPSR
+orchestrator itself -- lives in the tk25_ws decision repo and is started
+separately). Every stage's command line, argument, and environment variable
+below is taken verbatim from that runbook; read it first if anything here
+looks surprising.
+
+Design notes:
+
+- ``stage_commands(cfg)`` is a pure function: given a StackConfig it returns
+  the ordered stage plan as plain dicts, with no filesystem or subprocess
+  side effects. It is the only part of this script exercised by the test
+  suite (tests/test_gpsr_stack_dryrun.py) and by ``up --dry-run``.
+- A stage's ``cmd`` is normally a single argv list (``list[str]``) for one
+  process. The "vision" stage needs three concurrent processes (the vision
+  bringup launch file, plus the runbook's two manual gaps: the
+  ``head_camera_server``-named camera_server node, and the pan/tilt state
+  publisher that stitches ``/pan_tilt_controller/state`` into
+  ``/joint_states``), and stage "manipulation" needs three as well
+  (planning-only manipulation launch, arm_api's grasp_action, anygrasp). For
+  those, ``cmd`` is a list of argv lists -- callers detect this with
+  ``isinstance(cmd[0], list)`` and Popen each one.
+- Readiness gating: tools/gpsr_interface_census.py has no subset/filter flag
+  -- it always checks every GPSR interface across all six stacks and prints
+  one exit code for the whole graph. Since manipulation is commonly mocked
+  (``--manipulation mock``), its interfaces (stack "tk25_manipulation" in the
+  census) are permanently absent in that mode, so a bare "exit code == 0"
+  gate would never clear after Stage 3. Instead, readiness for a given stage
+  is decided by *parsing* the census's stdout for "MISSING [<stack>]"
+  section headers and checking only the census stack name(s) relevant to
+  that stage (see GATE_CENSUS_STACKS below); an unrelated stack being
+  missing (e.g. manipulation, while mocked) does not block the gate.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+REPO_ROOT = "/home/tinker/tinker-sim/6.0.1"
+TINKER_WS = "/home/tinker/tk25_ws"
+CENSUS_SCRIPT = str(Path(__file__).resolve().parent.parent / "tools" / "gpsr_interface_census.py")
+
+# Env keys the runbook's shared preamble unsets before every stage 2-6
+# command, so a terminal that previously sourced a different workspace can't
+# leak into this one.
+PREAMBLE_UNSET = (
+    "PYTHONPATH",
+    "AMENT_PREFIX_PATH",
+    "CMAKE_PREFIX_PATH",
+    "COLCON_PREFIX_PATH",
+    "ROS_PACKAGE_PATH",
+    "LD_LIBRARY_PATH",
+)
+
+# gate name -> the census's own stack name(s) (SERVICES/ACTIONS/TOPICS keys
+# in tools/gpsr_interface_census.py) that must show no "MISSING [...]"
+# section for that gate to be considered ready. "bridge" covers both the
+# sim-bridge interfaces (announce, listen_action, gripper_action, pan/tilt
+# state) and nav2's navigate_to_pose, since gpsr.launch.py (Stage 2) starts
+# Nav2/AMCL as part of the same composite launch.
+GATE_CENSUS_STACKS: dict[str, tuple[str, ...]] = {
+    "sim": ("sim cameras",),
+    "bridge": ("sim bridge", "nav2"),
+    "vision": ("tk26_vision",),
+    "manipulation": ("tk25_manipulation",),
+    "nav": ("tk26_navigation",),
+}
+
+STAGE_READY_TIMEOUT_S = 180.0
+STAGE_READY_POLL_S = 2.0
+TEARDOWN_GRACE_S = 10.0
+
+
+@dataclasses.dataclass
+class StackConfig:
+    scenario: str
+    seed: int
+    manipulation: str  # "mock" | "live"
+    manip_gpu: Optional[int]
+    log_dir: str
+
+
+def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
+    """Env overrides for a stage: the shared ROS_DOMAIN_ID plus extras.
+
+    Callers merge this over a copy of the real environment at exec time
+    (see ``_full_env``); this dict alone is what stage_commands() exposes so
+    it stays plain-data and testable.
+    """
+    env = {"ROS_DOMAIN_ID": "42"}
+    env.update(extra)
+    return env
+
+
+def stage_commands(cfg: StackConfig) -> list[dict]:
+    """Pure: build the ordered stage plan for Stages 1-5. No side effects.
+
+    Returns ``[{name, cmd, env, cwd, gate}, ...]``. ``cmd`` is either an
+    argv list (one process) or a list of argv lists (several concurrent
+    processes for that stage -- see the "vision" and "manipulation" stages).
+    Stage "manipulation" (runbook Stage 4) is present only when
+    ``cfg.manipulation == "live"``, and requires ``cfg.manip_gpu`` to be set.
+    """
+    if cfg.manipulation not in ("mock", "live"):
+        raise ValueError(f"manipulation must be 'mock' or 'live', got {cfg.manipulation!r}")
+    if cfg.manipulation == "live" and cfg.manip_gpu is None:
+        raise ValueError("--manip-gpu is required when --manipulation live")
+
+    stages: list[dict] = []
+
+    # --- Stage 1: Sim -----------------------------------------------------
+    stages.append({
+        "name": "sim",
+        "cmd": [
+            "./scripts/tinker-sim", "launch",
+            "--sensor-profile", "sensor-rich",
+            "--scenario", cfg.scenario,
+            "--seed", str(cfg.seed),
+            "--arena", "rcw2026",
+            "--spawn-xy=-2.0,-2.0",
+            "--ros",
+            "--headless",
+        ],
+        "env": _preamble_env({
+            "TINKER_SIM_CAMERA_HZ": "12",
+            "TINKER_SIM_CONTROL_HZ": "60",
+            "TINKER_SIM_ARENA_CAMERA": "1",
+            "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
+        }),
+        "cwd": REPO_ROOT,
+        "gate": "sim",
+    })
+
+    # --- Stage 2: Composite bridge launch (gpsr.launch.py) -----------------
+    stages.append({
+        "name": "bridge",
+        "cmd": _ros_argv(
+            sources=(
+                "/opt/ros/humble/setup.bash",
+                ".ros-vendor/humble/local_setup.bash",
+                f"{TINKER_WS}/install/setup.bash",
+                "ros2_ws/install/setup.bash",
+            ),
+            argv=[
+                "ros2", "launch", "tinker_sim_bridge", "gpsr.launch.py",
+                f"project_root:={REPO_ROOT}",
+                f"tinker_workspace:={TINKER_WS}",
+                f"scenario:={cfg.scenario}",
+                f"seed:={cfg.seed}",
+                "safety_source_deadline_s:=1.0",
+            ],
+        ),
+        "env": _preamble_env({}),
+        "cwd": REPO_ROOT,
+        "gate": "bridge",
+    })
+
+    # --- Stage 3: tk26_vision (plus the two manual runbook gaps) -----------
+    vision_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+    stages.append({
+        "name": "vision",
+        "cmd": [
+            _ros_argv(
+                sources=vision_sources,
+                argv=[
+                    "ros2", "launch", "vision_bringup", "vision_bringup.launch.py",
+                    "enable_gpsr:=true", "use_sim_time:=true",
+                ],
+            ),
+            # The node NAME is load-bearing: every service-backend vision
+            # consumer resolves frames through
+            # default_endpoint='/head_camera_server'.
+            _ros_argv(
+                sources=vision_sources,
+                argv=[
+                    "ros2", "run", "camera_server", "camera_server_node", "--ros-args",
+                    "-r", "__node:=head_camera_server",
+                    "-p", "use_sim_time:=true",
+                    "-p", "color_topic:=/camera/color/image_raw",
+                    "-p", "depth_topic:=/camera/depth/image_raw",
+                    "-p", "color_info_topic:=/camera/color/camera_info",
+                    "-p", "depth_info_topic:=/camera/color/camera_info",
+                ],
+            ),
+            # Without this, /pan_tilt_controller/state never reaches
+            # /joint_states and the head-camera TF subtree is disconnected.
+            _ros_argv(
+                sources=vision_sources,
+                argv=["ros2", "run", "pan_tilt", "state_publisher", "--ros-args",
+                      "-p", "use_sim_time:=true"],
+            ),
+        ],
+        "env": _preamble_env({
+            # waving_person_server defaults to show_window:=true and needs a
+            # display; this keeps a headless bring-up from aborting on it.
+            "QT_QPA_PLATFORM": "offscreen",
+        }),
+        "cwd": REPO_ROOT,
+        "gate": "vision",
+    })
+
+    # --- Stage 4: tk25_manipulation (live only) -----------------------------
+    if cfg.manipulation == "live":
+        manip_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+        stages.append({
+            "name": "manipulation",
+            "cmd": [
+                _ros_argv(
+                    sources=manip_sources,
+                    argv=[
+                        "ros2", "launch", "mobile_bringup",
+                        "manipulation_planning_task_only.launch.py",
+                        "execution_profile:=sim_cumotion", "use_sim_time:=true",
+                    ],
+                ),
+                _ros_argv(sources=manip_sources, argv=["ros2", "run", "arm_api", "grasp_action"]),
+                _ros_argv(sources=manip_sources, argv=["ros2", "run", "anygrasp_ros2", "anygrasp"]),
+            ],
+            "env": _preamble_env({"CUDA_VISIBLE_DEVICES": str(cfg.manip_gpu)}),
+            "cwd": REPO_ROOT,
+            "gate": "manipulation",
+        })
+
+    # --- Stage 5: tk26_navigation extras ------------------------------------
+    nav_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+    stages.append({
+        "name": "nav_extras",
+        "cmd": [
+            _ros_argv(
+                sources=nav_sources,
+                argv=["ros2", "launch", "approach_planner", "approach_planner.launch.py",
+                      "use_sim_time:=true"],
+            ),
+            _ros_argv(
+                sources=nav_sources,
+                argv=["ros2", "run", "orientation_angle_service", "orientation_angle_server"],
+            ),
+        ],
+        "env": _preamble_env({}),
+        "cwd": REPO_ROOT,
+        "gate": "nav",
+    })
+
+    return stages
+
+
+def _ros_argv(*, sources: tuple[str, ...], argv: list[str]) -> list[str]:
+    """Wrap a ros2 command in a login-shell that sources the ROS overlays.
+
+    ``source``-ing setup.bash scripts (AMENT_PREFIX_PATH, PATH, PYTHONPATH,
+    etc.) is a shell-only operation, so stages that need the ROS overlay run
+    under ``bash -lc``; the un-wrapped argv is quoted with shlex so any
+    ``:=`` launch arguments survive intact.
+    """
+    import shlex
+    parts = [f"cd {shlex.quote(REPO_ROOT)}"]
+    for src in sources:
+        parts.append(f"source {shlex.quote(src)}")
+    parts.append("exec " + " ".join(shlex.quote(a) for a in argv))
+    script = " && ".join(parts)
+    return ["bash", "-lc", script]
+
+
+# --------------------------------------------------------------------------
+# up / down / status -- these DO spawn subprocesses and touch the
+# filesystem; none of this is exercised by the automated test suite (which
+# only exercises stage_commands() and `up --dry-run`).
+# --------------------------------------------------------------------------
+
+def _full_env(stage_env: dict[str, str]) -> dict[str, str]:
+    env = dict(os.environ)
+    for key in PREAMBLE_UNSET:
+        env.pop(key, None)
+    env.update(_deployment_env())
+    env.update(stage_env)
+    return env
+
+
+def _deployment_env() -> dict[str, str]:
+    """Parse .deployment.env's KEY=VALUE lines without printing them.
+
+    Mirrors the runbook's ``set -a; source .deployment.env; set +a``. Never
+    logs or returns anything beyond what the file itself defines.
+    """
+    path = Path(REPO_ROOT) / ".deployment.env"
+    result: dict[str, str] = {}
+    if not path.is_file():
+        return result
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        result[key.strip()] = value.strip().strip('"').strip("'")
+    return result
+
+
+def _parse_missing(census_stdout: str) -> set[str]:
+    missing: set[str] = set()
+    for line in census_stdout.splitlines():
+        line = line.strip()
+        if line.startswith("MISSING [") and line.endswith("]"):
+            missing.add(line[len("MISSING ["):-1])
+    return missing
+
+
+def _run_census() -> tuple[int, str]:
+    proc = subprocess.run(
+        [sys.executable, CENSUS_SCRIPT],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _gate_ready(gate: str, census_stdout: str) -> bool:
+    required = GATE_CENSUS_STACKS[gate]
+    return not (_parse_missing(census_stdout) & set(required))
+
+
+def _wait_for_gate(gate: str) -> None:
+    deadline = time.monotonic() + STAGE_READY_TIMEOUT_S
+    last_output = ""
+    while time.monotonic() < deadline:
+        _rc, last_output = _run_census()
+        if _gate_ready(gate, last_output):
+            return
+        time.sleep(STAGE_READY_POLL_S)
+    raise RuntimeError(
+        f"gate {gate!r} not ready after {STAGE_READY_TIMEOUT_S:.0f}s; census output:\n{last_output}"
+    )
+
+
+def _stage_procs(cmd) -> list[list[str]]:
+    """Normalize a stage's cmd to a list of argv lists (one or many Popens)."""
+    if cmd and isinstance(cmd[0], list):
+        return cmd
+    return [cmd]
+
+
+def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
+    stages = stage_commands(cfg)
+
+    if dry_run:
+        for stage in stages:
+            print(f"=== stage: {stage['name']} (gate={stage['gate']}) ===")
+            for proc_argv in _stage_procs(stage["cmd"]):
+                print("  $", " ".join(proc_argv))
+            for key, value in stage["env"].items():
+                print(f"  env {key}={value}")
+        return 0
+
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    run_dir = Path(cfg.log_dir) / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, stage in enumerate(stages, start=1):
+        env = _full_env(stage["env"])
+        procs = _stage_procs(stage["cmd"])
+        for p_idx, argv in enumerate(procs):
+            suffix = "" if len(procs) == 1 else f"-{p_idx}"
+            base = f"{idx:02d}-{stage['name']}{suffix}"
+            log_path = run_dir / f"{base}.log"
+            pgid_path = run_dir / f"{base}.pgid"
+            with open(log_path, "wb") as log_file:
+                proc = subprocess.Popen(
+                    argv, cwd=stage["cwd"], env=env,
+                    stdout=log_file, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            pgid_path.write_text(str(os.getpgid(proc.pid)) + "\n", encoding="utf-8")
+        print(f"stage {stage['name']} launched; waiting on gate {stage['gate']!r}...")
+        _wait_for_gate(stage["gate"])
+        print(f"stage {stage['name']} ready")
+
+    print(f"stack up. logs: {run_dir}")
+    return 0
+
+
+def _newest_run_dir(log_dir: str) -> Optional[Path]:
+    base = Path(log_dir)
+    if not base.is_dir():
+        return None
+    candidates = sorted((p for p in base.iterdir() if p.is_dir()), key=lambda p: p.name)
+    return candidates[-1] if candidates else None
+
+
+def _run_down(cfg: StackConfig) -> int:
+    run_dir = _newest_run_dir(cfg.log_dir)
+    if run_dir is None:
+        print(f"no run directories found under {cfg.log_dir}; nothing to tear down")
+        return 0
+
+    pgid_files = sorted(run_dir.glob("*.pgid"), key=lambda p: p.name, reverse=True)
+    if not pgid_files:
+        print(f"no .pgid files found in {run_dir}; nothing to tear down")
+        return 0
+
+    pgids: list[int] = []
+    for pgid_file in pgid_files:
+        try:
+            pgid = int(pgid_file.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            continue
+        pgids.append(pgid)
+        print(f"SIGINT -> pgid {pgid} ({pgid_file.name})")
+        try:
+            os.killpg(pgid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    time.sleep(TEARDOWN_GRACE_S)
+
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,name,used_memory", "--format=csv"],
+        check=False,
+    )
+    return 0
+
+
+def _run_status(_cfg: StackConfig) -> int:
+    rc, output = _run_census()
+    print(output, end="" if output.endswith("\n") else "\n")
+    return rc
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gpsr-stack",
+        description="Bring up / tear down / status-check the GPSR-in-simulation stack.",
+    )
+    parser.add_argument("subcommand", choices=["up", "down", "status"])
+    parser.add_argument("--scenario", default="gpsr-rcw2026-bench")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--manipulation", choices=["mock", "live"], default="mock")
+    parser.add_argument("--manip-gpu", dest="manip_gpu", type=int, default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--log-dir", default="gpsr_stack_logs")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _build_parser().parse_args(argv)
+    cfg = StackConfig(
+        scenario=args.scenario,
+        seed=args.seed,
+        manipulation=args.manipulation,
+        manip_gpu=args.manip_gpu,
+        log_dir=args.log_dir,
+    )
+
+    if args.subcommand == "up":
+        try:
+            return _run_up(cfg, dry_run=args.dry_run)
+        except ValueError as exc:
+            print(f"gpsr-stack: {exc}", file=sys.stderr)
+            return 2
+    if args.subcommand == "down":
+        if args.dry_run:
+            print("down --dry-run: would SIGINT recorded PGIDs in reverse stage order")
+            return 0
+        return _run_down(cfg)
+    if args.subcommand == "status":
+        return _run_status(cfg)
+    raise AssertionError(f"unreachable subcommand {args.subcommand!r}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,149 @@
+{
+  "schema_version": 2,
+  "id": "gpsr-rcw2026-bench",
+  "world": {
+    "mode": "arena",
+    "arena": "rcw2026"
+  },
+  "robot": {
+    "id": "tinker2",
+    "initial_pose": [
+      -2.0,
+      -2.0,
+      0.0
+    ]
+  },
+  "actors": [
+    {
+      "id": "kitchen_person",
+      "asset_uri": "artifacts/people/sobits/d29ee5ef3b71bcbf7013ec61785a584b162bfda83a322ecce0a6a481180e531a/person_standing/person.usd",
+      "pose": {
+        "xyz": [
+          1.8,
+          -3.85,
+          0.0
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          -0.381912,
+          0.924199
+        ]
+      }
+    },
+    {
+      "id": "livingroom_person",
+      "asset_uri": "artifacts/people/sobits/d29ee5ef3b71bcbf7013ec61785a584b162bfda83a322ecce0a6a481180e531a/person_standing/person.usd",
+      "pose": {
+        "xyz": [
+          -4.684,
+          -4.089,
+          0.0
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          -0.381912,
+          0.924199
+        ]
+      }
+    }
+  ],
+  "objects": [
+    {
+      "id": "soup",
+      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_010_tomato_soup_can/object.usd",
+      "pose": {
+        "xyz": [
+          2.5,
+          -3.0,
+          0.734
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": "mug",
+      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_025_mug/object.usd",
+      "pose": {
+        "xyz": [
+          2.7,
+          -3.15,
+          0.734
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": "banana",
+      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_011_banana/object.usd",
+      "pose": {
+        "xyz": [
+          0.43,
+          1.755,
+          0.612
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": "bowl",
+      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_024_bowl/object.usd",
+      "pose": {
+        "xyz": [
+          0.312,
+          -0.57,
+          1.07
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "regions": [],
+  "events": [],
+  "dialogue": [
+    {
+      "endpoint": "wait_for_start",
+      "actor": "operator",
+      "outcome": "start"
+    },
+    {
+      "endpoint": "listen_action",
+      "actor": "operator",
+      "outcome": "go to the kitchen table and find a person"
+    },
+    {
+      "endpoint": "get_confirmation_service",
+      "actor": "operator",
+      "outcome": "yes"
+    }
+  ],
+  "postconditions": [
+    {
+      "name": "no safety stop",
+      "path": "robot.safety_stop",
+      "operator": "equals",
+      "value": false
+    }
+  ]
+}
