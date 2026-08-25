@@ -230,3 +230,87 @@ def test_run_census_runs_sourced_argv_with_full_env(monkeypatch):
     assert "source /opt/ros/humble/setup.bash" in captured["argv"][2]
     # Same ROS_DOMAIN_ID every stage's env carries, via _preamble_env/_full_env.
     assert captured["env"]["ROS_DOMAIN_ID"] == "42"
+
+
+# --- Fix round 1: gpsr-stack must run from its own repo root (worktree-safe)
+
+def test_repo_root_is_the_script_s_own_repo_not_a_hardcoded_checkout():
+    # mod.REPO_ROOT must be derived from the script's own location, so a
+    # worktree checkout (this one) resolves to itself, not to whatever
+    # REPO_ROOT used to be hardcoded to.
+    assert Path(mod.REPO_ROOT) == _SCRIPT_PATH.resolve().parents[1]
+
+
+def test_sim_stage_cwd_is_repo_root():
+    sim = mod.stage_commands(_cfg())[0]
+    assert sim["name"] == "sim"
+    assert Path(sim["cwd"]) == Path(mod.REPO_ROOT)
+
+
+def test_all_stage_cwds_are_repo_root():
+    stages = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))
+    for s in stages:
+        assert Path(s["cwd"]) == Path(mod.REPO_ROOT), s["name"]
+
+
+def test_bridge_stage_project_root_arg_is_repo_root():
+    bridge = [s for s in mod.stage_commands(_cfg()) if s["name"] == "bridge"][0]
+    script = bridge["cmd"][2]  # ["bash", "-lc", script]
+    assert f"project_root:={mod.REPO_ROOT}" in script
+
+
+def test_census_script_path_is_under_repo_root():
+    assert mod.CENSUS_SCRIPT.startswith(str(mod.REPO_ROOT))
+    assert mod.CENSUS_SCRIPT.endswith("tools/gpsr_interface_census.py")
+
+
+def test_resolve_ros2_ws_prefers_repo_root_install_when_present(tmp_path):
+    setup = tmp_path / "ros2_ws" / "install" / "setup.bash"
+    setup.parent.mkdir(parents=True)
+    setup.write_text("# fake setup.bash\n")
+
+    result = mod.resolve_ros2_ws(tmp_path)
+
+    assert result == setup
+
+
+def test_resolve_ros2_ws_falls_back_to_main_checkout_when_absent(tmp_path):
+    # tmp_path has no ros2_ws/install at all -- the common worktree case.
+    result = mod.resolve_ros2_ws(tmp_path)
+
+    assert result == mod.MAIN_CHECKOUT_ROS2_WS
+    assert str(result).endswith("ros2_ws/install/setup.bash")
+
+
+def test_resolve_ros_vendor_prefers_repo_root_when_present(tmp_path):
+    vendor = tmp_path / ".ros-vendor" / "humble" / "local_setup.bash"
+    vendor.parent.mkdir(parents=True)
+    vendor.write_text("# fake local_setup.bash\n")
+
+    result = mod.resolve_ros_vendor(tmp_path)
+
+    assert result == vendor
+
+
+def test_resolve_ros_vendor_falls_back_to_main_checkout_when_absent(tmp_path):
+    result = mod.resolve_ros_vendor(tmp_path)
+
+    assert result == mod.MAIN_CHECKOUT_ROS_VENDOR
+
+
+def test_census_sources_use_resolved_ros2_ws_and_vendor():
+    # CENSUS_SOURCES must reference the resolved (possibly-fallback) paths,
+    # never the bare relative "ros2_ws/install/setup.bash" /
+    # ".ros-vendor/humble/local_setup.bash" strings that only worked when
+    # REPO_ROOT was hardcoded to a fully-built main checkout.
+    assert str(mod.resolve_ros2_ws(mod.REPO_ROOT)) in mod.CENSUS_SOURCES
+    assert str(mod.resolve_ros_vendor(mod.REPO_ROOT)) in mod.CENSUS_SOURCES
+    assert "ros2_ws/install/setup.bash" not in mod.CENSUS_SOURCES
+    assert ".ros-vendor/humble/local_setup.bash" not in mod.CENSUS_SOURCES
+
+
+def test_bridge_stage_sources_use_resolved_ros2_ws():
+    bridge = [s for s in mod.stage_commands(_cfg()) if s["name"] == "bridge"][0]
+    script = bridge["cmd"][2]
+    assert f"source {mod.resolve_ros2_ws(mod.REPO_ROOT)}" in script
+    assert "source ros2_ws/install/setup.bash" not in script
