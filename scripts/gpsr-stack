@@ -62,6 +62,19 @@ PREAMBLE_UNSET = (
     "LD_LIBRARY_PATH",
 )
 
+# The overlay sourcing order Stage 2 (bridge) uses -- the broadest of any
+# stage, since gpsr.launch.py needs both this repo's ros2_ws install and the
+# tk25_ws workspace install. tools/gpsr_interface_census.py checks
+# interfaces across every stack, so its subprocess needs this same full
+# sourcing (see _run_census/_census_argv below) rather than relying on
+# whatever the invoking shell happened to have sourced already.
+CENSUS_SOURCES: tuple[str, ...] = (
+    "/opt/ros/humble/setup.bash",
+    ".ros-vendor/humble/local_setup.bash",
+    f"{TINKER_WS}/install/setup.bash",
+    "ros2_ws/install/setup.bash",
+)
+
 # gate name -> the census's own stack name(s) (SERVICES/ACTIONS/TOPICS keys
 # in tools/gpsr_interface_census.py) that must show no "MISSING [...]"
 # section for that gate to be considered ready. "bridge" covers both the
@@ -314,10 +327,23 @@ def _parse_missing(census_stdout: str) -> set[str]:
     return missing
 
 
+def _census_argv() -> list[str]:
+    """The census subprocess's argv, wrapped in the same ROS-sourcing shell
+    every stage's own command uses (see _ros_argv/CENSUS_SOURCES).
+
+    tools/gpsr_interface_census.py imports rclpy inside main(), so without
+    this wrapper it only works when the *invoking* shell already has ROS
+    Humble + the tk25_ws overlay sourced -- not true for a plain shell, the
+    natural way to invoke a self-contained bring-up script.
+    """
+    return _ros_argv(sources=CENSUS_SOURCES, argv=[sys.executable, CENSUS_SCRIPT])
+
+
 def _run_census() -> tuple[int, str]:
     proc = subprocess.run(
-        [sys.executable, CENSUS_SCRIPT],
+        _census_argv(),
         capture_output=True, text=True, cwd=REPO_ROOT,
+        env=_full_env(_preamble_env({})),
     )
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -363,24 +389,39 @@ def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
     run_dir = Path(cfg.log_dir) / ts
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, stage in enumerate(stages, start=1):
-        env = _full_env(stage["env"])
-        procs = _stage_procs(stage["cmd"])
-        for p_idx, argv in enumerate(procs):
-            suffix = "" if len(procs) == 1 else f"-{p_idx}"
-            base = f"{idx:02d}-{stage['name']}{suffix}"
-            log_path = run_dir / f"{base}.log"
-            pgid_path = run_dir / f"{base}.pgid"
-            with open(log_path, "wb") as log_file:
-                proc = subprocess.Popen(
-                    argv, cwd=stage["cwd"], env=env,
-                    stdout=log_file, stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            pgid_path.write_text(str(os.getpgid(proc.pid)) + "\n", encoding="utf-8")
-        print(f"stage {stage['name']} launched; waiting on gate {stage['gate']!r}...")
-        _wait_for_gate(stage["gate"])
-        print(f"stage {stage['name']} ready")
+    try:
+        for idx, stage in enumerate(stages, start=1):
+            env = _full_env(stage["env"])
+            procs = _stage_procs(stage["cmd"])
+            for p_idx, argv in enumerate(procs):
+                suffix = "" if len(procs) == 1 else f"-{p_idx}"
+                base = f"{idx:02d}-{stage['name']}{suffix}"
+                log_path = run_dir / f"{base}.log"
+                pgid_path = run_dir / f"{base}.pgid"
+                with open(log_path, "wb") as log_file:
+                    proc = subprocess.Popen(
+                        argv, cwd=stage["cwd"], env=env,
+                        stdout=log_file, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                pgid_path.write_text(str(os.getpgid(proc.pid)) + "\n", encoding="utf-8")
+            print(f"stage {stage['name']} launched; waiting on gate {stage['gate']!r}...")
+            _wait_for_gate(stage["gate"])
+            print(f"stage {stage['name']} ready")
+    except BaseException as exc:
+        # Any failure mid bring-up (a gate timeout's RuntimeError, a Popen
+        # OSError, an operator's KeyboardInterrupt, ...) must not leave
+        # already-started stages running unsupervised. Tear down exactly
+        # what `down` would tear down -- every PGID recorded so far, in
+        # reverse stage order -- then propagate the failure.
+        print(
+            f"gpsr-stack: bring-up failed during stage {stage['name']!r} ({exc}); "
+            f"tearing down already-started stages in {run_dir}...",
+            file=sys.stderr,
+        )
+        _teardown_run_dir(run_dir)
+        print(f"gpsr-stack: torn down. partial logs: {run_dir}", file=sys.stderr)
+        raise
 
     print(f"stack up. logs: {run_dir}")
     return 0
@@ -394,16 +435,18 @@ def _newest_run_dir(log_dir: str) -> Optional[Path]:
     return candidates[-1] if candidates else None
 
 
-def _run_down(cfg: StackConfig) -> int:
-    run_dir = _newest_run_dir(cfg.log_dir)
-    if run_dir is None:
-        print(f"no run directories found under {cfg.log_dir}; nothing to tear down")
-        return 0
+def _teardown_run_dir(run_dir: Path) -> None:
+    """SIGINT -> grace -> SIGKILL every PGID recorded in ``run_dir``, newest
+    stage first, then report leftover GPU processes.
 
+    This is the single teardown implementation, shared by ``down`` and by
+    ``_run_up``'s failure path, so a stack that dies mid bring-up is torn
+    down exactly the way an operator-requested ``down`` would tear it down.
+    """
     pgid_files = sorted(run_dir.glob("*.pgid"), key=lambda p: p.name, reverse=True)
     if not pgid_files:
         print(f"no .pgid files found in {run_dir}; nothing to tear down")
-        return 0
+        return
 
     pgids: list[int] = []
     for pgid_file in pgid_files:
@@ -430,6 +473,14 @@ def _run_down(cfg: StackConfig) -> int:
         ["nvidia-smi", "--query-compute-apps=pid,name,used_memory", "--format=csv"],
         check=False,
     )
+
+
+def _run_down(cfg: StackConfig) -> int:
+    run_dir = _newest_run_dir(cfg.log_dir)
+    if run_dir is None:
+        print(f"no run directories found under {cfg.log_dir}; nothing to tear down")
+        return 0
+    _teardown_run_dir(run_dir)
     return 0
 
 
@@ -468,8 +519,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             return _run_up(cfg, dry_run=args.dry_run)
         except ValueError as exc:
+            # Config validation failure (bad --manipulation, missing
+            # --manip-gpu): raised by stage_commands() before anything was
+            # started, so there is nothing to tear down.
             print(f"gpsr-stack: {exc}", file=sys.stderr)
             return 2
+        except KeyboardInterrupt:
+            # _run_up already tore down whatever had started before
+            # re-raising this.
+            print("gpsr-stack: interrupted; partial stack torn down", file=sys.stderr)
+            return 130
+        except Exception as exc:
+            # _run_up already tore down whatever had started before
+            # re-raising this (gate timeout, Popen failure, ...).
+            print(f"gpsr-stack: up failed: {exc}", file=sys.stderr)
+            return 1
     if args.subcommand == "down":
         if args.dry_run:
             print("down --dry-run: would SIGINT recorded PGIDs in reverse stage order")
