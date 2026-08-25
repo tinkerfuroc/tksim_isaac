@@ -30,6 +30,18 @@ class CameraStreamSpec:
     height: int
     horizontal_fov_deg: float
     tick_rate_hz: float
+    #: World-fixed mount translation (metres, stage frame); ``None`` (the
+    #: default) means "robot-mounted" -- unchanged behaviour, resolved by
+    #: searching for ``mount_prim`` under ``/World/Tinker`` as today. A
+    #: non-``None`` value means ``mount_prim`` is an absolute stage path
+    #: (e.g. ``/World/ArenaCamera``) the rig creates directly, translated
+    #: here and oriented by ``mount_rotation_wxyz``.
+    mount_translation: tuple[float, float, float] | None = None
+
+
+def is_color_only(spec: CameraStreamSpec) -> bool:
+    """True when ``spec`` publishes color only (no depth annotator/stream)."""
+    return spec.depth_topic == ""
 
 
 def _string(mapping: Mapping[str, Any], key: str, owner: str) -> str:
@@ -399,6 +411,9 @@ class CameraRig:
         #: buffer above. Kept device-resident between frames like the pinned
         #: host buffers are.
         self._depth_gpu_out: dict[str, Any] = {}
+        #: Names of specs with no depth annotator/stream (``is_color_only``);
+        #: ``capture()`` skips the depth branch entirely for these.
+        self._color_only: set[str] = set()
 
     def initialize(self, app: Any) -> None:
         from isaacsim.core.utils.extensions import enable_extension
@@ -417,17 +432,35 @@ class CameraRig:
         if not robot.IsValid():
             raise RuntimeError("camera rig requires the spawned /World/Tinker robot")
         for spec in self.specs:
-            mounts = [
-                prim
-                for prim in Usd.PrimRange(robot)
-                if prim.GetName() == spec.mount_prim
-            ]
-            if len(mounts) != 1:
-                raise RuntimeError(
-                    f"expected exactly one {spec.mount_prim!r} prim under "
-                    f"/World/Tinker, found {len(mounts)}"
-                )
-            camera_path = f"{mounts[0].GetPath().pathString}/rtx_camera"
+            if spec.mount_prim.startswith("/"):
+                # World-fixed mount: an absolute stage path this rig owns
+                # outright (e.g. ``/World/ArenaCamera``), not a named prim
+                # searched for under the robot. Create it directly and place
+                # it with ``mount_translation``; the RtxCamera child below
+                # gets the usual orient treatment.
+                if spec.mount_translation is None:
+                    raise RuntimeError(
+                        f"{spec.mount_prim!r} is an absolute mount path but "
+                        "has no mount_translation"
+                    )
+                mount_prim = UsdGeom.Xform.Define(stage, spec.mount_prim).GetPrim()
+                UsdGeom.Xformable(mount_prim).AddTranslateOp(
+                    UsdGeom.XformOp.PrecisionDouble
+                ).Set(Gf.Vec3d(*spec.mount_translation))
+                mount_path = mount_prim.GetPath().pathString
+            else:
+                mounts = [
+                    prim
+                    for prim in Usd.PrimRange(robot)
+                    if prim.GetName() == spec.mount_prim
+                ]
+                if len(mounts) != 1:
+                    raise RuntimeError(
+                        f"expected exactly one {spec.mount_prim!r} prim under "
+                        f"/World/Tinker, found {len(mounts)}"
+                    )
+                mount_path = mounts[0].GetPath().pathString
+            camera_path = f"{mount_path}/rtx_camera"
             camera = RtxCamera(camera_path, tick_rate=float(spec.tick_rate_hz))
             prim = stage.GetPrimAtPath(camera_path)
             usd_camera = UsdGeom.Camera(prim)
@@ -453,24 +486,37 @@ class CameraRig:
             xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
                 Gf.Quatd(*spec.mount_rotation_wxyz)
             )
+            color_only = is_color_only(spec)
+            if color_only:
+                self._color_only.add(spec.name)
+            annotators = (
+                [COLOR_ANNOTATOR] if color_only else [COLOR_ANNOTATOR, DEPTH_ANNOTATOR]
+            )
             self._sensors[spec.name] = CameraSensor(
                 camera,
                 resolution=(spec.height, spec.width),
-                annotators=[COLOR_ANNOTATOR, DEPTH_ANNOTATOR],
+                annotators=annotators,
             )
             # Pinned (page-locked) host buffers, sized to what rgb8_array/
             # depth_to_16uc1_mm expect (post RGBA->RGB slice for rgb; already
             # metres->16UC1-mm converted, on the GPU, for depth -- see
             # capture()). Pinned memory lets the D2H copy in capture() run as
             # a real async DMA instead of the synchronous-by-necessity copy
-            # a pageable destination forces.
+            # a pageable destination forces. Color-only streams (``depth_topic
+            # == ""``) get no depth annotator, so no depth pinned buffer or
+            # GPU scratch is allocated for them either.
             self._pinned[spec.name] = (
                 wp.empty((spec.height, spec.width, 3), dtype=wp.uint8, device="cpu", pinned=True),
-                wp.empty((spec.height, spec.width), dtype=wp.uint16, device="cpu", pinned=True),
+                None
+                if color_only
+                else wp.empty(
+                    (spec.height, spec.width), dtype=wp.uint16, device="cpu", pinned=True
+                ),
             )
-            self._depth_gpu_out[spec.name] = wp.zeros(
-                (spec.height, spec.width), dtype=wp.uint16, device="cuda"
-            )
+            if not color_only:
+                self._depth_gpu_out[spec.name] = wp.zeros(
+                    (spec.height, spec.width), dtype=wp.uint16, device="cuda"
+                )
         # JIT-compile the depth kernel now, on a throwaway array, so the
         # first real frame doesn't pay Warp's first-launch compile cost.
         _warm_kernel = _depth_to_mm_u16_kernel()
@@ -531,12 +577,17 @@ class CameraRig:
         sync_device = None
         for name, sensor in self._sensors.items():
             rgb, _info = sensor.get_data(COLOR_ANNOTATOR)
-            depth, _info = sensor.get_data(DEPTH_ANNOTATOR)
             rgb_pinned, depth_pinned = self._pinned[name]
             if rgb is not None:
                 wp.copy(rgb_pinned, rgb)
                 sync_device = rgb.device
                 rgb = rgb_pinned
+            if name in self._color_only:
+                # No depth annotator was created for this camera (see
+                # ``initialize()``); nothing to fetch or convert.
+                frames[name] = (rgb, None)
+                continue
+            depth, _info = sensor.get_data(DEPTH_ANNOTATOR)
             if depth is not None:
                 depth_gpu_out = self._depth_gpu_out[name]
                 n = depth_gpu_out.size
