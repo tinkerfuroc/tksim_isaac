@@ -235,6 +235,25 @@ def _arena_camera_pose(occupancy: object) -> tuple[list[float], list[float], lis
     return arena_camera_pose(occupancy)
 
 
+def _with_arena_camera(
+    specs: tuple, occupancy: object, env: dict
+) -> tuple[tuple, float]:
+    """Opt-in append of the arena observer camera to the robot's ``specs``.
+
+    ``robot_min_hz`` is always ``min(tick_rate_hz)`` over the *original*
+    ``specs`` only -- the arena camera (a slow, fixed overview stream) must
+    never lower the robot cameras' resolved cadence, whether or not it is
+    itself enabled via ``TINKER_SIM_ARENA_CAMERA``.
+    """
+    robot_min_hz = min(spec.tick_rate_hz for spec in specs)
+    from tinker_sim_isaac.arena_camera import arena_camera_spec, resolve_arena_camera
+
+    hz = resolve_arena_camera(env)
+    if hz is None:
+        return specs, robot_min_hz
+    return specs + (arena_camera_spec(occupancy, hz=hz),), robot_min_hz
+
+
 def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
     pointer = root / "artifacts/robot/tinker2/current.json"
     if requested is None:
@@ -969,6 +988,15 @@ def main() -> int:
                     "simulation only -- hardware parity is deliberately broken",
                     flush=True,
                 )
+            camera_specs, robot_min_camera_hz = _with_arena_camera(
+                camera_specs, backend.occupancy, os.environ
+            )
+            if camera_specs[-1].name == "arena_camera":
+                print(
+                    f"[sim] arena camera enabled at {camera_specs[-1].tick_rate_hz:g} Hz "
+                    "-> /sim/arena_camera/image_raw",
+                    flush=True,
+                )
             camera_rig = CameraRig(camera_specs)
             camera_rig.initialize(app)
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
@@ -982,7 +1010,7 @@ def main() -> int:
                 camera_pointcloud=args.camera_pointcloud,
             )
             camera_hz = _resolve_camera_hz(
-                min(spec.tick_rate_hz for spec in camera_specs),
+                robot_min_camera_hz,
                 os.environ.get("TINKER_SIM_CAMERA_HZ"),
             )
             camera_stride = _streaming_update_stride(backend.dt, update_hz=camera_hz)
