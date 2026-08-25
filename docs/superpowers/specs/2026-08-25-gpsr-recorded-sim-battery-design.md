@@ -81,7 +81,7 @@ Each run is recorded from two views (arena observer camera + head camera) and co
 
 ## Data flow
 
-corpus.jsonl → tier2 runner → (reset → record → orchestrate → verdict) per run → `out/runs/<id>/{frames/,run.json,sheet.jpg,orchestrator.log,debug/}` → report.py → `out/{report.json,SUMMARY.md}`. Committed: corpus, report.json, SUMMARY.md, all `sheet.jpg`; git-ignored: frames/, logs, debug telemetry.
+corpus.jsonl → tier2 runner → (reset → record → orchestrate → verdict) per run → `out/runs/<id>/{frames/,run.json,sheet.jpg,orchestrator.log,debug/}` → report.py → `out/{report.json,SUMMARY.md}`. Committed: corpus, report.json, SUMMARY.md. NOT committed (git-ignored under `runs/`): frames/, logs, debug telemetry, and the `sheet.jpg` files — 50 sheets ≈ 50–75 MB, too heavy for the repo; sheets are delivered to the user directly for review and remain on disk, with `SUMMARY.md` linking their run-relative paths.
 
 ## Error handling
 
