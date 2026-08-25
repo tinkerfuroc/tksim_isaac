@@ -135,6 +135,7 @@ class StackConfig:
     seed: int
     manipulation: str  # "mock" | "live"
     manip_gpu: Optional[int]
+    sim_gpu: int  # GPU device index for the simulator
     log_dir: str
 
 
@@ -180,6 +181,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             "--headless",
         ],
         "env": _preamble_env({
+            "CUDA_VISIBLE_DEVICES": str(cfg.sim_gpu),
             "TINKER_SIM_CAMERA_HZ": "12",
             "TINKER_SIM_CONTROL_HZ": "60",
             "TINKER_SIM_ARENA_CAMERA": "1",
@@ -535,6 +537,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--manipulation", choices=["mock", "live"], default="mock")
     parser.add_argument("--manip-gpu", dest="manip_gpu", type=int, default=None)
+    parser.add_argument("--sim-gpu", dest="sim_gpu", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-dir", default="gpsr_stack_logs")
     return parser
@@ -547,6 +550,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         seed=args.seed,
         manipulation=args.manipulation,
         manip_gpu=args.manip_gpu,
+        sim_gpu=args.sim_gpu,
         log_dir=args.log_dir,
     )
 
