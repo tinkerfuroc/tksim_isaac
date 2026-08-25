@@ -230,20 +230,9 @@ def _clear_stream_ready_file(path: Path = STREAM_READY_FILE) -> None:
 
 
 def _arena_camera_pose(occupancy: object) -> tuple[list[float], list[float], list[float]]:
-    width = int(getattr(occupancy, "width"))
-    height = int(getattr(occupancy, "height"))
-    resolution = float(getattr(occupancy, "resolution"))
-    origin_x = float(getattr(occupancy, "origin_x"))
-    origin_y = float(getattr(occupancy, "origin_y"))
-    if width <= 0 or height <= 0 or resolution <= 0.0:
-        raise ValueError("arena occupancy dimensions and resolution must be positive")
-    size_x = width * resolution
-    size_y = height * resolution
-    span = max(size_x, size_y)
-    center = [origin_x + size_x / 2.0, origin_y + size_y / 2.0, 0.5]
-    eye = [center[0] - 0.75 * span, center[1] - 0.75 * span, 0.90 * span]
-    bounds = [origin_x, origin_y, origin_x + size_x, origin_y + size_y]
-    return eye, center, bounds
+    from tinker_sim_isaac.arena_camera import arena_camera_pose
+
+    return arena_camera_pose(occupancy)
 
 
 def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
