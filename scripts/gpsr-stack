@@ -46,9 +46,44 @@ import time
 from pathlib import Path
 from typing import Optional
 
-REPO_ROOT = "/home/tinker/tinker-sim/6.0.1"
+# Derived from this script's own location, not hardcoded, so gpsr-stack
+# always launches against the checkout it lives in (the invoking worktree)
+# rather than whichever checkout happened to be "the main one" when this
+# constant was last edited. scripts/gpsr-stack lives at <repo>/scripts/, so
+# parents[1] is the repo root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 TINKER_WS = "/home/tinker/tk25_ws"
-CENSUS_SCRIPT = str(Path(__file__).resolve().parent.parent / "tools" / "gpsr_interface_census.py")
+CENSUS_SCRIPT = str(REPO_ROOT / "tools" / "gpsr_interface_census.py")
+
+# The main checkout -- used only as a fallback source for locally-built ROS
+# artifacts (ros2_ws/install, .ros-vendor) that a worktree hasn't built for
+# itself. The bridge code those artifacts contain is unchanged on feature
+# branches like this one, so sourcing the main checkout's build is
+# equivalent; this is never a source for *project* assets (the scenario
+# JSON, this script's own tools/) -- those always come from REPO_ROOT, e.g.
+# via project_root:=REPO_ROOT in the bridge launch below.
+MAIN_CHECKOUT_ROOT = Path("/home/tinker/tinker-sim/6.0.1")
+MAIN_CHECKOUT_ROS2_WS = MAIN_CHECKOUT_ROOT / "ros2_ws" / "install" / "setup.bash"
+MAIN_CHECKOUT_ROS_VENDOR = MAIN_CHECKOUT_ROOT / ".ros-vendor" / "humble" / "local_setup.bash"
+
+
+def resolve_ros2_ws(repo_root) -> Path:
+    """Return the ros2_ws/install/setup.bash to source for ``repo_root``.
+
+    Pure and filesystem-read-only (a single ``is_file`` stat) so it is
+    directly testable with tmp dirs. Prefers a build local to ``repo_root``;
+    falls back to MAIN_CHECKOUT_ROS2_WS when the repo (e.g. a fresh worktree)
+    has never run colcon build for ros2_ws itself -- see the module-level
+    comment on MAIN_CHECKOUT_ROOT for why that fallback is safe.
+    """
+    candidate = Path(repo_root) / "ros2_ws" / "install" / "setup.bash"
+    return candidate if candidate.is_file() else MAIN_CHECKOUT_ROS2_WS
+
+
+def resolve_ros_vendor(repo_root) -> Path:
+    """Same resolution as resolve_ros2_ws, for .ros-vendor/humble instead."""
+    candidate = Path(repo_root) / ".ros-vendor" / "humble" / "local_setup.bash"
+    return candidate if candidate.is_file() else MAIN_CHECKOUT_ROS_VENDOR
 
 # Env keys the runbook's shared preamble unsets before every stage 2-6
 # command, so a terminal that previously sourced a different workspace can't
@@ -70,9 +105,9 @@ PREAMBLE_UNSET = (
 # whatever the invoking shell happened to have sourced already.
 CENSUS_SOURCES: tuple[str, ...] = (
     "/opt/ros/humble/setup.bash",
-    ".ros-vendor/humble/local_setup.bash",
+    str(resolve_ros_vendor(REPO_ROOT)),
     f"{TINKER_WS}/install/setup.bash",
-    "ros2_ws/install/setup.bash",
+    str(resolve_ros2_ws(REPO_ROOT)),
 )
 
 # gate name -> the census's own stack name(s) (SERVICES/ACTIONS/TOPICS keys
@@ -160,9 +195,9 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
         "cmd": _ros_argv(
             sources=(
                 "/opt/ros/humble/setup.bash",
-                ".ros-vendor/humble/local_setup.bash",
+                str(resolve_ros_vendor(REPO_ROOT)),
                 f"{TINKER_WS}/install/setup.bash",
-                "ros2_ws/install/setup.bash",
+                str(resolve_ros2_ws(REPO_ROOT)),
             ),
             argv=[
                 "ros2", "launch", "tinker_sim_bridge", "gpsr.launch.py",
@@ -276,7 +311,7 @@ def _ros_argv(*, sources: tuple[str, ...], argv: list[str]) -> list[str]:
     ``:=`` launch arguments survive intact.
     """
     import shlex
-    parts = [f"cd {shlex.quote(REPO_ROOT)}"]
+    parts = [f"cd {shlex.quote(str(REPO_ROOT))}"]
     for src in sources:
         parts.append(f"source {shlex.quote(src)}")
     parts.append("exec " + " ".join(shlex.quote(a) for a in argv))
