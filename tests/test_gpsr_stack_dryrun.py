@@ -22,7 +22,7 @@ spec.loader.exec_module(mod)
 
 def _cfg(**kw):
     base = dict(scenario="gpsr-rcw2026-bench", seed=0, manipulation="mock",
-                manip_gpu=None, log_dir="gpsr_stack_logs")
+                manip_gpu=None, sim_gpu=0, log_dir="gpsr_stack_logs")
     base.update(kw)
     return mod.StackConfig(**base)
 
@@ -51,6 +51,48 @@ def test_scenario_json_has_two_actors():
     data = json.loads((Path(__file__).resolve().parents[1] /
                        "simulation/scenarios/gpsr-rcw2026-bench.json").read_text())
     assert len(data["actors"]) == 2
+
+
+def test_sim_stage_default_cuda_visible_devices():
+    """Default sim_gpu (0) → CUDA_VISIBLE_DEVICES == '0'."""
+    sim = mod.stage_commands(_cfg())[0]
+    assert sim["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_sim_stage_custom_cuda_visible_devices():
+    """Custom sim_gpu (1) → CUDA_VISIBLE_DEVICES == '1'."""
+    sim = mod.stage_commands(_cfg(sim_gpu=1))[0]
+    assert sim["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+
+
+def test_only_sim_stage_has_sim_gpu_cuda_visible_devices():
+    """Only sim stage should have CUDA_VISIBLE_DEVICES from sim_gpu.
+
+    Other stages (vision, bridge, nav_extras, manipulation) should not gain
+    CUDA_VISIBLE_DEVICES from the sim_gpu change. Manipulation's existing
+    manip_gpu behavior should remain unchanged.
+    """
+    stages = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1, sim_gpu=1))
+    sim_stage = [s for s in stages if s["name"] == "sim"][0]
+    bridge_stage = [s for s in stages if s["name"] == "bridge"][0]
+    vision_stage = [s for s in stages if s["name"] == "vision"][0]
+    manip_stage = [s for s in stages if s["name"] == "manipulation"][0]
+    nav_stage = [s for s in stages if s["name"] == "nav_extras"][0]
+
+    # Sim stage should have CUDA_VISIBLE_DEVICES from sim_gpu
+    assert sim_stage["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+
+    # Bridge stage should NOT have CUDA_VISIBLE_DEVICES
+    assert "CUDA_VISIBLE_DEVICES" not in bridge_stage["env"]
+
+    # Vision stage should NOT have CUDA_VISIBLE_DEVICES
+    assert "CUDA_VISIBLE_DEVICES" not in vision_stage["env"]
+
+    # Manipulation stage should still have CUDA_VISIBLE_DEVICES from manip_gpu
+    assert manip_stage["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+
+    # Nav stage should NOT have CUDA_VISIBLE_DEVICES
+    assert "CUDA_VISIBLE_DEVICES" not in nav_stage["env"]
 
 
 # --- extra coverage beyond the brief's minimum, still pure-function only ---
