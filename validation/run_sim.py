@@ -236,12 +236,22 @@ def _arena_camera_pose(occupancy: object) -> tuple[list[float], list[float], lis
 
 
 #: Opt-in gate: truthy disables the wrist camera (its RTX render product is
-#: never created). Controller ruling (see task-9-report.md, attempts 6-7):
-#: 3 concurrent RTX render products (head+wrist+arena) race a CUDA
-#: illegal-memory-access under GPU contention; 2 is stable. Hybrid runs
-#: (manipulation mocked -- the wrist camera's only consumer) drop the wrist
-#: camera and keep the arena camera; live-manipulation runs do the reverse
-#: (see ``TINKER_SIM_ARENA_CAMERA``).
+#: never created). NOT used by gpsr-stack battery runs any more: the theory
+#: this flag was introduced for -- that capping concurrent RTX render
+#: products at 2 (of head/wrist/arena) avoids a CUDA illegal-memory-access
+#: (error 700) under GPU contention -- was disproved live (see
+#: .superpowers/sdd/2026-08-25-gpsr-recorded-sim-battery/task-9-report.md,
+#: attempt 8: error 700 recurred with only 2 products active). The battery's
+#: actual fix was parking the arena camera outright (commit 1e730d4); the
+#: sim now runs its stock head+wrist cameras in both mock and live mode.
+#: This flag is retained as a manual operator escape hatch (e.g. isolating a
+#: wrist-camera-specific repro) -- but it is incompatible with
+#: ``scripts/gpsr-stack``: that script's "sim" gate now requires the wrist
+#: camera's census stack unconditionally (see
+#: tools/gpsr_interface_census.py's "sim cameras wrist" topics and
+#: ``_gate_census_stacks`` in scripts/gpsr-stack), so setting this env var
+#: for a ``gpsr-stack up`` run hangs that gate for the full 180s timeout and
+#: then tears the whole stack down.
 DISABLE_WRIST_CAMERA_ENV = "TINKER_SIM_DISABLE_WRIST_CAMERA"
 _TRUTHY = {"1", "true", "yes"}
 
