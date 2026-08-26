@@ -85,6 +85,51 @@ def resolve_ros_vendor(repo_root) -> Path:
     candidate = Path(repo_root) / ".ros-vendor" / "humble" / "local_setup.bash"
     return candidate if candidate.is_file() else MAIN_CHECKOUT_ROS_VENDOR
 
+
+def resolve_model_bundle_manifest(repo_root: Path) -> Path:
+    """Return the absolute path to the robot model-bundle manifest.json.
+
+    Pure and filesystem-read-only (reads asset-manifest.json once, then one
+    stat) so it is directly testable with tmp dirs. Reads ``repo_root/artifacts/
+    asset-manifest.json``, extracts ``generated_robot_usds[0]["path"]`` (a
+    repo-relative path to robot.usd), and returns ``repo_root / <its parent
+    dir> / "manifest.json"`` resolved absolute.
+
+    Raises RuntimeError if the asset manifest or the resulting manifest.json
+    path doesn't exist.
+    """
+    repo_root = Path(repo_root)
+    asset_manifest_path = repo_root / "artifacts" / "asset-manifest.json"
+
+    if not asset_manifest_path.is_file():
+        raise RuntimeError(f"asset-manifest.json not found at {asset_manifest_path}")
+
+    import json
+    try:
+        data = json.loads(asset_manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"failed to read asset-manifest.json: {e}")
+
+    try:
+        robot_usd_path = data["generated_robot_usds"][0]["path"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(
+            f"asset-manifest.json missing generated_robot_usds[0][\"path\"]: {e}"
+        )
+
+    # robot_usd_path is repo-relative, e.g.
+    # "artifacts/robot/tinker2/.../robot.usd". Get its parent dir.
+    robot_usd_rel = Path(robot_usd_path)
+    parent_rel = robot_usd_rel.parent
+    manifest_absolute = repo_root / parent_rel / "manifest.json"
+
+    if not manifest_absolute.is_file():
+        raise RuntimeError(
+            f"model-bundle manifest.json not found at {manifest_absolute}"
+        )
+
+    return manifest_absolute
+
 # Env keys the runbook's shared preamble unsets before every stage 2-6
 # command, so a terminal that previously sourced a different workspace can't
 # leak into this one.
@@ -281,6 +326,9 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     # --- Stage 4: tk25_manipulation (live only) -----------------------------
     if cfg.manipulation == "live":
         manip_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+        # Resolve model-bundle manifest path lazily so dry-run and tests work with
+        # fake repo roots. Resolution against the real REPO_ROOT is fine for dry-run.
+        manifest_path = resolve_model_bundle_manifest(REPO_ROOT)
         stages.append({
             "name": "manipulation",
             "cmd": [
@@ -290,6 +338,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                         "ros2", "launch", "mobile_bringup",
                         "manipulation_planning_task_only.launch.py",
                         "execution_profile:=sim_cumotion", "use_sim_time:=true",
+                        f"model_bundle_manifest:={manifest_path}",
                     ],
                 ),
                 _ros_argv(sources=manip_sources, argv=["ros2", "run", "arm_api", "grasp_action"]),
