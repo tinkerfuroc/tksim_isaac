@@ -167,7 +167,12 @@ def test_every_stage_has_required_keys():
 
 
 def test_stage_commands_pure_no_side_effects(tmp_path, monkeypatch):
-    # Calling stage_commands must not touch the filesystem or subprocess.
+    # stage_commands must never spawn a subprocess. It is NOT filesystem-read
+    # -free in live mode any more: resolve_model_bundle_manifest(REPO_ROOT)
+    # stats outputs/ompl-overlay/model-bundle/model-bundle.json to build the
+    # manipulation stage's model_bundle_manifest:= argument. This test's real
+    # REPO_ROOT happens to have that file (see the precedence/raise tests
+    # below for the read itself), so it only guards the subprocess half.
     import subprocess
     def _boom(*a, **kw):
         raise AssertionError("stage_commands must not spawn subprocesses")
@@ -303,6 +308,63 @@ def test_run_census_runs_sourced_argv_with_full_env(monkeypatch):
     assert captured["env"]["ROS_DOMAIN_ID"] == "42"
 
 
+def test_run_status_returns_zero_even_when_census_reports_nonzero(monkeypatch):
+    # _run_census's returncode is the whole-graph result, which is non-zero
+    # by construction under --manipulation mock (tk25_manipulation's
+    # interfaces are permanently absent). `status` is informational, so it
+    # must not propagate that as a false-negative exit code (review finding:
+    # `gpsr-stack status && ...` was a permanent false negative).
+    monkeypatch.setattr(mod, "_run_census", lambda: (1, "MISSING [tk25_manipulation]\n"))
+    rc = mod._run_status(_cfg())
+    assert rc == 0
+
+
+# --- Task 50 fix round: teardown survivor polling (runbook cumotion kill) --
+
+def test_poll_and_reap_survivors_returns_immediately_when_group_is_empty(monkeypatch):
+    monkeypatch.setattr(mod, "_pgrep_group", lambda pgid: "")
+    killpg_calls = []
+    monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+
+    mod._poll_and_reap_survivors(4242, timeout_s=1.0, poll_s=0.01)
+
+    assert killpg_calls == []
+
+
+def test_poll_and_reap_survivors_rekills_and_reports_persistent_members(monkeypatch, capsys):
+    # Simulate cumotion_goal_set_planner_node still showing up in pgrep
+    # after the first SIGKILL -- the runbook's "outlives a careless
+    # teardown" case.
+    monkeypatch.setattr(mod, "_pgrep_group", lambda pgid: "9999 cumotion_goal_set_planner_node")
+    killpg_calls = []
+    monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+
+    mod._poll_and_reap_survivors(4242, timeout_s=0.05, poll_s=0.01)
+
+    assert killpg_calls == [(4242, mod.signal.SIGKILL)]
+    err = capsys.readouterr().err
+    assert "4242" in err
+    assert "cumotion_goal_set_planner_node" in err
+
+
+def test_poll_and_reap_survivors_uses_pgrep_group_never_a_name_pattern(monkeypatch):
+    # Guard against regressing to a name-pattern sweep: the survivor check
+    # must go through _pgrep_group (pgrep -g <pgid>), not pgrep -f/pkill.
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        class _Result:
+            stdout = ""
+        return _Result()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    mod._poll_and_reap_survivors(4242, timeout_s=1.0, poll_s=0.01)
+
+    assert captured["argv"] == ["pgrep", "-g", "4242", "-l"]
+
+
 # --- Fix round 1: gpsr-stack must run from its own repo root (worktree-safe)
 
 def test_repo_root_is_the_script_s_own_repo_not_a_hardcoded_checkout():
@@ -390,20 +452,26 @@ def test_bridge_stage_sources_use_resolved_ros2_ws():
 # --- Task 50: model-bundle manifest resolution ---
 
 
-def test_resolve_model_bundle_manifest_returns_absolute_path(tmp_path):
-    """resolve_model_bundle_manifest resolves asset-manifest.json correctly."""
-    # Set up minimal asset-manifest.json
-    asset_dir = tmp_path / "artifacts"
+def _write_produced_bundle(repo_root) -> Path:
+    bundle_dir = Path(repo_root) / "outputs" / "ompl-overlay" / "model-bundle"
+    bundle_dir.mkdir(parents=True)
+    bundle = bundle_dir / "model-bundle.json"
+    bundle.write_text("{}")
+    return bundle
+
+
+def _write_artifact_manifest(repo_root) -> Path:
+    """Set up the OLD (removed) fallback shape: artifacts/asset-manifest.json
+    pointing at a robot-dir manifest.json. Used only to prove the resolver no
+    longer falls back to it even when it is present (precedence test).
+    """
+    asset_dir = Path(repo_root) / "artifacts"
     asset_dir.mkdir()
     asset_manifest = asset_dir / "asset-manifest.json"
-    robot_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "somehash"
+    robot_dir = asset_dir / "robot" / "tinker2" / "somehash"
     robot_dir.mkdir(parents=True)
-
-    # Create manifest.json in the robot dir (where robot.usd would be)
     manifest = robot_dir / "manifest.json"
     manifest.write_text("{}")
-
-    # Write asset-manifest.json pointing to robot.usd in that dir
     asset_manifest.write_text(
         """{
   "schema_version": 1,
@@ -415,54 +483,65 @@ def test_resolve_model_bundle_manifest_returns_absolute_path(tmp_path):
   ]
 }"""
     )
+    return manifest
+
+
+def test_resolve_model_bundle_manifest_returns_produced_bundle(tmp_path):
+    """resolve_model_bundle_manifest returns the produced bundle when present."""
+    bundle = _write_produced_bundle(tmp_path)
 
     result = mod.resolve_model_bundle_manifest(tmp_path)
 
-    assert result == manifest
+    assert result == bundle.resolve()
     assert result.is_absolute()
-    assert result.name == "manifest.json"
+    assert result.name == "model-bundle.json"
 
 
-def test_resolve_model_bundle_manifest_raises_when_asset_manifest_missing(tmp_path):
-    """resolve_model_bundle_manifest raises RuntimeError if asset-manifest.json missing."""
+def test_resolve_model_bundle_manifest_prefers_produced_bundle_over_artifact_manifest(tmp_path):
+    """The produced bundle takes precedence even when a robot-artifact
+    manifest.json also exists -- this is the whole point of c2c21e9 and had
+    no direct test (review finding: produced-bundle precedence)."""
+    bundle = _write_produced_bundle(tmp_path)
+    _write_artifact_manifest(tmp_path)
+
+    result = mod.resolve_model_bundle_manifest(tmp_path)
+
+    assert result == bundle.resolve()
+    assert result.name != "manifest.json"
+
+
+def test_resolve_model_bundle_manifest_raises_with_generation_recipe_when_absent(tmp_path):
+    """No silent fallback to the robot-artifact manifest.json: when the
+    produced bundle is absent, raise with the exact generation recipe."""
     import pytest
 
-    with pytest.raises(RuntimeError, match="asset-manifest.json not found"):
+    with pytest.raises(RuntimeError) as excinfo:
         mod.resolve_model_bundle_manifest(tmp_path)
 
+    message = str(excinfo.value)
+    assert "model-bundle.json" in message
+    assert "ros2 run tinker_sim_bridge model_limits" in message
+    assert "ros2 run tinker_sim_bridge model_bundle" in message
 
-def test_resolve_model_bundle_manifest_raises_when_manifest_missing(tmp_path):
-    """resolve_model_bundle_manifest raises RuntimeError if manifest.json missing."""
+
+def test_resolve_model_bundle_manifest_raises_even_when_artifact_manifest_present(tmp_path):
+    """The robot-artifact manifest.json is never a valid fallback any more,
+    even when it exists and is well-formed."""
     import pytest
 
-    # Set up asset-manifest.json but no manifest.json
-    asset_dir = tmp_path / "artifacts"
-    asset_dir.mkdir()
-    asset_manifest = asset_dir / "asset-manifest.json"
-    robot_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "somehash"
-    robot_dir.mkdir(parents=True)
+    _write_artifact_manifest(tmp_path)
 
-    asset_manifest.write_text(
-        """{
-  "schema_version": 1,
-  "generated_robot_usds": [
-    {
-      "path": "artifacts/robot/tinker2/somehash/robot.usd",
-      "sha256": "fake"
-    }
-  ]
-}"""
-    )
-
-    with pytest.raises(RuntimeError, match="manifest.json not found"):
+    with pytest.raises(RuntimeError, match="model_limits"):
         mod.resolve_model_bundle_manifest(tmp_path)
 
 
 def test_live_manipulation_stage_includes_model_bundle_manifest():
-    """Live-mode manipulation stage includes model_bundle_manifest:= argument."""
+    """Live-mode manipulation stage includes model_bundle_manifest:= argument,
+    pointing at the produced bundle (this test runs against the real
+    REPO_ROOT, which this checkout has already produced -- see
+    outputs/ompl-overlay/model-bundle/model-bundle.json)."""
     stages = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))
     manip = [s for s in stages if s["name"] == "manipulation"][0]
     script = manip["cmd"][0][2]  # ["bash", "-lc", script]
-    # The argument should end with /manifest.json and contain model_bundle_manifest:=
     assert "model_bundle_manifest:=" in script
-    assert script.endswith(("manifest.json", "model-bundle.json"))  # produced bundle preferred
+    assert script.endswith("model-bundle.json")
