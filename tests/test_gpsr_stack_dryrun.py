@@ -465,4 +465,4 @@ def test_live_manipulation_stage_includes_model_bundle_manifest():
     script = manip["cmd"][0][2]  # ["bash", "-lc", script]
     # The argument should end with /manifest.json and contain model_bundle_manifest:=
     assert "model_bundle_manifest:=" in script
-    assert script.endswith("manifest.json")  # Path arg ends with manifest.json
+    assert script.endswith(("manifest.json", "model-bundle.json"))  # produced bundle preferred
