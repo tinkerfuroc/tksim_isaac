@@ -97,8 +97,18 @@ def resolve_model_bundle_manifest(repo_root: Path) -> Path:
 
     Raises RuntimeError if the asset manifest or the resulting manifest.json
     path doesn't exist.
+
+    A canonical bundle produced per ros2_ws/src/tinker_sim_bridge/README.md
+    ("model_limits" + "model_bundle") at outputs/ompl-overlay/model-bundle/
+    model-bundle.json takes precedence: the robot-artifact manifest.json does
+    NOT satisfy mobile_bringup's model-bundle schema (missing artifacts/
+    contract/normalization/producer fields), so the produced bundle is the
+    only valid input when it exists.
     """
     repo_root = Path(repo_root)
+    produced = repo_root / "outputs" / "ompl-overlay" / "model-bundle" / "model-bundle.json"
+    if produced.is_file():
+        return produced.resolve()
     asset_manifest_path = repo_root / "artifacts" / "asset-manifest.json"
 
     if not asset_manifest_path.is_file():
