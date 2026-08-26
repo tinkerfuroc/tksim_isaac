@@ -37,11 +37,13 @@ TOPICS = {
         ("/camera/depth/image_raw", "sensor_msgs/msg/Image"),
         ("/camera/color/camera_info", "sensor_msgs/msg/CameraInfo"),
     ],
-    # Split from "sim cameras": the wrist camera is disabled in hybrid runs
-    # (TINKER_SIM_DISABLE_WRIST_CAMERA=1, manipulation mocked -- it is the
-    # wrist camera's only consumer), so gpsr-stack only requires this stack
-    # for live-manipulation runs (see scripts/gpsr-stack's
-    # _gate_census_stacks).
+    # Split from "sim cameras": the sim runs its stock head+wrist cameras in
+    # both mock and live mode alike, so scripts/gpsr-stack's
+    # _gate_census_stacks requires this stack unconditionally, not just for
+    # live-manipulation runs. (TINKER_SIM_DISABLE_WRIST_CAMERA=1 still
+    # exists as a manual escape hatch in validation/run_sim.py, but using it
+    # with gpsr-stack hangs this gate for the full timeout -- see that
+    # flag's own comment.)
     "sim cameras wrist": [
         ("/camera/xarm_camera/color/image_raw", "sensor_msgs/msg/Image"),
     ],
