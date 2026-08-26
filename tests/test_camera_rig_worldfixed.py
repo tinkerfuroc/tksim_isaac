@@ -1,10 +1,16 @@
+import inspect
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 
-from tinker_sim_isaac.camera_rig import CameraStreamSpec, load_camera_specs  # noqa: E402
+from tinker_sim_isaac.camera_rig import (  # noqa: E402
+    AA_OP_DLAA,
+    CameraRig,
+    CameraStreamSpec,
+    load_camera_specs,
+)
 
 
 def _spec(**kw):
@@ -34,3 +40,20 @@ def test_color_only_helper():
     from tinker_sim_isaac.camera_rig import is_color_only
     assert is_color_only(_spec())
     assert not is_color_only(_spec(depth_topic="/x"))
+
+
+def test_aa_op_dlaa_is_the_native_resolution_op():
+    # /rtx/post/aa/op: 3 = "DLSS" (Super Resolution, internal-res downscale
+    # + live resize), 4 = "DLAA" (native resolution, no downscale/resize).
+    # See CameraRig.initialize's docstring for why this distinction matters.
+    assert AA_OP_DLAA == 4
+
+
+def test_initialize_accepts_stable_aa_keyword():
+    # Pure signature check (no GPU/Isaac needed): confirms the wiring point
+    # run_sim.py's sensor-rich block depends on (camera_rig.initialize(app,
+    # stable_aa=arena_camera_enabled)) actually exists on CameraRig.
+    params = inspect.signature(CameraRig.initialize).parameters
+    assert "stable_aa" in params
+    assert params["stable_aa"].default is False
+    assert params["stable_aa"].kind is inspect.Parameter.KEYWORD_ONLY
