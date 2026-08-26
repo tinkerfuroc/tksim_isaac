@@ -385,3 +385,84 @@ def test_bridge_stage_sources_use_resolved_ros2_ws():
     script = bridge["cmd"][2]
     assert f"source {mod.resolve_ros2_ws(mod.REPO_ROOT)}" in script
     assert "source ros2_ws/install/setup.bash" not in script
+
+
+# --- Task 50: model-bundle manifest resolution ---
+
+
+def test_resolve_model_bundle_manifest_returns_absolute_path(tmp_path):
+    """resolve_model_bundle_manifest resolves asset-manifest.json correctly."""
+    # Set up minimal asset-manifest.json
+    asset_dir = tmp_path / "artifacts"
+    asset_dir.mkdir()
+    asset_manifest = asset_dir / "asset-manifest.json"
+    robot_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "somehash"
+    robot_dir.mkdir(parents=True)
+
+    # Create manifest.json in the robot dir (where robot.usd would be)
+    manifest = robot_dir / "manifest.json"
+    manifest.write_text("{}")
+
+    # Write asset-manifest.json pointing to robot.usd in that dir
+    asset_manifest.write_text(
+        """{
+  "schema_version": 1,
+  "generated_robot_usds": [
+    {
+      "path": "artifacts/robot/tinker2/somehash/robot.usd",
+      "sha256": "fake"
+    }
+  ]
+}"""
+    )
+
+    result = mod.resolve_model_bundle_manifest(tmp_path)
+
+    assert result == manifest
+    assert result.is_absolute()
+    assert result.name == "manifest.json"
+
+
+def test_resolve_model_bundle_manifest_raises_when_asset_manifest_missing(tmp_path):
+    """resolve_model_bundle_manifest raises RuntimeError if asset-manifest.json missing."""
+    import pytest
+
+    with pytest.raises(RuntimeError, match="asset-manifest.json not found"):
+        mod.resolve_model_bundle_manifest(tmp_path)
+
+
+def test_resolve_model_bundle_manifest_raises_when_manifest_missing(tmp_path):
+    """resolve_model_bundle_manifest raises RuntimeError if manifest.json missing."""
+    import pytest
+
+    # Set up asset-manifest.json but no manifest.json
+    asset_dir = tmp_path / "artifacts"
+    asset_dir.mkdir()
+    asset_manifest = asset_dir / "asset-manifest.json"
+    robot_dir = tmp_path / "artifacts" / "robot" / "tinker2" / "somehash"
+    robot_dir.mkdir(parents=True)
+
+    asset_manifest.write_text(
+        """{
+  "schema_version": 1,
+  "generated_robot_usds": [
+    {
+      "path": "artifacts/robot/tinker2/somehash/robot.usd",
+      "sha256": "fake"
+    }
+  ]
+}"""
+    )
+
+    with pytest.raises(RuntimeError, match="manifest.json not found"):
+        mod.resolve_model_bundle_manifest(tmp_path)
+
+
+def test_live_manipulation_stage_includes_model_bundle_manifest():
+    """Live-mode manipulation stage includes model_bundle_manifest:= argument."""
+    stages = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))
+    manip = [s for s in stages if s["name"] == "manipulation"][0]
+    script = manip["cmd"][0][2]  # ["bash", "-lc", script]
+    # The argument should end with /manifest.json and contain model_bundle_manifest:=
+    assert "model_bundle_manifest:=" in script
+    assert script.endswith("manifest.json")  # Path arg ends with manifest.json
