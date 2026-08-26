@@ -235,6 +235,33 @@ def _arena_camera_pose(occupancy: object) -> tuple[list[float], list[float], lis
     return arena_camera_pose(occupancy)
 
 
+#: Opt-in gate: truthy disables the wrist camera (its RTX render product is
+#: never created). Controller ruling (see task-9-report.md, attempts 6-7):
+#: 3 concurrent RTX render products (head+wrist+arena) race a CUDA
+#: illegal-memory-access under GPU contention; 2 is stable. Hybrid runs
+#: (manipulation mocked -- the wrist camera's only consumer) drop the wrist
+#: camera and keep the arena camera; live-manipulation runs do the reverse
+#: (see ``TINKER_SIM_ARENA_CAMERA``).
+DISABLE_WRIST_CAMERA_ENV = "TINKER_SIM_DISABLE_WRIST_CAMERA"
+_TRUTHY = {"1", "true", "yes"}
+
+
+def _without_wrist_camera(specs: tuple, env: dict) -> tuple:
+    """Drop the ``wrist_camera`` spec from ``specs`` when
+    ``TINKER_SIM_DISABLE_WRIST_CAMERA`` is a truthy literal ("1", "true",
+    "yes", case-insensitive); otherwise ``specs`` is returned unchanged.
+
+    Pure. Must run before ``_with_arena_camera`` (so a disabled wrist
+    camera never contributes to ``robot_min_hz``, and the arena camera's
+    append still lands after it) and before any RTX render products are
+    created.
+    """
+    raw = env.get(DISABLE_WRIST_CAMERA_ENV)
+    if raw is None or raw.strip().lower() not in _TRUTHY:
+        return specs
+    return tuple(spec for spec in specs if spec.name != "wrist_camera")
+
+
 def _with_arena_camera(
     specs: tuple, occupancy: object, env: dict
 ) -> tuple[tuple, float]:
@@ -998,6 +1025,10 @@ def main() -> int:
                     "simulation only -- hardware parity is deliberately broken",
                     flush=True,
                 )
+            filtered_camera_specs = _without_wrist_camera(camera_specs, os.environ)
+            if len(filtered_camera_specs) != len(camera_specs):
+                print("[sim] wrist camera disabled", flush=True)
+            camera_specs = filtered_camera_specs
             camera_specs, robot_min_camera_hz = _with_arena_camera(
                 camera_specs, backend.occupancy, os.environ
             )

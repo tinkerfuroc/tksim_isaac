@@ -17,7 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "validation"))
 sys.path.insert(0, str(ROOT / "simulation"))
 
-from run_sim import _arena_camera_enabled, _with_arena_camera  # noqa: E402
+from run_sim import (  # noqa: E402
+    _arena_camera_enabled,
+    _with_arena_camera,
+    _without_wrist_camera,
+)
 from tests.test_arena_camera import _Occ  # noqa: E402
 
 
@@ -48,3 +52,42 @@ def test_arena_camera_enabled_true_when_appended():
     specs = (_S(30.0),)
     out, _ = _with_arena_camera(specs, _Occ, {"TINKER_SIM_ARENA_CAMERA": "1"})
     assert _arena_camera_enabled(out) is True
+
+
+# --- Fix round 3: TINKER_SIM_DISABLE_WRIST_CAMERA (two-render-product cap) -
+
+def test_wrist_camera_disabled_removes_only_wrist():
+    specs = (_S(30.0, "head_camera"), _S(30.0, "wrist_camera"))
+    out = _without_wrist_camera(specs, {"TINKER_SIM_DISABLE_WRIST_CAMERA": "1"})
+    assert [s.name for s in out] == ["head_camera"]
+
+
+def test_wrist_camera_disabled_accepts_truthy_literals():
+    specs = (_S(30.0, "head_camera"), _S(30.0, "wrist_camera"))
+    for literal in ("1", "true", "True", "yes", "YES"):
+        out = _without_wrist_camera(specs, {"TINKER_SIM_DISABLE_WRIST_CAMERA": literal})
+        assert [s.name for s in out] == ["head_camera"], literal
+
+
+def test_wrist_camera_unset_leaves_specs_unchanged():
+    specs = (_S(30.0, "head_camera"), _S(30.0, "wrist_camera"))
+    out = _without_wrist_camera(specs, {})
+    assert out == specs
+
+
+def test_wrist_camera_falsy_leaves_specs_unchanged():
+    specs = (_S(30.0, "head_camera"), _S(30.0, "wrist_camera"))
+    out = _without_wrist_camera(specs, {"TINKER_SIM_DISABLE_WRIST_CAMERA": "0"})
+    assert out == specs
+
+
+def test_wrist_camera_disabled_then_arena_append_still_works():
+    specs = (_S(30.0, "head_camera"), _S(30.0, "wrist_camera"))
+    filtered = _without_wrist_camera(specs, {"TINKER_SIM_DISABLE_WRIST_CAMERA": "1"})
+    out, robot_hz = _with_arena_camera(
+        filtered, _Occ, {"TINKER_SIM_ARENA_CAMERA": "1"}
+    )
+    assert [s.name for s in out] == ["head_camera", "arena_camera"]
+    # robot_min_hz is over the (already wrist-filtered) specs handed to
+    # _with_arena_camera, not the original three-camera set.
+    assert robot_hz == 30.0

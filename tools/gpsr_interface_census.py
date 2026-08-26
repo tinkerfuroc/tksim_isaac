@@ -36,6 +36,13 @@ TOPICS = {
         ("/camera/color/image_raw", "sensor_msgs/msg/Image"),
         ("/camera/depth/image_raw", "sensor_msgs/msg/Image"),
         ("/camera/color/camera_info", "sensor_msgs/msg/CameraInfo"),
+    ],
+    # Split from "sim cameras": the wrist camera is disabled in hybrid runs
+    # (TINKER_SIM_DISABLE_WRIST_CAMERA=1, manipulation mocked -- it is the
+    # wrist camera's only consumer), so gpsr-stack only requires this stack
+    # for live-manipulation runs (see scripts/gpsr-stack's
+    # _gate_census_stacks).
+    "sim cameras wrist": [
         ("/camera/xarm_camera/color/image_raw", "sensor_msgs/msg/Image"),
     ],
     "sim bridge": [("/pan_tilt_controller/state", "tinker_vision_msgs_26/msg/PanTiltState")],

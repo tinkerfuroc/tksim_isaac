@@ -124,6 +124,26 @@ GATE_CENSUS_STACKS: dict[str, tuple[str, ...]] = {
     "nav": ("tk26_navigation",),
 }
 
+#: GATE_CENSUS_STACKS, mutated by _run_up() for the run's own cfg (see
+#: _gate_census_stacks/_gate_ready below) so _wait_for_gate's fixed
+#: (gate: str) -> None signature stays test-mockable with a single arg.
+_ACTIVE_GATE_CENSUS_STACKS: dict[str, tuple[str, ...]] = dict(GATE_CENSUS_STACKS)
+
+
+def _gate_census_stacks(cfg: "StackConfig") -> dict[str, tuple[str, ...]]:
+    """GATE_CENSUS_STACKS, with the "sim" gate widened to also require the
+    wrist camera's census stack ("sim cameras wrist",
+    tools/gpsr_interface_census.py) only when the wrist camera is actually
+    running this run (``cfg.manipulation == "live"``). In mock/hybrid mode
+    the sim stage sets ``TINKER_SIM_DISABLE_WRIST_CAMERA=1`` (see
+    ``stage_commands``), so those topics never publish and must not gate
+    bring-up.
+    """
+    stacks = dict(GATE_CENSUS_STACKS)
+    if cfg.manipulation == "live":
+        stacks["sim"] = GATE_CENSUS_STACKS["sim"] + ("sim cameras wrist",)
+    return stacks
+
 STAGE_READY_TIMEOUT_S = 180.0
 STAGE_READY_POLL_S = 2.0
 TEARDOWN_GRACE_S = 10.0
@@ -168,6 +188,19 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     stages: list[dict] = []
 
     # --- Stage 1: Sim -----------------------------------------------------
+    # RTX render products are capped at two per phase (controller ruling:
+    # 3 concurrent products -- head+wrist+arena -- race a CUDA
+    # illegal-memory-access under GPU contention; 2 is stable). Hybrid runs
+    # (manipulation mocked) drop the wrist camera, its only consumer, and
+    # keep the arena observer camera; live-manipulation runs need the wrist
+    # camera, so the arena camera is switched off instead.
+    if cfg.manipulation == "live":
+        sim_camera_env = {"TINKER_SIM_ARENA_CAMERA": "0"}
+    else:
+        sim_camera_env = {
+            "TINKER_SIM_ARENA_CAMERA": "1",
+            "TINKER_SIM_DISABLE_WRIST_CAMERA": "1",
+        }
     stages.append({
         "name": "sim",
         "cmd": [
@@ -184,8 +217,8 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             "CUDA_VISIBLE_DEVICES": str(cfg.sim_gpu),
             "TINKER_SIM_CAMERA_HZ": "12",
             "TINKER_SIM_CONTROL_HZ": "60",
-            "TINKER_SIM_ARENA_CAMERA": "1",
             "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
+            **sim_camera_env,
         }),
         "cwd": REPO_ROOT,
         "gate": "sim",
@@ -386,7 +419,7 @@ def _run_census() -> tuple[int, str]:
 
 
 def _gate_ready(gate: str, census_stdout: str) -> bool:
-    required = GATE_CENSUS_STACKS[gate]
+    required = _ACTIVE_GATE_CENSUS_STACKS[gate]
     return not (_parse_missing(census_stdout) & set(required))
 
 
@@ -412,6 +445,9 @@ def _stage_procs(cmd) -> list[list[str]]:
 
 def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
     stages = stage_commands(cfg)
+
+    global _ACTIVE_GATE_CENSUS_STACKS
+    _ACTIVE_GATE_CENSUS_STACKS = _gate_census_stacks(cfg)
 
     if dry_run:
         for stage in stages:
