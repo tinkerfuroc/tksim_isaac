@@ -131,17 +131,12 @@ _ACTIVE_GATE_CENSUS_STACKS: dict[str, tuple[str, ...]] = dict(GATE_CENSUS_STACKS
 
 
 def _gate_census_stacks(cfg: "StackConfig") -> dict[str, tuple[str, ...]]:
-    """GATE_CENSUS_STACKS, with the "sim" gate widened to also require the
-    wrist camera's census stack ("sim cameras wrist",
-    tools/gpsr_interface_census.py) only when the wrist camera is actually
-    running this run (``cfg.manipulation == "live"``). In mock/hybrid mode
-    the sim stage sets ``TINKER_SIM_DISABLE_WRIST_CAMERA=1`` (see
-    ``stage_commands``), so those topics never publish and must not gate
-    bring-up.
+    """GATE_CENSUS_STACKS, with the "sim" gate expanded to require both head
+    and wrist camera census stacks in both modes: the sim runs its stock
+    head+wrist cameras in mock and live mode alike.
     """
     stacks = dict(GATE_CENSUS_STACKS)
-    if cfg.manipulation == "live":
-        stacks["sim"] = GATE_CENSUS_STACKS["sim"] + ("sim cameras wrist",)
+    stacks["sim"] = GATE_CENSUS_STACKS["sim"] + ("sim cameras wrist",)
     return stacks
 
 STAGE_READY_TIMEOUT_S = 180.0
@@ -188,19 +183,11 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     stages: list[dict] = []
 
     # --- Stage 1: Sim -----------------------------------------------------
-    # RTX render products are capped at two per phase (controller ruling:
-    # 3 concurrent products -- head+wrist+arena -- race a CUDA
-    # illegal-memory-access under GPU contention; 2 is stable). Hybrid runs
-    # (manipulation mocked) drop the wrist camera, its only consumer, and
-    # keep the arena observer camera; live-manipulation runs need the wrist
-    # camera, so the arena camera is switched off instead.
-    if cfg.manipulation == "live":
-        sim_camera_env = {"TINKER_SIM_ARENA_CAMERA": "0"}
-    else:
-        sim_camera_env = {
-            "TINKER_SIM_ARENA_CAMERA": "1",
-            "TINKER_SIM_DISABLE_WRIST_CAMERA": "1",
-        }
+    # Arena observer camera disabled for battery runs: world-fixed RTX camera races
+    # the render pipeline under full-stack load (CUDA 700) — see
+    # .superpowers/sdd/2026-08-25-gpsr-recorded-sim-battery/task-9-report.md
+    # attempts 6-8. Re-enable via TINKER_SIM_ARENA_CAMERA=1 once fixed.
+    # The sim runs its stock head+wrist cameras in both mock and live mode alike.
     stages.append({
         "name": "sim",
         "cmd": [
@@ -218,7 +205,6 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             "TINKER_SIM_CAMERA_HZ": "12",
             "TINKER_SIM_CONTROL_HZ": "60",
             "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
-            **sim_camera_env,
         }),
         "cwd": REPO_ROOT,
         "gate": "sim",
