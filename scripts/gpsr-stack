@@ -9,10 +9,16 @@ looks surprising.
 
 Design notes:
 
-- ``stage_commands(cfg)`` is a pure function: given a StackConfig it returns
-  the ordered stage plan as plain dicts, with no filesystem or subprocess
-  side effects. It is the only part of this script exercised by the test
-  suite (tests/test_gpsr_stack_dryrun.py) and by ``up --dry-run``.
+- ``stage_commands(cfg)`` builds the ordered stage plan as plain dicts.
+  It never spawns a subprocess, but in live-manipulation mode
+  (``cfg.manipulation == "live"``) it does read the filesystem:
+  ``resolve_model_bundle_manifest(REPO_ROOT)`` stats/resolves
+  ``outputs/ompl-overlay/model-bundle/model-bundle.json`` so the
+  manipulation stage's launch line can carry ``model_bundle_manifest:=``.
+  So "no side effects" here means no writes and no subprocesses, not "no
+  filesystem reads" -- mock-mode calls remain fully read-free. It is the
+  only part of this script exercised by the test suite
+  (tests/test_gpsr_stack_dryrun.py) and by ``up --dry-run``.
 - A stage's ``cmd`` is normally a single argv list (``list[str]``) for one
   process. The "vision" stage needs three concurrent processes (the vision
   bringup launch file, plus the runbook's two manual gaps: the
@@ -86,59 +92,60 @@ def resolve_ros_vendor(repo_root) -> Path:
     return candidate if candidate.is_file() else MAIN_CHECKOUT_ROS_VENDOR
 
 
+#: The exact two-command recipe from ros2_ws/src/tinker_sim_bridge/README.md
+#: ("Joint-limit synthesis" / "model_bundle") that produces the canonical
+#: model-bundle.json resolve_model_bundle_manifest() requires. Kept as one
+#: constant so the error message below and any future doc sync stay in
+#: lockstep with the README instead of drifting independently.
+MODEL_BUNDLE_GENERATION_RECIPE = """\
+ros2 run tinker_sim_bridge model_limits \\
+  --arm-joint-limits "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm7/joint_limits.yaml" \\
+  --gripper-joint-limits "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm_gripper/joint_limits.yaml" \\
+  --output "$PWD/outputs/ompl-overlay/model-bundle/joint_limits.yaml"
+ros2 run tinker_sim_bridge model_bundle \\
+  --simulator-full-urdf "$(./scripts/model-bundle-sim-urdf.sh)" \\
+  --planning-urdf "$TINKER_WS/src/tk25_basic/src/cumotion_description/config/xarm7.urdf" \\
+  --planning-srdf "$TINKER_WS/src/tk25_basic/src/cumotion_description/config/xarm7.srdf" \\
+  --joint-limits "$PWD/outputs/ompl-overlay/model-bundle/joint_limits.yaml" \\
+  --kinematics "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm7/kinematics.yaml" \\
+  --prefix "" --mount-parent world --mount-child base_link \\
+  --output "$PWD/outputs/ompl-overlay/model-bundle/model-bundle.json"
+"""
+
+
 def resolve_model_bundle_manifest(repo_root: Path) -> Path:
-    """Return the absolute path to the robot model-bundle manifest.json.
+    """Return the absolute path to the produced model-bundle manifest.
 
-    Pure and filesystem-read-only (reads asset-manifest.json once, then one
-    stat) so it is directly testable with tmp dirs. Reads ``repo_root/artifacts/
-    asset-manifest.json``, extracts ``generated_robot_usds[0]["path"]`` (a
-    repo-relative path to robot.usd), and returns ``repo_root / <its parent
-    dir> / "manifest.json"`` resolved absolute.
+    Pure and filesystem-read-only (a single ``is_file`` stat) so it is
+    directly testable with tmp dirs. The only valid input is the canonical
+    bundle produced per ros2_ws/src/tinker_sim_bridge/README.md
+    ("model_limits" + "model_bundle") at ``repo_root/outputs/ompl-overlay/
+    model-bundle/model-bundle.json``.
 
-    Raises RuntimeError if the asset manifest or the resulting manifest.json
-    path doesn't exist.
+    There is deliberately no fallback to the robot-artifact
+    ``artifacts/robot/.../manifest.json``: that file does NOT satisfy
+    mobile_bringup's model-bundle schema (it is missing the artifacts/
+    contract/normalization/producer fields the schema requires). An earlier
+    version of this function fell back to it silently, which reproduced
+    exactly the Task 9 blocker c01e1af/c2c21e9 were written to remove --
+    just moved downstream, from a clear message here to an opaque stage-4
+    launch failure. So when the produced bundle is absent, this raises with
+    the exact generation recipe instead of guessing.
 
-    A canonical bundle produced per ros2_ws/src/tinker_sim_bridge/README.md
-    ("model_limits" + "model_bundle") at outputs/ompl-overlay/model-bundle/
-    model-bundle.json takes precedence: the robot-artifact manifest.json does
-    NOT satisfy mobile_bringup's model-bundle schema (missing artifacts/
-    contract/normalization/producer fields), so the produced bundle is the
-    only valid input when it exists.
+    Raises RuntimeError (naming ``MODEL_BUNDLE_GENERATION_RECIPE``) if the
+    produced bundle does not exist.
     """
     repo_root = Path(repo_root)
     produced = repo_root / "outputs" / "ompl-overlay" / "model-bundle" / "model-bundle.json"
     if produced.is_file():
         return produced.resolve()
-    asset_manifest_path = repo_root / "artifacts" / "asset-manifest.json"
 
-    if not asset_manifest_path.is_file():
-        raise RuntimeError(f"asset-manifest.json not found at {asset_manifest_path}")
-
-    import json
-    try:
-        data = json.loads(asset_manifest_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        raise RuntimeError(f"failed to read asset-manifest.json: {e}")
-
-    try:
-        robot_usd_path = data["generated_robot_usds"][0]["path"]
-    except (KeyError, IndexError) as e:
-        raise RuntimeError(
-            f"asset-manifest.json missing generated_robot_usds[0][\"path\"]: {e}"
-        )
-
-    # robot_usd_path is repo-relative, e.g.
-    # "artifacts/robot/tinker2/.../robot.usd". Get its parent dir.
-    robot_usd_rel = Path(robot_usd_path)
-    parent_rel = robot_usd_rel.parent
-    manifest_absolute = repo_root / parent_rel / "manifest.json"
-
-    if not manifest_absolute.is_file():
-        raise RuntimeError(
-            f"model-bundle manifest.json not found at {manifest_absolute}"
-        )
-
-    return manifest_absolute
+    raise RuntimeError(
+        f"produced model bundle not found at {produced}. "
+        "outputs/ is git-ignored, so it must be generated locally before "
+        "--manipulation live can be used. Generate it with:\n\n"
+        f"{MODEL_BUNDLE_GENERATION_RECIPE}"
+    )
 
 # Env keys the runbook's shared preamble unsets before every stage 2-6
 # command, so a terminal that previously sourced a different workspace can't
@@ -197,6 +204,8 @@ def _gate_census_stacks(cfg: "StackConfig") -> dict[str, tuple[str, ...]]:
 STAGE_READY_TIMEOUT_S = 180.0
 STAGE_READY_POLL_S = 2.0
 TEARDOWN_GRACE_S = 10.0
+SURVIVOR_POLL_TIMEOUT_S = 10.0
+SURVIVOR_POLL_INTERVAL_S = 1.0
 
 
 @dataclasses.dataclass
@@ -238,10 +247,12 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     stages: list[dict] = []
 
     # --- Stage 1: Sim -----------------------------------------------------
-    # Arena observer camera disabled for battery runs: world-fixed RTX camera races
-    # the render pipeline under full-stack load (CUDA 700) — see
-    # .superpowers/sdd/2026-08-25-gpsr-recorded-sim-battery/task-9-report.md
-    # attempts 6-8. Re-enable via TINKER_SIM_ARENA_CAMERA=1 once fixed.
+    # Arena observer camera disabled for battery runs: world-fixed RTX camera
+    # races the render pipeline under full-stack load (CUDA 700) — opt-in
+    # and currently known-broken. See docs/developer-log.md, "2026-08-26 —
+    # GPSR recorded sim battery bring-up" for the full DLSS/CUDA-700 story
+    # (this repo's .superpowers/sdd/ notes are git-ignored and won't survive
+    # on another checkout). Re-enable via TINKER_SIM_ARENA_CAMERA=1 once fixed.
     # The sim runs its stock head+wrist cameras in both mock and live mode alike.
     stages.append({
         "name": "sim",
@@ -553,9 +564,63 @@ def _newest_run_dir(log_dir: str) -> Optional[Path]:
     return candidates[-1] if candidates else None
 
 
+def _pgrep_group(pgid: int) -> str:
+    """Return ``pgrep -g <pgid> -l`` output ("pid name" per line), stripped.
+
+    Empty string means the process group has no members left. PGID-only, no
+    name pattern -- this asks the kernel "who is still in this group",
+    never "who looks like cumotion".
+    """
+    result = subprocess.run(
+        ["pgrep", "-g", str(pgid), "-l"], capture_output=True, text=True, check=False,
+    )
+    return result.stdout.strip()
+
+
+def _poll_and_reap_survivors(
+    pgid: int,
+    *,
+    timeout_s: float = SURVIVOR_POLL_TIMEOUT_S,
+    poll_s: float = SURVIVOR_POLL_INTERVAL_S,
+) -> None:
+    """After ``pgid`` has been SIGKILL'd, poll for up to ``timeout_s``
+    seconds for its members to actually exit; if any persist, re-SIGKILL
+    the group and print the survivors (pid + name).
+
+    This is what satisfies the runbook's "``cumotion_goal_set_planner_node``
+    must be killed explicitly" requirement (docs/gpsr-sim-runbook.md:509-510):
+    that node holds ~6.6 GB of GPU and, per the runbook, can outlive a
+    careless teardown. It runs inside the manipulation stage's own recorded
+    PGID (it is a child of the ``mobile_bringup`` launch Popen'd in stage 4),
+    so polling every recorded PGID for stragglers and re-SIGKILLing catches
+    it -- and anything else slow to die -- via the PGID this script itself
+    recorded, never a name-pattern sweep of the whole box.
+    """
+    deadline = time.monotonic() + timeout_s
+    survivors = _pgrep_group(pgid)
+    while survivors and time.monotonic() < deadline:
+        time.sleep(poll_s)
+        survivors = _pgrep_group(pgid)
+
+    if not survivors:
+        return
+
+    print(
+        f"gpsr-stack: pgid {pgid} still has members {timeout_s:.0f}s after "
+        f"SIGKILL; re-SIGKILLing. survivors:\n{survivors}",
+        file=sys.stderr,
+    )
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def _teardown_run_dir(run_dir: Path) -> None:
     """SIGINT -> grace -> SIGKILL every PGID recorded in ``run_dir``, newest
-    stage first, then report leftover GPU processes.
+    stage first; poll each PGID for stragglers and re-SIGKILL any that
+    persist (see ``_poll_and_reap_survivors``); then report leftover GPU
+    processes.
 
     This is the single teardown implementation, shared by ``down`` and by
     ``_run_up``'s failure path, so a stack that dies mid bring-up is torn
@@ -587,6 +652,9 @@ def _teardown_run_dir(run_dir: Path) -> None:
         except ProcessLookupError:
             pass
 
+    for pgid in pgids:
+        _poll_and_reap_survivors(pgid)
+
     subprocess.run(
         ["nvidia-smi", "--query-compute-apps=pid,name,used_memory", "--format=csv"],
         check=False,
@@ -603,9 +671,17 @@ def _run_down(cfg: StackConfig) -> int:
 
 
 def _run_status(_cfg: StackConfig) -> int:
-    rc, output = _run_census()
+    # Deliberately does not return the census's own exit code: that code is
+    # the whole-graph result (non-zero by construction whenever manipulation
+    # is mocked, since tk25_manipulation's interfaces are then permanently
+    # absent -- the same reason _gate_ready parses stdout instead of
+    # trusting it). Propagating it here would make `gpsr-stack status && ...`
+    # a permanent false negative in the common `--manipulation mock` case.
+    # `status` is informational; 0 means "the census ran", not "everything
+    # is present" -- read the printed MISSING sections for that.
+    _rc, output = _run_census()
     print(output, end="" if output.endswith("\n") else "\n")
-    return rc
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
