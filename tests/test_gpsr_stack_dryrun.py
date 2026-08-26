@@ -42,37 +42,37 @@ def test_sim_stage_env():
     sim = mod.stage_commands(_cfg())[0]
     env = sim["env"]
     assert env["ROS_DOMAIN_ID"] == "42"
-    assert env["TINKER_SIM_ARENA_CAMERA"] == "1"
+    assert "TINKER_SIM_ARENA_CAMERA" not in env
+    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env
     assert "--scenario" in sim["cmd"] and "gpsr-rcw2026-bench" in sim["cmd"]
 
 
-# --- Fix round 3: two-render-product cap (wrist off in hybrid, arena off in
-# live) --------------------------------------------------------------------
+# --- Fix round 4: battery runs with head+wrist cameras, arena camera parked ---
 
-def test_mock_mode_sim_env_disables_wrist_keeps_arena():
-    sim = mod.stage_commands(_cfg(manipulation="mock"))[0]
-    env = sim["env"]
-    assert env["TINKER_SIM_ARENA_CAMERA"] == "1"
-    assert env["TINKER_SIM_DISABLE_WRIST_CAMERA"] == "1"
+def test_sim_stage_no_camera_env_vars():
+    """Sim runs head+wrist cameras in both mock and live modes; arena camera
+    disabled as a known issue (see scripts/gpsr-stack comment block).
+    """
+    sim_mock = mod.stage_commands(_cfg(manipulation="mock"))[0]
+    env_mock = sim_mock["env"]
+    assert "TINKER_SIM_ARENA_CAMERA" not in env_mock
+    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env_mock
 
-
-def test_live_mode_sim_env_disables_arena_keeps_wrist():
-    sim = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))[0]
-    env = sim["env"]
-    assert env["TINKER_SIM_ARENA_CAMERA"] == "0"
-    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env
-
-
-def test_mock_mode_sim_gate_excludes_wrist_topics():
-    stacks = mod._gate_census_stacks(_cfg(manipulation="mock"))
-    assert stacks["sim"] == ("sim cameras",)
-    assert "sim cameras wrist" not in stacks["sim"]
+    sim_live = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))[0]
+    env_live = sim_live["env"]
+    assert "TINKER_SIM_ARENA_CAMERA" not in env_live
+    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env_live
 
 
-def test_live_mode_sim_gate_requires_wrist_topics():
-    stacks = mod._gate_census_stacks(_cfg(manipulation="live", manip_gpu=1))
-    assert "sim cameras wrist" in stacks["sim"]
-    assert "sim cameras" in stacks["sim"]
+def test_wrist_camera_required_in_both_modes():
+    """Wrist topics required in both mock and live modes."""
+    stacks_mock = mod._gate_census_stacks(_cfg(manipulation="mock"))
+    assert "sim cameras wrist" in stacks_mock["sim"]
+    assert "sim cameras" in stacks_mock["sim"]
+
+    stacks_live = mod._gate_census_stacks(_cfg(manipulation="live", manip_gpu=1))
+    assert "sim cameras wrist" in stacks_live["sim"]
+    assert "sim cameras" in stacks_live["sim"]
 
 
 def test_scenario_json_has_two_actors():
