@@ -4,6 +4,106 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-08-26 — GPSR recorded sim battery bring-up
+
+`scripts/gpsr-stack up/down/status` automates Stages 1-5 of
+`docs/gpsr-sim-runbook.md` (Stage 6, the GPSR orchestrator, still lives in
+the `tk25_ws` decision repo and is started separately). Getting a full
+hybrid (`--manipulation mock`) bring-up to all-gates-green took nine
+attempts across two repos; this entry is the fix narrative behind those
+attempts (full blow-by-blow, if ever needed, was kept in this task's
+now-deleted scratch notes — the summary below is complete on its own).
+
+**Fix 1 — vision-stage headless crash: `waving_person_server`'s debug
+window.** `vision_bringup.launch.py` starts `waving_person_server`
+(`tk_vision_specialized`) with no parameter override, so it kept its
+`show_window=True` default; on a headless GPU box with no `xcb` display and
+no `offscreen` Qt plugin bundled in that venv, the node SIGABRTs at startup
+and takes the whole vision stage down with it. `detect_waving.launch.py` (a
+different, standalone launch entry point in the same `tk26_vision` package)
+already forced `show_window:=False` for exactly this reason — the gap was
+`vision_bringup.launch.py` not doing the same. Fixed upstream in
+`tk26_vision` (commit `20b1a20`, "show_window off"); this repo's own
+mitigation is `scripts/gpsr-stack`'s vision-stage env,
+`QT_QPA_PLATFORM=offscreen`, which is a general belt-and-suspenders guard
+against any node in that stage defaulting to an on-screen Qt window, not a
+substitute for the upstream fix.
+
+**Fix 2 — vision gate never satisfied despite every node self-reporting
+ready: Fast DDS interface whitelist.** With the show_window crash fixed, all
+6 vision-0 nodes logged successful startup (services, actions, and topics
+all created, verified by reading node source directly against
+`tools/gpsr_interface_census.py`'s expected names/types — exact matches),
+yet the census's own `rclpy` discovery never saw them, across ~36
+independent polls over a full 180 s gate timeout. Root cause: the vision
+stage's Fast DDS profile's interface whitelist did not include this host's
+current wired IP, so default-transport participants (the census subprocess,
+the orchestrator) could not discover vision's participants at all — not a
+name/type/namespace mismatch, a transport-level one. Fixed by adding the
+host's wired IP to that whitelist; verified live (vision services became
+discoverable to a fresh default-transport participant immediately).
+
+**Fix 3 — `vision_bringup` needed a rebuild.** Between two attempts, the
+`vision_bringup` package the earlier attempts launched against was stale in
+`tk25_ws/install` (missing a fix already merged upstream); rebuilding it
+into `tk25_ws/install` picked up the current source. Routine but worth
+recording: a hybrid bring-up against a stale `tk25_ws/install` can silently
+run old vision code.
+
+**Fix 4 — CUDA error 700 (illegal memory access) during camera capture:
+DLSS resize race, arena camera parked.** Once the vision gate cleared, sim
+startup hit a Warp `wp_cuda_stream_synchronize` CUDA error 700 roughly 15-40 s
+in, reproduced 3/3 with the world-fixed arena observer camera enabled
+alongside the two hardware-parity cameras (head+wrist), 0/2 with only the
+two hardware-parity cameras. Root cause (see
+`simulation/tinker_sim_isaac/camera_rig.py`'s `CameraRig.initialize`
+docstring for the full mechanism): DLSS's default anti-aliasing op
+auto-picks an internal render resolution below the render product's
+declared output resolution when that pick falls under DLSS's ~300 px
+minimum input size (the 848x480 wrist camera's default-picked internal size
+is 424x240, both under 300), then live-resizes up — and with 3+ concurrent
+RTX render products alive, that resize raced this rig's Warp device-to-host
+copy/synchronize. Fix: pin DLSS to its native-resolution `DLAA` op
+(`stable_aa=True`, `AA_OP_DLAA`) whenever the arena camera pushes the
+render-product count to 3+, scoped so hardware-parity-only runs (2 render
+products) keep their previously-verified default AA path (commit `1ec9ade`).
+**This fix was necessary but not sufficient**: error 700 recurred on the
+*wrist* camera under the same `sensor-rich` (3-camera) profile even with the
+DLAA pin in place, and a follow-up retest with only 2 render products
+(head+wrist, arena off) still hit error 700 once — disproving the working
+theory that render-product *count* (specifically, "3 is unstable, 2 is
+stable") was the load-bearing variable
+(`.superpowers/sdd/2026-08-25-gpsr-recorded-sim-battery/task-9-report.md`,
+attempt 8). The controller ruling that actually stuck: park the arena
+observer camera outright as a known issue (it is sim-only tooling, not
+required for GPSR parity) and record head-camera only for the battery
+(commit `1e730d4`). Zero error-700 hits across every subsequent attempt.
+`TINKER_SIM_ARENA_CAMERA=1` still exists to re-enable it once someone picks
+the CUDA-700 investigation back up; `TINKER_SIM_DISABLE_WRIST_CAMERA=1` (the
+now-disproven 2-product mitigation) is retained only as a manual operator
+escape hatch and is incompatible with `scripts/gpsr-stack`'s census gate
+(see that flag's comment in `validation/run_sim.py`).
+
+**Fix 5 — live-manipulation launch needed the model-bundle manifest wired
+in.** `mobile_bringup manipulation_planning_task_only.launch.py` takes a
+`model_bundle_manifest:=` argument `scripts/gpsr-stack` was not passing at
+all; `resolve_model_bundle_manifest()` (`scripts/gpsr-stack:89-140`) now
+resolves the canonical bundle produced per
+`ros2_ws/src/tinker_sim_bridge/README.md` at
+`outputs/ompl-overlay/model-bundle/model-bundle.json` and raises with that
+README's exact generation recipe if it hasn't been produced yet — deliberately
+not falling back to the robot-artifact `manifest.json` under `artifacts/`,
+which does not satisfy `mobile_bringup`'s model-bundle schema and would
+otherwise fail later, opaquely, inside the launch itself.
+
+With all five fixes in place: hybrid (`--manipulation mock`) bring-up
+reaches all 4 gates green with zero error-700 hits, and step 5's tier2
+smoke corpus ran 2/2 PASS. Live-manipulation (`--manipulation live`)
+bring-up reaches the manipulation stage (previously never reached) and is
+blocked only on environment-local pieces out of this repo's scope (a
+missing `anygrasp` checkpoint, `tk25_ws`-side Python dependencies for the
+orchestrator) — not on anything `scripts/gpsr-stack` itself does.
+
 ## 2026-08-22 — GPSR `goto_command_point` stall: two root causes in the sim, one residual
 
 Starting point: `reports/gpsr-sim-2026-08-20/NAV-HANDOFF.md` — Nav2 never

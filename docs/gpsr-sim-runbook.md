@@ -14,6 +14,46 @@ stages depend on earlier ones being up. Record the PID reported at the top of
 each stage's output (or `echo $!` immediately after backgrounding it); Teardown
 below needs that list.
 
+## Automated bring-up: `scripts/gpsr-stack`
+
+`scripts/gpsr-stack up/down/status` automates Stages 1-5 below end to end
+(Stage 6, the GPSR orchestrator, still lives in the `tk25_ws` decision repo
+and is started separately — see Stage 6). Prefer it over running each stage
+by hand unless you're debugging a specific stage.
+
+```bash
+./scripts/gpsr-stack up --scenario gpsr-rcw2026-bench --seed 0 \
+  --manipulation mock --sim-gpu 0                 # hybrid: manipulation mocked
+./scripts/gpsr-stack up --scenario gpsr-rcw2026-bench --seed 0 \
+  --manipulation live --sim-gpu 0 --manip-gpu 1    # live manipulation, separate GPU
+./scripts/gpsr-stack status                        # one-shot interface census
+./scripts/gpsr-stack down                          # tears down the newest run dir
+```
+
+- `up` launches each stage as its own process group, waits on that stage's
+  readiness gate (`tools/gpsr_interface_census.py`, polled every 2 s, 180 s
+  timeout per stage — see the census-gating design note at the top of
+  `scripts/gpsr-stack`), and writes `<log-dir>/<timestamp>/<stage>.log` +
+  `.pgid` per process (default `--log-dir gpsr_stack_logs`, git-ignored). Any
+  failure mid bring-up tears down everything already started before
+  propagating the error.
+- `down` SIGINTs every recorded PGID in reverse stage order, waits, then
+  SIGKILLs survivors — then polls each PGID again and re-SIGKILLs anything
+  still alive, printing survivor pid+name, which is what satisfies this
+  runbook's "`cumotion_goal_set_planner_node` must be killed explicitly"
+  requirement (below) via the process's own recorded PGID, never a name
+  sweep.
+- `--manipulation live` requires the canonical model bundle to already be
+  produced at `outputs/ompl-overlay/model-bundle/model-bundle.json` (see
+  Stage 4 and `ros2_ws/src/tinker_sim_bridge/README.md`); `up` raises with
+  the exact two commands to produce it if it's missing.
+- The arena observer camera (a sim-only overview stream, out of GPSR parity)
+  is **opt-in and currently known-broken** under full-stack load — a
+  CUDA-700 illegal-memory-access race — so `gpsr-stack` never enables it.
+  See `docs/developer-log.md`, "2026-08-26 — GPSR recorded sim battery
+  bring-up" for the full investigation and fix history; re-enable via
+  `TINKER_SIM_ARENA_CAMERA=1` only once that's resolved.
+
 ## GPU pre-flight (before Stage 1, verbatim)
 
 Never launch Isaac while another Isaac holds the GPU.

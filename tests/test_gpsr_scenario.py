@@ -8,17 +8,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 
-SCENARIO = ROOT / "simulation/scenarios/gpsr-rcw2026.json"
 ARENA = ROOT / "artifacts/arena/rcw2026/d2b559b43207c8d54ae2609f638dca1cc36ee8b7adc7e4d94aee86e7fb56729c"
 
 
-class GpsrScenarioTest(unittest.TestCase):
+class _GpsrScenarioSchemaTestBase(unittest.TestCase):
+    """Shared schema/consistency checks for one GPSR arena scenario JSON.
+
+    Parametrized by the ``SCENARIO`` class attribute a subclass sets, so the
+    same checks run against every scenario derived from gpsr-rcw2026.json
+    (spec C4 for gpsr-rcw2026-bench.json: "validated by the existing
+    scenario schema tests" -- this base class IS that suite).
+    """
+
+    # Not directly collectible: this is a parametrized base, not a runnable
+    # suite on its own (it has no SCENARIO). Concrete subclasses below set
+    # __test__ = True to opt back in.
+    __test__ = False
+    SCENARIO: Path
+
     def setUp(self):
-        self.assertTrue(SCENARIO.is_file(), f"{SCENARIO} does not exist")
-        self.raw = json.loads(SCENARIO.read_text(encoding="utf-8"))
+        self.assertTrue(self.SCENARIO.is_file(), f"{self.SCENARIO} does not exist")
+        self.raw = json.loads(self.SCENARIO.read_text(encoding="utf-8"))
 
     def test_id_matches_filename_stem(self):
-        self.assertEqual(self.raw["id"], SCENARIO.stem)
+        self.assertEqual(self.raw["id"], self.SCENARIO.stem)
 
     def test_targets_the_arena(self):
         self.assertEqual(self.raw["world"], {"mode": "arena", "arena": "rcw2026"})
@@ -130,6 +143,26 @@ class GpsrScenarioTest(unittest.TestCase):
             math.dist((x, y), (table[0], table[1])), 1.5,
             "person is not within 1.5 m of the kitchen table",
         )
+
+
+class GpsrScenarioTest(_GpsrScenarioSchemaTestBase):
+    __test__ = True
+    SCENARIO = ROOT / "simulation/scenarios/gpsr-rcw2026.json"
+
+
+class GpsrBenchScenarioTest(_GpsrScenarioSchemaTestBase):
+    """gpsr-rcw2026-bench.json: same base scenario plus a second person
+    (``livingroom_person``) for command-variety coverage. Diff against
+    gpsr-rcw2026.json is exactly ``id`` + the added actor; objects untouched
+    -- so it must pass every check the base scenario passes."""
+
+    __test__ = True
+    SCENARIO = ROOT / "simulation/scenarios/gpsr-rcw2026-bench.json"
+
+    def test_has_two_actors(self):
+        self.assertEqual(len(self.raw["actors"]), 2)
+        ids = {a["id"] for a in self.raw["actors"]}
+        self.assertEqual(ids, {"kitchen_person", "livingroom_person"})
 
 
 if __name__ == "__main__":

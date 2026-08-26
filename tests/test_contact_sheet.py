@@ -6,7 +6,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tools.contact_sheet import build_sheet, sample_evenly  # noqa: E402
+from tools.contact_sheet import build_sheet, sample_evenly, _stamp_from_name  # noqa: E402
 
 
 def test_sample_evenly():
@@ -42,3 +42,23 @@ def test_build_sheet_missing_label_degrades(tmp_path):
     _mk_frames(tmp_path, "head", 2)
     out = build_sheet(tmp_path, {"id": "x", "verdict": "ERROR"}, tmp_path / "s.jpg")
     assert out.exists()  # no crash; arena row is a placeholder band
+
+
+def test_stamp_from_name_parses_seq_ms_filename():
+    assert _stamp_from_name("0007_1500.jpg") == "1.5"
+
+
+def test_stamp_from_name_degrades_on_unparseable_name():
+    # No trailing `_<ms>` integer -- must not raise (C3's "never a crash").
+    assert _stamp_from_name("not-a-frame-name.jpg") == "?"
+    assert _stamp_from_name("frame.jpg") == "?"
+
+
+def test_build_sheet_survives_unparseable_frame_filename(tmp_path):
+    # A stray non-conforming file in frames/head/ must not crash the
+    # builder -- it degrades to a "t=?s" caption instead.
+    p = tmp_path / "frames" / "head"
+    p.mkdir(parents=True)
+    Image.new("RGB", (32, 18), (10, 80, 80)).save(p / "not-a-frame-name.jpg")
+    out = build_sheet(tmp_path, {"id": "x", "verdict": "ERROR"}, tmp_path / "s.jpg")
+    assert out.exists()

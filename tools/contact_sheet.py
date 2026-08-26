@@ -24,6 +24,12 @@ CAPTION_H = 18
 HEADER_H = 88
 PLACEHOLDER_H = 40
 JPEG_QUALITY = 80
+# "arena" stays first even though the arena observer camera is parked as a
+# known issue (CUDA-700 under full-stack load; see docs/developer-log.md,
+# "2026-08-26 -- GPSR recorded sim battery bring-up") and battery runs
+# record head-camera only -- every sheet built from a battery run therefore
+# shows a permanent grey "no arena frames captured" placeholder band for
+# this row. That is the ledger's ruling, not a bug in this module.
 ROW_LABELS = ("arena", "head")
 TEXT_WRAP_WIDTH = 110
 
@@ -56,10 +62,18 @@ def sample_evenly(items: Sequence, k: int) -> list:
 
 
 def _stamp_from_name(name: str) -> str:
-    """Parse the `_<ms>` suffix from a `<seq>_<ms>.jpg` frame filename into a seconds string."""
+    """Parse the `_<ms>` suffix from a `<seq>_<ms>.jpg` frame filename into a
+    seconds string. Never raises: a file that doesn't match `<seq>_<ms>.jpg`
+    (unparseable trailing `_<ms>`) degrades to "?" rather than crashing the
+    builder, matching C3's "never a crash" promise -- honoured elsewhere for
+    missing rows, but this parse had no guard.
+    """
     stem = name.rsplit(".", 1)[0]
     ms_str = stem.split("_")[-1]
-    seconds = int(ms_str) / 1000.0
+    try:
+        seconds = int(ms_str) / 1000.0
+    except ValueError:
+        return "?"
     text = f"{seconds:.3f}".rstrip("0").rstrip(".")
     return text if text else "0"
 
