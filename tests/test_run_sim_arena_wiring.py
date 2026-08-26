@@ -17,13 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "validation"))
 sys.path.insert(0, str(ROOT / "simulation"))
 
-from run_sim import _with_arena_camera  # noqa: E402
+from run_sim import _arena_camera_enabled, _with_arena_camera  # noqa: E402
 from tests.test_arena_camera import _Occ  # noqa: E402
 
 
-class _S:  # minimal stand-in with tick_rate_hz
-    def __init__(self, hz):
+class _S:  # minimal stand-in with tick_rate_hz/name
+    def __init__(self, hz, name="robot_camera"):
         self.tick_rate_hz = hz
+        self.name = name
 
 
 def test_disabled_returns_originals():
@@ -37,3 +38,13 @@ def test_enabled_appends_arena_and_keeps_robot_hz():
     out, robot_hz = _with_arena_camera(specs, _Occ, {"TINKER_SIM_ARENA_CAMERA": "1"})
     assert len(out) == 2 and out[-1].name == "arena_camera"
     assert robot_hz == 30.0
+
+
+def test_arena_camera_enabled_false_when_absent():
+    assert _arena_camera_enabled((_S(30.0), _S(30.0))) is False
+
+
+def test_arena_camera_enabled_true_when_appended():
+    specs = (_S(30.0),)
+    out, _ = _with_arena_camera(specs, _Occ, {"TINKER_SIM_ARENA_CAMERA": "1"})
+    assert _arena_camera_enabled(out) is True

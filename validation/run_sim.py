@@ -254,6 +254,16 @@ def _with_arena_camera(
     return specs + (arena_camera_spec(occupancy, hz=hz),), robot_min_hz
 
 
+def _arena_camera_enabled(camera_specs: tuple) -> bool:
+    """True when ``_with_arena_camera`` appended the arena camera's spec.
+
+    ``camera_specs`` is always non-empty (``load_camera_specs`` guarantees at
+    least head+wrist); ``_with_arena_camera`` only ever appends, so the
+    arena camera -- when present -- is always last.
+    """
+    return camera_specs[-1].name == "arena_camera"
+
+
 def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
     pointer = root / "artifacts/robot/tinker2/current.json"
     if requested is None:
@@ -991,14 +1001,21 @@ def main() -> int:
             camera_specs, robot_min_camera_hz = _with_arena_camera(
                 camera_specs, backend.occupancy, os.environ
             )
-            if camera_specs[-1].name == "arena_camera":
+            arena_camera_enabled = _arena_camera_enabled(camera_specs)
+            if arena_camera_enabled:
                 print(
                     f"[sim] arena camera enabled at {camera_specs[-1].tick_rate_hz:g} Hz "
                     "-> /sim/arena_camera/image_raw",
                     flush=True,
                 )
             camera_rig = CameraRig(camera_specs)
-            camera_rig.initialize(app)
+            # stable_aa=True only once the arena camera is in play: with it,
+            # 3+ concurrent RTX camera render products are alive, which has
+            # raced DLSS's default live-resize path into a CUDA illegal
+            # memory access ~15s later (see CameraRig.initialize's
+            # docstring). Runs with just the two hardware-parity cameras
+            # keep the previously-verified-stable default AA behaviour.
+            camera_rig.initialize(app, stable_aa=arena_camera_enabled)
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
             gateway = RosStandardGateway(

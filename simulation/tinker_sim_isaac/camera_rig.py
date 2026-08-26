@@ -16,6 +16,13 @@ OPTICAL_TO_USD_CAMERA_WXYZ = (0.0, 1.0, 0.0, 0.0)
 #: Default USD camera aperture the focal length is solved against (mm).
 HORIZONTAL_APERTURE_MM = 20.955
 
+#: ``/rtx/post/aa/op`` value for DLSS "DLAA" (Deep Learning Anti-Aliasing):
+#: DLSS's neural denoiser/AA running at *native* resolution, i.e. with no
+#: internal-resolution downscale (contrast the default op, 3 = "DLSS" Super
+#: Resolution, which renders at a lower internal resolution and upscales).
+#: See ``CameraRig.initialize(..., stable_aa=True)`` for why this matters.
+AA_OP_DLAA = 4
+
 
 @dataclass(frozen=True)
 class CameraStreamSpec:
@@ -415,12 +422,43 @@ class CameraRig:
         #: ``capture()`` skips the depth branch entirely for these.
         self._color_only: set[str] = set()
 
-    def initialize(self, app: Any) -> None:
+    def initialize(self, app: Any, *, stable_aa: bool = False) -> None:
+        """Create this rig's RTX cameras.
+
+        ``stable_aa``: force DLSS to its native-resolution ``DLAA`` op
+        (``AA_OP_DLAA``) instead of its default ``DLSS`` Super Resolution op
+        *before* any render product in ``self.specs`` is created.
+
+        Root cause this works around: DLSS's default op auto-picks an
+        internal render resolution below the render product's declared
+        output resolution, then live-resizes the render target up if that
+        pick falls under DLSS's ~300 px minimum input size (observed as
+        "DLSS increasing input dimensions" for the 848x480 wrist camera,
+        whose default-picked internal size is 424x240 -- both under 300).
+        With 3+ concurrent RTX camera render products alive (hardware-parity
+        head+wrist plus the world-fixed arena observer camera), that live
+        resize has raced this rig's Warp D2H copy/synchronize in
+        ``capture()``: ~15 s after the resize, `wp_cuda_stream_synchronize`
+        reports CUDA error 700 ("illegal memory access"), followed by an
+        RT-pipeline/semaphore cascade -- reproduced 3/3 in
+        ``gpsr_stack_logs/2026082[56]T*`` runs with the arena camera on, 0/2
+        with only the two hardware-parity cameras. DLAA never downscales
+        (input resolution == output resolution, always), so the resize --
+        and the race it enables -- cannot happen. Scoped to ``stable_aa``
+        (set only when the arena camera pushes the render-product count to
+        3+; see ``run_sim.py``) so hardware-parity-only runs keep their
+        previously-verified-stable default AA behaviour unchanged.
+        """
         from isaacsim.core.utils.extensions import enable_extension
 
         enable_extension("isaacsim.sensors.experimental.rtx")
         for _ in range(4):
             app.update()
+
+        if stable_aa:
+            import carb.settings
+
+            carb.settings.get_settings().set_int("/rtx/post/aa/op", AA_OP_DLAA)
 
         import omni.usd
         import warp as wp
