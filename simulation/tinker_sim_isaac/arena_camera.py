@@ -14,7 +14,10 @@ from __future__ import annotations
 import math
 from typing import Mapping
 
-from tinker_sim_isaac.camera_rig import CameraStreamSpec
+from tinker_sim_isaac.camera_rig import (
+    OPTICAL_TO_USD_CAMERA_WXYZ,
+    CameraStreamSpec,
+)
 
 #: Opt-in gate: unset/falsy disables the arena camera entirely (its
 #: mount is never created, no topics are advertised).
@@ -147,6 +150,20 @@ def resolve_arena_camera(env: Mapping[str, str]) -> float | None:
     return min(ARENA_CAMERA_DEFAULT_HZ, override_hz)
 
 
+def quat_mul_wxyz(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Hamilton product ``a * b`` for wxyz quaternions (apply ``b`` first)."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
 def arena_camera_spec(occupancy: object, *, hz: float) -> CameraStreamSpec:
     """The world-fixed, color-only ``CameraStreamSpec`` for the arena camera."""
     eye, target, _bounds = arena_camera_pose(occupancy)
@@ -157,7 +174,18 @@ def arena_camera_spec(occupancy: object, *, hz: float) -> CameraStreamSpec:
         camera_info_topics=("/sim/arena_camera/camera_info",),
         frame_id="arena_camera_optical_frame",
         mount_prim="/World/ArenaCamera",
-        mount_rotation_wxyz=look_at_wxyz(eye, target),
+        # ``look_at_wxyz`` orients the OPTICAL frame (+Z at the target),
+        # but the rig authors this quaternion directly onto the USD camera
+        # prim, which renders along its local -Z (see
+        # ``CameraRig.initialize``'s orient-op comment: mount_rotation is
+        # per-camera contract data that already includes the optical->USD
+        # correction for the robot cameras). Without the composed flip the
+        # arena camera faces exactly backward and renders only the dome
+        # light -- uniform grey frames, first observed on the first boot
+        # that survived arena capture (2026-08-27).
+        mount_rotation_wxyz=quat_mul_wxyz(
+            look_at_wxyz(eye, target), OPTICAL_TO_USD_CAMERA_WXYZ
+        ),
         width=960,
         height=540,
         horizontal_fov_deg=70.0,

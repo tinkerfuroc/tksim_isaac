@@ -62,3 +62,21 @@ def test_pose_matches_run_sim_contract():
     eye, target, bounds = arena_camera_pose(_Occ)
     assert bounds == [-5.0, -4.0, 5.0, 4.0]
     assert eye[2] > target[2]
+
+
+def test_spec_rotation_points_usd_camera_forward_at_target():
+    # The rig authors mount_rotation_wxyz directly onto the USD camera prim,
+    # which renders along its local -Z. The spec's rotation must therefore
+    # map (0, 0, -1) onto the eye->target direction — look_at_wxyz alone
+    # (optical convention, +Z forward) faces exactly backward.
+    from tinker_sim_isaac.arena_camera import arena_camera_pose
+
+    spec = arena_camera_spec(_Occ, hz=4.0)
+    eye, target, _ = arena_camera_pose(_Occ)
+    fwd = _rotate(spec.mount_rotation_wxyz, (0.0, 0.0, -1.0))  # USD cam fwd
+    import math as _math
+
+    d = [t - e for t, e in zip(target, eye)]
+    n = _math.sqrt(sum(c * c for c in d))
+    d = [c / n for c in d]
+    assert all(abs(a - b) < 1e-9 for a, b in zip(fwd, d))
