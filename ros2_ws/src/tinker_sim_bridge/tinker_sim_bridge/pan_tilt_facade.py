@@ -44,21 +44,25 @@ class PanTiltFacade(Node):
             self._optional_degrees("initial_pan_deg"),
             self._optional_degrees("initial_tilt_deg"),
         )
-        # Re-assert until the mechanism reports it arrived: a single publish
-        # would be lost to a timeline reset, and the facade has no other way to
-        # know the head actually moved.
+        # HOLD the commanded pose continuously.  The command gateway's
+        # pan_tilt source expires 0.5 s after the last message, and the sim
+        # then stops driving the head joints entirely — gravity tilts the
+        # camera to the floor over a long run.  The real pan-tilt controller
+        # holds position in hardware; this facade stands in for it, so it
+        # re-publishes the current target forever (initial pose until the
+        # first /pan_tilt_controller/cmd, then whatever was last commanded).
+        self._target_pan = self._initial_pan
+        self._target_tilt = self._initial_tilt
         self._initial_pose_reached = False
-        self.create_timer(0.5, self._drive_initial_pose)
+        self.create_timer(0.2, self._hold_target)
 
     def _optional_degrees(self, name: str) -> float | None:
         """NaN is this node's "unset" -- rclpy has no optional double."""
         value = float(self.get_parameter(name).value)
         return None if math.isnan(value) else value
 
-    def _drive_initial_pose(self) -> None:
-        if self._initial_pose_reached:
-            return
-        if (
+    def _hold_target(self) -> None:
+        if not self._initial_pose_reached and (
             abs(self._pan - self._initial_pan) < 0.02
             and abs(self._tilt - self._initial_tilt) < 0.02
         ):
@@ -67,11 +71,10 @@ class PanTiltFacade(Node):
                 f"head at initial pose: pan={self._initial_pan:.4f} rad "
                 f"tilt={self._initial_tilt:.4f} rad"
             )
-            return
         command = JointState()
         command.header.stamp = self.get_clock().now().to_msg()
         command.name = ["pan_joint", "tilt_joint"]
-        command.position = [self._initial_pan, self._initial_tilt]
+        command.position = [self._target_pan, self._target_tilt]
         self._commands.publish(command)
 
     def _command(self, message: PanTiltCommand) -> None:
@@ -81,6 +84,8 @@ class PanTiltFacade(Node):
         else:
             pan = float(message.pan_rad)
             tilt = float(message.tilt_rad)
+        self._target_pan = pan
+        self._target_tilt = tilt
         command = JointState()
         command.header = message.header
         command.name = ["pan_joint", "tilt_joint"]

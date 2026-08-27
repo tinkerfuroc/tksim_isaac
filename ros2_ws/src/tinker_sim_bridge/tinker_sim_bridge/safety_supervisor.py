@@ -296,7 +296,12 @@ class SafetySupervisor(Node):
         request = SwitchController.Request()
         request.strictness = SwitchController.Request.STRICT
         request.activate_asap = True
-        request.timeout = Duration(seconds=2.0).to_msg()
+        # 30 s, not 2 s: the controller manager applies switches from its
+        # stepped update loop, and Isaac's stepping gaps out for multiple
+        # wall seconds during RTX camera strides / gripper contact bursts.
+        # A 2 s window then times out every attempt, leaving the arm
+        # controller stuck inactive after any transient safety stop.
+        request.timeout = Duration(seconds=30.0).to_msg()
         if activate:
             request.activate_controllers = [self._controller]
         else:
