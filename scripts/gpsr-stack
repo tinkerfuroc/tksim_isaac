@@ -320,6 +320,8 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                 argv=[
                     "ros2", "launch", "vision_bringup", "vision_bringup.launch.py",
                     "enable_gpsr:=true", "use_sim_time:=true",
+                    # Sim depth lags color ~0.5-1s under RTX load; 0.2 default starves detectors.
+                    "img_sync_thres:=2.0",
                 ],
             ),
             # The node NAME is load-bearing: every service-backend vision
