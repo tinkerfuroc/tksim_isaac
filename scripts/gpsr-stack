@@ -281,6 +281,15 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             # material). The RTF sphere substitutes carry no material and
             # slip on the arena floor: wheels spin, base never translates.
             "TINKER_SIM_WHEEL_COLLIDER": "cylinder",
+            # Arena observer re-enabled for the recorded battery (user asked
+            # for arena-view contact-sheet frames). Historically raced the
+            # render pipeline under full-stack load (CUDA 700, see
+            # docs/developer-log.md 2026-08-26); the stack has changed
+            # substantially since (head-only depth strides, DLAA pin, dome
+            # light). Watch the first battery runs for "error 700" and
+            # remove this pair again if the race returns.
+            "TINKER_SIM_ARENA_CAMERA": "1",
+            "TINKER_SIM_ARENA_CAMERA_HZ": "4",
         }),
         "cwd": REPO_ROOT,
         "gate": "sim",
