@@ -201,7 +201,7 @@ def _gate_census_stacks(cfg: "StackConfig") -> dict[str, tuple[str, ...]]:
     stacks["sim"] = GATE_CENSUS_STACKS["sim"] + ("sim cameras wrist",)
     return stacks
 
-STAGE_READY_TIMEOUT_S = 180.0
+STAGE_READY_TIMEOUT_S = 600.0
 STAGE_READY_POLL_S = 2.0
 TEARDOWN_GRACE_S = 10.0
 SURVIVOR_POLL_TIMEOUT_S = 10.0
