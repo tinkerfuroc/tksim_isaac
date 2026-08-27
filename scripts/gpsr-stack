@@ -277,6 +277,10 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             # mid-run). Camera-loaded runs need generous deadlines.
             "TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S": "10",
             "TINKER_SIM_COMMAND_STREAM_TIMEOUT_S": "5",
+            # A/B: authored cylinder wheel colliders (with their physics
+            # material). The RTF sphere substitutes carry no material and
+            # slip on the arena floor: wheels spin, base never translates.
+            "TINKER_SIM_WHEEL_COLLIDER": "cylinder",
         }),
         "cwd": REPO_ROOT,
         "gate": "sim",
@@ -331,6 +335,13 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                     "-p", "depth_topic:=/camera/depth/image_raw",
                     "-p", "color_info_topic:=/camera/color/camera_info",
                     "-p", "depth_info_topic:=/camera/color/camera_info",
+                    # Under RTX load the sim's depth stream lags color by
+                    # ~0.5-1s in stamp terms; at the 0.1s default slop the
+                    # synchronizer never pairs them ("sync starved") and every
+                    # detector downstream fails. 1.5s pairs the newest color
+                    # with a slightly older depth — fine for static-scene
+                    # detection, and sim-only.
+                    "-p", "sync_slop_sec:=1.5",
                 ],
             ),
             # Without this, /pan_tilt_controller/state never reaches
