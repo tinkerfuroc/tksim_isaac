@@ -56,6 +56,21 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     section["track_unknown_space"] = True
     section["plugins"] = list(PRIOR_MAP_PLUGINS)
     section["static_layer"] = dict(STATIC_LAYER)
+
+    # Goal tolerances: the upstream 0.10 m / 0.10 rad are hardware-precision
+    # values. The sim controller's documented steady-state offsets
+    # (0.014-0.072 rad per joint; base tracking in the same family) park the
+    # robot ~0.13 m from the goal, so goals never complete — follow_path
+    # aborts and the goto retries forever. Relax on the sim copy only; the
+    # upstream file stays hardware's.
+    controller = (
+        result.get("controller_server", {})
+        .get("ros__parameters", {})
+        .get("general_goal_checker")
+    )
+    if isinstance(controller, dict):
+        controller["xy_goal_tolerance"] = 0.3
+        controller["yaw_goal_tolerance"] = 0.4
     return result
 
 
