@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -22,6 +23,27 @@ HORIZONTAL_APERTURE_MM = 20.955
 #: Resolution, which renders at a lower internal resolution and upscales).
 #: See ``CameraRig.initialize(..., stable_aa=True)`` for why this matters.
 AA_OP_DLAA = 4
+
+
+def _debug_annotator_array(camera: str, kind: str, arr: Any) -> None:
+    """Trace one annotator array's raw metadata (``TINKER_SIM_CAMERA_DEBUG``).
+
+    Printed BEFORE ``capture()`` copies from or launches kernels on the
+    array, so a first-cycle CUDA-700 repro shows exactly what the RTX
+    annotator handed the rig (see ``.superpowers/arena-cam-debug/``).
+    """
+    if arr is None:
+        print(f"[camera-debug] {camera} {kind}: None", flush=True)
+        return
+    print(
+        f"[camera-debug] {camera} {kind}: "
+        f"device={getattr(arr, 'device', '?')} "
+        f"dtype={getattr(arr, 'dtype', '?')} "
+        f"shape={getattr(arr, 'shape', '?')} "
+        f"strides={getattr(arr, 'strides', '?')} "
+        f"ptr={hex(arr.ptr) if getattr(arr, 'ptr', None) else '?'}",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -431,6 +453,14 @@ class CameraRig:
         #: Names of specs with no depth annotator/stream (``is_color_only``);
         #: ``capture()`` skips the depth branch entirely for these.
         self._color_only: set[str] = set()
+        #: Debug aid (``TINKER_SIM_CAMERA_DEBUG=1``): number of remaining
+        #: ``capture()`` cycles that trace each camera's raw annotator
+        #: array metadata (device/shape/strides/ptr) BEFORE any copy or
+        #: kernel launch touches it. Used to pin down the CUDA-700
+        #: first-cycle race (see ``.superpowers/arena-cam-debug/``).
+        self._debug_cycles_left: int = (
+            10 if os.environ.get("TINKER_SIM_CAMERA_DEBUG") == "1" else 0
+        )
 
     def initialize(self, app: Any, *, stable_aa: bool = False) -> None:
         """Create this rig's RTX cameras.
@@ -474,6 +504,13 @@ class CameraRig:
         import warp as wp
         from isaacsim.sensors.experimental.rtx import CameraSensor, RtxCamera
         from pxr import Gf, Usd, UsdGeom
+
+        if os.environ.get("TINKER_SIM_WARP_VERIFY") == "1":
+            # Debug aid: have Warp check ``cudaGetLastError`` after every
+            # launch/copy so an async illegal access (CUDA 700) is
+            # attributed to the exact Warp call instead of the next
+            # ``synchronize_stream`` (see ``.superpowers/arena-cam-debug/``).
+            wp.config.verify_cuda = True
 
         stage = omni.usd.get_context().get_stage()
         robot = stage.GetPrimAtPath("/World/Tinker")
@@ -634,10 +671,15 @@ class CameraRig:
         """
         import warp as wp
 
+        debug = self._debug_cycles_left > 0
+        if debug:
+            self._debug_cycles_left -= 1
         frames: dict[str, tuple[Any, Any]] = {}
         sync_device = None
         for name, sensor in self._sensors.items():
             rgb, _info = sensor.get_data(COLOR_ANNOTATOR)
+            if debug:
+                _debug_annotator_array(name, "rgb", rgb)
             rgb_pinned, depth_pinned = self._pinned[name]
             if rgb is not None:
                 wp.copy(rgb_pinned, rgb)
@@ -649,6 +691,8 @@ class CameraRig:
                 frames[name] = (rgb, None)
                 continue
             depth, _info = sensor.get_data(DEPTH_ANNOTATOR)
+            if debug:
+                _debug_annotator_array(name, "depth", depth)
             if depth is not None:
                 depth_gpu_out = self._depth_gpu_out[name]
                 n = depth_gpu_out.size
