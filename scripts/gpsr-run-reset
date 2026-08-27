@@ -24,8 +24,13 @@ QW=${GPSR_RESET_QW:-1.0}
 
 ENTITY=${GPSR_RESET_ENTITY:-}
 if [ -z "$ENTITY" ]; then
+    # The whole entities list arrives on ONE line, so split on commas first
+    # (otherwise -o returns every /World/Tinker/* subpath as one giant blob),
+    # then keep only an entry that ENDS in /Tinker or /tinkerN — the robot
+    # root prim.  -m1 instead of `| head -1`: head's early exit SIGPIPEs
+    # grep, which aborts the whole script under `set -euo pipefail`.
     ENTITY=$(ros2 service call /get_entities simulation_interfaces/srv/GetEntities "{}" 2>/dev/null \
-        | grep -o "'[^']*[Tt]inker[^']*'" | head -1 | tr -d "'")
+        | tr ',' '\n' | grep -m1 -oE "'[^']*/[Tt]inker[0-9]*'" | tr -d "'") || true
 fi
 if [ -z "$ENTITY" ]; then
     echo "gpsr-run-reset: no robot entity matching 'tinker' in /get_entities" >&2
@@ -43,7 +48,7 @@ fi
 sleep 1
 
 ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
-    "{header: {frame_id: map}, pose: {pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}}, covariance: [0.25,0.0,0.0,0.0,0.0,0.0, 0.0,0.25,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.06853891]}" >/dev/null
+    "{header: {frame_id: map}, pose: {pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}}, covariance: [0.25,0.0,0.0,0.0,0.0,0.0, 0.0,0.25,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.06853891]}}" >/dev/null
 
 # AMCL convergence window.
 sleep 2
