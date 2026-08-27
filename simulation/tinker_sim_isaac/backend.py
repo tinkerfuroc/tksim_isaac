@@ -721,6 +721,21 @@ class IsaacWholeRobotBackend:
             material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
             return material
 
+        # Deterministic scene lighting.  The arena has appeared fully lit only
+        # after a destructive /reset_simulation STOP->PLAY; a plain bring-up
+        # (or the teleport-based per-run reset) can leave the stage so dark
+        # that the head camera sees only the emissive floor grid — which
+        # starves every vision detector.  A dome light guarantees a lit scene
+        # regardless of reset history.
+        from pxr import UsdLux
+
+        dome_path = "/World/tinker_sim_dome_light"
+        if not stage.GetPrimAtPath(dome_path).IsValid():
+            dome = UsdLux.DomeLight.Define(stage, dome_path)
+            dome.CreateIntensityAttr(1000.0)
+            dome.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+            print("[tinker-sim] dome light added for deterministic scene lighting")
+
         arm = _material("arm_white", (0.92, 0.92, 0.94), 0.55, 0.0)
         body = _material("body_grey", (0.25, 0.25, 0.27), 0.6, 0.25)
         # Arm chain: link_base/link1-7/link_eef/link_tcp, gripper base, and the
