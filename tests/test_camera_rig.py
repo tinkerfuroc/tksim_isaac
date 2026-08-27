@@ -42,6 +42,15 @@ class LoadCameraSpecsTest(unittest.TestCase):
         self.assertEqual(wrist.mount_rotation_wxyz, (0.0, 0.0, 1.0, 0.0))
         self.assertEqual((wrist.width, wrist.height), (848, 480))
 
+    def test_view_axis_forward_offset_defaults_to_zero(self) -> None:
+        """The contract never sets this; it's a code-only, opt-in field.
+
+        See ``tinker_sim_isaac.head_camera_aim`` for the one place that sets
+        it non-zero (the level-forward preset).
+        """
+        for spec in load_camera_specs(CONTRACT):
+            self.assertEqual(spec.view_axis_forward_offset_m, 0.0)
+
     def _mutated(self, mutate) -> Path:
         raw = json.loads(CONTRACT.read_text(encoding="utf-8"))
         mutate(raw)

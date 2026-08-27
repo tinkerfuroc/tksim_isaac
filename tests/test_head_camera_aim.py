@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT / "simulation"))
 from tinker_sim_isaac.head_camera_aim import (  # noqa: E402
     HEAD_AIM_ENV,
     LEVEL_FORWARD_CORRECTION_WXYZ,
+    LEVEL_FORWARD_VIEW_OFFSET_M,
     apply_head_aim_correction,
     resolve_head_aim_correction,
 )
@@ -146,6 +147,34 @@ class ApplyTest(unittest.TestCase):
         self.assertIn('"mount_rotation_wxyz"', text)
         self.assertNotIn("level-forward", text)
         self.assertNotIn(HEAD_AIM_ENV, text)
+
+    def test_no_correction_means_no_view_offset(self):
+        """Untouched specs never gain a forward offset."""
+        for spec in self.specs:
+            self.assertEqual(spec.view_axis_forward_offset_m, 0.0)
+
+    def test_the_preset_carries_the_measured_view_offset(self):
+        """level-forward levels the aim into the femto_bolt housing, so it
+
+        also dollies the render origin forward by LEVEL_FORWARD_VIEW_OFFSET_M
+        to clear it -- see that constant's docstring for the measurement.
+        """
+        out = apply_head_aim_correction(self.specs, LEVEL_FORWARD_CORRECTION_WXYZ)
+        head = next(s for s in out if s.name == "head_camera")
+        self.assertEqual(head.view_axis_forward_offset_m, LEVEL_FORWARD_VIEW_OFFSET_M)
+        self.assertGreater(LEVEL_FORWARD_VIEW_OFFSET_M, 0.0)
+
+    def test_an_explicit_non_preset_correction_gets_no_view_offset(self):
+        """The measured clearance is specific to the preset's geometry."""
+        out = apply_head_aim_correction(self.specs, (1.0, 0.0, 0.0, 0.0))
+        head = next(s for s in out if s.name == "head_camera")
+        self.assertEqual(head.view_axis_forward_offset_m, 0.0)
+
+    def test_view_offset_does_not_leak_to_other_cameras(self):
+        out = apply_head_aim_correction(self.specs, LEVEL_FORWARD_CORRECTION_WXYZ)
+        for spec in out:
+            if spec.name != "head_camera":
+                self.assertEqual(spec.view_axis_forward_offset_m, 0.0)
 
 
 class AimGeometryTest(unittest.TestCase):
