@@ -27,8 +27,18 @@ from tinker_sim_isaac.camera_rig import (
 )
 
 
-SAFETY_HEARTBEAT_TIMEOUT_S = 1.0
-COMMAND_STREAM_TIMEOUT_S = 0.5
+# Wall-clock freshness deadlines. The 1.0 s / 0.5 s defaults assume the
+# gateway spins continuously; under RTX camera rendering the stepping loop
+# (which pumps this gateway) stalls for multiple wall seconds per stride, so
+# every stall re-latched a safety stop mid-trajectory — arm stiffness dropped
+# 20000 -> 600 and the command stream was severed ("randomly hanging" arm).
+# Raise via env for camera-loaded runs; defaults preserve existing behavior.
+# (Ported from the shared checkout, where the grasp-benchmark session
+# diagnosed the same latch-up 2026-08-27.)
+SAFETY_HEARTBEAT_TIMEOUT_S = float(
+    os.environ.get("TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S", "1.0"))
+COMMAND_STREAM_TIMEOUT_S = float(
+    os.environ.get("TINKER_SIM_COMMAND_STREAM_TIMEOUT_S", "0.5"))
 MAX_RETIRED_COMMAND_EPOCHS = 64
 # R2: fixed range for the deterministic development-lidar fallback ring emitted
 # when the backend carries no occupancy map.  Finite and inside the 40 m lidar

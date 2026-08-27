@@ -271,6 +271,12 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             "TINKER_SIM_CAMERA_HZ": "12",
             "TINKER_SIM_CONTROL_HZ": "60",
             "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
+            # RTX camera strides stall the stepping loop for multiple wall
+            # seconds; at the 1.0 s / 0.5 s defaults every stall re-latches a
+            # safety hold and severs the command stream (frozen base + arm
+            # mid-run). Camera-loaded runs need generous deadlines.
+            "TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S": "10",
+            "TINKER_SIM_COMMAND_STREAM_TIMEOUT_S": "5",
         }),
         "cwd": REPO_ROOT,
         "gate": "sim",
