@@ -25,23 +25,40 @@ HORIZONTAL_APERTURE_MM = 20.955
 AA_OP_DLAA = 4
 
 
-def _debug_annotator_array(camera: str, kind: str, arr: Any) -> None:
+#: Last-seen annotator buffer pointer per (camera, kind), used to log pool
+#: churn events for the whole run while ``TINKER_SIM_CAMERA_DEBUG`` is on.
+_DEBUG_LAST_PTRS: dict[tuple[str, str], set[int]] = {}
+
+
+def _debug_annotator_array(camera: str, kind: str, arr: Any, *, full: bool) -> None:
     """Trace one annotator array's raw metadata (``TINKER_SIM_CAMERA_DEBUG``).
 
     Printed BEFORE ``capture()`` copies from or launches kernels on the
     array, so a first-cycle CUDA-700 repro shows exactly what the RTX
     annotator handed the rig (see ``.superpowers/arena-cam-debug/``).
+    ``full`` dumps every call (first cycles); afterwards only NEW buffer
+    pointers -- annotator pool churn -- are logged, which is the event that
+    immediately preceded the reproduced crash.
     """
     if arr is None:
-        print(f"[camera-debug] {camera} {kind}: None", flush=True)
+        if full:
+            print(f"[camera-debug] {camera} {kind}: None", flush=True)
         return
+    ptr = getattr(arr, "ptr", None)
+    seen = _DEBUG_LAST_PTRS.setdefault((camera, kind), set())
+    fresh = ptr is not None and ptr not in seen
+    if ptr is not None:
+        seen.add(ptr)
+    if not full and not fresh:
+        return
+    tag = " NEW-BUFFER" if (fresh and not full) else ""
     print(
-        f"[camera-debug] {camera} {kind}: "
+        f"[camera-debug]{tag} {camera} {kind}: "
         f"device={getattr(arr, 'device', '?')} "
         f"dtype={getattr(arr, 'dtype', '?')} "
         f"shape={getattr(arr, 'shape', '?')} "
         f"strides={getattr(arr, 'strides', '?')} "
-        f"ptr={hex(arr.ptr) if getattr(arr, 'ptr', None) else '?'}",
+        f"ptr={hex(ptr) if ptr else '?'}",
         flush=True,
     )
 
@@ -671,15 +688,17 @@ class CameraRig:
         """
         import warp as wp
 
-        debug = self._debug_cycles_left > 0
-        if debug:
+        debug_enabled = self._debug_cycles_left != 0 or bool(_DEBUG_LAST_PTRS)
+        debug_full = self._debug_cycles_left > 0
+        if debug_full:
             self._debug_cycles_left -= 1
+        debug = debug_enabled
         frames: dict[str, tuple[Any, Any]] = {}
         sync_device = None
         for name, sensor in self._sensors.items():
             rgb, _info = sensor.get_data(COLOR_ANNOTATOR)
             if debug:
-                _debug_annotator_array(name, "rgb", rgb)
+                _debug_annotator_array(name, "rgb", rgb, full=debug_full)
             rgb_pinned, depth_pinned = self._pinned[name]
             if rgb is not None:
                 wp.copy(rgb_pinned, rgb)
@@ -692,7 +711,7 @@ class CameraRig:
                 continue
             depth, _info = sensor.get_data(DEPTH_ANNOTATOR)
             if debug:
-                _debug_annotator_array(name, "depth", depth)
+                _debug_annotator_array(name, "depth", depth, full=debug_full)
             if depth is not None:
                 depth_gpu_out = self._depth_gpu_out[name]
                 n = depth_gpu_out.size
