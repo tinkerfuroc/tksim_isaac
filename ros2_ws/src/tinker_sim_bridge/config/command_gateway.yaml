@@ -10,3 +10,11 @@ tinker_sim_command_gateway:
     pan_tilt_joints: [pan_joint, tilt_joint]
     base_timeout_s: 0.25
     controller_timeout_s: 0.5
+    # Safety-clear samples come from nodes paced by SIM time; RTX camera
+    # strides stall the sim's stepping loop (and therefore /clock) for
+    # multiple wall seconds, gapping the heartbeat. At the 1.0 s default the
+    # gateway re-latched _safety_active on every stall and rejected ALL
+    # commands ("blocked by safety stop") — a robot that accepts nav goals
+    # and streams cmd_vel but never moves. 10 s tolerates the observed
+    # stalls; a genuinely dead supervisor still stops the robot.
+    safety_timeout_s: 10.0
