@@ -693,9 +693,19 @@ class CameraRig:
         if debug_full:
             self._debug_cycles_left -= 1
         debug = debug_enabled
+        # Debug aid (TINKER_SIM_CAPTURE_SKIP=<name>[,<name>..]): leave these
+        # cameras' render products alive but never consume their annotator
+        # arrays -- discriminates "our Warp reads trigger the CUDA 700" from
+        # "the renderer faults on its own" (.superpowers/arena-cam-debug/).
+        skip = {
+            s for s in os.environ.get("TINKER_SIM_CAPTURE_SKIP", "").split(",") if s
+        }
         frames: dict[str, tuple[Any, Any]] = {}
         sync_device = None
         for name, sensor in self._sensors.items():
+            if name in skip:
+                frames[name] = (None, None)
+                continue
             rgb, _info = sensor.get_data(COLOR_ANNOTATOR)
             if debug:
                 _debug_annotator_array(name, "rgb", rgb, full=debug_full)
