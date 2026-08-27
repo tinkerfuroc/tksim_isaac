@@ -298,7 +298,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                 f"tinker_workspace:={TINKER_WS}",
                 f"scenario:={cfg.scenario}",
                 f"seed:={cfg.seed}",
-                "safety_source_deadline_s:=1.0",
+                "safety_source_deadline_s:=5.0",
             ],
         ),
         "env": _preamble_env({}),
