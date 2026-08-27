@@ -470,6 +470,25 @@ class CameraRig:
         #: Names of specs with no depth annotator/stream (``is_color_only``);
         #: ``capture()`` skips the depth branch entirely for these.
         self._color_only: set[str] = set()
+        #: Cameras ticking slower than the rig's fastest camera. Their
+        #: annotator buffers go STALE between renders, and re-reading a
+        #: stale buffer while the RTX annotator pool reallocates under
+        #: load is the reproduced CUDA-700 crash (arena camera, 4 Hz tick
+        #: vs 12 Hz capture poll; see ``capture()`` and
+        #: ``.superpowers/arena-cam-debug/findings-phase1.md`` E1-E6).
+        #: ``capture()`` consumes these cameras' arrays only when freshly
+        #: rendered (buffer pointer changed) and otherwise serves the
+        #: pinned copy it already made.
+        fastest = max(spec.tick_rate_hz for spec in self.specs)
+        self._subrate: set[str] = {
+            spec.name for spec in self.specs if spec.tick_rate_hz < fastest
+        }
+        #: Last annotator buffer pointer consumed per (camera, kind) for
+        #: sub-rate cameras; equality means "same buffer we already
+        #: copied" (the RTX pool alternates >=2 buffers per stream, so a
+        #: fresh render always lands at a different pointer than the one
+        #: consumed last).
+        self._consumed_ptrs: dict[tuple[str, str], int] = {}
         #: Debug aid (``TINKER_SIM_CAMERA_DEBUG=1``): number of remaining
         #: ``capture()`` cycles that trace each camera's raw annotator
         #: array metadata (device/shape/strides/ptr) BEFORE any copy or
@@ -711,9 +730,22 @@ class CameraRig:
                 _debug_annotator_array(name, "rgb", rgb, full=debug_full)
             rgb_pinned, depth_pinned = self._pinned[name]
             if rgb is not None:
-                wp.copy(rgb_pinned, rgb)
-                sync_device = rgb.device
-                rgb = rgb_pinned
+                if name in self._subrate and self._consumed_ptrs.get(
+                    (name, "rgb")
+                ) == rgb.ptr:
+                    # Same buffer as last consume: the sub-rate camera has
+                    # not rendered since. Serve the pinned copy already
+                    # made instead of re-reading a device buffer the
+                    # annotator pool may reclaim mid-copy (the reproduced
+                    # CUDA-700; full-rate cameras never hit this branch --
+                    # their buffers are rewritten every cycle).
+                    rgb = rgb_pinned
+                else:
+                    if name in self._subrate:
+                        self._consumed_ptrs[(name, "rgb")] = rgb.ptr
+                    wp.copy(rgb_pinned, rgb)
+                    sync_device = rgb.device
+                    rgb = rgb_pinned
             if name in self._color_only:
                 # No depth annotator was created for this camera (see
                 # ``initialize()``); nothing to fetch or convert.
@@ -722,7 +754,16 @@ class CameraRig:
             depth, _info = sensor.get_data(DEPTH_ANNOTATOR)
             if debug:
                 _debug_annotator_array(name, "depth", depth, full=debug_full)
+            if (
+                depth is not None
+                and name in self._subrate
+                and self._consumed_ptrs.get((name, "depth")) == depth.ptr
+            ):
+                frames[name] = (rgb, depth_pinned)
+                continue
             if depth is not None:
+                if name in self._subrate:
+                    self._consumed_ptrs[(name, "depth")] = depth.ptr
                 depth_gpu_out = self._depth_gpu_out[name]
                 n = depth_gpu_out.size
                 wp.launch(
