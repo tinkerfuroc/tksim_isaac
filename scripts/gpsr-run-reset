@@ -1,55 +1,38 @@
 #!/bin/bash
-# Per-run GPSR bench "reset": teleport the robot back to its spawn pose and
-# re-localize AMCL, WITHOUT calling /reset_simulation.
+# Per-run GPSR bench "reset": restore the ARM and HEAD joint state between
+# runs. Deliberately does NOT touch the base pose or the localizer:
 #
-# Why not /reset_simulation: the Isaac sim_control extension ignores the
-# requested scope and always performs a FULL reset — timeline STOP, deletion
-# of every dynamically spawned entity (the scenario's actors and objects),
-# then PLAY.  That de-populates the arena for every subsequent run, and the
-# STOP->PLAY boundary used to re-zero /clock, which wedged TF/Nav2 and could
-# take the whole bridge down (see docs/developer-log.md 2026-08-27; the clock
-# is monotonic across resets since tinker_sim_isaac/backend.py fix, but the
-# entity deletion is unavoidable extension behavior).
+# - /reset_simulation is unusable: the Isaac sim_control extension ignores
+#   the requested scope and always deletes every spawned entity (the
+#   scenario's actors/objects) across a timeline STOP->PLAY.
+# - SetEntityState "teleports" are dead writes for the robot: the extension
+#   writes the USD layer, but Isaac Lab simulates the articulation in
+#   Fabric and never reads that xform back — the physical robot does not
+#   move (and GetEntityState reads the same stale layer back, which made
+#   the write look like it worked). Re-seeding /initialpose at spawn after
+#   such a "teleport" would actively MIS-localize the robot.
+# - The orchestrator's own "goto command point" phase drives the robot back
+#   to the command point through Nav2 at the start of every run, which is
+#   both physically real and GPSR-realistic. AMCL tracks continuously
+#   across runs on the up stack.
 #
-# Environment overrides:
-#   GPSR_RESET_ENTITY  robot entity name (default: discovered via /get_entities)
-#   GPSR_RESET_X/Y     spawn position     (default: -2.0 / -2.0)
-#   GPSR_RESET_QZ/QW   spawn orientation  (default: 0.0 / 1.0)
+# What still needs restoring between runs (the old destructive reset used
+# to re-zero these implicitly, and nothing else in a hybrid bring-up
+# commands them):
+# - Arm joints to zero: the sim's initial arm pose blocks the head camera,
+#   and mock-manipulation runs never move the arm back.
+# - Head pan/tilt to 0/0 via the facade (which holds the target at 5 Hz).
 set -euo pipefail
 
-X=${GPSR_RESET_X:--2.0}
-Y=${GPSR_RESET_Y:--2.0}
-QZ=${GPSR_RESET_QZ:-0.0}
-QW=${GPSR_RESET_QW:-1.0}
+# 8 s trajectory: a 2 s swing trips the controller's 1.0 rad state
+# tolerance ("Holding position due to state tolerance violation").
+timeout 20 ros2 topic pub --once /xarm7_traj_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory \
+    "{joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7], points: [{positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], time_from_start: {sec: 8}}]}" >/dev/null
+# Head reset goes through the facade (not the raw gateway topic) so the
+# facade's hold loop keeps driving this target afterwards.
+timeout 20 ros2 topic pub --once /pan_tilt_controller/cmd tinker_vision_msgs_26/msg/PanTiltCommand \
+    "{mode: 0, pan_rad: 0.0, tilt_rad: 0.0}" >/dev/null
 
-ENTITY=${GPSR_RESET_ENTITY:-}
-if [ -z "$ENTITY" ]; then
-    # The whole entities list arrives on ONE line, so split on commas first
-    # (otherwise -o returns every /World/Tinker/* subpath as one giant blob),
-    # then keep only an entry that ENDS in /Tinker or /tinkerN — the robot
-    # root prim.  -m1 instead of `| head -1`: head's early exit SIGPIPEs
-    # grep, which aborts the whole script under `set -euo pipefail`.
-    ENTITY=$(ros2 service call /get_entities simulation_interfaces/srv/GetEntities "{}" 2>/dev/null \
-        | tr ',' '\n' | grep -m1 -oE "'[^']*/[Tt]inker[0-9]*'" | tr -d "'") || true
-fi
-if [ -z "$ENTITY" ]; then
-    echo "gpsr-run-reset: no robot entity matching 'tinker' in /get_entities" >&2
-    exit 1
-fi
-
-OUT=$(ros2 service call /set_entity_state simulation_interfaces/srv/SetEntityState \
-    "{entity: '$ENTITY', state: {header: {frame_id: ''}, pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}}, twist: {}}}")
-if ! grep -q "result=1" <<<"$OUT"; then
-    echo "gpsr-run-reset: SetEntityState failed for '$ENTITY': $OUT" >&2
-    exit 1
-fi
-
-# Let physics settle at the new pose before re-seeding the localizer.
-sleep 1
-
-ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
-    "{header: {frame_id: map}, pose: {pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}}, covariance: [0.25,0.0,0.0,0.0,0.0,0.0, 0.0,0.25,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.06853891]}}" >/dev/null
-
-# AMCL convergence window.
-sleep 2
-echo "gpsr-run-reset: '$ENTITY' -> ($X, $Y), initialpose re-seeded"
+# Let the arm finish and physics settle.
+sleep 9
+echo "gpsr-run-reset: arm zeroed, head re-homed (base pose left to Nav2)"
