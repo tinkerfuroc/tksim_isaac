@@ -71,6 +71,31 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(controller, dict):
         controller["xy_goal_tolerance"] = 0.3
         controller["yaw_goal_tolerance"] = 0.4
+
+    # Planner tolerance: with the relaxed 0.3 m goal tolerance the robot
+    # parks close to furniture, sometimes inside the inflation ring. At the
+    # upstream GridBased tolerance of 0.1 the global planner then refuses
+    # every subsequent goal ("failed to generate a valid path", observed 152x
+    # on a return-to-start leg) and the run burns its whole budget retrying.
+    # 0.6 lets the planner accept a nearby reachable cell instead.
+    planner = (
+        result.get("planner_server", {})
+        .get("ros__parameters", {})
+        .get("GridBased")
+    )
+    if isinstance(planner, dict):
+        planner["tolerance"] = 0.6
+
+    # Inflation: at 0.30/0.35 m (inscribed radius 0.26) a robot parked
+    # 0.3 m from furniture starts INSIDE the lethal ring, and the global
+    # planner refuses every path from there — the run wedges at its first
+    # close approach. 0.22 keeps a thin safety margin while leaving the
+    # parked poses plannable.
+    for costmap in ("local_costmap", "global_costmap"):
+        node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
+        inflation = node.get("inflation_layer")
+        if isinstance(inflation, dict) and "inflation_radius" in inflation:
+            inflation["inflation_radius"] = 0.22
     return result
 
 
