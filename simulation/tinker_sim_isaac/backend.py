@@ -639,6 +639,7 @@ class IsaacWholeRobotBackend:
         if _os.environ.get("TINKER_SIM_STOCK_ACTUATOR_MODEL", "") != "1":
             bind_fused_actuator_model(self._robot)
         self.chassis_ballast_mass_kg = self._apply_chassis_ballast_mass()
+        self._apply_two_tone_paint()
         self._robot_view_identity: int | None = None
         self._clock_step_origin = 0
         # Elapsed steps observed at the last simulation_time read; anchors the
@@ -687,6 +688,59 @@ class IsaacWholeRobotBackend:
         last = self.physics_substeps - 1
         for index in range(self.physics_substeps):
             self._sim.step(render=self.render and index == last)
+
+    def _apply_two_tone_paint(self) -> None:
+        """Two-tone the robot so the arm reads apart from the chassis on camera.
+
+        Arm links stay near-white with a hint of grey; everything else on the
+        chassis goes dark grey.  Bindings target each link's ``visuals`` scope
+        with strongerThanDescendants so they override the asset's per-mesh
+        materials; collision meshes are left alone (never rendered).  Sim-only
+        visual aid; opt out with TINKER_SIM_TWO_TONE=0.
+        """
+        import os as _os
+
+        if _os.environ.get("TINKER_SIM_TWO_TONE", "1") == "0":
+            return
+        import omni.usd
+        from pxr import Gf, Sdf, UsdShade
+
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath("/World/Tinker")
+        if not root.IsValid():
+            return
+
+        def _material(name: str, rgb, roughness: float, metallic: float):
+            path = Sdf.Path(f"/World/Tinker/Looks/two_tone_{name}")
+            material = UsdShade.Material.Define(stage, path)
+            shader = UsdShade.Shader.Define(stage, path.AppendChild("shader"))
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
+            material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+            return material
+
+        arm = _material("arm_white", (0.92, 0.92, 0.94), 0.55, 0.0)
+        body = _material("body_grey", (0.25, 0.25, 0.27), 0.6, 0.25)
+        # Arm chain: link_base/link1-7/link_eef/link_tcp, gripper base, and the
+        # knuckle/finger parts (wheels are front_/rear_-prefixed, so the bare
+        # left_/right_ prefixes only catch gripper parts).
+        arm_prefixes = ("link", "xarm_gripper", "left_", "right_")
+        painted = 0
+        for child in root.GetChildren():
+            name = child.GetName()
+            if name in ("Looks", "joints"):
+                continue
+            visuals = child.GetChild("visuals")
+            target_prim = visuals if visuals.IsValid() else child
+            material = arm if name.startswith(arm_prefixes) else body
+            UsdShade.MaterialBindingAPI.Apply(target_prim).Bind(
+                material, UsdShade.Tokens.strongerThanDescendants
+            )
+            painted += 1
+        print(f"[tinker-sim] two-tone paint applied to {painted} links "
+              "(arm near-white, chassis dark grey)")
 
     def _apply_chassis_ballast_mass(self) -> float:
         """Add 10 kg to the existing low-mounted chassis ballast before reset."""
