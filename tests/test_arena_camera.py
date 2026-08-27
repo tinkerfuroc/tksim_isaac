@@ -80,3 +80,13 @@ def test_spec_rotation_points_usd_camera_forward_at_target():
     n = _math.sqrt(sum(c * c for c in d))
     d = [c / n for c in d]
     assert all(abs(a - b) < 1e-9 for a, b in zip(fwd, d))
+
+
+def test_spec_rotation_keeps_image_upright():
+    # USD camera up (+Y) must map to a world direction with positive Z:
+    # the bird's-eye view renders the arena with the sky up, not rolled
+    # 180 degrees (people head-down, observed live 2026-08-27 with the
+    # x-flip composition).
+    spec = arena_camera_spec(_Occ, hz=4.0)
+    up = _rotate(spec.mount_rotation_wxyz, (0.0, 1.0, 0.0))
+    assert up[2] > 0.0
