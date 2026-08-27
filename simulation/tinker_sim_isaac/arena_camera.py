@@ -14,10 +14,15 @@ from __future__ import annotations
 import math
 from typing import Mapping
 
-from tinker_sim_isaac.camera_rig import (
-    OPTICAL_TO_USD_CAMERA_WXYZ,
-    CameraStreamSpec,
-)
+from tinker_sim_isaac.camera_rig import CameraStreamSpec
+
+#: ``look_at_wxyz`` authors a y-up view frame (like the xarm wrist optical
+#: frame -- see ``CameraRig.initialize``'s orient-op comment), so mapping it
+#: onto the USD camera (-Z forward, +Y up) takes the y-flip variant, 180
+#: degrees about Y. The x-flip (``OPTICAL_TO_USD_CAMERA_WXYZ``) also faces
+#: the camera correctly but renders the arena rolled 180 degrees (verified
+#: live 2026-08-27: people rendered head-down).
+YUP_VIEW_TO_USD_CAMERA_WXYZ = (0.0, 0.0, 1.0, 0.0)
 
 #: Opt-in gate: unset/falsy disables the arena camera entirely (its
 #: mount is never created, no topics are advertised).
@@ -184,7 +189,7 @@ def arena_camera_spec(occupancy: object, *, hz: float) -> CameraStreamSpec:
         # light -- uniform grey frames, first observed on the first boot
         # that survived arena capture (2026-08-27).
         mount_rotation_wxyz=quat_mul_wxyz(
-            look_at_wxyz(eye, target), OPTICAL_TO_USD_CAMERA_WXYZ
+            look_at_wxyz(eye, target), YUP_VIEW_TO_USD_CAMERA_WXYZ
         ),
         width=960,
         height=540,
