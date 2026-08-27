@@ -1,0 +1,50 @@
+#!/bin/bash
+# Per-run GPSR bench "reset": teleport the robot back to its spawn pose and
+# re-localize AMCL, WITHOUT calling /reset_simulation.
+#
+# Why not /reset_simulation: the Isaac sim_control extension ignores the
+# requested scope and always performs a FULL reset — timeline STOP, deletion
+# of every dynamically spawned entity (the scenario's actors and objects),
+# then PLAY.  That de-populates the arena for every subsequent run, and the
+# STOP->PLAY boundary used to re-zero /clock, which wedged TF/Nav2 and could
+# take the whole bridge down (see docs/developer-log.md 2026-08-27; the clock
+# is monotonic across resets since tinker_sim_isaac/backend.py fix, but the
+# entity deletion is unavoidable extension behavior).
+#
+# Environment overrides:
+#   GPSR_RESET_ENTITY  robot entity name (default: discovered via /get_entities)
+#   GPSR_RESET_X/Y     spawn position     (default: -2.0 / -2.0)
+#   GPSR_RESET_QZ/QW   spawn orientation  (default: 0.0 / 1.0)
+set -euo pipefail
+
+X=${GPSR_RESET_X:--2.0}
+Y=${GPSR_RESET_Y:--2.0}
+QZ=${GPSR_RESET_QZ:-0.0}
+QW=${GPSR_RESET_QW:-1.0}
+
+ENTITY=${GPSR_RESET_ENTITY:-}
+if [ -z "$ENTITY" ]; then
+    ENTITY=$(ros2 service call /get_entities simulation_interfaces/srv/GetEntities "{}" 2>/dev/null \
+        | grep -o "'[^']*[Tt]inker[^']*'" | head -1 | tr -d "'")
+fi
+if [ -z "$ENTITY" ]; then
+    echo "gpsr-run-reset: no robot entity matching 'tinker' in /get_entities" >&2
+    exit 1
+fi
+
+OUT=$(ros2 service call /set_entity_state simulation_interfaces/srv/SetEntityState \
+    "{entity: '$ENTITY', state: {header: {frame_id: ''}, pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}}, twist: {}}}")
+if ! grep -q "result=1" <<<"$OUT"; then
+    echo "gpsr-run-reset: SetEntityState failed for '$ENTITY': $OUT" >&2
+    exit 1
+fi
+
+# Let physics settle at the new pose before re-seeding the localizer.
+sleep 1
+
+ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
+    "{header: {frame_id: map}, pose: {pose: {position: {x: $X, y: $Y, z: 0.0}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}}, covariance: [0.25,0.0,0.0,0.0,0.0,0.0, 0.0,0.25,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.0, 0.0,0.0,0.0,0.0,0.0,0.06853891]}" >/dev/null
+
+# AMCL convergence window.
+sleep 2
+echo "gpsr-run-reset: '$ENTITY' -> ($X, $Y), initialpose re-seeded"
