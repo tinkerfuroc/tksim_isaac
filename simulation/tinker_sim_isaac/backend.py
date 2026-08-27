@@ -641,6 +641,10 @@ class IsaacWholeRobotBackend:
         self.chassis_ballast_mass_kg = self._apply_chassis_ballast_mass()
         self._robot_view_identity: int | None = None
         self._clock_step_origin = 0
+        # Elapsed steps observed at the last simulation_time read; anchors the
+        # monotonic-clock continuation across STOP -> PLAY resets (see
+        # _refresh_robot_handles).
+        self._clock_elapsed_steps = 0
         import omni.kit.app
 
         # Flush USD/Fabric stage notices before SimulationContext creates the
@@ -768,9 +772,19 @@ class IsaacWholeRobotBackend:
         self._target_write_gate.force_next()
         if self._robot_view_identity is not None:
             # Standard ResetSimulation performs STOP -> PLAY.  Isaac Lab
-            # recreates the articulation view on PHYSICS_READY; use that
-            # lifecycle boundary as the new zero for ROS simulation time.
-            self._clock_step_origin = self._sim.get_physics_step_count()
+            # recreates the articulation view on PHYSICS_READY.  Keep ROS
+            # simulation time MONOTONIC across that boundary: a backward
+            # /clock jump wedges TF caches, Nav2 message filters, and
+            # ros2_control's controller-switch machinery in every long-lived
+            # stack node (observed 2026-08-27: the second in-stack reset
+            # re-zeroed /clock, Nav2 dropped all sensor data as "from the
+            # past", the bridge's safety controller switch timed out, and the
+            # safety supervisor tore the whole bridge launch down).  The step
+            # counter may or may not survive STOP -> PLAY, so anchor the new
+            # origin to the elapsed count observed before the boundary
+            # instead of re-zeroing.
+            count_now = self._sim.get_physics_step_count()
+            self._clock_step_origin = count_now - self._clock_elapsed_steps
             self._object_views.clear()
             self._contact_pairs_by_key.clear()
         self.joint_names = tuple(self._robot.data.joint_names)
@@ -833,8 +847,11 @@ class IsaacWholeRobotBackend:
         # public monotonic counter is therefore the authoritative /clock.
         # Isaac Lab counts solver steps; with substepping several make up one
         # control step, so the clock advances by physics_dt per counted step.
-        steps = self._sim.get_physics_step_count() - self._clock_step_origin
-        return float(max(0, steps)) * self.physics_dt
+        steps = max(0, self._sim.get_physics_step_count() - self._clock_step_origin)
+        # Remember the elapsed count so a STOP -> PLAY reset can continue the
+        # clock from here instead of jumping backwards (_refresh_robot_handles).
+        self._clock_elapsed_steps = steps
+        return float(steps) * self.physics_dt
 
     @property
     def physics_frame_index(self) -> int:
