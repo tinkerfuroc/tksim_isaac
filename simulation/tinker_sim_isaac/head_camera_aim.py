@@ -72,6 +72,27 @@ LEVEL_FORWARD_CORRECTION_WXYZ = (
 
 HEAD_CAMERA_NAME = "head_camera"
 
+#: Forward offset (metres, along the rendered camera's own view axis --
+#: see ``camera_rig.CameraStreamSpec.view_axis_forward_offset_m``) that
+#: rides along with ``LEVEL_FORWARD_CORRECTION_WXYZ``.
+#:
+#: Levelling the aim (above) rotates nearby housing geometry that used to
+#: sit outside the upward-pointing FOV into it. The femto_bolt mesh on
+#: ``head_camera_base_link`` -- the housing the camera sensor itself is
+#: mounted in -- is the culprit: at pan=0, tilt=0 with the correction
+#: applied, its own bounding box (chained from ``tilt_link`` down through
+#: ``head_camera_color_optical_frame`` and the rtx camera's corrected
+#: mount rotation) intersects the camera's frustum out to about 9.5mm of
+#: forward translation (``UsdGeom.BBoxCache`` + ``Gf.Frustum.Intersects``
+#: on the robot artifact, bisected: intersects at 9.4600mm, clear at
+#: 9.4604mm). Rendered, that is the black rounded silhouette across the
+#: bottom of the frame, worst on the right, that this offset exists to
+#: clear. 3cm gives roughly 3x margin over the measured threshold; it is
+#: a dolly of the render origin along the view axis, not a lens change, so
+#: it has no effect on anything already a metre or more away (the arena
+#: scenes GPSR scans).
+LEVEL_FORWARD_VIEW_OFFSET_M = 0.03
+
 
 def _normalise(quaternion: Sequence[float]) -> tuple[float, float, float, float]:
     norm = sum(float(value) * float(value) for value in quaternion) ** 0.5
@@ -138,10 +159,23 @@ def apply_head_aim_correction(
     mount's frame, where a corrected ``camera_mount_joint`` would act. On the
     right it would rotate the camera in its own optical frame instead, and
     the aim would only be right at the pose it was solved for.
+
+    When *correction* is exactly ``LEVEL_FORWARD_CORRECTION_WXYZ``, this also
+    sets ``view_axis_forward_offset_m`` to ``LEVEL_FORWARD_VIEW_OFFSET_M`` --
+    see that constant's docstring for why the level-forward aim needs it. An
+    explicit, non-preset correction gets no offset: the measured clearance
+    is specific to the preset's geometry, not a general property of "some
+    rotation was applied".
     """
     specs = tuple(specs)
     if not any(spec.name == camera_name for spec in specs):
         raise ValueError(f"no {camera_name!r} among the camera specs to correct")
+    correction = tuple(correction)
+    forward_offset_m = (
+        LEVEL_FORWARD_VIEW_OFFSET_M
+        if correction == LEVEL_FORWARD_CORRECTION_WXYZ
+        else 0.0
+    )
     corrected = []
     for spec in specs:
         if spec.name != camera_name:
@@ -153,6 +187,7 @@ def apply_head_aim_correction(
                 mount_rotation_wxyz=_normalise(
                     _multiply(correction, spec.mount_rotation_wxyz)
                 ),
+                view_axis_forward_offset_m=forward_offset_m,
             )
         )
     return tuple(corrected)

@@ -44,6 +44,16 @@ class CameraStreamSpec:
     #: (e.g. ``/World/ArenaCamera``) the rig creates directly, translated
     #: here and oriented by ``mount_rotation_wxyz``.
     mount_translation: tuple[float, float, float] | None = None
+    #: Extra translation (metres) along the *rendered* camera's own view
+    #: axis (local -Z, applied after ``mount_rotation_wxyz`` -- see
+    #: ``CameraRig.initialize``), on top of whatever ``mount_prim`` and
+    #: ``mount_rotation_wxyz`` already place it at. ``0.0`` (the default) is
+    #: unchanged behaviour: identity translation, camera origin == mount
+    #: origin. Non-zero is a dolly forward (positive) or backward (negative)
+    #: along that axis; see ``tinker_sim_isaac.head_camera_aim`` for the one
+    #: user of a non-zero value today (clearing the head camera's own
+    #: housing mesh out of the corrected, level-forward view).
+    view_axis_forward_offset_m: float = 0.0
 
 
 def is_color_only(spec: CameraStreamSpec) -> bool:
@@ -524,6 +534,19 @@ class CameraRig:
             xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
                 Gf.Quatd(*spec.mount_rotation_wxyz)
             )
+            if spec.view_axis_forward_offset_m:
+                # Listed *after* the orient op: xformOpOrder ops compose
+                # left-to-right as applied-first-to-last, so a translate
+                # listed after orient lands in the already-rotated (camera)
+                # frame, i.e. this shifts the rendered origin along the
+                # camera's own local -Z (forward, by the USD camera
+                # convention above) rather than along the mount's raw axes.
+                # Verified empirically against UsdGeom.XformCache on the
+                # robot artifact -- swapping the op order silently changes
+                # which axis this offset lands on.
+                xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
+                    Gf.Vec3d(0.0, 0.0, -spec.view_axis_forward_offset_m)
+                )
             color_only = is_color_only(spec)
             if color_only:
                 self._color_only.add(spec.name)
