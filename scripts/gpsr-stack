@@ -321,7 +321,15 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                 "safety_source_deadline_s:=5.0",
             ],
         ),
-        "env": _preamble_env({}),
+        # TINKER_SIM_ROOT: gpsr.launch.py imports tinker_sim_deploy from
+        # REPO_ROOT/tools at module scope, finding the root via this env
+        # var or a parents[4] fallback from its own __file__. The fallback
+        # only works when the INSTALLED launch file is a symlink back into
+        # src/ (--symlink-install builds); a plain colcon build copies the
+        # file under ros2_ws/install and the fallback resolves nowhere.
+        # Export the root explicitly so the bridge stage survives either
+        # build mode (bitten 2026-08-28: a plain rebuild broke bring-up).
+        "env": _preamble_env({"TINKER_SIM_ROOT": str(REPO_ROOT)}),
         "cwd": REPO_ROOT,
         "gate": "bridge",
     })
