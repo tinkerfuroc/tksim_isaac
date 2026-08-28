@@ -186,11 +186,14 @@ class UpstreamParamsTest(unittest.TestCase):
         # pivot is explicit rather than something the sampler must find.
         result = prior_map_costmap_overlay(self.params)
         fp = result["controller_server"]["ros__parameters"]["FollowPath"]
-        self.assertEqual(
-            fp["plugin"],
-            "nav2_rotation_shim_controller::RotationShimController",
-        )
-        self.assertIn("RegulatedPurePursuitController", fp["primary_controller"])
+        # BARE RPP — no RotationShim: the Humble shim ramps its rotation
+        # command from MEASURED odom velocity, which deadlocks against the
+        # sim base's ~0.1 rad/s angular deadband (commanded 0.084 forever,
+        # v_x never above 0.000). RPP's own rotate_to_heading ramps from
+        # the last commanded velocity and crosses the deadband.
+        self.assertIn("RegulatedPurePursuitController", fp["plugin"])
+        self.assertNotIn("primary_controller", fp)
+        self.assertEqual(fp["rotate_to_heading_angular_vel"], 0.6)
         self.assertTrue(fp["use_cost_regulated_linear_velocity_scaling"])
         self.assertTrue(fp["use_rotate_to_heading"])
         self.assertNotIn("critics", fp)
