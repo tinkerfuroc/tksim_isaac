@@ -224,6 +224,7 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
     type_map: dict[str, str] = {}
     trajectory_id: Optional[str] = None
     max_revision = 0
+    tree_generations = 0
     run_finished: dict[str, Any] = {}
     active_step_context: StepContext = None
 
@@ -263,20 +264,38 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
                     if node_id and node_type:
                         type_map[node_id] = node_type
 
+            # Measured reality (289 tree.generated events across the whole
+            # bench corpus, 2026-08-28): tree_revision is 0 in EVERY event —
+            # the orchestrator never increments it. Every run emits exactly
+            # two generations at revision 0: the skeleton tree at startup,
+            # then the full tree when the LLM plan materialises. A revision-
+            # only check therefore never fires. Treat the 3rd+ generation as
+            # a replan signal (a regenerated tree beyond the normal
+            # skeleton+materialisation pair), and keep the revision>0 check
+            # as a future-proof OR should the orchestrator start counting.
+            tree_generations += 1
             revision = payload.get("tree_revision")
-            if isinstance(revision, int):
-                if revision > max_revision:
-                    max_revision = revision
-                if revision > 0:
-                    judge_events.append(
-                        JudgeEvent(
-                            wall=occurred_at,
-                            kind="REPLAN",
-                            name="replan",
-                            status="SUCCESS",
-                            info=f"tree revision {revision}",
-                        )
+            if isinstance(revision, int) and revision > max_revision:
+                max_revision = revision
+            is_replan = (isinstance(revision, int) and revision > 0) or (
+                tree_generations >= 3
+            )
+            if is_replan:
+                n_nodes = len(nodes) if isinstance(nodes, list) else 0
+                detail = (
+                    f"tree revision {revision}"
+                    if isinstance(revision, int) and revision > 0
+                    else f"tree regenerated #{tree_generations - 1} ({n_nodes} nodes)"
+                )
+                judge_events.append(
+                    JudgeEvent(
+                        wall=occurred_at,
+                        kind="REPLAN",
+                        name="replan",
+                        status="SUCCESS",
+                        info=detail,
                     )
+                )
             continue
 
         if event_type == "tree.node_states_changed":
@@ -341,6 +360,7 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
     meta = {
         "trajectory_id": trajectory_id,
         "tree_revisions": max_revision,
+        "tree_generations": tree_generations,
         "run_finished": run_finished,
     }
     return milestones, judge_events, meta
