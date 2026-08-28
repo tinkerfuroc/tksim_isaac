@@ -228,3 +228,102 @@ def test_newest_gpsr_debug_dir_is_selected(tmp_path):
 
     assert len(milestones) == 4
     assert meta["trajectory_id"] == TRAJ
+
+
+def test_reset_and_clear_correction_excluded_from_judge_events(tmp_path):
+    # Authoritative ruling (overrides the brief's literal "reset correction"
+    # wording): any node whose name begins "reset " or "clear " is
+    # blackboard housekeeping, not a judge-worthy correction attempt --
+    # exclude the whole reset/clear family, not just the one literal name.
+    events = [
+        _event(
+            "tree.generated",
+            "2026-08-28T11:00:00.000000Z",
+            {
+                "tree_revision": 0,
+                "nodes": [
+                    {"id": "n_clear", "node_id": "n_clear", "name": "clear correction",
+                     "type": "BtNode_BlackboardSet"},
+                    {"id": "n_reset", "node_id": "n_reset", "name": "reset correction",
+                     "type": "BtNode_BlackboardSet"},
+                    {"id": "n_real", "node_id": "n_real", "name": "apply correction",
+                     "type": "BtNode_MoveArmSingle"},
+                ],
+            },
+            1,
+        ),
+        _event("tree.node_states_changed", "2026-08-28T11:00:01.000000Z",
+               {"nodes": [_node_state("n_clear", "SUCCESS", "")]}, 2),
+        _event("tree.node_states_changed", "2026-08-28T11:00:02.000000Z",
+               {"nodes": [_node_state("n_reset", "SUCCESS", "")]}, 3),
+        _event("tree.node_states_changed", "2026-08-28T11:00:03.000000Z",
+               {"nodes": [_node_state("n_real", "FAILURE", "correction attempt failed")]}, 4),
+    ]
+    run_dir = _write_events(tmp_path, events, run_name="run-correction")
+
+    _milestones, judge_events, _meta = load_run_telemetry(run_dir)
+
+    kinds_by_name = {j.name: j.kind for j in judge_events}
+    assert "clear correction" not in kinds_by_name
+    assert "reset correction" not in kinds_by_name
+    assert kinds_by_name["apply correction"] == "CORRECTION"
+
+
+def test_blackboard_write_typed_arm_nodes_excluded_from_milestones(tmp_path):
+    # "arm scan" / "arm nav" / "arm orbbec look" are BtNode_WriteToBlackboard
+    # bookkeeping leaves (they just flag intent on the blackboard) -- they
+    # must not leak into MANIP milestones even though their names match the
+    # MANIP "arm" pattern. "tuck arm before goto" is a real
+    # BtNode_MoveArmSingle ActionHandler and must still survive as MANIP.
+    events = [
+        _event(
+            "tree.generated",
+            "2026-08-28T12:00:00.000000Z",
+            {
+                "tree_revision": 0,
+                "nodes": [
+                    {"id": "n_arm_scan", "node_id": "n_arm_scan", "name": "arm scan",
+                     "type": "BtNode_WriteToBlackboard"},
+                    {"id": "n_arm_nav", "node_id": "n_arm_nav", "name": "arm nav",
+                     "type": "BtNode_WriteToBlackboard"},
+                    {"id": "n_arm_look", "node_id": "n_arm_look", "name": "arm orbbec look",
+                     "type": "BtNode_WriteToBlackboard"},
+                    {"id": "n_tuck", "node_id": "n_tuck", "name": "tuck arm before goto",
+                     "type": "BtNode_MoveArmSingle"},
+                ],
+            },
+            1,
+        ),
+        _event("tree.node_states_changed", "2026-08-28T12:00:01.000000Z",
+               {"nodes": [_node_state("n_arm_scan", "SUCCESS", "Success writing to namespace")]}, 2),
+        _event("tree.node_states_changed", "2026-08-28T12:00:02.000000Z",
+               {"nodes": [_node_state("n_arm_nav", "SUCCESS", "Success writing to namespace")]}, 3),
+        _event("tree.node_states_changed", "2026-08-28T12:00:03.000000Z",
+               {"nodes": [_node_state("n_arm_look", "SUCCESS", "Success writing to namespace")]}, 4),
+        _event("tree.node_states_changed", "2026-08-28T12:00:04.000000Z",
+               {"nodes": [_node_state("n_tuck", "SUCCESS", "MOCK: auto-complete finished")]}, 5),
+    ]
+    run_dir = _write_events(tmp_path, events, run_name="run-blackboard")
+
+    milestones, _judge_events, _meta = load_run_telemetry(run_dir)
+
+    names = [m.name for m in milestones]
+    assert "arm scan" not in names
+    assert "arm nav" not in names
+    assert "arm orbbec look" not in names
+    assert names == ["tuck arm before goto"]
+    assert milestones[0].kind == "MANIP"
+
+
+def test_non_utf8_events_file_returns_empty_shapes(tmp_path):
+    run_dir = tmp_path / "run-badenc"
+    debug_dir = run_dir / "debug" / "gpsr-20260828T100000000000Z-fixture03"
+    debug_dir.mkdir(parents=True)
+    events_file = debug_dir / "events.jsonl"
+    # 0xff is not valid in UTF-8 (or any of Python's default text codecs'
+    # first bytes here) -- Path.read_text() on this raises UnicodeDecodeError.
+    events_file.write_bytes(b'{"event_type": "run.finished", \xff\xfe"payload": {}}\n')
+
+    milestones, judge_events, meta = load_run_telemetry(run_dir)
+
+    assert (milestones, judge_events, meta) == ([], [], {})
