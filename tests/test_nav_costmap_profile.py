@@ -179,13 +179,21 @@ class UpstreamParamsTest(unittest.TestCase):
         self.assertEqual(checker["required_movement_radius"], 0.15)
         self.assertEqual(checker["movement_time_allowance"], 30.0)
 
-    def test_path_align_detuned_from_corner_hugging(self):
-        # nav2 #938 / #1747: high align scales + long forward point steer
-        # into corners.
+    def test_follow_path_is_rotation_shim_over_rpp(self):
+        # Doorway round 4: DWB failed three tuned rounds at the same
+        # 0.95 m doorway turn; the Nav2 tuning guide recommends RPP for
+        # doorway turns, fronted by the rotation shim so the door-entry
+        # pivot is explicit rather than something the sampler must find.
         result = prior_map_costmap_overlay(self.params)
         fp = result["controller_server"]["ros__parameters"]["FollowPath"]
-        self.assertEqual(fp["PathAlign.scale"], 12.0)
-        self.assertEqual(fp["PathAlign.forward_point_distance"], 0.1)
+        self.assertEqual(
+            fp["plugin"],
+            "nav2_rotation_shim_controller::RotationShimController",
+        )
+        self.assertIn("RegulatedPurePursuitController", fp["primary_controller"])
+        self.assertTrue(fp["use_cost_regulated_linear_velocity_scaling"])
+        self.assertTrue(fp["use_rotate_to_heading"])
+        self.assertNotIn("critics", fp)
 
     def test_footprint_is_sim_parity_not_hardware_envelope(self):
         # The upstream 0.95 m footprint models the REAL robot's rear
@@ -197,20 +205,6 @@ class UpstreamParamsTest(unittest.TestCase):
             fp = result[costmap][costmap]["ros__parameters"]["footprint"]
             self.assertIn("-0.45", fp)
             self.assertNotIn("-0.7", fp)
-
-    def test_dwb_scores_the_footprint_not_the_center_point(self):
-        # A 0.5 x 0.95 m footprint clears a 0.95 m door only when the
-        # whole polygon is collision-checked: BaseObstacle (centre-point
-        # cost, scale 0.02) let DWB pick door-clipping trajectories and
-        # the base physically caught the frame. ObstacleFootprint vetoes
-        # any candidate whose polygon touches lethal cost.
-        result = prior_map_costmap_overlay(self.params)
-        follow_path = result["controller_server"]["ros__parameters"]["FollowPath"]
-        self.assertIn("ObstacleFootprint", follow_path["critics"])
-        self.assertNotIn("BaseObstacle", follow_path["critics"])
-        self.assertNotIn("BaseObstacle.scale", follow_path)
-        self.assertIn("ObstacleFootprint.scale", follow_path)
-
 
 if __name__ == "__main__":
     unittest.main()

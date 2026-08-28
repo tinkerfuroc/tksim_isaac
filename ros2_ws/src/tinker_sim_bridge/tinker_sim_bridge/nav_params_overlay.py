@@ -140,27 +140,53 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # door-clipping trajectories and the base physically caught the door
     # frame (same live probe as above). ObstacleFootprint vetoes any
     # candidate whose polygon touches lethal cost, independent of scale.
-    follow_path = (
-        result.get("controller_server", {})
-        .get("ros__parameters", {})
-        .get("FollowPath")
+    # Controller (2026-08-28, doorway round 4): DWB failed three
+    # progressively-tuned rounds at the same 0.95 m doorway turn
+    # (ObstacleFootprint veto; sim-parity footprint; cost bowl + align
+    # de-tune + pivot-tolerant progress checker — aborts fell 32 -> 10
+    # but the door never cleared). The Nav2 tuning guide's own words:
+    # RPP "makes better turns into doorways, whereas DWB can come close
+    # to scraping the wall". Replace FollowPath with RotationShim
+    # (pivots in place toward the path heading — exactly the door-entry
+    # maneuver DWB could not sample) wrapping RegulatedPurePursuit
+    # (exact path tracking with obstacle-proximity slowdown). The
+    # upstream DWB config stays untouched in the hardware file.
+    controller_ros = result.get("controller_server", {}).get(
+        "ros__parameters", {}
     )
-    if isinstance(follow_path, dict):
-        critics = follow_path.get("critics")
-        if isinstance(critics, list) and "BaseObstacle" in critics:
-            follow_path["critics"] = [
-                "ObstacleFootprint" if c == "BaseObstacle" else c
-                for c in critics
-            ]
-            follow_path.pop("BaseObstacle.scale", None)
-            follow_path["ObstacleFootprint.scale"] = 0.02
-        # PathAlign/GoalAlign at 32/24 are documented (nav2 #938) to steer
-        # "dangerously close to obstacles ... rounding corners"; the
-        # forward-point fix (nav2 #1747) recommends a short lookahead.
-        follow_path["PathAlign.scale"] = 12.0
-        follow_path["GoalAlign.scale"] = 10.0
-        follow_path["PathAlign.forward_point_distance"] = 0.1
-        follow_path["GoalAlign.forward_point_distance"] = 0.1
+    if "FollowPath" in controller_ros:
+        controller_ros["FollowPath"] = {
+            "plugin": "nav2_rotation_shim_controller::RotationShimController",
+            "primary_controller":
+                "nav2_regulated_pure_pursuit_controller"
+                "::RegulatedPurePursuitController",
+            # Shim: pivot when path heading differs by > ~45 deg.
+            "angular_dist_threshold": 0.785,
+            "forward_sampling_distance": 0.5,
+            "rotate_to_heading_angular_vel": 0.6,
+            "max_angular_accel": 2.1,
+            "simulate_ahead_time": 1.0,
+            # RPP: modest speed, velocity-scaled lookahead, cost-based
+            # slowdown near the doorposts, pivot on large heading error.
+            "desired_linear_vel": 0.35,
+            "lookahead_dist": 0.5,
+            "min_lookahead_dist": 0.25,
+            "max_lookahead_dist": 0.7,
+            "use_velocity_scaled_lookahead_dist": True,
+            "lookahead_time": 1.5,
+            "transform_tolerance": 0.1,
+            "use_regulated_linear_velocity_scaling": True,
+            "use_cost_regulated_linear_velocity_scaling": True,
+            "regulated_linear_scaling_min_radius": 0.6,
+            "regulated_linear_scaling_min_speed": 0.1,
+            "use_rotate_to_heading": True,
+            "rotate_to_heading_min_angle": 0.785,
+            "max_angular_vel": 0.6,
+            "min_approach_linear_velocity": 0.05,
+            "approach_velocity_scaling_dist": 0.6,
+            "max_robot_pose_search_dist": 10.0,
+            "allow_reversing": False,
+        }
 
     # SimpleProgressChecker counts XY translation only — an in-place
     # pivot into a doorway is "zero progress", and the upstream 0.5 m /
