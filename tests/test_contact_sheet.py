@@ -22,9 +22,9 @@ def _mk_frames(d, label, n, size=(32, 18)):
         Image.new("RGB", size, (i * 10 % 255, 80, 80)).save(p / f"{i:04d}_{i*1000}.jpg")
 
 
-def test_build_sheet_two_rows(tmp_path):
+def test_build_sheet_is_portrait_two_columns(tmp_path):
     _mk_frames(tmp_path, "arena", 20)
-    _mk_frames(tmp_path, "head", 3)
+    _mk_frames(tmp_path, "head", 20)
     meta = {
         "id": "c001",
         "text": "go to the kitchen table",
@@ -34,14 +34,28 @@ def test_build_sheet_two_rows(tmp_path):
     }
     out = build_sheet(tmp_path, meta, tmp_path / "sheet.jpg", columns=12)
     img = Image.open(out)
-    assert img.width == 12 * 320
-    assert img.height > 88 + 2 * 18  # header + two captioned rows
+    # Vertical layout: one column per camera (arena | head), time flowing
+    # downward — 12 sampled tile rows under header + camera-label band.
+    assert img.width == 2 * 320
+    assert img.height > 88 + 18 + 12 * 18  # header + label band + 12 captioned rows
+    assert img.height > img.width  # the sheet reads top-to-bottom
+
+
+def test_build_sheet_short_column_pads_with_placeholders(tmp_path):
+    # head has fewer frames than the sample count: its column ends in grey
+    # placeholder tiles rather than truncating the arena column.
+    _mk_frames(tmp_path, "arena", 20)
+    _mk_frames(tmp_path, "head", 3)
+    out = build_sheet(tmp_path, {"id": "x", "verdict": "PASS"}, tmp_path / "s.jpg")
+    img = Image.open(out)
+    assert img.width == 2 * 320
+    assert img.height > 88 + 18 + 12 * 18  # arena still gets its 12 rows
 
 
 def test_build_sheet_missing_label_degrades(tmp_path):
     _mk_frames(tmp_path, "head", 2)
     out = build_sheet(tmp_path, {"id": "x", "verdict": "ERROR"}, tmp_path / "s.jpg")
-    assert out.exists()  # no crash; arena row is a placeholder band
+    assert out.exists()  # no crash; arena column is grey placeholder tiles
 
 
 def test_stamp_from_name_parses_seq_ms_filename():

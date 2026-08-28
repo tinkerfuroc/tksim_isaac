@@ -2,9 +2,13 @@
 """Contact-sheet builder for GPSR tier-2 runs.
 
 Condenses the JPEG frames a run recorder captured (see
-``validation/gpsr_run_recorder.py``) into one reviewable JPEG: a header band
-summarising the run, then one row per camera label showing an evenly sampled
-strip of frames with per-tile timestamp captions.
+``validation/gpsr_run_recorder.py``) into one reviewable JPEG in PORTRAIT
+orientation: a header band summarising the run, a label band naming the
+camera columns, then one column per camera label with an evenly sampled
+run of frames flowing top-to-bottom, each tile captioned with its
+timestamp. (The original layout was one very wide horizontal strip per
+camera; the user asked for vertical sheets, which also scroll naturally
+in an editor or on a phone.)
 
 Pure PIL, no ROS.
 """
@@ -22,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 TILE_W = 320
 CAPTION_H = 18
 HEADER_H = 88
+LABEL_BAND_H = 18
 PLACEHOLDER_H = 40
 JPEG_QUALITY = 80
 # "arena" stays first even though the arena observer camera is parked as a
@@ -31,7 +36,9 @@ JPEG_QUALITY = 80
 # shows a permanent grey "no arena frames captured" placeholder band for
 # this row. That is the ledger's ruling, not a bug in this module.
 ROW_LABELS = ("arena", "head")
-TEXT_WRAP_WIDTH = 110
+# Portrait sheets are two tiles (640 px) wide; the default PIL bitmap font
+# runs ~6 px per character, so wrap the command text to fit that width.
+TEXT_WRAP_WIDTH = 96
 
 VERDICT_COLORS = {
     "PASS": "#2e7d32",
@@ -114,60 +121,95 @@ def _draw_header(draw: ImageDraw.ImageDraw, font, width: int, meta: dict) -> Non
 
 
 def build_sheet(run_dir: Path, meta: dict, out: Path, columns: int = 12) -> Path:
+    """Build a PORTRAIT sheet: one column per camera, time flowing downward.
+
+    ``columns`` keeps its historical name for caller compatibility (the
+    battery's ``--sheet-cmd`` and older scripts) but now means the number of
+    evenly sampled frames per camera column — i.e. the number of tile rows.
+    """
     run_dir = Path(run_dir)
     out = Path(out)
-    width = columns * TILE_W
+    n_samples = columns
+    width = len(ROW_LABELS) * TILE_W
 
-    rows = []
-    total_h = HEADER_H
+    # Sample every camera first; missing cameras keep a column of grey
+    # placeholder tiles so the sheet never crashes and the reviewer sees the
+    # absence explicitly.
+    cols = []
     for label in ROW_LABELS:
         files = _load_label_files(run_dir, label)
-        if not files:
-            rows.append({"label": label, "kind": "placeholder", "height": PLACEHOLDER_H})
-            total_h += PLACEHOLDER_H
-            continue
-
         tiles = []
-        max_img_h = 0
-        for f in sample_evenly(files, columns):
+        for f in sample_evenly(files, n_samples):
             img = Image.open(f).convert("RGB")
             w, h = img.size
             tile_h = max(1, round(TILE_W * h / w))
             img = img.resize((TILE_W, tile_h))
             tiles.append((img, _stamp_from_name(f.name)))
-            max_img_h = max(max_img_h, tile_h)
+        cols.append({"label": label, "tiles": tiles})
 
-        row_h = max_img_h + CAPTION_H
-        rows.append({"label": label, "kind": "frames", "tiles": tiles, "height": row_h})
-        total_h += row_h
+    n_rows = max((len(c["tiles"]) for c in cols), default=0)
+    # Per-tile-row height: the tallest tile across the cameras in that row
+    # (cameras may differ in aspect ratio), plus the caption band.
+    row_heights = []
+    for i in range(n_rows):
+        max_img_h = PLACEHOLDER_H
+        for c in cols:
+            if i < len(c["tiles"]):
+                max_img_h = max(max_img_h, c["tiles"][i][0].height)
+        row_heights.append(max_img_h + CAPTION_H)
 
+    total_h = HEADER_H + LABEL_BAND_H + (sum(row_heights) if row_heights else PLACEHOLDER_H)
     sheet = Image.new("RGB", (width, total_h), "white")
     draw = ImageDraw.Draw(sheet)
     font = ImageFont.load_default()
 
     _draw_header(draw, font, width, meta)
 
-    y = HEADER_H
-    for row in rows:
-        if row["kind"] == "placeholder":
-            draw.rectangle([0, y, width, y + row["height"]], fill="#bdbdbd")
-            draw.text(
-                (8, y + row["height"] // 2 - 6),
-                f"no {row['label']} frames captured",
-                fill="black",
-                font=font,
-            )
-            y += row["height"]
-            continue
+    # Camera-name band under the header, one label per column.
+    band_y = HEADER_H
+    draw.rectangle([0, band_y, width, band_y + LABEL_BAND_H], fill="#eeeeee")
+    for k, c in enumerate(cols):
+        draw.text((k * TILE_W + 4, band_y + 3), c["label"], fill="black", font=font)
+    draw.line(
+        [(0, band_y + LABEL_BAND_H - 1), (width, band_y + LABEL_BAND_H - 1)],
+        fill="#cccccc",
+    )
 
-        x = 0
-        for img, stamp in row["tiles"]:
-            sheet.paste(img, (x, y))
-            caption_y = y + row["height"] - CAPTION_H
-            draw.rectangle([x, caption_y, x + TILE_W, caption_y + CAPTION_H], fill="#222222")
-            draw.text((x + 4, caption_y + 2), f"t={stamp}s", fill="white", font=font)
-            x += TILE_W
-        y += row["height"]
+    if n_rows == 0:
+        y = band_y + LABEL_BAND_H
+        draw.rectangle([0, y, width, y + PLACEHOLDER_H], fill="#bdbdbd")
+        draw.text(
+            (8, y + PLACEHOLDER_H // 2 - 6),
+            "no frames captured",
+            fill="black",
+            font=font,
+        )
+    else:
+        y = band_y + LABEL_BAND_H
+        for i in range(n_rows):
+            row_h = row_heights[i]
+            for k, c in enumerate(cols):
+                x = k * TILE_W
+                if i < len(c["tiles"]):
+                    img, stamp = c["tiles"][i]
+                    sheet.paste(img, (x, y))
+                    caption_y = y + row_h - CAPTION_H
+                    draw.rectangle(
+                        [x, caption_y, x + TILE_W, caption_y + CAPTION_H],
+                        fill="#222222",
+                    )
+                    draw.text(
+                        (x + 4, caption_y + 2), f"t={stamp}s", fill="white", font=font
+                    )
+                else:
+                    draw.rectangle([x, y, x + TILE_W, y + row_h], fill="#bdbdbd")
+                    draw.text(
+                        (x + 8, y + row_h // 2 - 6),
+                        f"no {c['label']} frame",
+                        fill="black",
+                        font=font,
+                    )
+            y += row_h
 
     out.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(out, "JPEG", quality=JPEG_QUALITY)
@@ -179,7 +221,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", required=True, help="Run directory containing frames/<label>/*.jpg.")
     parser.add_argument("--meta", required=True, help="Path to run.json (id/text/template/... metadata).")
     parser.add_argument("--out", required=True, help="Output sheet JPEG path.")
-    parser.add_argument("--columns", type=int, default=12, help="Tiles per row.")
+    parser.add_argument(
+        "--columns",
+        type=int,
+        default=12,
+        help="Sampled frames per camera column (tile rows); historical name.",
+    )
     return parser
 
 
