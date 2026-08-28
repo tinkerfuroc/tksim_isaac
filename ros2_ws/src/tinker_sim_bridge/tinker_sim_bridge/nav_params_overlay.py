@@ -86,16 +86,49 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(planner, dict):
         planner["tolerance"] = 0.6
 
-    # Inflation: at 0.30/0.35 m (inscribed radius 0.26) a robot parked
+    # Inflation, split by costmap (2026-08-28 doorway-wedge debug):
+    #
+    # GLOBAL 0.22: at 0.30/0.35 m (inscribed radius 0.26) a robot parked
     # 0.3 m from furniture starts INSIDE the lethal ring, and the global
     # planner refuses every path from there — the run wedges at its first
-    # close approach. 0.22 keeps a thin safety margin while leaving the
-    # parked poses plannable.
-    for costmap in ("local_costmap", "global_costmap"):
+    # close approach (observed 152x). 0.22 keeps the parked poses
+    # plannable.
+    #
+    # LOCAL 0.30: the upstream file's own annotation warns inflation must
+    # stay ABOVE the asymmetric footprint's inscribed radius (0.26).
+    # Dropping the local costmap to 0.22 removed the near-wall cost
+    # gradient entirely (a cell 0.25 m from a wall — body overlapping —
+    # scored 0), and DWB drove the robot's flank into the 0.95 m doorway
+    # posts: live probe showed the base pressed against the wall at
+    # (0.25, 2.87), v≈0, follow_path "Failed to make progress" aborting
+    # every ~10 sim-s for the whole run.
+    for costmap, radius in (("local_costmap", 0.30), ("global_costmap", 0.22)):
         node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
         inflation = node.get("inflation_layer")
         if isinstance(inflation, dict) and "inflation_radius" in inflation:
-            inflation["inflation_radius"] = 0.22
+            inflation["inflation_radius"] = radius
+
+    # DWB obstacle critic: upstream scores trajectories with BaseObstacle
+    # (CENTER-POINT cost, scale 0.02 — effectively decorative). A 0.5 m
+    # wide, 0.95 m long footprint clears a 0.95 m door only when the WHOLE
+    # polygon is checked; with the point critic DWB happily selected
+    # door-clipping trajectories and the base physically caught the door
+    # frame (same live probe as above). ObstacleFootprint vetoes any
+    # candidate whose polygon touches lethal cost, independent of scale.
+    follow_path = (
+        result.get("controller_server", {})
+        .get("ros__parameters", {})
+        .get("FollowPath")
+    )
+    if isinstance(follow_path, dict):
+        critics = follow_path.get("critics")
+        if isinstance(critics, list) and "BaseObstacle" in critics:
+            follow_path["critics"] = [
+                "ObstacleFootprint" if c == "BaseObstacle" else c
+                for c in critics
+            ]
+            follow_path.pop("BaseObstacle.scale", None)
+            follow_path["ObstacleFootprint.scale"] = 0.02
     return result
 
 

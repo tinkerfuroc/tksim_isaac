@@ -159,6 +159,37 @@ class UpstreamParamsTest(unittest.TestCase):
             "nav2_costmap_2d::ObstacleLayer",
         )
 
+    def test_inflation_split_local_footprint_global_permissive(self):
+        # Doorway-wedge fix (2026-08-28): the LOCAL costmap must keep an
+        # inflation radius >= the footprint's inscribed radius (0.26) so
+        # DWB sees a gradient before the body touches a doorpost; the
+        # GLOBAL costmap stays at 0.22 so parked-near-furniture starts
+        # remain plannable.
+        result = prior_map_costmap_overlay(self.params)
+        local = (
+            result["local_costmap"]["local_costmap"]["ros__parameters"]
+            ["inflation_layer"]["inflation_radius"]
+        )
+        global_ = (
+            result["global_costmap"]["global_costmap"]["ros__parameters"]
+            ["inflation_layer"]["inflation_radius"]
+        )
+        self.assertEqual(local, 0.30)
+        self.assertEqual(global_, 0.22)
+
+    def test_dwb_scores_the_footprint_not_the_center_point(self):
+        # A 0.5 x 0.95 m footprint clears a 0.95 m door only when the
+        # whole polygon is collision-checked: BaseObstacle (centre-point
+        # cost, scale 0.02) let DWB pick door-clipping trajectories and
+        # the base physically caught the frame. ObstacleFootprint vetoes
+        # any candidate whose polygon touches lethal cost.
+        result = prior_map_costmap_overlay(self.params)
+        follow_path = result["controller_server"]["ros__parameters"]["FollowPath"]
+        self.assertIn("ObstacleFootprint", follow_path["critics"])
+        self.assertNotIn("BaseObstacle", follow_path["critics"])
+        self.assertNotIn("BaseObstacle.scale", follow_path)
+        self.assertIn("ObstacleFootprint.scale", follow_path)
+
 
 if __name__ == "__main__":
     unittest.main()
