@@ -298,6 +298,27 @@ def topic_control_description(urdf: str | bytes) -> str:
     root = ET.fromstring(raw)
     for existing in list(root.findall("ros2_control")):
         root.remove(existing)
+    # Strip the URDF's world fixture (<link name="world"/> plus the fixed
+    # world -> base_link joint). It exists for offline model tooling, but
+    # fed to robot_state_publisher it publishes a STATIC identity
+    # world->base_link TF — giving base_link a SECOND parent besides the
+    # real odom->base_link. With gpsr.launch's static world->map, TF
+    # lookups that resolve through the static chain pin the robot at the
+    # map origin: the costmap obstacle layer then inserts every lidar
+    # scan as if the robot stood at (0,0,0), fabricating phantom walls
+    # and erasing real ones (2026-08-28 doorway-wedge root cause — four
+    # controller/costmap tuning rounds were no-ops against it). Runtime
+    # consumers that want a world anchor still get one via
+    # world->map->odom->base_link.
+    for joint in list(root.findall("joint")):
+        parent = joint.find("parent")
+        if joint.get("name") == "world_joint" or (
+            parent is not None and parent.get("link") == "world"
+        ):
+            root.remove(joint)
+    for link in list(root.findall("link")):
+        if link.get("name") == "world":
+            root.remove(link)
     control = ET.SubElement(root, "ros2_control", name="TinkerTopicSystem", type="system")
     hardware = ET.SubElement(control, "hardware")
     ET.SubElement(hardware, "plugin").text = "topic_based_ros2_control/TopicBasedSystem"

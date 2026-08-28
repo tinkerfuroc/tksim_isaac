@@ -290,3 +290,35 @@ def test_arm_collision_uses_dedicated_static_obstacle() -> None:
     # Collision geometry stays on the fixture cube, not the root.
     cube_header = xform_body[cube_start : xform_body.index("{", cube_start)]
     assert "PhysicsCollisionAPI" in cube_header
+
+
+def test_topic_control_description_strips_world_fixture():
+    """The URDF's world fixture must never reach robot_state_publisher.
+
+    A fixed world->base_link joint publishes a STATIC second parent for
+    base_link (the real one is odom->base_link), and with the launch's
+    static world->map the robot resolves to the map origin — the 2026-08-28
+    root cause of phantom costmap walls and every doorway wedge.
+    """
+    import sys
+    from pathlib import Path as _P
+
+    sys.path.insert(0, str(_P(__file__).resolve().parents[1] / "tools"))
+    from tinker_sim_deploy.runtime import topic_control_description
+
+    urdf = (
+        '<robot name="t">'
+        '<link name="world"></link>'
+        '<joint name="world_joint" type="fixed">'
+        '<parent link="world"></parent><child link="base_link"></child>'
+        '<origin rpy="0 0 0" xyz="0 0 0"></origin></joint>'
+        '<link name="base_link"></link>'
+        '<joint name="j1" type="revolute">'
+        '<parent link="base_link"></parent><child link="link1"></child>'
+        "</joint>"
+        '<link name="link1"></link>'
+        "</robot>"
+    )
+    out = topic_control_description(urdf)
+    assert "world" not in out
+    assert "base_link" in out and "link1" in out and "j1" in out
