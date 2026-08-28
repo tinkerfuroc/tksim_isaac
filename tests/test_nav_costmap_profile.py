@@ -177,6 +177,17 @@ class UpstreamParamsTest(unittest.TestCase):
         self.assertEqual(local, 0.30)
         self.assertEqual(global_, 0.22)
 
+    def test_footprint_is_sim_parity_not_hardware_envelope(self):
+        # The upstream 0.95 m footprint models the REAL robot's rear
+        # overhang; the sim body spans x [-0.38, +0.13] (robot.urdf base
+        # mesh). With the hardware envelope a 90-degree turn into a
+        # 0.95 m doorway has no collision-free DWB trajectory.
+        result = prior_map_costmap_overlay(self.params)
+        for costmap in ("local_costmap", "global_costmap"):
+            fp = result[costmap][costmap]["ros__parameters"]["footprint"]
+            self.assertIn("-0.45", fp)
+            self.assertNotIn("-0.7", fp)
+
     def test_dwb_scores_the_footprint_not_the_center_point(self):
         # A 0.5 x 0.95 m footprint clears a 0.95 m door only when the
         # whole polygon is collision-checked: BaseObstacle (centre-point
