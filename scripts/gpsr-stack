@@ -289,7 +289,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             # light). Watch the first battery runs for "error 700" and
             # remove this pair again if the race returns.
             "TINKER_SIM_ARENA_CAMERA": "1",
-            "TINKER_SIM_ARENA_CAMERA_HZ": "4",
+            "TINKER_SIM_ARENA_CAMERA_HZ": "2",
         }),
         "cwd": REPO_ROOT,
         "gate": "sim",
