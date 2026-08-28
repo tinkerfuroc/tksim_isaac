@@ -160,9 +160,19 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # Humble shim ramps its rotation command from MEASURED odom velocity,
     # so it deadlocks: command 0.084, base does not move, measured stays
     # 0, command stays 0.084 forever (probe: 1810 cmd_vel msgs, mean and
-    # max v_x exactly 0.000, w -0.084 constant, yaw drift ~0). RPP's own
-    # rotate_to_heading ramps from the last COMMANDED velocity and
-    # crosses the deadband within cycles, so RPP runs bare.
+    # max v_x exactly 0.000, w -0.084 constant, yaw drift ~0). RPP runs
+    # bare.
+    #
+    # odom_topic (2026-08-28, measured): RPP — like the shim — ramps its
+    # rotate command and scales its lookahead from MEASURED speed, which
+    # controller_server reads from its ``odom_topic`` parameter. Upstream
+    # leaves it at the default ``odom`` — a topic with ZERO publishers on
+    # this robot (odometry is ``/tracer/odom``). Measured speed is then
+    # permanently 0.0: the rotate ramp is clamped to one accel step
+    # (2.1/25 Hz = 0.084 rad/s) forever, and the velocity-scaled
+    # lookahead is pinned at min_lookahead_dist. Point it at the real
+    # odometry.
+    controller_ros["odom_topic"] = "/tracer/odom"
     if "FollowPath" in controller_ros:
         controller_ros["FollowPath"] = {
             "plugin":
@@ -173,7 +183,17 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
             # slowdown near the doorposts, pivot on large heading error.
             "desired_linear_vel": 0.35,
             "lookahead_dist": 0.5,
-            "min_lookahead_dist": 0.25,
+            # Humble RPP's shouldRotateToGoalHeading compares the CARROT
+            # distance — not the true goal distance — against the goal
+            # checker's xy tolerance (0.3 here). At standstill the
+            # velocity-scaled lookahead clamps to min_lookahead_dist, so
+            # a min below 0.3 makes RPP believe it is AT the goal from
+            # the very first tick: linear stays 0.0 and it rotates to
+            # the goal heading in place until the progress checker
+            # aborts (measured: carrot pinned at 0.25 m, v never above
+            # 0.000 for 900 s). Keep min_lookahead_dist strictly above
+            # the xy goal tolerance.
+            "min_lookahead_dist": 0.35,
             "max_lookahead_dist": 0.7,
             "use_velocity_scaled_lookahead_dist": True,
             "lookahead_time": 1.5,

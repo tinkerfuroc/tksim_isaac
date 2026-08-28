@@ -105,9 +105,17 @@ class PriorMapOverlayTest(unittest.TestCase):
         )
 
     def test_unrelated_sections_survive(self):
+        # controller_server keeps its upstream keys; the overlay's only
+        # unconditional addition is the real odometry topic (the default
+        # ``odom`` has no publisher on this robot).
+        cs = self.result["controller_server"]["ros__parameters"]
         self.assertEqual(
-            self.result["controller_server"], SLAM_PROFILE["controller_server"]
+            cs["controller_frequency"],
+            SLAM_PROFILE["controller_server"]["ros__parameters"][
+                "controller_frequency"
+            ],
         )
+        self.assertEqual(cs["odom_topic"], "/tracer/odom")
 
     def test_input_is_not_mutated(self):
         """The caller's parsed upstream params stay as they were read."""
@@ -189,14 +197,37 @@ class UpstreamParamsTest(unittest.TestCase):
         # BARE RPP — no RotationShim: the Humble shim ramps its rotation
         # command from MEASURED odom velocity, which deadlocks against the
         # sim base's ~0.1 rad/s angular deadband (commanded 0.084 forever,
-        # v_x never above 0.000). RPP's own rotate_to_heading ramps from
-        # the last commanded velocity and crosses the deadband.
+        # v_x never above 0.000). RPP runs bare.
         self.assertIn("RegulatedPurePursuitController", fp["plugin"])
         self.assertNotIn("primary_controller", fp)
         self.assertEqual(fp["rotate_to_heading_angular_vel"], 0.6)
         self.assertTrue(fp["use_cost_regulated_linear_velocity_scaling"])
         self.assertTrue(fp["use_rotate_to_heading"])
         self.assertNotIn("critics", fp)
+
+    def test_controller_reads_the_robots_real_odometry(self):
+        # Upstream leaves controller_server's odom_topic at the default
+        # ``odom`` — a topic nothing publishes on this robot (odometry is
+        # /tracer/odom). Measured speed then reads 0.0 forever: RPP's
+        # rotate ramp is clamped to a single accel step (0.084 rad/s) and
+        # the velocity-scaled lookahead never leaves its minimum.
+        result = prior_map_costmap_overlay(self.params)
+        cs = result["controller_server"]["ros__parameters"]
+        self.assertEqual(cs["odom_topic"], "/tracer/odom")
+
+    def test_min_lookahead_clears_the_goal_tolerance(self):
+        # Humble RPP's shouldRotateToGoalHeading compares the CARROT
+        # distance against the goal checker's xy tolerance. At standstill
+        # the carrot sits at min_lookahead_dist, so min_lookahead below
+        # the tolerance means "at goal" from the first tick: linear stays
+        # 0.0 and the robot spins in place until the progress checker
+        # aborts (measured: carrot pinned at 0.25 m vs tolerance 0.3,
+        # v_x 0.000 for the whole 900 s battery run).
+        result = prior_map_costmap_overlay(self.params)
+        cs = result["controller_server"]["ros__parameters"]
+        fp = cs["FollowPath"]
+        xy_tol = cs["general_goal_checker"]["xy_goal_tolerance"]
+        self.assertGreater(fp["min_lookahead_dist"], xy_tol)
 
     def test_footprint_is_sim_parity_not_hardware_envelope(self):
         # The upstream 0.95 m footprint models the REAL robot's rear
