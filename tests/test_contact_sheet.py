@@ -10,9 +10,12 @@ sys.path.insert(0, str(ROOT))
 
 from tools.contact_sheet import (  # noqa: E402
     build_sheet,
+    build_judge_sheet,
     sample_evenly,
     select_event_rows,
     _stamp_from_name,
+    _dedup_transcript,
+    REPLAN_BAND_COLOR,
 )
 
 
@@ -282,3 +285,227 @@ def test_build_sheet_event_layout_caps_rows_at_40(tmp_path):
     uncapped_estimate = 88 + 18 + 100 * 40
     assert img.height < uncapped_estimate
     assert img.height <= 88 + 18 + 41 * 200
+
+
+# --- judge sheet ---------------------------------------------------------
+#
+# judge events = PRECONDITION SUCCESS, POSTCONDITION FAILURE, SUPERVISOR
+# SUCCESS -- none of these node names match the milestone classifier, so
+# `_mk_judge_events` fixtures have empty `milestones` but populated
+# `judge_events`, matching a real gate/barrier-heavy run.
+
+_JUDGE_WALLS = (
+    "2026-08-28T11:00:01.000000Z",
+    "2026-08-28T11:00:02.000000Z",
+    "2026-08-28T11:00:03.000000Z",
+)
+
+
+def _mk_judge_events(run_dir, replan=False):
+    """Write events.jsonl with PRECONDITION SUCCESS, POSTCONDITION FAILURE,
+    SUPERVISOR SUCCESS judge events. With `replan=True`, also append a
+    tree_revision=1 tree.generated event, which load_run_telemetry turns
+    into one extra REPLAN judge event.
+    """
+    debug_dir = run_dir / "debug" / "gpsr-20260828T110000000000Z-judge-fixture"
+    debug_dir.mkdir(parents=True)
+    nodes = [
+        {"id": "n_pre", "node_id": "n_pre", "name": "precondition gate:0:0"},
+        {"id": "n_post", "node_id": "n_post", "name": "postcondition gate:0:0"},
+        {"id": "n_barrier", "node_id": "n_barrier", "name": "supervisor barrier:0:0"},
+    ]
+    events = [
+        {
+            "trajectory_id": "traj-judge",
+            "occurred_at": "2026-08-28T11:00:00.000000Z",
+            "event_type": "tree.generated",
+            "payload": {"tree_revision": 0, "nodes": nodes},
+        },
+        {
+            "trajectory_id": "traj-judge",
+            "occurred_at": _JUDGE_WALLS[0],
+            "event_type": "tree.node_states_changed",
+            "payload": {
+                "nodes": [{"id": "n_pre", "node_id": "n_pre", "status": "SUCCESS", "feedback": "ok"}]
+            },
+        },
+        {
+            "trajectory_id": "traj-judge",
+            "occurred_at": _JUDGE_WALLS[1],
+            "event_type": "tree.node_states_changed",
+            "payload": {
+                "nodes": [
+                    {
+                        "id": "n_post",
+                        "node_id": "n_post",
+                        "status": "FAILURE",
+                        "feedback": "postcondition unmet: counted(persons) (UNKNOWN)",
+                    }
+                ]
+            },
+        },
+        {
+            "trajectory_id": "traj-judge",
+            "occurred_at": _JUDGE_WALLS[2],
+            "event_type": "tree.node_states_changed",
+            "payload": {
+                "nodes": [{"id": "n_barrier", "node_id": "n_barrier", "status": "SUCCESS", "feedback": ""}]
+            },
+        },
+    ]
+    if replan:
+        events.append(
+            {
+                "trajectory_id": "traj-judge",
+                "occurred_at": "2026-08-28T11:00:04.000000Z",
+                "event_type": "tree.generated",
+                "payload": {"tree_revision": 1, "nodes": nodes},
+            }
+        )
+    events_file = debug_dir / "events.jsonl"
+    with events_file.open("w") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+    return debug_dir
+
+
+def test_build_judge_sheet_exists_with_rows(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    meta = {
+        "id": "c010",
+        "text": "count people",
+        "verdict": "FAIL",
+        "seconds": 30.0,
+        "tier": "T2",
+        "detail": "postcondition unmet",
+    }
+    out = build_judge_sheet(tmp_path, meta, tmp_path / "judge-sheet.jpg")
+    assert out is not None
+    assert out.exists()
+    img = Image.open(out)
+    assert img.width == 960
+
+
+def test_build_judge_sheet_height_grows_with_event_count(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    meta = {"id": "c010", "verdict": "FAIL"}
+    out1 = build_judge_sheet(tmp_path, meta, tmp_path / "judge1.jpg")
+    h1 = Image.open(out1).height
+
+    tmp2 = tmp_path / "more"
+    tmp2.mkdir()
+    _mk_frames(tmp2, "arena", 5)
+    _mk_frames(tmp2, "head", 5)
+    _mk_judge_events(tmp2, replan=True)  # one extra (REPLAN) judge event
+    out2 = build_judge_sheet(tmp2, meta, tmp2 / "judge2.jpg")
+    h2 = Image.open(out2).height
+    assert h2 > h1
+
+
+def test_build_judge_sheet_replan_band_renders(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path, replan=True)
+    meta = {"id": "c011", "verdict": "FAIL"}
+    out = build_judge_sheet(tmp_path, meta, tmp_path / "judge-replan.jpg")
+    assert out is not None
+    img = Image.open(out).convert("RGB")
+    target = tuple(int(REPLAN_BAND_COLOR[i : i + 2], 16) for i in (1, 3, 5))
+    found = False
+    for x in range(0, img.width, 20):
+        for y in range(0, img.height, 5):
+            r, g, b = img.getpixel((x, y))
+            if abs(r - target[0]) < 25 and abs(g - target[1]) < 25 and abs(b - target[2]) < 25:
+                found = True
+                break
+        if found:
+            break
+    assert found, "expected a REPLAN band (#b71c1c) somewhere in the judge sheet"
+
+
+def test_build_judge_sheet_returns_none_without_telemetry(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    out_path = tmp_path / "judge-sheet.jpg"
+    result = build_judge_sheet(tmp_path, {"id": "x", "verdict": "PASS"}, out_path)
+    assert result is None
+    assert not out_path.exists()
+
+
+def test_dedup_transcript_preserves_first_occurrence_order_and_caps():
+    lines = ["a", "b", "a", "c", "b", "d"]
+    assert _dedup_transcript(lines, cap=25) == ["a", "b", "c", "d"]
+    assert _dedup_transcript(lines, cap=2) == ["a", "b"]
+
+
+def test_build_judge_sheet_plan_block_grows_height(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    meta_no_plan = {"id": "c012", "verdict": "PASS"}
+    out1 = build_judge_sheet(tmp_path, meta_no_plan, tmp_path / "judge-noplan.jpg")
+    h1 = Image.open(out1).height
+
+    meta_with_plan = {
+        "id": "c012",
+        "verdict": "PASS",
+        "plan": ["go to the kitchen", "find the person", "count them"],
+    }
+    out2 = build_judge_sheet(tmp_path, meta_with_plan, tmp_path / "judge-plan.jpg")
+    h2 = Image.open(out2).height
+    assert h2 > h1
+
+
+def test_main_no_judge_sheet_flag_skips_judge_sheet(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    meta_path = tmp_path / "run.json"
+    meta_path.write_text(json.dumps({"id": "c020", "verdict": "PASS", "text": "go", "seconds": 5.0, "tier": "T2"}))
+    out_path = tmp_path / "sheet.jpg"
+
+    from tools.contact_sheet import main as sheet_main
+
+    rc = sheet_main(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--meta",
+            str(meta_path),
+            "--out",
+            str(out_path),
+            "--no-judge-sheet",
+        ]
+    )
+    assert rc == 0
+    assert out_path.exists()
+    assert not (tmp_path / "judge-sheet.jpg").exists()
+
+
+def test_main_default_creates_judge_sheet(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    meta_path = tmp_path / "run.json"
+    meta_path.write_text(json.dumps({"id": "c021", "verdict": "PASS", "text": "go", "seconds": 5.0, "tier": "T2"}))
+    out_path = tmp_path / "sheet.jpg"
+
+    from tools.contact_sheet import main as sheet_main
+
+    rc = sheet_main(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--meta",
+            str(meta_path),
+            "--out",
+            str(out_path),
+        ]
+    )
+    assert rc == 0
+    assert out_path.exists()
+    assert (tmp_path / "judge-sheet.jpg").exists()

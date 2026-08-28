@@ -61,6 +61,12 @@ KIND_COLORS = {
     "VISION": "#6a1b9a",
     "AUDIO": "#2e7d32",
     "MANIP": "#ef6c00",
+    # Judge-sheet kinds (disjoint from the milestone kinds above, so this
+    # dict, and `_draw_label_block`'s row rendering, is shared as-is).
+    "PRECONDITION": "#00695c",
+    "POSTCONDITION": "#4527a0",
+    "SUPERVISOR": "#37474f",
+    "CORRECTION": "#b71c1c",
 }
 DEFAULT_KIND_COLOR = "#212121"
 FAILURE_TINT = "#ffebee"
@@ -83,6 +89,21 @@ VERDICT_COLORS = {
     "ERROR": "#616161",
 }
 DEFAULT_VERDICT_COLOR = "#455a64"
+
+# --- judge-sheet layout constants ---------------------------------------
+PLAN_MAX_STEPS = 12
+PLAN_WRAP_WIDTH = 140  # judge sheet is 960px wide; header's TEXT_WRAP_WIDTH
+# (96) was tuned for the 640px-wide portrait/event sheet header.
+PLAN_LINE_H = 16
+PLAN_PAD = 6
+
+TRANSCRIPT_CAP = 25
+TRANSCRIPT_LINE_H = 16
+TRANSCRIPT_PAD = 6
+TRANSCRIPT_BG = "#f5f5f5"
+
+REPLAN_BAND_COLOR = "#b71c1c"
+REPLAN_BAND_H = LABEL_PAD * 2 + LABEL_LINE_H * 2  # same as a 0-info-line label block
 
 
 def sample_evenly(items: Sequence, k: int) -> list:
@@ -320,7 +341,14 @@ def _draw_label_block(draw: ImageDraw.ImageDraw, font, x: int, y: int, h: int, e
         )
 
 
-def _draw_header(draw: ImageDraw.ImageDraw, font, width: int, meta: dict) -> None:
+def _draw_header(
+    draw: ImageDraw.ImageDraw, font, width: int, meta: dict, extra_line: Optional[str] = None
+) -> None:
+    """Draw the shared header band: run id / verdict / seconds / tier, then
+    up to 2 wrapped lines of the command text. `extra_line`, when given (the
+    judge sheet's bench-detail line), is drawn on the next line -- HEADER_H
+    already has slack past 2 wrapped text lines to fit it without growing.
+    """
     verdict = str(meta.get("verdict", ""))
     color = VERDICT_COLORS.get(verdict, DEFAULT_VERDICT_COLOR)
     run_id = meta.get("id", "")
@@ -330,8 +358,12 @@ def _draw_header(draw: ImageDraw.ImageDraw, font, width: int, meta: dict) -> Non
     line1 = f"{run_id}  [{verdict}]  {seconds}s  {tier}"
     draw.text((8, 6), line1, fill=color, font=font)
 
-    for i, line in enumerate(_wrapped_text_lines(meta.get("text", ""), max_lines=2)):
+    text_lines = _wrapped_text_lines(meta.get("text", ""), max_lines=2)
+    for i, line in enumerate(text_lines):
         draw.text((8, 6 + 20 * (i + 1)), line, fill="black", font=font)
+
+    if extra_line:
+        draw.text((8, 6 + 20 * (len(text_lines) + 1)), extra_line, fill="#555555", font=font)
 
     draw.line([(0, HEADER_H - 1), (width, HEADER_H - 1)], fill="#cccccc")
 
@@ -352,9 +384,14 @@ def build_sheet(run_dir: Path, meta: dict, out: Path, columns: int = 12) -> Path
     if milestones:
         try:
             return _build_event_sheet(run_dir, meta, out, milestones)
-        except Exception:
-            # Never crash the bench: fall through to the time-strip layout.
-            pass
+        except Exception as exc:
+            # Never crash the bench: fall through to the time-strip layout,
+            # but say so on stderr -- silent degradation is otherwise
+            # invisible in bench logs.
+            print(
+                f"contact_sheet: event layout failed ({type(exc).__name__}); using fallback layout",
+                file=sys.stderr,
+            )
 
     return _build_fallback_sheet(run_dir, meta, out, columns)
 
@@ -424,6 +461,182 @@ def _build_event_sheet(run_dir: Path, meta: dict, out: Path, milestones: list) -
                     )
             _draw_label_block(draw, font, len(ROW_LABELS) * TILE_W, y, row_h, row["event"])
             y += row_h
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out, "JPEG", quality=JPEG_QUALITY)
+    return out
+
+
+# --- judge sheet ----------------------------------------------------------
+#
+# A separate <out-dir>/judge-sheet.jpg per run, documenting the
+# orchestrator's judging machinery (pre/postcondition gates, supervisor
+# barriers, replan/correction events) rather than the robot's own actions.
+# Skips (returns None, writes nothing) when the run has no telemetry at
+# all; never raises.
+
+
+def _plan_block_lines(plan) -> list:
+    """Numbered, wrapped plan-step lines from run.json's `plan` list, capped
+    at PLAN_MAX_STEPS steps. [] (block omitted) when `plan` is absent/empty.
+    """
+    if not isinstance(plan, list) or not plan:
+        return []
+    lines = []
+    for i, step in enumerate(plan[:PLAN_MAX_STEPS], start=1):
+        wrapped = textwrap.wrap(f"{i}. {step}", width=PLAN_WRAP_WIDTH) or [f"{i}. {step}"]
+        lines.extend(wrapped)
+    return lines
+
+
+def _load_transcript_lines(run_dir: Path) -> list:
+    """Read <run_dir>/announcements.txt into a list of non-empty stripped
+    lines. Never raises: an absent file yields [].
+    """
+    path = run_dir / "announcements.txt"
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _dedup_transcript(lines: Sequence[str], cap: int) -> list:
+    """Order-preserving first-occurrence dedup of `lines`, capped at `cap`."""
+    seen = set()
+    out = []
+    for line in lines:
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def build_judge_sheet(run_dir: Path, meta: dict, out: Path) -> Optional[Path]:
+    """Build <out>: the judge sheet documenting gate/supervisor/replan/
+    correction events plus the bench verdict for one run.
+
+    Returns None and writes nothing when the run has no telemetry at all
+    (no judge events and no telemetry meta). Never raises.
+    """
+    run_dir = Path(run_dir)
+    out = Path(out)
+    try:
+        _milestones, judge_events, tmeta = sheet_events.load_run_telemetry(run_dir)
+        if not judge_events and not tmeta:
+            return None
+        return _build_judge_sheet(run_dir, meta, out, judge_events)
+    except Exception as exc:
+        print(
+            f"contact_sheet: judge sheet failed ({type(exc).__name__}); skipping",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _build_judge_sheet(run_dir: Path, meta: dict, out: Path, judge_events: list) -> Path:
+    width = len(EVENT_COL_LABELS) * TILE_W
+    index_by_label = _load_frame_index(run_dir)
+    recorder_meta = _load_recorder_meta(run_dir)
+
+    detail = str(meta.get("detail") or "").strip()
+    extra_line = f"detail: {detail}" if detail else None
+
+    plan_lines = _plan_block_lines(meta.get("plan"))
+    plan_h = (PLAN_PAD * 2 + PLAN_LINE_H * len(plan_lines)) if plan_lines else 0
+
+    rows = []
+    for event in judge_events:
+        if event.kind == "REPLAN":
+            rows.append({"event": event, "replan": True, "row_h": REPLAN_BAND_H})
+            continue
+        event_dt = _parse_iso(event.wall)
+        tiles = {
+            label: _load_event_tile(run_dir, label, event_dt, index_by_label, recorder_meta)
+            for label in ROW_LABELS
+        }
+        info_lines = (
+            _wrapped_text_lines(event.info, INFO_MAX_LINES, width=LABEL_WRAP_WIDTH) if event.info else []
+        )
+        row_h = max(_label_block_height(len(info_lines)), PLACEHOLDER_H)
+        for label in ROW_LABELS:
+            tile = tiles[label]
+            if tile is not None:
+                row_h = max(row_h, tile.height)
+        rows.append({"event": event, "replan": False, "tiles": tiles, "row_h": row_h})
+
+    transcript_lines = _dedup_transcript(_load_transcript_lines(run_dir), TRANSCRIPT_CAP)
+    transcript_h = (
+        TRANSCRIPT_PAD * 2 + TRANSCRIPT_LINE_H * len(transcript_lines) if transcript_lines else 0
+    )
+
+    events_h = sum(r["row_h"] for r in rows) if rows else PLACEHOLDER_H
+
+    total_h = HEADER_H + plan_h + LABEL_BAND_H + events_h + transcript_h
+    sheet = Image.new("RGB", (width, total_h), "white")
+    draw = ImageDraw.Draw(sheet)
+    font = ImageFont.load_default()
+
+    _draw_header(draw, font, width, meta, extra_line=extra_line)
+
+    y = HEADER_H
+    if plan_lines:
+        draw.rectangle([0, y, width, y + plan_h], fill="#fafafa")
+        for i, line in enumerate(plan_lines):
+            draw.text((8, y + PLAN_PAD + PLAN_LINE_H * i), line, fill="black", font=font)
+        y += plan_h
+
+    band_y = y
+    draw.rectangle([0, band_y, width, band_y + LABEL_BAND_H], fill="#eeeeee")
+    for k, label in enumerate(EVENT_COL_LABELS):
+        draw.text((k * TILE_W + 4, band_y + 3), label, fill="black", font=font)
+    draw.line(
+        [(0, band_y + LABEL_BAND_H - 1), (width, band_y + LABEL_BAND_H - 1)],
+        fill="#cccccc",
+    )
+    y = band_y + LABEL_BAND_H
+
+    if not rows:
+        draw.rectangle([0, y, width, y + PLACEHOLDER_H], fill="#bdbdbd")
+        draw.text((8, y + PLACEHOLDER_H // 2 - 6), "no judge events recorded", fill="black", font=font)
+        y += PLACEHOLDER_H
+    else:
+        for row in rows:
+            row_h = row["row_h"]
+            if row["replan"]:
+                event = row["event"]
+                draw.rectangle([0, y, width, y + row_h], fill=REPLAN_BAND_COLOR)
+                # ASCII "--" not an em dash: PIL's default bitmap font can't
+                # encode U+2014 and raises UnicodeEncodeError on draw.text.
+                text = f"REPLAN -- {event.info}" if event.info else "REPLAN"
+                draw.text((8, y + row_h // 2 - 6), text, fill="white", font=font)
+            else:
+                for k, label in enumerate(ROW_LABELS):
+                    x = k * TILE_W
+                    tile = row["tiles"][label]
+                    if tile is not None:
+                        sheet.paste(tile, (x, y))
+                        if tile.height < row_h:
+                            draw.rectangle([x, y + tile.height, x + TILE_W, y + row_h], fill="#fafafa")
+                    else:
+                        draw.rectangle([x, y, x + TILE_W, y + row_h], fill="#bdbdbd")
+                        draw.text(
+                            (x + 8, y + row_h // 2 - 6),
+                            f"no {label} frame",
+                            fill="black",
+                            font=font,
+                        )
+                _draw_label_block(draw, font, len(ROW_LABELS) * TILE_W, y, row_h, row["event"])
+            y += row_h
+
+    if transcript_lines:
+        draw.rectangle([0, y, width, y + transcript_h], fill=TRANSCRIPT_BG)
+        for i, line in enumerate(transcript_lines):
+            draw.text((8, y + TRANSCRIPT_PAD + TRANSCRIPT_LINE_H * i), f"> {line}", fill="black", font=font)
+        y += transcript_h
 
     out.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(out, "JPEG", quality=JPEG_QUALITY)
@@ -535,13 +748,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=12,
         help="Sampled frames per camera column (tile rows); historical name.",
     )
+    parser.add_argument(
+        "--no-judge-sheet",
+        action="store_true",
+        help="Skip building judge-sheet.jpg next to --out.",
+    )
     return parser
 
 
 def main(argv=None) -> int:
     args = _build_arg_parser().parse_args(argv)
     meta = json.loads(Path(args.meta).read_text())
-    build_sheet(Path(args.run_dir), meta, Path(args.out), columns=args.columns)
+    run_dir = Path(args.run_dir)
+    out = Path(args.out)
+    build_sheet(run_dir, meta, out, columns=args.columns)
+    if not args.no_judge_sheet:
+        build_judge_sheet(run_dir, meta, out.parent / "judge-sheet.jpg")
     return 0
 
 
