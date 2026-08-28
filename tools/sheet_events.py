@@ -55,8 +55,25 @@ _ANNOUNCE_PREFIX = "Finished announcing "
 
 _TERMINAL_STATUSES = ("SUCCESS", "FAILURE")
 
+# Node "type" values (tree.generated payload.nodes[].type, e.g.
+# "BtNode_WriteToBlackboard", "BtNode_BlackboardSet") that are blackboard
+# bookkeeping leaves rather than robot actions -- e.g. "arm scan" /
+# "arm nav" / "arm orbbec look" are BtNode_WriteToBlackboard nodes that
+# merely flag intent on the blackboard, not BtNode_MoveArmSingle-style
+# ActionHandlers that actually move the robot. These must never become
+# milestones even though their names match a MANIP/VISION/etc. pattern.
+_BOOKKEEPING_TYPE_MARKER = "blackboard"
 
-def _classify_milestone(name: str) -> Optional[str]:
+
+def _is_bookkeeping_type(node_type: Optional[str]) -> bool:
+    if not node_type:
+        return False
+    return _BOOKKEEPING_TYPE_MARKER in node_type.lower()
+
+
+def _classify_milestone(name: str, node_type: Optional[str] = None) -> Optional[str]:
+    if _is_bookkeeping_type(node_type):
+        return None
     low = name.lower()
     if "keepalive" in low:
         return None
@@ -79,7 +96,11 @@ def _classify_judge(name: str) -> Optional[str]:
         return "POSTCONDITION"
     if low.startswith("supervisor barrier"):
         return "SUPERVISOR"
-    if "correction" in low and low != "reset correction":
+    # "reset correction" / "clear correction" (and any other reset-/clear-
+    # prefixed housekeeping node) are blackboard resets, not judge-worthy
+    # correction attempts -- exclude the whole reset/clear family, not just
+    # the one literal name.
+    if "correction" in low and not (low.startswith("reset ") or low.startswith("clear ")):
         return "CORRECTION"
     return None
 
@@ -134,12 +155,13 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
 
     try:
         raw_text = events_file.read_text()
-    except OSError:
+    except (OSError, UnicodeDecodeError, ValueError):
         return empty
 
     milestones: list[MilestoneEvent] = []
     judge_events: list[JudgeEvent] = []
     name_map: dict[str, str] = {}
+    type_map: dict[str, str] = {}
     trajectory_id: Optional[str] = None
     max_revision = 0
     run_finished: dict[str, Any] = {}
@@ -176,6 +198,9 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
                     node_name = node.get("name")
                     if node_id and node_name:
                         name_map[node_id] = node_name
+                    node_type = node.get("type")
+                    if node_id and node_type:
+                        type_map[node_id] = node_type
 
             revision = payload.get("tree_revision")
             if isinstance(revision, int):
@@ -208,8 +233,9 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
                 if not name:
                     continue
                 feedback = node.get("feedback") or ""
+                node_type = type_map.get(node_id) if node_id else None
 
-                mkind = _classify_milestone(name)
+                mkind = _classify_milestone(name, node_type)
                 if mkind is not None:
                     milestones.append(
                         MilestoneEvent(
