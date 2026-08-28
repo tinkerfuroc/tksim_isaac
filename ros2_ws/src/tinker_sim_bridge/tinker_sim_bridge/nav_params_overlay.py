@@ -108,6 +108,24 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
         if isinstance(inflation, dict) and "inflation_radius" in inflation:
             inflation["inflation_radius"] = radius
 
+    # Footprint, sim-parity (2026-08-28 doorway-wedge debug, fix 2): the
+    # upstream footprint [[0.25,0.25],[0.25,-0.25],[-0.7,-0.25],[-0.7,0.25]]
+    # models the REAL robot's 0.95 m envelope (rear overhang). The sim
+    # robot's collision model (artifacts robot.urdf base_link mesh, scale
+    # 0.001, yaw -90deg, origin -0.38/0.20/0.03) spans x [-0.38, +0.13],
+    # y [-0.205, +0.20] — about 0.51 x 0.41 m. With the 0.95 m footprint a
+    # 90-degree turn INTO a 0.95 m doorway has no collision-free DWB
+    # trajectory (validated: robot stalled at the north door mouth at
+    # (-0.5, 3.66) with 32 progress-failures after the ObstacleFootprint
+    # fix), while the actual sim body passes easily. Overlay a sim-true
+    # envelope with margin (0.65 x 0.54): rear -0.45, front +0.20, half-
+    # width 0.27 (covers wheels). Upstream file stays hardware's.
+    sim_footprint = "[ [0.20, 0.27], [0.20, -0.27], [-0.45, -0.27], [-0.45, 0.27] ]"
+    for costmap in ("local_costmap", "global_costmap"):
+        node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
+        if "footprint" in node:
+            node["footprint"] = sim_footprint
+
     # DWB obstacle critic: upstream scores trajectories with BaseObstacle
     # (CENTER-POINT cost, scale 0.02 — effectively decorative). A 0.5 m
     # wide, 0.95 m long footprint clears a 0.95 m door only when the WHOLE
