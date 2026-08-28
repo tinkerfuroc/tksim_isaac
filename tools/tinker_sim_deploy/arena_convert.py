@@ -31,6 +31,102 @@ from .arena_world import ArenaLayout, BoxCollider, MeshCollider
 _IDENTITY_SCALE = (1.0, 1.0, 1.0)
 _IDENTITY_POSE = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
+# --- arena appearance -------------------------------------------------------
+#
+# The GLB-converted furniture ships per-model textures but renders bland /
+# white in the arena (the GLB's own material bindings do not resolve at
+# render time). Rather than chase texture resolution, compose_arena binds a
+# deterministic solid PBR color over each furniture prim. Colors are matte
+# (roughness ~0.8) unless a material reads glossier in reality (appliances,
+# TV). Values are UsdPreviewSurface diffuseColor, same convention as the
+# wall gray below. Every rcw2026-allowlisted model has an explicit entry;
+# anything unlisted falls back to a warm neutral so nothing can regress to
+# stark-white.
+
+#: Solid wood-oak floor slab authored into arena.usd (see ``floor_slab``).
+FLOOR_COLOR = (0.50, 0.35, 0.20)
+FLOOR_ROUGHNESS = 0.75
+
+#: Warm neutral for any furniture model_id without an explicit color.
+_FURNITURE_FALLBACK: tuple[tuple[float, float, float], float] = ((0.55, 0.50, 0.45), 0.8)
+
+#: model_id -> (diffuse rgb 0..1, roughness). Keep in sync with the rcw2026
+#: import allowlist in ``config/arena-import.json``.
+FURNITURE_COLORS: dict[str, tuple[tuple[float, float, float], float]] = {
+    # Wood -- medium
+    "rcw26_kitchen_table": ((0.55, 0.38, 0.22), 0.8),
+    "rcw26_side_table": ((0.60, 0.42, 0.25), 0.8),
+    "rcw26_laundry_desk": ((0.56, 0.40, 0.24), 0.8),
+    "rcw26_stand": ((0.52, 0.36, 0.21), 0.8),
+    # Wood -- light
+    "rcw26_shelf": ((0.62, 0.45, 0.28), 0.8),
+    "rcw26_door": ((0.63, 0.46, 0.28), 0.8),
+    # Wood -- dark
+    "rcw26_tv_stand": ((0.45, 0.30, 0.18), 0.8),
+    "rcw26_bed": ((0.46, 0.31, 0.19), 0.8),
+    # Soft furnishings / fabric
+    "rcw26_sofa": ((0.35, 0.40, 0.48), 0.85),
+    "rcw26_cushion": ((0.70, 0.55, 0.45), 0.85),
+    "rcw26_chair": ((0.30, 0.32, 0.35), 0.85),
+    # Appliances -- off-white steel, a touch glossier
+    "rcw26_refrigerator": ((0.86, 0.87, 0.89), 0.5),
+    "rcw26_washing_machine": ((0.88, 0.88, 0.90), 0.5),
+    "rcw26_washing_machine_open": ((0.88, 0.88, 0.90), 0.5),
+    "rcw26_dishwasher_close": ((0.80, 0.82, 0.84), 0.5),
+    "rcw26_dishwasher_open": ((0.80, 0.82, 0.84), 0.5),
+    "rcw26_sink": ((0.78, 0.80, 0.82), 0.4),
+    # Plastic / wicker
+    "rcw26_trashbin": ((0.25, 0.28, 0.32), 0.7),
+    "rcw26_laundry_basket": ((0.80, 0.75, 0.60), 0.8),
+    # Plants
+    "rcw26_plant_mid": ((0.20, 0.45, 0.20), 0.8),
+    "rcw26_plant_tall": ((0.18, 0.42, 0.18), 0.8),
+    # Electronics
+    "rcw26_tv": ((0.05, 0.05, 0.06), 0.3),
+}
+
+
+def furniture_material(model_id: str) -> tuple[tuple[float, float, float], float]:
+    """``(diffuse rgb, roughness)`` for a furniture ``model_id``.
+
+    Falls back to a warm neutral for any unlisted id, so a newly
+    allowlisted model can never regress to an untextured stark-white.
+    """
+    return FURNITURE_COLORS.get(model_id, _FURNITURE_FALLBACK)
+
+
+def floor_slab(
+    layout: ArenaLayout,
+    *,
+    margin: float = 0.10,
+    thickness: float = 0.02,
+    lift: float = 0.002,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """``(center_xyz, size_xyz)`` for the visual wood floor slab.
+
+    The footprint is the axis-aligned bounding box of every wall box's XY
+    extent, expanded by ``margin`` on each side. The slab is ``thickness``
+    tall and its top face sits at z=``lift`` -- a hair above the physics
+    ground plane at z=0 -- so it wins the depth test against Isaac's default
+    ground grid without disturbing physics (the slab carries no collider).
+
+    Wall yaw is 0 in rcw2026; a rotated wall contributes its axis-aligned
+    half-extent, a conservative over-approximation that only ever grows the
+    footprint the floor must cover.
+    """
+    if not layout.walls:
+        raise ValueError("floor_slab requires at least one wall")
+    min_x = min(wall.center[0] - wall.size[0] / 2.0 for wall in layout.walls)
+    max_x = max(wall.center[0] + wall.size[0] / 2.0 for wall in layout.walls)
+    min_y = min(wall.center[1] - wall.size[1] / 2.0 for wall in layout.walls)
+    max_y = max(wall.center[1] + wall.size[1] / 2.0 for wall in layout.walls)
+    size_x = (max_x - min_x) + 2.0 * margin
+    size_y = (max_y - min_y) + 2.0 * margin
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    center_z = lift - thickness / 2.0
+    return (center_x, center_y, center_z), (size_x, size_y, thickness)
+
 
 def convert_glb_to_usd(
     glb_path: Path,
@@ -313,19 +409,47 @@ def author_model_colliders(
     _resave_fresh(stage, usd_path)
 
 
-def _bind_gray_material(stage, prim, materials_scope: str) -> None:
+def _bind_pbr_material(
+    stage,
+    prim,
+    *,
+    materials_scope: str,
+    name: str,
+    rgb: tuple[float, float, float],
+    roughness: float,
+    override_descendants: bool = False,
+) -> None:
+    """Author (once) and bind a matte ``UsdPreviewSurface`` under
+    ``materials_scope`` to ``prim``.
+
+    ``override_descendants`` binds at ``strongerThanDescendants`` strength so
+    the binding wins over any material the prim's own subtree carries -- used
+    for referenced furniture whose GLB material bindings would otherwise
+    render (see FURNITURE_COLORS for why they don't resolve cleanly).
+    """
     from pxr import Sdf, UsdShade
 
-    material_path = f"{materials_scope}/Gray"
+    material_path = f"{materials_scope}/{name}"
     material = UsdShade.Material.Get(stage, material_path)
     if not material:
         material = UsdShade.Material.Define(stage, material_path)
         shader = UsdShade.Shader.Define(stage, f"{material_path}/Shader")
         shader.CreateIdAttr("UsdPreviewSurface")
-        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set((0.6, 0.6, 0.6))
-        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.8)
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(tuple(rgb))
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
         material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-    UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
+    binding = UsdShade.MaterialBindingAPI.Apply(prim)
+    if override_descendants:
+        binding.Bind(material, bindingStrength=UsdShade.Tokens.strongerThanDescendants)
+    else:
+        binding.Bind(material)
+
+
+def _bind_gray_material(stage, prim, materials_scope: str) -> None:
+    _bind_pbr_material(
+        stage, prim, materials_scope=materials_scope, name="Gray",
+        rgb=(0.6, 0.6, 0.6), roughness=0.8,
+    )
 
 
 def compose_arena(
@@ -357,6 +481,21 @@ def compose_arena(
         rigid_body = UsdPhysics.RigidBodyAPI.Apply(cube.GetPrim())
         rigid_body.CreateKinematicEnabledAttr(True)
 
+    # Visual wood floor covering the arena footprint. No collider -- physics
+    # still rides the backend's default ground plane at z=0; the slab's top
+    # face sits a hair above it (see floor_slab) so it wins the depth test
+    # against Isaac's default ground grid without touching physics/nav.
+    floor_center, floor_size = floor_slab(layout)
+    floor_cube = UsdGeom.Cube.Define(stage, f"{root.GetPath()}/Floor")
+    floor_cube.CreateSizeAttr(1.0)
+    floor_xform = UsdGeom.Xformable(floor_cube.GetPrim())
+    floor_xform.AddTranslateOp().Set(Gf.Vec3d(*floor_center))
+    floor_xform.AddScaleOp().Set(Gf.Vec3f(*floor_size))
+    _bind_pbr_material(
+        stage, floor_cube.GetPrim(), materials_scope="/World/Arena/Materials",
+        name="Floor", rgb=FLOOR_COLOR, roughness=FLOOR_ROUGHNESS,
+    )
+
     furniture_scope = UsdGeom.Scope.Define(stage, "/World/Arena/Furniture")
     instance_counts: dict[str, int] = {}
     for item in layout.furniture:
@@ -384,6 +523,16 @@ def compose_arena(
         xform.AddRotateZOp().Set(math.degrees(item.yaw))
         content_prim = stage.DefinePrim(f"{prim_path}/content")
         content_prim.GetReferences().AddReference(f"./{furniture_dir_name}/{item.model_id}.usd")
+        # Solid PBR tint bound on the wrapper at strongerThanDescendants so it
+        # overrides the referenced GLB subtree's own (non-resolving) materials
+        # -- without this the furniture renders stark-white. One material per
+        # model_id, reused across repeated placements.
+        rgb, roughness = furniture_material(item.model_id)
+        _bind_pbr_material(
+            stage, wrapper.GetPrim(), materials_scope="/World/Arena/Materials",
+            name=f"furn_{item.model_id}", rgb=rgb, roughness=roughness,
+            override_descendants=True,
+        )
 
     stage.Save()
 
