@@ -94,6 +94,7 @@ class FrameSink:
             "frames": self._count,
             "first_stamp": self._first_stamp,
             "last_stamp": self._last_stamp,
+            "index_write_errors": self._index_write_errors,
         }
 
 

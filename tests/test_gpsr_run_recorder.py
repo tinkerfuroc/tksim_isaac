@@ -35,7 +35,12 @@ def test_meta_summary(tmp_path):
     s = FrameSink(tmp_path, "arena", interval_s=1.0, max_frames=10)
     s.offer(2.0, _rgb(2, 2, 1), 2, 2)
     s.offer(3.5, _rgb(2, 2, 1), 2, 2)
-    assert s.summary() == {"frames": 2, "first_stamp": 2.0, "last_stamp": 3.5}
+    assert s.summary() == {
+        "frames": 2,
+        "first_stamp": 2.0,
+        "last_stamp": 3.5,
+        "index_write_errors": 0,
+    }
 
 
 def test_sink_appends_index_line_for_accepted_frames_only(tmp_path):
@@ -77,3 +82,17 @@ def test_sink_index_shared_across_labels(tmp_path):
     assert len(lines) == 2
     labels = {json.loads(line)["label"] for line in lines}
     assert labels == {"arena", "head"}
+
+
+def test_sink_offer_survives_index_write_failure(tmp_path):
+    # Force the index append to fail: make the index path a directory so
+    # open(..., "a") raises IsADirectoryError (an OSError subclass).
+    index_path = tmp_path / "frames" / "index.jsonl"
+    index_path.mkdir(parents=True)
+
+    s = FrameSink(tmp_path, "arena", interval_s=0.0, max_frames=10)
+    p = s.offer(0.0, _rgb(2, 2, 1), 2, 2, wall_iso="2026-08-28T00:00:00+00:00")
+
+    assert p is not None
+    assert p.exists()
+    assert s.summary()["index_write_errors"] == 1
