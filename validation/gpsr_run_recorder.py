@@ -38,12 +38,21 @@ class FrameSink:
         self.interval_s = interval_s
         self.max_frames = max_frames
         self._frames_dir = self.out_dir / "frames" / label
+        self._index_path = self.out_dir / "frames" / "index.jsonl"
         self._count = 0
         self._last_accepted: Optional[float] = None
         self._first_stamp: Optional[float] = None
         self._last_stamp: Optional[float] = None
+        self._index_write_errors = 0
 
-    def offer(self, stamp_s: float, rgb_bytes: bytes, width: int, height: int) -> Optional[Path]:
+    def offer(
+        self,
+        stamp_s: float,
+        rgb_bytes: bytes,
+        width: int,
+        height: int,
+        wall_iso: Optional[str] = None,
+    ) -> Optional[Path]:
         if self._count >= self.max_frames:
             return None
         if self._last_accepted is not None and stamp_s < self._last_accepted + self.interval_s:
@@ -62,7 +71,23 @@ class FrameSink:
         if self._first_stamp is None:
             self._first_stamp = stamp_s
         self._last_stamp = stamp_s
+
+        self._append_index_line(name, stamp_s, wall_iso)
         return path
+
+    def _append_index_line(self, name: str, stamp_s: float, wall_iso: Optional[str]) -> None:
+        entry = {
+            "label": self.label,
+            "file": f"frames/{self.label}/{name}",
+            "stamp_s": stamp_s,
+            "wall": wall_iso,
+        }
+        try:
+            self._index_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._index_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            self._index_write_errors += 1
 
     def summary(self) -> dict:
         return {
@@ -132,7 +157,8 @@ def main(argv=None) -> int:
                 )
                 return
             stamp_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            sink.offer(stamp_s, bytes(msg.data), msg.width, msg.height)
+            wall_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            sink.offer(stamp_s, bytes(msg.data), msg.width, msg.height, wall_iso=wall_iso)
 
         return _callback
 
