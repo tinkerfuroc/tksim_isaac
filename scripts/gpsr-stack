@@ -277,10 +277,17 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             # mid-run). Camera-loaded runs need generous deadlines.
             "TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S": "10",
             "TINKER_SIM_COMMAND_STREAM_TIMEOUT_S": "5",
-            # A/B: authored cylinder wheel colliders (with their physics
-            # material). The RTF sphere substitutes carry no material and
-            # slip on the arena floor: wheels spin, base never translates.
-            "TINKER_SIM_WHEEL_COLLIDER": "cylinder",
+            # Wheel colliders stay on the engineered SPHERE default. The
+            # cylinder override below was added 2026-08-27 while chasing
+            # "wheels spin, base never translates" — later proven to be a
+            # phantom from stale USD-layer reads (the robot really drove).
+            # The cylinder line contact cannot skid, so in-place turns
+            # reach 0% of the command below 0.2 rad/s and ~55% at 0.5
+            # (backend.py's own A/B numbers, re-measured 2026-08-28:
+            # cmd 0.2 -> -0.05 achieved, cmd 0.5 -> 0.15). That angular
+            # deadband deadlocked every Nav2 rotate-to-heading ramp and
+            # was the final root cause of the doorway wedging.
+            # "TINKER_SIM_WHEEL_COLLIDER": "cylinder",  # DO NOT re-enable
             # Arena observer re-enabled for the recorded battery (user asked
             # for arena-view contact-sheet frames). Historically raced the
             # render pipeline under full-stack load (CUDA 700, see
