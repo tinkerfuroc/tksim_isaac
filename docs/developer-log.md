@@ -4,6 +4,49 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-08-28 — Arena reskin: wood floor + tinted furniture (rcw2026)
+
+The rendered arena read as stark-white: Isaac's default gray ground grid
+under everything, and GLB furniture that renders bland/white because the
+converted models' own material bindings do not resolve at render time (the
+artifact ships `textures/<id>/*.png`, but they don't bind through). Fix is
+in `tools/tinker_sim_deploy/arena_convert.py`, all at compose time — no GLB
+re-conversion, no image textures (solid PBR keeps render cost ≈ current):
+
+- **Floor**: `compose_arena` now authors `/World/Arena/Floor`, a thin
+  (`2 cm`) visual cube covering the wall-footprint AABB (+10 cm margin,
+  `floor_slab`), oak-tinted (`FLOOR_COLOR`). No collider — physics still
+  rides the backend's `GroundPlaneCfg` plane at z=0; the slab's top face
+  sits `2 mm` above it so it wins the depth test against the default grid.
+- **Furniture**: a solid PBR from `FURNITURE_COLORS` (keyed by model_id,
+  warm-neutral fallback) bound on each furniture wrapper at
+  `strongerThanDescendants`, overriding the GLB subtree's bindings. Woods
+  brown, fabrics muted, appliances off-white steel (intentional, not the
+  untextured default), plants green, TV black.
+- **Walls**: unchanged (gray `0.6`). `_bind_gray_material` now delegates to
+  the shared `_bind_pbr_material`.
+
+Pure geometry/color logic (`floor_slab`, `furniture_material`) is unit-tested
+in `tests/test_arena_convert.py` under plain Python; the pxr authoring is
+live-only as usual.
+
+**Operator step — regenerate + re-pin (Isaac box, needs Kit + pinned SOBITS
+checkout; not runnable in dev/CI):**
+
+1. `python tools/arena_import.py --config config/arena-import.json`
+   (add `--checkout <existing pinned checkout>` to skip the clone). This
+   publishes a new content-addressed arena artifact and re-points
+   `artifacts/arena/rcw2026/current.json`. Then register the new
+   `arena.usd` path + sha256 under `generated_arena_usds` in
+   `artifacts/asset-manifest.json` (the tool prints this reminder).
+2. Eyeball the render: wood floor present, furniture tinted, walls unchanged.
+3. Run the vision/detection smoke to confirm detection parity and that
+   per-frame render time stayed close to the pre-change baseline (solid PBR
+   should not move it). If a furniture tint still reads white, the override
+   binding didn't win — check the `strongerThanDescendants` strength.
+
+Design: `docs/superpowers/specs/2026-08-28-arena-wood-floor-furniture-tint-design.md`.
+
 ## 2026-08-22 — GPSR `goto_command_point` stall: two root causes in the sim, one residual
 
 Starting point: `reports/gpsr-sim-2026-08-20/NAV-HANDOFF.md` — Nav2 never
