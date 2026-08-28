@@ -173,19 +173,19 @@ def test_load_run_telemetry_extracts_milestones_and_judge_events(tmp_path):
     # "step 0: goto({'location': 'bedroom'})" -- info should end with the
     # step-context suffix.
     assert milestones[0].info == (
-        "goal accepted :) [BtNode_GotoAction/goto target] | step 0 goto: location=bedroom"
+        "goal accepted :) [BtNode_GotoAction/goto target] | plan-step 0 goto: location=bedroom"
     )
-    assert milestones[0].info.endswith("| step 0 goto: location=bedroom")
+    assert milestones[0].info.endswith("| plan-step 0 goto: location=bedroom")
     # scan milestone: materialise:0:0:1 carries the count step's context.
     assert milestones[1].info == (
-        SCAN_FAILURE_FEEDBACK + " | step 1 count: object=persons pointing to the left"
+        SCAN_FAILURE_FEEDBACK + " | plan-step 1 count: object=persons pointing to the left"
     )
     # announce milestone: materialise:0:0:3 has empty params -- suffix has
     # no trailing ": k=v" clause.
-    assert milestones[2].info == "0 persons | step 3 announce"
+    assert milestones[2].info == "0 persons | plan-step 3 announce"
     # tuck: no materialise SUCCESS follows announce's, so the step-3
     # announce context is still the "most recent" one in effect.
-    assert milestones[3].info == "MOCK: auto-complete finished | step 3 announce"
+    assert milestones[3].info == "MOCK: auto-complete finished | plan-step 3 announce"
     assert milestones[0].wall == "2026-08-28T10:00:01.000000Z"
 
     assert all(isinstance(m, MilestoneEvent) for m in milestones)
@@ -194,7 +194,7 @@ def test_load_run_telemetry_extracts_milestones_and_judge_events(tmp_path):
     assert judge_events[0].name == "postcondition gate:0:0"
     assert judge_events[0].status == "FAILURE"
     # Judge events get the same active step-context suffix as milestones.
-    assert judge_events[0].info == POSTCONDITION_FEEDBACK + " | step 3 announce"
+    assert judge_events[0].info == POSTCONDITION_FEEDBACK + " | plan-step 3 announce"
     assert judge_events[1].name == "replan"
     assert judge_events[1].status == "SUCCESS"
     assert judge_events[1].info == "tree revision 1"
@@ -378,14 +378,14 @@ def test_materialise_step_context_stamped_onto_milestones_and_judge_events(tmp_p
     assert not any(name.startswith("materialise:") for name in all_names)
 
     by_name = {m.name: m for m in milestones}
-    assert by_name["goto target"].info.endswith("| step 0 goto: location=bedroom")
+    assert by_name["goto target"].info.endswith("| plan-step 0 goto: location=bedroom")
     assert by_name["scan to count"].info.endswith(
-        "| step 1 count: object=persons pointing to the left"
+        "| plan-step 1 count: object=persons pointing to the left"
     )
-    assert by_name["announce vlm count"].info.endswith("| step 3 announce")
+    assert by_name["announce vlm count"].info.endswith("| plan-step 3 announce")
 
     postcondition = next(j for j in judge_events if j.kind == "POSTCONDITION")
-    assert postcondition.info.endswith("| step 3 announce")
+    assert postcondition.info.endswith("| plan-step 3 announce")
 
 
 def test_malformed_materialise_feedback_leaves_info_unchanged(tmp_path):

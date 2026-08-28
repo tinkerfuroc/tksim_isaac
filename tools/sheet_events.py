@@ -103,8 +103,8 @@ def _format_step_context(context: StepContext) -> str:
     step_num, action, params = context  # type: ignore[misc]
     if params:
         kv = ", ".join(f"{k}={v}" for k, v in params.items())
-        return f"step {step_num} {action}: {kv}"
-    return f"step {step_num} {action}"
+        return f"plan-step {step_num} {action}: {kv}"
+    return f"plan-step {step_num} {action}"
 
 
 def _apply_step_context(info: str, context: StepContext) -> str:
