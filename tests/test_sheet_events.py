@@ -56,8 +56,11 @@ def _build_events():
         {
             "tree_revision": 0,
             "nodes": [
+                {"id": "n_mat0", "node_id": "n_mat0", "name": "materialise:0:0:0"},
                 {"id": "n_goto", "node_id": "n_goto", "name": "goto target"},
+                {"id": "n_mat1", "node_id": "n_mat1", "name": "materialise:0:0:1"},
                 {"id": "n_scan", "node_id": "n_scan", "name": "scan to count"},
+                {"id": "n_mat3", "node_id": "n_mat3", "name": "materialise:0:0:3"},
                 {"id": "n_announce", "node_id": "n_announce", "name": "announce vlm count"},
                 {"id": "n_keepalive", "node_id": "n_keepalive", "name": "nav keepalive 0"},
                 {"id": "n_post", "node_id": "n_post", "name": "postcondition gate:0:0"},
@@ -70,13 +73,36 @@ def _build_events():
 
     add(
         "tree.node_states_changed",
+        "2026-08-28T10:00:00.500000Z",
+        {"nodes": [_node_state("n_mat0", "SUCCESS", "step 0: goto({'location': 'bedroom'})")]},
+    )
+    add(
+        "tree.node_states_changed",
         "2026-08-28T10:00:01.000000Z",
         {"nodes": [_node_state("n_goto", "SUCCESS", "goal accepted :) [BtNode_GotoAction/goto target]")]},
     )
     add(
         "tree.node_states_changed",
+        "2026-08-28T10:00:01.500000Z",
+        {
+            "nodes": [
+                _node_state(
+                    "n_mat1",
+                    "SUCCESS",
+                    "step 1: count({'object': 'persons pointing to the left'})",
+                )
+            ]
+        },
+    )
+    add(
+        "tree.node_states_changed",
         "2026-08-28T10:00:02.000000Z",
         {"nodes": [_node_state("n_scan", "FAILURE", SCAN_FAILURE_FEEDBACK)]},
+    )
+    add(
+        "tree.node_states_changed",
+        "2026-08-28T10:00:02.500000Z",
+        {"nodes": [_node_state("n_mat3", "SUCCESS", "step 3: announce({})")]},
     )
     add(
         "tree.node_states_changed",
@@ -143,10 +169,23 @@ def test_load_run_telemetry_extracts_milestones_and_judge_events(tmp_path):
         "tuck arm before goto",
     ]
     assert [m.status for m in milestones] == ["SUCCESS", "FAILURE", "SUCCESS", "SUCCESS"]
-    assert milestones[0].info == "goal accepted :) [BtNode_GotoAction/goto target]"
-    assert milestones[1].info == SCAN_FAILURE_FEEDBACK
-    assert milestones[2].info == "0 persons"
-    assert milestones[3].info == "MOCK: auto-complete finished"
+    # goto milestone: the preceding materialise:0:0:0 SUCCESS carries
+    # "step 0: goto({'location': 'bedroom'})" -- info should end with the
+    # step-context suffix.
+    assert milestones[0].info == (
+        "goal accepted :) [BtNode_GotoAction/goto target] | step 0 goto: location=bedroom"
+    )
+    assert milestones[0].info.endswith("| step 0 goto: location=bedroom")
+    # scan milestone: materialise:0:0:1 carries the count step's context.
+    assert milestones[1].info == (
+        SCAN_FAILURE_FEEDBACK + " | step 1 count: object=persons pointing to the left"
+    )
+    # announce milestone: materialise:0:0:3 has empty params -- suffix has
+    # no trailing ": k=v" clause.
+    assert milestones[2].info == "0 persons | step 3 announce"
+    # tuck: no materialise SUCCESS follows announce's, so the step-3
+    # announce context is still the "most recent" one in effect.
+    assert milestones[3].info == "MOCK: auto-complete finished | step 3 announce"
     assert milestones[0].wall == "2026-08-28T10:00:01.000000Z"
 
     assert all(isinstance(m, MilestoneEvent) for m in milestones)
@@ -154,7 +193,8 @@ def test_load_run_telemetry_extracts_milestones_and_judge_events(tmp_path):
     assert [j.kind for j in judge_events] == ["POSTCONDITION", "REPLAN"]
     assert judge_events[0].name == "postcondition gate:0:0"
     assert judge_events[0].status == "FAILURE"
-    assert judge_events[0].info == POSTCONDITION_FEEDBACK
+    # Judge events get the same active step-context suffix as milestones.
+    assert judge_events[0].info == POSTCONDITION_FEEDBACK + " | step 3 announce"
     assert judge_events[1].name == "replan"
     assert judge_events[1].status == "SUCCESS"
     assert judge_events[1].info == "tree revision 1"
@@ -327,3 +367,59 @@ def test_non_utf8_events_file_returns_empty_shapes(tmp_path):
     milestones, judge_events, meta = load_run_telemetry(run_dir)
 
     assert (milestones, judge_events, meta) == ([], [], {})
+
+
+def test_materialise_step_context_stamped_onto_milestones_and_judge_events(tmp_path):
+    run_dir = _write_events(tmp_path, _build_events(), run_name="run-stepctx")
+
+    milestones, judge_events, _meta = load_run_telemetry(run_dir)
+
+    all_names = [m.name for m in milestones] + [j.name for j in judge_events]
+    assert not any(name.startswith("materialise:") for name in all_names)
+
+    by_name = {m.name: m for m in milestones}
+    assert by_name["goto target"].info.endswith("| step 0 goto: location=bedroom")
+    assert by_name["scan to count"].info.endswith(
+        "| step 1 count: object=persons pointing to the left"
+    )
+    assert by_name["announce vlm count"].info.endswith("| step 3 announce")
+
+    postcondition = next(j for j in judge_events if j.kind == "POSTCONDITION")
+    assert postcondition.info.endswith("| step 3 announce")
+
+
+def test_malformed_materialise_feedback_leaves_info_unchanged(tmp_path):
+    events = [
+        _event(
+            "tree.generated",
+            "2026-08-28T13:00:00.000000Z",
+            {
+                "tree_revision": 0,
+                "nodes": [
+                    {"id": "n_mat_bad", "node_id": "n_mat_bad", "name": "materialise:0:0:0"},
+                    {"id": "n_goto", "node_id": "n_goto", "name": "goto target"},
+                ],
+            },
+            1,
+        ),
+        _event(
+            "tree.node_states_changed",
+            "2026-08-28T13:00:01.000000Z",
+            {"nodes": [_node_state("n_mat_bad", "SUCCESS", "step X: ???")]},
+            2,
+        ),
+        _event(
+            "tree.node_states_changed",
+            "2026-08-28T13:00:02.000000Z",
+            {"nodes": [_node_state("n_goto", "SUCCESS", "goal accepted")]},
+            3,
+        ),
+    ]
+    run_dir = _write_events(tmp_path, events, run_name="run-malformed-materialise")
+
+    milestones, _judge_events, _meta = load_run_telemetry(run_dir)
+
+    assert [m.name for m in milestones] == ["goto target"]
+    # A materialise SUCCESS whose feedback doesn't parse never raises and
+    # never stamps a bogus step-context suffix onto later events.
+    assert milestones[0].info == "goal accepted"

@@ -16,7 +16,9 @@ result.
 """
 from __future__ import annotations
 
+import ast
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -54,6 +56,64 @@ _MANIP_SUBSTRINGS = ("arm", "grasp", "tuck", "gripper", "place")
 _ANNOUNCE_PREFIX = "Finished announcing "
 
 _TERMINAL_STATUSES = ("SUCCESS", "FAILURE")
+
+# "materialise:<plan>:<task>:<step>" nodes are the tree's step-dispatch
+# leaves. Their SUCCESS feedback is a Python-repr-ish call, e.g.
+# "step 0: goto({'location': 'bedroom'})" -- it names the action and
+# params for the step that is *about* to run, and always precedes the
+# milestone/judge nodes that execute that step. They are never
+# themselves robot actions or judge gates, so they must never become a
+# MilestoneEvent or JudgeEvent.
+_MATERIALISE_PREFIX = "materialise:"
+
+# Tolerant on purpose: matches "step 0: goto({'location': 'bedroom'})" and
+# "step 3: announce({})"; anything else (empty feedback, a mangled call,
+# a future format change) simply fails to match and yields no context.
+_STEP_CONTEXT_RE = re.compile(r"step\s+(\d+):\s*(\w+)\((.*)\)$")
+
+# (step_num, action, params) for the most recently seen materialise
+# SUCCESS, or None. A type alias purely for readability below.
+StepContext = Optional[tuple[str, str, dict]]
+
+
+def _parse_step_context(feedback: str) -> StepContext:
+    """Parse a materialise node's SUCCESS feedback into (step, action, params).
+
+    Never raises: a feedback string that doesn't match the expected
+    "step N: action(...)" shape returns None (no context), and params
+    that don't ast.literal_eval to a dict fall back to {}.
+    """
+    match = _STEP_CONTEXT_RE.match((feedback or "").strip())
+    if not match:
+        return None
+    step_num, action, params_str = match.groups()
+    params: dict = {}
+    params_str = params_str.strip()
+    if params_str:
+        try:
+            parsed = ast.literal_eval(params_str)
+            if isinstance(parsed, dict):
+                params = parsed
+        except Exception:
+            params = {}
+    return step_num, action, params
+
+
+def _format_step_context(context: StepContext) -> str:
+    step_num, action, params = context  # type: ignore[misc]
+    if params:
+        kv = ", ".join(f"{k}={v}" for k, v in params.items())
+        return f"step {step_num} {action}: {kv}"
+    return f"step {step_num} {action}"
+
+
+def _apply_step_context(info: str, context: StepContext) -> str:
+    if context is None:
+        return info
+    suffix = _format_step_context(context)
+    if not info:
+        return suffix
+    return f"{info} | {suffix}"
 
 # Node "type" values (tree.generated payload.nodes[].type, e.g.
 # "BtNode_WriteToBlackboard", "BtNode_BlackboardSet") that are blackboard
@@ -165,6 +225,7 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
     trajectory_id: Optional[str] = None
     max_revision = 0
     run_finished: dict[str, Any] = {}
+    active_step_context: StepContext = None
 
     for line in raw_text.splitlines():
         line = line.strip()
@@ -235,6 +296,16 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
                 feedback = node.get("feedback") or ""
                 node_type = type_map.get(node_id) if node_id else None
 
+                # materialise:<plan>:<task>:<step> nodes are step-dispatch
+                # bookkeeping, not milestones or judge gates. Their SUCCESS
+                # feedback updates the "active step context" stamped onto
+                # every subsequent milestone/judge row, until the next
+                # materialise SUCCESS replaces it.
+                if name.startswith(_MATERIALISE_PREFIX):
+                    if status == "SUCCESS":
+                        active_step_context = _parse_step_context(feedback)
+                    continue
+
                 mkind = _classify_milestone(name, node_type)
                 if mkind is not None:
                     milestones.append(
@@ -243,7 +314,9 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
                             kind=mkind,
                             name=name,
                             status=status,
-                            info=_milestone_info(mkind, feedback),
+                            info=_apply_step_context(
+                                _milestone_info(mkind, feedback), active_step_context
+                            ),
                         )
                     )
                     continue
@@ -256,7 +329,7 @@ def load_run_telemetry(run_dir: Path) -> tuple[list[MilestoneEvent], list[JudgeE
                             kind=jkind,
                             name=name,
                             status=status,
-                            info=feedback.strip(),
+                            info=_apply_step_context(feedback.strip(), active_step_context),
                         )
                     )
             continue
