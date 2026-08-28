@@ -102,7 +102,14 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # posts: live probe showed the base pressed against the wall at
     # (0.25, 2.87), v≈0, follow_path "Failed to make progress" aborting
     # every ~10 sim-s for the whole run.
-    for costmap, radius in (("local_costmap", 0.30), ("global_costmap", 0.22)):
+    # 2026-08-28 round 3 (web-research-backed, Nav2 tuning guide): with
+    # inflation below the door half-width there is no centering "cost
+    # bowl" and plans run door-post-adjacent; the robot stalled on door
+    # approaches even in open space. 0.45 on BOTH costmaps makes the
+    # 0.95 m doorway a single-channel bowl that centers the path. (If
+    # parked-near-furniture planner refusals return, lower ONLY the
+    # global radius — that was the original reason for 0.22.)
+    for costmap, radius in (("local_costmap", 0.45), ("global_costmap", 0.45)):
         node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
         inflation = node.get("inflation_layer")
         if isinstance(inflation, dict) and "inflation_radius" in inflation:
@@ -147,6 +154,26 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
             ]
             follow_path.pop("BaseObstacle.scale", None)
             follow_path["ObstacleFootprint.scale"] = 0.02
+        # PathAlign/GoalAlign at 32/24 are documented (nav2 #938) to steer
+        # "dangerously close to obstacles ... rounding corners"; the
+        # forward-point fix (nav2 #1747) recommends a short lookahead.
+        follow_path["PathAlign.scale"] = 12.0
+        follow_path["GoalAlign.scale"] = 10.0
+        follow_path["PathAlign.forward_point_distance"] = 0.1
+        follow_path["GoalAlign.forward_point_distance"] = 0.1
+
+    # SimpleProgressChecker counts XY translation only — an in-place
+    # pivot into a doorway is "zero progress", and the upstream 0.5 m /
+    # 10 s window matched our abort cadence exactly (aborts every ~10
+    # sim-seconds at the door mouth). Loosen so slow door maneuvers and
+    # pivots are not treated as being stuck.
+    controller_params = result.get("controller_server", {}).get(
+        "ros__parameters", {}
+    )
+    checker = controller_params.get("progress_checker")
+    if isinstance(checker, dict):
+        checker["required_movement_radius"] = 0.15
+        checker["movement_time_allowance"] = 30.0
     return result
 
 

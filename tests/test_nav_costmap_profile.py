@@ -159,23 +159,33 @@ class UpstreamParamsTest(unittest.TestCase):
             "nav2_costmap_2d::ObstacleLayer",
         )
 
-    def test_inflation_split_local_footprint_global_permissive(self):
-        # Doorway-wedge fix (2026-08-28): the LOCAL costmap must keep an
-        # inflation radius >= the footprint's inscribed radius (0.26) so
-        # DWB sees a gradient before the body touches a doorpost; the
-        # GLOBAL costmap stays at 0.22 so parked-near-furniture starts
-        # remain plannable.
+    def test_inflation_forms_a_doorway_cost_bowl(self):
+        # Doorway fix round 3 (Nav2 tuning guide): inflation must exceed
+        # the inscribed radius by enough that a 0.95 m doorway becomes a
+        # centering cost bowl; below it, plans legally hug the posts.
         result = prior_map_costmap_overlay(self.params)
-        local = (
-            result["local_costmap"]["local_costmap"]["ros__parameters"]
-            ["inflation_layer"]["inflation_radius"]
-        )
-        global_ = (
-            result["global_costmap"]["global_costmap"]["ros__parameters"]
-            ["inflation_layer"]["inflation_radius"]
-        )
-        self.assertEqual(local, 0.30)
-        self.assertEqual(global_, 0.22)
+        for costmap in ("local_costmap", "global_costmap"):
+            radius = (
+                result[costmap][costmap]["ros__parameters"]
+                ["inflation_layer"]["inflation_radius"]
+            )
+            self.assertEqual(radius, 0.45)
+
+    def test_progress_checker_tolerates_door_pivots(self):
+        # SimpleProgressChecker counts XY translation only; the upstream
+        # 0.5 m / 10 s window aborted every in-place door pivot.
+        result = prior_map_costmap_overlay(self.params)
+        checker = result["controller_server"]["ros__parameters"]["progress_checker"]
+        self.assertEqual(checker["required_movement_radius"], 0.15)
+        self.assertEqual(checker["movement_time_allowance"], 30.0)
+
+    def test_path_align_detuned_from_corner_hugging(self):
+        # nav2 #938 / #1747: high align scales + long forward point steer
+        # into corners.
+        result = prior_map_costmap_overlay(self.params)
+        fp = result["controller_server"]["ros__parameters"]["FollowPath"]
+        self.assertEqual(fp["PathAlign.scale"], 12.0)
+        self.assertEqual(fp["PathAlign.forward_point_distance"], 0.1)
 
     def test_footprint_is_sim_parity_not_hardware_envelope(self):
         # The upstream 0.95 m footprint models the REAL robot's rear
