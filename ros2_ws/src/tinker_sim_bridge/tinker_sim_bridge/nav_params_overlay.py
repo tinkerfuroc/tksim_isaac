@@ -154,18 +154,21 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     controller_ros = result.get("controller_server", {}).get(
         "ros__parameters", {}
     )
+    # NO RotationShim (2026-08-28, measured): the sim base has an angular
+    # DEADBAND — commanded |w|~0.08 rad/s produces ~zero actual rotation
+    # (wheel-speed differential ~2 cm/s is eaten by PhysX friction). The
+    # Humble shim ramps its rotation command from MEASURED odom velocity,
+    # so it deadlocks: command 0.084, base does not move, measured stays
+    # 0, command stays 0.084 forever (probe: 1810 cmd_vel msgs, mean and
+    # max v_x exactly 0.000, w -0.084 constant, yaw drift ~0). RPP's own
+    # rotate_to_heading ramps from the last COMMANDED velocity and
+    # crosses the deadband within cycles, so RPP runs bare.
     if "FollowPath" in controller_ros:
         controller_ros["FollowPath"] = {
-            "plugin": "nav2_rotation_shim_controller::RotationShimController",
-            "primary_controller":
+            "plugin":
                 "nav2_regulated_pure_pursuit_controller"
                 "::RegulatedPurePursuitController",
-            # Shim: pivot when path heading differs by > ~45 deg.
-            "angular_dist_threshold": 0.785,
-            "forward_sampling_distance": 0.5,
-            "rotate_to_heading_angular_vel": 0.6,
             "max_angular_accel": 2.1,
-            "simulate_ahead_time": 1.0,
             # RPP: modest speed, velocity-scaled lookahead, cost-based
             # slowdown near the doorposts, pivot on large heading error.
             "desired_linear_vel": 0.35,
@@ -181,6 +184,10 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
             "regulated_linear_scaling_min_speed": 0.1,
             "use_rotate_to_heading": True,
             "rotate_to_heading_min_angle": 0.785,
+            # Well above the sim base's measured angular deadband
+            # (~0.1 rad/s); RPP ramps toward this from the last COMMANDED
+            # velocity, so the pivot actually executes.
+            "rotate_to_heading_angular_vel": 0.6,
             "max_angular_vel": 0.6,
             "min_approach_linear_velocity": 0.05,
             "approach_velocity_scaling_dist": 0.6,
