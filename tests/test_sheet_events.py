@@ -423,3 +423,35 @@ def test_malformed_materialise_feedback_leaves_info_unchanged(tmp_path):
     # A materialise SUCCESS whose feedback doesn't parse never raises and
     # never stamps a bogus step-context suffix onto later events.
     assert milestones[0].info == "goal accepted"
+
+
+def test_third_generation_at_revision_zero_is_a_replan(tmp_path):
+    # Measured on the real corpus (289 tree.generated events, 2026-08-28):
+    # tree_revision is ALWAYS 0 -- the orchestrator never increments it --
+    # and every run emits exactly two generations (skeleton, then plan
+    # materialisation). A third generation is therefore the only telemetry
+    # signature a regenerated tree can leave, and must produce a REPLAN
+    # judge event even at revision 0. Two generations must NOT.
+    two_gens = [
+        _event("tree.generated", "2026-01-01T00:00:00Z",
+               {"tree_revision": 0, "nodes": []}, 1),
+        _event("tree.generated", "2026-01-01T00:00:10Z",
+               {"tree_revision": 0,
+                "nodes": [{"id": "a", "node_id": "a", "name": "x"}]}, 2),
+    ]
+    run_dir = _write_events(tmp_path, two_gens)
+    _m, judge_events, meta = load_run_telemetry(run_dir)
+    assert [j for j in judge_events if j.kind == "REPLAN"] == []
+    assert meta["tree_generations"] == 2
+
+    three_gens = two_gens + [
+        _event("tree.generated", "2026-01-01T00:00:20Z",
+               {"tree_revision": 0,
+                "nodes": [{"id": "a", "node_id": "a", "name": "x"}]}, 3),
+    ]
+    run_dir2 = _write_events(tmp_path, three_gens, run_name="run-001")
+    _m2, judge_events2, meta2 = load_run_telemetry(run_dir2)
+    replans = [j for j in judge_events2 if j.kind == "REPLAN"]
+    assert len(replans) == 1
+    assert replans[0].info == "tree regenerated #2 (1 nodes)"
+    assert meta2["tree_generations"] == 3
