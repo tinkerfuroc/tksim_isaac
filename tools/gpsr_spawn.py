@@ -15,10 +15,12 @@ failing this way is treated the same as a reset failure by the bench),
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Callable, Optional, Protocol, Sequence
 
@@ -113,19 +115,68 @@ def _nearest_spot_or_room(xyz, placements: dict) -> Optional[str]:
     return best_key
 
 
+def _base_scenario_counts(base_scenario: dict, placements: dict) -> tuple[Counter, Counter]:
+    """(key_counts, spot_counts).
+
+    `key_counts[(asset_key, where)]` is how many base-scenario records
+    (actors + objects) resolve to that exact key -- the count-aware form
+    of `base_scenario_keys`, used to dedupe a plan against the base
+    scenario by count, not just presence (a plan wanting 3 of an asset
+    that's already got 1 in the base scenario should still spawn 2).
+
+    `spot_counts[spot]` is how many base-scenario OBJECT records (any
+    asset -- persons/rooms are excluded, they are never grid-sloted) sit
+    at that placement `spot`. Used to grid-slot newly-spawned items so
+    they never land on the same xyz as a pre-existing base object,
+    regardless of whether that object is the same asset or not.
+    """
+    key_counts: Counter = Counter()
+    spot_counts: Counter = Counter()
+    spots = placements.get("spots", {})
+    for record in base_scenario.get("actors", []):
+        asset = _asset_key(record.get("asset_uri", ""))
+        xyz = record.get("pose", {}).get("xyz", [0.0, 0.0, 0.0])
+        where = _nearest_spot_or_room(xyz, placements)
+        if where is not None:
+            key_counts[(asset, where)] += 1
+    for record in base_scenario.get("objects", []):
+        asset = _asset_key(record.get("asset_uri", ""))
+        xyz = record.get("pose", {}).get("xyz", [0.0, 0.0, 0.0])
+        where = _nearest_spot_or_room(xyz, placements)
+        if where is not None:
+            key_counts[(asset, where)] += 1
+            if where in spots:
+                spot_counts[where] += 1
+    return key_counts, spot_counts
+
+
 def base_scenario_keys(base_scenario: dict, placements: dict) -> set[tuple[str, str]]:
     """(asset_key, spot-or-room) already present in the base scenario,
     derived by matching each spawned pose against the placement table
     (not hardcoded, so it stays correct if the base scenario changes).
     """
-    keys: set[tuple[str, str]] = set()
-    for record in (*base_scenario.get("actors", []), *base_scenario.get("objects", [])):
-        asset = _asset_key(record.get("asset_uri", ""))
-        xyz = record.get("pose", {}).get("xyz", [0.0, 0.0, 0.0])
-        where = _nearest_spot_or_room(xyz, placements)
-        if where is not None:
-            keys.add((asset, where))
-    return keys
+    key_counts, _spot_counts = _base_scenario_counts(base_scenario, placements)
+    return set(key_counts)
+
+
+def _grid_slot_xyz(where: str, k: int, placements: dict) -> Optional[tuple[float, float, float]]:
+    """The kth grid slot's xyz on placement spot `where` (`plan_scene`'s
+    own (i % 3, i // 3) * (grid_dx, grid_dy) formula, so re-sloted items
+    land on the same grid a fresh plan would have used). None if `where`
+    is not a known placement spot (e.g. it's a person room, or unknown --
+    callers keep the item's original xyz in that case).
+    """
+    spot_info = placements.get("spots", {}).get(where)
+    if spot_info is None:
+        return None
+    surface_xyz = spot_info["surface_xyz"]
+    grid_dx = spot_info["grid_dx"]
+    grid_dy = spot_info["grid_dy"]
+    return (
+        surface_xyz[0] + (k % 3) * grid_dx,
+        surface_xyz[1] + (k // 3) * grid_dy,
+        surface_xyz[2],
+    )
 
 
 def apply_plan(
@@ -137,13 +188,33 @@ def apply_plan(
     previous_manifest: Optional[dict] = None,
     on_progress: Optional[Callable[[dict], None]] = None,
 ) -> dict:
-    """Spawn every item in `plan` via `client`, skipping items whose
-    (asset, spot-or-room) already exists in the base scenario or a
-    *successful* previous-manifest entry. A previously FAILED entry
-    (`"ok": False`) does not count as present -- it is retried, and its
+    """Spawn every item in `plan` via `client`, count-aware-deduping against
+    the base scenario and a previous manifest's *successful* entries: for
+    each (asset, spot-or-room) key, `existing = (# base-scenario records
+    with that key) + (# ok:True previous-manifest entities with that
+    key)`; of the plan's items sharing that key (in plan order), the
+    first `existing` are skipped as "already present" and the rest are
+    spawned -- so e.g. a 3-instance counting command against a base
+    scenario/previous manifest that already has 1 of that asset at that
+    spot spawns the other 2, rather than treating the whole key as either
+    fully present or fully absent. A previously FAILED entry (`"ok":
+    False`) does not count toward `existing` -- it is retried, and its
     stale manifest record (matched by (asset_key, where), not item id,
     since a retried item may be replanned under a different id) is
     replaced by the fresh attempt's result.
+
+    Every item actually spawned (not skipped) is re-sloted onto a grid
+    cell of its placement spot before being handed to `client.spawn`: slot
+    index `k = (# base-scenario objects, any asset, at that spot) + (# ok
+    previous-manifest entities, any asset, at that spot) + (# items
+    already spawned at that spot earlier in *this* apply_plan call)`,
+    `xyz = surface_xyz + ((k % 3) * grid_dx, (k // 3) * grid_dy, 0)`. This
+    overrides the plan's own xyz (the planner's default slot, which does
+    not know about the base scenario or other items sharing its spot) so
+    a spawned item never overlaps a pre-existing base object or another
+    item spawned earlier in the same call. Persons (room keys, not
+    placement spots) are never re-sloted. The re-sloted xyz is what's
+    recorded in the manifest entity and what actually gets spawned.
 
     Never raises for an ordinary per-item spawn failure -- it is recorded
     in the returned manifest's entities with `"ok": False` and the loop
@@ -157,18 +228,45 @@ def apply_plan(
     can rewrite the manifest file incrementally, leaving a usable on-disk
     manifest even if the run is killed mid-plan.
     """
-    seen_keys = set(base_scenario_keys(base_scenario, placements))
+    base_key_counts, base_spot_counts = _base_scenario_counts(base_scenario, placements)
     entities: list[dict] = []
+    prev_ok_key_counts: Counter = Counter()
+    prev_ok_spot_counts: Counter = Counter()
+    prev_failed_by_key: dict[tuple, list] = defaultdict(list)
     if previous_manifest:
         for e in previous_manifest.get("entities", []):
             key = (e.get("asset_key"), e.get("where"))
             if e.get("ok"):
-                seen_keys.add(key)
+                prev_ok_key_counts[key] += 1
+                if e.get("where") in placements.get("spots", {}):
+                    prev_ok_spot_counts[e.get("where")] += 1
+            else:
+                prev_failed_by_key[key].append(e)
             entities.append(e)
 
-    def _drop_stale(key: tuple[str, str]) -> None:
-        entities[:] = [e for e in entities if (e.get("asset_key"), e.get("where")) != key]
+    existing_key_counts: Counter = Counter(base_key_counts)
+    existing_key_counts.update(prev_ok_key_counts)
+    spot_counts_so_far: Counter = Counter(base_spot_counts)
+    spot_counts_so_far.update(prev_ok_spot_counts)
 
+    def _replace_stale(key: tuple[str, str]) -> None:
+        # Pop (at most) one stale FAILED previous-manifest record for this
+        # key, matched by identity (not equality -- two distinct failed
+        # records could otherwise compare equal), and drop it from
+        # `entities` in favour of the fresh attempt about to be appended.
+        # OK previous records are never touched here -- they're already
+        # counted in `existing_key_counts` and were never candidates for
+        # a retry in the first place.
+        queue = prev_failed_by_key.get(key)
+        if not queue:
+            return
+        stale = queue.pop(0)
+        for i, existing_entity in enumerate(entities):
+            if existing_entity is stale:
+                del entities[i]
+                break
+
+    plan_key_seen: Counter = Counter()
     skipped: list[dict] = []
     not_attempted: list[dict] = []
 
@@ -182,6 +280,8 @@ def apply_plan(
         where = item.spot if item.spot else item.room
         asset_key = _asset_key(item.asset_uri)
         key = (asset_key, where)
+        idx_in_key = plan_key_seen[key]
+        plan_key_seen[key] += 1
 
         if service_down:
             not_attempted.append(
@@ -190,18 +290,26 @@ def apply_plan(
             _report()
             continue
 
-        if key in seen_keys:
+        if idx_in_key < existing_key_counts.get(key, 0):
             skipped.append({"id": item.id, "reason": "already present", "where": where})
             _report()
             continue
 
+        spawn_item = item
+        if item.spot and item.spot in placements.get("spots", {}):
+            k = spot_counts_so_far[where]
+            spot_counts_so_far[where] += 1
+            new_xyz = _grid_slot_xyz(where, k, placements)
+            if new_xyz is not None:
+                spawn_item = dataclasses.replace(item, xyz=new_xyz)
+
         entity_name = f"/World/Scenario/{item.id}"
-        pose_fields = {"xyz": list(item.xyz), "quaternion_xyzw": list(item.quaternion_xyzw)}
+        pose_fields = {"xyz": list(spawn_item.xyz), "quaternion_xyzw": list(spawn_item.quaternion_xyzw)}
         try:
-            actual = client.spawn(item)
+            actual = client.spawn(spawn_item)
         except ServiceUnavailable as exc:
             service_down = True
-            _drop_stale(key)
+            _replace_stale(key)
             entities.append(
                 {"id": item.id, "asset_key": asset_key, "where": where,
                  "entity_name": entity_name, "ok": False, "error": repr(exc), **pose_fields}
@@ -209,15 +317,14 @@ def apply_plan(
             _report()
             continue
         except Exception as exc:  # noqa: BLE001 - never crash a bench run
-            _drop_stale(key)
+            _replace_stale(key)
             entities.append(
                 {"id": item.id, "asset_key": asset_key, "where": where,
                  "entity_name": entity_name, "ok": False, "error": repr(exc), **pose_fields}
             )
             _report()
             continue
-        seen_keys.add(key)
-        _drop_stale(key)
+        _replace_stale(key)
         entities.append(
             {"id": item.id, "asset_key": asset_key, "where": where,
              "entity_name": actual, "ok": True, **pose_fields}
@@ -272,13 +379,25 @@ def clear_manifest(
 
 def emit_scenario(plans: Sequence[ScenePlan], base_scenario: dict, placements: dict) -> dict:
     """Merge every plan's items into a COPY of base_scenario (base_scenario
-    itself is never mutated). Dedupe by (asset, spot-or-room) against the
-    base scenario; when two plans want the same (asset, spot-or-room),
-    the plan that proposed MORE instances of it wins outright (its whole
-    item group is used, the smaller plan's group is dropped).
+    itself is never mutated). Count-aware dedupe against the base scenario,
+    same rule as `apply_plan`: for each (asset, spot-or-room) key, the
+    merge target is `max(plan count, existing base-scenario count)` -- so
+    only the plan count's excess over what's already in the base scenario
+    is actually appended (a plan wanting 3 of an asset the base scenario
+    already has 1 of adds 2, not 0 and not 3). When two plans want the
+    same key, the plan that proposed MORE instances of it wins outright
+    (its whole item group is used, the smaller plan's group is dropped) --
+    unchanged from before.
+
+    Every appended item is re-sloted the same way `apply_plan` re-slots a
+    spawn: grid slot `k = (# base-scenario objects, any asset, at that
+    spot) + (# items already merged into that spot earlier in *this*
+    emit_scenario call)`, so a merged item never lands on the same xyz as
+    a pre-existing base object (of any asset) or another item merged
+    earlier in the same call. Persons (room keys) are never re-sloted.
     """
     merged = json.loads(json.dumps(base_scenario))
-    existing = base_scenario_keys(base_scenario, placements)
+    existing_key_counts, base_spot_counts = _base_scenario_counts(base_scenario, placements)
 
     best: dict[tuple[str, str], list[SpawnItem]] = {}
     for plan in plans:
@@ -288,22 +407,34 @@ def emit_scenario(plans: Sequence[ScenePlan], base_scenario: dict, placements: d
             key = (_asset_key(item.asset_uri), where)
             per_plan.setdefault(key, []).append(item)
         for key, group in per_plan.items():
-            if key in existing:
-                continue
             if key not in best or len(group) > len(best[key]):
                 best[key] = group
 
-    for (_asset_key_value, where), group in best.items():
+    spot_counts_so_far: Counter = Counter(base_spot_counts)
+    for key, group in best.items():
+        _asset_key_value, where = key
+        existing_count = existing_key_counts.get(key, 0)
+        to_add = group[existing_count:]
+        if not to_add:
+            continue
         target_list = merged["actors"] if group[0].kind == "person" else merged["objects"]
-        for item in group:
+        for item in to_add:
+            spawn_item = item
+            if item.spot and item.spot in placements.get("spots", {}):
+                k = spot_counts_so_far[where]
+                spot_counts_so_far[where] += 1
+                new_xyz = _grid_slot_xyz(where, k, placements)
+                if new_xyz is not None:
+                    spawn_item = dataclasses.replace(item, xyz=new_xyz)
             target_list.append(
                 {
                     # Suffixed by `where` so two different (asset, where)
                     # groups across different plans can never collide on
                     # id even if their SpawnItem ids happened to match.
-                    "id": f"{item.id}__{where}",
-                    "asset_uri": item.asset_uri,
-                    "pose": {"xyz": list(item.xyz), "quaternion_xyzw": list(item.quaternion_xyzw)},
+                    "id": f"{spawn_item.id}__{where}",
+                    "asset_uri": spawn_item.asset_uri,
+                    "pose": {"xyz": list(spawn_item.xyz),
+                             "quaternion_xyzw": list(spawn_item.quaternion_xyzw)},
                 }
             )
     return merged
