@@ -49,6 +49,15 @@ def test_aa_op_dlaa_is_the_native_resolution_op():
     assert AA_OP_DLAA == 4
 
 
+def test_initialize_accepts_stable_aa_cameras_keyword():
+    import inspect
+    from tinker_sim_isaac.camera_rig import CameraRig
+    params = inspect.signature(CameraRig.initialize).parameters
+    assert "stable_aa_cameras" in params
+    assert params["stable_aa_cameras"].default is None
+    assert params["stable_aa_cameras"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 def test_initialize_accepts_stable_aa_keyword():
     # Pure signature check (no GPU/Isaac needed): confirms the wiring point
     # run_sim.py's sensor-rich block depends on (camera_rig.initialize(app,

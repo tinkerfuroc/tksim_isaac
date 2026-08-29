@@ -24,6 +24,15 @@ HORIZONTAL_APERTURE_MM = 20.955
 #: See ``CameraRig.initialize(..., stable_aa=True)`` for why this matters.
 AA_OP_DLAA = 4
 
+#: Per-render-product token equivalent of ``AA_OP_DLAA``, for the
+#: ``omni:rtx:post:aa:op`` USD attribute on an individual render product's
+#: ``UsdRender.Product`` prim -- unlike the global ``/rtx/post/aa/op`` carb
+#: setting (an int enum), this attribute is USD-schema-typed as a token
+#: with a *different* label for the same DLAA op (confirmed against
+#: ``omni.usd.schema.render_settings.rtx``'s own test, which asserts
+#: ``settings.get("/rtx/post/aa/op") == 4`` maps to this exact token).
+AA_OP_DLAA_TOKEN = "rtxaa"
+
 
 #: Last-seen annotator buffer pointer per (camera, kind), used to log pool
 #: churn events for the whole run while ``TINKER_SIM_CAMERA_DEBUG`` is on.
@@ -498,12 +507,27 @@ class CameraRig:
             10 if os.environ.get("TINKER_SIM_CAMERA_DEBUG") == "1" else 0
         )
 
-    def initialize(self, app: Any, *, stable_aa: bool = False) -> None:
+    def initialize(
+        self,
+        app: Any,
+        *,
+        stable_aa: bool = False,
+        stable_aa_cameras: frozenset[str] | None = None,
+    ) -> None:
         """Create this rig's RTX cameras.
 
         ``stable_aa``: force DLSS to its native-resolution ``DLAA`` op
         (``AA_OP_DLAA``) instead of its default ``DLSS`` Super Resolution op
         *before* any render product in ``self.specs`` is created.
+
+        ``stable_aa_cameras``: when given (and ``stable_aa`` is set), scope
+        the DLAA pin to only the named cameras' render products, authoring
+        ``omni:rtx:post:aa:op`` directly on each one's ``UsdRender.Product``
+        prim instead of touching the global ``/rtx/post/aa/op`` setting --
+        confirmed per-render-product-overridable by probing a live render
+        product's authored attributes (see the developer log, Task 4a).
+        ``None`` (the default) keeps the old global-setting behaviour, which
+        pins every render product regardless of name.
 
         Root cause this works around: DLSS's default op auto-picks an
         internal render resolution below the render product's declared
@@ -523,7 +547,13 @@ class CameraRig:
         and the race it enables -- cannot happen. Scoped to ``stable_aa``
         (set only when the arena camera pushes the render-product count to
         3+; see ``run_sim.py``) so hardware-parity-only runs keep their
-        previously-verified-stable default AA behaviour unchanged.
+        previously-verified-stable default AA behaviour unchanged. Further
+        scoped to just the arena camera's render product via
+        ``stable_aa_cameras`` (see ``run_sim.py``) once Task 4a confirmed the
+        parity cameras don't need the pin at all -- the global setting had
+        been taxing their render cost too (measured: ~80% of the arena
+        camera's RTF hit was this DLAA switch alone, applied to every render
+        product including the two that never resize).
         """
         from isaacsim.core.utils.extensions import enable_extension
 
@@ -531,7 +561,7 @@ class CameraRig:
         for _ in range(4):
             app.update()
 
-        if stable_aa:
+        if stable_aa and stable_aa_cameras is None:
             import carb.settings
 
             carb.settings.get_settings().set_int("/rtx/post/aa/op", AA_OP_DLAA)
@@ -631,6 +661,27 @@ class CameraRig:
                 resolution=(spec.height, spec.width),
                 annotators=annotators,
             )
+            if (
+                stable_aa
+                and stable_aa_cameras is not None
+                and spec.name in stable_aa_cameras
+            ):
+                # Per-product DLAA pin: author the same op the global
+                # setting above would otherwise set everywhere, but only on
+                # this camera's own render product prim, so the parity
+                # cameras (not in ``stable_aa_cameras``) keep their default,
+                # cheaper AA op untouched. The attribute is already present
+                # (pre-authored by the render-product schema, confirmed by
+                # probing a live prim -- see the developer log, Task 4a), so
+                # ``GetAttribute`` finds it rather than needing to create
+                # it -- but it is USD-token-typed, not int-typed like the
+                # global carb setting, hence ``AA_OP_DLAA_TOKEN`` and not
+                # ``AA_OP_DLAA`` here (a first attempt with the int raised
+                # ``Type mismatch ... expected 'TfToken', got 'int'``; see
+                # the developer log, Task 4a).
+                self._sensors[spec.name].render_product.GetPrim().GetAttribute(
+                    "omni:rtx:post:aa:op"
+                ).Set(AA_OP_DLAA_TOKEN)
             # Pinned (page-locked) host buffers, sized to what rgb8_array/
             # depth_to_16uc1_mm expect (post RGBA->RGB slice for rgb; already
             # metres->16UC1-mm converted, on the GPU, for depth -- see

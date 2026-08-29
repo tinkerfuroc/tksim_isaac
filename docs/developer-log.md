@@ -89,7 +89,99 @@ none of it. DLAA is the tax.
 
 Decision: Task 4a
 
-## 2026-08-26 — GPSR recorded sim battery bring-up
+### Phase 1a — scoping the DLAA pin
+
+Task 4a: stop the global `/rtx/post/aa/op` DLAA pin from taxing the
+hardware-parity (head/wrist) cameras' render cost while keeping the arena
+camera's CUDA-700 workaround intact. Two sub-approaches, tried in order,
+per-render-product override first.
+
+**Step 1 — probe (04:11:50 EDT, sensor-rich, `TINKER_SIM_ARENA_CAMERA=1
+TINKER_SIM_CAMERA_DEBUG=1`, GPU 1, 20 s sim duration, clean exit).** A
+temporary print in `CameraRig.initialize` after each `CameraSensor` is
+created, listing every `aa`/`dlss`-named attribute already authored on that
+camera's `UsdRender.Product` prim:
+
+```
+[probe] head_camera /Render/OmniverseKit/HydraTextures/camera_sensor_7993988978446 ['omni:rtx:dlss:frameGeneration', 'omni:rtx:post:aa:autoExposureMode', 'omni:rtx:post:aa:exposure', 'omni:rtx:post:aa:exposureMultiplier', 'omni:rtx:post:aa:limitedOps', 'omni:rtx:post:aa:op', 'omni:rtx:post:aa:sharpness', 'omni:rtx:post:dlss:execMode', 'omni:rtx:post:dlss:manualScaling', 'omni:rtx:post:fxaa:quality:edgeThreshold', 'omni:rtx:post:fxaa:quality:edgeThresholdMin', 'omni:rtx:post:fxaa:quality:subPixel', 'omni:rtx:post:taa:alpha', 'omni:rtx:post:taa:colorBoxSigma', 'omni:rtx:post:taa:samples', 'omni:rtx:pt:dlss:enabled', 'omni:rtx:scene:GPUProceduralAABB:enabled']
+[probe] wrist_camera /Render/OmniverseKit/HydraTextures/camera_sensor_7993988978335 ['omni:rtx:dlss:frameGeneration', 'omni:rtx:post:aa:autoExposureMode', 'omni:rtx:post:aa:exposure', 'omni:rtx:post:aa:exposureMultiplier', 'omni:rtx:post:aa:limitedOps', 'omni:rtx:post:aa:op', 'omni:rtx:post:aa:sharpness', 'omni:rtx:post:dlss:execMode', 'omni:rtx:post:dlss:manualScaling', 'omni:rtx:post:fxaa:quality:edgeThreshold', 'omni:rtx:post:fxaa:quality:edgeThresholdMin', 'omni:rtx:post:fxaa:quality:subPixel', 'omni:rtx:post:taa:alpha', 'omni:rtx:post:taa:colorBoxSigma', 'omni:rtx:post:taa:samples', 'omni:rtx:pt:dlss:enabled', 'omni:rtx:scene:GPUProceduralAABB:enabled']
+[probe] arena_camera /Render/OmniverseKit/HydraTextures/camera_sensor_7993988977774 ['omni:rtx:dlss:frameGeneration', 'omni:rtx:post:aa:autoExposureMode', 'omni:rtx:post:aa:exposure', 'omni:rtx:post:aa:exposureMultiplier', 'omni:rtx:post:aa:limitedOps', 'omni:rtx:post:aa:op', 'omni:rtx:post:aa:sharpness', 'omni:rtx:post:dlss:execMode', 'omni:rtx:post:dlss:manualScaling', 'omni:rtx:post:fxaa:quality:edgeThreshold', 'omni:rtx:post:fxaa:quality:edgeThresholdMin', 'omni:rtx:post:fxaa:quality:subPixel', 'omni:rtx:post:taa:alpha', 'omni:rtx:post:taa:colorBoxSigma', 'omni:rtx:post:taa:samples', 'omni:rtx:pt:dlss:enabled', 'omni:rtx:scene:GPUProceduralAABB:enabled']
+```
+
+`omni:rtx:post:aa:op` is authored on every render product individually →
+approach (i), per-render-product scoping, is possible. Probe removed
+before commit.
+
+**Approach chosen: (i), per-render-product override.** Added
+`CameraRig.initialize(..., stable_aa_cameras: frozenset[str] | None = None)`:
+when given, the global `carb.settings` call is skipped and
+`omni:rtx:post:aa:op` is instead set directly on the named cameras' own
+render-product prims (`run_sim.py` passes `frozenset({"arena_camera"})`).
+`stable_aa_cameras=None` keeps the old global-setting path byte-for-byte,
+so any caller that doesn't pass it (there are none left after this change)
+sees no behaviour change.
+
+**Implementation bug found and fixed along the way.** The first attempt
+authored the attribute with the same int the global carb setting takes
+(`AA_OP_DLAA = 4`) via `GetAttribute("omni:rtx:post:aa:op").Set(4)`. This
+surfaced immediately, not as a CUDA-700 recurrence but as a Python
+exception during the first crash-recipe attempt (`up start` 04:15:30 EDT,
+`gpsr_stack_logs/20260829T041530/01-sim.log`):
+
+```
+pxr.Tf.ErrorException:
+	Error in 'pxrInternal_v0_25_11__pxrReserved__::UsdStage::_SetValueImpl' at line 7058 in file /builds/omniverse/usd-ci/conan/src/0.25.11.kit.2/pxr/usd/usd/stage.cpp : 'Type mismatch for </Render/OmniverseKit/HydraTextures/camera_sensor_8499610349849.omni:rtx:post:aa:op>: expected 'TfToken', got 'int''
+```
+
+Unlike the global carb setting, the per-render-product `omni:rtx:post:aa:op`
+USD attribute is token-typed, with a *five-token* enum
+(`["none", "taa", "fxaa", "dlss", "rtxaa"]`, from
+`omni.usd.schema.render_settings.rtx`'s `generatedSchema.usda`) that
+doesn't literally spell "dlaa". That extension's own test
+(`test_render_settings.py::test_carb_command_line`) asserts
+`settings.get("/rtx/post/aa/op") == 4` maps to token `"rtxaa"` — confirmed
+as the DLAA-equivalent token, added as `AA_OP_DLAA_TOKEN = "rtxaa"` in
+`camera_rig.py` and used for the per-product `.Set()` call instead of the
+int constant. A follow-up 20 s sanity run (04:26:11 EDT, same recipe as
+the Step 1 probe) completed cleanly with the fix in place, before starting
+the real crash recipe.
+
+**Step 5 — crash recipe, 3×5 min, `./scripts/gpsr-stack up --scenario
+gpsr-rcw2026-bench --sim-gpu 1` (arena camera on by default in this
+recipe), teardown via `./scripts/gpsr-stack down` between runs, GPU 1
+confirmed free before each:**
+
+| run | up start (EDT) | bring-up | sim watch window | teardown | result |
+|---|---|---|---|---|---|
+| 1 | 04:28:29 | 72 s (rc=0) | 300 s total, clean | 04:33:28 → 04:33:39 | no `error 700` / illegal memory access / Traceback in `gpsr_stack_logs/20260829T042828/01-sim.log` |
+| 2 | 04:34:04 | 72 s (rc=0) | 300 s total, clean | 04:39:04 → 04:39:17 | no `error 700` / illegal memory access / Traceback in `gpsr_stack_logs/20260829T043404/01-sim.log` |
+| 3 | 04:39:36 | 86 s (rc=0) | 300 s total, clean | 04:44:36 → 04:44:47 | no `error 700` / illegal memory access / Traceback in `gpsr_stack_logs/20260829T043936/01-sim.log` |
+
+Clean 3/3. All three sim logs show `[sim] arena camera enabled at 2 Hz,
+960x540 -> /sim/arena_camera/image_raw` and run the full 300 s watch
+window before teardown; the only errors present are unrelated benign
+shutdown-time warnings (`Pattern '/World/Scenario/soup' did not match any
+rigid bodies`, a physx-tensors cleanup message, present in all three runs
+of Task 3's Phase 0 sweep too).
+
+**Re-measure (sim-only, GPU 1, `TINKER_SIM_PROFILE=1`, variants A and B of
+`scripts/arena-rtf-spike`, run by hand — `outputs/rtf-remeasure-4a/run_ab.sh`,
+not committed):**
+
+| variant | windows | kit_pump ms | cameras ms | physics ms | wall ms | RTF |
+|---|---|---|---|---|---|---|
+| A_arena_off | 118 | 37.1 | 13.6 | 49.0 | 115.9 | 0.72 |
+| B_arena_2hz | 121 | 44.1 | 15.7 | 50.5 | 127.1 | 0.66 |
+
+`B - A` = 44.1 - 37.1 = **7.0 ms**, down from Task 3's 62.1 ms — a shrink of
+55.1 ms, exceeding the 49.9 ms (`D - A`) predicted shrink from Task 3's
+decision rule (some of the gap is run-to-run variance: `A` itself came in
+4 ms lower than Task 3's 41.0 ms baseline). RTF for the arena-camera-on
+variant recovers from 0.44 (Task 3, global pin) to 0.66 (scoped pin),
+close to the arena-camera-off baseline's 0.72. The scoped pin removes
+essentially all of the DLAA tax from the parity cameras while the arena
+camera itself still gets DLAA (crash workaround intact, confirmed by the
+3/3 clean crash recipe above).
 
 `scripts/gpsr-stack up/down/status` automates Stages 1-5 of
 `docs/gpsr-sim-runbook.md` (Stage 6, the GPSR orchestrator, still lives in

@@ -1076,11 +1076,20 @@ def main() -> int:
             # docstring). Runs with just the two hardware-parity cameras
             # keep the previously-verified-stable default AA behaviour.
             # TINKER_SIM_STABLE_AA can force this decision either way for
-            # the RTF spike -- see _stable_aa_requested.
+            # the RTF spike -- see _stable_aa_requested. Scoped to just the
+            # arena camera's render product (stable_aa_cameras): Task 4a
+            # measured the DLAA pin taxing the hardware-parity cameras too
+            # when set globally (~80% of the arena camera's RTF hit was this
+            # switch alone), even though only the arena camera's render
+            # product ever hits the live-resize race the pin guards against.
             stable_aa = _stable_aa_requested(arena_camera_enabled, os.environ)
             if stable_aa != arena_camera_enabled:
                 print(f"[sim] stable_aa forced to {stable_aa} by {STABLE_AA_ENV}", flush=True)
-            camera_rig.initialize(app, stable_aa=stable_aa)
+            camera_rig.initialize(
+                app,
+                stable_aa=stable_aa,
+                stable_aa_cameras=frozenset({"arena_camera"}) if stable_aa else None,
+            )
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
             gateway = RosStandardGateway(
