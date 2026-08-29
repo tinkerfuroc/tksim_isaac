@@ -567,3 +567,67 @@ def test_build_judge_sheet_survives_a_corrupt_scene_plan(tmp_path):
     out = build_judge_sheet(tmp_path, meta, tmp_path / "judge-badscene.jpg")
     assert out is not None
     assert out.exists()
+
+
+def test_scene_summary_line_non_dict_top_level_returns_none(tmp_path):
+    # Syntactically valid JSON whose top level isn't a dict (a bare list
+    # here) must degrade like a parse error, not raise AttributeError out
+    # of data.get("items").
+    (tmp_path / "scene-plan.json").write_text(json.dumps([]))
+    assert _scene_summary_line(tmp_path) is None
+
+
+def test_build_judge_sheet_survives_a_non_dict_scene_plan(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    (tmp_path / "scene-plan.json").write_text(json.dumps([]))
+    meta = {"id": "c015", "verdict": "PASS"}
+    out = build_judge_sheet(tmp_path, meta, tmp_path / "judge-listscene.jpg")
+    assert out is not None
+    assert out.exists()
+
+
+def test_scene_summary_line_caps_at_12_keys_with_more_suffix(tmp_path):
+    items = [
+        {"id": f"cmd_item_{i}", "kind": "object", "name": f"item{i}",
+         "spot": f"spot{i}", "room": "kitchen"}
+        for i in range(15)
+    ]
+    (tmp_path / "scene-plan.json").write_text(json.dumps({"items": items}))
+    line = _scene_summary_line(tmp_path)
+    assert line is not None
+    assert line.endswith("+3 more")
+
+
+def test_build_judge_sheet_header_grows_for_long_scene_summary(tmp_path):
+    items = [
+        {"id": f"cmd_item_{i}", "kind": "object", "name": f"item{i}",
+         "spot": f"spot{i}", "room": "kitchen"}
+        for i in range(15)
+    ]
+    meta = {"id": "c016", "text": "x", "verdict": "PASS", "seconds": 1.0, "tier": "T2"}
+
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    (tmp_path / "scene-plan.json").write_text(json.dumps({"items": items}))
+    tall_out = build_judge_sheet(tmp_path, meta, tmp_path / "judge-tall.jpg")
+    assert tall_out is not None
+
+    short_dir = tmp_path / "short"
+    short_dir.mkdir()
+    _mk_frames(short_dir, "arena", 5)
+    _mk_frames(short_dir, "head", 5)
+    _mk_judge_events(short_dir)
+    (short_dir / "scene-plan.json").write_text(json.dumps({
+        "items": [
+            {"id": "cmd_bleach_0", "kind": "object", "name": "bleach",
+             "spot": "kitchen_table", "room": "kitchen"},
+        ],
+    }))
+    short_out = build_judge_sheet(short_dir, meta, short_dir / "judge-short.jpg")
+    assert short_out is not None
+
+    with Image.open(tall_out) as tall_img, Image.open(short_out) as short_img:
+        assert tall_img.height > short_img.height

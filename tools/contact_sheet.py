@@ -96,6 +96,8 @@ PLAN_WRAP_WIDTH = 140  # judge sheet is 960px wide; header's TEXT_WRAP_WIDTH
 # (96) was tuned for the 640px-wide portrait/event sheet header.
 PLAN_LINE_H = 16
 PLAN_PAD = 6
+SCENE_SUMMARY_MAX_KEYS = 12  # distinct name@spot/person@room keys shown before "+N more"
+EXTRA_LINE_MAX_LINES = 6  # cap on wrapped header lines for the detail/scene extra line
 
 TRANSCRIPT_CAP = 25
 TRANSCRIPT_LINE_H = 16
@@ -341,13 +343,35 @@ def _draw_label_block(draw: ImageDraw.ImageDraw, font, x: int, y: int, h: int, e
         )
 
 
+HEADER_EXTRA_LINE_H = 20  # matches the 20px row spacing _draw_header uses for extra lines
+
+
+def _header_height(extra_line_count: int) -> int:
+    """Header band height needed to fit `extra_line_count` wrapped extra
+    lines (the judge sheet's detail/scene line) below the command text.
+    HEADER_H already has slack for exactly one extra line without growing
+    (the original, still-supported case); each additional line grows the
+    header by one text row.
+    """
+    if not extra_line_count:
+        return HEADER_H
+    return HEADER_H + HEADER_EXTRA_LINE_H * max(0, extra_line_count - 1)
+
+
 def _draw_header(
-    draw: ImageDraw.ImageDraw, font, width: int, meta: dict, extra_line: Optional[str] = None
+    draw: ImageDraw.ImageDraw,
+    font,
+    width: int,
+    meta: dict,
+    extra_lines: Optional[Sequence[str]] = None,
+    header_h: int = HEADER_H,
 ) -> None:
     """Draw the shared header band: run id / verdict / seconds / tier, then
-    up to 2 wrapped lines of the command text. `extra_line`, when given (the
-    judge sheet's bench-detail line), is drawn on the next line -- HEADER_H
-    already has slack past 2 wrapped text lines to fit it without growing.
+    up to 2 wrapped lines of the command text. `extra_lines`, when given
+    (the judge sheet's bench-detail/scene lines), are drawn one per row
+    starting on the next line. `header_h` must match what `_header_height`
+    returned for `len(extra_lines)` -- the caller sizes the sheet image to
+    it before calling this, so the separator line drawn here has to agree.
     """
     verdict = str(meta.get("verdict", ""))
     color = VERDICT_COLORS.get(verdict, DEFAULT_VERDICT_COLOR)
@@ -362,10 +386,12 @@ def _draw_header(
     for i, line in enumerate(text_lines):
         draw.text((8, 6 + 20 * (i + 1)), line, fill="black", font=font)
 
-    if extra_line:
-        draw.text((8, 6 + 20 * (len(text_lines) + 1)), extra_line, fill="#555555", font=font)
+    if extra_lines:
+        base_y = 6 + 20 * (len(text_lines) + 1)
+        for i, line in enumerate(extra_lines):
+            draw.text((8, base_y + 20 * i), line, fill="#555555", font=font)
 
-    draw.line([(0, HEADER_H - 1), (width, HEADER_H - 1)], fill="#cccccc")
+    draw.line([(0, header_h - 1), (width, header_h - 1)], fill="#cccccc")
 
 
 def build_sheet(run_dir: Path, meta: dict, out: Path, columns: int = 12) -> Path:
@@ -519,34 +545,46 @@ def _scene_summary_line(run_dir: Path) -> Optional[str]:
     """Summarize <run_dir>/scene-plan.json's spawned items for the judge-
     sheet header, e.g. "scene: bleach@kitchen_table x1, person@bedroom
     x1" -- so a reviewer can see what the arena actually contained.
-    Missing/corrupt/empty file -> None; never raises.
+    Distinct keys beyond SCENE_SUMMARY_MAX_KEYS collapse into a trailing
+    "+N more". Missing/corrupt/malformed/empty file -> None; never raises
+    -- everything past the file read is wrapped in one try/except so a
+    syntactically-valid-but-wrong-shaped payload (a JSON array, `null`, a
+    bare string, ...) degrades the same way a parse error does instead of
+    raising out of this function and dropping the whole judge sheet.
     """
     plan_path = Path(run_dir) / "scene-plan.json"
     if not plan_path.is_file():
         return None
     try:
         data = json.loads(plan_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        items = data.get("items")
+        if not isinstance(items, list) or not items:
+            return None
+        counts: dict[str, int] = {}
+        order: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("kind") == "person":
+                key = f"person@{item.get('room', '?')}"
+            else:
+                spot = item.get("spot") or item.get("room", "?")
+                key = f"{item.get('name', '?')}@{spot}"
+            if key not in counts:
+                order.append(key)
+            counts[key] = counts.get(key, 0) + 1
+        if not order:
+            return None
+        displayed = order[:SCENE_SUMMARY_MAX_KEYS]
+        parts = [f"{key} x{counts[key]}" for key in displayed]
+        remaining = len(order) - len(displayed)
+        if remaining > 0:
+            parts.append(f"+{remaining} more")
+        return "scene: " + ", ".join(parts)
     except Exception:
         return None
-    items = data.get("items")
-    if not isinstance(items, list) or not items:
-        return None
-    counts: dict[str, int] = {}
-    order: list[str] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if item.get("kind") == "person":
-            key = f"person@{item.get('room', '?')}"
-        else:
-            spot = item.get("spot") or item.get("room", "?")
-            key = f"{item.get('name', '?')}@{spot}"
-        if key not in counts:
-            order.append(key)
-        counts[key] = counts.get(key, 0) + 1
-    if not order:
-        return None
-    return "scene: " + ", ".join(f"{key} x{counts[key]}" for key in order)
 
 
 def build_judge_sheet(run_dir: Path, meta: dict, out: Path) -> Optional[Path]:
@@ -583,7 +621,13 @@ def _build_judge_sheet(run_dir: Path, meta: dict, out: Path, judge_events: list)
         extra_parts.append(f"detail: {detail}")
     if scene_summary:
         extra_parts.append(scene_summary)
-    extra_line = " | ".join(extra_parts) if extra_parts else None
+    extra_text = " | ".join(extra_parts) if extra_parts else None
+    extra_lines = (
+        _wrapped_text_lines(extra_text, EXTRA_LINE_MAX_LINES, width=PLAN_WRAP_WIDTH)
+        if extra_text
+        else []
+    )
+    header_h = _header_height(len(extra_lines))
 
     plan_lines = _plan_block_lines(meta.get("plan"))
     plan_h = (PLAN_PAD * 2 + PLAN_LINE_H * len(plan_lines)) if plan_lines else 0
@@ -615,14 +659,14 @@ def _build_judge_sheet(run_dir: Path, meta: dict, out: Path, judge_events: list)
 
     events_h = sum(r["row_h"] for r in rows) if rows else PLACEHOLDER_H
 
-    total_h = HEADER_H + plan_h + LABEL_BAND_H + events_h + transcript_h
+    total_h = header_h + plan_h + LABEL_BAND_H + events_h + transcript_h
     sheet = Image.new("RGB", (width, total_h), "white")
     draw = ImageDraw.Draw(sheet)
     font = ImageFont.load_default()
 
-    _draw_header(draw, font, width, meta, extra_line=extra_line)
+    _draw_header(draw, font, width, meta, extra_lines=extra_lines, header_h=header_h)
 
-    y = HEADER_H
+    y = header_h
     if plan_lines:
         draw.rectangle([0, y, width, y + plan_h], fill="#fafafa")
         for i, line in enumerate(plan_lines):
