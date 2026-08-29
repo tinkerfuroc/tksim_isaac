@@ -70,17 +70,19 @@ def test_s2026_002_counts_persons_spawns_no_objects_and_a_bedroom_person(knowled
     assert person.xyz == pytest.approx((0.28, 1.755, 0.0))
 
 
-def test_s2026_003_finds_kitchen_item_category_at_the_named_placement_spot(knowledge, placements):
-    # The command names both a search room ("living_room") and a final
-    # placement spot ("kitchen_table"); the literal Where rule scans every
-    # known SPOT before any room, so the spot wins and objects spawn at
-    # kitchen_table, not living_room.
+def test_s2026_003_finds_kitchen_item_category_at_the_first_mentioned_room(knowledge, placements):
+    # The command names both a search room ("living_room") and a later
+    # placement spot ("kitchen_table"); objects resolve to the
+    # FIRST-MENTIONED location in text order, so the search room
+    # (living_room, at its first search spot: sofa) wins -- not the later
+    # kitchen_table placement destination.
     text = "locate a kitchen item in the living_room then grasp it and place it on the kitchen_table"
     plan = plan_scene(text, knowledge, placements, seed=2026)
 
     assert _names(plan.items) == ["bleach", "bowl", "mustard"]
-    assert all(it.spot == "kitchen_table" for it in plan.items)
-    assert all(it.room == "kitchen" for it in plan.items)
+    assert all(it.spot == "sofa" for it in plan.items)
+    assert all(it.room == "living_room" for it in plan.items)
+    assert all(it.spot != "kitchen_table" for it in plan.items)
 
 
 def test_s2026_004_explicit_pudding_box_at_side_table_02_no_person(knowledge, placements):
@@ -235,3 +237,49 @@ def test_malformed_placements_missing_spots_key_never_raises(knowledge):
     plan = plan_scene("bring me a mug", knowledge, {}, seed=1)
     assert plan.items == ()
     assert any("no placement entry" in note for note in plan.notes)
+
+
+# --- fix round 2 --------------------------------------------------------------
+# Issue: objects resolve to the FIRST-MENTIONED location in text order among
+# all spot and room mentions (position, not spot-vs-room priority). The
+# s2026-003 corpus regression itself is covered above by
+# test_s2026_003_finds_kitchen_item_category_at_the_first_mentioned_room.
+
+def test_bedroom_first_then_named_spot_still_resolves_to_that_spot(knowledge, placements):
+    # "bedroom" is named first; its first search spot is side_table_02,
+    # which also happens to be the later-named spot -- same result as
+    # before the fix, but now via first-mention-wins rather than
+    # spot-priority.
+    text = "go to the bedroom then locate a pudding_box and fetch it and put it on the side_table_02"
+    plan = plan_scene(text, knowledge, placements, seed=2026)
+
+    assert len(plan.items) == 1
+    item = plan.items[0]
+    assert item.name == "pudding_box"
+    assert item.spot == "side_table_02"
+    assert item.room == "bedroom"
+
+
+def test_spot_only_text_is_unaffected_by_first_mention_change(knowledge, placements):
+    text = "bring me a spam from the laundry_desk"
+    plan = plan_scene(text, knowledge, placements, seed=1)
+
+    assert len(plan.items) == 1
+    item = plan.items[0]
+    assert item.name == "spam"
+    assert item.spot == "laundry_desk"
+    assert item.room == "laundry_room"
+
+
+def test_first_mentioned_spot_wins_over_a_later_mentioned_room(knowledge, placements):
+    # "kitchen_table" (a spot) is named before "bedroom" (a room); the
+    # first-mentioned spot wins even though it appears first among mixed
+    # spot/room mentions.
+    text = "take the mug from the kitchen_table to the bedroom"
+    plan = plan_scene(text, knowledge, placements, seed=1)
+
+    assert len(plan.items) == 1
+    item = plan.items[0]
+    assert item.name == "mug"
+    assert item.spot == "kitchen_table"
+    assert item.room == "kitchen"

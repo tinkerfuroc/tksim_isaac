@@ -130,24 +130,52 @@ def _match_category(text: str) -> Optional[str]:
 
 
 def _resolve_location(text: str, knowledge: dict) -> tuple[Optional[str], Optional[str]]:
-    """Return (room, spot) from an explicit mention in `text`. An explicit
-    placement spot wins over an explicit room name (its owning room is
-    used); neither present returns (None, None). Longest-name-first so
-    "side_table_02" is preferred over the "side_table" it starts with.
+    """Return (room, spot) from the FIRST-MENTIONED location in `text`,
+    by text order (`match.start()`) across every known SPOT and ROOM name
+    together -- not spot-vs-room priority. A spot resolves to itself; a
+    room resolves to its first `search_spots` entry. Within a tie at the
+    same start position, longest-name-first so "side_table_02" is
+    preferred over the "side_table" it starts with. Neither present
+    returns (None, None).
+
+    A category phrase (e.g. "kitchen item") is masked out of the text
+    before location matching: the room "kitchen" is a substring word of
+    that category name and must never be mistaken for a location mention
+    of the room -- e.g. "locate a kitchen item in the living_room" must
+    not resolve to the kitchen via the word "kitchen" inside "kitchen
+    item".
     """
     search_spots = knowledge["search_spots"]
     spot_to_room = {
         s: r for r, spots in search_spots.items() if not r.startswith("_") for s in spots
     }
-    for spot in sorted(spot_to_room, key=lambda s: (-len(s), s)):
-        if _text_contains(text, spot):
-            return spot_to_room[spot], spot
-    for room in sorted(search_spots, key=lambda r: (-len(r), r)):
+    normalized = _normalize_words(text)
+    masked = normalized
+    for category in CATEGORY_MAP:
+        match = _phrase_pattern(category).search(masked)
+        if match:
+            start, end = match.span()
+            masked = masked[:start] + " " * (end - start) + masked[end:]
+
+    candidates: list[tuple[int, int, str, bool]] = []
+    for spot in spot_to_room:
+        match = _phrase_pattern(spot).search(masked)
+        if match:
+            candidates.append((match.start(), -len(spot), spot, True))
+    for room in search_spots:
         if room.startswith("_"):
             continue
-        if _text_contains(text, room):
-            return room, search_spots[room][0]
-    return None, None
+        match = _phrase_pattern(room).search(masked)
+        if match:
+            candidates.append((match.start(), -len(room), room, False))
+
+    if not candidates:
+        return None, None
+    candidates.sort()
+    _start, _neg_len, name, is_spot = candidates[0]
+    if is_spot:
+        return spot_to_room[name], name
+    return name, search_spots[name][0]
 
 
 def _person_triggered(text: str) -> bool:
@@ -165,8 +193,8 @@ def _person_triggered(text: str) -> bool:
 
 
 def _resolve_person_room(text: str, knowledge: dict) -> str:
-    """Person room: an explicit room, or the room of the first placement
-    spot, NAMED IN `text` -- else "living_room". A spot that was only
+    """Person room: the room of the FIRST-MENTIONED location (spot or
+    room) NAMED IN `text` -- else "living_room". A spot that was only
     *defaulted* for an object (via `default_locations`, never mentioned in
     the text) must never leak into the person's room; `_resolve_location`
     already only matches text that is actually present, so no separate
