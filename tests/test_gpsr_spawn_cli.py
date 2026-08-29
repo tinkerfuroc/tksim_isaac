@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools.gpsr_scene import ScenePlan, SpawnItem, scene_plan_to_json  # noqa: E402
 from tools.gpsr_spawn import (  # noqa: E402
+    EntityAlreadyExists,
     ServiceUnavailable,
     apply_plan,
     base_scenario_keys,
@@ -95,6 +96,32 @@ def test_apply_plan_records_a_failed_spawn_without_raising():
     manifest = apply_plan(plan, client, base_scenario=BASE_SCENARIO, placements=PLACEMENTS)
     assert manifest["entities"][0]["ok"] is False
     assert "spawn failed" in manifest["entities"][0]["error"]
+
+
+class _AlreadyExistsClient(FakeServiceClient):
+    def spawn(self, item):
+        raise EntityAlreadyExists(
+            f"spawn_entity failed for {item.id}: Entity '/World/Scenario/{item.id}' already exists "
+            "and allow_renaming is false"
+        )
+
+
+def test_apply_plan_treats_an_already_existing_entity_as_present():
+    # Live 2026-08-29 (s2026-007): the first spawn_entity reply took >30 s, the tool marked
+    # the item failed, and the retry got "already exists" -- but the entity IS in the sim,
+    # which is what the caller wanted. Record it ok (and clear-able), with a note.
+    plan = ScenePlan(
+        items=(_item("cmd_person_laundry_room", "person", None, "laundry_room", (-2.931, 4.663, 0.0),
+                     kind="person", asset_uri="artifacts/people/person_standing/person.usd"),),
+        notes=(),
+    )
+    manifest = apply_plan(plan, _AlreadyExistsClient(), base_scenario=BASE_SCENARIO, placements=PLACEMENTS)
+    entry = manifest["entities"][0]
+    assert entry["ok"] is True
+    assert entry["entity_name"] == "/World/Scenario/cmd_person_laundry_room"
+    assert "already" in entry["note"]
+    assert "error" not in entry
+    assert manifest["not_attempted"] == []
 
 
 def test_apply_plan_skips_items_already_in_a_previous_manifest():
