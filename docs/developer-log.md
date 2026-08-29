@@ -281,6 +281,25 @@ blocked only on environment-local pieces out of this repo's scope (a
 missing `anygrasp` checkpoint, `tk25_ws`-side Python dependencies for the
 orchestrator) — not on anything `scripts/gpsr-stack` itself does.
 
+### Phase 2 — arena defaults
+
+Task 5: lower the arena camera's defaults from 4 Hz / 960x540 to
+`ARENA_CAMERA_DEFAULT_HZ = 2.0` and `ARENA_CAMERA_DEFAULT_SIZE = (640, 360)`
+(`simulation/tinker_sim_isaac/arena_camera.py`). Justification is the Phase
+0 table above: with the DLAA fix already landed (Phase 1a), Task 3's own
+`E_arena_640` and `F_arena_0p5hz` variants showed resolution and capture
+rate move RTF by well under 2% each — these lower defaults cost nothing
+measurable and are a free win, not a real tradeoff. 640x360 was chosen
+because a bird's-eye frame at that size still shows a recognisable person
+and table. `tools/contact_sheet.py` was checked (`grep -n "960|540|arena"`)
+and left untouched: its `960` is the judge sheet's own 3-tile layout width
+(`TILE_W = 320`), not a hard-coded arena frame size — each tile is resized
+from the loaded frame's actual `width`/`height` (`contact_sheet.py:313`),
+so it already adapts to any arena frame size. Step 3 (live visual check of
+a 640x360 frame with a person and table recognisable, `TINKER_SIM_ARENA_CAMERA=1`
+on GPU 1) is deferred to Task 7's stack run — GPU 1 was in use by another
+session's benchmark stack at the time of this task.
+
 ## 2026-08-22 — GPSR `goto_command_point` stall: two root causes in the sim, one residual
 
 Starting point: `reports/gpsr-sim-2026-08-20/NAV-HANDOFF.md` — Nav2 never

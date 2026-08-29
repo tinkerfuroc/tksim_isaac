@@ -38,6 +38,7 @@ def test_resolve_disabled_by_default():
     assert resolve_arena_camera({"TINKER_SIM_ARENA_CAMERA": "0"}) is None
 
 def test_resolve_enabled_and_rate_only_lowers():
+    assert ARENA_CAMERA_DEFAULT_HZ == 2.0
     assert resolve_arena_camera({"TINKER_SIM_ARENA_CAMERA": "1"}) == ARENA_CAMERA_DEFAULT_HZ
     env = {"TINKER_SIM_ARENA_CAMERA": "1", "TINKER_SIM_ARENA_CAMERA_HZ": "2"}
     assert resolve_arena_camera(env) == 2.0
@@ -55,7 +56,7 @@ def test_spec_shape():
     assert spec.camera_info_topics == ("/sim/arena_camera/camera_info",)
     assert spec.mount_prim == "/World/ArenaCamera"
     assert spec.mount_translation is not None
-    assert (spec.width, spec.height) == (960, 540)
+    assert (spec.width, spec.height) == (640, 360)
     assert spec.tick_rate_hz == 4.0
 
 def test_pose_matches_run_sim_contract():
@@ -96,10 +97,10 @@ def test_resolve_size_default_and_only_lowers():
     from tinker_sim_isaac.arena_camera import (
         ARENA_CAMERA_DEFAULT_SIZE, resolve_arena_camera_size,
     )
-    assert resolve_arena_camera_size({}) == ARENA_CAMERA_DEFAULT_SIZE == (960, 540)
+    assert resolve_arena_camera_size({}) == ARENA_CAMERA_DEFAULT_SIZE == (640, 360)
     assert resolve_arena_camera_size({"TINKER_SIM_ARENA_CAMERA_SIZE": "640x360"}) == (640, 360)
     # may only lower: a larger request is clamped to the default
-    assert resolve_arena_camera_size({"TINKER_SIM_ARENA_CAMERA_SIZE": "1920x1080"}) == (960, 540)
+    assert resolve_arena_camera_size({"TINKER_SIM_ARENA_CAMERA_SIZE": "960x540"}) == (640, 360)
     for bad in ("640", "640x", "axb", "0x0", "-1x10"):
         with pytest.raises(ValueError):
             resolve_arena_camera_size({"TINKER_SIM_ARENA_CAMERA_SIZE": bad})
