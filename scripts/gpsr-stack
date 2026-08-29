@@ -216,6 +216,7 @@ class StackConfig:
     manip_gpu: Optional[int]
     sim_gpu: int  # GPU device index for the simulator
     log_dir: str
+    evidence: bool = False  # arena observer camera on: contact-sheet evidence runs
 
 
 def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
@@ -247,13 +248,39 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     stages: list[dict] = []
 
     # --- Stage 1: Sim -----------------------------------------------------
-    # Arena observer camera disabled for battery runs: world-fixed RTX camera
-    # races the render pipeline under full-stack load (CUDA 700) — opt-in
-    # and currently known-broken. See docs/developer-log.md, "2026-08-26 —
-    # GPSR recorded sim battery bring-up" for the full DLSS/CUDA-700 story
-    # (this repo's .superpowers/sdd/ notes are git-ignored and won't survive
-    # on another checkout). Re-enable via TINKER_SIM_ARENA_CAMERA=1 once fixed.
-    # The sim runs its stock head+wrist cameras in both mock and live mode alike.
+    # The sim runs its stock head+wrist cameras in both mock and live mode
+    # alike. The arena observer camera is an opt-in evidence-run cost: it
+    # costs RTF (see docs/developer-log.md, 2026-08-29), so pass/fail
+    # batteries run without it by default and only --evidence runs pay for it.
+    sim_env = {
+        "CUDA_VISIBLE_DEVICES": str(cfg.sim_gpu),
+        "TINKER_SIM_CAMERA_HZ": "12",
+        "TINKER_SIM_CONTROL_HZ": "60",
+        "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
+        # RTX camera strides stall the stepping loop for multiple wall
+        # seconds; at the 1.0 s / 0.5 s defaults every stall re-latches a
+        # safety hold and severs the command stream (frozen base + arm
+        # mid-run). Camera-loaded runs need generous deadlines.
+        "TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S": "10",
+        "TINKER_SIM_COMMAND_STREAM_TIMEOUT_S": "5",
+        # Wheel colliders stay on the engineered SPHERE default. The
+        # cylinder override below was added 2026-08-27 while chasing
+        # "wheels spin, base never translates" — later proven to be a
+        # phantom from stale USD-layer reads (the robot really drove).
+        # The cylinder line contact cannot skid, so in-place turns
+        # reach 0% of the command below 0.2 rad/s and ~55% at 0.5
+        # (backend.py's own A/B numbers, re-measured 2026-08-28:
+        # cmd 0.2 -> -0.05 achieved, cmd 0.5 -> 0.15). That angular
+        # deadband deadlocked every Nav2 rotate-to-heading ramp and
+        # was the final root cause of the doorway wedging.
+        # "TINKER_SIM_WHEEL_COLLIDER": "cylinder",  # DO NOT re-enable
+    }
+    if cfg.evidence:
+        # Arena observer only for evidence runs: it costs RTF (docs/
+        # developer-log.md 2026-08-29), so pass/fail batteries run without
+        # it and keep their 600 s wall cap.
+        sim_env["TINKER_SIM_ARENA_CAMERA"] = "1"
+        sim_env["TINKER_SIM_ARENA_CAMERA_HZ"] = "2"
     stages.append({
         "name": "sim",
         "cmd": [
@@ -266,38 +293,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             "--ros",
             "--headless",
         ],
-        "env": _preamble_env({
-            "CUDA_VISIBLE_DEVICES": str(cfg.sim_gpu),
-            "TINKER_SIM_CAMERA_HZ": "12",
-            "TINKER_SIM_CONTROL_HZ": "60",
-            "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
-            # RTX camera strides stall the stepping loop for multiple wall
-            # seconds; at the 1.0 s / 0.5 s defaults every stall re-latches a
-            # safety hold and severs the command stream (frozen base + arm
-            # mid-run). Camera-loaded runs need generous deadlines.
-            "TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S": "10",
-            "TINKER_SIM_COMMAND_STREAM_TIMEOUT_S": "5",
-            # Wheel colliders stay on the engineered SPHERE default. The
-            # cylinder override below was added 2026-08-27 while chasing
-            # "wheels spin, base never translates" — later proven to be a
-            # phantom from stale USD-layer reads (the robot really drove).
-            # The cylinder line contact cannot skid, so in-place turns
-            # reach 0% of the command below 0.2 rad/s and ~55% at 0.5
-            # (backend.py's own A/B numbers, re-measured 2026-08-28:
-            # cmd 0.2 -> -0.05 achieved, cmd 0.5 -> 0.15). That angular
-            # deadband deadlocked every Nav2 rotate-to-heading ramp and
-            # was the final root cause of the doorway wedging.
-            # "TINKER_SIM_WHEEL_COLLIDER": "cylinder",  # DO NOT re-enable
-            # Arena observer re-enabled for the recorded battery (user asked
-            # for arena-view contact-sheet frames). Historically raced the
-            # render pipeline under full-stack load (CUDA 700, see
-            # docs/developer-log.md 2026-08-26); the stack has changed
-            # substantially since (head-only depth strides, DLAA pin, dome
-            # light). Watch the first battery runs for "error 700" and
-            # remove this pair again if the race returns.
-            "TINKER_SIM_ARENA_CAMERA": "1",
-            "TINKER_SIM_ARENA_CAMERA_HZ": "2",
-        }),
+        "env": _preamble_env(sim_env),
         "cwd": REPO_ROOT,
         "gate": "sim",
     })
@@ -740,6 +736,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sim-gpu", dest="sim_gpu", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-dir", default="gpsr_stack_logs")
+    parser.add_argument(
+        "--evidence", action="store_true",
+        help="enable the arena observer camera (contact-sheet evidence runs; costs RTF)")
     return parser
 
 
@@ -752,6 +751,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         manip_gpu=args.manip_gpu,
         sim_gpu=args.sim_gpu,
         log_dir=args.log_dir,
+        evidence=args.evidence,
     )
 
     if args.subcommand == "up":
