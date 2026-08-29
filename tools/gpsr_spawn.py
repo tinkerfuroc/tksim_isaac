@@ -63,6 +63,15 @@ class ServiceUnavailable(RuntimeError):
     """
 
 
+class EntityAlreadyExists(RuntimeError):
+    """Raised by a service client when the sim refuses a spawn because a prim
+    with the requested name is already present (`allow_renaming` is False).
+    `apply_plan` records the item as ok: the entity the caller asked for is
+    in the sim. Live 2026-08-29: a spawn whose reply took longer than the
+    30 s timeout still landed, and the bench's retry then hit this.
+    """
+
+
 class ServiceClient(Protocol):
     def spawn(self, item: SpawnItem) -> str:
         """Spawn `item`; return its entity name, or raise on failure.
@@ -316,6 +325,15 @@ def apply_plan(
             )
             _report()
             continue
+        except EntityAlreadyExists:
+            _replace_stale(key)
+            entities.append(
+                {"id": item.id, "asset_key": asset_key, "where": where,
+                 "entity_name": entity_name, "ok": True,
+                 "note": "already present in sim (spawn refused: name exists)", **pose_fields}
+            )
+            _report()
+            continue
         except Exception as exc:  # noqa: BLE001 - never crash a bench run
             _replace_stale(key)
             entities.append(
@@ -515,9 +533,10 @@ def _make_ros_service_client() -> "ServiceClient":
                 raise ServiceUnavailable(f"spawn_entity timed out for {item.id}")
             response = future.result()
             if response.result.result != Result.RESULT_OK:
-                raise RuntimeError(
-                    f"spawn_entity failed for {item.id}: {response.result.error_message}"
-                )
+                message = f"spawn_entity failed for {item.id}: {response.result.error_message}"
+                if "already exists" in str(response.result.error_message):
+                    raise EntityAlreadyExists(message)
+                raise RuntimeError(message)
             return str(response.entity_name)
 
         def delete(self, entity: str) -> bool:
