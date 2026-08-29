@@ -283,12 +283,15 @@ def _with_arena_camera(
     itself enabled via ``TINKER_SIM_ARENA_CAMERA``.
     """
     robot_min_hz = min(spec.tick_rate_hz for spec in specs)
-    from tinker_sim_isaac.arena_camera import arena_camera_spec, resolve_arena_camera
+    from tinker_sim_isaac.arena_camera import (
+        arena_camera_spec, resolve_arena_camera, resolve_arena_camera_size,
+    )
 
     hz = resolve_arena_camera(env)
     if hz is None:
         return specs, robot_min_hz
-    return specs + (arena_camera_spec(occupancy, hz=hz),), robot_min_hz
+    size = resolve_arena_camera_size(env)
+    return specs + (arena_camera_spec(occupancy, hz=hz, size=size),), robot_min_hz
 
 
 def _arena_camera_enabled(camera_specs: tuple) -> bool:
@@ -299,6 +302,21 @@ def _arena_camera_enabled(camera_specs: tuple) -> bool:
     arena camera -- when present -- is always last.
     """
     return camera_specs[-1].name == "arena_camera"
+
+
+#: A/B aid for the RTF work: "1" forces the DLAA pin on without the arena
+#: camera (isolates its per-frame cost on the parity cameras), "0" forces
+#: it off with the arena camera on (only for the crash-recipe re-check;
+#: see docs/superpowers/specs/2026-08-29-arena-camera-rtf-design.md).
+STABLE_AA_ENV = "TINKER_SIM_STABLE_AA"
+
+
+def _stable_aa_requested(arena_enabled: bool, env: dict) -> bool:
+    """DLAA pin decision: the arena camera's presence unless the env forces it."""
+    raw = env.get(STABLE_AA_ENV)
+    if raw is None:
+        return arena_enabled
+    return raw.strip().lower() in _TRUTHY
 
 
 def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
@@ -1044,9 +1062,10 @@ def main() -> int:
             )
             arena_camera_enabled = _arena_camera_enabled(camera_specs)
             if arena_camera_enabled:
+                spec = camera_specs[-1]
                 print(
-                    f"[sim] arena camera enabled at {camera_specs[-1].tick_rate_hz:g} Hz "
-                    "-> /sim/arena_camera/image_raw",
+                    f"[sim] arena camera enabled at {spec.tick_rate_hz:g} Hz, "
+                    f"{spec.width}x{spec.height} -> /sim/arena_camera/image_raw",
                     flush=True,
                 )
             camera_rig = CameraRig(camera_specs)
@@ -1056,7 +1075,12 @@ def main() -> int:
             # memory access ~15s later (see CameraRig.initialize's
             # docstring). Runs with just the two hardware-parity cameras
             # keep the previously-verified-stable default AA behaviour.
-            camera_rig.initialize(app, stable_aa=arena_camera_enabled)
+            # TINKER_SIM_STABLE_AA can force this decision either way for
+            # the RTF spike -- see _stable_aa_requested.
+            stable_aa = _stable_aa_requested(arena_camera_enabled, os.environ)
+            if stable_aa != arena_camera_enabled:
+                print(f"[sim] stable_aa forced to {stable_aa} by {STABLE_AA_ENV}", flush=True)
+            camera_rig.initialize(app, stable_aa=stable_aa)
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
             gateway = RosStandardGateway(
