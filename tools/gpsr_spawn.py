@@ -52,6 +52,9 @@ DEFAULT_PLACEMENTS = REPO_ROOT / "simulation" / "scenarios" / "rcw2026-placement
 DEFAULT_BASE_SCENARIO = REPO_ROOT / "simulation" / "scenarios" / "gpsr-rcw2026-bench.json"
 
 
+SPAWN_TIMEOUT_S = 120.0
+
+
 class ServiceUnavailable(RuntimeError):
     """Raised by the real ROS service client (see `_make_ros_service_client`)
     when a simulation_interfaces service is missing at construction time, or
@@ -528,9 +531,13 @@ def _make_ros_service_client() -> "ServiceClient":
             ) = item.quaternion_xyzw
             request.initial_pose = pose
             future = spawn_client.call_async(request)
-            rclpy.spin_until_future_complete(node, future, timeout_sec=30.0)
+            # Live 2026-08-29: right after a bench reset the spawn reply can take well
+            # over 30 s while the prim still lands (two runs lost to a 30 s timeout).
+            rclpy.spin_until_future_complete(node, future, timeout_sec=SPAWN_TIMEOUT_S)
             if future.result() is None:
-                raise ServiceUnavailable(f"spawn_entity timed out for {item.id}")
+                raise ServiceUnavailable(
+                    f"spawn_entity timed out for {item.id} after {SPAWN_TIMEOUT_S:.0f}s"
+                )
             response = future.result()
             if response.result.result != Result.RESULT_OK:
                 message = f"spawn_entity failed for {item.id}: {response.result.error_message}"
