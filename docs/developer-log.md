@@ -470,3 +470,52 @@ difference at 4 or 16.
 With `TINKER_SIM_PROFILE=1`, every profile line now also carries
 `physics_breakdown_ms.physx_substeps` and a `publish_breakdown_ms`
 (clock / joint_state / imu / cloud / status / truth per `publish()` call).
+
+## 2026-08-29: gpsr-spawn-spike — live scene-spawn viability
+
+Ran `scripts/gpsr-spawn-spike` against the live stack (Nav2 + sim
+PLAYING + bridge, `gpsr-stack up --scenario gpsr-rcw2026-bench --sim-gpu 1`)
+per the command-driven-scene design
+(docs/superpowers/specs/2026-08-28-command-driven-scene-and-sim-identity-design.md,
+section 2.4): `tools/gpsr_spawn.py plan`+`apply` for "count the
+pudding_box on the kitchen_table", checked `/clock` monotonicity, Nav2
+health, and entity presence, then `clear`.
+
+Results:
+- plan: PASS
+- apply (spawn_entity while PLAYING): PASS — `/get_entities` lists
+  `/World/Scenario/cmd_pudding_box_0` afterwards; `GetEntityState` reads
+  (2.5, -3.0, 0.734).
+- arena-camera frame shows the pudding_box: INCONCLUSIVE — a 10 cm YCB
+  object is ~3 px at the arena camera's 960 px; even the base scenario's
+  soup/mug are not discernible. Entity-list check used instead.
+- /clock monotonic across apply (20 samples before, 90 after; 65.43 -> 66.92 s): PASS
+- Nav2 goto bedroom and back after the spawn: goals accepted, robot drove
+  and ended at (-1.87, -1.78) ~ command point. Each leg hit the 170 s
+  wall cap before reporting SUCCEEDED because RTF is ~0.2 with the arena
+  camera on (sim clock 189 s after ~15 min wall) — a cadence limit, not a
+  Nav2 fault.
+- clear (delete_entity): PASS — entity absent from `/get_entities` afterwards.
+
+Three things the spike caught that the unit tests could not:
+1. `python3 tools/gpsr_spawn.py` failed with `ModuleNotFoundError: tools`
+   when run as a script (fixed: repo root inserted on sys.path).
+2. Presence-based (asset, spot) dedupe skipped instances 1-2 of a count
+   command, and slot 0 coincides with the base scenario's soup pose at
+   kitchen_table (fixed: count-aware dedupe + grid slots offset by the
+   objects already at the spot).
+3. `ros2 topic echo` via the ROS daemon intermittently dies with
+   `!rclpy.ok()` — the spike uses `--no-daemon`.
+
+**Decision:** outcome A — tier-2 uses runtime spawning per run:
+`--spawn-cmd "scripts/gpsr-scene-apply --command {command} --seed {seed}
+--plan {plan} --manifest {manifest}"` (plan+apply in one command) and
+`--clear-cmd "python3 tools/gpsr_spawn.py clear --manifest {manifest}"`.
+The bench environment must carry the vendored `simulation_interfaces`
+Python overlay (`.ros-vendor/humble/opt/ros/humble/{local/lib,lib}/python3.10`)
+on PYTHONPATH — the battery script already does.
+
+Next: re-run `s2026-003`, `004`, `005` (old run dirs archived as
+`*.attempt1-no-scene`). Acceptance: 003/004 no longer fail on absent
+objects; 005 passes the `person_found` gate under
+`GPSR_SIM_IDENTITY_RELAXED=1`.
