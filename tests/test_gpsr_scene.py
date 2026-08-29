@@ -187,3 +187,51 @@ def test_scene_plan_json_round_trips(knowledge, placements):
     data = scene_plan_to_json(plan, command_text=text, seed=1)
     restored = scene_plan_from_json(data)
     assert restored == plan
+
+
+# --- fix round 1 -------------------------------------------------------------
+# Issue 1: person room must come only from a room/spot NAMED IN THE TEXT, never
+# from an object's location that was silently defaulted via default_locations.
+
+def test_person_room_never_leaks_a_defaulted_object_location(knowledge, placements):
+    # "banana" names no location; its spawn spot is defaulted (bedroom's
+    # side_table_02, per default_locations) -- that default must not leak
+    # into the (unrelated) person's room, which falls back to living_room.
+    plan = plan_scene("guide me to find a banana", knowledge, placements, seed=1)
+    person_items = [it for it in plan.items if it.kind == "person"]
+    assert len(person_items) == 1
+    assert person_items[0].room == "living_room"
+
+    # "kitchen_table" IS named in the text, so it (and its owning room,
+    # kitchen) is fair game for the person's room even with no object named.
+    plan2 = plan_scene("guide me to the kitchen_table", knowledge, placements, seed=1)
+    person_items2 = [it for it in plan2.items if it.kind == "person"]
+    assert len(person_items2) == 1
+    assert person_items2[0].room == "kitchen"
+
+
+# Issue 2: every explicitly named object spawns (1 instance each, in order of
+# first appearance in the text); the counting template's x3 applies only to
+# the first-mentioned object.
+
+def test_two_named_objects_each_spawn_one_in_mention_order(knowledge, placements):
+    text = "grasp the mug and place it next to the bowl"
+    plan = plan_scene(text, knowledge, placements, seed=1)
+    assert _names(plan.items) == ["mug", "bowl"]
+    assert _ids(plan.items) == ["cmd_mug_0", "cmd_bowl_0"]
+
+
+def test_counting_template_multiplies_only_the_first_named_object(knowledge, placements):
+    text = "how many mugs are on the kitchen_table next to the bowl"
+    plan = plan_scene(text, knowledge, placements, seed=1)
+    assert _names(plan.items) == ["mug", "mug", "mug", "bowl"]
+    assert _ids(plan.items) == ["cmd_mug_0", "cmd_mug_1", "cmd_mug_2", "cmd_bowl_0"]
+
+
+# Issue 3: a malformed placements dict (missing "spots") degrades to an empty
+# plan with a note, per the module's "never raises" contract -- not a KeyError.
+
+def test_malformed_placements_missing_spots_key_never_raises(knowledge):
+    plan = plan_scene("bring me a mug", knowledge, {}, seed=1)
+    assert plan.items == ()
+    assert any("no placement entry" in note for note in plan.notes)
