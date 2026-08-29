@@ -1077,11 +1077,16 @@ def main() -> int:
             # keep the previously-verified-stable default AA behaviour.
             # TINKER_SIM_STABLE_AA can force this decision either way for
             # the RTF spike -- see _stable_aa_requested. Scoped to just the
-            # arena camera's render product (stable_aa_cameras): Task 4a
-            # measured the DLAA pin taxing the hardware-parity cameras too
-            # when set globally (~80% of the arena camera's RTF hit was this
-            # switch alone), even though only the arena camera's render
-            # product ever hits the live-resize race the pin guards against.
+            # arena camera's render product (stable_aa_cameras): the actual
+            # CUDA-700 race was root-caused to stale sub-rate annotator
+            # reads and fixed independently in a9fa951, so head/wrist can
+            # keep the default DLSS op -- resize included, see
+            # CameraRig.initialize's docstring -- without reopening the
+            # race; Task 4a measured the global pin taxing those parity
+            # renders by ~50 ms per Kit pump for no benefit, since neither
+            # was ever the sub-rate camera the race depended on. The pin
+            # stays on the arena product as defence in depth for the one
+            # product added after the original crash.
             stable_aa = _stable_aa_requested(arena_camera_enabled, os.environ)
             if stable_aa != arena_camera_enabled:
                 print(f"[sim] stable_aa forced to {stable_aa} by {STABLE_AA_ENV}", flush=True)
