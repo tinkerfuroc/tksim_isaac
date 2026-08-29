@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "simulation"))
 
 from run_sim import (  # noqa: E402
     _arena_camera_enabled,
+    _stable_aa_requested,
     _with_arena_camera,
     _without_wrist_camera,
 )
@@ -91,3 +92,21 @@ def test_wrist_camera_disabled_then_arena_append_still_works():
     # robot_min_hz is over the (already wrist-filtered) specs handed to
     # _with_arena_camera, not the original three-camera set.
     assert robot_hz == 30.0
+
+
+def test_enabled_arena_honours_size_env():
+    specs = (_S(30.0),)
+    out, _ = _with_arena_camera(
+        specs, _Occ,
+        {"TINKER_SIM_ARENA_CAMERA": "1", "TINKER_SIM_ARENA_CAMERA_SIZE": "640x360"},
+    )
+    assert (out[-1].width, out[-1].height) == (640, 360)
+
+
+def test_stable_aa_follows_arena_unless_forced():
+    assert _stable_aa_requested(True, {}) is True
+    assert _stable_aa_requested(False, {}) is False
+    assert _stable_aa_requested(False, {"TINKER_SIM_STABLE_AA": "1"}) is True
+    assert _stable_aa_requested(False, {"TINKER_SIM_STABLE_AA": "0"}) is False
+    # the env can force DLAA *off* with the arena on, for the A/B only
+    assert _stable_aa_requested(True, {"TINKER_SIM_STABLE_AA": "0"}) is False

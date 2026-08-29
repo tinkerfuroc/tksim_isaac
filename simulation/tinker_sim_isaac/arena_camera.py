@@ -33,6 +33,13 @@ ARENA_CAMERA_ENV = "TINKER_SIM_ARENA_CAMERA"
 ARENA_CAMERA_HZ_ENV = "TINKER_SIM_ARENA_CAMERA_HZ"
 ARENA_CAMERA_DEFAULT_HZ = 4.0
 
+#: Optional override for the render size, ``WIDTHxHEIGHT``; may only lower
+#: either dimension (the bird's-eye view cannot resolve 10 cm objects at
+#: the default size anyway, so smaller is never a fidelity loss that
+#: matters -- and every arena pixel is paid for on the sim's GPU).
+ARENA_CAMERA_SIZE_ENV = "TINKER_SIM_ARENA_CAMERA_SIZE"
+ARENA_CAMERA_DEFAULT_SIZE = (960, 540)
+
 _TRUTHY = {"1", "true", "yes"}
 
 
@@ -155,6 +162,30 @@ def resolve_arena_camera(env: Mapping[str, str]) -> float | None:
     return min(ARENA_CAMERA_DEFAULT_HZ, override_hz)
 
 
+def resolve_arena_camera_size(env: Mapping[str, str]) -> tuple[int, int]:
+    """Arena render size ``(width, height)`` from ``env``.
+
+    ``env[ARENA_CAMERA_SIZE_ENV]`` is ``WIDTHxHEIGHT`` (positive integers);
+    each dimension is clamped to ``ARENA_CAMERA_DEFAULT_SIZE`` (the
+    override may only lower). Unset -> the default. Malformed -> ValueError.
+    """
+    raw = env.get(ARENA_CAMERA_SIZE_ENV)
+    if raw is None:
+        return ARENA_CAMERA_DEFAULT_SIZE
+    parts = raw.lower().split("x")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ValueError(
+            f"{ARENA_CAMERA_SIZE_ENV} must be WIDTHxHEIGHT, got {raw!r}"
+        )
+    width, height = (int(p) for p in parts)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{ARENA_CAMERA_SIZE_ENV} dimensions must be positive")
+    return (
+        min(ARENA_CAMERA_DEFAULT_SIZE[0], width),
+        min(ARENA_CAMERA_DEFAULT_SIZE[1], height),
+    )
+
+
 def quat_mul_wxyz(
     a: tuple[float, float, float, float], b: tuple[float, float, float, float]
 ) -> tuple[float, float, float, float]:
@@ -169,9 +200,12 @@ def quat_mul_wxyz(
     )
 
 
-def arena_camera_spec(occupancy: object, *, hz: float) -> CameraStreamSpec:
+def arena_camera_spec(
+    occupancy: object, *, hz: float, size: tuple[int, int] = ARENA_CAMERA_DEFAULT_SIZE
+) -> CameraStreamSpec:
     """The world-fixed, color-only ``CameraStreamSpec`` for the arena camera."""
     eye, target, _bounds = arena_camera_pose(occupancy)
+    width, height = size
     return CameraStreamSpec(
         name="arena_camera",
         color_topic="/sim/arena_camera/image_raw",
@@ -191,8 +225,8 @@ def arena_camera_spec(occupancy: object, *, hz: float) -> CameraStreamSpec:
         mount_rotation_wxyz=quat_mul_wxyz(
             look_at_wxyz(eye, target), YUP_VIEW_TO_USD_CAMERA_WXYZ
         ),
-        width=960,
-        height=540,
+        width=width,
+        height=height,
         horizontal_fov_deg=70.0,
         tick_rate_hz=hz,
         mount_translation=tuple(eye),

@@ -90,3 +90,22 @@ def test_spec_rotation_keeps_image_upright():
     spec = arena_camera_spec(_Occ, hz=4.0)
     up = _rotate(spec.mount_rotation_wxyz, (0.0, 1.0, 0.0))
     assert up[2] > 0.0
+
+
+def test_resolve_size_default_and_only_lowers():
+    from tinker_sim_isaac.arena_camera import (
+        ARENA_CAMERA_DEFAULT_SIZE, resolve_arena_camera_size,
+    )
+    assert resolve_arena_camera_size({}) == ARENA_CAMERA_DEFAULT_SIZE == (960, 540)
+    assert resolve_arena_camera_size({"TINKER_SIM_ARENA_CAMERA_SIZE": "640x360"}) == (640, 360)
+    # may only lower: a larger request is clamped to the default
+    assert resolve_arena_camera_size({"TINKER_SIM_ARENA_CAMERA_SIZE": "1920x1080"}) == (960, 540)
+    for bad in ("640", "640x", "axb", "0x0", "-1x10"):
+        with pytest.raises(ValueError):
+            resolve_arena_camera_size({"TINKER_SIM_ARENA_CAMERA_SIZE": bad})
+
+
+def test_spec_takes_size():
+    spec = arena_camera_spec(_Occ, hz=2.0, size=(640, 360))
+    assert (spec.width, spec.height) == (640, 360)
+    assert spec.horizontal_fov_deg == 70.0   # FOV is independent of size
