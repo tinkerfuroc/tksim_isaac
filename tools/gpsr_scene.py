@@ -99,11 +99,27 @@ def _object_names(knowledge: dict) -> list[str]:
     return sorted(knowledge.get("possible_objects", {}), key=lambda n: (-len(n), n))
 
 
-def _match_object_name(text: str, knowledge: dict) -> Optional[str]:
+def _match_object_names(text: str, knowledge: dict) -> list[str]:
+    """Every known object name explicitly mentioned in `text`, in order of
+    first appearance in the text (not name length or alphabetical order):
+    the controller spawns one of each mentioned object in mention order,
+    e.g. "grasp the mug and place it next to the bowl" -> ["mug", "bowl"].
+    Per-name matching is still longest-name-first via `_object_names` so a
+    name that text-prefixes another can't shadow the more specific one;
+    that only affects *whether* a name matches, not the returned order.
+    """
+    normalized = _normalize_words(text)
+    hits: list[tuple[int, str]] = []
+    seen: set[str] = set()
     for name in _object_names(knowledge):
-        if _text_contains(text, name):
-            return name
-    return None
+        if name in seen:
+            continue
+        match = _phrase_pattern(name).search(normalized)
+        if match:
+            hits.append((match.start(), name))
+            seen.add(name)
+    hits.sort(key=lambda pair: pair[0])
+    return [name for _pos, name in hits]
 
 
 def _match_category(text: str) -> Optional[str]:
@@ -148,18 +164,17 @@ def _person_triggered(text: str) -> bool:
     return False
 
 
-def _resolve_person_room(text: str, knowledge: dict, first_object_spot: Optional[str]) -> str:
+def _resolve_person_room(text: str, knowledge: dict) -> str:
+    """Person room: an explicit room, or the room of the first placement
+    spot, NAMED IN `text` -- else "living_room". A spot that was only
+    *defaulted* for an object (via `default_locations`, never mentioned in
+    the text) must never leak into the person's room; `_resolve_location`
+    already only matches text that is actually present, so no separate
+    "first object spot" fallback is needed here.
+    """
     room, _spot = _resolve_location(text, knowledge)
     if room is not None:
         return room
-    if first_object_spot is not None:
-        spot_to_room = {
-            s: r
-            for r, spots in knowledge["search_spots"].items()
-            if not r.startswith("_")
-            for s in spots
-        }
-        return spot_to_room.get(first_object_spot, "living_room")
     return "living_room"
 
 
@@ -195,16 +210,21 @@ def plan_scene(
     rng = random.Random(seed)
     by_name = _load_object_asset_uris(asset_root or REPO_ROOT)
 
-    object_name = _match_object_name(command_text, knowledge)
-    category = None if object_name else _match_category(command_text)
+    object_names = _match_object_names(command_text, knowledge)
+    category = None if object_names else _match_category(command_text)
     counting = _is_counting_template(command_text)
 
     object_specs: list[tuple[str, int]] = []
-    if object_name:
-        count = 3 if counting else 1
-        object_specs = [(object_name, i) for i in range(count)]
+    if object_names:
+        # Every explicitly named object gets 1 instance each, in order of
+        # first appearance; the counting template's x3 applies only to the
+        # first-mentioned object.
+        first_name, *rest_names = object_names
+        first_count = 3 if counting else 1
+        object_specs = [(first_name, i) for i in range(first_count)]
+        object_specs.extend((name, 0) for name in rest_names)
         notes.append(
-            f"explicit object '{object_name}' x{count}"
+            f"explicit objects {object_names} (first '{first_name}' x{first_count})"
             + (" (counting template)" if counting else "")
         )
     elif category:
@@ -225,7 +245,7 @@ def plan_scene(
             if resolved_spot is None:
                 resolved_spot = knowledge["search_spots"]["kitchen"][0]
             notes.append(f"no location named; defaulted to '{resolved_spot}'")
-        spot_info = placements["spots"].get(resolved_spot)
+        spot_info = placements.get("spots", {}).get(resolved_spot)
         if spot_info is None:
             notes.append(f"spot '{resolved_spot}' has no placement entry; no objects spawned")
         else:
@@ -262,7 +282,7 @@ def plan_scene(
                 )
 
     if _person_triggered(command_text):
-        person_room = _resolve_person_room(command_text, knowledge, resolved_spot)
+        person_room = _resolve_person_room(command_text, knowledge)
         person_pose = placements.get("persons", {}).get(person_room)
         if person_pose is None:
             notes.append(f"person triggered but room '{person_room}' has no known pose; skipped")
