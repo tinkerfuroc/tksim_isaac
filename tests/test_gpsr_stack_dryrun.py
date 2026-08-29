@@ -47,21 +47,29 @@ def test_sim_stage_env():
     assert "--scenario" in sim["cmd"] and "gpsr-rcw2026-bench" in sim["cmd"]
 
 
-# --- Fix round 4: battery runs with head+wrist cameras, arena camera parked ---
+# --- Arena camera is an evidence-run opt-in (RTF: 0.24 with it, 0.68+ without) ---
 
-def test_sim_stage_no_camera_env_vars():
-    """Sim runs head+wrist cameras in both mock and live modes; arena camera
-    disabled as a known issue (see scripts/gpsr-stack comment block).
-    """
-    sim_mock = mod.stage_commands(_cfg(manipulation="mock"))[0]
-    env_mock = sim_mock["env"]
-    assert "TINKER_SIM_ARENA_CAMERA" not in env_mock
-    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env_mock
+def test_sim_stage_arena_off_by_default():
+    for cfg in (_cfg(manipulation="mock"), _cfg(manipulation="live", manip_gpu=1)):
+        env = mod.stage_commands(cfg)[0]["env"]
+        assert "TINKER_SIM_ARENA_CAMERA" not in env
+        assert "TINKER_SIM_ARENA_CAMERA_HZ" not in env
+        assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env
 
-    sim_live = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))[0]
-    env_live = sim_live["env"]
-    assert "TINKER_SIM_ARENA_CAMERA" not in env_live
-    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env_live
+
+def test_sim_stage_arena_on_for_evidence_runs():
+    env = mod.stage_commands(_cfg(evidence=True))[0]["env"]
+    assert env["TINKER_SIM_ARENA_CAMERA"] == "1"
+    assert env["TINKER_SIM_ARENA_CAMERA_HZ"] == "2"
+
+
+def test_cli_evidence_flag_reaches_config(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(mod, "_run_up", lambda cfg, dry_run: seen.update(cfg=cfg) or 0)
+    assert mod.main(["up", "--evidence", "--dry-run"]) == 0
+    assert seen["cfg"].evidence is True
+    assert mod.main(["up", "--dry-run"]) == 0
+    assert seen["cfg"].evidence is False
 
 
 def test_wrist_camera_required_in_both_modes():

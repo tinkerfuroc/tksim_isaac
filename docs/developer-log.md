@@ -300,6 +300,10 @@ a 640x360 frame with a person and table recognisable, `TINKER_SIM_ARENA_CAMERA=1
 on GPU 1) is deferred to Task 7's stack run — GPU 1 was in use by another
 session's benchmark stack at the time of this task.
 
+### Phase 3 — bench policy
+
+Task 6: `gpsr-stack up` now takes `--evidence` to opt into the arena camera; pass/fail batteries run arena-off by default.
+
 ## 2026-08-22 — GPSR `goto_command_point` stall: two root causes in the sim, one residual
 
 Starting point: `reports/gpsr-sim-2026-08-20/NAV-HANDOFF.md` — Nav2 never

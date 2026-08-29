@@ -28,6 +28,7 @@ by hand unless you're debugging a specific stage.
   --manipulation live --sim-gpu 0 --manip-gpu 1    # live manipulation, separate GPU
 ./scripts/gpsr-stack status                        # one-shot interface census
 ./scripts/gpsr-stack down                          # tears down the newest run dir
+./scripts/gpsr-stack up ... --evidence              # arena observer camera on (contact sheets); costs RTF, off for batteries
 ```
 
 - `up` launches each stage as its own process group, waits on that stage's
