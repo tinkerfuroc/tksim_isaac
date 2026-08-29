@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -305,6 +307,136 @@ def test_apply_plan_records_pose_fields_on_each_entity():
     entity = manifest["entities"][0]
     assert entity["xyz"] == [-2.988, 4.525, 0.734]
     assert entity["quaternion_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+
+
+def test_apply_plan_count_aware_dedupe_spawns_remainder_and_slots_past_a_different_asset():
+    # Fix round 4: a counting command (3 instances of the same key) must
+    # not be treated as fully-present just because one instance of the
+    # key already exists -- dedupe is count-aware. A different-asset
+    # object already at the same spot (any asset) still claims grid slot
+    # 0, so the 3 new spawns land on slots 1, 2, 3.
+    base_scenario_with_a_mug_at_kitchen_table = {
+        "objects": [
+            {
+                "id": "obj_mug",
+                "asset_uri": "artifacts/objects/ycb/x/ycb_025_mug/object.usd",
+                "pose": {"xyz": [2.5, -3.0, 0.734], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }
+        ],
+        "actors": [],
+    }
+    plan = ScenePlan(
+        items=tuple(
+            _item(f"cmd_pudding_box_{i}", "pudding_box", "kitchen_table", "kitchen",
+                 (2.5 + 0.18 * i, -3.0, 0.734),
+                 asset_uri="artifacts/objects/ycb/x/ycb_008_pudding_box/object.usd")
+            for i in range(3)
+        ),
+        notes=(),
+    )
+    client = FakeServiceClient()
+    manifest = apply_plan(plan, client, base_scenario=base_scenario_with_a_mug_at_kitchen_table,
+                          placements=PLACEMENTS)
+    assert manifest["skipped"] == []
+    assert client.spawned == ["cmd_pudding_box_0", "cmd_pudding_box_1", "cmd_pudding_box_2"]
+    assert len(manifest["entities"]) == 3
+    kitchen_table = PLACEMENTS["spots"]["kitchen_table"]
+    surface_xyz, dx, dy = kitchen_table["surface_xyz"], kitchen_table["grid_dx"], kitchen_table["grid_dy"]
+    expected_slots = [1, 2, 3]
+    for entity, k in zip(manifest["entities"], expected_slots):
+        assert entity["ok"] is True
+        assert entity["xyz"] == pytest.approx(
+            [surface_xyz[0] + (k % 3) * dx, surface_xyz[1] + (k // 3) * dy, surface_xyz[2]]
+        )
+        # slot 0 (the pre-existing mug's spot) is never reused
+        assert entity["xyz"] != pytest.approx(list(surface_xyz))
+
+
+def test_apply_plan_count_aware_dedupe_against_a_previous_manifest_ok_entity():
+    # A previous manifest already has 1 ok pudding_box at kitchen_table
+    # (from an earlier apply of the same command); a fresh 3-instance plan
+    # must skip only that 1 and spawn the remaining 2.
+    plan = ScenePlan(
+        items=tuple(
+            _item(f"cmd_pudding_box_{i}", "pudding_box", "kitchen_table", "kitchen",
+                 (2.5 + 0.18 * i, -3.0, 0.734),
+                 asset_uri="artifacts/objects/ycb/x/ycb_008_pudding_box/object.usd")
+            for i in range(3)
+        ),
+        notes=(),
+    )
+    previous = {
+        "entities": [
+            {"id": "cmd_pudding_box_0", "asset_key": "ycb_008_pudding_box", "where": "kitchen_table",
+             "entity_name": "/World/Scenario/cmd_pudding_box_0", "ok": True}
+        ],
+        "skipped": [],
+    }
+    client = FakeServiceClient()
+    manifest = apply_plan(plan, client, base_scenario=BASE_SCENARIO, placements=PLACEMENTS,
+                          previous_manifest=previous)
+    assert len(manifest["skipped"]) == 1
+    assert manifest["skipped"][0]["id"] == "cmd_pudding_box_0"
+    assert client.spawned == ["cmd_pudding_box_1", "cmd_pudding_box_2"]
+    assert len([e for e in manifest["entities"] if e.get("ok")]) == 3  # 1 carried + 2 fresh
+
+
+def test_apply_plan_count_aware_dedupe_against_a_same_asset_base_scenario_item():
+    # The bench scenario already has 1 soup at kitchen_table; a plan
+    # asking for 3 soups at kitchen_table must skip only that 1 and spawn
+    # the other 2 (not treat the whole key as already-satisfied).
+    plan = ScenePlan(
+        items=tuple(
+            _item(f"cmd_soup_{i}", "soup", "kitchen_table", "kitchen",
+                 (2.5 + 0.18 * i, -3.0, 0.734),
+                 asset_uri="artifacts/objects/ycb/x/ycb_010_tomato_soup_can/object.usd")
+            for i in range(3)
+        ),
+        notes=(),
+    )
+    client = FakeServiceClient()
+    manifest = apply_plan(plan, client, base_scenario=BASE_SCENARIO, placements=PLACEMENTS)
+    assert len(manifest["skipped"]) == 1
+    assert manifest["skipped"][0]["id"] == "cmd_soup_0"
+    assert client.spawned == ["cmd_soup_1", "cmd_soup_2"]
+
+
+def test_emit_scenario_count_aware_dedupe_adds_only_the_excess_over_existing_count():
+    # Fix round 4: emit_scenario's dedupe must be count-aware like
+    # apply_plan's, not presence-only -- the base scenario already has 1
+    # soup at kitchen_table; a plan asking for 3 soups there should merge
+    # in only the excess 2, not 0 (old presence-only behaviour) and not 3.
+    plan = ScenePlan(
+        items=tuple(
+            _item(f"cmd_soup_{i}", "soup", "kitchen_table", "kitchen",
+                 (2.5 + 0.18 * i, -3.0, 0.734),
+                 asset_uri="artifacts/objects/ycb/x/ycb_010_tomato_soup_can/object.usd")
+            for i in range(3)
+        ),
+        notes=(),
+    )
+    merged = emit_scenario([plan], BASE_SCENARIO, PLACEMENTS)
+    new_soup_objects = [o for o in merged["objects"] if "tomato_soup" in o["asset_uri"]
+                        and o["id"] not in {b["id"] for b in BASE_SCENARIO["objects"]}]
+    assert len(new_soup_objects) == 2
+
+
+def test_emit_scenario_merged_objects_never_share_xyz_with_base_objects_at_that_spot():
+    # Fix round 4: the bench scenario already has soup + mug at
+    # kitchen_table (slots 0 and thereabouts); a plan merging a new asset
+    # into kitchen_table must be re-sloted past both, never landing on
+    # either's exact xyz.
+    plan = ScenePlan(
+        items=(_item("cmd_spam_0", "spam", "kitchen_table", "kitchen", (2.5, -3.0, 0.734),
+                     asset_uri="artifacts/objects/ycb/x/ycb_005_spam/object.usd"),),
+        notes=(),
+    )
+    merged = emit_scenario([plan], BASE_SCENARIO, PLACEMENTS)
+    base_xyzs = {tuple(o["pose"]["xyz"]) for o in BASE_SCENARIO["objects"]}
+    new_objects = [o for o in merged["objects"] if o["id"] not in
+                  {b["id"] for b in BASE_SCENARIO["objects"]}]
+    assert len(new_objects) == 1
+    assert tuple(new_objects[0]["pose"]["xyz"]) not in base_xyzs
 
 
 def test_clear_manifest_deletes_every_ok_entity_and_tolerates_missing():
