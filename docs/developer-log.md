@@ -4,6 +4,91 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-08-29 — Arena camera RTF: Phase 0 measurement
+
+Throwaway measurement (`scripts/arena-rtf-spike`, sim-only, GPU 1, no
+bridge): six 120 s-sim variants with `TINKER_SIM_PROFILE=1`, profiled every
+10 camera cycles, to attribute the arena observer camera's RTF hit (~0.8 ->
+~0.24 seen live) to render cost, DLAA, resolution, or the ROS publish path.
+
+Preflight (GPU 1 reserved by prior agreement): worktree had no other
+`run_sim.py` on GPU 1 and ≥5 GB free —
+
+```
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv
+1, 2498 MiB, 11264 MiB, 21 %
+```
+
+```
+$ cat /proc/loadavg
+8.72 10.60 11.89 3/3232 2861952
+```
+
+Note: this worktree was missing the `.cache`, `.deps`, `.venv` symlinks that
+sibling `.claude/worktrees/*` checkouts carry to the shared Isaac/uv caches
+(it had a partial real `.cache/uv` and an empty `.venv` instead, both
+artifacts of the harness's first, failed attempt). All six variants failed
+in seconds with `Isaac Sim internal Humble libraries were not found in the
+locked environment` until those three symlinks were recreated to point at
+the main checkout's `.cache`, `.deps`, `.venv` (same targets the sibling
+worktrees use); the measurement below is from the re-run after that fix.
+
+Six logs, six clean completions — no crash signatures (`error 700`,
+`illegal memory access`, `cudaErrorMemoryAllocation`, `Traceback`) in any
+log, no non-zero variant exits, and every variant well past the ≥20-window
+sanity floor after the 30 s warm-up (119-128 windows each):
+
+| variant | windows | kit_pump ms | cameras ms | physics ms | wall ms | RTF |
+|---|---|---|---|---|---|---|
+| A_arena_off | 119 | 41.0 | 16.1 | 50.0 | 123.4 | 0.68 |
+| B_arena_2hz | 128 | 103.1 | 18.3 | 51.8 | 190.3 | 0.44 |
+| C_capture_skip | 127 | 104.0 | 16.2 | 53.5 | 190.4 | 0.44 |
+| D_dlaa_only | 127 | 90.9 | 15.4 | 50.9 | 175.3 | 0.48 |
+| E_arena_640 | 127 | 98.3 | 16.1 | 50.9 | 183.2 | 0.46 |
+| F_arena_0p5hz | 127 | 90.6 | 17.5 | 51.8 | 178.1 | 0.47 |
+
+Per-variant notes:
+
+- **A_arena_off** — baseline, arena camera fully disabled. RTF 0.68, the
+  best of the six as expected.
+- **B_arena_2hz** — arena camera on at 2 Hz, default resolution. RTF drops
+  to 0.44; `kit_pump` more than doubles over A (+62.1 ms).
+- **C_capture_skip** — same as B but `TINKER_SIM_CAPTURE_SKIP=arena_camera`
+  (render still runs, ROS publish of the frame is skipped). `kit_pump`
+  104.0 ms, essentially identical to B (104.0 vs 103.1) and nowhere near A
+  (41.0) — the publish/bridge path is not where the cost lives.
+- **D_dlaa_only** — arena camera *off*, only `TINKER_SIM_STABLE_AA=1`
+  forced. `kit_pump` 90.9 ms — most of B's hit reproduced with the camera
+  disabled entirely.
+- **E_arena_640** — arena camera on at 2 Hz, resolution cut to 640x360.
+  `kit_pump` 98.3 ms, only 4.8 ms better than B — resolution is not the
+  lever.
+- **F_arena_0p5hz** — arena camera on at 0.5 Hz (quarter the capture rate
+  of B). `kit_pump` 90.6 ms, close to B (within 12%) — capture rate is not
+  the lever either, and it lands right next to D.
+
+Decision rule (all deltas in `kit_pump` ms, skip-first-30s means):
+
+- `B - A` = 103.1 - 41.0 = **62.1 ms**
+- `D - A` = 90.9 - 41.0 = **49.9 ms** = **80.3% of (B - A)** — clears the
+  ≥60% bar for "DLAA is the tax" outright.
+- `E` recovery vs `B`: (B-A) - (E-A) = 62.1 - 57.3 = 4.8 ms, i.e. **7.7%**
+  of the gap recovered by dropping resolution — far short of the ≥60% bar
+  for "resolution is the lever."
+- `F` vs `B`: |90.6 - 103.1| / 103.1 = **12.1%**, within the 15% "F ≈ B"
+  band, but `D` is not small (it is 80.3% of the gap), so the "fixed
+  per-product cost" reading does not hold either.
+- `C` vs `A`: 104.0 vs 41.0 — not close; `C` sits with `B` (104.0 vs 103.1,
+  0.9% apart) instead, so the cost is not in `publish_cameras`.
+
+`D - A` clearing 60% of `B - A` fires first and on its own: turning on
+`TINKER_SIM_STABLE_AA` alone, with the arena camera left off, reproduces
+80% of the arena camera's RTF hit. Neither resolution (E) nor capture rate
+(F) meaningfully recovers it, and skipping the publish step (C) recovers
+none of it. DLAA is the tax.
+
+Decision: Task 4a
+
 ## 2026-08-26 — GPSR recorded sim battery bring-up
 
 `scripts/gpsr-stack up/down/status` automates Stages 1-5 of
