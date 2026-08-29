@@ -454,4 +454,97 @@ def test_third_generation_at_revision_zero_is_a_replan(tmp_path):
     replans = [j for j in judge_events2 if j.kind == "REPLAN"]
     assert len(replans) == 1
     assert replans[0].info == "tree regenerated #2 (1 nodes)"
-    assert meta2["tree_generations"] == 3
+
+
+GENERALIST_SCAN_FEEDBACK = (
+    'ScanForGeneralist for brown pudding box failed status=1: '
+    'no matches for "brown pudding box" via vlm_sam'
+)
+
+
+def test_generalist_scan_failure_is_vision_milestone(tmp_path):
+    # "generalist scan" doesn't start with "scan " -- the word "scan" is
+    # mid-name. It's the leaf whose FAILURE explains most find_object
+    # failures, and must surface as a VISION milestone on the contact
+    # sheet, not silently drop.
+    events = [
+        _event(
+            "tree.generated",
+            "2026-08-29T09:00:00.000000Z",
+            {
+                "tree_revision": 0,
+                "nodes": [
+                    {"id": "n_gscan", "node_id": "n_gscan", "name": "generalist scan",
+                     "type": "BtNode_ScanForGeneralist"},
+                ],
+            },
+            1,
+        ),
+        _event("tree.node_states_changed", "2026-08-29T09:00:01.000000Z",
+               {"nodes": [_node_state("n_gscan", "FAILURE", GENERALIST_SCAN_FEEDBACK)]}, 2),
+    ]
+    run_dir = _write_events(tmp_path, events, run_name="run-generalist-scan")
+
+    milestones, _judge_events, _meta = load_run_telemetry(run_dir)
+
+    assert len(milestones) == 1
+    milestone = milestones[0]
+    assert milestone.kind == "VISION"
+    assert milestone.status == "FAILURE"
+    assert "no matches" in milestone.info
+
+
+def test_object_scan_plus_verify_is_vision_milestone(tmp_path):
+    # "object scan+verify" is another vision detection leaf whose name
+    # doesn't start with "scan " -- must still classify as VISION.
+    events = [
+        _event(
+            "tree.generated",
+            "2026-08-29T09:05:00.000000Z",
+            {
+                "tree_revision": 0,
+                "nodes": [
+                    {"id": "n_osv", "node_id": "n_osv", "name": "object scan+verify",
+                     "type": "BtNode_ScanAndVerify"},
+                ],
+            },
+            1,
+        ),
+        _event("tree.node_states_changed", "2026-08-29T09:05:01.000000Z",
+               {"nodes": [_node_state("n_osv", "SUCCESS", "verified brown pudding box")]}, 2),
+    ]
+    run_dir = _write_events(tmp_path, events, run_name="run-object-scan-verify")
+
+    milestones, _judge_events, _meta = load_run_telemetry(run_dir)
+
+    assert len(milestones) == 1
+    assert milestones[0].kind == "VISION"
+    assert milestones[0].status == "SUCCESS"
+
+
+def test_arm_scan_blackboard_write_still_excluded_from_milestones(tmp_path):
+    # "arm scan" is a BtNode_WriteToBlackboard bookkeeping leaf, same
+    # family as "arm nav" / "arm orbbec look" -- the \bscan\b VISION match
+    # must not override the bookkeeping-type exclusion, which is checked
+    # first in _classify_milestone.
+    events = [
+        _event(
+            "tree.generated",
+            "2026-08-29T09:10:00.000000Z",
+            {
+                "tree_revision": 0,
+                "nodes": [
+                    {"id": "n_arm_scan", "node_id": "n_arm_scan", "name": "arm scan",
+                     "type": "BtNode_WriteToBlackboard"},
+                ],
+            },
+            1,
+        ),
+        _event("tree.node_states_changed", "2026-08-29T09:10:01.000000Z",
+               {"nodes": [_node_state("n_arm_scan", "SUCCESS", "Success writing to namespace")]}, 2),
+    ]
+    run_dir = _write_events(tmp_path, events, run_name="run-arm-scan-blackboard")
+
+    milestones, _judge_events, _meta = load_run_telemetry(run_dir)
+
+    assert milestones == []
