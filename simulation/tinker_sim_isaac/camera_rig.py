@@ -547,13 +547,25 @@ class CameraRig:
         and the race it enables -- cannot happen. Scoped to ``stable_aa``
         (set only when the arena camera pushes the render-product count to
         3+; see ``run_sim.py``) so hardware-parity-only runs keep their
-        previously-verified-stable default AA behaviour unchanged. Further
-        scoped to just the arena camera's render product via
-        ``stable_aa_cameras`` (see ``run_sim.py``) once Task 4a confirmed the
-        parity cameras don't need the pin at all -- the global setting had
-        been taxing their render cost too (measured: ~80% of the arena
-        camera's RTF hit was this DLAA switch alone, applied to every render
-        product including the two that never resize).
+        previously-verified-stable default AA behaviour unchanged.
+
+        Further scoped to just the arena camera's render product via
+        ``stable_aa_cameras`` (see ``run_sim.py``): the wrist camera's
+        live-resize documented above still happens under this narrower
+        scoping -- head and wrist keep the default DLSS op, resize
+        included -- because the CUDA-700 race was root-caused separately to
+        stale sub-rate annotator reads and fixed independently in a9fa951
+        (``capture()`` now consumes an annotator's buffer only once freshly
+        rendered, not on every poll). With that race closed, the wrist
+        resize is believed harmless on its own; that belief rests on a
+        clean 3/3 x 5 min full-stack crash recipe run 2026-08-29 with the
+        pin scoped this way (see the developer log, Task 4a) and would need
+        re-testing if error 700 returns. The pin stays on the arena
+        camera's render product as defence in depth for the one product
+        added after the original crash -- at negligible cost, since Task 4a
+        measured the global pin taxing the 12 Hz parity renders by ~50 ms
+        per Kit pump (``scripts/arena-rtf-spike`` variant D) for no benefit
+        to cameras that were never implicated in the race.
         """
         from isaacsim.core.utils.extensions import enable_extension
 
