@@ -515,6 +515,40 @@ def _dedup_transcript(lines: Sequence[str], cap: int) -> list:
     return out
 
 
+def _scene_summary_line(run_dir: Path) -> Optional[str]:
+    """Summarize <run_dir>/scene-plan.json's spawned items for the judge-
+    sheet header, e.g. "scene: bleach@kitchen_table x1, person@bedroom
+    x1" -- so a reviewer can see what the arena actually contained.
+    Missing/corrupt/empty file -> None; never raises.
+    """
+    plan_path = Path(run_dir) / "scene-plan.json"
+    if not plan_path.is_file():
+        return None
+    try:
+        data = json.loads(plan_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "person":
+            key = f"person@{item.get('room', '?')}"
+        else:
+            spot = item.get("spot") or item.get("room", "?")
+            key = f"{item.get('name', '?')}@{spot}"
+        if key not in counts:
+            order.append(key)
+        counts[key] = counts.get(key, 0) + 1
+    if not order:
+        return None
+    return "scene: " + ", ".join(f"{key} x{counts[key]}" for key in order)
+
+
 def build_judge_sheet(run_dir: Path, meta: dict, out: Path) -> Optional[Path]:
     """Build <out>: the judge sheet documenting gate/supervisor/replan/
     correction events plus the bench verdict for one run.
@@ -543,7 +577,13 @@ def _build_judge_sheet(run_dir: Path, meta: dict, out: Path, judge_events: list)
     recorder_meta = _load_recorder_meta(run_dir)
 
     detail = str(meta.get("detail") or "").strip()
-    extra_line = f"detail: {detail}" if detail else None
+    scene_summary = _scene_summary_line(run_dir)
+    extra_parts = []
+    if detail:
+        extra_parts.append(f"detail: {detail}")
+    if scene_summary:
+        extra_parts.append(scene_summary)
+    extra_line = " | ".join(extra_parts) if extra_parts else None
 
     plan_lines = _plan_block_lines(meta.get("plan"))
     plan_h = (PLAN_PAD * 2 + PLAN_LINE_H * len(plan_lines)) if plan_lines else 0

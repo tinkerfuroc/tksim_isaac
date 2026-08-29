@@ -15,6 +15,7 @@ from tools.contact_sheet import (  # noqa: E402
     select_event_rows,
     _stamp_from_name,
     _dedup_transcript,
+    _scene_summary_line,
     REPLAN_BAND_COLOR,
 )
 
@@ -509,3 +510,60 @@ def test_main_default_creates_judge_sheet(tmp_path):
     assert rc == 0
     assert out_path.exists()
     assert (tmp_path / "judge-sheet.jpg").exists()
+
+
+def test_scene_summary_line_formats_objects_and_person(tmp_path):
+    (tmp_path / "scene-plan.json").write_text(json.dumps({
+        "items": [
+            {"id": "cmd_bleach_0", "kind": "object", "name": "bleach",
+             "spot": "kitchen_table", "room": "kitchen"},
+            {"id": "cmd_bowl_0", "kind": "object", "name": "bowl",
+             "spot": "kitchen_table", "room": "kitchen"},
+            {"id": "cmd_person_bedroom", "kind": "person", "name": "person",
+             "spot": "", "room": "bedroom"},
+        ],
+    }))
+    assert _scene_summary_line(tmp_path) == (
+        "scene: bleach@kitchen_table x1, bowl@kitchen_table x1, person@bedroom x1"
+    )
+
+
+def test_scene_summary_line_missing_file_returns_none(tmp_path):
+    assert _scene_summary_line(tmp_path) is None
+
+
+def test_scene_summary_line_corrupt_file_returns_none(tmp_path):
+    (tmp_path / "scene-plan.json").write_text("{not json")
+    assert _scene_summary_line(tmp_path) is None
+
+
+def test_scene_summary_line_empty_items_returns_none(tmp_path):
+    (tmp_path / "scene-plan.json").write_text(json.dumps({"items": []}))
+    assert _scene_summary_line(tmp_path) is None
+
+
+def test_build_judge_sheet_includes_scene_summary_from_scene_plan(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    (tmp_path / "scene-plan.json").write_text(json.dumps({
+        "items": [
+            {"id": "cmd_bleach_0", "kind": "object", "name": "bleach",
+             "spot": "kitchen_table", "room": "kitchen"},
+        ],
+    }))
+    meta = {"id": "c013", "text": "x", "verdict": "PASS", "seconds": 1.0, "tier": "T2"}
+    out = build_judge_sheet(tmp_path, meta, tmp_path / "judge-scene.jpg")
+    assert out is not None
+    assert out.exists()
+
+
+def test_build_judge_sheet_survives_a_corrupt_scene_plan(tmp_path):
+    _mk_frames(tmp_path, "arena", 5)
+    _mk_frames(tmp_path, "head", 5)
+    _mk_judge_events(tmp_path)
+    (tmp_path / "scene-plan.json").write_text("{not json")
+    meta = {"id": "c014", "verdict": "PASS"}
+    out = build_judge_sheet(tmp_path, meta, tmp_path / "judge-badscene.jpg")
+    assert out is not None
+    assert out.exists()
