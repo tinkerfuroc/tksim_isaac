@@ -310,6 +310,10 @@ def _arena_camera_enabled(camera_specs: tuple) -> bool:
 #: see docs/superpowers/specs/2026-08-29-arena-camera-rtf-design.md).
 STABLE_AA_ENV = "TINKER_SIM_STABLE_AA"
 
+#: The DLAA pin, when requested, is scoped to just the arena camera's render
+#: product -- see the docstring above camera_rig.initialize's call site.
+STABLE_AA_CAMERAS = frozenset({"arena_camera"})
+
 
 def _stable_aa_requested(arena_enabled: bool, env: dict) -> bool:
     """DLAA pin decision: the arena camera's presence unless the env forces it."""
@@ -1093,7 +1097,7 @@ def main() -> int:
             camera_rig.initialize(
                 app,
                 stable_aa=stable_aa,
-                stable_aa_cameras=frozenset({"arena_camera"}) if stable_aa else None,
+                stable_aa_cameras=STABLE_AA_CAMERAS if stable_aa else None,
             )
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
