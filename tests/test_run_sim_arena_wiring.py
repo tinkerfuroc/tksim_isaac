@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "validation"))
 sys.path.insert(0, str(ROOT / "simulation"))
 
 from run_sim import (  # noqa: E402
+    STABLE_AA_CAMERAS,
     _arena_camera_enabled,
     _stable_aa_requested,
     _with_arena_camera,
@@ -110,3 +111,10 @@ def test_stable_aa_follows_arena_unless_forced():
     assert _stable_aa_requested(False, {"TINKER_SIM_STABLE_AA": "0"}) is False
     # the env can force DLAA *off* with the arena on, for the A/B only
     assert _stable_aa_requested(True, {"TINKER_SIM_STABLE_AA": "0"}) is False
+
+
+def test_stable_aa_cameras_is_arena_only():
+    # the DLAA pin, when applied, must be scoped to the arena render
+    # product only -- not the head/wrist parity cameras (Task 4a's finding
+    # that a global pin taxed them ~50ms/pump for no benefit).
+    assert STABLE_AA_CAMERAS == frozenset({"arena_camera"})
