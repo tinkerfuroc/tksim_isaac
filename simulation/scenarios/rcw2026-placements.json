@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "_comment": "surface_xyz for kitchen_table/side_table_02/shelf_02 and persons.kitchen/persons.living_room are exactly the poses already spawned in gpsr-rcw2026-bench.json (soup, banana, bowl, kitchen_person, livingroom_person). The other four spot surfaces (side_table, laundry_desk, shelf, sofa) were measured 2026-08-29 from the built rcw2026 arena USD (artifacts/asset-manifest.json['generated_arena_usds'][0]['path'], or any artifacts/arena/rcw2026/*/arena.usd -- two independently-built copies gave identical furniture placements) using `uv run --frozen --no-sync python` (pxr is present in this repo's own uv-managed venv; see tools/tinker_sim_deploy/cli.py's _launch_command for this invocation pattern) to read /World/Arena/Furniture/rcw26_<spot> prim world-space origin xy (UsdGeom.Xformable.ComputeLocalToWorldTransform) and world bounding-box max z (UsdGeom.BBoxCache.ComputeWorldBound). side_table reuses side_table_02's known surface z (0.612) since both are the same furniture asset and their raw bbox tops match almost exactly (0.6025 vs 0.6025); shelf reuses shelf_02's known usable-shelf-level z (1.07) for the same reason (both bbox tops are 2.0196, the top of the whole multi-level unit, not a usable shelf surface); laundry_desk uses its own bbox top directly (0.7337, rounds to 0.734, within 1cm of kitchen_table's own known desk height); sofa uses the design doc's flat seat-height fallback (0.45) since its bbox top (0.653) is the backrest, not the seat. Person poses for bedroom/laundry_room use the design doc's exact fallback formula (no analogous already-spawned ground truth for these two rooms): DEC constants.rcw2026.json possible_poses[<room's first search_spots entry>] point, moved 0.8m along that pose's own facing direction (yaw = 2*atan2(orientation.z, orientation.w)), z=0, with the person's own orientation rotated 180 degrees from the spot's yaw so they face back toward the spot.",
+  "spots": {
+    "kitchen_table": {"surface_xyz": [2.5, -3.0, 0.734], "grid_dx": 0.18, "grid_dy": 0.15},
+    "side_table_02": {"surface_xyz": [0.43, 1.755, 0.612], "grid_dx": 0.18, "grid_dy": 0.15},
+    "shelf_02": {"surface_xyz": [0.312, -0.57, 1.07], "grid_dx": 0.18, "grid_dy": 0.15},
+    "side_table": {"surface_xyz": [-0.346, -5.045, 0.612], "grid_dx": 0.18, "grid_dy": 0.15},
+    "laundry_desk": {"surface_xyz": [-2.988, 4.525, 0.734], "grid_dx": 0.18, "grid_dy": 0.15},
+    "shelf": {"surface_xyz": [-3.687, 0.309, 1.07], "grid_dx": 0.18, "grid_dy": 0.15},
+    "sofa": {"surface_xyz": [-2.184, -4.839, 0.45], "grid_dx": 0.18, "grid_dy": 0.15}
+  },
+  "persons": {
+    "kitchen": {"xyz": [1.8, -3.85, 0.0], "quaternion_xyzw": [0.0, 0.0, -0.381912, 0.924199]},
+    "living_room": {"xyz": [-4.684, -4.089, 0.0], "quaternion_xyzw": [0.0, 0.0, -0.381912, 0.924199]},
+    "bedroom": {"xyz": [0.28, 1.755, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+    "laundry_room": {"xyz": [-2.931, 4.663, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.831497, -0.55553]}
+  }
+}
