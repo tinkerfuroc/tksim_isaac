@@ -22,6 +22,18 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, Protocol, Sequence
 
+# The bench invokes this file as a standalone script from another repo
+# (`python3 /abs/path/tools/gpsr_spawn.py ...`), with no PYTHONPATH help --
+# `from tools.gpsr_scene import ...` below would otherwise raise
+# `ModuleNotFoundError: No module named 'tools'` in that mode (it only
+# resolves under pytest, which runs from the repo root with the repo root
+# already on sys.path). Guarded so this is a no-op -- and does not disturb
+# import order/caching -- when the repo root is already on sys.path, e.g.
+# under pytest.
+_REPO_ROOT_FOR_IMPORT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT_FOR_IMPORT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT_FOR_IMPORT)
+
 from tools.gpsr_scene import (
     REPO_ROOT,
     ScenePlan,

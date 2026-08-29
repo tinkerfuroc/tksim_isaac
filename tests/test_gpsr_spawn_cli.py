@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -390,3 +392,22 @@ def test_cli_emit_scenario_merges_plans(tmp_path):
     assert code == 0
     merged = json.loads(out.read_text())
     assert len(merged["objects"]) >= len(BASE_SCENARIO["objects"])
+
+def test_cli_runs_as_a_standalone_script_with_no_pythonpath(tmp_path):
+    # Fix round 3: the bench invokes this file as a bare script from
+    # another repo (`python3 /abs/path/tools/gpsr_spawn.py ...`), with no
+    # PYTHONPATH help -- `from tools.gpsr_scene import ...` used to raise
+    # ModuleNotFoundError in that mode (it only resolved under pytest,
+    # which already has the repo root on sys.path). Exercise the actual
+    # failure mode: a subprocess whose env has PATH only, no PYTHONPATH
+    # and no cwd assumption tying it to the repo.
+    out = tmp_path / "p.json"
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "gpsr_spawn.py"),
+         "plan", "--command", "bring me a mug", "--seed", "1", "--out", str(out)],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert out.is_file()
