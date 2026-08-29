@@ -213,7 +213,7 @@ Expected RTF (simulated / wall; gpsr-rcw2026, rcw2026 arena, this host):
 | default 120 / control 120 | 0.75 | ~0.64 | — |
 | `TINKER_SIM_CONTROL_HZ=60` | 1.18 | **0.77-0.80** | **0.81 / 0.68 / 0.63** |
 | `TINKER_SIM_CONTROL_HZ=30` | 1.88 | ~0.85 | — |
-| arena camera on (`--evidence`) | — | — | **~0.58 idle** (0.54-0.59, 2026-08-29 bench measurement) |
+| arena camera on (`--evidence`) | — | — | **~0.58 idle** (0.54-0.59, 2026-08-29 bench measurement, vision attached — not directly comparable to the 0.81 row above, measured without vision) |
 
 Adding `TINKER_SIM_CPU_THREADS=16` (Kit's worker pool; default 32 on this
 host) is worth ~0.03-0.05 on every bridge-attached figure and is safe.

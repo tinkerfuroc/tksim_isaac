@@ -118,3 +118,10 @@ def test_stable_aa_cameras_is_arena_only():
     # product only -- not the head/wrist parity cameras (Task 4a's finding
     # that a global pin taxed them ~50ms/pump for no benefit).
     assert STABLE_AA_CAMERAS == frozenset({"arena_camera"})
+
+
+def test_stable_aa_cameras_scope_follows_arena_presence():
+    from run_sim import STABLE_AA_CAMERAS, _stable_aa_cameras
+
+    assert _stable_aa_cameras(True) == STABLE_AA_CAMERAS == frozenset({"arena_camera"})
+    assert _stable_aa_cameras(False) is None

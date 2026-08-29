@@ -49,12 +49,25 @@ def test_sim_stage_env():
 
 # --- Arena camera is an evidence-run opt-in (RTF: 0.24 with it, 0.68+ without) ---
 
-def test_sim_stage_arena_off_by_default():
-    for cfg in (_cfg(manipulation="mock"), _cfg(manipulation="live", manip_gpu=1)):
-        env = mod.stage_commands(cfg)[0]["env"]
-        assert "TINKER_SIM_ARENA_CAMERA" not in env
-        assert "TINKER_SIM_ARENA_CAMERA_HZ" not in env
-        assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env
+def test_sim_stage_arena_off_by_default_mock():
+    env = mod.stage_commands(_cfg(manipulation="mock"))[0]["env"]
+    assert "TINKER_SIM_ARENA_CAMERA" not in env
+    assert "TINKER_SIM_ARENA_CAMERA_HZ" not in env
+    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env
+
+
+def test_sim_stage_arena_off_by_default_live():
+    # Split from the mock case so the mock half is unaffected by this repo's
+    # known environmental gap: stage_commands(manipulation="live") resolves
+    # the model bundle manifest via resolve_model_bundle_manifest(), which
+    # raises "produced model bundle not found" when this worktree hasn't
+    # produced one (per docs/gpsr-sim-runbook.md's generation recipe) -- an
+    # environmental precondition, not something the arena-off assertion
+    # below is exercising.
+    env = mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))[0]["env"]
+    assert "TINKER_SIM_ARENA_CAMERA" not in env
+    assert "TINKER_SIM_ARENA_CAMERA_HZ" not in env
+    assert "TINKER_SIM_DISABLE_WRIST_CAMERA" not in env
 
 
 def test_sim_stage_arena_on_for_evidence_runs():

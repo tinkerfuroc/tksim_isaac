@@ -527,9 +527,13 @@ class CameraRig:
         confirmed per-render-product-overridable by probing a live render
         product's authored attributes (see the developer log, Task 4a).
         ``None`` (the default) keeps the old global-setting behaviour, which
-        pins every render product regardless of name.
+        pins every render product regardless of name. An empty
+        ``stable_aa_cameras`` set is not the same as ``None``: with
+        ``stable_aa=True`` and an empty set, no camera's name is ever a
+        member, so the pin is authored on nothing -- by design, not a bug.
+        Callers that want the global pin must pass ``None``, not ``frozenset()``.
 
-        Root cause this works around: DLSS's default op auto-picks an
+        Original hypothesis (2026-08-26): DLSS's default op auto-picks an
         internal render resolution below the render product's declared
         output resolution, then live-resizes the render target up if that
         pick falls under DLSS's ~300 px minimum input size (observed as
@@ -562,10 +566,10 @@ class CameraRig:
         pin scoped this way (see the developer log, Task 4a) and would need
         re-testing if error 700 returns. The pin stays on the arena
         camera's render product as defence in depth for the one product
-        added after the original crash -- at negligible cost, since Task 4a
-        measured the global pin taxing the 12 Hz parity renders by ~50 ms
-        per Kit pump (``scripts/arena-rtf-spike`` variant D) for no benefit
-        to cameras that were never implicated in the race.
+        added after the original crash -- at negligible cost, since Task 3 /
+        Phase 0 measured the global pin taxing the 12 Hz parity renders by
+        ~50 ms per Kit pump (``scripts/arena-rtf-spike`` variant D) for no
+        benefit to cameras that were never implicated in the race.
         """
         from isaacsim.core.utils.extensions import enable_extension
 
