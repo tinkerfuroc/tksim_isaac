@@ -183,6 +183,116 @@ essentially all of the DLAA tax from the parity cameras while the arena
 camera itself still gets DLAA (crash workaround intact, confirmed by the
 3/3 clean crash recipe above).
 
+### Phase 2 — arena defaults
+
+Task 5: lower the arena camera's defaults from 4 Hz / 960x540 to
+`ARENA_CAMERA_DEFAULT_HZ = 2.0` and `ARENA_CAMERA_DEFAULT_SIZE = (640, 360)`
+(`simulation/tinker_sim_isaac/arena_camera.py`). Justification is Phase 1a's
+re-measure, not Task 3's `E`/`F` variants (those were Phase 0 measurements
+taken under the *old* global DLAA pin, before the scoped-pin fix landed —
+`F_arena_0p5hz` alone moved `kit_pump` by 12.5 ms, RTF 0.44 → 0.47, so they
+are not evidence of a small effect post-fix). The real justification: with
+the DLAA fix in place, Phase 1a's re-measure shows the arena camera's
+*entire* residual cost is ~7 ms of `kit_pump` (post-fix `B - A`: 44.1 vs
+37.1 ms), so its capture rate and resolution individually cannot move RTF
+by more than that either way — lowering the defaults costs nothing
+measurable to give up, not a real tradeoff. 640x360 was chosen because a
+bird's-eye frame at that size still shows a recognisable person and table,
+which is all a bird's-eye evidence frame needs. `tools/contact_sheet.py`
+was checked (`grep -n "960|540|arena"`)
+and left untouched: its `960` is the judge sheet's own 3-tile layout width
+(`TILE_W = 320`), not a hard-coded arena frame size — each tile is resized
+from the loaded frame's actual `width`/`height` (`contact_sheet.py:313`),
+so it already adapts to any arena frame size. Step 3 (live visual check of
+a 640x360 frame with a person and table recognisable, `TINKER_SIM_ARENA_CAMERA=1`
+on GPU 1) is deferred to Task 7's stack run — GPU 1 was in use by another
+session's benchmark stack at the time of this task.
+
+### Phase 3 — bench policy
+
+Task 6: `gpsr-stack up` now takes `--evidence` to opt into the arena camera; pass/fail batteries run arena-off by default.
+
+### Phase 4 — verification on the bench stack
+
+Task 7: verified the fix on the real hybrid stack (bridge + Nav2 + vision
+attached, `--manipulation mock`), not just sim-only. `TINKER_WS`/GPU 1,
+`gpsr-rcw2026-bench`, `scripts/gpsr-stack up/down`.
+
+**Regression guard (Step 1).** Task 4 landed approach (i) (per-render-product
+override), so the guard is a module constant:
+`STABLE_AA_CAMERAS = frozenset({"arena_camera"})` in `validation/run_sim.py`,
+used at the `camera_rig.initialize(...)` call site instead of the inline
+literal, with `test_stable_aa_cameras_is_arena_only`
+(`tests/test_run_sim_arena_wiring.py`) pinning it. All four camera test
+files: 51 passed.
+
+**Before/after, bridge-attached, idle (simulated-sec / wall-sec, 3 samples
+each, ~1-2 min apart via `/clock`):**
+
+| configuration | sample 1 | sample 2 | sample 3 | mean RTF | GPU 1 util (nvidia-smi) |
+|---|---|---|---|---|---|
+| before (bench session, earlier 2026-08-29) | 0.21 | — | 0.24 | 0.21-0.24 | 98% |
+| after, arena camera on (`--evidence`) | 0.544 | 0.592 | 0.594 | **0.577** | 45-53% (~0.65 GB more VRAM than off) |
+| after, arena camera off (control) | 0.643 | 0.692 | 0.594 | **0.643** | 48-53% |
+
+Raw samples (arena on, `up --scenario gpsr-rcw2026-bench --sim-gpu 1
+--evidence`, logs `gpsr_stack_logs/20260829T052441`): 233->244 sec / 20.225 s
+wall = 0.544; 297->309 sec / 20.266 s = 0.592; 320->332 sec / 20.220 s =
+0.594. Arena off (control, no `--evidence`, logs
+`gpsr_stack_logs/20260829T053421`): 25->38 sec / 20.213 s = 0.643; 47->61
+sec / 20.241 s = 0.692; 69->81 sec / 20.218 s = 0.594. (Method note: `grep
+sec` also matches `nanosec:` lines, since `nanosec` contains `sec` as a
+substring — anchored to `grep '^sec:'` before `sed -n '1p;$p'` so the "last"
+line is actually the last `sec:` value, not the last message's `nanosec:`.)
+
+Both configurations (4a arena-on-with-evidence and the arena-off control)
+were taken; the brief's 4b variant (a lower-cost mitigation short of the
+scoped-pin fix) was not needed — the scoped DLAA pin from Task 4a's Phase 1a
+already recovers RTF from 0.21-0.24 to 0.58 with `--evidence` on the real
+stack, well clear of the ≥0.5 "GPSR runnable" floor, so there was nothing
+left for a second, weaker mitigation to buy.
+
+GPU 1 utilisation stayed in the 45-53% band across every sample in both
+configurations — nowhere near the 98% seen before the fix (arena-on no
+longer saturates the card; the remaining draw is the vision stack sharing
+GPU 1, not the arena render).
+
+**Crash recipe.** No re-run needed for this task — Phase 1a's Step 5 already
+recorded 3/3 clean 5-minute bring-up/watch/teardown cycles with the arena
+camera on and the scoped DLAA pin in place (zero `error 700` / illegal
+memory access / `Traceback` in any of the three `01-sim.log`s). This task's
+own two stack-up logs (`20260829T052441`, arena-on-with-evidence;
+`20260829T053421`, arena-off) add two more clean runs with no CUDA-700
+signature, for a combined 5/5 across both tasks.
+
+**Policy.** `--evidence` is the one-line policy: contact-sheet/evidence runs
+opt into the arena camera (and pay the RTF cost above); pass/fail batteries
+run arena-off by default and are unaffected.
+
+**Visual check (deferred from Phase 2/Task 5).** With arena-on up:
+`/sim/arena_camera/image_raw` reports `width=640`, `height=360`,
+`encoding=rgb8` (matches Phase 2's 640x360 default). `image_view` is not
+installed on this box, so a frame was saved via a small `rclpy` +
+`sensor_msgs/Image` + PIL script (`cv_bridge` is broken in this env — built
+against numpy 1.x, current numpy is 2.x) to `outputs/arena-640-check.jpg`
+(gitignored, not committed). Visual inspection: a bird's-eye view of the
+arena floor plan is legible, with a round dining table and two chairs
+clearly recognisable, and two humanoid figures clearly recognisable — one
+standing near the table, one standing near a doorway at the bottom of the
+frame. Confirms Phase 2's 640x360 choice.
+
+**Follow-up, not done.** The spec's Phase 2 item 3 (gating the head camera's
+12 Hz publish on having a live subscriber) was not pursued here. Reason:
+Phase 0's row `A_arena_off` — the baseline with the arena camera fully
+disabled — already shows `kit_pump` (41.0 ms) is the largest per-cycle
+bucket *after* physics (50.0 ms) and well ahead of `cameras` (16.1 ms);
+subscriber-gating only touches the `cameras` bucket, which is not where the
+arena-off budget is going, so the payback looked small relative to the
+change's risk (a codepath that silently stops publishing when nothing is
+subscribed) and it was left for a future task with its own measurement.
+
+## 2026-08-26 — GPSR recorded sim battery bring-up
+
 `scripts/gpsr-stack up/down/status` automates Stages 1-5 of
 `docs/gpsr-sim-runbook.md` (Stage 6, the GPSR orchestrator, still lives in
 the `tk25_ws` decision repo and is started separately). Getting a full
@@ -280,108 +390,6 @@ bring-up reaches the manipulation stage (previously never reached) and is
 blocked only on environment-local pieces out of this repo's scope (a
 missing `anygrasp` checkpoint, `tk25_ws`-side Python dependencies for the
 orchestrator) — not on anything `scripts/gpsr-stack` itself does.
-
-### Phase 2 — arena defaults
-
-Task 5: lower the arena camera's defaults from 4 Hz / 960x540 to
-`ARENA_CAMERA_DEFAULT_HZ = 2.0` and `ARENA_CAMERA_DEFAULT_SIZE = (640, 360)`
-(`simulation/tinker_sim_isaac/arena_camera.py`). Justification is the Phase
-0 table above: with the DLAA fix already landed (Phase 1a), Task 3's own
-`E_arena_640` and `F_arena_0p5hz` variants showed resolution and capture
-rate move RTF by well under 2% each — these lower defaults cost nothing
-measurable and are a free win, not a real tradeoff. 640x360 was chosen
-because a bird's-eye frame at that size still shows a recognisable person
-and table. `tools/contact_sheet.py` was checked (`grep -n "960|540|arena"`)
-and left untouched: its `960` is the judge sheet's own 3-tile layout width
-(`TILE_W = 320`), not a hard-coded arena frame size — each tile is resized
-from the loaded frame's actual `width`/`height` (`contact_sheet.py:313`),
-so it already adapts to any arena frame size. Step 3 (live visual check of
-a 640x360 frame with a person and table recognisable, `TINKER_SIM_ARENA_CAMERA=1`
-on GPU 1) is deferred to Task 7's stack run — GPU 1 was in use by another
-session's benchmark stack at the time of this task.
-
-### Phase 3 — bench policy
-
-Task 6: `gpsr-stack up` now takes `--evidence` to opt into the arena camera; pass/fail batteries run arena-off by default.
-
-### Phase 4 — verification on the bench stack
-
-Task 7: verified the fix on the real hybrid stack (bridge + Nav2 + vision
-attached, `--manipulation mock`), not just sim-only. `TINKER_WS`/GPU 1,
-`gpsr-rcw2026-bench`, `scripts/gpsr-stack up/down`.
-
-**Regression guard (Step 1).** Task 4 landed approach (i) (per-render-product
-override), so the guard is a module constant:
-`STABLE_AA_CAMERAS = frozenset({"arena_camera"})` in `validation/run_sim.py`,
-used at the `camera_rig.initialize(...)` call site instead of the inline
-literal, with `test_stable_aa_cameras_is_arena_only`
-(`tests/test_run_sim_arena_wiring.py`) pinning it. All four camera test
-files: 51 passed.
-
-**Before/after, bridge-attached, idle (simulated-sec / wall-sec, 3 samples
-each, ~1-2 min apart via `/clock`):**
-
-| configuration | sample 1 | sample 2 | sample 3 | mean RTF | GPU 1 util (nvidia-smi) |
-|---|---|---|---|---|---|
-| before (bench session, earlier 2026-08-29) | 0.21 | — | 0.24 | 0.21-0.24 | 98% |
-| after, arena camera on (`--evidence`) | 0.544 | 0.592 | 0.594 | **0.577** | 45-53% (~1.7 GB more VRAM than off) |
-| after, arena camera off (control) | 0.643 | 0.692 | 0.594 | **0.643** | 48-53% |
-
-Raw samples (arena on, `up --scenario gpsr-rcw2026-bench --sim-gpu 1
---evidence`, logs `gpsr_stack_logs/20260829T052441`): 233->244 sec / 20.225 s
-wall = 0.544; 297->309 sec / 20.266 s = 0.592; 320->332 sec / 20.220 s =
-0.594. Arena off (control, no `--evidence`, logs
-`gpsr_stack_logs/20260829T053421`): 25->38 sec / 20.213 s = 0.643; 47->61
-sec / 20.241 s = 0.692; 69->81 sec / 20.218 s = 0.594. (Method note: `grep
-sec` also matches `nanosec:` lines, since `nanosec` contains `sec` as a
-substring — anchored to `grep '^sec:'` before `sed -n '1p;$p'` so the "last"
-line is actually the last `sec:` value, not the last message's `nanosec:`.)
-
-Both configurations (4a arena-on-with-evidence and the arena-off control)
-were taken; the brief's 4b variant (a lower-cost mitigation short of the
-scoped-pin fix) was not needed — the scoped DLAA pin from Task 4a's Phase 1a
-already recovers RTF from 0.21-0.24 to 0.58 with `--evidence` on the real
-stack, well clear of the ≥0.5 "GPSR runnable" floor, so there was nothing
-left for a second, weaker mitigation to buy.
-
-GPU 1 utilisation stayed in the 45-53% band across every sample in both
-configurations — nowhere near the 98% seen before the fix (arena-on no
-longer saturates the card; the remaining draw is the vision stack sharing
-GPU 1, not the arena render).
-
-**Crash recipe.** No re-run needed for this task — Phase 1a's Step 5 already
-recorded 3/3 clean 5-minute bring-up/watch/teardown cycles with the arena
-camera on and the scoped DLAA pin in place (zero `error 700` / illegal
-memory access / `Traceback` in any of the three `01-sim.log`s). This task's
-own two stack-up logs (`20260829T052441`, arena-on-with-evidence;
-`20260829T053421`, arena-off) add two more clean runs with no CUDA-700
-signature, for a combined 5/5 across both tasks.
-
-**Policy.** `--evidence` is the one-line policy: contact-sheet/evidence runs
-opt into the arena camera (and pay the RTF cost above); pass/fail batteries
-run arena-off by default and are unaffected.
-
-**Visual check (deferred from Phase 2/Task 5).** With arena-on up:
-`/sim/arena_camera/image_raw` reports `width=640`, `height=360`,
-`encoding=rgb8` (matches Phase 2's 640x360 default). `image_view` is not
-installed on this box, so a frame was saved via a small `rclpy` +
-`sensor_msgs/Image` + PIL script (`cv_bridge` is broken in this env — built
-against numpy 1.x, current numpy is 2.x) to `outputs/arena-640-check.jpg`
-(gitignored, not committed). Visual inspection: a bird's-eye view of the
-arena floor plan is legible, with a round dining table and two chairs
-clearly recognisable, and two humanoid figures clearly recognisable — one
-standing near the table, one standing near a doorway at the bottom of the
-frame. Confirms Phase 2's 640x360 choice.
-
-**Follow-up, not done.** The spec's Phase 2 item 3 (gating the head camera's
-12 Hz publish on having a live subscriber) was not pursued here. Reason:
-Phase 0's row `A_arena_off` — the baseline with the arena camera fully
-disabled — already shows `kit_pump` (41.0 ms) is the largest per-cycle
-bucket *after* physics (50.0 ms) and well ahead of `cameras` (16.1 ms);
-subscriber-gating only touches the `cameras` bucket, which is not where the
-arena-off budget is going, so the payback looked small relative to the
-change's risk (a codepath that silently stops publishing when nothing is
-subscribed) and it was left for a future task with its own measurement.
 
 ## 2026-08-22 — GPSR `goto_command_point` stall: two root causes in the sim, one residual
 

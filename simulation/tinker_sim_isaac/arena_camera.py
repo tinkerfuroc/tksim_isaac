@@ -30,9 +30,13 @@ ARENA_CAMERA_ENV = "TINKER_SIM_ARENA_CAMERA"
 #: Optional override for the publish rate (Hz); may only lower the
 #: default, never raise it -- a low, coarse rate is the entire point of a
 #: fixed overview camera that only needs to prove where things ended up.
-#: Measured 2026-08-29 (Task 3 table, top entry of docs/developer-log.md):
-#: with the DLAA fix in place, 2 Hz vs 0.5 Hz and 960 vs 640 px moved RTF
-#: by less than ~2%, so these defaults are a free cut, not a real tradeoff.
+#: Measured 2026-08-29 (Phase 1a re-measure, top entry of
+#: docs/developer-log.md): after the DLAA-pin fix, the arena camera's
+#: entire residual cost is ~7 ms of kit_pump (post-fix B-A: 44.1 vs
+#: 37.1 ms), so its capture rate and resolution cannot possibly move RTF
+#: by more than that either way -- these defaults are 2 Hz / 640x360
+#: because that is all a bird's-eye evidence frame needs, not because a
+#: higher rate or resolution was measured and found costly post-fix.
 ARENA_CAMERA_HZ_ENV = "TINKER_SIM_ARENA_CAMERA_HZ"
 ARENA_CAMERA_DEFAULT_HZ = 2.0
 
@@ -41,7 +45,7 @@ ARENA_CAMERA_DEFAULT_HZ = 2.0
 #: the default size anyway, so smaller is never a fidelity loss that
 #: matters -- and every arena pixel is paid for on the sim's GPU). 640x360
 #: still shows a recognisable person and table in the bird's-eye frame; see
-#: the HZ comment above for the 2026-08-29 measurement this default relies on.
+#: the HZ comment above for the residual-cost budget this default relies on.
 ARENA_CAMERA_SIZE_ENV = "TINKER_SIM_ARENA_CAMERA_SIZE"
 ARENA_CAMERA_DEFAULT_SIZE = (640, 360)
 

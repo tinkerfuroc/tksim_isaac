@@ -304,9 +304,13 @@ def _arena_camera_enabled(camera_specs: tuple) -> bool:
     return camera_specs[-1].name == "arena_camera"
 
 
-#: A/B aid for the RTF work: "1" forces the DLAA pin on without the arena
-#: camera (isolates its per-frame cost on the parity cameras), "0" forces
-#: it off with the arena camera on (only for the crash-recipe re-check;
+#: A/B aid for the RTF work. Unset: the pin follows the arena camera's
+#: presence, scoped to just its render product (see _stable_aa_cameras) --
+#: on with the arena camera, off without it. "1" forces the pin on even
+#: without the arena camera, which (via _stable_aa_cameras) falls back to
+#: the historical *global* pin across every render product, isolating its
+#: per-frame cost on the parity cameras for A/B comparison. "0" forces the
+#: pin off with the arena camera on (only for the crash-recipe re-check;
 #: see docs/superpowers/specs/2026-08-29-arena-camera-rtf-design.md).
 STABLE_AA_ENV = "TINKER_SIM_STABLE_AA"
 
@@ -321,6 +325,13 @@ def _stable_aa_requested(arena_enabled: bool, env: dict) -> bool:
     if raw is None:
         return arena_enabled
     return raw.strip().lower() in _TRUTHY
+
+
+def _stable_aa_cameras(arena_enabled: bool) -> frozenset[str] | None:
+    """Per-product scope for the DLAA pin: the arena product when it exists,
+    else ``None`` so a forced pin (``TINKER_SIM_STABLE_AA=1`` without the arena)
+    falls back to the historical global pin -- what the spike's variant D measures."""
+    return STABLE_AA_CAMERAS if arena_enabled else None
 
 
 def _content_addressed_tinker_usd(root: Path, requested: Path | None) -> Path:
@@ -1080,24 +1091,30 @@ def main() -> int:
             # docstring). Runs with just the two hardware-parity cameras
             # keep the previously-verified-stable default AA behaviour.
             # TINKER_SIM_STABLE_AA can force this decision either way for
-            # the RTF spike -- see _stable_aa_requested. Scoped to just the
-            # arena camera's render product (stable_aa_cameras): the actual
-            # CUDA-700 race was root-caused to stale sub-rate annotator
-            # reads and fixed independently in a9fa951, so head/wrist can
-            # keep the default DLSS op -- resize included, see
-            # CameraRig.initialize's docstring -- without reopening the
-            # race; Task 4a measured the global pin taxing those parity
-            # renders by ~50 ms per Kit pump for no benefit, since neither
-            # was ever the sub-rate camera the race depended on. The pin
-            # stays on the arena product as defence in depth for the one
-            # product added after the original crash.
+            # the RTF spike -- see _stable_aa_requested. Scope (which render
+            # products actually get the pin) follows the arena camera's own
+            # presence via _stable_aa_cameras, independent of why stable_aa
+            # ended up True: unset or "1" with the arena camera on scopes
+            # the pin to just the arena product; "1" with the arena camera
+            # off has no arena product to scope to, so it falls back to the
+            # historical global pin (what the spike's variant D measures).
+            # The arena-scoped pin is enough on its own: the actual CUDA-700
+            # race was root-caused to stale sub-rate annotator reads and
+            # fixed independently in a9fa951, so head/wrist can keep the
+            # default DLSS op -- resize included, see CameraRig.initialize's
+            # docstring -- without reopening the race; Task 3 / Phase 0
+            # measured the global pin taxing those parity renders by ~50 ms
+            # per Kit pump for no benefit, since neither was ever the
+            # sub-rate camera the race depended on. The pin stays on the
+            # arena product as defence in depth for the one product added
+            # after the original crash.
             stable_aa = _stable_aa_requested(arena_camera_enabled, os.environ)
             if stable_aa != arena_camera_enabled:
                 print(f"[sim] stable_aa forced to {stable_aa} by {STABLE_AA_ENV}", flush=True)
             camera_rig.initialize(
                 app,
                 stable_aa=stable_aa,
-                stable_aa_cameras=STABLE_AA_CAMERAS if stable_aa else None,
+                stable_aa_cameras=_stable_aa_cameras(arena_camera_enabled),
             )
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
