@@ -17,9 +17,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
-from typing import Optional, Protocol, Sequence
+from typing import Callable, Optional, Protocol, Sequence
 
 from tools.gpsr_scene import (
     REPO_ROOT,
@@ -37,9 +38,23 @@ DEFAULT_PLACEMENTS = REPO_ROOT / "simulation" / "scenarios" / "rcw2026-placement
 DEFAULT_BASE_SCENARIO = REPO_ROOT / "simulation" / "scenarios" / "gpsr-rcw2026-bench.json"
 
 
+class ServiceUnavailable(RuntimeError):
+    """Raised by the real ROS service client (see `_make_ros_service_client`)
+    when a simulation_interfaces service is missing at construction time, or
+    when a spawn/delete call's `spin_until_future_complete` times out.
+    `apply_plan` treats this specially: unlike an ordinary per-item spawn
+    failure (the item itself is bad), a `ServiceUnavailable` means the sim
+    is presumed down for the rest of the run, so the plan's remaining items
+    are not attempted at all rather than tried and failed one by one.
+    """
+
+
 class ServiceClient(Protocol):
     def spawn(self, item: SpawnItem) -> str:
-        """Spawn `item`; return its entity name, or raise on failure."""
+        """Spawn `item`; return its entity name, or raise on failure.
+        Raise `ServiceUnavailable` specifically for an infra-level failure
+        (missing service, call timeout); any other exception is treated as
+        an ordinary per-item failure."""
         ...
 
     def delete(self, entity: str) -> bool:
@@ -108,61 +123,129 @@ def apply_plan(
     base_scenario: dict,
     placements: dict,
     previous_manifest: Optional[dict] = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """Spawn every item in `plan` via `client`, skipping items whose
     (asset, spot-or-room) already exists in the base scenario or a
-    previous manifest. Never raises for a per-item spawn failure -- it is
-    recorded in the returned manifest's entities with `"ok": False`.
+    *successful* previous-manifest entry. A previously FAILED entry
+    (`"ok": False`) does not count as present -- it is retried, and its
+    stale manifest record (matched by (asset_key, where), not item id,
+    since a retried item may be replanned under a different id) is
+    replaced by the fresh attempt's result.
+
+    Never raises for an ordinary per-item spawn failure -- it is recorded
+    in the returned manifest's entities with `"ok": False` and the loop
+    continues to the next item. A `ServiceUnavailable` failure is
+    different: it means the sim itself is down, not just this one item,
+    so the loop stops immediately and every remaining item is recorded in
+    `"not_attempted"` instead of being attempted.
+
+    If `on_progress` is given, it is called with the manifest-so-far after
+    every item (skipped, attempted, or not-attempted) -- e.g. so the CLI
+    can rewrite the manifest file incrementally, leaving a usable on-disk
+    manifest even if the run is killed mid-plan.
     """
     seen_keys = set(base_scenario_keys(base_scenario, placements))
     entities: list[dict] = []
     if previous_manifest:
         for e in previous_manifest.get("entities", []):
-            seen_keys.add((e["asset_key"], e["where"]))
+            key = (e.get("asset_key"), e.get("where"))
+            if e.get("ok"):
+                seen_keys.add(key)
             entities.append(e)
 
+    def _drop_stale(key: tuple[str, str]) -> None:
+        entities[:] = [e for e in entities if (e.get("asset_key"), e.get("where")) != key]
+
     skipped: list[dict] = []
+    not_attempted: list[dict] = []
+
+    def _report() -> None:
+        if on_progress:
+            on_progress({"entities": list(entities), "skipped": list(skipped),
+                        "not_attempted": list(not_attempted)})
+
+    service_down = False
     for item in plan.items:
         where = item.spot if item.spot else item.room
         asset_key = _asset_key(item.asset_uri)
         key = (asset_key, where)
+
+        if service_down:
+            not_attempted.append(
+                {"id": item.id, "ok": False, "error": "not attempted: service unavailable"}
+            )
+            _report()
+            continue
+
         if key in seen_keys:
             skipped.append({"id": item.id, "reason": "already present", "where": where})
+            _report()
             continue
+
         entity_name = f"/World/Scenario/{item.id}"
+        pose_fields = {"xyz": list(item.xyz), "quaternion_xyzw": list(item.quaternion_xyzw)}
         try:
             actual = client.spawn(item)
-        except Exception as exc:  # noqa: BLE001 - never crash a bench run
+        except ServiceUnavailable as exc:
+            service_down = True
+            _drop_stale(key)
             entities.append(
                 {"id": item.id, "asset_key": asset_key, "where": where,
-                 "entity_name": entity_name, "ok": False, "error": repr(exc)}
+                 "entity_name": entity_name, "ok": False, "error": repr(exc), **pose_fields}
             )
+            _report()
+            continue
+        except Exception as exc:  # noqa: BLE001 - never crash a bench run
+            _drop_stale(key)
+            entities.append(
+                {"id": item.id, "asset_key": asset_key, "where": where,
+                 "entity_name": entity_name, "ok": False, "error": repr(exc), **pose_fields}
+            )
+            _report()
             continue
         seen_keys.add(key)
+        _drop_stale(key)
         entities.append(
             {"id": item.id, "asset_key": asset_key, "where": where,
-             "entity_name": actual, "ok": True}
+             "entity_name": actual, "ok": True, **pose_fields}
         )
-    return {"entities": entities, "skipped": skipped}
+        _report()
+    return {"entities": entities, "skipped": skipped, "not_attempted": not_attempted}
 
 
-def clear_manifest(manifest: dict, client: "ServiceClient") -> dict:
+def clear_manifest(
+    manifest: dict,
+    client: "ServiceClient",
+    *,
+    on_progress: Optional[Callable[[dict], None]] = None,
+) -> dict:
     """Delete every successfully-spawned entity in `manifest` via
     `client`. Tolerates NOT_FOUND (client.delete returning True). Never
-    raises for a per-item delete failure.
+    raises for a per-item delete failure. If `on_progress` is given, it is
+    called with the manifest-so-far after every entity.
     """
     results: list[dict] = []
+    skipped = list(manifest.get("skipped", []))
+
+    def _report() -> None:
+        if on_progress:
+            on_progress({"entities": list(results), "skipped": list(skipped)})
+
     for e in manifest.get("entities", []):
         if not e.get("ok"):
             results.append(e)
+            _report()
             continue
         try:
             deleted = client.delete(e["entity_name"])
         except Exception as exc:  # noqa: BLE001 - never crash a bench run
             results.append({**e, "cleared": False, "clear_error": repr(exc)})
+            _report()
             continue
         results.append({**e, "cleared": bool(deleted)})
-    return {"entities": results, "skipped": manifest.get("skipped", [])}
+        _report()
+    return {"entities": results, "skipped": skipped}
 
 
 def emit_scenario(plans: Sequence[ScenePlan], base_scenario: dict, placements: dict) -> dict:
@@ -216,7 +299,10 @@ def _resolve_asset_uri(asset_uri: str) -> str:
 def _make_ros_service_client() -> "ServiceClient":
     """The only place this module imports rclpy -- constructed lazily so
     `plan`/`emit-scenario` (and every test) never need ROS on the path.
-    Raises if `/spawn_entity` never becomes available.
+    Waits for BOTH `/spawn_entity` and `/delete_entity` (10s each) before
+    returning, raising `ServiceUnavailable` naming whichever service never
+    came up -- a client this module hands to `apply_plan`/`clear_manifest`
+    should never be able to hit a service that was never actually there.
     """
     import rclpy
     from geometry_msgs.msg import PoseStamped
@@ -228,10 +314,14 @@ def _make_ros_service_client() -> "ServiceClient":
     node = Node("gpsr_spawn_client")
     spawn_client = node.create_client(SpawnEntity, "/spawn_entity")
     delete_client = node.create_client(DeleteEntity, "/delete_entity")
-    if not spawn_client.wait_for_service(timeout_sec=10.0):
-        node.destroy_node()
-        rclpy.shutdown()
-        raise RuntimeError("/spawn_entity service unavailable after 10s")
+    for service_name, ros_client in (
+        ("/spawn_entity", spawn_client),
+        ("/delete_entity", delete_client),
+    ):
+        if not ros_client.wait_for_service(timeout_sec=10.0):
+            node.destroy_node()
+            rclpy.shutdown()
+            raise ServiceUnavailable(f"{service_name} service unavailable after 10s")
 
     class _RclpyServiceClient:
         def spawn(self, item: SpawnItem) -> str:
@@ -253,7 +343,7 @@ def _make_ros_service_client() -> "ServiceClient":
             future = spawn_client.call_async(request)
             rclpy.spin_until_future_complete(node, future, timeout_sec=30.0)
             if future.result() is None:
-                raise RuntimeError(f"spawn_entity timed out for {item.id}")
+                raise ServiceUnavailable(f"spawn_entity timed out for {item.id}")
             response = future.result()
             if response.result.result != Result.RESULT_OK:
                 raise RuntimeError(
@@ -267,7 +357,7 @@ def _make_ros_service_client() -> "ServiceClient":
             future = delete_client.call_async(request)
             rclpy.spin_until_future_complete(node, future, timeout_sec=30.0)
             if future.result() is None:
-                raise RuntimeError(f"delete_entity timed out for {entity}")
+                raise ServiceUnavailable(f"delete_entity timed out for {entity}")
             response = future.result()
             if response.result.result == Result.RESULT_NOT_FOUND:
                 return True
@@ -278,6 +368,21 @@ def _make_ros_service_client() -> "ServiceClient":
             rclpy.shutdown()
 
     return _RclpyServiceClient()
+
+
+def _manifest_writer(path: str) -> Callable[[dict], None]:
+    """An `on_progress` callback that rewrites `path` after every item: it
+    writes to `<path>.tmp` then atomically `os.replace`s it over the real
+    file, so a run killed mid-`apply`/`clear` still leaves a valid,
+    complete-as-of-its-last-item manifest on disk -- never a half-written
+    or corrupt one.
+    """
+    def _write(manifest: dict) -> None:
+        tmp_path = f"{path}.tmp"
+        Path(tmp_path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, path)
+
+    return _write
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -349,11 +454,12 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         return 2
     try:
         manifest = apply_plan(plan, client, base_scenario=base_scenario, placements=placements,
-                              previous_manifest=previous_manifest)
+                              previous_manifest=previous_manifest,
+                              on_progress=_manifest_writer(args.manifest))
     finally:
         client.shutdown()
     Path(args.manifest).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    if any(not e.get("ok", True) for e in manifest["entities"]):
+    if manifest.get("not_attempted") or any(not e.get("ok", True) for e in manifest["entities"]):
         return 2
     return 0
 
@@ -369,7 +475,7 @@ def _cmd_clear(args: argparse.Namespace) -> int:
         print(f"gpsr_spawn: service client unavailable: {exc}", file=sys.stderr)
         return 2
     try:
-        updated = clear_manifest(manifest, client)
+        updated = clear_manifest(manifest, client, on_progress=_manifest_writer(args.manifest))
     finally:
         client.shutdown()
     Path(args.manifest).write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")

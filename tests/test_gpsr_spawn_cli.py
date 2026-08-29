@@ -5,8 +5,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tools.gpsr_scene import ScenePlan, SpawnItem  # noqa: E402
+from tools.gpsr_scene import ScenePlan, SpawnItem, scene_plan_to_json  # noqa: E402
 from tools.gpsr_spawn import (  # noqa: E402
+    ServiceUnavailable,
     apply_plan,
     base_scenario_keys,
     clear_manifest,
@@ -110,6 +111,173 @@ def test_apply_plan_skips_items_already_in_a_previous_manifest():
                           previous_manifest=previous)
     assert manifest["skipped"][0]["id"] == "cmd_spam_0"
     assert client.spawned == []
+
+
+def test_apply_plan_retries_a_previously_failed_item_and_replaces_its_manifest_record():
+    # Fix round 1, finding 1: a previous ok:False entry must not count as
+    # "already present" -- the item is retried (even under a new id, since
+    # a replan can rename it) and the stale failed record is dropped in
+    # favour of the fresh attempt's result.
+    plan = ScenePlan(
+        items=(_item("cmd_spam_1", "spam", "laundry_desk", "laundry_room", (-2.988, 4.525, 0.734),
+                     asset_uri="artifacts/objects/ycb/x/ycb_005_spam/object.usd"),),
+        notes=(),
+    )
+    client = FakeServiceClient()
+    previous = {
+        "entities": [
+            {"id": "cmd_spam_0", "asset_key": "ycb_005_spam", "where": "laundry_desk",
+             "entity_name": "", "ok": False, "error": "boom"}
+        ],
+        "skipped": [],
+    }
+    manifest = apply_plan(plan, client, base_scenario=BASE_SCENARIO, placements=PLACEMENTS,
+                          previous_manifest=previous)
+    assert client.spawned == ["cmd_spam_1"]
+    assert manifest["skipped"] == []
+    assert len(manifest["entities"]) == 1
+    assert manifest["entities"][0]["id"] == "cmd_spam_1"
+    assert manifest["entities"][0]["ok"] is True
+
+
+def test_apply_plan_stops_after_service_unavailable_and_marks_remaining_not_attempted():
+    # Fix round 1, finding 2: a ServiceUnavailable spawn failure is an
+    # infra-level outage, not a per-item failure -- apply_plan must stop
+    # attempting further items (exactly one spawn call) and record the
+    # rest as not_attempted instead.
+    plan = ScenePlan(
+        items=(
+            _item("cmd_spam_0", "spam", "laundry_desk", "laundry_room", (-2.988, 4.525, 0.734),
+                 asset_uri="artifacts/objects/ycb/x/ycb_005_spam/object.usd"),
+            _item("cmd_mustard_0", "mustard", "shelf", "laundry_room", (-3.687, 0.309, 1.07),
+                 asset_uri="artifacts/objects/ycb/x/ycb_006_mustard_bottle/object.usd"),
+        ),
+        notes=(),
+    )
+
+    class OutageClient:
+        def __init__(self):
+            self.calls = 0
+            self.deleted = []
+
+        def spawn(self, item):
+            self.calls += 1
+            raise ServiceUnavailable("/spawn_entity timed out")
+
+        def delete(self, entity):
+            self.deleted.append(entity)
+            return True
+
+    client = OutageClient()
+    manifest = apply_plan(plan, client, base_scenario=BASE_SCENARIO, placements=PLACEMENTS)
+    assert client.calls == 1
+    assert manifest["entities"][0]["id"] == "cmd_spam_0"
+    assert manifest["entities"][0]["ok"] is False
+    assert len(manifest["not_attempted"]) == 1
+    assert manifest["not_attempted"][0]["id"] == "cmd_mustard_0"
+    assert manifest["not_attempted"][0]["error"] == "not attempted: service unavailable"
+
+
+def test_cli_apply_exits_2_on_service_unavailable_and_calls_spawn_once(tmp_path, monkeypatch):
+    # Fix round 1, finding 2 (CLI-level): the same outage propagates to a
+    # process exit code of 2, and _make_ros_service_client is monkeypatched
+    # so this stays ROS-free.
+    plan = ScenePlan(
+        items=(
+            _item("cmd_spam_0", "spam", "laundry_desk", "laundry_room", (-2.988, 4.525, 0.734),
+                 asset_uri="artifacts/objects/ycb/x/ycb_005_spam/object.usd"),
+            _item("cmd_mustard_0", "mustard", "shelf", "laundry_room", (-3.687, 0.309, 1.07),
+                 asset_uri="artifacts/objects/ycb/x/ycb_006_mustard_bottle/object.usd"),
+        ),
+        notes=(),
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(scene_plan_to_json(plan, command_text="x", seed=1)))
+    manifest_path = tmp_path / "manifest.json"
+
+    class OutageClient:
+        def __init__(self):
+            self.calls = 0
+
+        def spawn(self, item):
+            self.calls += 1
+            raise ServiceUnavailable("/spawn_entity timed out")
+
+        def delete(self, entity):
+            return True
+
+        def shutdown(self):
+            pass
+
+    outage_client = OutageClient()
+    monkeypatch.setattr("tools.gpsr_spawn._make_ros_service_client", lambda: outage_client)
+
+    code = main([
+        "apply", "--plan", str(plan_path), "--manifest", str(manifest_path),
+        "--base-scenario", str(ROOT / "simulation" / "scenarios" / "gpsr-rcw2026-bench.json"),
+        "--placements", str(ROOT / "simulation" / "scenarios" / "rcw2026-placements.json"),
+    ])
+    assert code == 2
+    assert outage_client.calls == 1
+
+
+def test_apply_plan_calls_on_progress_once_per_item_with_cumulative_manifest():
+    # Fix round 1, finding 4: on_progress is called after every item with
+    # the manifest-so-far (used by the CLI to rewrite the manifest file
+    # incrementally).
+    plan = ScenePlan(
+        items=(
+            _item("cmd_spam_0", "spam", "laundry_desk", "laundry_room", (-2.988, 4.525, 0.734),
+                 asset_uri="artifacts/objects/ycb/x/ycb_005_spam/object.usd"),
+            _item("cmd_mustard_0", "mustard", "shelf", "laundry_room", (-3.687, 0.309, 1.07),
+                 asset_uri="artifacts/objects/ycb/x/ycb_006_mustard_bottle/object.usd"),
+        ),
+        notes=(),
+    )
+    client = FakeServiceClient()
+    snapshots = []
+    apply_plan(plan, client, base_scenario=BASE_SCENARIO, placements=PLACEMENTS,
+              on_progress=lambda m: snapshots.append(json.loads(json.dumps(m))))
+    assert len(snapshots) == 2
+    assert len(snapshots[0]["entities"]) == 1
+    assert snapshots[0]["entities"][0]["id"] == "cmd_spam_0"
+    assert len(snapshots[1]["entities"]) == 2
+
+
+def test_clear_manifest_calls_on_progress_once_per_entity():
+    # Fix round 1, finding 4 (clear_manifest side).
+    manifest = {
+        "entities": [
+            {"id": "cmd_spam_0", "entity_name": "/World/Scenario/cmd_spam_0", "ok": True,
+             "asset_key": "ycb_005_spam", "where": "laundry_desk"},
+            {"id": "cmd_mustard_0", "entity_name": "/World/Scenario/cmd_mustard_0", "ok": True,
+             "asset_key": "ycb_006_mustard_bottle", "where": "shelf"},
+        ],
+        "skipped": [],
+    }
+    client = FakeServiceClient()
+    snapshots = []
+    clear_manifest(manifest, client,
+                   on_progress=lambda m: snapshots.append(json.loads(json.dumps(m))))
+    assert len(snapshots) == 2
+    assert snapshots[0]["entities"][0]["cleared"] is True
+    assert len(snapshots[1]["entities"]) == 2
+
+
+def test_apply_plan_records_pose_fields_on_each_entity():
+    # Fix round 1, finding 5: manifest entities carry the spawned item's
+    # xyz/quaternion_xyzw (spec 2.3: "entity names, poses, skipped items,
+    # service results").
+    plan = ScenePlan(
+        items=(_item("cmd_spam_0", "spam", "laundry_desk", "laundry_room", (-2.988, 4.525, 0.734),
+                     asset_uri="artifacts/objects/ycb/x/ycb_005_spam/object.usd"),),
+        notes=(),
+    )
+    client = FakeServiceClient()
+    manifest = apply_plan(plan, client, base_scenario=BASE_SCENARIO, placements=PLACEMENTS)
+    entity = manifest["entities"][0]
+    assert entity["xyz"] == [-2.988, 4.525, 0.734]
+    assert entity["quaternion_xyzw"] == [0.0, 0.0, 0.0, 1.0]
 
 
 def test_clear_manifest_deletes_every_ok_entity_and_tolerates_missing():
