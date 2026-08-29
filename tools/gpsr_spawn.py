@@ -366,15 +366,31 @@ def clear_manifest(
             results.append(e)
             _report()
             continue
+        # A re-run over a manifest whose earlier clear failed must not keep the old error
+        # text next to a fresh "cleared": true.
+        base = {k: v for k, v in e.items() if k != "clear_error"}
         try:
-            deleted = client.delete(e["entity_name"])
+            deleted = _delete_with_one_retry(client, e["entity_name"])
         except Exception as exc:  # noqa: BLE001 - never crash a bench run
-            results.append({**e, "cleared": False, "clear_error": repr(exc)})
+            results.append({**base, "cleared": False, "clear_error": repr(exc)})
             _report()
             continue
-        results.append({**e, "cleared": bool(deleted)})
+        results.append({**base, "cleared": bool(deleted)})
         _report()
     return _snapshot()
+
+
+def _delete_with_one_retry(client: ServiceClient, entity: str) -> bool:
+    """`client.delete(entity)`, retried once if the service was unavailable.
+
+    Live 2026-08-29: the first delete_entity issued right after the orchestrator's
+    teardown timed out once (sim busy), and the same call succeeded seconds later.
+    Item-level failures (any other exception) are not retried.
+    """
+    try:
+        return client.delete(entity)
+    except ServiceUnavailable:
+        return client.delete(entity)
 
 
 def emit_scenario(plans: Sequence[ScenePlan], base_scenario: dict, placements: dict) -> dict:

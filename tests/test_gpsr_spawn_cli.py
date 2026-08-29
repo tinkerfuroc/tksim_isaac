@@ -455,6 +455,58 @@ def test_clear_manifest_deletes_every_ok_entity_and_tolerates_missing():
     assert "cleared" not in updated["entities"][1]
 
 
+class _FlakyDeleteClient(FakeServiceClient):
+    """delete() raises ServiceUnavailable the first `flaky` times per entity, then succeeds."""
+
+    def __init__(self, flaky: int):
+        super().__init__()
+        self.flaky = flaky
+        self.attempts: dict[str, int] = {}
+
+    def delete(self, entity):
+        n = self.attempts.get(entity, 0) + 1
+        self.attempts[entity] = n
+        if n <= self.flaky:
+            raise ServiceUnavailable(f"delete_entity timed out for {entity}")
+        return super().delete(entity)
+
+
+def test_clear_manifest_retries_a_timed_out_delete_once():
+    # Live 2026-08-29: the first delete_entity right after orchestrator teardown timed out
+    # once (cmd_bleach_0), and a manual re-run cleared it. One retry absorbs that.
+    manifest = {"entities": [
+        {"id": "cmd_bleach_0", "entity_name": "/World/Scenario/cmd_bleach_0", "ok": True,
+         "asset_key": "ycb_021_bleach_cleanser", "where": "sofa"}], "skipped": []}
+    client = _FlakyDeleteClient(flaky=1)
+    updated = clear_manifest(manifest, client)
+    assert client.attempts["/World/Scenario/cmd_bleach_0"] == 2
+    assert updated["entities"][0]["cleared"] is True
+    assert "clear_error" not in updated["entities"][0]
+
+
+def test_clear_manifest_gives_up_after_the_retry_and_records_the_error():
+    manifest = {"entities": [
+        {"id": "cmd_bleach_0", "entity_name": "/World/Scenario/cmd_bleach_0", "ok": True,
+         "asset_key": "ycb_021_bleach_cleanser", "where": "sofa"}], "skipped": []}
+    client = _FlakyDeleteClient(flaky=5)
+    updated = clear_manifest(manifest, client)
+    assert client.attempts["/World/Scenario/cmd_bleach_0"] == 2
+    assert updated["entities"][0]["cleared"] is False
+    assert "timed out" in updated["entities"][0]["clear_error"]
+
+
+def test_clear_manifest_drops_a_stale_clear_error_once_the_entity_is_cleared():
+    # A re-run of `clear` on a manifest whose earlier attempt failed must not carry the
+    # old error text next to "cleared": true.
+    manifest = {"entities": [
+        {"id": "cmd_bleach_0", "entity_name": "/World/Scenario/cmd_bleach_0", "ok": True,
+         "asset_key": "ycb_021_bleach_cleanser", "where": "sofa", "cleared": False,
+         "clear_error": "ServiceUnavailable('delete_entity timed out')"}], "skipped": []}
+    updated = clear_manifest(manifest, FakeServiceClient())
+    assert updated["entities"][0]["cleared"] is True
+    assert "clear_error" not in updated["entities"][0]
+
+
 def test_emit_scenario_merges_a_new_item_into_a_copy_of_the_base_scenario():
     plan = ScenePlan(
         items=(_item("cmd_spam_0", "spam", "laundry_desk", "laundry_room", (-2.988, 4.525, 0.734),
