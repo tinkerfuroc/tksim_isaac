@@ -51,6 +51,10 @@ _VISION_PREFIXES = (
     "track ",
 )
 _AUDIO_PREFIXES = ("announce", "listen", "say ")
+# Vision detection leaves like "generalist scan" and "object scan+verify"
+# don't start with "scan " -- the word appears mid-name. Match the whole
+# word "scan" anywhere in the (lowercased) name, not just as a prefix.
+_SCAN_WORD_RE = re.compile(r"\bscan\b")
 _MANIP_SUBSTRINGS = ("arm", "grasp", "tuck", "gripper", "place")
 
 _ANNOUNCE_PREFIX = "Finished announcing "
@@ -139,7 +143,7 @@ def _classify_milestone(name: str, node_type: Optional[str] = None) -> Optional[
         return None
     if low.startswith("goto target"):
         return "NAV"
-    if low.startswith(_VISION_PREFIXES) or low == "turn pantilt":
+    if low.startswith(_VISION_PREFIXES) or low == "turn pantilt" or _SCAN_WORD_RE.search(low):
         return "VISION"
     if low.startswith(_AUDIO_PREFIXES):
         return "AUDIO"
