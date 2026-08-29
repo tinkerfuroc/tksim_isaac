@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Bench glue for tier-2 `--spawn-cmd`: plan the scene for one command and
+# apply it to the live sim in a single invocation (the bench passes one
+# shell-split command, not a pipeline).
+#
+# Usage: gpsr-scene-apply --command "<text>" --seed N --plan <scene-plan.json> --manifest <spawned.json>
+# Exit codes are gpsr_spawn.py's: 0 ok, 2 service unavailable/timeout, 3 bad input.
+# Requires the bridge ROS env (simulation_interfaces on PYTHONPATH) — the
+# battery script already sets it up.
+set -uo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+COMMAND="" SEED="" PLAN="" MANIFEST=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --command) COMMAND="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
+    --plan) PLAN="$2"; shift 2 ;;
+    --manifest) MANIFEST="$2"; shift 2 ;;
+    *) echo "gpsr-scene-apply: unknown arg $1" >&2; exit 3 ;;
+  esac
+done
+[ -n "$COMMAND" ] && [ -n "$SEED" ] && [ -n "$PLAN" ] && [ -n "$MANIFEST" ] || { echo "gpsr-scene-apply: missing args" >&2; exit 3; }
+python3 "$ROOT/tools/gpsr_spawn.py" plan --command "$COMMAND" --seed "$SEED" --out "$PLAN" || exit $?
+exec python3 "$ROOT/tools/gpsr_spawn.py" apply --plan "$PLAN" --manifest "$MANIFEST"

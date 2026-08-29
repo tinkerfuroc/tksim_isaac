@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Live spike for the command-driven-scene design (spec 2026-08-28, section
+# 2.4). Requires the GPU stack up (Nav2 + sim PLAYING + bridge) and the
+# bridge's ROS env sourced. Spawns a pudding_box on kitchen_table via
+# tools/gpsr_spawn.py plan+apply, records arena-camera frames so a human
+# can confirm placement, checks /clock stays monotonic, then clears the
+# spawned entities. Prints PASS/FAIL per check; exit 0 only if all passed.
+#
+# Usage: scripts/gpsr-spawn-spike [OUT_DIR]   (default: a mktemp dir, kept)
+set -uo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="${1:-$(mktemp -d /tmp/gpsr-spawn-spike.XXXXXX)}"
+mkdir -p "$WORK"
+echo "gpsr-spawn-spike: artifacts in $WORK"
+
+pass() { echo "PASS: $1"; }
+fail() { echo "FAIL: $1"; STATUS=1; }
+STATUS=0
+
+echo "== plan =="
+python3 "$ROOT/tools/gpsr_spawn.py" plan \
+  --command "count the pudding_box on the kitchen_table" --seed 1 \
+  --out "$WORK/scene-plan.json"
+if [ -s "$WORK/scene-plan.json" ]; then pass "plan wrote scene-plan.json"; else fail "plan did not write scene-plan.json"; fi
+
+echo "== clock sample BEFORE apply (5 s) =="
+timeout 5 ros2 topic echo --no-daemon /clock --field clock > "$WORK/clock-before.txt" 2>&1
+
+echo "== apply =="
+python3 "$ROOT/tools/gpsr_spawn.py" apply \
+  --plan "$WORK/scene-plan.json" --manifest "$WORK/spawned.json"
+APPLY_EXIT=$?
+if [ "$APPLY_EXIT" -eq 0 ]; then pass "apply exited 0"; else fail "apply exited $APPLY_EXIT"; fi
+[ -s "$WORK/spawned.json" ] && cat "$WORK/spawned.json"
+
+echo "== settle 5 s, record arena frames for 8 s =="
+sleep 5
+timeout -s INT 8 python3 "$ROOT/validation/gpsr_run_recorder.py" --out "$WORK/rec" \
+  --topic /sim/arena_camera/image_raw=arena --interval 1.0 \
+  > "$WORK/recorder.log" 2>&1
+N_FRAMES=$(ls "$WORK/rec/frames/arena" 2>/dev/null | wc -l)
+if [ "$N_FRAMES" -gt 0 ]; then pass "recorded $N_FRAMES arena frame(s) -> $WORK/rec/frames/arena (eyeball the pudding_box on kitchen_table)"; else fail "no arena frames recorded (see $WORK/recorder.log)"; fi
+
+echo "== clock sample AFTER apply (10 s) + monotonic check across both samples =="
+timeout 10 ros2 topic echo --no-daemon /clock --field clock > "$WORK/clock-after.txt" 2>&1
+python3 - "$WORK/clock-before.txt" "$WORK/clock-after.txt" <<'PYEOF'
+import re, sys
+def samples(path):
+    out, sec = [], None
+    for line in open(path, errors="replace"):
+        m = re.match(r"\s*sec:\s*(-?\d+)", line)
+        if m:
+            sec = int(m.group(1)); continue
+        m = re.match(r"\s*nanosec:\s*(\d+)", line)
+        if m and sec is not None:
+            out.append(sec + int(m.group(1)) * 1e-9); sec = None
+    return out
+before, after = samples(sys.argv[1]), samples(sys.argv[2])
+if len(after) < 2:
+    print("FAIL: fewer than 2 /clock samples after apply"); sys.exit(1)
+if any(b < a for a, b in zip(after, after[1:])):
+    print("FAIL: /clock went backwards after the spawn"); sys.exit(1)
+if before and after[0] < before[-1]:
+    print(f"FAIL: /clock re-zeroed across apply ({before[-1]:.2f} -> {after[0]:.2f})"); sys.exit(1)
+print(f"PASS: /clock monotonic ({len(before)} samples before, {len(after)} after; {after[0]:.2f} -> {after[-1]:.2f})")
+PYEOF
+[ $? -ne 0 ] && STATUS=1
+
+echo "== clear =="
+python3 "$ROOT/tools/gpsr_spawn.py" clear --manifest "$WORK/spawned.json"
+CLEAR_EXIT=$?
+if [ "$CLEAR_EXIT" -eq 0 ]; then pass "clear exited 0"; else fail "clear exited $CLEAR_EXIT"; fi
+[ -s "$WORK/spawned.json" ] && cat "$WORK/spawned.json"
+
+echo "== post-clear arena frames (4 s) — object should be gone =="
+timeout -s INT 4 python3 "$ROOT/validation/gpsr_run_recorder.py" --out "$WORK/rec-after-clear" \
+  --topic /sim/arena_camera/image_raw=arena --interval 1.0 \
+  > "$WORK/recorder-after-clear.log" 2>&1
+
+echo
+if [ "$STATUS" -eq 0 ]; then echo "gpsr-spawn-spike: ALL CHECKS PASSED"; else echo "gpsr-spawn-spike: SOME CHECKS FAILED (see FAIL lines above)"; fi
+exit "$STATUS"
