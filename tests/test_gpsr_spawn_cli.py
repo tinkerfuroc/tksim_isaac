@@ -264,6 +264,31 @@ def test_clear_manifest_calls_on_progress_once_per_entity():
     assert len(snapshots[1]["entities"]) == 2
 
 
+def test_clear_manifest_preserves_not_attempted_in_return_and_every_progress_snapshot():
+    # Fix round 2: clear_manifest used to return/persist only
+    # {"entities", "skipped"}, silently dropping a partial-outage apply's
+    # "not_attempted" list. It (and every top-level key it doesn't own)
+    # must survive unchanged through both the return value and every
+    # on_progress snapshot.
+    manifest = {
+        "entities": [
+            {"id": "cmd_spam_0", "entity_name": "/World/Scenario/cmd_spam_0", "ok": True,
+             "asset_key": "ycb_005_spam", "where": "laundry_desk"},
+        ],
+        "skipped": [],
+        "not_attempted": [
+            {"id": "cmd_mustard_0", "ok": False, "error": "not attempted: service unavailable"}
+        ],
+    }
+    client = FakeServiceClient()
+    snapshots = []
+    updated = clear_manifest(manifest, client,
+                             on_progress=lambda m: snapshots.append(json.loads(json.dumps(m))))
+    assert updated["not_attempted"] == manifest["not_attempted"]
+    assert len(snapshots) == 1
+    assert snapshots[0]["not_attempted"] == manifest["not_attempted"]
+
+
 def test_apply_plan_records_pose_fields_on_each_entity():
     # Fix round 1, finding 5: manifest entities carry the spawned item's
     # xyz/quaternion_xyzw (spec 2.3: "entity names, poses, skipped items,

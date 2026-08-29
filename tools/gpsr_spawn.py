@@ -224,13 +224,23 @@ def clear_manifest(
     `client`. Tolerates NOT_FOUND (client.delete returning True). Never
     raises for a per-item delete failure. If `on_progress` is given, it is
     called with the manifest-so-far after every entity.
+
+    Every top-level key of `manifest` other than `"entities"` (e.g.
+    `"skipped"`, or a partial `apply`'s `"not_attempted"`) is passed
+    through unchanged into both the return value and every `on_progress`
+    snapshot -- `clear_manifest` only owns `"entities"`, so it must not
+    silently drop fields it doesn't recognise.
     """
     results: list[dict] = []
-    skipped = list(manifest.get("skipped", []))
+    passthrough = {k: v for k, v in manifest.items() if k != "entities"}
+    passthrough.setdefault("skipped", [])
+
+    def _snapshot() -> dict:
+        return {**passthrough, "entities": list(results)}
 
     def _report() -> None:
         if on_progress:
-            on_progress({"entities": list(results), "skipped": list(skipped)})
+            on_progress(_snapshot())
 
     for e in manifest.get("entities", []):
         if not e.get("ok"):
@@ -245,7 +255,7 @@ def clear_manifest(
             continue
         results.append({**e, "cleared": bool(deleted)})
         _report()
-    return {"entities": results, "skipped": skipped}
+    return _snapshot()
 
 
 def emit_scenario(plans: Sequence[ScenePlan], base_scenario: dict, placements: dict) -> dict:
