@@ -201,33 +201,47 @@ def _person_triggered(text: str) -> bool:
     return False
 
 
-def _person_mention_pos(text: str) -> int:
-    """Offset (in `_normalize_words(text)`) of the first person mention --
-    a known name, "person(s)", or "someone" -- or 0 when only a trigger
-    verb ("meet", "greet", ...) implied the person.
+def _person_mention_positions(text: str) -> list[int]:
+    """Offsets (in `_normalize_words(text)`) of every person mention -- a
+    known name, "person(s)", or "someone" -- in text order; `[0]` when only
+    a trigger verb ("meet", "greet", ...) implied the person.
     """
     normalized = _normalize_words(text)
-    positions = []
+    positions: list[int] = []
     for token in (*_PERSON_NAMES, "persons", "person", "someone"):
-        match = re.search(r"\b" + re.escape(token) + r"\b", normalized)
-        if match:
+        for match in re.finditer(r"\b" + re.escape(token) + r"\b", normalized):
             positions.append(match.start())
-    return min(positions) if positions else 0
+    return sorted(set(positions)) or [0]
+
+
+def _resolve_person_rooms(text: str, knowledge: dict) -> tuple[list[str], list[str]]:
+    """One room per person mention, in text order, deduplicated: the room
+    of the first location (spot or room) NAMED IN `text` at or after that
+    mention -- "deliver it to Emma in the bedroom" puts Emma in the
+    bedroom even though the kitchen was named earlier for the object; "the
+    person at the shelf_02 ... the person at the sofa" yields
+    [kitchen, living_room] -- else the first location overall, else
+    "living_room". Returns (rooms, notes). A spot that was only
+    *defaulted* for an object (via `default_locations`, never mentioned in
+    the text) never leaks in; `_resolve_location` only matches present
+    text. The arena has one actor pose per room, so two mentions that
+    resolve to the same room collapse to one person (noted).
+    """
+    rooms: list[str] = []
+    notes: list[str] = []
+    for pos in _person_mention_positions(text):
+        room, _spot = _resolve_location(text, knowledge, after=pos)
+        room = room or "living_room"
+        if room in rooms:
+            notes.append(f"one person per room: second person mention also resolves to '{room}'; collapsed")
+            continue
+        rooms.append(room)
+    return rooms, notes
 
 
 def _resolve_person_room(text: str, knowledge: dict) -> str:
-    """Person room: the room of the first location (spot or room) NAMED IN
-    `text` at or after the person mention -- "deliver it to Emma in the
-    bedroom" puts Emma in the bedroom even though the kitchen was named
-    earlier for the object -- else the first location overall, else
-    "living_room". A spot that was only *defaulted* for an object (via
-    `default_locations`, never mentioned in the text) never leaks into the
-    person's room; `_resolve_location` only matches text that is present.
-    """
-    room, _spot = _resolve_location(text, knowledge, after=_person_mention_pos(text))
-    if room is not None:
-        return room
-    return "living_room"
+    """Room of the first person mention (see `_resolve_person_rooms`)."""
+    return _resolve_person_rooms(text, knowledge)[0][0]
 
 
 def _load_object_asset_uris(asset_root: Path) -> dict[str, str]:
@@ -342,11 +356,13 @@ def plan_scene(
                 )
 
     if _person_triggered(command_text):
-        person_room = _resolve_person_room(command_text, knowledge)
-        person_pose = placements.get("persons", {}).get(person_room)
-        if person_pose is None:
-            notes.append(f"person triggered but room '{person_room}' has no known pose; skipped")
-        else:
+        person_rooms, person_notes = _resolve_person_rooms(command_text, knowledge)
+        notes.extend(person_notes)
+        for person_room in person_rooms:
+            person_pose = placements.get("persons", {}).get(person_room)
+            if person_pose is None:
+                notes.append(f"person triggered but room '{person_room}' has no known pose; skipped")
+                continue
             items.append(
                 SpawnItem(
                     id=f"cmd_person_{person_room}",

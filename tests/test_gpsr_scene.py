@@ -160,6 +160,32 @@ def test_person_with_no_location_after_the_mention_falls_back_to_the_first_locat
     assert [p.room for p in persons] == ["kitchen"]
 
 
+def test_s2026_011_two_person_command_spawns_one_person_per_mentioned_location(knowledge, placements):
+    # tellPrsInfoAtLocToPrsAtLoc: both persons must exist for the second find_person to be
+    # satisfiable. shelf_02 -> kitchen, sofa -> living_room.
+    text = "tell the gesture of the person at the shelf_02 to the person at the sofa"
+    plan = plan_scene(text, knowledge, placements, seed=2026)
+
+    persons = [it for it in plan.items if it.kind == "person"]
+    assert [p.room for p in persons] == ["kitchen", "living_room"]
+    assert [p.id for p in persons] == ["cmd_person_kitchen", "cmd_person_living_room"]
+    assert persons[0].xyz != persons[1].xyz
+
+
+def test_s2026_023_two_person_command_in_text_order(knowledge, placements):
+    text = "tell the pose of the person at the sofa to the person at the kitchen_table"
+    plan = plan_scene(text, knowledge, placements, seed=2026)
+    assert [p.room for p in plan.items if p.kind == "person"] == ["living_room", "kitchen"]
+
+
+def test_two_persons_in_the_same_room_collapse_to_one_with_a_note(knowledge, placements):
+    text = "tell the name of the person at the kitchen_table to the person at the shelf_02"
+    plan = plan_scene(text, knowledge, placements, seed=2026)
+    persons = [it for it in plan.items if it.kind == "person"]
+    assert [p.room for p in persons] == ["kitchen"]
+    assert any("one person per room" in n for n in plan.notes)
+
+
 def test_generic_object_phrase_samples_three_objects_at_the_named_spot(knowledge, placements):
     # tellObjPropOnPlcmt: "the thinnest object on the side_table" names no object, but the
     # command is meaningless on an empty table.
