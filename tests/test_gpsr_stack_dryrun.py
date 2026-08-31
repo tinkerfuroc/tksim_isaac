@@ -171,7 +171,7 @@ def test_gates_present_and_known():
     assert by_name["nav_extras"] == "nav"
 
 
-def test_vision_stage_has_three_popens_including_named_camera_server_and_pan_tilt():
+def test_vision_stage_has_four_popens_including_named_camera_server_and_pan_tilt():
     stages = mod.stage_commands(_cfg())
     vision = [s for s in stages if s["name"] == "vision"][0]
     cmd = vision["cmd"]
@@ -180,6 +180,25 @@ def test_vision_stage_has_three_popens_including_named_camera_server_and_pan_til
     assert any("vision_bringup" in c for c in flat)
     assert any("__node:=head_camera_server" in c for c in flat)
     assert any("pan_tilt" in c and "state_publisher" in c for c in flat)
+    assert any("pan_tilt_tf_publisher.py" in c for c in flat)
+
+
+def test_pan_tilt_state_publisher_stays_off_joint_states():
+    """pick_and_place's live-manip readiness contract requires exactly one
+    /joint_states publisher (the joint_state_broadcaster), so the pan/tilt
+    state publisher must be remapped to the side topic the TF publisher
+    consumes -- in every mode, so hybrid and live stacks behave identically.
+    """
+    for cfg in (_cfg(), _cfg(manipulation="live", manip_gpu=0)):
+        stages = mod.stage_commands(cfg)
+        vision = [s for s in stages if s["name"] == "vision"][0]
+        flat = [" ".join(c) for c in vision["cmd"]]
+        stitcher = [c for c in flat if "state_publisher" in c and "pan_tilt " in c]
+        assert stitcher, "pan_tilt state_publisher process missing"
+        assert "joint_state_topic:=/pan_tilt/joint_states" in stitcher[0]
+        tf_pub = [c for c in flat if "pan_tilt_tf_publisher.py" in c]
+        assert tf_pub, "pan_tilt_tf_publisher process missing"
+        assert "joint_state_topic:=/pan_tilt/joint_states" in tf_pub[0]
 
 
 def test_every_stage_has_required_keys():
