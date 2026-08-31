@@ -1057,8 +1057,11 @@ def main() -> int:
             # unless asked for -- see tinker_sim_isaac.head_camera_aim.
             from tinker_sim_isaac.head_camera_aim import (
                 HEAD_AIM_ENV,
+                WRIST_AIM_ENV,
+                WRIST_CAMERA_NAME,
                 apply_head_aim_correction,
                 resolve_head_aim_correction,
+                resolve_wrist_aim_correction,
             )
 
             head_aim = resolve_head_aim_correction(os.environ.get(HEAD_AIM_ENV))
@@ -1066,6 +1069,18 @@ def main() -> int:
                 camera_specs = apply_head_aim_correction(camera_specs, head_aim)
                 print(
                     f"[sim] {HEAD_AIM_ENV} active: head camera aim corrected in "
+                    "simulation only -- hardware parity is deliberately broken",
+                    flush=True,
+                )
+            wrist_aim = resolve_wrist_aim_correction(os.environ.get(WRIST_AIM_ENV))
+            if wrist_aim is not None and any(
+                spec.name == WRIST_CAMERA_NAME for spec in camera_specs
+            ):
+                camera_specs = apply_head_aim_correction(
+                    camera_specs, wrist_aim, camera_name=WRIST_CAMERA_NAME
+                )
+                print(
+                    f"[sim] {WRIST_AIM_ENV} active: wrist camera aim corrected in "
                     "simulation only -- hardware parity is deliberately broken",
                     flush=True,
                 )

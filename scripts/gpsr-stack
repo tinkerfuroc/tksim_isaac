@@ -257,6 +257,12 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
         "TINKER_SIM_CAMERA_HZ": "12",
         "TINKER_SIM_CONTROL_HZ": "60",
         "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
+        # Same defect class as the head aim, same sanctioned parity break:
+        # the description mounts the wrist camera 90 deg off the tool
+        # approach axis (ceiling frames at every table-scan pose), so no
+        # live grasp can see its target without this. See
+        # tinker_sim_isaac.head_camera_aim's wrist section.
+        "TINKER_SIM_WRIST_CAMERA_AIM": "tool-forward",
         # RTX camera strides stall the stepping loop for multiple wall
         # seconds; at the 1.0 s / 0.5 s defaults every stall re-latches a
         # safety hold and severs the command stream (frozen base + arm
