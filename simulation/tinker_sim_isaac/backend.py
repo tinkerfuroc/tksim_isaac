@@ -528,6 +528,24 @@ class IsaacWholeRobotBackend:
         )
         self._tracked_object_views: dict[str, Any] = {}
         self._tracked_object_step = 0
+        # Self-healing watchdog for the mid-play spawn attach race: about 1
+        # in 3 /spawn_entity spawns onto a playing timeline never enters
+        # PhysX (prim created and acked, RigidBodyAPI authored, but no
+        # rigid body ever materialises -- a ghost no gripper or teleport
+        # can touch; observed 2026-08-31, per-spawn nondeterministic, same
+        # boot attaches the next spawn fine). The race lives in
+        # omni.physx's incremental parse of stage notices, which this repo
+        # cannot patch, so the backend watches /World/Scenario children
+        # and, when a rigid-body prim has no PhysX body after a discovery
+        # interval, re-triggers the parse with the standard active-toggle
+        # nudge. Attached bodies are never touched; a ghost cannot be made
+        # worse. TINKER_SIM_HEAL_DETACHED_SPAWNS=0 disables.
+        self._heal_detached_spawns = (
+            _os.environ.get("TINKER_SIM_HEAL_DETACHED_SPAWNS", "1") == "1"
+        )
+        #: path -> {"first_step", "attempts", "healed"} for scenario children.
+        self._spawn_attach_watch: dict[str, dict[str, int]] = {}
+        self._spawn_attach_step = 0
         self._contact_pairs_by_key: dict[tuple[int, int, int, int], dict[str, object]] = {}
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
@@ -1606,8 +1624,104 @@ class IsaacWholeRobotBackend:
         if _t is not None:
             _sp["object_views"] += _t() - _sp["_mark"]
             _sp["n"] += 1
-        if self._tracked_object_paths:
+        # getattr defaults: test doubles construct via object.__new__ and
+        # call step() without running __init__.
+        if getattr(self, "_tracked_object_paths", ()):
             self._log_tracked_objects()
+        if getattr(self, "_heal_detached_spawns", False):
+            self._heal_detached_scenario_bodies()
+
+    def _heal_detached_scenario_bodies(self) -> None:
+        """Re-parse /World/Scenario rigid-body prims PhysX failed to attach.
+
+        Runs at the object-discovery cadence. For each Scenario child prim
+        carrying ``UsdPhysics.RigidBodyAPI``: one quiet view probe per
+        interval; if the body is absent after a full interval since the
+        prim appeared, toggle the prim inactive/active (the standard
+        omni.physx re-parse trigger) and re-probe next interval. Two nudges
+        maximum, then one ``spawn_attach_failed`` JSON line and a permanent
+        mark. Attached prims are marked healed on the first successful
+        probe and never probed again, so steady-state cost is one stage
+        child listing per interval.
+        """
+        self._spawn_attach_step += 1
+        interval = self._object_discovery_interval
+        if interval > 1 and self._spawn_attach_step % interval:
+            return
+        try:
+            import omni.usd
+            from isaaclab_physx.physics import PhysxManager
+            from pxr import UsdPhysics
+
+            stage = omni.usd.get_context().get_stage()
+            scenario = stage.GetPrimAtPath("/World/Scenario")
+            if not scenario.IsValid():
+                return
+            physics_view = PhysxManager.get_physics_sim_view()
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        for child in scenario.GetChildren():
+            path = child.GetPath().pathString
+            state = self._spawn_attach_watch.get(path)
+            if state is None:
+                state = {"first_step": self._spawn_attach_step, "attempts": 0, "healed": 0}
+                self._spawn_attach_watch[path] = state
+                continue  # give a fresh spawn one full interval to attach
+            if state["healed"] or state["attempts"] >= 3:
+                continue
+            if not child.HasAPI(UsdPhysics.RigidBodyAPI):
+                state["healed"] = 1  # not a rigid body (actor, prop); ignore
+                continue
+            attached = False
+            try:
+                view = physics_view.create_rigid_body_view(path)
+                attached = view is not None and int(view.count) > 0
+            except (AttributeError, RuntimeError, TypeError):
+                attached = False
+            if attached:
+                if state["attempts"]:
+                    print(
+                        json.dumps(
+                            {
+                                "spawn_attach_healed": path,
+                                "nudges": state["attempts"],
+                                "t": round(self.simulation_time, 3),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                state["healed"] = 1
+                continue
+            state["attempts"] += 1
+            if state["attempts"] >= 3:
+                print(
+                    json.dumps(
+                        {
+                            "spawn_attach_failed": path,
+                            "t": round(self.simulation_time, 3),
+                            "hint": (
+                                "PhysX never attached a rigid body for this "
+                                "spawned prim and two active-toggle re-parse "
+                                "nudges did not help"
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                continue
+            try:
+                child.SetActive(False)
+                child.SetActive(True)
+            except Exception as error:
+                print(
+                    json.dumps(
+                        {"spawn_attach_nudge_error": path, "error": str(error)},
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
 
     def _log_tracked_objects(self) -> None:
         """Print tracked rigid-body world poses (TINKER_SIM_TRACK_OBJECTS)."""
