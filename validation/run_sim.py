@@ -1044,7 +1044,11 @@ def main() -> int:
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
             )
-            from tinker_sim_isaac.camera_rig import CameraRig, load_camera_specs
+            from tinker_sim_isaac.camera_rig import (
+                CameraRig,
+                load_camera_specs,
+                load_spectator_spec,
+            )
 
             camera_specs = load_camera_specs(
                 root / "simulation/sensors/hardware-parity.json"
@@ -1067,6 +1071,19 @@ def main() -> int:
                 print(
                     f"[sim] {HEAD_AIM_ENV} active: head camera aim corrected in "
                     "simulation only -- hardware parity is deliberately broken",
+                    flush=True,
+                )
+            # Opt-in, sim-only world-fixed spectator camera; a separate spec
+            # file so the hardware-parity contract stays unedited. Appended
+            # before the arena camera so that camera, when enabled, stays
+            # last (_arena_camera_enabled relies on it).
+            spectator_path = os.environ.get("TINKER_SIM_SPECTATOR_CAMERA")
+            if spectator_path:
+                spectator = load_spectator_spec(Path(spectator_path))
+                camera_specs = camera_specs + (spectator,)
+                print(
+                    f"[sim] spectator camera enabled at {spectator.tick_rate_hz:g} Hz, "
+                    f"{spectator.width}x{spectator.height} -> {spectator.color_topic}",
                     flush=True,
                 )
             filtered_camera_specs = _without_wrist_camera(camera_specs, os.environ)
