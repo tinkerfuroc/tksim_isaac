@@ -103,37 +103,91 @@ def _normalise(quaternion: Sequence[float]) -> tuple[float, float, float, float]
     return tuple(float(value) / norm for value in quaternion)  # type: ignore[return-value]
 
 
-def resolve_head_aim_correction(
+def _resolve_correction(
+    env_name: str,
+    preset_name: str,
+    preset_value: tuple[float, float, float, float],
     value: str | None,
 ) -> tuple[float, float, float, float] | None:
-    """Parse ``TINKER_SIM_HEAD_CAMERA_AIM``; ``None`` means leave parity alone.
+    """Shared parser for the aim-override env vars; ``None`` keeps parity.
 
-    Accepts the ``level-forward`` preset or an explicit ``w,x,y,z``
-    quaternion. Anything else raises: a silently ignored typo here looks
-    exactly like the override working, and the whole point of the flag is
-    that a parity break is never accidental.
+    Accepts the named preset or an explicit ``w,x,y,z`` quaternion.
+    Anything else raises: a silently ignored typo here looks exactly like
+    the override working, and the whole point of these flags is that a
+    parity break is never accidental.
     """
     if value is None:
         return None
     text = value.strip()
     if not text:
         return None
-    if text.lower() == _PRESET_NAME:
-        return LEVEL_FORWARD_CORRECTION_WXYZ
+    if text.lower() == preset_name:
+        return preset_value
 
     parts = [item.strip() for item in text.split(",")]
     if len(parts) != 4:
         raise ValueError(
-            f"{HEAD_AIM_ENV}: expected {_PRESET_NAME!r} or four comma-separated "
+            f"{env_name}: expected {preset_name!r} or four comma-separated "
             f"quaternion components (w,x,y,z), got {value!r}"
         )
     try:
         numbers = [float(item) for item in parts]
     except ValueError as error:
         raise ValueError(
-            f"{HEAD_AIM_ENV}: quaternion components must be numbers: {value!r}"
+            f"{env_name}: quaternion components must be numbers: {value!r}"
         ) from error
     return _normalise(numbers)
+
+
+def resolve_head_aim_correction(
+    value: str | None,
+) -> tuple[float, float, float, float] | None:
+    """Parse ``TINKER_SIM_HEAD_CAMERA_AIM``; ``None`` means leave parity alone."""
+    return _resolve_correction(
+        HEAD_AIM_ENV, _PRESET_NAME, LEVEL_FORWARD_CORRECTION_WXYZ, value
+    )
+
+
+#: Opt-in, sim-only correction for the WRIST camera's aim -- the same
+#: defect class as the head camera, in the same hand-authored inertial-less
+#: camera stub frames. Measured 2026-08-31 from the artifact's own
+#: ``robot.urdf`` forward kinematics: the description mounts the wrist
+#: camera with its optical axis exactly 90 deg away from the tool approach
+#: axis. At joint zeros the gripper points straight down (-90 deg) while
+#: the camera looks dead level; at the orchestrator's table-scan pose
+#: (joints [0, -0.942, -0.017, 0.611, 0, 0.820, -0.017]) the TCP aims
+#: forward-down at -48 deg while the camera looks UP at +42 deg -- the
+#: rendered ceiling frame that ended every live grasp in referee fallback.
+#: A wrist-mounted RealSense physically looks along the approach axis (the
+#: real robot's grasp pipeline survives the bad frames because hand-eye
+#: calibration, not URDF TF, supplies its extrinsics). Rotating the camera
+#: +90 deg about the optical frame's own +X maps the render axis exactly
+#: onto the TCP forward: at the scan pose, -Y of the optical frame equals
+#: the TCP +Z to three decimals. As with the head: this deliberately
+#: breaks hardware parity, defaults off, and the real fix belongs in the
+#: robot description.
+WRIST_AIM_ENV = "TINKER_SIM_WRIST_CAMERA_AIM"
+
+_WRIST_PRESET_NAME = "tool-forward"
+
+#: +90 deg about the mount (optical) frame's +X: (cos 45, sin 45, 0, 0).
+TOOL_FORWARD_CORRECTION_WXYZ = (
+    0.7071067811865476,
+    0.7071067811865476,
+    0.0,
+    0.0,
+)
+
+WRIST_CAMERA_NAME = "wrist_camera"
+
+
+def resolve_wrist_aim_correction(
+    value: str | None,
+) -> tuple[float, float, float, float] | None:
+    """Parse ``TINKER_SIM_WRIST_CAMERA_AIM``; ``None`` means leave parity alone."""
+    return _resolve_correction(
+        WRIST_AIM_ENV, _WRIST_PRESET_NAME, TOOL_FORWARD_CORRECTION_WXYZ, value
+    )
 
 
 def _multiply(
