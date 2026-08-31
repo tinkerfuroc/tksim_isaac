@@ -397,7 +397,8 @@ def _expected_scenario_objects(
     from tinker_sim_core.scenario import load_named_scenario, validate_world_selection
 
     scenario = load_named_scenario(root, scenario_name)
-    validate_world_selection(scenario, arena_id)
+    for warning in validate_world_selection(scenario, arena_id):
+        print(json.dumps({"world_selection_warning": warning}), flush=True)
     expected: dict[str, dict[str, object]] = {}
     for record in scenario.objects:
         pose = record.get("pose", {})
