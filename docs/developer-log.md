@@ -180,6 +180,36 @@ aim geometry before trusting an "invisible" verdict (two boots went to
 out-of-frame layouts), and `force_load_physics_from_usd` mid-run destroys
 every live tensor view.
 
+**Viewed-prim deletion kills the boot; the backend now recovers
+(`90ad061`, `a078da7`, `2c6f587`).** Two whole-boot kills in one evening,
+same class: deleting a prim that ANY live tensor view covers invalidates
+the SHARED SimulationView ("prim ... was deleted while being used by a
+tensor view class"), after which every articulation read/write raises and
+/spawn_entity is dead. First kill: the spawn-attach healer's per-spawn
+probe views (`a078da7`'s original form) at a routine multi-entity clear.
+Second: the referee hand_object's cached write view at its post-run
+clear. Measured facts that shape the fix: the physics.tensors views have
+NO release API, and even a dropped, garbage-collected Python view leaves
+the backend registration alive -- so create-use-drop is NOT safe, and
+avoidance alone cannot protect against every component. Layered fix:
+(1) everything that watches DELETABLE spawns is view-free via
+``IPhysx.get_rigidbody_transformation`` (healer, tracker); discovery keeps
+views for scenario-boot objects under the documented invariant that those
+are never deleted mid-play; (2) the backend self-recovers from the
+invalidation: de-initialize the articulation (its PHYSICS_READY handler
+early-returns while it believes itself initialized), rebuild the
+PhysxManager AND isaacsim SimulationManager views replicating only their
+creation lines (their own warmup paths force_load the stage and snap
+every body to its authored pose -- unusable), re-initialize directly (the
+event-bus path stores callback exceptions silently), re-anchor the
+monotonic /clock (the physics step counter resets with the views), force
+the next target write; budget 5 per boot. Verified live: two consecutive
+held-view deletes each recovered in one attempt with the arm holding its
+commanded pose and a mid-fall can landing DURING recovery. Also fixed
+along the way: the spawn-attach healer itself (about 1 in 3 mid-play
+spawns never enters PhysX -- per-spawn nondeterministic omni.physx parse
+race; active-toggle re-parse nudge, TINKER_SIM_HEAL_DETACHED_SPAWNS).
+
 **Still open.** Head + wrist camera aim: the description-level defects
 need measurement on the physical robot; the env-gated sim corrections
 remain the sanctioned workarounds. `/get_entity_state` staleness above.
