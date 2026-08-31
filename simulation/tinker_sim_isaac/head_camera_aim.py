@@ -158,22 +158,29 @@ def resolve_head_aim_correction(
 #: (joints [0, -0.942, -0.017, 0.611, 0, 0.820, -0.017]) the TCP aims
 #: forward-down at -48 deg while the camera looks UP at +42 deg -- the
 #: rendered ceiling frame that ended every live grasp in referee fallback.
-#: A wrist-mounted RealSense physically looks along the approach axis (the
-#: real robot's grasp pipeline survives the bad frames because hand-eye
-#: calibration, not URDF TF, supplies its extrinsics). Rotating the camera
-#: +90 deg about the optical frame's own +X maps the render axis exactly
-#: onto the TCP forward: at the scan pose, -Y of the optical frame equals
-#: the TCP +Z to three decimals. As with the head: this deliberately
-#: breaks hardware parity, defaults off, and the real fix belongs in the
-#: robot description.
+#: A wrist-mounted RealSense physically looks toward the tool (the real
+#: robot's grasp pipeline survives the bad frames because hand-eye
+#: calibration, not URDF TF, supplies its extrinsics). The correction
+#: rotates the camera about the optical frame's own +X toward the tool
+#: axis -- but NOT the full 90 deg onto it: the description places the
+#: camera almost co-axial above the gripper, so a perfectly tool-aligned
+#: view stares straight into the hand (measured live 2026-08-31: at
+#: 90/80 deg the frame is all gripper, median depth 76 mm; the depth
+#: near-clip makes it read as an all-black close-up). A tilt sweep at the
+#: scan pose picked 60 deg: the scene fills the frame with the gripper
+#: riding the bottom edge (real wrist-camera framing), and the view
+#: centres a desk-height surface about a metre ahead. As with the head:
+#: this deliberately breaks hardware parity, defaults off, and the real
+#: fix belongs in the robot description.
 WRIST_AIM_ENV = "TINKER_SIM_WRIST_CAMERA_AIM"
 
 _WRIST_PRESET_NAME = "tool-forward"
 
-#: +90 deg about the mount (optical) frame's +X: (cos 45, sin 45, 0, 0).
+#: +60 deg about the mount (optical) frame's +X: (cos 30, sin 30, 0, 0).
+#: 30 deg shy of the tool axis, clearing the co-axial gripper.
 TOOL_FORWARD_CORRECTION_WXYZ = (
-    0.7071067811865476,
-    0.7071067811865476,
+    0.8660254037844387,
+    0.5,
     0.0,
     0.0,
 )

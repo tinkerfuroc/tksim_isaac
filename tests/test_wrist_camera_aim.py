@@ -69,12 +69,18 @@ class ResolveTest(unittest.TestCase):
 
 
 class CorrectionGeometryTest(unittest.TestCase):
-    def test_maps_optical_forward_onto_minus_y(self):
-        # +90 deg about +X takes the optical +Z (the pre-correction render
-        # axis) to -Y_optical -- which the URDF FK shows is the TCP forward.
+    def test_tilts_render_axis_60_deg_toward_the_tool(self):
+        # The tool axis sits at -Y_optical (URDF FK, 90 deg from the render
+        # axis). The preset stops 30 deg short of it: a perfectly
+        # tool-aligned view stares into the co-axial gripper (measured:
+        # median depth 76 mm, all hand), so the sweep-picked 60 deg keeps
+        # the gripper at the frame's bottom edge with the scene in view.
         rotated = _rotate(TOOL_FORWARD_CORRECTION_WXYZ, (0.0, 0.0, 1.0))
-        for got, want in zip(rotated, (0.0, -1.0, 0.0)):
-            self.assertAlmostEqual(got, want, places=12)
+        angle_from_original = math.degrees(math.acos(rotated[2]))
+        self.assertAlmostEqual(angle_from_original, 60.0, places=9)
+        tool_axis = (0.0, -1.0, 0.0)
+        cos_to_tool = sum(a * b for a, b in zip(rotated, tool_axis))
+        self.assertAlmostEqual(math.degrees(math.acos(cos_to_tool)), 30.0, places=9)
 
     def test_preserves_image_right(self):
         # A rotation about +X leaves image-right (+X) alone: no roll change.
