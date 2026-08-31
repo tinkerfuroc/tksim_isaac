@@ -24,7 +24,10 @@ try:
 except ImportError:  # pragma: no cover
     Usd = None
 
-from tinker_sim_deploy.arena_convert import author_object_rigid_body  # noqa: E402
+from tinker_sim_deploy.arena_convert import (  # noqa: E402
+    author_object_rigid_body,
+    author_preview_surface_material,
+)
 
 
 @unittest.skipIf(Usd is None, "pxr is unavailable")
@@ -61,6 +64,72 @@ class AuthorObjectRigidBody(unittest.TestCase):
         author_object_rigid_body(stage)
         author_object_rigid_body(stage)
         self.assertTrue(stage.GetDefaultPrim().HasAPI(UsdPhysics.RigidBodyAPI))
+
+
+@unittest.skipIf(Usd is None, "pxr is unavailable")
+class AuthorPreviewSurfaceMaterial(unittest.TestCase):
+    """MDL-shaded materials must become native UsdPreviewSurface networks.
+
+    Measured live 2026-08-31: a prim spawned onto a playing stage renders
+    as NOTHING when its material is MDL -- any MDL -- while the identical
+    mesh with a UsdPreviewSurface network renders correctly, textures
+    included. The rewrite must keep the Material prim path (bindings stay
+    valid), carry the diffuse texture over, and leave MDL-free materials
+    alone.
+    """
+
+    def _material_stage(self, *, mdl: bool, texture: str | None = None):
+        from pxr import Sdf, UsdShade
+
+        stage = Usd.Stage.CreateInMemory()
+        root = stage.DefinePrim("/World", "Xform")
+        stage.SetDefaultPrim(root)
+        material = UsdShade.Material.Define(stage, "/World/Looks/mat")
+        shader_prim = stage.DefinePrim("/World/Looks/mat/mat", "Shader")
+        if mdl:
+            shader_prim.CreateAttribute(
+                "info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset
+            ).Set(Sdf.AssetPath("OmniPBR_Opacity.mdl"))
+            if texture:
+                shader_prim.CreateAttribute(
+                    "inputs:diffuse_texture", Sdf.ValueTypeNames.Asset
+                ).Set(Sdf.AssetPath(texture))
+        return stage, material
+
+    def test_rewrites_mdl_material_keeping_texture(self):
+        from pxr import UsdShade
+
+        stage, material = self._material_stage(
+            mdl=True, texture="./textures/x/x.png"
+        )
+        self.assertEqual(author_preview_surface_material(stage), 1)
+        surface = stage.GetPrimAtPath("/World/Looks/mat/surface")
+        self.assertTrue(surface)
+        self.assertEqual(
+            UsdShade.Shader(surface).GetIdAttr().Get(), "UsdPreviewSurface"
+        )
+        texture_shader = stage.GetPrimAtPath("/World/Looks/mat/diffuseTex")
+        self.assertTrue(texture_shader)
+        self.assertEqual(
+            str(texture_shader.GetAttribute("inputs:file").Get().path),
+            "./textures/x/x.png",
+        )
+        # The old MDL shader child is gone; the Material prim survives so
+        # existing material:binding relationships stay valid.
+        self.assertFalse(stage.GetPrimAtPath("/World/Looks/mat/mat"))
+        self.assertTrue(stage.GetPrimAtPath("/World/Looks/mat"))
+
+    def test_untextured_mdl_material_gets_constant_color(self):
+        stage, _material = self._material_stage(mdl=True, texture=None)
+        self.assertEqual(author_preview_surface_material(stage), 1)
+        surface = stage.GetPrimAtPath("/World/Looks/mat/surface")
+        self.assertTrue(surface.GetAttribute("inputs:diffuseColor").Get())
+        self.assertFalse(stage.GetPrimAtPath("/World/Looks/mat/diffuseTex"))
+
+    def test_leaves_mdl_free_materials_alone(self):
+        stage, _material = self._material_stage(mdl=False)
+        self.assertEqual(author_preview_surface_material(stage), 0)
+        self.assertTrue(stage.GetPrimAtPath("/World/Looks/mat/mat"))
 
 
 @unittest.skipIf(Usd is None, "pxr is unavailable")
