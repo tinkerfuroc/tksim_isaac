@@ -52,7 +52,7 @@
   "objects": [
     {
       "id": "soup",
-      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_010_tomato_soup_can/object.usd",
+      "asset_uri": "artifacts/objects/ycb/5117994887a13406e976744f240ebac8ddc5b59c03ac0df932777e7bd5c79f3f/ycb_010_tomato_soup_can/object.usd",
       "pose": {
         "xyz": [
           2.5,
@@ -69,7 +69,7 @@
     },
     {
       "id": "mug",
-      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_025_mug/object.usd",
+      "asset_uri": "artifacts/objects/ycb/5117994887a13406e976744f240ebac8ddc5b59c03ac0df932777e7bd5c79f3f/ycb_025_mug/object.usd",
       "pose": {
         "xyz": [
           2.7,
@@ -86,7 +86,7 @@
     },
     {
       "id": "banana",
-      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_011_banana/object.usd",
+      "asset_uri": "artifacts/objects/ycb/5117994887a13406e976744f240ebac8ddc5b59c03ac0df932777e7bd5c79f3f/ycb_011_banana/object.usd",
       "pose": {
         "xyz": [
           0.43,
@@ -103,7 +103,7 @@
     },
     {
       "id": "bowl",
-      "asset_uri": "artifacts/objects/ycb/d2d5ccd2c098b68f39737f8f0490358b7fd6cbfa8080b604851e073fc758acda/ycb_024_bowl/object.usd",
+      "asset_uri": "artifacts/objects/ycb/5117994887a13406e976744f240ebac8ddc5b59c03ac0df932777e7bd5c79f3f/ycb_024_bowl/object.usd",
       "pose": {
         "xyz": [
           0.312,

@@ -4,6 +4,117 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-08-31 — joint4 tuck stall, physics-less YCB objects, wall-clock safety deadlines
+
+Root-cause round for the sim bugs blocking the GPSR battery and the grasp
+benchmark (branch `task-sim-bugfixes`, commits 8e4caa4, 53bc502, 9b5fe4a,
+e5d4312). All measurements from in-process manipulation-core probes (CPU
+PhysX, contacts on, no bridge; probe scripts under the session job dir).
+
+**joint4 blocked near tuck (every tuck trajectory aborting).** The elbow sat
+pinned at its 50 Nm `effort_limit_sim` with zero velocity, up to 0.04 rad
+short of the orchestrator's tuck target. Ruled out in order, one variable
+per boot: link contact (contact reporting enabled: zero pairs at the
+stall), PhysX joint friction (the USD authors `physxJoint:jointFriction=1.0`
+on all arm joints and Isaac Lab's own `data.joint_friction_coeff` reads 0.0
+— its new-style friction-properties write path never reaches this PhysX
+build's live coefficient — but zeroing the live coefficient via
+`set_dof_friction_coefficients` left the stall bit-identical), and the fused
+actuator model (`TINKER_SIM_STOCK_ACTUATOR_MODEL=1` bit-identical). The
+tell: `get_dof_projected_joint_forces` at the stall reads 50.0 Nm on joint4
+— a genuine static load at the cap. `data.default_mass` shows why: the
+URDF->USD importer applies `MassAPI` with inertia but no authored
+`physics:mass` to every link the URDF declares without `<inertial>`, and
+PhysX then defaults each to 1.0 kg. tinker2 uses 21 such links as pure
+frames — ~11 kg hanging off the wrist (link_eef, link_tcp, nine
+xarm-camera frames), ~10 kg on the head. Real elbow-downstream mass is
+~3.6 kg (<= 15 Nm), matching the earlier estimate that had "ruled out"
+gravity from the *authored* masses. Fix: `_apply_stub_link_masses` authors
+1 g at spawn on exactly the links the artifact's colocated `robot.urdf`
+declares inertial-less and collision-less (data-driven, no name list),
+beside the ballast/wheel corrections. Verified: joint4 tuck error 0.039 ->
+0.0019 rad (= real ~13 Nm gravity / 7000 stiffness), stable across cycles.
+
+Two side findings. `/joint_states` effort is **stale telemetry**:
+`applied_torque` refreshes only when the target-write gate writes, so the
+published effort freezes at the last mid-transient value (a saturated 50.0,
+or ~1e-16 after a hold) — judge tracking by position. And the "arm ignores
+all trajectories for 240 s after ~3 aborts" degraded state was never a
+drive fault: see the deadline item below.
+
+**Every YCB object was static scenery.** `ycb_import` published each
+`object.usd` with colliders but no `RigidBodyAPI` on the default prim
+(violating the repo's own spawnable-asset contract,
+`simulation/assets/primitives/task-object.usda`), and `spawn_entity` adds
+no physics APIs. So no scenario object ever resolved a rigid-body view: no
+ground-truth pose in physics-truth frames, ungraspable. Only `soup` errored
+(~17k physx pattern-miss lines/session) because `create_rigid_body_view`
+raises after logging and the discovery loop's broad `except` aborted the
+whole pass — soup was merely first in dict order; mug/banana/bowl failed
+silently behind it. The old developer-log claim that these messages were
+"benign shutdown noise" was wrong (first hit is ~40 s into the run, when
+scenario_runner spawns). Fixes: `author_object_rigid_body` in the importer
+(mass stays density-derived from the collision hulls — the soup can
+computes to ~0.35 kg vs 0.349 kg published); `ycb_import --repair-physics
+[--root]` republishes the current artifact Kit-free (deterministic
+identity 5117994887a1...) and repoints `asset-manifest.json`; scenarios
+reference the repaired identity; the discovery loop is per-object, logs one
+`rigid_body_missing` diagnosis, and backs off 20x. Verified in-process: a
+repaired soup resolves, reports a truth pose, and settles under gravity; a
+deliberately broken sibling logs once and blocks nothing. Behavior change
+flagged to the battery/bench sessions: YCB objects now settle and can be
+knocked over.
+
+**Wall-clock liveness deadlines re-latched the limp hold.** The gateway's
+safety-heartbeat (1.0 s) and command-stream (0.5 s) deadlines were pure
+wall clock while the publishers live in separate processes: an RTX render
+stride stalls the stepping loop for multiple wall seconds with healthy
+samples queued in DDS, and the gateway then re-latched the limp safety
+hold / invalidated the command stream on every stride (grasp-bench report;
+the GPSR battery ran the 1.0/0.5 s defaults, making this the prime suspect
+for its post-abort dead-arm state). Deadlines now require staleness in
+BOTH wall and simulation time (`9b5fe4a`): sim time freezes exactly when
+the loop stalls, so the loop cannot punish itself; a dead publisher still
+trips within one simulated timeout while stepping; wall age still gates
+faster-than-realtime runs. The 59b9d7e env overrides remain as escape
+hatch.
+
+**Operator traps (grasp-bench reports #4/#5, e5d4312).** World mode
+`current` with no `--arena` plus declared spawns now prints a
+`world_selection_warning` (a full benchmark run was lost to a silently
+bare ground plane), and `pick-deliver-place` moved to the validated free
+corridor — its old robot (0,0) and object (0.65, 0, 0.8) poses both sit
+inside shelf_02's rasterized footprint in the rcw2026 arena map.
+
+**Head DEPTH "freeze": not reproducible on the current build.** A live
+discriminator probe (in-process rig, `level-forward` aim + 3 cm dolly
+active, Kit pumped per capture, five pan/tilt poses through pan 180 deg)
+shows head depth tracking every pose change — valid fraction 0.47 (level,
+empty world) -> 0.97 (tilt 30 down) -> 0.00 (tilt 30 up: sky, all samples
+out of range -> all-zero by the 16UC1 contract) -> 0.74 -> 0.90 — with
+fresh buffers whenever the scene changes. No housing occlusion from the
+dolly at any probed pose, no stale annotator. Two benign behaviors imitate
+a freeze: an out-of-range aim yields constant all-zero frames while color
+keeps rendering, and a static scene yields byte-identical depth while RGB
+still dithers (AA sampling), so "depth unchanged, color changing" is the
+*expected* static-scene signature. The 2026-08-27 field report also
+predates the pan/tilt `/joint_states` fix (4e9c694): with pan/tilt
+commands being rejected, the head physically never left its boot pose, so
+its depth naturally never changed while the wrist camera (riding the
+moving arm) looked alive. If a freeze recurs post-4e9c694, capture
+`TINKER_SIM_CAMERA_DEBUG=1` (annotator buffer-pointer churn) plus a
+per-frame depth valid-fraction before filing.
+
+Probe hygiene note for future camera probes: RTX render products tick on
+Kit `app.update()` (run_sim's `_pump_streaming_app_update`), NOT on
+`SimulationContext.render()` — a probe that skips the Kit pump sees every
+camera frozen at the boot frame, color included.
+
+**Still open.** Head camera aim: the description-level defect (optical axis
++14..+48 deg above horizon everywhere reachable) needs a measurement on the
+physical robot; the env-gated `level-forward` sim correction remains the
+sanctioned workaround.
+
 ## 2026-08-29 — Arena camera RTF: Phase 0 measurement
 
 Throwaway measurement (`scripts/arena-rtf-spike`, sim-only, GPU 1, no

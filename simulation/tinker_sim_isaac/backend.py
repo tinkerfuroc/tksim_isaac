@@ -128,6 +128,44 @@ def wheel_sphere_radius(cylinder_radius: object) -> float:
 
 
 
+#: Mass authored at spawn onto robot links whose URDF declares no ``<inertial>``.
+#: The URDF -> USD importer leaves ``physics:mass`` unauthored on those links
+#: and PhysX then assigns its 1.0 kg default to every one of them.  This robot
+#: description uses 22 such links as pure frames (link_eef, link_tcp, the
+#: eleven wrist/head camera frame links, pan/tilt stubs), so the default hangs
+#: ~11 kg of phantom mass off the wrist and ~10 kg off the head.  Measured
+#: 2026-08-31 (in-process manipulation-core probe): the phantom wrist mass
+#: alone loads joint4 with 50.0 Nm of static gravity torque at the
+#: orchestrator's tuck posture -- exactly its effort cap -- so the elbow
+#: stalls up to 0.04 rad short of its target and every tuck trajectory aborts
+#: on the controller's 0.01 rad goal tolerance.  Real downstream mass at the
+#: elbow is ~3.6 kg (<= 15 Nm).  1 g per frame link keeps the articulation
+#: valid for PhysX while contributing nothing measurable.
+STUB_LINK_MASS_KG = 0.001
+
+
+def massless_stub_links(urdf_bytes: bytes) -> tuple[str, ...]:
+    """Links the URDF declares with neither ``<inertial>`` nor ``<collision>``.
+
+    These are attachment frames, not physical bodies: the description gives
+    them no mass, no inertia, and no geometry, and the real robot treats them
+    as coordinate frames only.  Excludes ``world`` (never a rigid body).
+    Fails closed on malformed XML -- a broken robot description must not
+    silently disable the mass correction.
+    """
+    import xml.etree.ElementTree as ElementTree
+
+    root = ElementTree.fromstring(urdf_bytes)
+    names = []
+    for link in root.findall("link"):
+        name = link.get("name")
+        if not name or name == "world":
+            continue
+        if link.find("inertial") is None and link.find("collision") is None:
+            names.append(name)
+    return tuple(names)
+
+
 def slew_velocity_target(current: float, target: float, max_delta: float) -> float:
     """Move a velocity target toward ``target`` by at most ``max_delta``.
 
@@ -659,6 +697,18 @@ class IsaacWholeRobotBackend:
             self._apply_wheel_sphere_colliders()
             omni.kit.app.get_app().update()
         print(json.dumps({"wheel_collider": self.wheel_collider_mode}, sort_keys=True), flush=True)
+        self.stub_links_corrected = self._apply_stub_link_masses(usd_path)
+        print(
+            json.dumps(
+                {
+                    "stub_link_mass_kg": STUB_LINK_MASS_KG,
+                    "stub_links_corrected": list(self.stub_links_corrected),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        omni.kit.app.get_app().update()
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
         # playback range.  Override it only after every USD has been authored.
@@ -778,6 +828,51 @@ class IsaacWholeRobotBackend:
         mass_api.GetMassAttr().Set(target_mass)
         mass_api.GetDiagonalInertiaAttr().Set(Gf.Vec3f(*target_inertia))
         return target_mass
+
+    def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
+        """Author ``STUB_LINK_MASS_KG`` on the URDF's massless frame links before reset.
+
+        Runtime override of the spawned stage, like the chassis ballast and
+        the wheel sphere colliders: the artifact USD is untouched.  The link
+        set comes from the artifact's own colocated ``robot.urdf`` (links
+        with neither ``<inertial>`` nor ``<collision>``), never from a
+        hard-coded name list, so a description change reflows automatically.
+        Only unauthored masses are corrected -- an authored ``physics:mass``
+        is the description speaking and stays authoritative.
+        """
+        import omni.usd
+        from pxr import Usd, UsdPhysics
+
+        urdf_path = usd_path.parent / "robot.urdf"
+        if not urdf_path.is_file():
+            raise RuntimeError(
+                f"stub-link mass correction requires the colocated robot.urdf: {urdf_path}"
+            )
+        stubs = massless_stub_links(urdf_path.read_bytes())
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath("/World/Tinker")
+        if not root.IsValid():
+            raise RuntimeError("stub-link mass correction requires the spawned /World/Tinker robot")
+        by_name = {
+            prim.GetName(): prim
+            for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
+            if prim.GetName() in set(stubs)
+        }
+        corrected = []
+        for name in stubs:
+            prim = by_name.get(name)
+            if prim is None or not prim.HasAPI(UsdPhysics.MassAPI):
+                # The importer may merge a fixed frame into its parent; a
+                # frame that is not a rigid body carries no phantom mass.
+                continue
+            mass_attr = UsdPhysics.MassAPI(prim).GetMassAttr()
+            # An unauthored physics:mass still reads back as the schema's 0.0
+            # fallback, so authorship -- not value -- is the discriminator.
+            if mass_attr and mass_attr.HasAuthoredValue():
+                continue
+            UsdPhysics.MassAPI(prim).CreateMassAttr(STUB_LINK_MASS_KG)
+            corrected.append(name)
+        return tuple(corrected)
 
     def _apply_wheel_sphere_colliders(self) -> None:
         """Replace each wheel's authored cylinder collider with a sphere before reset.
@@ -1589,9 +1684,27 @@ class IsaacWholeRobotBackend:
 
             stage = omni.usd.get_context().get_stage()
             physics_view = PhysxManager.get_physics_sim_view()
-            for name, descriptor in self._expected_objects.items():
-                if name in self._object_views:
-                    continue
+        except (AttributeError, RuntimeError, TypeError):
+            # Standard spawn may not have happened yet; retry on the next step.
+            return
+        for name, descriptor in self._expected_objects.items():
+            if name in self._object_views:
+                continue
+            # A prim that resolved but exposed no rigid body will not grow one
+            # until it is respawned (physics APIs ship inside the asset), so
+            # back off hard instead of paying a PhysX pattern miss -- three
+            # logged errors per attempt, measured 16,946 error lines per
+            # session -- twice a second forever.  The slow retry still picks
+            # up a delete + respawn with a fixed asset.
+            failed_at = descriptor.get("_rigid_body_missing_step")
+            if (
+                isinstance(failed_at, int)
+                and self._object_discovery_step - failed_at < 20 * interval
+            ):
+                continue
+            # One object's failure must never hide its siblings: everything
+            # per-object stays inside this per-object try.
+            try:
                 candidates = [
                     str(descriptor.get("prim_path", "")),
                     f"/World/{name}",
@@ -1612,13 +1725,39 @@ class IsaacWholeRobotBackend:
                             break
                 if prim_path is None:
                     continue
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+            try:
                 view = physics_view.create_rigid_body_view(prim_path)
-                if int(view.count) > 0:
-                    self._object_views[name] = view
-                    descriptor["actual_prim_path"] = prim_path
-        except (AttributeError, RuntimeError, TypeError):
-            # Standard spawn may not have happened yet; retry on the next step.
-            return
+                count = int(view.count) if view is not None else 0
+            except (AttributeError, RuntimeError, TypeError):
+                # The prim exists but PhysX matched no rigid body under it
+                # (this build raises instead of returning an empty view).
+                view = None
+                count = 0
+            if count > 0:
+                self._object_views[name] = view
+                descriptor.pop("_rigid_body_missing_step", None)
+                descriptor["actual_prim_path"] = prim_path
+                continue
+            descriptor["_rigid_body_missing_step"] = self._object_discovery_step
+            if not descriptor.get("_rigid_body_missing_logged"):
+                descriptor["_rigid_body_missing_logged"] = True
+                print(
+                    json.dumps(
+                        {
+                            "object_discovery": "rigid_body_missing",
+                            "object": name,
+                            "prim_path": prim_path,
+                            "hint": (
+                                "prim exists but PhysX sees no rigid body; "
+                                "the spawned asset lacks UsdPhysics.RigidBodyAPI"
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
 
     def _actual_object_states(self) -> list[dict[str, object]]:
         states: list[dict[str, object]] = []

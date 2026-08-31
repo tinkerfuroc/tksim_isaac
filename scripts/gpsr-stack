@@ -366,12 +366,26 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                     "-p", "sync_slop_sec:=1.5",
                 ],
             ),
-            # Without this, /pan_tilt_controller/state never reaches
-            # /joint_states and the head-camera TF subtree is disconnected.
+            # Without this, /pan_tilt_controller/state never reaches TF and
+            # the head-camera subtree is disconnected. It must NOT publish to
+            # /joint_states: pick_and_place's live-manipulation readiness
+            # contract requires exactly ONE /joint_states publisher (the
+            # ros2_control joint_state_broadcaster) and rejects every arm goal
+            # otherwise (first live-manip run, 2026-08-31). So the state
+            # publisher writes its offset-corrected JointState to a side topic
+            # and pan_tilt_tf_publisher.py turns it into the same TF
+            # robot_state_publisher would have derived.
             _ros_argv(
                 sources=vision_sources,
                 argv=["ros2", "run", "pan_tilt", "state_publisher", "--ros-args",
-                      "-p", "use_sim_time:=true"],
+                      "-p", "use_sim_time:=true",
+                      "-p", "joint_state_topic:=/pan_tilt/joint_states"],
+            ),
+            _ros_argv(
+                sources=vision_sources,
+                argv=["python3", str(REPO_ROOT / "tools" / "pan_tilt_tf_publisher.py"),
+                      "--ros-args", "-p", "use_sim_time:=true",
+                      "-p", "joint_state_topic:=/pan_tilt/joint_states"],
             ),
         ],
         "env": _preamble_env({

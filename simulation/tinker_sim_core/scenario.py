@@ -461,11 +461,29 @@ def _records(
     return tuple(value)
 
 
-def validate_world_selection(scenario: ScenarioDefinition, arena_id: str | None) -> None:
-    """Fail closed when a scenario's declared world does not match the launch."""
+def validate_world_selection(
+    scenario: ScenarioDefinition, arena_id: str | None
+) -> tuple[str, ...]:
+    """Fail closed when a scenario's declared world does not match the launch.
+
+    Returns warnings for selections that are legal but almost certainly not
+    what the operator meant.  World mode ``current`` with no ``--arena``
+    renders a bare ground plane; spawning task objects or actors into that
+    void cost a full benchmark run before anyone noticed it on camera
+    (reported 2026-08-31), so that combination is called out loudly instead
+    of silently accepted.
+    """
     mode = scenario.world.get("mode", "current")
     if mode == "current":
-        return
+        if arena_id is None and (scenario.objects or scenario.actors):
+            spawned = len(tuple(scenario.objects)) + len(tuple(scenario.actors))
+            return (
+                f"{scenario.scenario_id}: world mode 'current' with no --arena "
+                f"spawns {spawned} entities onto a bare ground plane; pass "
+                "--arena (or declare world mode 'arena') if a furnished world "
+                "was intended",
+            )
+        return ()
     if mode != "arena":
         raise ValueError(f"{scenario.scenario_id}: unsupported world mode {mode!r}")
     if "uri" in scenario.world:
@@ -481,3 +499,4 @@ def validate_world_selection(scenario: ScenarioDefinition, arena_id: str | None)
         raise ValueError(
             f"{scenario.scenario_id}: scenario requires arena {declared!r}, launcher selected {arena_id!r}"
         )
+    return ()
