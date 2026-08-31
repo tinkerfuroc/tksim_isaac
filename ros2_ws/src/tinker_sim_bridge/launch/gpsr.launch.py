@@ -209,14 +209,21 @@ def _resolve(context):
         additional_env=python_env,
     )
 
+    scenario_runner_arguments = [
+        "--root", str(root),
+        "--scenario", scenario,
+        "--seed", seed,
+    ]
+    if os.environ.get("TINKER_SIM_SPAWN_WHILE_PLAYING") == "1":
+        # Spawned rigid bodies only pair with the robot's articulation links
+        # when the timeline has never been stopped; the boot stop bracket
+        # leaves every later spawn passing through the gripper (see
+        # tinker_sim_core.orchestration.standard_operations).
+        scenario_runner_arguments.append("--spawn-while-playing")
     scenario_runner = Node(
         package="tinker_sim_bridge",
         executable="scenario_runner",
-        arguments=[
-            "--root", str(root),
-            "--scenario", scenario,
-            "--seed", seed,
-        ],
+        arguments=scenario_runner_arguments,
         output="screen",
         parameters=[{"use_sim_time": True}],
         additional_env=python_env,

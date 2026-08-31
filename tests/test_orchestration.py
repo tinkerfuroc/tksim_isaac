@@ -40,6 +40,48 @@ class ScenarioOrchestrationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             standard_operations(ROOT, scenario, -1)
 
+    def test_spawn_while_playing_drops_the_stop_bracket(self) -> None:
+        # A STOP -> PLAY cycle leaves subsequently spawned rigid bodies
+        # unpaired with the robot's articulation links (they pass through
+        # the gripper), so this mode must issue no reset_spawned and no
+        # state-0 stop while keeping the spawns and the final state-1 op
+        # (a no-op play when already playing) untouched.
+        for path in sorted((ROOT / "simulation/scenarios").glob("*.json")):
+            try:
+                scenario = load_named_scenario(ROOT, path.stem)
+            except ValueError:
+                # Non-scenario data files (e.g. rcw2026-placements.json)
+                # share the directory; the compile-all test above owns that
+                # dispute.
+                continue
+            if scenario.world.get("uri"):
+                continue
+            operations = standard_operations(
+                ROOT, scenario, 7, spawn_while_playing=True
+            )
+            kinds = [operation.kind for operation in operations]
+            self.assertNotIn("reset_spawned", kinds)
+            self.assertNotIn("load_world", kinds)
+            states = [
+                operation.payload["state"]
+                for operation in operations
+                if operation.kind == "set_simulation_state"
+            ]
+            self.assertEqual(states, [1])
+            self.assertEqual(operations[-1].payload["boundary"], "PHYSICS_READY")
+            baseline = standard_operations(ROOT, scenario, 7)
+            self.assertEqual(
+                [op.payload for op in operations if op.kind == "spawn_entity"],
+                [op.payload for op in baseline if op.kind == "spawn_entity"],
+            )
+
+    def test_spawn_while_playing_refuses_world_loads(self) -> None:
+        scenario = load_named_scenario(ROOT, "find-and-approach-person")
+        if not scenario.world.get("uri"):
+            self.skipTest("scenario has no world uri")
+        with self.assertRaises(ValueError):
+            standard_operations(ROOT, scenario, 7, spawn_while_playing=True)
+
 
 if __name__ == "__main__":
     unittest.main()
