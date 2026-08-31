@@ -110,10 +110,40 @@ Kit `app.update()` (run_sim's `_pump_streaming_app_update`), NOT on
 `SimulationContext.render()` — a probe that skips the Kit pump sees every
 camera frozen at the boot frame, color included.
 
+**Spawned objects pass through the gripper (grasp-bench run 5, and the
+likely root of live-manip's 100% referee fallback).** Definitive
+in-process discriminator (overlap probe, cube spawned intersecting
+left_finger, contact pairs accumulated every physics step): on a timeline
+that has NEVER been stopped, a mid-play `/spawn_entity` body pairs fully
+with the articulation -- 261 N depenetration contact on the finger. After
+any timeline STOP -> PLAY cycle, bodies spawned during or after the cycle
+pair only with static geometry and free-fall straight through the fingers
+with zero contact events. The stack always enters that poisoned regime at
+boot: scenario_runner runs `reset_spawned` (itself a stop->play, per the
+documented ResetSimulation scope bug) plus the SPAWN_READY state-0 stop
+before spawning, so every later bench/command spawn is ungraspable. Fix
+(`b37b67a`): `standard_operations(spawn_while_playing=True)` spawns
+everything onto the still-playing first-run timeline (no reset_spawned, no
+state-0; the final state-1 op stays as a no-op play carrying the
+PHYSICS_READY payload); plumbed as `scenario_runner --spawn-while-playing`
+/ `TINKER_SIM_SPAWN_WHILE_PLAYING=1`. Deliberately opt-in until the A/B
+baselines that assume the old boot sequence are re-cut; end-to-end
+validation is the battery's s2026-000 live-manip rerun. Caveats: earlier
+probe iterations that judged collision by "object reached the floor" were
+worthless (a cube bounces off the narrow gripper to the floor anyway, fast
+falls tunnel, and 0.5 s contact sampling misses pairs removed on
+CONTACT_LOST) -- accumulate per-step contact maxima and use overlap
+spawns. Same defect family, still open: `/get_entity_state` returns the
+frozen spawn pose for such bodies (sim_control's RigidPrim binds against
+SimulationManager's cached warp sim view, which never re-binds; observed
+stale even on a fresh timeline in-process). Consumers should read gateway
+physics-truth instead; `force_load_physics_from_usd` as a repair is
+destructive (invalidates every live tensor view) -- do not use it mid-run.
+
 **Still open.** Head camera aim: the description-level defect (optical axis
 +14..+48 deg above horizon everywhere reachable) needs a measurement on the
 physical robot; the env-gated `level-forward` sim correction remains the
-sanctioned workaround.
+sanctioned workaround. `/get_entity_state` staleness above.
 
 ## 2026-08-29 — Arena camera RTF: Phase 0 measurement
 
