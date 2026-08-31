@@ -1645,8 +1645,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_expected_object_pose_and_twist_comes_from_scenario(self) -> None:
         expected = _expected_scenario_objects(ROOT, "pick-deliver-place")
+        # Pose pinned to the arena-safe layout (e5d4312): the old (0.65, 0)
+        # point sits inside shelf_02's rasterized footprint in rcw2026.
         self.assertEqual(
-            expected["delivery_object"]["pose"]["position"], [0.65, 0.0, 0.8]
+            expected["delivery_object"]["pose"]["position"], [-1.35, -2.0, 0.8]
         )
         self.assertEqual(expected["delivery_object"]["twist"]["linear"], [0.0, 0.0, 0.0])
         self.assertEqual(
