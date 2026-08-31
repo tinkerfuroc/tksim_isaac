@@ -156,6 +156,30 @@ for consumers: if a pipeline derives wrist extrinsics from URDF TF instead
 of calibration, corrected images now disagree with that TF by 90 deg --
 good detections at wrong map positions is the signature.
 
+**MDL-bound spawns render as nothing (`f8e764e`).** The vanished
+cmd_spam_0 — tracked physically rock-stable at its desk pose for 57 s
+(`TINKER_SIM_TRACK_OBJECTS`, `bad2693`) while the correctly-aimed wrist
+camera saw an empty desk — was a MATERIALS defect: a prim spawned onto a
+playing stage renders as NOTHING when its material is MDL (any MDL;
+textured, untextured, opaque, or the converter's own authored-transparent
+`OmniPBR_Opacity` with `opacity_constant=0.0`), while the identical mesh
+with no material or a `UsdPreviewSurface` network renders correctly,
+textures included. Ruled out along the way, one boot each: the spawn pose
+(settles to 0.1 mm), slot overlap (single-item manifest; though two
+overlapping spawns DO skitter violently across a desk — a real hazard for
+placement planning), the sim_control service pose write, delete/respawn,
+and file format (usda vs crate identical). Boot-parse objects rendered
+under the old stop-bracket boot, masking this for furniture and
+pre-battery scenario objects. Fix: `author_preview_surface_material`
+rewrites MDL materials in place to UsdPreviewSurface networks (Material
+prim path kept, bindings stay valid); `--repair-physics` is now a
+physics+materials repair; round-2 artifact identity `4b635c93c704...`.
+Verified live: mid-play-spawned spam and soup cans render fully textured
+in the wrist view. Probe lessons: compute camera-frame placement from the
+aim geometry before trusting an "invisible" verdict (two boots went to
+out-of-frame layouts), and `force_load_physics_from_usd` mid-run destroys
+every live tensor view.
+
 **Still open.** Head + wrist camera aim: the description-level defects
 need measurement on the physical robot; the env-gated sim corrections
 remain the sanctioned workarounds. `/get_entity_state` staleness above.
