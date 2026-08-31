@@ -243,6 +243,108 @@ def run_import(
     return publication
 
 
+def repair_physics(repo_root: Path) -> AssetPublication:
+    """Republish the current YCB artifact with rigid-body physics authored.
+
+    The original import published each ``object.usd`` with colliders but no
+    ``RigidBodyAPI`` on the default prim, so every spawned YCB object
+    composed in as static scenery: the simulation's rigid-body view never
+    resolved, ground-truth poses were silently absent, and grasps could not
+    move anything (observed live 2026-08-31 as the ``/World/Scenario/soup``
+    physx-tensors pattern-miss loop, ~17k error lines per session).
+
+    This is a pure pxr edit -- ``author_object_rigid_body`` applied to each
+    existing ``object.usd``, every other payload byte carried over verbatim,
+    the source lock reused unchanged (upstream sources are identical) -- so
+    it needs no Kit, no GPU, and no upstream checkout.  Publishing yields a
+    new content-addressed identity; the old artifact directory remains for
+    provenance.
+    """
+    from pxr import Usd
+
+    from tinker_sim_deploy.arena_convert import author_object_rigid_body
+
+    current = json.loads(
+        (repo_root / "artifacts/objects/ycb/current.json").read_text(encoding="utf-8")
+    )
+    manifest_path = repo_root / current["manifest"]
+    artifact_dir = manifest_path.parent
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_lock = json.loads((artifact_dir / "source-lock.json").read_text(encoding="utf-8"))
+
+    payload: dict[str, bytes] = {}
+    repaired = []
+    with tempfile.TemporaryDirectory(prefix="ycb-physics-repair-") as scratch_dir:
+        scratch = Path(scratch_dir)
+        for name in manifest["payload"]:
+            data = (artifact_dir / name).read_bytes()
+            if name.endswith("/object.usd"):
+                object_id = name.split("/", 1)[0]
+                work = scratch / object_id
+                work.mkdir(parents=True, exist_ok=True)
+                source = work / "object.usd"
+                source.write_bytes(data)
+                stage = Usd.Stage.Open(str(source))
+                author_object_rigid_body(stage)
+                repaired_path = work / "object.repaired.usd"
+                if not stage.GetRootLayer().Export(str(repaired_path)):
+                    raise AssetArtifactError(f"failed to export repaired USD for {name}")
+                data = repaired_path.read_bytes()
+                repaired.append(object_id)
+            payload[name] = data
+    if not repaired:
+        raise AssetArtifactError("current YCB artifact contains no object.usd payloads")
+    publication = publish_asset_artifact(
+        repo_root,
+        kind="objects",
+        asset_id="ycb",
+        payload=payload,
+        source_lock=source_lock,
+    )
+    _repoint_asset_manifest(repo_root, artifact_dir.name, publication)
+    return publication
+
+
+def _repoint_asset_manifest(
+    repo_root: Path, old_identity: str, publication: AssetPublication
+) -> None:
+    """Repoint ``generated_object_usds`` entries at the repaired artifact.
+
+    ``tools/gpsr_scene.py`` resolves command-spawned object assets through
+    ``artifacts/asset-manifest.json``, so a physics repair is incomplete for
+    the bench until these entries follow the new identity.  Entries for
+    other artifacts are left untouched; a missing manifest is left missing
+    (offline bundles may not carry one).
+    """
+    manifest_path = repo_root / "artifacts" / "asset-manifest.json"
+    if not manifest_path.is_file():
+        return
+    new_manifest = json.loads(
+        (publication.artifact_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    updated = 0
+    for entry in data.get("generated_object_usds", []):
+        path = str(entry.get("path", ""))
+        if old_identity not in path:
+            continue
+        new_path = path.replace(old_identity, publication.identity)
+        relative = new_path.split(f"{publication.identity}/", 1)[1]
+        digest = new_manifest["payload"].get(relative)
+        if digest is None:
+            raise AssetArtifactError(
+                f"asset-manifest entry {path!r} has no counterpart in the repaired artifact"
+            )
+        entry["path"] = new_path
+        entry["sha256"] = digest
+        updated += 1
+    if updated:
+        manifest_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    print(f"asset-manifest.json: repointed {updated} generated_object_usds entries")
+
+
 def _build_real_converter():
     from tinker_sim_deploy import arena_convert
 
@@ -251,14 +353,48 @@ def _build_real_converter():
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument(
         "--checkout",
         type=Path,
         default=None,
         help="reuse an existing pinned checkout instead of cloning fresh into the scratchpad",
     )
+    parser.add_argument(
+        "--repair-physics",
+        action="store_true",
+        help=(
+            "republish the current artifact with rigid-body physics authored "
+            "on each object.usd (pure pxr, no Kit, no checkout)"
+        ),
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help=(
+            "repository root holding the real artifacts/ store (defaults to "
+            "this checkout; pass the primary checkout from a worktree whose "
+            "artifacts/ is a symlink -- the atomic publisher refuses symlink "
+            "components)"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.repair_physics:
+        publication = repair_physics((args.root or ROOT).resolve())
+        print(
+            f"published physics-repaired ycb objects artifact: "
+            f"identity={publication.identity} dir={publication.artifact_dir}"
+        )
+        print(
+            "operator reminder: update scenario asset_uris and the "
+            "generated_object_usds entries in artifacts/asset-manifest.json "
+            "to the new identity"
+        )
+        return 0
+    if args.config is None:
+        parser.error("--config is required unless --repair-physics is given")
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
     repo_root = ROOT
