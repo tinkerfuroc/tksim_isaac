@@ -118,6 +118,12 @@ def _resolve(context):
     ]
     if attempt_dir is not None:
         scenario_arguments.extend(["--report", str(attempt_dir / "scenario-runner.json")])
+    if os.environ.get("TINKER_SIM_SPAWN_WHILE_PLAYING") == "1":
+        # Spawned rigid bodies only pair with the robot's articulation links
+        # when the timeline has never been stopped; the boot stop bracket
+        # leaves every later spawn passing through the gripper (see
+        # tinker_sim_core.orchestration.standard_operations).
+        scenario_arguments.append("--spawn-while-playing")
 
     evaluator_jsonl = ""
     if attempt_dir is not None:

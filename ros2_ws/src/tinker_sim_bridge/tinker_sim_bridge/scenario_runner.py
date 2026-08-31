@@ -369,6 +369,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--expected-model-fingerprint")
     parser.add_argument("--provider-manifest", type=Path)
     parser.add_argument("--provider-manifest-sha256")
+    parser.add_argument(
+        "--spawn-while-playing",
+        action="store_true",
+        help=(
+            "spawn entities onto the still-playing first-run timeline "
+            "instead of the reset_spawned + SPAWN_READY stop bracket -- a "
+            "STOP->PLAY cycle leaves subsequently spawned rigid bodies "
+            "unpaired with the robot's articulation links (they pass "
+            "through the gripper), so grasping spawned objects requires "
+            "this mode; see tinker_sim_core.orchestration"
+        ),
+    )
     arguments = parser.parse_args(
         rclpy.utilities.remove_ros_args(args=sys.argv if argv is None else argv)[1:]
     )
@@ -424,7 +436,12 @@ def main(argv: list[str] | None = None) -> None:
                     )
                 )
 
-    operations = standard_operations(root, scenario, arguments.seed)
+    operations = standard_operations(
+        root,
+        scenario,
+        arguments.seed,
+        spawn_while_playing=arguments.spawn_while_playing,
+    )
     rclpy.init(args=argv)
     node = ScenarioRunner(
         timeout_s=arguments.timeout,

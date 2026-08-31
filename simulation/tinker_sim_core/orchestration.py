@@ -14,26 +14,51 @@ class ScenarioOperation:
 
 
 def standard_operations(
-    root: Path, scenario: ScenarioDefinition, seed: int
+    root: Path,
+    scenario: ScenarioDefinition,
+    seed: int,
+    *,
+    spawn_while_playing: bool = False,
 ) -> tuple[ScenarioOperation, ...]:
-    """Compile a scenario into standard simulation_interfaces operations."""
+    """Compile a scenario into standard simulation_interfaces operations.
+
+    ``spawn_while_playing`` skips the boot-time ``reset_spawned`` and the
+    ``SPAWN_READY`` stop, spawning every entity onto the still-playing
+    first-run timeline. Measured 2026-08-31 (in-process overlap probe): a
+    rigid body spawned mid-play on a never-stopped timeline collides fully
+    with the robot's articulation links (261 N depenetration on
+    left_finger), while after any timeline STOP -> PLAY cycle, newly
+    spawned bodies pair only with static geometry and pass straight
+    through the gripper -- which made every spawned object ungraspable
+    (the live-manip referee-fallback root). The stop bracket is what puts
+    the whole session into that poisoned regime, so opting out of it is
+    the fix; it stays opt-in until the A/B baselines that assume the old
+    boot sequence are re-cut. Requires a scenario with no world uri (a
+    world load belongs on a stopped timeline).
+    """
     if seed < 0 or seed > 2**64 - 1:
         raise ValueError("seed must fit uint64")
     operations: list[ScenarioOperation] = []
     world_uri = scenario.world.get("uri")
+    if spawn_while_playing and world_uri:
+        raise ValueError(
+            "spawn_while_playing cannot load a world uri: world loads "
+            "require a stopped timeline"
+        )
     if world_uri:
         operations.append(
             ScenarioOperation("load_world", {"uri": _uri(root, world_uri)})
         )
-    else:
+    elif not spawn_while_playing:
         operations.append(ScenarioOperation("reset_spawned", {"scope": 4}))
-    # ResetSimulation may restart the timeline; reassert STOPPED before spawn.
-    operations.append(
-        ScenarioOperation(
-            "set_simulation_state",
-            {"state": 0, "boundary": "SPAWN_READY"},
+    if not spawn_while_playing:
+        # ResetSimulation may restart the timeline; reassert STOPPED before spawn.
+        operations.append(
+            ScenarioOperation(
+                "set_simulation_state",
+                {"state": 0, "boundary": "SPAWN_READY"},
+            )
         )
-    )
     for record in (*scenario.actors, *scenario.objects):
         logical_id = record.get("id")
         if not isinstance(logical_id, str) or not logical_id:
