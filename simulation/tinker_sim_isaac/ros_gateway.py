@@ -373,6 +373,7 @@ class RosStandardGateway:
         try:
             received_at = time.monotonic()
             self._safety_last_sample_at = received_at
+            self._safety_last_sample_sim_at = self._sim_receipt_time()
             self._safety_sample_sequence = (
                 getattr(self, "_safety_sample_sequence", 0) + 1
             )
@@ -656,6 +657,40 @@ class RosStandardGateway:
         self.backend.set_safety_stop(True)
         self._last_command_error = "command stream expired"
 
+    def _sim_receipt_time(self) -> float | None:
+        """Backend simulation time for stamping a message receipt, or None."""
+        try:
+            value = getattr(self.backend, "simulation_time", None)
+            return None if value is None else float(value)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _sim_age_stale(self, received_sim_at: object, timeout: float) -> bool:
+        """Whether a receipt is also stale measured in *simulation* time.
+
+        The heartbeat/command publishers run on wall clock in separate
+        processes, but this loop's wall clock is not a fair judge of their
+        liveness: an RTX render stride or a loaded box stalls the stepping
+        loop for multiple wall seconds while perfectly healthy samples queue
+        in DDS, and a wall-only deadline then re-latches the limp safety
+        hold on every stride (observed 2026-08-31 by the grasp-bench stack).
+        Simulation time freezes with the loop, so requiring the sample to be
+        stale in BOTH clocks keeps every real guarantee -- a dead publisher
+        still trips the deadline within one simulated timeout while the sim
+        is stepping, and a faster-than-realtime sim cannot trip it early
+        (wall age still gates) -- without punishing the loop for its own
+        stalls.  While the timeline is paused nothing moves, so deferring
+        expiry until stepping resumes is safe by construction.  Receipts
+        with no simulation stamp (older tests, exotic backends) keep the
+        wall-only behavior.
+        """
+        if received_sim_at is None:
+            return True
+        sim_now = self._sim_receipt_time()
+        if sim_now is None:
+            return True
+        return sim_now - float(received_sim_at) >= timeout
+
     def _enforce_command_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
         if getattr(self, "_command_stream_lost", False):
@@ -664,8 +699,13 @@ class RosStandardGateway:
         timeout = getattr(
             self, "_command_stream_timeout_s", COMMAND_STREAM_TIMEOUT_S
         )
-        if last is not None and now - last >= timeout:
-            self._enter_command_stream_lost(now)
+        if last is None or now - last < timeout:
+            return
+        if not self._sim_age_stale(
+            getattr(self, "_last_command_received_sim_at", None), timeout
+        ):
+            return
+        self._enter_command_stream_lost(now)
 
     def _enforce_safety_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -674,6 +714,10 @@ class RosStandardGateway:
         last = self._safety_last_sample_at
         timeout = getattr(self, "_safety_timeout_s", SAFETY_HEARTBEAT_TIMEOUT_S)
         if last is not None and now - last < timeout:
+            return
+        if last is not None and not self._sim_age_stale(
+            getattr(self, "_safety_last_sample_sim_at", None), timeout
+        ):
             return
         if self._safety_active:
             return
@@ -990,6 +1034,7 @@ class RosStandardGateway:
                 self._snapshot_baseline_pending = False
                 self._snapshot_recovery_floor = None
                 self._last_command_received_at = time.monotonic()
+                self._last_command_received_sim_at = self._sim_receipt_time()
                 self._last_command_error = None
                 continue
 
@@ -1023,6 +1068,7 @@ class RosStandardGateway:
                     self._snapshot_baseline_pending = False
                     self._snapshot_recovery_floor = None
                     self._last_command_received_at = time.monotonic()
+                    self._last_command_received_sim_at = self._sim_receipt_time()
                     self._last_command_error = None
             except Exception as error:
                 self._last_command_error = str(error)

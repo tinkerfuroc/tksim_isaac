@@ -1030,6 +1030,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(gateway.backend._velocity_targets.tolist(), [[0.0, 1.75]])
 
         gateway._last_command_received_at = 10.0
+        # Expiry needs the receipt stale in simulation time too (the sim has
+        # stepped a full timeout past it), not only in wall time.
+        gateway._last_command_received_sim_at = float(gateway.backend.simulation_time) - 1.0
         gateway._enforce_command_deadline(now=10.5)
 
         self.assertTrue(gateway._command_stream_lost)
@@ -1055,6 +1058,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway._last_snapshot_packet_count = 1
         gateway._last_snapshot_packet_index = 1
         gateway._last_command_received_at = 10.0
+        # Expiry needs the receipt stale in simulation time too (the sim has
+        # stepped a full timeout past it), not only in wall time.
+        gateway._last_command_received_sim_at = float(gateway.backend.simulation_time) - 1.0
         gateway._enforce_command_deadline(now=10.5)
 
         gateway._safety_stop(SimpleNamespace(data=False))
