@@ -513,6 +513,21 @@ class IsaacWholeRobotBackend:
         self.scenario = str(scenario)
         self.task = str(task or scenario)
         self._object_views: dict[str, Any] = {}
+        # Diagnostic pose tracker for arbitrary rigid-body prims, opt-in via
+        # TINKER_SIM_TRACK_OBJECTS=/World/Scenario/a,/World/Scenario/b.
+        # Prints one JSON line per tracked prim every ~0.25 s of control
+        # time through the backend's own (working) view read path -- the
+        # standard channels cannot answer "where did a spawned object go":
+        # /get_entity_state reads the stale USD layer for spawned bodies and
+        # physics-truth only covers scenario-declared objects. Built for the
+        # 2026-08-31 vanishing-spawn investigation; costs nothing unset.
+        self._tracked_object_paths = tuple(
+            item.strip()
+            for item in _os.environ.get("TINKER_SIM_TRACK_OBJECTS", "").split(",")
+            if item.strip()
+        )
+        self._tracked_object_views: dict[str, Any] = {}
+        self._tracked_object_step = 0
         self._contact_pairs_by_key: dict[tuple[int, int, int, int], dict[str, object]] = {}
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
@@ -1591,6 +1606,68 @@ class IsaacWholeRobotBackend:
         if _t is not None:
             _sp["object_views"] += _t() - _sp["_mark"]
             _sp["n"] += 1
+        if self._tracked_object_paths:
+            self._log_tracked_objects()
+
+    def _log_tracked_objects(self) -> None:
+        """Print tracked rigid-body world poses (TINKER_SIM_TRACK_OBJECTS)."""
+        self._tracked_object_step += 1
+        interval = max(1, int(0.25 * self.control_hz))
+        if self._tracked_object_step % interval:
+            return
+        for path in self._tracked_object_paths:
+            view = self._tracked_object_views.get(path)
+            if view is None:
+                try:
+                    from isaaclab_physx.physics import PhysxManager
+
+                    view = PhysxManager.get_physics_sim_view().create_rigid_body_view(path)
+                    if view is None or int(view.count) == 0:
+                        view = None
+                except (AttributeError, RuntimeError, TypeError):
+                    view = None
+                if view is None:
+                    print(
+                        json.dumps(
+                            {
+                                "tracked_object": path,
+                                "t": round(self.simulation_time, 3),
+                                "state": "no rigid-body view yet",
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    continue
+                self._tracked_object_views[path] = view
+            try:
+                transforms = self._torch_value(view.get_transforms())
+                pose = transforms.reshape(-1, 7)[0].detach().cpu().tolist()
+            except (AttributeError, RuntimeError, TypeError) as error:
+                self._tracked_object_views.pop(path, None)
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": f"view read failed: {error}",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                continue
+            print(
+                json.dumps(
+                    {
+                        "tracked_object": path,
+                        "t": round(self.simulation_time, 3),
+                        "xyz": [round(float(v), 4) for v in pose[:3]],
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     def _profile_changed_targets(self) -> None:
         """Profile-only: count which joints' targets differ from the last push."""
