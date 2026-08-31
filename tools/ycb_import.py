@@ -262,7 +262,10 @@ def repair_physics(repo_root: Path) -> AssetPublication:
     """
     from pxr import Usd
 
-    from tinker_sim_deploy.arena_convert import author_object_rigid_body
+    from tinker_sim_deploy.arena_convert import (
+        author_object_rigid_body,
+        author_preview_surface_material,
+    )
 
     current = json.loads(
         (repo_root / "artifacts/objects/ycb/current.json").read_text(encoding="utf-8")
@@ -286,6 +289,7 @@ def repair_physics(repo_root: Path) -> AssetPublication:
                 source.write_bytes(data)
                 stage = Usd.Stage.Open(str(source))
                 author_object_rigid_body(stage)
+                author_preview_surface_material(stage)
                 repaired_path = work / "object.repaired.usd"
                 if not stage.GetRootLayer().Export(str(repaired_path)):
                     raise AssetArtifactError(f"failed to export repaired USD for {name}")

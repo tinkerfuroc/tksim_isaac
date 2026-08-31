@@ -524,6 +524,95 @@ def author_object_rigid_body(stage) -> None:
         pass
 
 
+def author_preview_surface_material(stage) -> int:
+    """Rewrite every MDL-shaded material to a native UsdPreviewSurface network.
+
+    Kit's asset converter binds object visuals to MDL shaders
+    (``OmniPBR_Opacity`` with the opacity inputs authored fully
+    transparent, no less). Measured live 2026-08-31: a prim spawned onto a
+    playing stage renders as NOTHING when its material is MDL -- any MDL,
+    textured or not, opaque or not -- while the identical mesh with no
+    material or with a ``UsdPreviewSurface`` network renders correctly,
+    textures included. Every spawned object was therefore physically
+    present but camera-invisible (the vanishing-spam investigation), and
+    no vision-driven grasp could ever see its target.
+
+    The rewrite happens inside the SAME ``Material`` prim, so existing
+    ``material:binding`` relationships stay valid: the old shader children
+    are removed, a ``UsdPreviewSurface`` (plus ``UsdUVTexture`` +
+    ``UsdPrimvarReader_float2`` when the MDL shader carried a
+    ``diffuse_texture``) is authored in their place, and any mdl-context
+    outputs on the material are dropped so the RTX renderer cannot prefer
+    a leftover MDL binding. Returns the number of materials rewritten.
+    """
+    from pxr import Sdf, UsdShade
+
+    material_paths = [
+        prim.GetPath()
+        for prim in stage.Traverse()
+        if prim.GetTypeName() == "Material"
+    ]
+    rewritten = 0
+    for material_path in material_paths:
+        prim = stage.GetPrimAtPath(material_path)
+        if not prim:
+            continue
+        mdl_shaders = [
+            child
+            for child in prim.GetChildren()
+            if child.GetAttribute("info:mdl:sourceAsset")
+            and child.GetAttribute("info:mdl:sourceAsset").Get()
+        ]
+        if not mdl_shaders:
+            continue
+        texture = None
+        for shader_prim in mdl_shaders:
+            attr = shader_prim.GetAttribute("inputs:diffuse_texture")
+            if attr and attr.Get():
+                texture = attr.Get()
+        for child in list(prim.GetChildren()):
+            stage.RemovePrim(child.GetPath())
+        for output_name in (
+            "outputs:mdl:surface",
+            "outputs:mdl:displacement",
+            "outputs:mdl:volume",
+        ):
+            prim.RemoveProperty(output_name)
+
+        material = UsdShade.Material(prim)
+        surface = UsdShade.Shader.Define(stage, prim.GetPath().AppendChild("surface"))
+        surface.CreateIdAttr("UsdPreviewSurface")
+        surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.6)
+        if texture is not None:
+            st_reader = UsdShade.Shader.Define(
+                stage, prim.GetPath().AppendChild("stReader")
+            )
+            st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+            st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+            uv_texture = UsdShade.Shader.Define(
+                stage, prim.GetPath().AppendChild("diffuseTex")
+            )
+            uv_texture.CreateIdAttr("UsdUVTexture")
+            uv_texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+                Sdf.AssetPath(texture.path)
+            )
+            uv_texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+            )
+            surface.CreateInput(
+                "diffuseColor", Sdf.ValueTypeNames.Color3f
+            ).ConnectToSource(uv_texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3))
+        else:
+            surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                (0.6, 0.6, 0.6)
+            )
+        material.CreateSurfaceOutput().ConnectToSource(
+            surface.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+        )
+        rewritten += 1
+    return rewritten
+
+
 def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: Path) -> None:
     """Wrap the two independent raw conversions (DAE visual, STL collision)
     into one flattened ``usd_path``, structured per the collider-placement
@@ -599,6 +688,7 @@ def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: P
         raise RuntimeError(f"{usd_path}: no collision mesh geometry found under {collision_root.GetPath()}")
     UsdGeom.Imageable(collision_root).MakeInvisible()
     author_object_rigid_body(stage)
+    author_preview_surface_material(stage)
 
     # Fail-closed runtime guard (Task 10 review round, Finding 1): nothing
     # up to this point actually checks that "STL scale=1.0, no rotation,
