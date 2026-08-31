@@ -140,10 +140,25 @@ stale even on a fresh timeline in-process). Consumers should read gateway
 physics-truth instead; `force_load_physics_from_usd` as a repair is
 destructive (invalidates every live tensor view) -- do not use it mid-run.
 
-**Still open.** Head camera aim: the description-level defect (optical axis
-+14..+48 deg above horizon everywhere reachable) needs a measurement on the
-physical robot; the env-gated `level-forward` sim correction remains the
-sanctioned workaround. `/get_entity_state` staleness above.
+**Wrist camera aim: same description defect class as the head, exactly
+90 deg (`e821e79`).** Found by the first live s2026-000 run with the
+collision fix armed: the wrist frame at the table-scan pose renders the
+ceiling. The artifact's robot.urdf FK proves it: the camera optical axis
+sits 90 deg from the tool approach axis at every configuration (joint
+zeros: gripper -90 deg, camera level; scan pose: TCP -48 deg, camera
++42 deg up). The wrist camera stub frames are among the same hand-authored
+inertial-less links as the phantom-mass defect; the real robot survives
+because hand-eye calibration, not URDF TF, supplies its grasp extrinsics.
+Sim correction mirrors the head one: `TINKER_SIM_WRIST_CAMERA_AIM=
+tool-forward` (+90 deg about the optical frame's own +X = render axis onto
+the TCP forward), opt-in, parity-breaking, set by gpsr-stack. Watchpoint
+for consumers: if a pipeline derives wrist extrinsics from URDF TF instead
+of calibration, corrected images now disagree with that TF by 90 deg --
+good detections at wrong map positions is the signature.
+
+**Still open.** Head + wrist camera aim: the description-level defects
+need measurement on the physical robot; the env-gated sim corrections
+remain the sanctioned workarounds. `/get_entity_state` staleness above.
 
 ## 2026-08-29 — Arena camera RTF: Phase 0 measurement
 
