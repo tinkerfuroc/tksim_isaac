@@ -52,6 +52,9 @@ DEFAULT_PLACEMENTS = REPO_ROOT / "simulation" / "scenarios" / "rcw2026-placement
 DEFAULT_BASE_SCENARIO = REPO_ROOT / "simulation" / "scenarios" / "gpsr-rcw2026-bench.json"
 
 
+SPAWN_TIMEOUT_S = 120.0
+
+
 class ServiceUnavailable(RuntimeError):
     """Raised by the real ROS service client (see `_make_ros_service_client`)
     when a simulation_interfaces service is missing at construction time, or
@@ -60,6 +63,15 @@ class ServiceUnavailable(RuntimeError):
     failure (the item itself is bad), a `ServiceUnavailable` means the sim
     is presumed down for the rest of the run, so the plan's remaining items
     are not attempted at all rather than tried and failed one by one.
+    """
+
+
+class EntityAlreadyExists(RuntimeError):
+    """Raised by a service client when the sim refuses a spawn because a prim
+    with the requested name is already present (`allow_renaming` is False).
+    `apply_plan` records the item as ok: the entity the caller asked for is
+    in the sim. Live 2026-08-29: a spawn whose reply took longer than the
+    30 s timeout still landed, and the bench's retry then hit this.
     """
 
 
@@ -316,6 +328,15 @@ def apply_plan(
             )
             _report()
             continue
+        except EntityAlreadyExists:
+            _replace_stale(key)
+            entities.append(
+                {"id": item.id, "asset_key": asset_key, "where": where,
+                 "entity_name": entity_name, "ok": True,
+                 "note": "already present in sim (spawn refused: name exists)", **pose_fields}
+            )
+            _report()
+            continue
         except Exception as exc:  # noqa: BLE001 - never crash a bench run
             _replace_stale(key)
             entities.append(
@@ -366,15 +387,31 @@ def clear_manifest(
             results.append(e)
             _report()
             continue
+        # A re-run over a manifest whose earlier clear failed must not keep the old error
+        # text next to a fresh "cleared": true.
+        base = {k: v for k, v in e.items() if k != "clear_error"}
         try:
-            deleted = client.delete(e["entity_name"])
+            deleted = _delete_with_one_retry(client, e["entity_name"])
         except Exception as exc:  # noqa: BLE001 - never crash a bench run
-            results.append({**e, "cleared": False, "clear_error": repr(exc)})
+            results.append({**base, "cleared": False, "clear_error": repr(exc)})
             _report()
             continue
-        results.append({**e, "cleared": bool(deleted)})
+        results.append({**base, "cleared": bool(deleted)})
         _report()
     return _snapshot()
+
+
+def _delete_with_one_retry(client: ServiceClient, entity: str) -> bool:
+    """`client.delete(entity)`, retried once if the service was unavailable.
+
+    Live 2026-08-29: the first delete_entity issued right after the orchestrator's
+    teardown timed out once (sim busy), and the same call succeeded seconds later.
+    Item-level failures (any other exception) are not retried.
+    """
+    try:
+        return client.delete(entity)
+    except ServiceUnavailable:
+        return client.delete(entity)
 
 
 def emit_scenario(plans: Sequence[ScenePlan], base_scenario: dict, placements: dict) -> dict:
@@ -494,14 +531,19 @@ def _make_ros_service_client() -> "ServiceClient":
             ) = item.quaternion_xyzw
             request.initial_pose = pose
             future = spawn_client.call_async(request)
-            rclpy.spin_until_future_complete(node, future, timeout_sec=30.0)
+            # Live 2026-08-29: right after a bench reset the spawn reply can take well
+            # over 30 s while the prim still lands (two runs lost to a 30 s timeout).
+            rclpy.spin_until_future_complete(node, future, timeout_sec=SPAWN_TIMEOUT_S)
             if future.result() is None:
-                raise ServiceUnavailable(f"spawn_entity timed out for {item.id}")
+                raise ServiceUnavailable(
+                    f"spawn_entity timed out for {item.id} after {SPAWN_TIMEOUT_S:.0f}s"
+                )
             response = future.result()
             if response.result.result != Result.RESULT_OK:
-                raise RuntimeError(
-                    f"spawn_entity failed for {item.id}: {response.result.error_message}"
-                )
+                message = f"spawn_entity failed for {item.id}: {response.result.error_message}"
+                if "already exists" in str(response.result.error_message):
+                    raise EntityAlreadyExists(message)
+                raise RuntimeError(message)
             return str(response.entity_name)
 
         def delete(self, entity: str) -> bool:

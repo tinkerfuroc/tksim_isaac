@@ -487,6 +487,43 @@ def _check_bounds_overlap(
             )
 
 
+def author_object_rigid_body(stage) -> None:
+    """Author dynamic rigid-body physics on a composed object's default prim.
+
+    Every spawnable asset in this codebase carries its own physics (see
+    ``simulation/assets/primitives/task-object.usda``): ``RigidBodyAPI`` +
+    ``PhysxRigidBodyAPI`` on the default prim, mass left to PhysX's
+    density-derived computation over the collision hulls (scene default
+    1000 kg/m^3 lands within ~2x of the published YCB masses).  Without
+    this, a spawned object composes in as static scenery: the simulation's
+    rigid-body view for it never resolves, its ground-truth pose is
+    silently absent from every physics-truth frame, and a grasp can never
+    move it.  Requires an already-authored collision subtree; fails closed
+    otherwise, because a dynamic body with no collider falls through the
+    world.
+    """
+    from pxr import Usd, UsdPhysics
+
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError("rigid-body authoring requires a default prim")
+    if not any(
+        prim.HasAPI(UsdPhysics.CollisionAPI) for prim in Usd.PrimRange(default_prim)
+    ):
+        raise RuntimeError(
+            f"{default_prim.GetPath()}: rigid-body authoring requires an authored collider"
+        )
+    UsdPhysics.RigidBodyAPI.Apply(default_prim)
+    try:
+        from pxr import PhysxSchema
+
+        PhysxSchema.PhysxRigidBodyAPI.Apply(default_prim)
+    except ImportError:
+        # Outside a Kit process the PhysX schema plugin may be absent; the
+        # UsdPhysics rigid body alone is sufficient for simulation.
+        pass
+
+
 def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: Path) -> None:
     """Wrap the two independent raw conversions (DAE visual, STL collision)
     into one flattened ``usd_path``, structured per the collider-placement
@@ -561,6 +598,7 @@ def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: P
     if not found_mesh:
         raise RuntimeError(f"{usd_path}: no collision mesh geometry found under {collision_root.GetPath()}")
     UsdGeom.Imageable(collision_root).MakeInvisible()
+    author_object_rigid_body(stage)
 
     # Fail-closed runtime guard (Task 10 review round, Finding 1): nothing
     # up to this point actually checks that "STL scale=1.0, no rotation,
