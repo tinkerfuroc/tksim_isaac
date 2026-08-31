@@ -49,11 +49,13 @@ by hand unless you're debugging a specific stage.
   Stage 4 and `ros2_ws/src/tinker_sim_bridge/README.md`); `up` raises with
   the exact two commands to produce it if it's missing.
 - The arena observer camera (a sim-only overview stream, out of GPSR parity)
-  is **opt-in and currently known-broken** under full-stack load — a
-  CUDA-700 illegal-memory-access race — so `gpsr-stack` never enables it.
-  See `docs/developer-log.md`, "2026-08-26 — GPSR recorded sim battery
-  bring-up" for the full investigation and fix history; re-enable via
-  `TINKER_SIM_ARENA_CAMERA=1` only once that's resolved.
+  is **opt-in via `gpsr-stack up --evidence`**: the 2026-08-29 fix round
+  (per-product DLAA pin + sub-rate annotator guard) resolved the CUDA-700
+  illegal-memory-access race, and evidence runs since then have been clean
+  at 640x360 / 2 Hz with a measured RTF cost of ~0.64 -> ~0.58. Batteries
+  run without it by default. See `docs/developer-log.md`, "2026-08-29 —
+  Arena camera RTF" for the fix history; `TINKER_SIM_ARENA_CAMERA=1` is the
+  raw switch `--evidence` sets.
 
 ## GPU pre-flight (before Stage 1, verbatim)
 
