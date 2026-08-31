@@ -1595,6 +1595,8 @@ class IsaacWholeRobotBackend:
             try:
                 self._robot.write_data_to_sim()
             except Exception as error:
+                if self._maybe_recover_simulation_view(error):
+                    return
                 raise RuntimeError(
                     "articulation tensor view failed "
                     f"(time={self.simulation_time:.6f}, end={self.timeline_end_time:.6f}, "
@@ -1616,7 +1618,12 @@ class IsaacWholeRobotBackend:
         if _t is not None:
             _sp["physx"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
-        self._robot.update(self.dt)
+        try:
+            self._robot.update(self.dt)
+        except Exception as error:
+            if not self._maybe_recover_simulation_view(error):
+                raise
+            return
         if _t is not None:
             _sp["robot_update"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
@@ -1630,6 +1637,168 @@ class IsaacWholeRobotBackend:
             self._log_tracked_objects()
         if getattr(self, "_heal_detached_spawns", False):
             self._heal_detached_scenario_bodies()
+
+    def _maybe_recover_simulation_view(self, error: Exception) -> bool:
+        """Rebuild the tensor simulation view after a topology invalidation.
+
+        Deleting a prim any live tensor view covers invalidates the SHARED
+        SimulationView ("prim ... was deleted while being used by a tensor
+        view class"); the physics SCENE itself keeps simulating -- only the
+        view layer dies -- but every ``Articulation.update`` read then
+        raises ("Failed to get DOF velocities from backend") and, without
+        this, the boot is unrecoverable (observed 2026-08-31 twice: the
+        healer's probe views, and the referee's cached write view, each
+        made a routine post-run clear fatal). The views have no release
+        API and even a dropped, garbage-collected Python view leaves the
+        backend registration live (measured), so avoidance alone cannot
+        protect against every component.
+
+        Recovery mirrors the manager's own STOP -> PLAY view lifecycle
+        minus the timeline (and minus the warmup ``force_load``, which
+        would re-parse the stage and snap every body back to its authored
+        pose): invalidate + clear the views, recreate them against the
+        still-live scene, and let the re-dispatched PHYSICS_READY rebind
+        the articulation -- ``_refresh_robot_handles`` already handles the
+        new root-view identity on the next step. Budgeted to 5 recoveries
+        per boot so a genuinely broken scene still fails loudly.
+        """
+        message = str(error)
+        if not any(
+            token in message
+            for token in ("Failed to get", "Failed to set", "invalidated", "Simulation view")
+        ):
+            return False
+        budget_used = getattr(self, "_view_recoveries", 0)
+        if budget_used >= 5:
+            return False
+        self._view_recoveries = budget_used + 1
+        try:
+            from isaaclab_physx.physics import PhysxManager
+
+            # De-initialize the articulation first: its PHYSICS_READY
+            # handler early-returns while it believes itself initialized
+            # (measured: without this, view recreation "succeeds" but every
+            # read keeps failing against the stale articulation view).
+            # This is exactly what the timeline-stop callback does.
+            self._robot._invalidate_initialize_callback(None)
+            # Replicate ONLY the view-creation lines of PhysxManager.
+            # _warmup_and_create_views: the method itself is unusable here
+            # (its first guard early-returns without _warmup_needed, and
+            # with it, its warmup force_load_physics_from_usd re-parses the
+            # stage and snaps every body back to its authored pose).
+            import omni.physics.tensors as _tensors
+            from isaaclab.sim.utils.stage import get_current_stage_id
+
+            stage_id = get_current_stage_id()
+            PhysxManager._warmup_needed = False
+            PhysxManager._invalidate_views()
+            fresh_view = _tensors.create_simulation_view("warp", stage_id=stage_id)
+            fresh_view_warp = _tensors.create_simulation_view("warp", stage_id=stage_id)
+            fresh_view.set_subspace_roots("/")
+            fresh_view_warp.set_subspace_roots("/")
+            PhysxManager._view = fresh_view
+            PhysxManager._view_warp = fresh_view_warp
+            PhysxManager._physx.update_simulation(PhysxManager.get_physics_dt(), 0.0)
+            PhysxManager._view_created = True
+            try:
+                PhysxManager._scene_data_backend.simulation_view = PhysxManager._view
+            except Exception:
+                pass
+            # The physics step counter resets with the new views; re-anchor
+            # the monotonic clock immediately -- the gateway may publish
+            # /clock before the next _refresh_robot_handles, and a single
+            # backward /clock sample wedges TF caches and Nav2 stack-wide
+            # (the documented 2026-08-27 trap).
+            count_now = self._sim.get_physics_step_count()
+            self._clock_step_origin = count_now - self._clock_elapsed_steps
+            # The articulation's _initialize_impl sources its view from
+            # isaacsim's SimulationManager (a separate holder from
+            # PhysxManager); rebuild those views too, replicating only the
+            # view-creation lines of SimulationManager.initialize_physics --
+            # never its warmup, whose force_load_physics_from_usd would
+            # re-parse the stage and snap every body to its authored pose.
+            import omni.physics.tensors as _tensors
+            import omni.usd as _omni_usd
+            from isaacsim.core.simulation_manager import SimulationManager
+
+            for attr in ("_physics_sim_view", "_physics_sim_view__warp"):
+                stale = getattr(SimulationManager, attr, None)
+                if stale is not None:
+                    try:
+                        stale.invalidate()
+                    except Exception:
+                        pass
+                    setattr(SimulationManager, attr, None)
+            stage_id = _omni_usd.get_context().get_stage_id()
+            engine = getattr(SimulationManager, "_engine", None)
+
+            def _create_view(frontend: str):
+                try:
+                    view = _tensors.create_simulation_view(
+                        frontend, stage_id=stage_id, backend=engine
+                    )
+                except TypeError:
+                    view = _tensors.create_simulation_view(frontend, stage_id=stage_id)
+                view.set_subspace_roots("/")
+                return view
+
+            SimulationManager._physics_sim_view__warp = _create_view("warp")
+            frontend = None
+            try:
+                frontend = SimulationManager.get_backend()
+            except Exception:
+                pass
+            SimulationManager._physics_sim_view = (
+                _create_view(frontend)
+                if frontend and frontend != "warp"
+                else SimulationManager._physics_sim_view__warp
+            )
+            SimulationManager._simulation_view_created = True
+            if not self._robot.is_initialized:
+                # The event-bus init path invokes assets through
+                # safe_callback_invoke, which STORES exceptions instead of
+                # raising; re-run the initialization directly so a failure
+                # lands in this try block and is reported.
+                self._robot._initialize_callback(None)
+            if not self._robot.is_initialized:
+                raise RuntimeError("articulation did not re-initialize after view recreation")
+        except Exception as recovery_error:
+            print(
+                json.dumps(
+                    {
+                        "simulation_view_recovery": "failed",
+                        "error": str(recovery_error)[:300],
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return False
+        # Deliver any deferred PHYSICS_READY work and rebind the articulation
+        # before the next target write; a write against the old view raises
+        # "articulation tensor view failed".
+        try:
+            import omni.kit.app
+
+            for _ in range(2):
+                omni.kit.app.get_app().update()
+            self._refresh_robot_handles()
+        except Exception:
+            pass
+        self._target_write_gate.force_next()
+        print(
+            json.dumps(
+                {
+                    "simulation_view_recovery": "ok",
+                    "attempt": self._view_recoveries,
+                    "t": round(self.simulation_time, 3),
+                    "trigger": message[:160],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return True
 
     def _heal_detached_scenario_bodies(self) -> None:
         """Re-parse /World/Scenario rigid-body prims PhysX failed to attach.
