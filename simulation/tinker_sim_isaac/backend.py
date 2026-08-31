@@ -1635,7 +1635,7 @@ class IsaacWholeRobotBackend:
         """Re-parse /World/Scenario rigid-body prims PhysX failed to attach.
 
         Runs at the object-discovery cadence. For each Scenario child prim
-        carrying ``UsdPhysics.RigidBodyAPI``: one quiet view probe per
+        carrying ``UsdPhysics.RigidBodyAPI``: one attachment probe per
         interval; if the body is absent after a full interval since the
         prim appeared, toggle the prim inactive/active (the standard
         omni.physx re-parse trigger) and re-probe next interval. Two nudges
@@ -1643,6 +1643,16 @@ class IsaacWholeRobotBackend:
         mark. Attached prims are marked healed on the first successful
         probe and never probed again, so steady-state cost is one stage
         child listing per interval.
+
+        The probe is ``IPhysx.get_rigidbody_transformation`` -- deliberately
+        NOT a tensor view: the physics.tensors views have no release API,
+        and deleting a prim that any live view covers invalidates the
+        SHARED SimulationView, killing the articulation for the rest of the
+        boot (observed 2026-08-31: the first battery boot that probed
+        spawned objects with views died at the first multi-entity clear --
+        "prim ... was deleted while being used by a tensor view class").
+        Spawned objects are exactly the prims that later get deleted, so
+        nothing that watches them may ever hold a view on them.
         """
         self._spawn_attach_step += 1
         interval = self._object_discovery_interval
@@ -1650,15 +1660,15 @@ class IsaacWholeRobotBackend:
             return
         try:
             import omni.usd
-            from isaaclab_physx.physics import PhysxManager
+            from omni.physx import get_physx_interface
             from pxr import UsdPhysics
 
             stage = omni.usd.get_context().get_stage()
             scenario = stage.GetPrimAtPath("/World/Scenario")
             if not scenario.IsValid():
                 return
-            physics_view = PhysxManager.get_physics_sim_view()
-        except (AttributeError, RuntimeError, TypeError):
+            physx = get_physx_interface()
+        except (AttributeError, ImportError, RuntimeError, TypeError):
             return
         for child in scenario.GetChildren():
             path = child.GetPath().pathString
@@ -1674,8 +1684,8 @@ class IsaacWholeRobotBackend:
                 continue
             attached = False
             try:
-                view = physics_view.create_rigid_body_view(path)
-                attached = view is not None and int(view.count) > 0
+                result = physx.get_rigidbody_transformation(path)
+                attached = bool(result.get("ret_val"))
             except (AttributeError, RuntimeError, TypeError):
                 attached = False
             if attached:
@@ -1724,59 +1734,61 @@ class IsaacWholeRobotBackend:
                 )
 
     def _log_tracked_objects(self) -> None:
-        """Print tracked rigid-body world poses (TINKER_SIM_TRACK_OBJECTS)."""
+        """Print tracked rigid-body world poses (TINKER_SIM_TRACK_OBJECTS).
+
+        Reads through ``IPhysx.get_rigidbody_transformation`` -- view-free
+        on purpose: tracked objects are typically spawned objects that
+        later get deleted, and a tensor view held (or ever created -- the
+        views have no release API) on a deleted prim invalidates the shared
+        SimulationView and kills the boot. See
+        ``_heal_detached_scenario_bodies``.
+        """
         self._tracked_object_step += 1
         interval = max(1, int(0.25 * self.control_hz))
         if self._tracked_object_step % interval:
             return
-        for path in self._tracked_object_paths:
-            view = self._tracked_object_views.get(path)
-            if view is None:
-                try:
-                    from isaaclab_physx.physics import PhysxManager
+        try:
+            from omni.physx import get_physx_interface
 
-                    view = PhysxManager.get_physics_sim_view().create_rigid_body_view(path)
-                    if view is None or int(view.count) == 0:
-                        view = None
-                except (AttributeError, RuntimeError, TypeError):
-                    view = None
-                if view is None:
-                    print(
-                        json.dumps(
-                            {
-                                "tracked_object": path,
-                                "t": round(self.simulation_time, 3),
-                                "state": "no rigid-body view yet",
-                            },
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
-                    continue
-                self._tracked_object_views[path] = view
+            physx = get_physx_interface()
+        except (AttributeError, ImportError, RuntimeError):
+            return
+        for path in self._tracked_object_paths:
             try:
-                transforms = self._torch_value(view.get_transforms())
-                pose = transforms.reshape(-1, 7)[0].detach().cpu().tolist()
+                result = physx.get_rigidbody_transformation(path)
             except (AttributeError, RuntimeError, TypeError) as error:
-                self._tracked_object_views.pop(path, None)
                 print(
                     json.dumps(
                         {
                             "tracked_object": path,
                             "t": round(self.simulation_time, 3),
-                            "state": f"view read failed: {error}",
+                            "state": f"pose query failed: {error}",
                         },
                         sort_keys=True,
                     ),
                     flush=True,
                 )
                 continue
+            if not result.get("ret_val"):
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": "no rigid body",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                continue
+            position = result.get("position")
             print(
                 json.dumps(
                     {
                         "tracked_object": path,
                         "t": round(self.simulation_time, 3),
-                        "xyz": [round(float(v), 4) for v in pose[:3]],
+                        "xyz": [round(float(v), 4) for v in tuple(position)[:3]],
                     },
                     sort_keys=True,
                 ),
@@ -1851,6 +1863,15 @@ class IsaacWholeRobotBackend:
         return value
 
     def _refresh_object_views(self) -> None:
+        # These are TENSOR VIEWS, held for the truth stream's pose+twist
+        # reads. The views have no release API, and deleting a prim any
+        # live view covers invalidates the shared SimulationView (whole
+        # boot dies -- see _heal_detached_scenario_bodies). That is safe
+        # here ONLY because expected (scenario-declared) objects are never
+        # deleted on a playing timeline in any current flow; anything that
+        # wants to delete one mid-play must first go through a stop
+        # boundary. Watchers of DELETABLE spawns must use the view-free
+        # IPhysx.get_rigidbody_transformation instead.
         if not self._expected_objects:
             return
         # Every expected object that has already resolved is skipped below, so
