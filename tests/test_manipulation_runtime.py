@@ -796,6 +796,68 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # commits the captured target (see _apply_joint_command).
         self.assertAlmostEqual(float(backend._drive_command_target), 0.6)
 
+    def test_gripper_close_ramp_slews_then_halts_on_contact(self) -> None:
+        # The close target must not jump to the command; it slews, and it
+        # FREEZES once finger-pad grip force reaches the halt force so the press
+        # stops at that force instead of climbing to the effort caps (the
+        # cycle-1 248 N runaway) and so measured position can flatline for the
+        # facade's stall detector.
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_contact_halt_force = 15.0
+        backend._position_targets = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+        grip = {"force": 0.0}
+        backend._gripper_grip_force = lambda: grip["force"]  # type: ignore[assignment]
+
+        step = 1.5 / 120.0
+        backend._ramp_drive_target()
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), step, places=6)
+        self.assertLess(float(backend._position_targets[0, 0]), 0.85)
+
+        # No grip force yet -> keeps advancing one slew step per call.
+        for _ in range(5):
+            backend._ramp_drive_target()
+        advanced = float(backend._position_targets[0, 0])
+        self.assertAlmostEqual(advanced, step * 6, places=6)
+
+        # Fingers press the object past the halt force -> target freezes.
+        grip["force"] = 20.0
+        backend._ramp_drive_target()
+        self.assertAlmostEqual(
+            float(backend._position_targets[0, 0]), advanced, places=6
+        )
+
+        # Object slips (force falls below halt) -> the ramp resumes closing.
+        grip["force"] = 5.0
+        backend._ramp_drive_target()
+        self.assertGreater(float(backend._position_targets[0, 0]), advanced)
+
+    def test_gripper_close_ramp_disabled_applies_target_instantly(self) -> None:
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 0.0  # ramp disabled
+        backend._gripper_contact_halt_force = 15.0
+        backend._position_targets = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+        backend._gripper_grip_force = lambda: 0.0  # type: ignore[assignment]
+        backend._ramp_drive_target()
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.85, places=6)
+
+    def test_gripper_open_ignores_contact_halt(self) -> None:
+        # Only the closing stroke is force-bounded; an opening command must slew
+        # freely even while the pads still report force, so release is prompt.
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_contact_halt_force = 15.0
+        backend._position_targets = torch.tensor([[0.85, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.0  # open
+        backend._gripper_grip_force = lambda: 50.0  # type: ignore[assignment]
+        backend._ramp_drive_target()
+        self.assertLess(float(backend._position_targets[0, 0]), 0.85)
+
     def test_gateway_applies_callbacks_in_arrival_order_across_safety_and_commands(self) -> None:
         class _GatewayBackend:
             safety_stopped = False

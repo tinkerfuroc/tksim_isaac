@@ -710,16 +710,30 @@ class IsaacWholeRobotBackend:
         # (isaaclab source shows they are scoped to /World/Tinker and cannot
         # address a loose body); if the spawn lands correctly, they are.
         self._base_hold_dryrun = _os.environ.get("TINKER_SIM_FIX_BASE_DRYRUN") == "1"
-        # Gripper close ramp: slew the drive_joint target toward the commanded
-        # value at this rate (rad/s) so first-contact force builds gradually
-        # instead of the impulsive spike that ejects light objects. Starts open;
-        # tunable live via TINKER_SIM_GRIPPER_CLOSE_SLEW (0/unset -> no ramp).
+        # Gripper close ramp + contact halt: slew the drive_joint target toward
+        # the commanded value at _gripper_close_slew rad/s so first-contact
+        # force builds gradually, then FREEZE the applied target once finger-pad
+        # grip force reaches _gripper_contact_halt_force so the press stops at
+        # that force instead of climbing to the effort caps -- and so the
+        # measured joint position flatlines, which lets the gripper facade's
+        # stall detector latch a successful grasp instead of running the close
+        # out to its timeout. Starts open. slew defaults 1.5 rad/s, override via
+        # TINKER_SIM_GRIPPER_CLOSE_SLEW (<=0 disables the ramp: apply instantly).
+        # Halt force defaults 15 N, override via TINKER_SIM_GRIPPER_CONTACT_HALT_N
+        # (<=0 disables the halt: open-loop slew to the commanded target).
         self._drive_command_target: float | None = None
         self._gripper_close_slew = 1.5
         try:
             _slew = _os.environ.get("TINKER_SIM_GRIPPER_CLOSE_SLEW")
             if _slew is not None and _slew.strip():
                 self._gripper_close_slew = max(0.0, float(_slew))
+        except (TypeError, ValueError):
+            pass
+        self._gripper_contact_halt_force = 15.0
+        try:
+            _halt = _os.environ.get("TINKER_SIM_GRIPPER_CONTACT_HALT_N")
+            if _halt is not None and _halt.strip():
+                self._gripper_contact_halt_force = max(0.0, float(_halt))
         except (TypeError, ValueError):
             pass
         articulation_props = None
@@ -2029,17 +2043,50 @@ class IsaacWholeRobotBackend:
         except (AttributeError, ImportError, RuntimeError, TypeError):
             return self._base_hold_scene_sig or 0
 
-    def _ramp_drive_target(self) -> None:
-        """Slew the drive_joint applied target toward the commanded value.
+    def _gripper_grip_force(self) -> float:
+        """Finger-pad contact force -- the SAME quantity the gripper facade
+        reads on /sim/parity/finger_contact (the sum of the two finger-pad
+        normal forces, ros_gateway._publish), so the close halt below and the
+        facade's contact-stall threshold agree: when the halt fires, the facade
+        sees the identical force and latches its grasp.
+        """
+        try:
+            state = self.contact_state()
+        except Exception:
+            return 0.0
+        total = 0.0
+        for name in ("left_finger", "right_finger"):
+            entry = state.get(name)
+            if entry is not None:
+                total += float(entry.get("force", 0.0))
+        return total
 
-        _apply_joint_command records the gripper close/open target in
-        _drive_command_target rather than applying it directly; ramping the
-        applied target at _gripper_close_slew rad/s means the position error
-        (and thus the finger press force) builds gradually, so first contact is
-        a bounded ramp instead of the 12-190 N impulse that ejects a light
-        object before the jaw captures it. The mirror then carries the slewed
-        target to the five followers, so both jaws ramp together. getattr
-        guards keep the step() test doubles happy.
+    def _ramp_drive_target(self) -> None:
+        """Slew the drive_joint applied target toward the command, halting on
+        contact so the press force is bounded and the jaw reaches a clean stall.
+
+        _apply_joint_command records the gripper target in _drive_command_target
+        rather than applying it directly. Two closed-loop shaping steps run here
+        each physics step, before the mimic mirror carries the result to the
+        five followers:
+
+        1. Slew: advance the applied target by at most _gripper_close_slew * dt,
+           so the finger press builds gradually instead of an impulsive spike.
+
+        2. Contact halt: once finger-pad grip force reaches
+           _gripper_contact_halt_force, FREEZE the applied target. An open-loop
+           slew bounds dF/dt but never stops -- past first contact the target
+           keeps advancing to the fully-closed command, so the follower press
+           climbs to the effort caps (grasp-bench cycle-1 peak 248 N) AND the
+           measured joint position keeps creeping, which defeats the facade's
+           position-stall detector and runs the close out to its 5 s timeout
+           -> abort ("native gripper: execution failed"). Freezing caps the
+           press near the halt force and flatlines the measured position so the
+           facade's contact/position stall latches a successful grasp.
+
+        Only the closing stroke is force-bounded; an opening command (target
+        below the current applied value) always slews freely so release is
+        prompt. getattr guards keep the step() test doubles happy.
         """
         drive_index = getattr(self, "_drive_joint_index", None)
         command = getattr(self, "_drive_command_target", None)
@@ -2050,6 +2097,10 @@ class IsaacWholeRobotBackend:
         if slew <= 0.0:
             self._position_targets[0, drive_index] = command
             return
+        closing = command > current
+        halt_force = getattr(self, "_gripper_contact_halt_force", 0.0)
+        if closing and halt_force > 0.0 and self._gripper_grip_force() >= halt_force:
+            return  # fingers press the object -- hold the target, don't punch through
         max_delta = slew * self.dt
         delta = max(-max_delta, min(max_delta, command - current))
         self._position_targets[0, drive_index] = current + delta
