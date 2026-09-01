@@ -822,14 +822,18 @@ class IsaacWholeRobotBackend:
                 # follower pinned short of its target (e.g. the jaw closing onto
                 # the desk) pushes k*error ~= 1500*0.56 ~= 840, which overwhelms
                 # drive_joint's 0 lower limit and back-drives it to -0.57 (drops
-                # the object). Capping at 80 keeps the drive's hard limit
-                # enforceable while clearing the measured ~45 (k*0.03) needed to
-                # track under the 37 N grip, so the coupling is preserved.
+                # the object). The cap must sit below that ~840 so the drive's
+                # hard limit stays enforceable, yet above the DYNAMIC grip demand
+                # -- the static estimate (~45 = k*0.03 steady tracking) undershot
+                # badly (a cap of 80 saturated the followers under real contact,
+                # lag regressed to 0.11 rad and the 37 N squeeze was lost). 180
+                # restores the grip (measured) while staying ~4-5x below 840, so
+                # the limit holds and the coupling is preserved.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
                     stiffness=1500.0,
                     damping=55.0,
-                    effort_limit_sim=80.0,
+                    effort_limit_sim=180.0,
                 ),
                 "casters": ImplicitActuatorCfg(
                     joint_names_expr=["rear_.*_swivel_joint", "rear_.*_wheel_joint"],
