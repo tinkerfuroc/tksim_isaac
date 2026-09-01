@@ -668,6 +668,13 @@ class IsaacWholeRobotBackend:
                 self._base_hold_resettle_s = max(0.0, float(_resettle))
         except (TypeError, ValueError):
             pass
+        # Diagnostic (TINKER_SIM_FIX_BASE_DRYRUN=1): run the whole hold -- settle,
+        # latch, scene-change detection, logging -- but SKIP the two
+        # set_root_transforms writes. If a spawn still lands at the robot pose
+        # with writes suppressed, the hold's root writes are NOT the cause
+        # (isaaclab source shows they are scoped to /World/Tinker and cannot
+        # address a loose body); if the spawn lands correctly, they are.
+        self._base_hold_dryrun = _os.environ.get("TINKER_SIM_FIX_BASE_DRYRUN") == "1"
         articulation_props = None
         if solver_position is not None or solver_velocity is not None:
             articulation_props = sim_utils.ArticulationRootPropertiesCfg(
@@ -1676,12 +1683,30 @@ class IsaacWholeRobotBackend:
             self._base_hold_skip_until_sim_s = (
                 self.simulation_time + self._base_hold_resettle_s
             )
+            # Log the robot's own read-back root pose at the change: if it now
+            # reads far from the latched pose, the articulation view has gone
+            # stale (loose-body insertion fires no invalidation callback), which
+            # is the only failure mode the isaaclab write path admits.
             print(
-                json.dumps({"base_hold_scene_change": sig}, sort_keys=True),
+                json.dumps(
+                    {
+                        "base_hold_scene_change": sig,
+                        "robot_readback_xyz": [
+                            round(float(v), 4)
+                            for v in data.root_pos_w[0][:3].detach().cpu()
+                        ],
+                        "latched_xyz": [
+                            round(float(v), 4) for v in self._base_hold_pose[0][:3]
+                        ],
+                    },
+                    sort_keys=True,
+                ),
                 flush=True,
             )
             return
         if self.simulation_time < self._base_hold_skip_until_sim_s:
+            return
+        if self._base_hold_dryrun:
             return
         self._robot.write_root_pose_to_sim_index(root_pose=self._base_hold_pose)
         self._robot.write_root_velocity_to_sim_index(root_velocity=self._base_hold_vel)
