@@ -764,7 +764,11 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend.command_joints(JointCommand(("drive_joint",), positions=(0.6,)))
 
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 0.0]])
-        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.6)
+        # drive_joint positions defer to the close ramp (_ramp_drive_target in
+        # step()), so the snapshot captures the target rather than writing it
+        # straight into _position_targets. The velocity retirement above is the
+        # subject; the captured target confirms the command committed.
+        self.assertAlmostEqual(float(backend._drive_command_target), 0.6)
 
     def test_snapshot_boundary_preserves_active_mixed_base_and_arm_packets(self) -> None:
         backend = _backend()
@@ -788,7 +792,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend.begin_command_snapshot(second)
         backend.command_joints(JointCommand(("drive_joint",), positions=(0.6,)))
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 1.25]])
-        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.6)
+        # drive_joint positions defer to the close ramp; the final packet
+        # commits the captured target (see _apply_joint_command).
+        self.assertAlmostEqual(float(backend._drive_command_target), 0.6)
 
     def test_gateway_applies_callbacks_in_arrival_order_across_safety_and_commands(self) -> None:
         class _GatewayBackend:
