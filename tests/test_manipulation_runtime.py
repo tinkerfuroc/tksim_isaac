@@ -1876,22 +1876,25 @@ class ManipulationRuntimeTest(unittest.TestCase):
             "distal tiers (j3:30, j4:50, j5:30, j6-7:20)",
         )
 
-    def test_gripper_mimic_joints_driven_and_mirrored_to_drive_joint(self) -> None:
-        """Source contract: the gripper mimic joints are actively driven and
-        mirror drive_joint 1:1.
+    def test_gripper_mimic_joints_coupled_by_physx_constraint(self) -> None:
+        """Source contract: the gripper mimic joints are coupled to drive_joint
+        by a rigid PhysX mimic-joint constraint, and stay passive.
 
         The tinker2 gripper is a mimic linkage -- the URDF mimics all five
         finger/knuckle joints (left_finger_joint, left_inner_knuckle_joint,
         right_inner_knuckle_joint, right_outer_knuckle_joint, right_finger_joint)
         to drive_joint 1:1. But the URDF->USD import DROPPED every <mimic>: in
-        robot.usd those joints carry no drive and no coupling (proven), so the
-        earlier "leave them passive" contract let drive_joint close while the
-        fingers flopped and the jaw closed straight through the object. The
-        repair restores the coupling in software: the five mimics live in a
-        distinct 'gripper_mimic' group with NON-ZERO gains, and step() mirrors
-        drive_joint's target into them each step
-        (_mirror_gripper_mimic_targets). The 'gripper' actuator still scopes to
-        drive_joint only.
+        robot.usd those joints carry no drive and no coupling (proven). The
+        repair authors a rigid PhysxSchema.PhysxMimicJointAPI constraint
+        coupling each follower to drive_joint before the physics parse. That
+        constraint REQUIRES the followers to be passive: a competing stiff
+        follower drive fights the mimic constraint and the follower stops
+        tracking (documented PhysX failure). So the five mimics live in a
+        distinct 'gripper_mimic' group with ZERO gains, the constraint alone
+        drives them, and the 'gripper' actuator still scopes to drive_joint
+        only. (An earlier soft-mirror repair drove them at 200/20 and mirrored
+        the target each step; that was exactly the drive that fought the
+        constraint -- removed.)
         """
         backend_source = (
             ROOT / "simulation/tinker_sim_isaac/backend.py"
@@ -1983,39 +1986,45 @@ class ManipulationRuntimeTest(unittest.TestCase):
             "the 'gripper' actuator must keep a non-zero stiffness to actively drive drive_joint",
         )
 
-        driven = [
+        mimic_group = [
             (name, cfg)
             for name, cfg in groups.items()
             if matched_joints(cfg.get("joint_names_expr")) == set(mimic_joints)
         ]
         self.assertTrue(
-            driven,
+            mimic_group,
             "no actuator group claims exactly the five mimic joints "
             f"{sorted(mimic_joints)}; they must live in a distinct group",
         )
-        for name, cfg in driven:
-            self.assertNotEqual(
-                float(cfg.get("stiffness", 0.0)),  # type: ignore[arg-type]
+        for name, cfg in mimic_group:
+            self.assertEqual(
+                float(cfg.get("stiffness", 1.0)),  # type: ignore[arg-type]
                 0.0,
-                f"mimic group {name!r} must be actively driven (non-zero "
-                "stiffness): robot.usd dropped the URDF mimic coupling, so a "
-                "passive group leaves the fingers flopping and the jaw closes "
-                "through the object",
+                f"mimic group {name!r} must be PASSIVE (zero stiffness): the "
+                "rigid PhysX mimic-joint constraint couples the followers, and "
+                "a competing stiff follower drive fights it so the follower "
+                "stops tracking",
             )
 
-        # The coupling the USD dropped is restored in software: step() must
-        # mirror drive_joint's target into the five mimic joints so they track
-        # the master 1:1.
+        # The coupling the USD dropped is restored by a rigid PhysX mimic-joint
+        # constraint (PhysxMimicJointAPI) authored before the physics parse,
+        # referencing drive_joint from each of the five followers.
         self.assertIn(
-            "_mirror_gripper_mimic_targets",
+            "PhysxMimicJointAPI",
             backend_source,
-            "backend must mirror drive_joint's target into the mimic joints",
+            "backend must author a PhysX mimic-joint constraint coupling the "
+            "followers to drive_joint",
+        )
+        self.assertIn(
+            "_apply_gripper_mimic_joints",
+            backend_source,
+            "backend must author the gripper mimic-joint constraint before reset",
         )
         for joint in mimic_joints:
             self.assertIn(
                 joint,
                 backend_source,
-                f"the gripper mimic mirror must reference {joint}",
+                f"the gripper mimic constraint must reference {joint}",
             )
 
 
