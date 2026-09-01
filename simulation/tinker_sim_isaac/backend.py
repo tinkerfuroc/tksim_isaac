@@ -653,6 +653,21 @@ class IsaacWholeRobotBackend:
         self._base_hold_vel = None   # zeros [1,6]
         # Let the free base drop-settle onto its wheels before latching.
         self._base_hold_after_sim_s = 2.0
+        # A mid-play /spawn_entity (or delete) rebuilds the shared physics
+        # view; a root write issued across that rebuild aliases onto the
+        # freshly inserted body, teleporting the spawned object to the robot's
+        # latched pose. Watch the Scenario child set and pause hold writes for
+        # a short resettle window on any change, so writes only resume once
+        # they target the true robot root again.
+        self._base_hold_scene_sig: int | None = None
+        self._base_hold_skip_until_sim_s = 0.0
+        self._base_hold_resettle_s = 0.15
+        try:
+            _resettle = _os.environ.get("TINKER_SIM_FIX_BASE_RESETTLE_S")
+            if _resettle is not None and _resettle.strip():
+                self._base_hold_resettle_s = max(0.0, float(_resettle))
+        except (TypeError, ValueError):
+            pass
         articulation_props = None
         if solver_position is not None or solver_velocity is not None:
             articulation_props = sim_utils.ArticulationRootPropertiesCfg(
@@ -1641,6 +1656,7 @@ class IsaacWholeRobotBackend:
                 dtype=self._base_hold_pose.dtype,
                 device=self._base_hold_pose.device,
             )
+            self._base_hold_scene_sig = self._scenario_child_signature()
             print(
                 json.dumps(
                     {"base_hold_latched": [round(float(v), 4)
@@ -1649,8 +1665,40 @@ class IsaacWholeRobotBackend:
                 ),
                 flush=True,
             )
+        # A spawn/delete rebuilds the shared physics view; a root write across
+        # that rebuild aliases onto the freshly inserted body (Task #13). On
+        # any Scenario child-set change, pause writes for a resettle window so
+        # the write never lands on the wrong body -- the base free-drifts for
+        # that ~0.15 s, negligible next to the 5-17 deg/pick it fixes.
+        sig = self._scenario_child_signature()
+        if sig != self._base_hold_scene_sig:
+            self._base_hold_scene_sig = sig
+            self._base_hold_skip_until_sim_s = (
+                self.simulation_time + self._base_hold_resettle_s
+            )
+            print(
+                json.dumps({"base_hold_scene_change": sig}, sort_keys=True),
+                flush=True,
+            )
+            return
+        if self.simulation_time < self._base_hold_skip_until_sim_s:
+            return
         self._robot.write_root_pose_to_sim_index(root_pose=self._base_hold_pose)
         self._robot.write_root_velocity_to_sim_index(root_velocity=self._base_hold_vel)
+
+    def _scenario_child_signature(self) -> int:
+        """Count /World/Scenario children -- a per-step spawn/delete signal for
+        the base hold. Cheap (one stage child listing) and only called while
+        TINKER_SIM_FIX_BASE is active."""
+        try:
+            import omni.usd
+            stage = omni.usd.get_context().get_stage()
+            scenario = stage.GetPrimAtPath("/World/Scenario")
+            if not scenario.IsValid():
+                return 0
+            return len(scenario.GetChildren())
+        except (AttributeError, ImportError, RuntimeError, TypeError):
+            return self._base_hold_scene_sig or 0
 
     def step(self) -> None:
         if self.step_profile["enabled"]:
