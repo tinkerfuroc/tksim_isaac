@@ -17,6 +17,7 @@ from geometry_msgs.msg import WrenchStamped  # noqa: E402
 from rclpy.action import GoalResponse  # noqa: E402
 from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 from rclpy.node import Node  # noqa: E402
+from rclpy.parameter import Parameter  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
 from sensor_msgs.msg import JointState  # noqa: E402
 from std_msgs.msg import Bool  # noqa: E402
@@ -65,6 +66,14 @@ def _clear_safety(node: GripperFacade) -> None:
     message = Bool()
     message.data = False
     node._safety(message)
+
+
+def _disable_position_stall(node: GripperFacade) -> None:
+    # Isolate the property under test from the contact-free position-stall
+    # path: a finger parked away from its target is a stall by design, so
+    # tests that deliberately hold it there (cancel, safety, stale-contact)
+    # disable that path to exercise only their own concern.
+    node.set_parameters([Parameter("stall_dwell_s", Parameter.Type.DOUBLE, 0.0)])
 
 
 def _spin(node: Node, source: Node):
@@ -119,6 +128,7 @@ def test_joint_state_callback_progresses_during_execute(ros_context) -> None:
 def test_safety_callback_aborts_execute(ros_context) -> None:
     node = GripperFacade()
     _clear_safety(node)
+    _disable_position_stall(node)
     source = Node("gripper_executor_safety_source")
     command_messages = []
     source.create_subscription(
@@ -225,6 +235,7 @@ def test_rejects_second_goal_while_first_is_active(ros_context) -> None:
 def test_cancel_publishes_measured_zero_effort_hold(ros_context) -> None:
     node = GripperFacade()
     _clear_safety(node)
+    _disable_position_stall(node)
     source = Node("gripper_executor_cancel_source")
     state_publisher = source.create_publisher(JointState, "/isaac_joint_states", 20)
     command_messages = []
@@ -280,6 +291,7 @@ def test_cancel_publishes_measured_zero_effort_hold(ros_context) -> None:
 def test_stale_contact_from_previous_goal_does_not_stall(ros_context) -> None:
     node = GripperFacade()
     _clear_safety(node)
+    _disable_position_stall(node)
     source = Node("gripper_executor_stale_contact_source")
     contact_publisher = source.create_publisher(
         WrenchStamped, "/sim/parity/finger_contact", 20
@@ -313,6 +325,41 @@ def test_stale_contact_from_previous_goal_does_not_stall(ros_context) -> None:
         assert goal.outcome == "canceled"
         assert not any(feedback.stalled for feedback in goal.feedback)
     finally:
+        executor.shutdown()
+        spin_thread.join(timeout=2.0)
+        node.destroy_node()
+        source.destroy_node()
+
+
+def test_finger_parked_short_of_target_stalls_without_contact(ros_context) -> None:
+    # A close that stops advancing toward its target while still short of it --
+    # with no contact telemetry at all -- is a physical stall and must report a
+    # successful (stalled) grasp, as a real gripper driver does.  This is the
+    # contact-free path that keeps grasps working in profiles that run the
+    # backend without contact reporting (sensor-rich).
+    node = GripperFacade()
+    _clear_safety(node)
+    node.set_parameters([Parameter("stall_dwell_s", Parameter.Type.DOUBLE, 0.15)])
+    source = Node("gripper_executor_position_stall_source")
+    publisher = source.create_publisher(JointState, "/isaac_joint_states", 20)
+    goal = _GoalHandle(target=1.0)
+    _run_goal_with_timer(node, goal)
+
+    def publish_state() -> None:
+        message = JointState()
+        message.name = ["drive_joint"]
+        message.position = [0.4]  # parked well short of the 1.0 target
+        publisher.publish(message)
+
+    state_timer = source.create_timer(0.02, publish_state)
+    executor, spin_thread = _spin(node, source)
+    try:
+        assert goal.finished.wait(3.0)
+        assert goal.outcome == "succeeded"
+        assert any(feedback.stalled for feedback in goal.feedback)
+        assert not any(feedback.reached_goal for feedback in goal.feedback)
+    finally:
+        state_timer.cancel()
         executor.shutdown()
         spin_thread.join(timeout=2.0)
         node.destroy_node()

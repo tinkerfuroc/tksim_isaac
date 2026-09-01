@@ -4,6 +4,58 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-01 — contact-free gripper stall (grasps aborting in the sensor-rich profile)
+
+The grasp benchmark's real closes were all aborting as "native gripper:
+execution failed" — every close that physically stalled on an object timed
+out instead of succeeding (run went 0/3 on bottles). Root cause is a
+profile-parity gap, not a grasp-planning fault. The gripper facade
+(`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/gripper_facade.py`)
+recognizes a successful grasp two ways: the finger reaches its commanded
+position (`reached_goal`), or it stalls short of it against an object
+(`stalled`). The stall test required a *fresh contact force* >=
+`contact_force_n` on `/sim/parity/finger_contact`. But the sensor-rich
+profile — the one that actually runs GPSR grasps — builds its backend with
+`enable_contacts=False` (`validation/run_sim.py`), so that parity topic is
+structurally silent there. `manipulation-core` *enforces* contacts
+(`run_sim` raises "must enable contacts"); sensor-rich disables them, most
+likely for RTF at camera cadence. So a real grasp in sensor-rich stalls the
+fingers on the object (correct physics), produces no contact telemetry, and
+the facade can only time out.
+
+Why not just turn contacts on in sensor-rich: `activate_contact_sensors`
+(`backend.py`) is an all-or-nothing flag on the whole `/World/Tinker` spawn
+and the contact-report subscription is robot-global — there is no
+finger-only contact path today, so it would mean paying robot-wide contact
+reporting in the camera-bound loop. And it is unnecessary: the *only*
+real-time consumer of `finger_contact` is the facade's stall test. The
+qualification gate verifiers (`validation/integrated_gate_verifier.py`,
+`manipulation_gate_verifier.py`) also read contact force, but they run under
+`manipulation-core`, where contacts are on — so they are untouched.
+
+Fix: give the facade a contact-free stall path, which is what a real gripper
+driver does anyway — detect that the finger has stopped advancing toward its
+target while still short of it. A close whose best distance-to-target has
+not improved by `stall_epsilon` for `stall_dwell_s` (default 0.3 s) while
+still outside `position_tolerance` is declared `stalled`. It is additive to
+the contact path (`contact-stall OR position-stall`), so `manipulation-core`
+keeps its contact semantics and the two coincide on a real grasp there; the
+position path is what carries sensor-rich. Set `stall_dwell_s <= 0` to
+disable it. Enabled by default because a profile that cannot complete a real
+grasp is not a defensible default — this supersedes the interim
+`TINKER_SIM_SENSOR_RICH_CONTACTS` env-gate the grasp-bench session used to
+unblock. No launch change: the GPSR/manipulation launches pass no override,
+so the default applies once the bridge is rebuilt. A free close still exits
+via `reached_goal` (the finger reaches target before any dwell elapses); an
+already-touching close reports stalled after one dwell. Verified with the
+`test_gripper_executor_humble.py` suite under the Humble overlay (8 passed,
+3 consecutive runs), including a new parked-finger-stalls-without-contact
+test; the three tests that deliberately park the finger for an orthogonal
+concern (cancel, safety, stale-contact) now disable the path explicitly.
+`manipulation-core` qualification should get one confirmatory run since its
+facade result now has a second success route (gate verdicts are unchanged —
+the verifiers read the raw contact topic, not the facade result).
+
 ## 2026-08-31 — joint4 tuck stall, physics-less YCB objects, wall-clock safety deadlines
 
 Root-cause round for the sim bugs blocking the GPSR battery and the grasp
