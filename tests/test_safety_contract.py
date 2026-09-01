@@ -95,7 +95,10 @@ def test_stopped_command_packets_are_blocked_before_parse_without_error_logging(
     )
     assert "blocked by safety stop" in gateway
     assert "self.get_logger().error(f\"rejected {source} joint command: {error}\")" in gateway
-    assert gateway.index("if self._safety_active:") < gateway.index("command_from_sequences(")
+    # The parse/ownership-projection step (renamed from command_from_sequences
+    # to _owned_command when inbound parsing moved onto the simulation
+    # thread) must stay behind the safety-stop gate.
+    assert gateway.index("if self._safety_active:") < gateway.index("self._owned_command(")
 
 
 def test_safety_clear_requires_a_fresh_packet_after_mux_stop() -> None:
