@@ -886,6 +886,7 @@ class IsaacWholeRobotBackend:
         self.arena_friction_bound = self._apply_arena_friction_material()
         self.arena_surface_boxes = self._apply_arena_support_surface_colliders()
         self.gripper_friction_bound = self._apply_gripper_friction_material()
+        self.gripper_mimic_joints = self._apply_gripper_mimic_joints()
         omni.kit.app.get_app().update()
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
@@ -1139,6 +1140,69 @@ class IsaacWholeRobotBackend:
                 )
                 bound += 1
         print(json.dumps({"gripper_friction_bound": bound}, sort_keys=True), flush=True)
+        return bound
+
+    def _apply_gripper_mimic_joints(self) -> int:
+        """Author PhysX mimic-joint constraints coupling the 5 finger/knuckle
+        joints to drive_joint 1:1 -- a RIGID version of the coupling the
+        URDF->USD import dropped.
+
+        The step() control-mirror (_mirror_gripper_mimic_targets) restored the
+        linkage as a soft PD, which transmits force but YIELDS under the
+        squeeze: the fingers penetrate the object and the jaw closes through it
+        (stall ~0.48 = half-closed on a 70 mm bottle). A rigid PhysxMimicJoint
+        constraint makes the linkage solid, so the fingers hard-stop on contact
+        and the drive stalls at the object's width. gearing=-1 realizes the
+        URDF multiplier=+1 under the schema's jointPos + gearing*ref + offset=0
+        (uniform, since the importer baked the URDF's negative axes as 180 deg
+        frame flips). Disable with TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT=0.
+
+        PhysxMimicJointAPI is deprecated in this build (110.1.13); if omni.physx
+        does not honor it this is a no-op and the soft mirror remains in force
+        (so it is safe to leave on). Authored before reset so the parse cooks
+        the constraint.
+        """
+        if _os.environ.get("TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT") == "0":
+            return 0
+        try:
+            from pxr import PhysxSchema
+        except ImportError:
+            return 0
+        import omni.usd
+
+        stage = omni.usd.get_context().get_stage()
+        reference = "/World/Tinker/joints/drive_joint"
+        if not stage.GetPrimAtPath(reference).IsValid():
+            return 0
+        names = (
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_finger_joint",
+            "right_inner_knuckle_joint",
+        )
+        bound = 0
+        for name in names:
+            joint = stage.GetPrimAtPath(f"/World/Tinker/joints/{name}")
+            if not joint.IsValid():
+                continue
+            try:
+                api = PhysxSchema.PhysxMimicJointAPI.Apply(joint, "rotX")
+                api.CreateReferenceJointRel().SetTargets([reference])
+                api.CreateReferenceJointAxisAttr("rotX")
+                api.CreateGearingAttr(-1.0)
+                api.CreateOffsetAttr(0.0)
+                bound += 1
+            except Exception as error:  # deprecated API may be inert/renamed
+                print(
+                    json.dumps(
+                        {"gripper_mimic_joint_error": name, "error": str(error)[:120]},
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                return bound
+        print(json.dumps({"gripper_mimic_joints": bound}, sort_keys=True), flush=True)
         return bound
 
     def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
