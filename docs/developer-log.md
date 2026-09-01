@@ -4,6 +4,56 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-01 — close-phase punch, and why the first (open-loop) ramp made it worse
+
+With the mimic coupling stiffened to k=1500 (the fingers finally grip), the
+grasp-bench round found a new retention failure: every object — light ones
+worst — was ejected from the jaw at *first pad contact*. The finger-contact
+force trace showed a spike of 12–190 N on the first sample, before the grip
+settled: the k=1500 followers applied the full commanded close target in one
+step, so on first touch the position error (and thus `k*error` press) was at
+its maximum. A punch, not a squeeze.
+
+First attempt (`21d744c`): slew the applied drive target toward the command at
+`_gripper_close_slew` rad/s instead of jumping to it, so the press builds
+gradually. It made things worse on two axes, and the reason is the same on
+both. An open-loop slew bounds `dF/dt` but never *stops* — past first contact
+the target keeps advancing to the fully-closed command. (1) The follower press
+therefore still climbs to the effort caps; the measured peak rose to 248 N,
+worse than the unramped 190. (2) More subtly, it broke a previously-green path:
+all three knife grasps began aborting as "native gripper: execution failed".
+The gripper facade keys success on the *measured* joint position vs the fixed
+goal (see the entry below): a close that stalls short of the goal is a success
+only if it *stalls* — either fresh contact force, or measured position no
+longer improving for `stall_dwell_s`. The open-loop ramp keeps the target
+creeping, so the followers keep deepening and the measured position keeps
+inching down by more than `stall_epsilon` every dwell window — the position-
+stall detector never latches, contact-stall alone can't carry the thin knife,
+and the close runs out its 5 s `simulation_timeout_s` and aborts. The ramp
+defeated the very stall detector the entry below had just added.
+
+Fix (`8cde40f`): make the ramp closed-loop — FREEZE the applied target once
+finger-pad grip force reaches `_gripper_contact_halt_force`
+(`TINKER_SIM_GRIPPER_CONTACT_HALT_N`, default 15 N). Freezing caps the press
+near the halt force instead of the effort caps, and — because the target stops
+moving — the measured position flatlines, so the facade's stall (contact and
+position both) latches and the grasp reports success. The halt reads the same
+quantity the facade sees on `/sim/parity/finger_contact` (the sum of the two
+finger-pad normal forces, via `contact_state`), so the halt point and the
+facade's contact threshold agree by construction — when the sim stops pressing,
+the facade sees exactly that force. Only the closing stroke is force-bounded;
+an opening command always slews freely so release stays prompt. `slew <= 0` and
+`halt <= 0` each disable their own stage.
+
+The 15 N default was sized off the force trace, not guessed: good grips form in
+a 13–41 N band before the runaway climbs 41 → 100 → 249, and the two grasps
+that *did* hold settled at 31/36 N. 15 N sits inside that band — 3× the 4.9 N
+needed to slide the bottle, bounds the peak well under 20 N, and triggers on
+any real grasp — and it is the live-tuning knob. A `PhysxMaterialAPI` compliant-
+contact spring on the pads (`TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS`) is retained
+as a softer-first-touch escalation, off by default. Needs a live force trace to
+confirm no >20 N peak and that knife grasps stop aborting.
+
 ## 2026-09-01 — contact-free gripper stall (grasps aborting in the sensor-rich profile)
 
 The grasp benchmark's real closes were all aborting as "native gripper:
