@@ -255,6 +255,23 @@ def validate_spawn_xy(spawn_xy: object) -> tuple[float, float]:
     return x, y
 
 
+def resolve_spawn_yaw(value: str | None) -> float:
+    """Parse ``TINKER_SIM_SPAWN_YAW`` (radians, world frame; default 0).
+
+    Fails closed on malformed or non-finite input, mirroring
+    ``validate_spawn_xy``.
+    """
+    if value is None or not value.strip():
+        return 0.0
+    try:
+        yaw = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"TINKER_SIM_SPAWN_YAW must be a number, got {value!r}")
+    if not math.isfinite(yaw):
+        raise ValueError("TINKER_SIM_SPAWN_YAW must be finite")
+    return yaw
+
+
 def _fused_apply_actuator_model(self) -> None:
     """Replacement for ``Articulation._apply_actuator_model`` that launches once.
 
@@ -624,6 +641,18 @@ class IsaacWholeRobotBackend:
             "position": solver_position,
             "velocity": solver_velocity,
         }
+        # Opt-in kinematic base hold (TINKER_SIM_FIX_BASE=1): the free base
+        # yaws 5-17 deg per pick under arm reaction torques, drifting every
+        # base-frame goal cm off its world target. Held by latching the
+        # settled root pose and re-writing it each step (see _apply_base_hold)
+        # -- NOT fix_root_link, which makes the arm joints stick-slip and
+        # welds at the airborne spawn pose. Off by default: navigation
+        # profiles need a rolling base.
+        self.base_fixed = _os.environ.get("TINKER_SIM_FIX_BASE") == "1"
+        self._base_hold_pose = None  # latched [1,7] pos+quat(xyzw) tensor
+        self._base_hold_vel = None   # zeros [1,6]
+        # Let the free base drop-settle onto its wheels before latching.
+        self._base_hold_after_sim_s = 2.0
         articulation_props = None
         if solver_position is not None or solver_velocity is not None:
             articulation_props = sim_utils.ArticulationRootPropertiesCfg(
@@ -642,7 +671,24 @@ class IsaacWholeRobotBackend:
                 joint_drive_props=sim_utils.JointDriveBaseCfg(drive_type="force"),
                 articulation_props=articulation_props,
             ),
-            init_state=ArticulationCfg.InitialStateCfg(pos=(spawn_x, spawn_y, spawn_z)),
+            # TINKER_SIM_SPAWN_YAW (radians, world frame): spawn heading. The
+            # spawner drops this rot for a USD-referenced articulation (it is
+            # re-authored on the root xformOp:orient just after construction),
+            # but it is set here too so the intent reads with the pose. A
+            # fixed-root/held base can never be re-aimed after spawn and a
+            # post-bind /set_entity_state root write is a physics no-op, so the
+            # heading must be right from the start.
+            init_state=ArticulationCfg.InitialStateCfg(
+                pos=(spawn_x, spawn_y, spawn_z),
+                rot=(
+                    math.cos(resolve_spawn_yaw(
+                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
+                    0.0,
+                    0.0,
+                    math.sin(resolve_spawn_yaw(
+                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
+                ),
+            ),
             actuators={
                 "arm": ImplicitActuatorCfg(
                     joint_names_expr=["joint[1-7]"],
@@ -706,6 +752,34 @@ class IsaacWholeRobotBackend:
             },
         )
         self._robot = Articulation(robot_cfg)
+        # Author the spawn yaw directly on the robot root prim: the spawner
+        # honors InitialStateCfg.pos (xformOp:translate) but drops the
+        # orientation for this USD-referenced articulation (observed: rot
+        # (0.707, 0, 0, 0.707) requested, layer yaw 0 after spawn), and
+        # post-bind /set_entity_state root writes are physics no-ops.
+        spawn_yaw = resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
+        if abs(spawn_yaw) > 1.0e-9:
+            from pxr import Gf, UsdGeom
+            import omni.usd
+            stage = omni.usd.get_context().get_stage()
+            robot_prim = stage.GetPrimAtPath("/World/Tinker")
+            if not robot_prim.IsValid():
+                raise RuntimeError("TINKER_SIM_SPAWN_YAW: /World/Tinker not found")
+            xformable = UsdGeom.Xformable(robot_prim)
+            half = spawn_yaw / 2.0
+            quat = Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half)))
+            orient_op = None
+            for op in xformable.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                    orient_op = op
+                    break
+            if orient_op is None:
+                orient_op = xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
+            if orient_op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                orient_op.Set(Gf.Quatf(quat))
+            else:
+                orient_op.Set(quat)
+            print(json.dumps({"spawn_yaw_rad": spawn_yaw}, sort_keys=True), flush=True)
         # Ten Warp launches per target push -> two; see _fused_apply_actuator_model.
         if _os.environ.get("TINKER_SIM_STOCK_ACTUATOR_MODEL", "") != "1":
             bind_fused_actuator_model(self._robot)
@@ -1543,6 +1617,41 @@ class IsaacWholeRobotBackend:
         for index, value in zip(self._wheel_indices, updated.tolist()):
             self._applied_wheel_velocities[index] = value
 
+    def _apply_base_hold(self) -> None:
+        """Kinematic braked-base hold (TINKER_SIM_FIX_BASE=1).
+
+        Latch the settled root pose once, then re-write it with zero twist
+        every step: to the arm this is a braked base, while the articulation
+        stays floating-base so the solver problem (and the mm-accurate joint
+        tracking it gives) is unchanged. fix_root_link is NOT equivalent --
+        converting to a fixed-base articulation made the arm joints
+        stick-slip (recover-8 probes 0/6).
+        """
+        data = self._robot.data
+        if self._base_hold_pose is None:
+            if self.simulation_time < self._base_hold_after_sim_s:
+                return
+            self._base_hold_pose = self._torch.cat(
+                [data.root_pos_w[:1].detach().clone(),
+                 data.root_quat_w[:1].detach().clone()],
+                dim=-1,
+            )
+            self._base_hold_vel = self._torch.zeros(
+                (1, 6),
+                dtype=self._base_hold_pose.dtype,
+                device=self._base_hold_pose.device,
+            )
+            print(
+                json.dumps(
+                    {"base_hold_latched": [round(float(v), 4)
+                                           for v in self._base_hold_pose[0]]},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        self._robot.write_root_pose_to_sim_index(root_pose=self._base_hold_pose)
+        self._robot.write_root_velocity_to_sim_index(root_velocity=self._base_hold_vel)
+
     def step(self) -> None:
         if self.step_profile["enabled"]:
             self.step_profile["_mark"] = self.step_profile["_clock"]()
@@ -1566,6 +1675,8 @@ class IsaacWholeRobotBackend:
             self._apply_safety_actuator_hold()
         else:
             self._slew_wheel_targets()
+        if getattr(self, "base_fixed", False):
+            self._apply_base_hold()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
         # persist until changed and this backend uses implicit (stateless)

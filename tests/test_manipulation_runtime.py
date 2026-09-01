@@ -161,6 +161,7 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._contact_pairs_by_key = {}
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
+    backend._clock_elapsed_steps = 0
     backend._sim = SimpleNamespace(
         get_physics_step_count=lambda: 0,
         step=lambda render=False: None,
