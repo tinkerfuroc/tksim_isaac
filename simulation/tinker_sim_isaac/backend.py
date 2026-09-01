@@ -1157,18 +1157,52 @@ class IsaacWholeRobotBackend:
         api.CreateStaticFrictionAttr(1.0)
         api.CreateDynamicFrictionAttr(1.0)
         api.CreateRestitutionAttr(0.0)
+        # Torsional friction on the finger PADS: physxCollision:
+        # torsionalPatchRadius gives the pad a finite rubber contact patch that
+        # resists in-hand spin about the contact normal. Without it (radius 0 =
+        # a point contact) a tall object gripped near its CoM is an inverted
+        # pendulum about the pad axis and rotates out of the jaw on the first
+        # lift accel; top-down pinches (knife, plate) resist yaw ONLY via this.
+        # ~0.01 = the pad half-width. PhysxSchema loads only in the Isaac
+        # runtime, so guard it (a missing API is a logged no-op).
+        try:
+            from pxr import PhysxSchema
+        except ImportError:
+            PhysxSchema = None
         keys = ("finger", "knuckle", "gripper_base")
         bound = 0
+        torsional = 0
         for prim in Usd.PrimRange(robot):
             if not prim.HasAPI(UsdPhysics.CollisionAPI):
                 continue
             path_lower = prim.GetPath().pathString.lower()
-            if any(key in path_lower for key in keys):
-                UsdShade.MaterialBindingAPI.Apply(prim).Bind(
-                    material, materialPurpose="physics"
-                )
-                bound += 1
-        print(json.dumps({"gripper_friction_bound": bound}, sort_keys=True), flush=True)
+            if not any(key in path_lower for key in keys):
+                continue
+            UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                material, materialPurpose="physics"
+            )
+            bound += 1
+            if PhysxSchema is not None and "finger" in path_lower:
+                try:
+                    collision = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+                    collision.CreateTorsionalPatchRadiusAttr(0.01)
+                    collision.CreateMinTorsionalPatchRadiusAttr(0.01)
+                    torsional += 1
+                except Exception as error:  # deprecated/renamed attr -> no-op
+                    print(
+                        json.dumps(
+                            {"gripper_torsional_error": str(error)[:120]},
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+        print(
+            json.dumps(
+                {"gripper_friction_bound": bound, "gripper_torsional_pads": torsional},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return bound
 
     def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
