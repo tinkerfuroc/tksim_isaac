@@ -789,10 +789,21 @@ class IsaacWholeRobotBackend:
                     stiffness=200.0,
                     damping=20.0,
                 ),
+                # The gripper is a mimic linkage: the URDF mimics all five
+                # finger/knuckle joints to drive_joint 1:1, but the URDF->USD
+                # import dropped every <mimic> (in robot.usd these joints carry
+                # no drive and no coupling), so closing drive_joint left the
+                # fingers passive and the jaw closed straight through the
+                # object. These gains actively drive the joints, and step()
+                # mirrors drive_joint's target into them each step
+                # (_mirror_gripper_mimic_targets) so the parallelogram tracks
+                # the master 1:1 and grip force transmits to the pads. The 180
+                # deg frame flips the importer baked for the URDF's negative
+                # axes make a uniform +1 mirror correct for all five.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
-                    stiffness=0.0,
-                    damping=0.0,
+                    stiffness=200.0,
+                    damping=20.0,
                 ),
                 "casters": ImplicitActuatorCfg(
                     joint_names_expr=["rear_.*_swivel_joint", "rear_.*_wheel_joint"],
@@ -1263,6 +1274,21 @@ class IsaacWholeRobotBackend:
         self._safety_joint_ids = tuple(
             self._joint_index[name]
             for name in (f"joint{index}" for index in range(1, 8))
+            if name in self._joint_index
+        )
+        # Gripper mimic linkage: step() mirrors drive_joint's target into these
+        # (uniform +1) so the passive-in-USD finger/knuckle joints track the
+        # master and the jaw actually grips (see the gripper_mimic actuator).
+        self._drive_joint_index = self._joint_index.get("drive_joint")
+        self._gripper_mimic_indices = tuple(
+            self._joint_index[name]
+            for name in (
+                "left_finger_joint",
+                "left_inner_knuckle_joint",
+                "right_outer_knuckle_joint",
+                "right_finger_joint",
+                "right_inner_knuckle_joint",
+            )
             if name in self._joint_index
         )
         self._safety_nominal_stiffness = self._read_joint_gain_values(
@@ -1897,6 +1923,25 @@ class IsaacWholeRobotBackend:
         except (AttributeError, ImportError, RuntimeError, TypeError):
             return self._base_hold_scene_sig or 0
 
+    def _mirror_gripper_mimic_targets(self) -> None:
+        """Drive the passive gripper mimic joints from drive_joint's target.
+
+        robot.usd dropped the URDF <mimic> coupling, so the five
+        finger/knuckle joints carry no drive of their own; with the
+        gripper_mimic actuator gains restored, mirroring the master
+        drive_joint target into them (uniform +1 -- the importer baked the
+        URDF's negative axes as 180 deg frame flips, so every joint's +axis
+        closes) makes the parallelogram track drive_joint 1:1 and transmit
+        grip force to the pads. getattr guards keep step() test doubles happy.
+        """
+        drive_index = getattr(self, "_drive_joint_index", None)
+        mimic_indices = getattr(self, "_gripper_mimic_indices", ())
+        if drive_index is None or not mimic_indices:
+            return
+        drive_target = self._position_targets[0, drive_index]
+        for index in mimic_indices:
+            self._position_targets[0, index] = drive_target
+
     def step(self) -> None:
         if self.step_profile["enabled"]:
             self.step_profile["_mark"] = self.step_profile["_clock"]()
@@ -1922,6 +1967,7 @@ class IsaacWholeRobotBackend:
             self._slew_wheel_targets()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
+        self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
         # persist until changed and this backend uses implicit (stateless)
