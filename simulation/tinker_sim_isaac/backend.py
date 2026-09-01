@@ -874,6 +874,7 @@ class IsaacWholeRobotBackend:
         )
         self.arena_friction_bound = self._apply_arena_friction_material()
         self.arena_surface_boxes = self._apply_arena_support_surface_colliders()
+        self.gripper_friction_bound = self._apply_gripper_friction_material()
         omni.kit.app.get_app().update()
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
@@ -1087,6 +1088,47 @@ class IsaacWholeRobotBackend:
                     boxed += 1
         print(json.dumps({"arena_surface_boxes": boxed}, sort_keys=True), flush=True)
         return boxed
+
+    def _apply_gripper_friction_material(self) -> int:
+        """Bind a grippy physics material to the gripper's collision meshes.
+
+        The robot's finger/knuckle/gripper-base collision meshes (under
+        /World/Tinker) carry no physics material, so under use_fabric=False
+        they resolve frictionless -- the same failure class as the arena mesh
+        colliders. A closing jaw then squirts a cylinder out instead of
+        gripping it (the object rests fine on the box+material desk, but the
+        finger contact is the frictionless side). Bind an explicit
+        high-friction material (rubber-pad-like) on the gripper contact meshes
+        before the physics parse. Authored on the robot side; the spawned
+        object's own material (in its USDA) is the other half of the contact.
+        """
+        import omni.usd
+        from pxr import Usd, UsdPhysics, UsdShade
+
+        stage = omni.usd.get_context().get_stage()
+        robot = stage.GetPrimAtPath("/World/Tinker")
+        if not robot.IsValid():
+            return 0
+        material = UsdShade.Material.Define(
+            stage, "/World/Tinker/PhysicsMaterials/gripper_friction"
+        )
+        api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+        api.CreateStaticFrictionAttr(1.0)
+        api.CreateDynamicFrictionAttr(1.0)
+        api.CreateRestitutionAttr(0.0)
+        keys = ("finger", "knuckle", "gripper_base")
+        bound = 0
+        for prim in Usd.PrimRange(robot):
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            path_lower = prim.GetPath().pathString.lower()
+            if any(key in path_lower for key in keys):
+                UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                    material, materialPurpose="physics"
+                )
+                bound += 1
+        print(json.dumps({"gripper_friction_bound": bound}, sort_keys=True), flush=True)
+        return bound
 
     def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
         """Author ``STUB_LINK_MASS_KG`` on the URDF's massless frame links before reset.
