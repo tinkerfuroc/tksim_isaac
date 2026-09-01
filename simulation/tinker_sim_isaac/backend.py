@@ -428,6 +428,7 @@ class IsaacWholeRobotBackend:
     ) -> None:
         spawn_x, spawn_y = validate_spawn_xy(spawn_xy)
         arena_usd, map_yaml = resolve_arena_inputs(arena_artifact, map_yaml)
+        self._arena_usd = arena_usd  # dir holds placement.json (support surfaces)
         if arena_artifact is not None and wall_color_fn is not None:
             raise ValueError(
                 "arena_artifact and wall_color_fn are mutually exclusive: "
@@ -872,6 +873,7 @@ class IsaacWholeRobotBackend:
             flush=True,
         )
         self.arena_friction_bound = self._apply_arena_friction_material()
+        self.arena_surface_boxes = self._apply_arena_support_surface_colliders()
         omni.kit.app.get_app().update()
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
@@ -1034,6 +1036,57 @@ class IsaacWholeRobotBackend:
                 bound += 1
         print(json.dumps({"arena_friction_bound": bound}, sort_keys=True), flush=True)
         return bound
+
+    def _apply_arena_support_surface_colliders(self) -> int:
+        """Switch support-surface furniture colliders from convexHull to a
+        primitive box (boundingCube approximation).
+
+        A convexHull mesh collider ejects objects on DYNAMIC impact: a fast
+        touchdown that lands on a hull facet edge/tilt resolves with an
+        off-vertical contact normal, and the normal impulse kicks the object
+        laterally (validated: a 5 cm drop rests on the primitive ground plane
+        but is flung off the convexHull desk, deterministic per landing spot).
+        A box has one exact analytic face normal, so impacts resolve straight.
+        Applied ONLY to furniture carrying a declared placement surface
+        (desk/tables/shelves/sofa from placement.json) -- these are box-shaped,
+        so boundingCube barely changes their footprint (nav uses the arena map,
+        not live colliders); chairs/plants/doors keep convexHull. Authored
+        before reset so the physics parse cooks a box shape.
+        """
+        arena_usd = getattr(self, "_arena_usd", None)
+        if arena_usd is None:
+            return 0
+        placement = Path(arena_usd).parent / "placement.json"
+        if not placement.is_file():
+            return 0
+        try:
+            surfaces = json.loads(placement.read_text()).get("surfaces", [])
+        except (ValueError, OSError):
+            return 0
+        targets = {
+            "/World/Arena/Furniture/rcw26_" + s["surface_id"].split("#", 1)[0]
+            for s in surfaces
+            if s.get("surface_id")
+        }
+        if not targets:
+            return 0
+        import omni.usd
+        from pxr import Usd, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        boxed = 0
+        for furniture_path in sorted(targets):
+            furniture = stage.GetPrimAtPath(furniture_path)
+            if not furniture.IsValid():
+                continue
+            for prim in Usd.PrimRange(furniture):
+                if prim.HasAPI(UsdPhysics.MeshCollisionAPI):
+                    UsdPhysics.MeshCollisionAPI(prim).CreateApproximationAttr(
+                        "boundingCube"
+                    )
+                    boxed += 1
+        print(json.dumps({"arena_surface_boxes": boxed}, sort_keys=True), flush=True)
+        return boxed
 
     def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
         """Author ``STUB_LINK_MASS_KG`` on the URDF's massless frame links before reset.
