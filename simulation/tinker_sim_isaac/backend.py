@@ -792,19 +792,28 @@ class IsaacWholeRobotBackend:
                 # The gripper is a mimic linkage: the URDF mimics all five
                 # finger/knuckle joints to drive_joint 1:1, but the URDF->USD
                 # import dropped every <mimic> (in robot.usd these joints carry
-                # no drive and no coupling). The coupling is restored by a rigid
-                # PhysX mimic-joint CONSTRAINT (_apply_gripper_mimic_joints).
-                # That constraint requires the followers to be PASSIVE: a
-                # competing stiff follower drive fights the mimic constraint and
-                # the follower stops tracking (documented PhysX failure mode).
-                # So these stay at zero gain and the constraint alone drives
-                # them from drive_joint. (An earlier soft-mirror attempt gave
-                # them 200/20 and mirrored the target in step(); that is exactly
-                # the drive that fought the constraint -- removed.)
+                # no drive and no coupling), so closing drive_joint left the
+                # fingers passive and the jaw closed straight through. These
+                # gains actively drive the joints, and step() mirrors
+                # drive_joint's target into them each step
+                # (_mirror_gripper_mimic_targets) so the parallelogram tracks
+                # the master 1:1 and grip force transmits to the pads. The 180
+                # deg frame flips the importer baked for the URDF's negative
+                # axes make a uniform +1 mirror correct for all five.
+                #
+                # Stiffness sized from the measured yield: at k=200 the
+                # followers lag 0.13-0.17 rad under an ~11.7 N grip (physics
+                # probe), which lets the object extrude; k~=1500 (7-8x) pulls
+                # that toward <=0.02 rad for a firm hold, damping ~sqrt(k)-scaled
+                # from the 200/20 baseline (20*sqrt(1500/200)~=55). NB the
+                # rigid PhysxMimicJoint constraint is authored too but is DEAD
+                # in this stage (proven: passive followers flop), so this
+                # control mirror is the actual coupling -- see
+                # _apply_gripper_mimic_joints.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
-                    stiffness=0.0,
-                    damping=0.0,
+                    stiffness=1500.0,
+                    damping=55.0,
                 ),
                 "casters": ImplicitActuatorCfg(
                     joint_names_expr=["rear_.*_swivel_joint", "rear_.*_wheel_joint"],
@@ -1148,21 +1157,20 @@ class IsaacWholeRobotBackend:
         joints to drive_joint 1:1 -- a RIGID version of the coupling the
         URDF->USD import dropped.
 
-        An earlier soft-PD attempt drove the followers and mirrored the drive
-        target each step: it transmitted force but YIELDED under the squeeze
-        (fingers penetrate, jaw closes through, stall ~0.48 on a 70 mm bottle),
-        AND a stiff follower drive fights the mimic constraint. So the followers
-        are now PASSIVE (gripper_mimic gains 0) and this rigid constraint alone
-        couples them, hard-stopping the fingers on contact so the drive stalls
-        at the object's width. gearing=-1 realizes the URDF multiplier=+1 under
-        the schema formula jointPos + gearing*ref + offset = 0 (uniform, since
-        the importer baked the URDF's negative axes as 180 deg frame flips).
-        Disable with TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT=0.
+        The step() control-mirror (_mirror_gripper_mimic_targets) restored the
+        linkage as a soft PD, which transmits force but YIELDS under the
+        squeeze: the fingers penetrate the object and the jaw closes through it
+        (stall ~0.48 = half-closed on a 70 mm bottle). A rigid PhysxMimicJoint
+        constraint makes the linkage solid, so the fingers hard-stop on contact
+        and the drive stalls at the object's width. gearing=-1 realizes the
+        URDF multiplier=+1 under the schema's jointPos + gearing*ref + offset=0
+        (uniform, since the importer baked the URDF's negative axes as 180 deg
+        frame flips). Disable with TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT=0.
 
-        PhysxMimicJointAPI is deprecated in this build (110.1.13) but still
-        parsed/enforced on the PhysX backend; the Apply is guarded, so a
-        renamed/absent API is a logged no-op. Authored before reset so the
-        parse cooks the constraint.
+        PhysxMimicJointAPI is deprecated in this build (110.1.13); if omni.physx
+        does not honor it this is a no-op and the soft mirror remains in force
+        (so it is safe to leave on). Authored before reset so the parse cooks
+        the constraint.
         """
         if os.environ.get("TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT") == "0":
             return 0
@@ -1340,6 +1348,21 @@ class IsaacWholeRobotBackend:
         self._safety_joint_ids = tuple(
             self._joint_index[name]
             for name in (f"joint{index}" for index in range(1, 8))
+            if name in self._joint_index
+        )
+        # Gripper mimic linkage: step() mirrors drive_joint's target into these
+        # (uniform +1) so the passive-in-USD finger/knuckle joints track the
+        # master and the jaw actually grips (see the gripper_mimic actuator).
+        self._drive_joint_index = self._joint_index.get("drive_joint")
+        self._gripper_mimic_indices = tuple(
+            self._joint_index[name]
+            for name in (
+                "left_finger_joint",
+                "left_inner_knuckle_joint",
+                "right_outer_knuckle_joint",
+                "right_finger_joint",
+                "right_inner_knuckle_joint",
+            )
             if name in self._joint_index
         )
         self._safety_nominal_stiffness = self._read_joint_gain_values(
@@ -1974,6 +1997,25 @@ class IsaacWholeRobotBackend:
         except (AttributeError, ImportError, RuntimeError, TypeError):
             return self._base_hold_scene_sig or 0
 
+    def _mirror_gripper_mimic_targets(self) -> None:
+        """Drive the passive gripper mimic joints from drive_joint's target.
+
+        robot.usd dropped the URDF <mimic> coupling, so the five
+        finger/knuckle joints carry no drive of their own; with the
+        gripper_mimic actuator gains restored, mirroring the master
+        drive_joint target into them (uniform +1 -- the importer baked the
+        URDF's negative axes as 180 deg frame flips, so every joint's +axis
+        closes) makes the parallelogram track drive_joint 1:1 and transmit
+        grip force to the pads. getattr guards keep step() test doubles happy.
+        """
+        drive_index = getattr(self, "_drive_joint_index", None)
+        mimic_indices = getattr(self, "_gripper_mimic_indices", ())
+        if drive_index is None or not mimic_indices:
+            return
+        drive_target = self._position_targets[0, drive_index]
+        for index in mimic_indices:
+            self._position_targets[0, index] = drive_target
+
     def step(self) -> None:
         if self.step_profile["enabled"]:
             self.step_profile["_mark"] = self.step_profile["_clock"]()
@@ -1999,6 +2041,7 @@ class IsaacWholeRobotBackend:
             self._slew_wheel_targets()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
+        self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
         # persist until changed and this backend uses implicit (stateless)
