@@ -710,17 +710,29 @@ class IsaacWholeRobotBackend:
         # (isaaclab source shows they are scoped to /World/Tinker and cannot
         # address a loose body); if the spawn lands correctly, they are.
         self._base_hold_dryrun = _os.environ.get("TINKER_SIM_FIX_BASE_DRYRUN") == "1"
-        # Gripper close ramp + contact halt: slew the drive_joint target toward
-        # the commanded value at _gripper_close_slew rad/s so first-contact
-        # force builds gradually, then FREEZE the applied target once finger-pad
-        # grip force reaches _gripper_contact_halt_force so the press stops at
-        # that force instead of climbing to the effort caps -- and so the
-        # measured joint position flatlines, which lets the gripper facade's
-        # stall detector latch a successful grasp instead of running the close
-        # out to its timeout. Starts open. slew defaults 1.5 rad/s, override via
-        # TINKER_SIM_GRIPPER_CLOSE_SLEW (<=0 disables the ramp: apply instantly).
-        # Halt force defaults 15 N, override via TINKER_SIM_GRIPPER_CONTACT_HALT_N
-        # (<=0 disables the halt: open-loop slew to the commanded target).
+        # Gripper close shaping. Two limits run in step() before the mimic
+        # mirror, so the finger press is bounded and the jaw reaches a clean
+        # mechanical stall:
+        #   * SLEW (_gripper_close_slew, rad/s): cap how fast the applied target
+        #     advances toward the command, so the approach is not an impulse.
+        #     Override TINKER_SIM_GRIPPER_CLOSE_SLEW; <=0 applies the command
+        #     instantly (no ramp).
+        #   * BOUNDED LEAD (_gripper_max_lead, rad): never let the applied
+        #     target lead the MEASURED pad position by more than this, so the
+        #     follower press <= k * lead. This is what stops the close: a thin
+        #     object stalls the pads, the target clamps at pad + lead and stops
+        #     advancing, and the (unloaded) drive_joint the facade watches then
+        #     flatlines so its stall detector latches a success. It reads
+        #     measured position, not contact reports, so it is robust for thin
+        #     objects whose contacts report sparsely, and a transient brush
+        #     cannot latch it (it is a continuous clamp, not a trigger).
+        #     Override TINKER_SIM_GRIPPER_MAX_LEAD_RAD; ~k*lead sets grip force
+        #     (1500 * 0.015 ~= 22 N); <=0 disables the clamp.
+        # An optional hard force cap (_gripper_contact_halt_force) freezes the
+        # target if pad contact force exceeds it; OFF by default because a
+        # single-sample force spike latches it prematurely (grasp-bench cycle-2
+        # froze a knife close at a transient brush). Override
+        # TINKER_SIM_GRIPPER_CONTACT_HALT_N; <=0 (default) disables it.
         self._drive_command_target: float | None = None
         self._gripper_close_slew = 1.5
         try:
@@ -729,7 +741,14 @@ class IsaacWholeRobotBackend:
                 self._gripper_close_slew = max(0.0, float(_slew))
         except (TypeError, ValueError):
             pass
-        self._gripper_contact_halt_force = 15.0
+        self._gripper_max_lead = 0.015
+        try:
+            _lead = _os.environ.get("TINKER_SIM_GRIPPER_MAX_LEAD_RAD")
+            if _lead is not None and _lead.strip():
+                self._gripper_max_lead = max(0.0, float(_lead))
+        except (TypeError, ValueError):
+            pass
+        self._gripper_contact_halt_force = 0.0
         try:
             _halt = _os.environ.get("TINKER_SIM_GRIPPER_CONTACT_HALT_N")
             if _halt is not None and _halt.strip():
@@ -1402,6 +1421,15 @@ class IsaacWholeRobotBackend:
             )
             if name in self._joint_index
         )
+        # The two pad joints specifically -- their MEASURED position is what the
+        # close ramp's bounded-lead clamp reads (a thin object stalls the pads
+        # while the unloaded drive_joint keeps tracking, so the drive's own
+        # position can't detect the stall; the pads can).
+        self._gripper_finger_indices = tuple(
+            self._joint_index[name]
+            for name in ("left_finger_joint", "right_finger_joint")
+            if name in self._joint_index
+        )
         self._safety_nominal_stiffness = self._read_joint_gain_values(
             "joint_stiffness",
             self.NOMINAL_ARM_STIFFNESS,
@@ -2061,32 +2089,62 @@ class IsaacWholeRobotBackend:
                 total += float(entry.get("force", 0.0))
         return total
 
+    def _measured_finger_closure(self) -> float | None:
+        """Least-closed (smallest) MEASURED pad joint position, or None.
+
+        The bounded-lead clamp reads this. Using the minimum tracks the most-
+        blocked pad, so its follower error -- and thus its press -- is the one
+        bounded; a pad that closes freely (off-centre object) simply has a
+        smaller error. Report-independent, unlike finger contact force.
+        """
+        indices = getattr(self, "_gripper_finger_indices", ())
+        if not indices:
+            return None
+        try:
+            joint_pos = self._torch_value(self._robot.data.joint_pos)
+        except Exception:
+            return None
+        values: list[float] = []
+        for index in indices:
+            try:
+                values.append(float(joint_pos[0, index]))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return min(values) if values else None
+
     def _ramp_drive_target(self) -> None:
-        """Slew the drive_joint applied target toward the command, halting on
-        contact so the press force is bounded and the jaw reaches a clean stall.
+        """Slew the drive_joint applied target toward the command and cap its
+        lead over the measured pads, so the press is bounded and the jaw reaches
+        a clean stall.
 
         _apply_joint_command records the gripper target in _drive_command_target
-        rather than applying it directly. Two closed-loop shaping steps run here
-        each physics step, before the mimic mirror carries the result to the
-        five followers:
+        rather than applying it directly; step() calls this each physics step,
+        before the mimic mirror carries the result to the five followers. Two
+        limits shape the closing stroke:
 
-        1. Slew: advance the applied target by at most _gripper_close_slew * dt,
-           so the finger press builds gradually instead of an impulsive spike.
+        1. Slew: advance by at most _gripper_close_slew * dt, so the approach is
+           not an impulse.
 
-        2. Contact halt: once finger-pad grip force reaches
-           _gripper_contact_halt_force, FREEZE the applied target. An open-loop
-           slew bounds dF/dt but never stops -- past first contact the target
-           keeps advancing to the fully-closed command, so the follower press
-           climbs to the effort caps (grasp-bench cycle-1 peak 248 N) AND the
-           measured joint position keeps creeping, which defeats the facade's
-           position-stall detector and runs the close out to its 5 s timeout
-           -> abort ("native gripper: execution failed"). Freezing caps the
-           press near the halt force and flatlines the measured position so the
-           facade's contact/position stall latches a successful grasp.
+        2. Bounded lead: never let the applied target exceed the measured pad
+           position by more than _gripper_max_lead. This is what STOPS the
+           close. An open-loop slew (the cycle-1/2 attempts) bounds dF/dt but
+           never stops -- past contact the target keeps advancing to the fully-
+           closed command, so the follower press climbs to the effort caps
+           (peak 248 N) AND the measured position keeps creeping, defeating the
+           facade's position-stall detector and running the close out to its
+           5 s timeout -> abort ("native gripper: execution failed"). Capping
+           the lead over the pads freezes the target the moment the pads stall
+           against the object (press <= k * lead), so the unloaded drive_joint
+           the facade watches flatlines and its stall latches a success. It
+           reads measured position, not the sparse/spiky finger-contact reports
+           a thin object produces, and a transient brush cannot latch a
+           continuous clamp -- the two failure modes cycle-2 exposed.
 
-        Only the closing stroke is force-bounded; an opening command (target
-        below the current applied value) always slews freely so release is
-        prompt. getattr guards keep the step() test doubles happy.
+        Only the closing stroke is bounded; an opening command (target below the
+        current applied value) slews freely so release is prompt. An optional
+        hard force cap (_gripper_contact_halt_force, off by default) can freeze
+        the target on raw contact force. getattr guards keep the step() test
+        doubles happy.
         """
         drive_index = getattr(self, "_drive_joint_index", None)
         command = getattr(self, "_drive_command_target", None)
@@ -2097,13 +2155,18 @@ class IsaacWholeRobotBackend:
         if slew <= 0.0:
             self._position_targets[0, drive_index] = command
             return
-        closing = command > current
-        halt_force = getattr(self, "_gripper_contact_halt_force", 0.0)
-        if closing and halt_force > 0.0 and self._gripper_grip_force() >= halt_force:
-            return  # fingers press the object -- hold the target, don't punch through
         max_delta = slew * self.dt
-        delta = max(-max_delta, min(max_delta, command - current))
-        self._position_targets[0, drive_index] = current + delta
+        target = current + max(-max_delta, min(max_delta, command - current))
+        if command > current:  # closing
+            lead = getattr(self, "_gripper_max_lead", 0.0)
+            if lead > 0.0:
+                pad = self._measured_finger_closure()
+                if pad is not None:
+                    target = min(target, pad + lead)
+            halt_force = getattr(self, "_gripper_contact_halt_force", 0.0)
+            if halt_force > 0.0 and self._gripper_grip_force() >= halt_force:
+                target = current  # optional hard cap: freeze on raw contact force
+        self._position_targets[0, drive_index] = target
 
     def _mirror_gripper_mimic_targets(self) -> None:
         """Drive the passive gripper mimic joints from drive_joint's target.
