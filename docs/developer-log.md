@@ -77,11 +77,35 @@ own position can't see the stall; that is why the clamp reads the pad joints
 specifically. `max_lead` (`TINKER_SIM_GRIPPER_MAX_LEAD_RAD`, default 0.015 rad)
 is the grip-force knob: `k * lead ≈ 1500 * 0.015 ≈ 22 N`. The old force cap
 (`TINKER_SIM_GRIPPER_CONTACT_HALT_N`) is kept but defaults **off**, since it was
-the source of the transient latch. `slew <= 0` disables the ramp; `lead <= 0`
-disables the clamp. The `PhysxMaterialAPI` compliant-contact spring
-(`TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS`) remains as a softer-first-touch
-escalation, off by default. Needs a live trace to confirm no >20 N peak, knife
-grasps complete without abort, and the grip holds through the lift.
+the source of the transient latch.
+
+Cycle-3 showed the naïve always-on clamp has a fatal flaw of its own: it went
+0/3, every knife close **timed out with the drive back at 0.0 — jaw fully
+open**. The clamp ratchets the target *backward*. The `lead ≈ press/k`
+relationship only holds *quasi-statically*; while the pads are moving,
+`target − pad` is the **dynamic tracking lag** (the peer measured 0.02–0.03 rad
+in motion, vs ±0.004 rad settled), which is *larger* than the 0.015 lead. So
+during the approach `pad + lead = target − 0.025 + 0.015 = target − 0.01`, and
+`min(slew, pad+lead)` drives the target down 0.01 every step until the jaw sits
+fully open and the facade times out. The unit test had masked this by faking
+zero-lag pads — an unphysical `pad == target`.
+
+The fix gates the clamp on stall: apply it only once the pads have nearly
+stopped (`max pad speed ≤ _gripper_stall_speed`, default 0.1 rad/s;
+`TINKER_SIM_GRIPPER_STALL_SPEED`). Free-close pad speed is ~the slew rate (1.5),
+so the gate cleanly separates moving from stalled. While the pads move the clamp
+is off and the target slews freely (no backward ratchet); the instant they
+stall on the object, speed drops through the gate, the dynamic lag has decayed
+to the settled ±0.004, and the clamp bounds the now-quasi-static press at
+`k * lead`. `max(current, …)` additionally keeps the close monotonic so the
+clamp can never retreat the target even at the moment the gate flips. `slew <= 0`
+disables the ramp; `lead <= 0` disables the clamp. The `PhysxMaterialAPI`
+compliant-contact spring (`TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS`) remains as a
+softer-first-touch escalation, off by default. Not yet live-validated past
+cycle-3 — reasoned safe (startup, slow legitimate motion, one-step velocity lag,
+and missing-signal all degrade to bounded press or plain slew, none deadlock);
+needs a live trace to confirm no >20 N peak, knife grasps complete without
+abort, and the grip holds through the lift.
 
 ## 2026-09-01 — contact-free gripper stall (grasps aborting in the sensor-rich profile)
 

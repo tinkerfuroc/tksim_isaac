@@ -748,6 +748,21 @@ class IsaacWholeRobotBackend:
                 self._gripper_max_lead = max(0.0, float(_lead))
         except (TypeError, ValueError):
             pass
+        # The bounded-lead clamp engages ONLY once the pads are (nearly) stopped
+        # -- below this speed (rad/s). During motion the target-pad gap is
+        # dominated by dynamic tracking lag (0.02-0.03 rad, larger than the
+        # lead), so clamping it there ratchets the target backward and deadlocks
+        # the jaw open (grasp-bench cycle-3); the lead ~ press/k relationship
+        # only holds quasi-statically. Free-close pad speed is ~the slew rate
+        # (1.5), so this cleanly separates moving from stalled. Override
+        # TINKER_SIM_GRIPPER_STALL_SPEED.
+        self._gripper_stall_speed = 0.1
+        try:
+            _sspeed = _os.environ.get("TINKER_SIM_GRIPPER_STALL_SPEED")
+            if _sspeed is not None and _sspeed.strip():
+                self._gripper_stall_speed = max(0.0, float(_sspeed))
+        except (TypeError, ValueError):
+            pass
         self._gripper_contact_halt_force = 0.0
         try:
             _halt = _os.environ.get("TINKER_SIM_GRIPPER_CONTACT_HALT_N")
@@ -2112,6 +2127,28 @@ class IsaacWholeRobotBackend:
                 continue
         return min(values) if values else None
 
+    def _measured_finger_speed(self) -> float | None:
+        """Fastest |velocity| of the two pad joints, or None.
+
+        The bounded-lead clamp gates on this: it engages only when the pads are
+        (nearly) stopped, so the lead is bounding a quasi-static press error
+        rather than the dynamic tracking lag of a moving joint.
+        """
+        indices = getattr(self, "_gripper_finger_indices", ())
+        if not indices:
+            return None
+        try:
+            joint_vel = self._torch_value(self._robot.data.joint_vel)
+        except Exception:
+            return None
+        speeds: list[float] = []
+        for index in indices:
+            try:
+                speeds.append(abs(float(joint_vel[0, index])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return max(speeds) if speeds else None
+
     def _ramp_drive_target(self) -> None:
         """Slew the drive_joint applied target toward the command and cap its
         lead over the measured pads, so the press is bounded and the jaw reaches
@@ -2125,20 +2162,28 @@ class IsaacWholeRobotBackend:
         1. Slew: advance by at most _gripper_close_slew * dt, so the approach is
            not an impulse.
 
-        2. Bounded lead: never let the applied target exceed the measured pad
-           position by more than _gripper_max_lead. This is what STOPS the
-           close. An open-loop slew (the cycle-1/2 attempts) bounds dF/dt but
-           never stops -- past contact the target keeps advancing to the fully-
-           closed command, so the follower press climbs to the effort caps
-           (peak 248 N) AND the measured position keeps creeping, defeating the
-           facade's position-stall detector and running the close out to its
-           5 s timeout -> abort ("native gripper: execution failed"). Capping
-           the lead over the pads freezes the target the moment the pads stall
-           against the object (press <= k * lead), so the unloaded drive_joint
-           the facade watches flatlines and its stall latches a success. It
-           reads measured position, not the sparse/spiky finger-contact reports
-           a thin object produces, and a transient brush cannot latch a
-           continuous clamp -- the two failure modes cycle-2 exposed.
+        2. Bounded lead (gated on stall): once the pads have nearly stopped
+           (max pad speed <= _gripper_stall_speed), cap the applied target at
+           pad + _gripper_max_lead. This is what STOPS the close. An open-loop
+           slew (the cycle-1/2 attempts) bounds dF/dt but never stops -- past
+           contact the target keeps advancing to the fully-closed command, so
+           the follower press climbs to the effort caps (peak 248 N) AND the
+           measured position keeps creeping, defeating the facade's position-
+           stall detector and running the close out to its 5 s timeout -> abort
+           ("native gripper: execution failed"). Capping the lead over the pads
+           freezes the target the moment the pads stall against the object
+           (press <= k * lead), so the unloaded drive_joint the facade watches
+           flatlines and its stall latches a success. It reads measured
+           position, not the sparse/spiky finger-contact a thin object reports,
+           and a continuous clamp cannot be latched by a transient brush.
+
+           The stall gate is essential: while the pads are MOVING, target - pad
+           is dominated by dynamic tracking lag (0.02-0.03 rad, larger than the
+           lead), and clamping it there would drive the target backward and
+           deadlock the jaw open (cycle-3). The lead ~ press/k relationship the
+           clamp relies on holds only quasi-statically, so it is applied only
+           when the pads are stopped; max(current, ...) keeps the close
+           monotonic so the clamp can never retreat the target either.
 
         Only the closing stroke is bounded; an opening command (target below the
         current applied value) slews freely so release is prompt. An optional
@@ -2161,8 +2206,15 @@ class IsaacWholeRobotBackend:
             lead = getattr(self, "_gripper_max_lead", 0.0)
             if lead > 0.0:
                 pad = self._measured_finger_closure()
-                if pad is not None:
-                    target = min(target, pad + lead)
+                speed = self._measured_finger_speed()
+                stall_speed = getattr(self, "_gripper_stall_speed", 0.0)
+                # Gate on stall: clamp only once the pads have (nearly) stopped.
+                # During motion the target-pad gap is dynamic tracking lag, not
+                # press, and clamping it ratchets the target backward (cycle-3
+                # deadlock). max(current, ...) keeps the close monotonic so the
+                # clamp can never retreat the target.
+                if pad is not None and speed is not None and speed <= stall_speed:
+                    target = max(current, min(target, pad + lead))
             halt_force = getattr(self, "_gripper_contact_halt_force", 0.0)
             if halt_force > 0.0 and self._gripper_grip_force() >= halt_force:
                 target = current  # optional hard cap: freeze on raw contact force
