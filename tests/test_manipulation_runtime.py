@@ -811,8 +811,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._drive_command_target = 0.85
 
         step = 1.5 / 120.0
-        # Pads stalled at 0.0 (object blocks them from the very start).
+        # Pads stalled at 0.0 (object blocks them) and NOT moving -> the stall
+        # gate lets the lead clamp engage.
         backend._measured_finger_closure = lambda: 0.0  # type: ignore[assignment]
+        backend._measured_finger_speed = lambda: 0.0  # type: ignore[assignment]
         backend._ramp_drive_target()
         # First step: slew (0.0125) is below the lead cap (0.0 + 0.015).
         self.assertAlmostEqual(float(backend._position_targets[0, 0]), step, places=6)
@@ -822,22 +824,42 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.015, places=5)
 
     def test_gripper_close_advances_while_pads_follow(self) -> None:
-        # When the pads track the target (nothing blocking), the lead cap stays
-        # slack and the target advances at the slew rate toward the command.
+        # While the pads are MOVING, the stall gate holds the lead clamp OFF and
+        # the target advances at the slew rate toward the command.
         backend = _backend()
         backend._drive_joint_index = 0
         backend._gripper_close_slew = 1.5
         backend._gripper_max_lead = 0.015
+        backend._gripper_stall_speed = 0.1
         backend._gripper_contact_halt_force = 0.0
         backend._position_targets = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
         backend._drive_command_target = 0.85
-        # Pads sit right at the current target each step (no lag): cap is slack.
-        backend._measured_finger_closure = lambda: float(  # type: ignore[assignment]
-            backend._position_targets[0, 0]
-        )
+        backend._measured_finger_closure = lambda: 0.0  # type: ignore[assignment]
+        backend._measured_finger_speed = lambda: 1.5  # moving at slew rate
         for _ in range(20):
             backend._ramp_drive_target()
         self.assertGreater(float(backend._position_targets[0, 0]), 0.2)
+
+    def test_gripper_close_does_not_ratchet_backward_under_dynamic_lag(self) -> None:
+        # cycle-3 regression: while the pads move, target - pad is dominated by
+        # dynamic tracking lag (0.03 > lead 0.015). If the clamp engaged there,
+        # min(slew, pad + lead) would drive the target BACKWARD and deadlock the
+        # jaw open. The stall gate must hold it off while the pads are moving.
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_max_lead = 0.015
+        backend._gripper_stall_speed = 0.1
+        backend._gripper_contact_halt_force = 0.0
+        backend._position_targets = torch.tensor([[0.1, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+        backend._measured_finger_closure = lambda: float(  # lags by 0.03
+            backend._position_targets[0, 0]
+        ) - 0.03
+        backend._measured_finger_speed = lambda: 1.5  # moving
+        before = float(backend._position_targets[0, 0])
+        backend._ramp_drive_target()
+        self.assertGreater(float(backend._position_targets[0, 0]), before)
 
     def test_gripper_close_ramp_disabled_applies_target_instantly(self) -> None:
         backend = _backend()
