@@ -26,6 +26,18 @@ class GripperFacade(Node):
         self.declare_parameter("wall_watchdog_s", 30.0)
         self.declare_parameter("contact_force_n", 1.0)
         self.declare_parameter("contact_max_age_s", 0.1)
+        # Contact-free stall detection.  A finger commanded past an obstacle
+        # stops advancing toward the target while still short of it; that is a
+        # physical stall, exactly what a real gripper driver reports as a
+        # closed grasp -- and it needs no contact telemetry, so it holds in
+        # profiles that run the backend without contact reporting (sensor-rich,
+        # where /sim/parity/finger_contact is structurally silent).  A close
+        # that has not improved its best distance-to-target by ``stall_epsilon``
+        # for ``stall_dwell_s`` while still outside ``position_tolerance`` is
+        # declared stalled.  Set ``stall_dwell_s`` <= 0 to disable this path and
+        # fall back to contact-only stall detection.
+        self.declare_parameter("stall_dwell_s", 0.3)
+        self.declare_parameter("stall_epsilon", 0.0005)
         self.declare_parameter("safety_timeout_s", 1.0)
         self._joint = str(self.get_parameter("joint").value)
         self._position = 0.0
@@ -199,6 +211,10 @@ class GripperFacade(Node):
             wall_watchdog = float(self.get_parameter("wall_watchdog_s").value)
             contact_threshold = float(self.get_parameter("contact_force_n").value)
             contact_max_age = float(self.get_parameter("contact_max_age_s").value)
+            stall_dwell = float(self.get_parameter("stall_dwell_s").value)
+            stall_epsilon = float(self.get_parameter("stall_epsilon").value)
+            best_error: float | None = None
+            last_progress_at = time.monotonic()
             with self._lock:
                 position = self._position
                 effort = self._effort
@@ -244,6 +260,15 @@ class GripperFacade(Node):
                     and contact_received_at >= start_wall
                     and time.monotonic() - contact_received_at <= contact_max_age
                 )
+                now_monotonic = time.monotonic()
+                if best_error is None or error < best_error - stall_epsilon:
+                    best_error = error
+                    last_progress_at = now_monotonic
+                position_stalled = (
+                    stall_dwell > 0.0
+                    and error > tolerance
+                    and now_monotonic - last_progress_at >= stall_dwell
+                )
                 feedback = GripperCommand.Feedback()
                 feedback.position = position
                 feedback.effort = effort
@@ -252,7 +277,7 @@ class GripperFacade(Node):
                     contact_is_fresh
                     and contact >= contact_threshold
                     and error > tolerance
-                )
+                ) or position_stalled
                 goal_handle.publish_feedback(feedback)
                 if feedback.reached_goal or feedback.stalled:
                     goal_handle.succeed()
