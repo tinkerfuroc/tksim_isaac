@@ -107,6 +107,57 @@ and missing-signal all degrade to bounded press or plain slew, none deadlock);
 needs a live trace to confirm no >20 N peak, knife grasps complete without
 abort, and the grip holds through the lift.
 
+Cycle-4 (stall-gated clamp) is the decisive dataset, and it closes the reactive
+approach entirely: 1/3 completed (drive 0.728, 18 mm *past* the knife), 2/3
+timed out, and the force bound broke — three single-sample spikes of 118/228/
+221 N against the ~22 N `k*lead` ceiling. The spikes land **during pad motion**,
+i.e. while the stall gate is off by design, at first contact. At k=1500 and
+1.5 rad/s the finger carries enough momentum that first contact with an 80 g
+object is resolved impulsively **inside a single physics step** — the object is
+ejected/displaced before the pads can slow, so no stall ever forms (the pads
+close through to 0.728, or the facade times out on the disturbed geometry).
+
+The conclusion across all four cycles: **any reactive stop scheme is
+structurally one step too late for a light object.** The ejection happens inside
+the very step the scheme is waiting to observe — a force latch (cycle-2) and a
+velocity/stall gate (cycle-4) both see it only after the fact. The dominant term
+is not the PD spring `k*error` but the rigid-contact **collision impulse**: the
+solver resolving the moving finger's momentum into the light object in one step.
+
+That moves the fix out of the control loop and into the solver step itself.
+The mapped lever ladder, in order:
+  1. **Compliant contact on the pads** — the primary. `PhysxMaterialAPI`
+     compliant-contact spring (`TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS`, with
+     `_DAMPING`; already wired in `_apply_gripper_friction_material`, off by
+     default). It softens the *contact constraint* so the collision impulse is
+     spread over several steps instead of one — the only place a one-step event
+     can be tamed. It also buys the stall-gated clamp the steps it needs to
+     latch, so the two are complementary (compliance softens the impact, the
+     clamp bounds the steady hold). Acceleration-spring is on, so the stiffness
+     is mass-normalized; a first-cut in the 1e5–1e6 range is the place to start
+     an A/B, tuning down until the >20 N spike is gone and up until the grip
+     still holds.
+  2. **Soft-close k** — drop the mimic follower stiffness during the closing
+     phase (k is the impulse multiplier) and restore k=1500 only after settled
+     contact. k=200 alone fails the *hold* (e320d5b: the object extrudes at
+     0.13–0.17 rad lag), so it must be phase-switched, not lowered outright. The
+     runtime write path exists (`write_joint_stiffness_to_sim_index`, as the
+     safety hold uses); the restore trigger is the same stall gate (not time-
+     critical for the hold). Not yet implemented — it is runtime gain-switching
+     against the actuator model and the mirror, so it wants a GPU round to
+     develop, not a blind commit.
+  3. **Slower slew through the contact band** — reduces the finger momentum at
+     impact (`TINKER_SIM_GRIPPER_CLOSE_SLEW`). Bounded by the facade's 5 s
+     timeout (a global 0.15 rad/s close would overrun it), so it is an adjunct
+     to (1)/(2), not a standalone fix.
+
+Reactive tuning is done: `21d744c/8cde40f/1f6f124/06cc2e1` are all on the branch
+as the instrumented record, `06cc2e1` (stall-gated clamp) is the head and the
+right *hold*-phase bound, but the *impact* must be solved at the solver level.
+Next window: enable compliant contact (lever 1) with the cycle-4
+`force-trace-gate.txt` as the baseline, tune the stiffness, then reassess
+whether soft-close (lever 2) is still needed.
+
 ## 2026-09-01 — contact-free gripper stall (grasps aborting in the sensor-rich profile)
 
 The grasp benchmark's real closes were all aborting as "native gripper:
