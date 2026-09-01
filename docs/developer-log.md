@@ -45,14 +45,43 @@ the facade sees exactly that force. Only the closing stroke is force-bounded;
 an opening command always slews freely so release stays prompt. `slew <= 0` and
 `halt <= 0` each disable their own stage.
 
-The 15 N default was sized off the force trace, not guessed: good grips form in
-a 13–41 N band before the runaway climbs 41 → 100 → 249, and the two grasps
-that *did* hold settled at 31/36 N. 15 N sits inside that band — 3× the 4.9 N
-needed to slide the bottle, bounds the peak well under 20 N, and triggers on
-any real grasp — and it is the live-tuning knob. A `PhysxMaterialAPI` compliant-
-contact spring on the pads (`TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS`) is retained
-as a softer-first-touch escalation, off by default. Needs a live force trace to
-confirm no >20 N peak and that knife grasps stop aborting.
+The 15 N default was sized off the force trace: good grips form in a 13–41 N
+band before the runaway climbs 41 → 100 → 249, and the two grasps that *did*
+hold settled at 31/36 N.
+
+Cycle-2 (knife-only) showed the force halt was the wrong instrument, for a
+reason that matters: a force threshold on the **contact-report** signal is
+unreliable for exactly the object that needs it. Knife completion went 0/3 →
+1/3 (the freeze-lets-the-facade-latch direction is right), but the one that
+completed **froze at drive 0.148** — a single transient brush during approach
+crossed 15 N and latched the halt ~73 mm open on a 30 mm knife, no real pinch —
+while a 212 N peak persisted on the aborting closes. Both are the same defect:
+a thin object reports contact **sparsely and spikily** (the knife baseline is 3
+blips over an entire close), so a force latch both fires on a lone transient and
+misses a fast spike that ejects the object within the one-step lag between
+setting the target and reading the next contact report.
+
+The fix (bounded lead) drops force sensing from the stopping decision entirely.
+Instead of freezing on contact force, cap how far the applied target may lead
+the **measured** pad position: `applied = min(slewed, pad_measured + max_lead)`
+while closing, where `pad_measured` is the least-closed of the two finger
+joints. Follower press is then `k * (target − pad_measured) <= k * max_lead` by
+construction — a hard force bound with no runaway — and the moment the pads
+stall on the object the target clamps at `pad + max_lead` and stops, so the
+unloaded `drive_joint` the facade watches flatlines and its position-stall
+latches. It reads measured position, not contact reports, so it is robust for a
+thin object; and being a continuous clamp rather than a one-shot trigger, a
+transient brush cannot latch it (the brush doesn't stall the pads). The drive
+joint is unloaded — the pads carry the object, not the drive — so the drive's
+own position can't see the stall; that is why the clamp reads the pad joints
+specifically. `max_lead` (`TINKER_SIM_GRIPPER_MAX_LEAD_RAD`, default 0.015 rad)
+is the grip-force knob: `k * lead ≈ 1500 * 0.015 ≈ 22 N`. The old force cap
+(`TINKER_SIM_GRIPPER_CONTACT_HALT_N`) is kept but defaults **off**, since it was
+the source of the transient latch. `slew <= 0` disables the ramp; `lead <= 0`
+disables the clamp. The `PhysxMaterialAPI` compliant-contact spring
+(`TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS`) remains as a softer-first-touch
+escalation, off by default. Needs a live trace to confirm no >20 N peak, knife
+grasps complete without abort, and the grip holds through the lift.
 
 ## 2026-09-01 — contact-free gripper stall (grasps aborting in the sensor-rich profile)
 
