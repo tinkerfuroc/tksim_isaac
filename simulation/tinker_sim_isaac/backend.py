@@ -571,9 +571,43 @@ class IsaacWholeRobotBackend:
         self._contact_event_lost = ContactEventType.CONTACT_LOST
         self._contact_event_persist = ContactEventType.CONTACT_PERSIST
         self._contact_report_subscription: Any | None = None
+        # use_fabric: SPAWN_YAW authors a non-identity orient on the robot
+        # root, which leaks through omni.physx.fabric's C++ ingestion of
+        # newly-spawned rigid bodies -- sibling /World/Scenario spawns land
+        # rotated by -robot_yaw about the robot origin in PHYSICS, while
+        # USD/get_entity_state read back the commanded pose correctly (the
+        # spawn's XformPrim usd-path composition is provably correct; the leak
+        # is below Python, in fabric's world-transform resolution against the
+        # rotated root while /physics/updateToUsd is off). Disabling fabric
+        # makes USD authoritative for spawned-body ingestion and removes the
+        # leak; the cost is per-step PhysX->USD transform write-back --
+        # rendering, cameras/render products and the tensor pipeline are gated
+        # separately and unaffected. Default on (keeps the hard-won RTF for
+        # nav/arena runs); auto-off only when SPAWN_YAW is set (the sole
+        # trigger, itself opt-in); TINKER_SIM_USE_FABRIC=0/1 forces either way
+        # (e.g. to A/B the RTF cost).
+        _spawn_yaw_set = (
+            abs(resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))) > 1.0e-9
+        )
+        _use_fabric = not _spawn_yaw_set
+        _use_fabric_env = _os.environ.get("TINKER_SIM_USE_FABRIC")
+        if _use_fabric_env == "1":
+            _use_fabric = True
+        elif _use_fabric_env == "0":
+            _use_fabric = False
+        print(
+            json.dumps(
+                {"use_fabric": _use_fabric, "spawn_yaw_set": _spawn_yaw_set},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         self._sim = SimulationContext(
             SimulationCfg(
-                dt=self.physics_dt, device=self.physics_device, render_interval=1
+                dt=self.physics_dt,
+                device=self.physics_device,
+                render_interval=1,
+                use_fabric=_use_fabric,
             )
         )
         self._timeline = omni.timeline.get_timeline_interface()
