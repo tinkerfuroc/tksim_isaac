@@ -154,9 +154,35 @@ The mapped lever ladder, in order:
 Reactive tuning is done: `21d744c/8cde40f/1f6f124/06cc2e1` are all on the branch
 as the instrumented record, `06cc2e1` (stall-gated clamp) is the head and the
 right *hold*-phase bound, but the *impact* must be solved at the solver level.
-Next window: enable compliant contact (lever 1) with the cycle-4
-`force-trace-gate.txt` as the baseline, tune the stiffness, then reassess
-whether soft-close (lever 2) is still needed.
+
+**Cycle-5 (compliant contact, VALIDATED lever).** The A/B ran at
+`COMPLIANT_STIFFNESS=3e5` / `_DAMPING=1e3` (compliance confirmed engaged, no
+`gripper_compliant_error` in the boot log). Peak first-contact force
+**228.4 → 156.6 N (−31%)**, and — the important part — the trace *character*
+changed: sustained mid-range samples (40/60/59/45/90 N) replaced cycle-4's
+isolated 118–228 N extremes, i.e. the collision impulse is genuinely spreading
+over steps rather than resolving in one. Lever 1 is the right one and the
+response is monotonic — a two-point curve now exists (rigid 228 N
+`force-trace-gate.txt` → 3e5 gives 157 N `force-trace-compliant.txt`, both in
+`results/2026-09-01-retention-campaign/part3-evidence/`). Completion held at
+1/3, held 0/3: 3e5 alone doesn't yet clear retention. Two follow-ons, both env
+knobs (no code change — the levers are all exposed):
+  - Go **softer**: `COMPLIANT_STIFFNESS=1e5` next (expect roughly proportional
+    softening toward the <20 N target); add lower `CLOSE_SLEW` through the
+    contact band if compliance alone stalls above 20 N.
+  - **Retune the stall gate for compliant contact.** The one completing close
+    overshot to drive 0.458 (~10 mm past the knife) because the hold-phase clamp
+    latched late: under compliance the pads decelerate *gradually* rather than
+    stalling sharply, so the rigid-sized `_gripper_stall_speed = 0.1 rad/s`
+    catches the stall too late. Raise `TINKER_SIM_GRIPPER_STALL_SPEED` so the
+    clamp latches earlier on the gentler deceleration (watch it does not latch
+    during the free-close velocity ripple). This is the coupling between the two
+    fixes: compliance changes the deceleration profile the hold-phase gate keys
+    on.
+
+Next window: `COMPLIANT_STIFFNESS=1e5` with the two-point curve as the guide,
+then raise `STALL_SPEED` to kill the hold overshoot; reassess soft-close
+(lever 2) only if compliance + slew can't reach <20 N with a holding grip.
 
 ## 2026-09-01 — contact-free gripper stall (grasps aborting in the sensor-rich profile)
 
