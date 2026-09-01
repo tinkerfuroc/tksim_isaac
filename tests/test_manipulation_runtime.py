@@ -1876,17 +1876,22 @@ class ManipulationRuntimeTest(unittest.TestCase):
             "distal tiers (j3:30, j4:50, j5:30, j6-7:20)",
         )
 
-    def test_gripper_actuator_drives_only_drive_joint_and_mimics_are_passive(self) -> None:
-        """RED source contract: the gripper actuator drives only drive_joint.
+    def test_gripper_mimic_joints_driven_and_mirrored_to_drive_joint(self) -> None:
+        """Source contract: the gripper mimic joints are actively driven and
+        mirror drive_joint 1:1.
 
-        The five authored USD mimic joints (left_finger_joint, left_inner_knuckle_joint,
-        right_inner_knuckle_joint, right_outer_knuckle_joint, right_finger_joint) follow
-        drive_joint through the bundle URDF mimic constraints. They must not be actively
-        driven by the 'gripper' ImplicitActuatorCfg, or the PD loop competes with the
-        mimic constraint and the fingers fight the drive. The repair must scope the
-        'gripper' actuator to drive_joint only and assign the five mimics to a distinct
-        passive implicit actuator group with zero stiffness and zero damping. No explicit
-        mimic target propagation is required.
+        The tinker2 gripper is a mimic linkage -- the URDF mimics all five
+        finger/knuckle joints (left_finger_joint, left_inner_knuckle_joint,
+        right_inner_knuckle_joint, right_outer_knuckle_joint, right_finger_joint)
+        to drive_joint 1:1. But the URDF->USD import DROPPED every <mimic>: in
+        robot.usd those joints carry no drive and no coupling (proven), so the
+        earlier "leave them passive" contract let drive_joint close while the
+        fingers flopped and the jaw closed straight through the object. The
+        repair restores the coupling in software: the five mimics live in a
+        distinct 'gripper_mimic' group with NON-ZERO gains, and step() mirrors
+        drive_joint's target into them each step
+        (_mirror_gripper_mimic_targets). The 'gripper' actuator still scopes to
+        drive_joint only.
         """
         backend_source = (
             ROOT / "simulation/tinker_sim_isaac/backend.py"
@@ -1978,26 +1983,39 @@ class ManipulationRuntimeTest(unittest.TestCase):
             "the 'gripper' actuator must keep a non-zero stiffness to actively drive drive_joint",
         )
 
-        passive = [
+        driven = [
             (name, cfg)
             for name, cfg in groups.items()
             if matched_joints(cfg.get("joint_names_expr")) == set(mimic_joints)
         ]
         self.assertTrue(
-            passive,
+            driven,
             "no actuator group claims exactly the five mimic joints "
-            f"{sorted(mimic_joints)}; they must live in a distinct passive group",
+            f"{sorted(mimic_joints)}; they must live in a distinct group",
         )
-        for name, cfg in passive:
-            self.assertEqual(
-                float(cfg.get("stiffness", 1.0)),  # type: ignore[arg-type]
+        for name, cfg in driven:
+            self.assertNotEqual(
+                float(cfg.get("stiffness", 0.0)),  # type: ignore[arg-type]
                 0.0,
-                f"mimic passive group {name!r} must have zero stiffness",
+                f"mimic group {name!r} must be actively driven (non-zero "
+                "stiffness): robot.usd dropped the URDF mimic coupling, so a "
+                "passive group leaves the fingers flopping and the jaw closes "
+                "through the object",
             )
-            self.assertEqual(
-                float(cfg.get("damping", 1.0)),  # type: ignore[arg-type]
-                0.0,
-                f"mimic passive group {name!r} must have zero damping",
+
+        # The coupling the USD dropped is restored in software: step() must
+        # mirror drive_joint's target into the five mimic joints so they track
+        # the master 1:1.
+        self.assertIn(
+            "_mirror_gripper_mimic_targets",
+            backend_source,
+            "backend must mirror drive_joint's target into the mimic joints",
+        )
+        for joint in mimic_joints:
+            self.assertIn(
+                joint,
+                backend_source,
+                f"the gripper mimic mirror must reference {joint}",
             )
 
 
