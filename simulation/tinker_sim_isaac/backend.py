@@ -1162,7 +1162,7 @@ class IsaacWholeRobotBackend:
         (so it is safe to leave on). Authored before reset so the parse cooks
         the constraint.
         """
-        if _os.environ.get("TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT") == "0":
+        if os.environ.get("TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT") == "0":
             return 0
         try:
             from pxr import PhysxSchema
