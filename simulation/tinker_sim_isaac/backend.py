@@ -710,6 +710,18 @@ class IsaacWholeRobotBackend:
         # (isaaclab source shows they are scoped to /World/Tinker and cannot
         # address a loose body); if the spawn lands correctly, they are.
         self._base_hold_dryrun = _os.environ.get("TINKER_SIM_FIX_BASE_DRYRUN") == "1"
+        # Gripper close ramp: slew the drive_joint target toward the commanded
+        # value at this rate (rad/s) so first-contact force builds gradually
+        # instead of the impulsive spike that ejects light objects. Starts open;
+        # tunable live via TINKER_SIM_GRIPPER_CLOSE_SLEW (0/unset -> no ramp).
+        self._drive_command_target: float | None = None
+        self._gripper_close_slew = 1.5
+        try:
+            _slew = _os.environ.get("TINKER_SIM_GRIPPER_CLOSE_SLEW")
+            if _slew is not None and _slew.strip():
+                self._gripper_close_slew = max(0.0, float(_slew))
+        except (TypeError, ValueError):
+            pass
         articulation_props = None
         if solver_position is not None or solver_velocity is not None:
             articulation_props = sim_utils.ArticulationRootPropertiesCfg(
@@ -1157,6 +1169,27 @@ class IsaacWholeRobotBackend:
         api.CreateStaticFrictionAttr(1.0)
         api.CreateDynamicFrictionAttr(1.0)
         api.CreateRestitutionAttr(0.0)
+        # Optional compliant contact (TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS):
+        # a soft contact spring on the pads cushions the first-contact impulse
+        # -- the escalation co-fix to the close ramp (which is the primary
+        # bound on first-contact force). Off by default; enable to A/B if the
+        # ramp alone leaves a >20 N spike.
+        compliant = os.environ.get("TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS")
+        if compliant and compliant.strip():
+            try:
+                from pxr import PhysxSchema
+
+                pmat = PhysxSchema.PhysxMaterialAPI.Apply(material.GetPrim())
+                pmat.CreateCompliantContactStiffnessAttr(float(compliant))
+                pmat.CreateCompliantContactDampingAttr(
+                    float(os.environ.get("TINKER_SIM_GRIPPER_COMPLIANT_DAMPING", "0.0"))
+                )
+                pmat.CreateCompliantContactAccelerationSpringAttr(True)
+            except Exception as error:  # missing/renamed API -> friction still binds
+                print(
+                    json.dumps({"gripper_compliant_error": str(error)[:120]}, sort_keys=True),
+                    flush=True,
+                )
         # Torsional friction on the finger PADS: physxCollision:
         # torsionalPatchRadius gives the pad a finite rubber contact patch that
         # resists in-hand spin about the contact normal. Without it (radius 0 =
@@ -1786,8 +1819,17 @@ class IsaacWholeRobotBackend:
         for offset, name in enumerate(command.names):
             index = self._joint_index[name]
             if command.positions and math.isfinite(command.positions[offset]):
-                position_index.append(index)
-                position_values.append(command.positions[offset])
+                if name == "drive_joint":
+                    # Don't apply the gripper target directly -- record the
+                    # commanded value and let step() SLEW the applied target
+                    # toward it (_ramp_drive_target), so the close builds
+                    # first-contact force gradually instead of the impulsive
+                    # spike (12-190 N) that ejects a light object before the
+                    # jaw captures it.
+                    self._drive_command_target = float(command.positions[offset])
+                else:
+                    position_index.append(index)
+                    position_values.append(command.positions[offset])
                 if not command.velocities:
                     # A position-only packet takes ownership of this joint's
                     # control mode and must retire an older velocity target.
@@ -1987,6 +2029,31 @@ class IsaacWholeRobotBackend:
         except (AttributeError, ImportError, RuntimeError, TypeError):
             return self._base_hold_scene_sig or 0
 
+    def _ramp_drive_target(self) -> None:
+        """Slew the drive_joint applied target toward the commanded value.
+
+        _apply_joint_command records the gripper close/open target in
+        _drive_command_target rather than applying it directly; ramping the
+        applied target at _gripper_close_slew rad/s means the position error
+        (and thus the finger press force) builds gradually, so first contact is
+        a bounded ramp instead of the 12-190 N impulse that ejects a light
+        object before the jaw captures it. The mirror then carries the slewed
+        target to the five followers, so both jaws ramp together. getattr
+        guards keep the step() test doubles happy.
+        """
+        drive_index = getattr(self, "_drive_joint_index", None)
+        command = getattr(self, "_drive_command_target", None)
+        if drive_index is None or command is None:
+            return
+        current = float(self._position_targets[0, drive_index])
+        slew = getattr(self, "_gripper_close_slew", 0.0)
+        if slew <= 0.0:
+            self._position_targets[0, drive_index] = command
+            return
+        max_delta = slew * self.dt
+        delta = max(-max_delta, min(max_delta, command - current))
+        self._position_targets[0, drive_index] = current + delta
+
     def _mirror_gripper_mimic_targets(self) -> None:
         """Drive the passive gripper mimic joints from drive_joint's target.
 
@@ -2029,6 +2096,7 @@ class IsaacWholeRobotBackend:
             self._apply_safety_actuator_hold()
         else:
             self._slew_wheel_targets()
+            self._ramp_drive_target()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
         self._mirror_gripper_mimic_targets()
