@@ -774,6 +774,14 @@ class IsaacWholeRobotBackend:
                         "joint[5]": 30.0,
                         "joint[6-7]": 20.0,
                     },
+                    # Hardware-parity speed cap: xarm7.urdf.xacro authors
+                    # velocity="3.14" rad/s (180 deg/s) on every arm joint, so
+                    # the real arm cannot do the 5.7-6.2 rad/s the sim was
+                    # reaching -- fast enough to fling a gripped object during
+                    # retract. Uncapped is a parity gap (same class as the
+                    # phantom-mass and friction gaps); 3.14 sits well above the
+                    # ~2.3 planned peaks at execution_slowdown 3.0.
+                    velocity_limit_sim=3.14,
                 ),
                 "head": ImplicitActuatorCfg(
                     joint_names_expr=["pan_joint", "tilt_joint"],
@@ -805,15 +813,23 @@ class IsaacWholeRobotBackend:
                 # followers lag 0.13-0.17 rad under an ~11.7 N grip (physics
                 # probe), which lets the object extrude; k~=1500 (7-8x) pulls
                 # that toward <=0.02 rad for a firm hold, damping ~sqrt(k)-scaled
-                # from the 200/20 baseline (20*sqrt(1500/200)~=55). NB the
-                # rigid PhysxMimicJoint constraint is authored too but is DEAD
-                # in this stage (proven: passive followers flop), so this
-                # control mirror is the actual coupling -- see
-                # _apply_gripper_mimic_joints.
+                # from the 200/20 baseline (20*sqrt(1500/200)~=55). (The rigid
+                # PhysxMimicJoint constraint is a proven dead end on this
+                # warm-start/Fabric parse path, so this control mirror is the
+                # permanent coupling.)
+                #
+                # effort_limit_sim caps the follower reaction. Unbounded, a
+                # follower pinned short of its target (e.g. the jaw closing onto
+                # the desk) pushes k*error ~= 1500*0.56 ~= 840, which overwhelms
+                # drive_joint's 0 lower limit and back-drives it to -0.57 (drops
+                # the object). Capping at 80 keeps the drive's hard limit
+                # enforceable while clearing the measured ~45 (k*0.03) needed to
+                # track under the 37 N grip, so the coupling is preserved.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
                     stiffness=1500.0,
                     damping=55.0,
+                    effort_limit_sim=80.0,
                 ),
                 "casters": ImplicitActuatorCfg(
                     joint_names_expr=["rear_.*_swivel_joint", "rear_.*_wheel_joint"],
@@ -896,7 +912,6 @@ class IsaacWholeRobotBackend:
         self.arena_friction_bound = self._apply_arena_friction_material()
         self.arena_surface_boxes = self._apply_arena_support_surface_colliders()
         self.gripper_friction_bound = self._apply_gripper_friction_material()
-        self.gripper_mimic_joints = self._apply_gripper_mimic_joints()
         omni.kit.app.get_app().update()
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
@@ -1150,69 +1165,6 @@ class IsaacWholeRobotBackend:
                 )
                 bound += 1
         print(json.dumps({"gripper_friction_bound": bound}, sort_keys=True), flush=True)
-        return bound
-
-    def _apply_gripper_mimic_joints(self) -> int:
-        """Author PhysX mimic-joint constraints coupling the 5 finger/knuckle
-        joints to drive_joint 1:1 -- a RIGID version of the coupling the
-        URDF->USD import dropped.
-
-        The step() control-mirror (_mirror_gripper_mimic_targets) restored the
-        linkage as a soft PD, which transmits force but YIELDS under the
-        squeeze: the fingers penetrate the object and the jaw closes through it
-        (stall ~0.48 = half-closed on a 70 mm bottle). A rigid PhysxMimicJoint
-        constraint makes the linkage solid, so the fingers hard-stop on contact
-        and the drive stalls at the object's width. gearing=-1 realizes the
-        URDF multiplier=+1 under the schema's jointPos + gearing*ref + offset=0
-        (uniform, since the importer baked the URDF's negative axes as 180 deg
-        frame flips). Disable with TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT=0.
-
-        PhysxMimicJointAPI is deprecated in this build (110.1.13); if omni.physx
-        does not honor it this is a no-op and the soft mirror remains in force
-        (so it is safe to leave on). Authored before reset so the parse cooks
-        the constraint.
-        """
-        if os.environ.get("TINKER_SIM_GRIPPER_MIMIC_CONSTRAINT") == "0":
-            return 0
-        try:
-            from pxr import PhysxSchema
-        except ImportError:
-            return 0
-        import omni.usd
-
-        stage = omni.usd.get_context().get_stage()
-        reference = "/World/Tinker/joints/drive_joint"
-        if not stage.GetPrimAtPath(reference).IsValid():
-            return 0
-        names = (
-            "left_finger_joint",
-            "left_inner_knuckle_joint",
-            "right_outer_knuckle_joint",
-            "right_finger_joint",
-            "right_inner_knuckle_joint",
-        )
-        bound = 0
-        for name in names:
-            joint = stage.GetPrimAtPath(f"/World/Tinker/joints/{name}")
-            if not joint.IsValid():
-                continue
-            try:
-                api = PhysxSchema.PhysxMimicJointAPI.Apply(joint, "rotX")
-                api.CreateReferenceJointRel().SetTargets([reference])
-                api.CreateReferenceJointAxisAttr("rotX")
-                api.CreateGearingAttr(-1.0)
-                api.CreateOffsetAttr(0.0)
-                bound += 1
-            except Exception as error:  # deprecated API may be inert/renamed
-                print(
-                    json.dumps(
-                        {"gripper_mimic_joint_error": name, "error": str(error)[:120]},
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-                return bound
-        print(json.dumps({"gripper_mimic_joints": bound}, sort_keys=True), flush=True)
         return bound
 
     def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
