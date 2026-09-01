@@ -871,6 +871,7 @@ class IsaacWholeRobotBackend:
             ),
             flush=True,
         )
+        self.arena_friction_bound = self._apply_arena_friction_material()
         omni.kit.app.get_app().update()
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
@@ -991,6 +992,48 @@ class IsaacWholeRobotBackend:
         mass_api.GetMassAttr().Set(target_mass)
         mass_api.GetDiagonalInertiaAttr().Set(Gf.Vec3f(*target_inertia))
         return target_mass
+
+    def _apply_arena_friction_material(self) -> int:
+        """Bind an explicit physics material to arena furniture colliders.
+
+        The arena importer (arena_convert.author_model_colliders) authors
+        CollisionAPI/MeshCollisionAPI on furniture but NO physics material,
+        so furniture colliders fall back to the PhysicsScene default
+        material. Under TINKER_SIM_USE_FABRIC=0 (updateToUsd; the mode
+        SPAWN_YAW selects for correct spawn placement) the convex-hull MESH
+        colliders do not pick up that scene default -- objects glide
+        frictionlessly on the desk while the primitive ground plane (which
+        does honor the default) holds them rock-solid. An explicit per-shape
+        material carrying the same friction resolves fabric-independently:
+        a no-op under fabric-on (already effectively 0.5), and it restores
+        the intended friction under fabric-off. Authored before reset so the
+        USD physics parse ingests it.
+        """
+        import omni.usd
+        from pxr import Usd, UsdPhysics, UsdShade
+
+        stage = omni.usd.get_context().get_stage()
+        arena = stage.GetPrimAtPath("/World/Arena")
+        if not arena.IsValid():
+            return 0
+        material = UsdShade.Material.Define(
+            stage, "/World/Arena/PhysicsMaterials/furniture_friction"
+        )
+        api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+        # Match the isaaclab scene-default RigidBodyMaterialCfg (0.5/0.5): the
+        # fix is making that friction actually apply to the mesh colliders,
+        # not changing its value, so fabric-on behavior is unchanged.
+        api.CreateStaticFrictionAttr(0.5)
+        api.CreateDynamicFrictionAttr(0.5)
+        api.CreateRestitutionAttr(0.0)
+        bound = 0
+        for prim in Usd.PrimRange(arena):
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                binding = UsdShade.MaterialBindingAPI.Apply(prim)
+                binding.Bind(material, materialPurpose="physics")
+                bound += 1
+        print(json.dumps({"arena_friction_bound": bound}, sort_keys=True), flush=True)
+        return bound
 
     def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
         """Author ``STUB_LINK_MASS_KG`` on the URDF's massless frame links before reset.
