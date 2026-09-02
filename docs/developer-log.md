@@ -4,6 +4,79 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-02 — close-phase punch root cause: the mimic mirror copied the TARGET, not the drive's angle
+
+Closes Task #19 at the source. Five reactive/solver-level cycles (below) treated
+the first-contact spike as a control or contact problem; it is a kinematics
+problem. The xArm gripper (UFACTORY manual V1.11.0: one actuator, 84 mm stroke,
+30 N max clamping force) is a single-DOF mechanism — one motor on the left
+outer knuckle, the right knuckle gear-coupled, each finger on a parallelogram
+that keeps the pad parallel. The URDF says exactly that: all five follower
+joints carry `<mimic joint="drive_joint" multiplier="1" offset="0"/>` (finger
+joints on `-x` axes = counter-rotation = parallel pads; the importer baked
+those axes as 180° frame flips, so a uniform +1 mirror is kinematically right).
+URDF mimic semantics are `q_follower = q_drive` — the driving joint's ACTUAL
+angle. `_mirror_gripper_mimic_targets` copied drive_joint's commanded TARGET.
+Identical in free motion; wrong the instant the object blocks the drive
+knuckle, when the followers keep chasing the far target as five independent
+k=1500 motors.
+
+Measured in-process (headless probe, CPU PhysX, bench bottle centred at the
+bench's recorded grasp pose, stock defaults): the k=200 drive side lags the
+k=1500 followers 0.06 rad even in free motion, so the right pad always arrives
+first; after the drive stalls at 0.43 rad the right outer knuckle runs on to
+0.65 and shoves the bottle into the weak left pad (right 25 N vs left 5 N,
+bottle tilted 12°, held only by hooking); and the finger joints run to 0.845
+regardless — the pads CURL 0.2–0.4 rad about the finger axis. That curl is the
+bench's "pads close through to 0.728, 18 mm past the knife"; on a desk-lying
+knife it drives the fingertips into desk/knife, the 200+ N spikes.
+
+Two earlier readings are corrected by the same data. (1) The d·v "preload"
+hypothesis is real but not the ejector: free closes give k·lag = d·v within 3%
+in every config (defaults: 73 N·m per follower entering contact; slew 0.75 →
+37; d=20 → 22; k=500 → 60, i.e. lowering k only grows the lag), yet on a
+centred bottle the stock jaw peaks at only 33 N and LOWER damping made
+retention worse (d=10: 67 N, dropped). isaaclab's `applied_torque` reports
+the net (spring − damper ≈ 0 in motion), which is why the preload was never
+visible. (2) The dev-log's "drive joint is unloaded" premise is false:
+`drive_joint` → `left_outer_knuckle` → `left_finger` carries the left pad.
+
+Fix: followers target `q_drive + q̇_drive·dt` (measured angle plus one control
+step of feed-forward so their one-step lag does not drag the drive; at stall
+q̇ ≈ 0 so they hold the drive's angle exactly). A blocked knuckle now stops the
+whole linkage, the pinch is symmetric, and drive_joint's actuator — its effort
+limit, i.e. the facade's `max_effort` (50 → the USD maxForce; ≈20 N total pad
+force, vs the 30 N spec) — is the true grip bound. The stall-gated lead clamp
+(06cc2e1) is retired to default-off: with mimic-correct followers it has
+nothing to bound, and its gate self-locks the close into a 0.1 rad/s crawl
+(pads trail the drive by one step, so pad speed sits on the gate; a 30 mm knife
+was not reached in 3 s). `TINKER_SIM_GRIPPER_MAX_LEAD_RAD` keeps it available.
+
+Validation (same probe, bench objects, bench grasp poses, lift = joint2
+−0.15 rad, retention = object rises with the TCP): bottle 7/7 retained
+(peak = hold ≈ 20 N, tilt ≤ 6°, contact at 0.18 s) across slew 1.5/0.5,
+follower k 1500/500, clamp on/off; knife (top-down, fingertips 15 mm above the
+desk) 3/3 retained (peak 20 N, hold 19 N, no displacement) vs 0/5 with the
+stock mirror (46–49 N peak, drive 0.42 while pads curl to 0.845, apparent
+30 N "hold" that vanishes on lift — the bench's signature). Unit test:
+`test_gripper_mimic_followers_track_measured_drive_angle` (red on the old
+mirror, green now).
+
+Probe lessons worth keeping: a static support column wider than the bottle
+footprint spawned INTO the gripper hulls and exploded the articulation (drive
+−32 rad) before any close — use a footprint-sized pedestal and gate every
+trial on "no contact pairs, followers quiet, drive in range"; the kinematic
+base hold latches at sim t=2 s, which on the bare ground plane caught the
+0.2 m spawn drop mid-tumble (root z 0.218, 40° tilt) — latch after ~8 s;
+`body_quat_w` comes through as XYZW here (the backend's `root_state` reorders
+the same way) — decoding it as wxyz put the knife 139° off; the finger pad
+runs 0–61 mm from the finger joint along the tool axis with the TCP plane at
+64 mm, so a top-down pinch of a 25 mm object needs the fingertips within
+~10 mm of the desk. Follow-ups: the exact model is a PhysX loop-closure joint
+between inner knuckle and finger (NVIDIA: no native closed loops; the mimic
+API is reported broken for parallel grippers on Isaac 5.1), which would make
+the parallelogram passive; and sizing the drive effort limit to the 30 N spec.
+
 ## 2026-09-01 — close-phase punch, and why the first (open-loop) ramp made it worse
 
 With the mimic coupling stiffened to k=1500 (the fingers finally grip), the
