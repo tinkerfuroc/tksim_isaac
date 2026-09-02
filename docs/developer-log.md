@@ -72,7 +72,17 @@ base hold latches at sim t=2 s, which on the bare ground plane caught the
 the same way) — decoding it as wxyz put the knife 139° off; the finger pad
 runs 0–61 mm from the finger joint along the tool axis with the TCP plane at
 64 mm, so a top-down pinch of a 25 mm object needs the fingertips within
-~10 mm of the desk. Follow-ups: the exact model is a PhysX loop-closure joint
+~10 mm of the desk. One more, unexplained and worth its own round: on the
+bare ground plane (no arena) the probe's boot LAUNCHES the robot — root +12 cm
+in the first physics step, head tilt and finger joints at 30–70 rad/s against
+their effort caps for ~0.3 s, base airborne to z=1.7 m and down 2 m away,
+sometimes on its side — with the safety stop held or released, at spawn_z
+0.20 or 0.09. The arena stack never shows it (the bench's base stays at its
+spawn xy). The probe works around it (settle 8 s, re-latch the base hold
+upright at the origin, then release the safety stop); the cause (a spawn-time
+state violation — epsilon-mass frame links? the zero-mass link_tcp with an
+undefined centre of mass? ground-plane placement?) is open. Follow-ups: the
+exact model is a PhysX loop-closure joint
 between inner knuckle and finger (NVIDIA: no native closed loops; the mimic
 API is reported broken for parallel grippers on Isaac 5.1), which would make
 the parallelogram passive; and sizing the drive effort limit to the 30 N spec.
