@@ -190,6 +190,56 @@ def load_camera_specs(path: Path) -> tuple[CameraStreamSpec, ...]:
     return tuple(specs)
 
 
+def load_spectator_spec(path: Path) -> CameraStreamSpec:
+    """Load an optional world-fixed spectator camera (sim-only, not parity).
+
+    Kept out of the hardware-parity contract on purpose: this camera has no
+    real-robot counterpart, so it lives in its own opt-in spec file
+    (``TINKER_SIM_SPECTATOR_CAMERA``). The mount must be an absolute stage
+    path with an explicit world translation. Always color-only — a depth
+    annotator on a pure observer stream would tax RTF for nothing.
+    """
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    name = "spectator_camera"
+    camera = raw.get(name)
+    if not isinstance(camera, Mapping):
+        raise ValueError(f"spectator spec is missing {name}")
+    mount_prim = _string(camera, "mount_prim", name)
+    if not mount_prim.startswith("/"):
+        raise ValueError(f"{name}.mount_prim must be an absolute stage path")
+    translation = camera.get("mount_translation_xyz")
+    if (
+        not isinstance(translation, list)
+        or len(translation) != 3
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in translation
+        )
+    ):
+        raise ValueError(f"{name}.mount_translation_xyz must be three numbers")
+    info_topics = camera.get("camera_info_topics")
+    if (
+        not isinstance(info_topics, list)
+        or not info_topics
+        or any(not isinstance(topic, str) or not topic for topic in info_topics)
+    ):
+        raise ValueError(f"{name}.camera_info_topics must be non-empty strings")
+    return CameraStreamSpec(
+        name=name,
+        color_topic=_string(camera, "color_topic", name),
+        depth_topic="",
+        camera_info_topics=tuple(info_topics),
+        frame_id=_string(camera, "frame_id", name),
+        mount_prim=mount_prim,
+        mount_rotation_wxyz=_quaternion_wxyz(camera, "mount_rotation_wxyz", name),
+        width=int(_positive_number(camera, "width", name)),
+        height=int(_positive_number(camera, "height", name)),
+        horizontal_fov_deg=_positive_number(camera, "horizontal_fov_deg", name),
+        tick_rate_hz=_positive_number(camera, "tick_rate_hz", name),
+        mount_translation=tuple(float(item) for item in translation),
+    )
+
+
 def focal_from_fov(
     width_px: int,
     horizontal_fov_deg: float,

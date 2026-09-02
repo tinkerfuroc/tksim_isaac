@@ -70,6 +70,7 @@ def _planning_overlay_actions(context, root: Path, workspace: Path):
             "seed": LaunchConfiguration("seed"),
             "reset_attempts": LaunchConfiguration("reset_attempts"),
             "reset_retry_delay": LaunchConfiguration("reset_retry_delay"),
+            "reset_timeout": LaunchConfiguration("reset_timeout"),
             "qualification": LaunchConfiguration("qualification"),
             "model_bundle_manifest": LaunchConfiguration("model_bundle_manifest"),
             "provider_manifest_path": LaunchConfiguration("provider_manifest_path"),
@@ -97,6 +98,7 @@ def _resolve(context):
     seed = LaunchConfiguration("seed").perform(context)
     reset_attempts = LaunchConfiguration("reset_attempts").perform(context)
     reset_retry_delay = LaunchConfiguration("reset_retry_delay").perform(context)
+    reset_timeout = LaunchConfiguration("reset_timeout").perform(context)
     qualification = _bool(LaunchConfiguration("qualification").perform(context))
     attempt_value = LaunchConfiguration("attempt_dir").perform(context).strip()
     attempt_dir = Path(attempt_value).expanduser().resolve() if attempt_value else None
@@ -115,6 +117,7 @@ def _resolve(context):
         "--seed", seed,
         "--reset-attempts", reset_attempts,
         "--reset-retry-delay", reset_retry_delay,
+        "--timeout", reset_timeout,
     ]
     if attempt_dir is not None:
         scenario_arguments.extend(["--report", str(attempt_dir / "scenario-runner.json")])
@@ -135,7 +138,19 @@ def _resolve(context):
         raw_jsonl_path = str(attempt_dir / "physics_truth.jsonl")
     elif os.environ.get("TINKER_SIM_TRUTH_JSONL"):
         raw_jsonl_path = os.environ["TINKER_SIM_TRUTH_JSONL"]
-    safety_parameters = [{"use_sim_time": True}]
+    # Wall-clock liveness deadline for the supervisor's required safety
+    # sources. Default 1.0 preserves existing behavior; a CPU-shared host can
+    # raise it per run (the collision monitor was measured gapping 1.2 s
+    # during gripper contact bursts while Isaac runs on the same machine).
+    safety_source_deadline_s = float(
+        LaunchConfiguration("safety_source_deadline_s").perform(context)
+    )
+    safety_parameters = [
+        {
+            "use_sim_time": True,
+            "required_source_deadline_s": safety_source_deadline_s,
+        }
+    ]
     evaluator_parameters = [
         {
             "use_sim_time": True,
@@ -299,7 +314,15 @@ def generate_launch_description():
             DeclareLaunchArgument("seed", default_value="0"),
             DeclareLaunchArgument("reset_attempts", default_value="3"),
             DeclareLaunchArgument("reset_retry_delay", default_value="0.5"),
+            # Scenario-runner per-service-call timeout (seconds). The 20 s
+            # default is fine on an idle sim; raise it when Isaac is loaded
+            # (RTX cameras + a starting control plane slow /reset_simulation
+            # past 20 s on this CPU-shared host).
+            DeclareLaunchArgument("reset_timeout", default_value="20.0"),
             DeclareLaunchArgument("qualification", default_value="false"),
+            DeclareLaunchArgument(
+                "safety_source_deadline_s", default_value="1.0"
+            ),
             DeclareLaunchArgument(
                 "attempt_dir", default_value=os.environ.get("TINKER_SIM_ATTEMPT_DIR", "")
             ),
