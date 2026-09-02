@@ -56,8 +56,9 @@ parser.add_argument(
 )
 parser.add_argument("--bottle-offset", default="", help="x,y,z of bottle BASE relative to pad midpoint (phase B fallback)")
 parser.add_argument("--lift", action="store_true", help="phase B: after the close, raise the arm and report whether the bottle follows")
-parser.add_argument("--mirror-mode", default="target", choices=("target", "measured", "measured_ff"),
-                    help="target = stock mirror (followers track drive TARGET); measured = followers track the drive joint's MEASURED angle (single-DOF jaw); measured_ff = measured + one-step velocity feed-forward (q + qdot*dt)")
+parser.add_argument("--mirror-mode", default="target",
+                    choices=("target", "measured", "measured_ff", "central"),
+                    help="target = stock mirror (followers track drive TARGET); measured = followers track the drive joint's MEASURED angle (single-DOF jaw); measured_ff = measured + one-step velocity feed-forward (q + qdot*dt); central = virtual central command: all six gripper joints track the applied drive target c (symmetric gains + stall-gated lead clamp)")
 parser.add_argument("--max-lead", type=float, default=None, help="override backend._gripper_max_lead (0 disables the stall-gated lead clamp)")
 parser.add_argument("--stall-speed", type=float, default=None, help="override backend._gripper_stall_speed")
 parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
@@ -345,6 +346,22 @@ def parse_configs(text: str) -> list[dict[str, float]]:
 
 
 CONFIGS = parse_configs(args.configs)
+
+if args.mirror_mode == "central":
+    set_follower_gains(55.0, 1500.0, drive_stiffness=1500.0, drive_damping=55.0)
+    if args.max_lead is None:
+        backend._gripper_max_lead = 0.015
+    def _mirror_central() -> None:
+        di = getattr(backend, "_drive_joint_index", None)
+        ids = getattr(backend, "_gripper_mimic_indices", ())
+        if di is None or not ids:
+            return
+        c = float(backend._position_targets[0, di])   # applied central command
+        for i in ids:
+            backend._position_targets[0, i] = c
+    backend._mirror_gripper_mimic_targets = _mirror_central
+    print(json.dumps({"event": "mirror_mode", "mode": "central",
+                      "max_lead": backend._gripper_max_lead}), flush=True)
 
 # ----------------------------------------------------------- arm staging pose
 # Built-in arm poses, solved offline from the artifact URDF (planar elbow
