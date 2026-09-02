@@ -19,5 +19,17 @@ def Xform "BenchBottle" (
         double3 xformOp:translate = (0, 0, 0.095)
         uniform token[] xformOpOrder = ["xformOp:translate"]
         color3f[] primvars:displayColor = [(0.15, 0.45, 0.75)]
+        rel material:binding:physics = </BenchBottle/PhysicsMat> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
+    }
+
+    def Material "PhysicsMat" (
+        prepend apiSchemas = ["PhysicsMaterialAPI"]
+    )
+    {
+        float physics:staticFriction = 1.0
+        float physics:dynamicFriction = 1.0
+        float physics:restitution = 0.0
     }
 }
