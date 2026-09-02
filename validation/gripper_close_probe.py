@@ -77,6 +77,13 @@ parser.add_argument("--closing-axis", default="y", choices=("x", "y"), help="bas
 parser.add_argument("--descend-from", type=float, default=0.0, help="stage the arm this much above the grasp TCP and descend onto the object before every close (0 = spawn at the grasp pose)")
 parser.add_argument("--descend-s", type=float, default=2.0, help="descent duration (joint-space interpolation)")
 parser.add_argument("--lift-dz", type=float, default=0.10, help="--lift height when the IK family is in use")
+parser.add_argument("--render-dir", default="", help="if set, capture RGB frames of the close (replicator camera looking at the TCP) into this dir")
+parser.add_argument("--render-cam", default="0.45,-0.5,0.35", help="camera position offset (dx,dy,dz world) from the TCP for --render-dir")
+parser.add_argument("--render-every", type=float, default=0.08, help="capture a frame each time the drive advances this many rad")
+parser.add_argument("--render-focal", type=float, default=40.0, help="camera focal length mm (higher = zoomed in on the jaw)")
+parser.add_argument("--video", action="store_true", help="also record a dense per-step RTX video of the whole grasp (descend+close+lift) and encode <render-dir>/grasp.mp4 (needs --render-dir + ffmpeg)")
+parser.add_argument("--video-stride", type=int, default=3, help="--video: capture a frame every N sim steps (lower = smoother, slower)")
+parser.add_argument("--video-fps", type=int, default=30, help="--video: output mp4 frame rate")
 args = parser.parse_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -491,6 +498,110 @@ pad_mid = [(a + b) / 2 for a, b in zip(lf_p, rf_p)]
 pad_axis = [a - b for a, b in zip(lf_p, rf_p)]
 emit(event="staged", settle_s=settled, tcp=tcp_p, tcp_quat_wxyz=tcp_q, left_finger=lf_p, right_finger=rf_p, pad_mid=pad_mid, pad_axis=pad_axis, gap=math.dist(lf_p, rf_p),
      root=backend.root_state() if hasattr(backend, "root_state") else None)
+
+# --------------------------------------------------------- optional RGB capture
+# A replicator observer camera looking at the TCP; app.update() renders it even
+# though the backend steps with render=False. get_data() -> HxWx4 uint8.
+_render = {"on": bool(args.render_dir)}
+if _render["on"]:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.image as _mpimg
+    import omni.replicator.core as rep
+
+    import omni.usd
+    from pxr import Gf, UsdGeom
+
+    _cam_off = [float(v) for v in args.render_cam.split(",")]
+    # aim slightly below the pad origins, toward the fingertips/object
+    _look = (pad_mid[0], pad_mid[1], pad_mid[2] - 0.045)
+    _cam_pos = (pad_mid[0] + _cam_off[0], pad_mid[1] + _cam_off[1], pad_mid[2] + _cam_off[2])
+    # Build the camera prim directly and set its look-at transform with USD math
+    # (rep.create.camera's look_at did not orient the camera on this stack).
+    _stage = omni.usd.get_context().get_stage()
+    _cam_path = "/World/ProbeCam"
+    _ucam = UsdGeom.Camera.Define(_stage, _cam_path)
+    _ucam.GetFocalLengthAttr().Set(float(args.render_focal))
+    _ucam.GetHorizontalApertureAttr().Set(20.955)
+    _ucam.GetVerticalApertureAttr().Set(20.955 * 540.0 / 960.0)
+    _ucam.GetClippingRangeAttr().Set(Gf.Vec2f(0.02, 100.0))
+    # SetLookAt gives world->view (view looks down -Z); camera local-to-world is
+    # its inverse.
+    _view = Gf.Matrix4d().SetLookAt(Gf.Vec3d(*_cam_pos), Gf.Vec3d(*_look), Gf.Vec3d(0, 0, 1))
+    _xf = UsdGeom.Xformable(_ucam.GetPrim())
+    _xf.ClearXformOpOrder()
+    _xf.AddTransformOp().Set(_view.GetInverse())
+    _rp = rep.create.render_product(_cam_path, (960, 540))
+    _rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+    _rgb_annot.attach([_rp])
+    # lights: a dome for fill + a distant key so the object is not a silhouette
+    try:
+        rep.create.light(light_type="dome", intensity=1200)
+        rep.create.light(light_type="distant", intensity=2500,
+                         rotation=(-45, 20, 0))
+    except Exception as _le:
+        print(json.dumps({"event": "render_light_error", "err": str(_le)[:120]}), flush=True)
+    for _ in range(8):
+        app.update()
+    Path(args.render_dir).mkdir(parents=True, exist_ok=True)
+    _render.update(next_drive=-1.0, idx=0)
+
+    def capture_frame(tag: str, drive: float, force: str = "") -> None:
+        if not _render["on"]:
+            return
+        for _ in range(2):
+            app.update()
+        arr = _rgb_annot.get_data()
+        try:
+            import numpy as _np
+            arr = _np.asarray(arr)
+            if arr.ndim == 3 and arr.shape[-1] >= 3:
+                img = arr[:, :, :3].astype("uint8")
+                name = f"{_render['idx']:02d}_{tag}_d{drive:.2f}{('_' + force) if force else ''}.png"
+                _mpimg.imsave(str(Path(args.render_dir) / name), img)
+                _render["idx"] += 1
+        except Exception as _e:
+            print(json.dumps({"event": "render_error", "err": str(_e)[:160]}), flush=True)
+
+    def maybe_capture(tag: str, drive: float, force: str = "") -> None:
+        if _render["on"] and drive >= _render["next_drive"]:
+            capture_frame(tag, drive, force)
+            _render["next_drive"] = drive + args.render_every
+
+    # Dense per-step video capture: unlike maybe_capture (drive-gated, so it
+    # never samples the open-gripper descent or the constant-drive lift), this
+    # fires on a fixed step stride so the mp4 shows the whole grasp arc.
+    import numpy as _np_v
+    _video = {"on": bool(args.video), "stride": max(1, args.video_stride), "n": 0, "vidx": 0}
+    _video_dir = Path(args.render_dir) / "video_frames"
+    if _video["on"]:
+        _video_dir.mkdir(parents=True, exist_ok=True)
+
+    def video_tick() -> None:
+        if not _video["on"]:
+            return
+        _video["n"] += 1
+        if _video["n"] % _video["stride"] != 0:
+            return
+        app.update()
+        try:
+            arr = _np_v.asarray(_rgb_annot.get_data())
+            if arr.ndim == 3 and arr.shape[-1] >= 3:
+                _mpimg.imsave(str(_video_dir / f"frame_{_video['vidx']:06d}.png"),
+                              arr[:, :, :3].astype("uint8"))
+                _video["vidx"] += 1
+        except Exception as _ve:
+            print(json.dumps({"event": "video_error", "err": str(_ve)[:160]}), flush=True)
+else:
+    def capture_frame(tag: str, drive: float, force: str = "") -> None:
+        pass
+
+    def maybe_capture(tag: str, drive: float, force: str = "") -> None:
+        pass
+
+    def video_tick() -> None:
+        pass
+
 # Descent staging: park the arm above the grasp before the object appears.
 stage_pose = arm_pose
 if args.descend_from > 0.0:
@@ -510,8 +621,10 @@ def descend(duration_s: float) -> dict[str, object]:
         a = k / n
         command_arm({j: stage_pose[j] + a * (arm_pose[j] - stage_pose[j]) for j in ARM})
         backend.step()
+        video_tick()
     for _ in range(int(1.0 / DT)):
         backend.step()
+        video_tick()
     tcp_now, _ = body_pose("link_tcp")
     lf_now, _ = body_pose("left_finger")
     rf_now, _ = body_pose("right_finger")
@@ -526,6 +639,8 @@ def descend(duration_s: float) -> dict[str, object]:
 def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, object]:
     backend._gripper_close_slew = cfg["slew"]
     gains = set_follower_gains(cfg["damping"], cfg["stiffness"], cfg.get("drive_stiffness"), cfg.get("drive_damping"))
+    if _render["on"]:
+        _render["next_drive"] = -1.0  # capture from the first step of this close
     command_gripper(args.close_target)
     steps = int(args.record_s / DT)
     peak_force = 0.0
@@ -597,6 +712,8 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
                 r["pairs"] = [(str(p["body_a"]).split("/")[-1], str(p["body_b"]).split("/")[-1], round(float(p["normal_force"]), 1)) for p in backend.contact_pairs()][:8]
         row(**r)
         last = r
+        maybe_capture(tag, g["drive_joint"][0], force=f"L{lf:.0f}R{rf:.0f}")
+        video_tick()
     tail = int(0.5 / DT)
     metrics: dict[str, object] = {
         "tag": tag, "config": cfg, "gains_after_write": {k: gains.get(k) for k in ("joint_damping", "joint_stiffness")},
@@ -686,6 +803,8 @@ if "B" in args.phase:
     if support_top > 0.01:
         cube = UsdGeom.Cube.Define(stage, "/World/Probe/Support")
         cube.GetSizeAttr().Set(1.0)
+        # dark pedestal so light objects (knife/plate) contrast in renders
+        cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.20, 0.22, 0.26)])
         xf = UsdGeom.Xformable(cube.GetPrim())
         # centre the pedestal under the TCP + object (covers both footprints)
         ped_cx = (tcp_p[0] + bottle_base[0]) / 2.0 if args.descend_from > 0.0 else bottle_base[0]
@@ -794,11 +913,13 @@ if "B" in args.phase:
             command_arm(lifted)
             for _ in range(int(2.0 / DT)):
                 backend.step()
+                video_tick()
             tcp_after, _ = body_pose("link_tcp")
             bl = bottle_state()
             lf, rf = pad_forces()
             m["lift"] = {"tcp_dz": tcp_after[2] - tcp_p[2], "bottle_dz": bl["z"] - pre["z"], "bottle_tilt": bl["tilt_deg"], "hold_force": lf + rf,
                          "tcp_after": tcp_after, "object_after": bl}
+            capture_frame("LIFT", 0.0, force=f"dz{bl['z']-pre['z']:+.02f}_tilt{bl['tilt_deg']:.0f}")
             # release BEFORE returning: a closed jaw descending onto an object
             # left on the pedestal jams the drive past its limit (probe6)
             wait_gripper_open()
@@ -807,6 +928,26 @@ if "B" in args.phase:
         command_arm(stage_pose)
         wait_arm(stage_pose, timeout_s=5.0)
         emit(event="phaseB", **m)
+
+if _render["on"] and _video["on"]:
+    import subprocess
+    n_frames = _video["vidx"]
+    mp4 = str(Path(args.render_dir) / "grasp.mp4")
+    if n_frames > 0:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-framerate", str(args.video_fps),
+            "-i", str(_video_dir / "frame_%06d.png"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", mp4,
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+            emit(event="video", frames=n_frames, fps=args.video_fps, mp4=mp4)
+        except Exception as _ee:
+            emit(event="video_encode_error", frames=n_frames, err=str(_ee)[:200],
+                 hint="frames are in " + str(_video_dir))
+    else:
+        emit(event="video_empty", hint="no frames captured; check --video-stride")
 
 emit(event="done")
 _out.close()
