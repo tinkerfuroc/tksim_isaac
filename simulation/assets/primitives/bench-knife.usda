@@ -18,5 +18,17 @@ def Xform "BenchKnife" (
         double3 xformOp:translate = (0, 0, 0.0125)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         color3f[] primvars:displayColor = [(0.7, 0.7, 0.72)]
+        rel material:binding:physics = </BenchKnife/PhysicsMat> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
+    }
+
+    def Material "PhysicsMat" (
+        prepend apiSchemas = ["PhysicsMaterialAPI"]
+    )
+    {
+        float physics:staticFriction = 1.0
+        float physics:dynamicFriction = 1.0
+        float physics:restitution = 0.0
     }
 }
