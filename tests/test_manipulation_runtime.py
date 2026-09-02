@@ -2115,12 +2115,13 @@ class ManipulationRuntimeTest(unittest.TestCase):
             )
 
         # The coupling the USD dropped is restored in software: step() must
-        # mirror drive_joint's target into the five mimic joints so they track
-        # the master 1:1.
+        # mirror drive_joint's MEASURED angle into the five mimic joints so
+        # they track the master 1:1 (URDF mimic semantics; see the behavioral
+        # test below).
         self.assertIn(
             "_mirror_gripper_mimic_targets",
             backend_source,
-            "backend must mirror drive_joint's target into the mimic joints",
+            "backend must mirror drive_joint's measured angle into the mimic joints",
         )
         for joint in mimic_joints:
             self.assertIn(
@@ -2128,6 +2129,75 @@ class ManipulationRuntimeTest(unittest.TestCase):
                 backend_source,
                 f"the gripper mimic mirror must reference {joint}",
             )
+
+    def test_gripper_mimic_followers_track_measured_drive_angle(self) -> None:
+        """URDF ``<mimic joint="drive_joint" multiplier="1">`` means
+        ``q_follower = q_drive`` -- the driving joint's ACTUAL angle. The real
+        xArm gripper is one motor plus gear-coupled, parallelogram fingers, so
+        a blocked drive knuckle stops the whole linkage.
+
+        Mirroring the COMMANDED target instead breaks that the moment the
+        object blocks the drive: the five followers keep chasing the far
+        target as independent k=1500 motors -- the right knuckle over-runs
+        the stalled left one and shoves the object into the weak pad, and the
+        finger joints curl the pads about the finger axis (measured in-process:
+        drive stalled at 0.43 rad while the pads ran to 0.845, 25 N vs 5 N
+        pads, the object tilted 12 deg; the grasp bench's "pads close through
+        to 0.728, 18 mm past the knife"). With the measured-angle mirror the
+        same closes pinch symmetrically and retain through a lift.
+        """
+        names = (
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_finger_joint",
+            "right_inner_knuckle_joint",
+            "joint1",
+        )
+        backend = object.__new__(IsaacWholeRobotBackend)
+        backend._torch = torch
+        backend.dt = 1.0 / 120.0
+        backend._drive_joint_index = 0
+        backend._gripper_mimic_indices = (1, 2, 3, 4, 5)
+        # Drive blocked by the object at 0.43 rad, still pushing at 1.2 rad/s
+        # commanded slew; the command target sits far ahead at 0.85.
+        backend._robot = SimpleNamespace(
+            data=SimpleNamespace(
+                joint_names=names,
+                joint_pos=torch.tensor([[0.43, 0.6, 0.6, 0.6, 0.6, 0.6, 0.0]], dtype=torch.float32),
+                joint_vel=torch.tensor([[1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+            )
+        )
+        backend._position_targets = torch.tensor(
+            [[0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.0]], dtype=torch.float32
+        )
+        backend._mirror_gripper_mimic_targets()
+        expected = 0.43 + 1.2 / 120.0  # measured angle + one control step of feed-forward
+        for index in backend._gripper_mimic_indices:
+            self.assertAlmostEqual(
+                float(backend._position_targets[0, index]),
+                expected,
+                places=6,
+                msg=f"follower {names[index]} must track the drive's measured angle, not its 0.85 target",
+            )
+        # The drive's own target is untouched (the master keeps its command).
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.85, places=6)
+        # At stall (zero drive velocity) the followers hold exactly the drive angle.
+        backend._robot.data.joint_vel[0, 0] = 0.0
+        backend._mirror_gripper_mimic_targets()
+        for index in backend._gripper_mimic_indices:
+            self.assertAlmostEqual(float(backend._position_targets[0, index]), 0.43, places=6)
+
+    def test_gripper_lead_clamp_defaults_off_with_measured_mirror(self) -> None:
+        """With mimic-correct followers the press is bounded by drive_joint's
+        effort limit, and the stall-gated lead clamp self-locks the close into
+        a 0.1 rad/s crawl (pads trail the drive by one step, so pad speed sits
+        at the gate). It must default OFF; the env knob keeps it available."""
+        backend_source = (ROOT / "simulation/tinker_sim_isaac/backend.py").read_text(encoding="utf-8")
+        self.assertRegex(backend_source, r"self\._gripper_max_lead = 0\.0\s*\n")
+        self.assertNotRegex(backend_source, r"self\._gripper_max_lead = 0\.015")
+        self.assertIn("TINKER_SIM_GRIPPER_MAX_LEAD_RAD", backend_source)
 
 
 if __name__ == "__main__":

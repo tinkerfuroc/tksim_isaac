@@ -741,7 +741,17 @@ class IsaacWholeRobotBackend:
                 self._gripper_close_slew = max(0.0, float(_slew))
         except (TypeError, ValueError):
             pass
-        self._gripper_max_lead = 0.015
+        # Default OFF since the mimic followers track drive_joint's MEASURED
+        # angle (_mirror_gripper_mimic_targets): the followers can no longer
+        # run ahead of a blocked drive, so the press is bounded by drive_joint's
+        # own effort limit (the facade's max_effort) and the clamp has nothing
+        # left to bound. Left on, its stall gate self-locks the close into a
+        # 0.1 rad/s crawl (pads track the drive with one step of lag, so pad
+        # speed sits exactly at the gate and the clamp keeps re-engaging;
+        # measured: a 30 mm knife not reached in 3 s). Opt back in with
+        # TINKER_SIM_GRIPPER_MAX_LEAD_RAD if a hold-phase bound below the
+        # effort limit is ever wanted.
+        self._gripper_max_lead = 0.0
         try:
             _lead = _os.environ.get("TINKER_SIM_GRIPPER_MAX_LEAD_RAD")
             if _lead is not None and _lead.strip():
@@ -2221,23 +2231,59 @@ class IsaacWholeRobotBackend:
         self._position_targets[0, drive_index] = target
 
     def _mirror_gripper_mimic_targets(self) -> None:
-        """Drive the passive gripper mimic joints from drive_joint's target.
+        """Couple the five gripper mimic joints to drive_joint's MEASURED angle.
 
-        robot.usd dropped the URDF <mimic> coupling, so the five
-        finger/knuckle joints carry no drive of their own; with the
-        gripper_mimic actuator gains restored, mirroring the master
-        drive_joint target into them (uniform +1 -- the importer baked the
-        URDF's negative axes as 180 deg frame flips, so every joint's +axis
-        closes) makes the parallelogram track drive_joint 1:1 and transmit
-        grip force to the pads. getattr guards keep step() test doubles happy.
+        The xArm gripper is a single-DOF mechanism: one motor drives the left
+        outer knuckle; the right knuckle is gear-coupled to it, and each finger
+        rides a parallelogram (outer knuckle + inner knuckle) that keeps the pad
+        parallel. The URDF expresses this as ``<mimic joint="drive_joint"
+        multiplier="1">`` on all five follower joints (the finger joints on -x
+        axes, which the importer baked as 180 deg frame flips, so a uniform +1
+        mirror is kinematically right). robot.usd dropped every <mimic>, so the
+        coupling is restored here in software.
+
+        URDF mimic semantics are ``q_follower = multiplier * q_drive`` -- the
+        driving joint's ACTUAL angle. Mirroring drive_joint's commanded TARGET
+        instead (the previous implementation) only agrees with that in free
+        motion; the moment the drive knuckle is blocked by an object the
+        followers keep chasing the far-away target as five independent
+        k=1500 motors: the right knuckle over-runs the stalled left one and
+        shoves the object into the weak pad, and the finger joints curl the
+        pads 0.2-0.4 rad about the finger axis (measured: 25 N vs 5 N pads,
+        12 deg bottle tilt; the bench's "pads close through to 0.728, 18 mm
+        past the knife" and the 200+ N first-contact spikes). Tracking the
+        measured angle makes a blocked knuckle stop the whole linkage, the
+        pinch symmetric, and drive_joint's actuator (its effort limit, i.e.
+        the facade's max_effort) the true grip-force bound. Measured on the
+        bench objects at the bench grasp poses: bottle 7/7 retained through
+        a lift (peak = hold ~20 N, tilt <= 6 deg) vs a hooked, tilted shove
+        before; the followers' 1500 gains now act as the linkage constraint,
+        not as motors.
+
+        A one-step velocity feed-forward (q + qdot*dt) removes the followers'
+        control-step lag in steady motion; at stall qdot ~ 0 so the followers
+        hold exactly the drive's angle. getattr guards keep step() test doubles
+        happy.
         """
         drive_index = getattr(self, "_drive_joint_index", None)
         mimic_indices = getattr(self, "_gripper_mimic_indices", ())
         if drive_index is None or not mimic_indices:
             return
-        drive_target = self._position_targets[0, drive_index]
+        data = getattr(self._robot, "data", None)
+        joint_pos = getattr(data, "joint_pos", None)
+        if joint_pos is None:
+            return
+        try:
+            follower_target = float(self._torch_value(joint_pos)[0, drive_index])
+            joint_vel = getattr(data, "joint_vel", None)
+            if joint_vel is not None:
+                follower_target += float(self._torch_value(joint_vel)[0, drive_index]) * float(
+                    getattr(self, "dt", 0.0)
+                )
+        except (IndexError, TypeError, ValueError):
+            return
         for index in mimic_indices:
-            self._position_targets[0, index] = drive_target
+            self._position_targets[0, index] = follower_target
 
     def step(self) -> None:
         if self.step_profile["enabled"]:
