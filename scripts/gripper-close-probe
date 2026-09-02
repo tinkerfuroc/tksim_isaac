@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Launch validation/gripper_close_probe.py in-process with a ROS-clean environment
+# (Isaac refuses ROS-sourced shells). Physics is CPU; PROBE_GPU picks the render
+# card (default 1, the card the sim usually leaves free). All TINKER_SIM_* env
+# knobs pass through to the backend.
+#   PROBE_GPU=0 scripts/gripper-close-probe --out /tmp/probe.jsonl --phase B --lift
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+export PATH="/home/tinker/.local/bin:$PATH"
+if [ -f .deployment.env ]; then set -a; source .deployment.env; set +a; fi
+unset PYTHONPATH AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH ROS_PACKAGE_PATH LD_LIBRARY_PATH PKG_CONFIG_PATH
+for v in $(env | grep -oE '^(ROS_|AMENT_|COLCON_|RMW_|CYCLONEDDS|FASTRTPS)[A-Za-z0-9_]*' || true); do
+  case "$v" in ROS_DOMAIN_ID|RMW_IMPLEMENTATION) ;; *) unset "$v" ;; esac
+done
+export CUDA_VISIBLE_DEVICES="${PROBE_GPU:-1}"
+export TINKER_ACCEPT_OMNIVERSE_EULA=Y ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES
+# Same kinematic base hold the grasp bench runs with; the probe latches it only
+# after the spawn-drop settle (PROBE_PRESETTLE_S, default 8 s).
+export TINKER_SIM_FIX_BASE="${TINKER_SIM_FIX_BASE:-1}"
+exec uv run --frozen --no-sync python validation/gripper_close_probe.py "$@"
