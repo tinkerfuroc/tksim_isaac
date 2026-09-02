@@ -60,10 +60,22 @@ parser.add_argument("--mirror-mode", default="target", choices=("target", "measu
                     help="target = stock mirror (followers track drive TARGET); measured = followers track the drive joint's MEASURED angle (single-DOF jaw); measured_ff = measured + one-step velocity feed-forward (q + qdot*dt)")
 parser.add_argument("--max-lead", type=float, default=None, help="override backend._gripper_max_lead (0 disables the stall-gated lead clamp)")
 parser.add_argument("--stall-speed", type=float, default=None, help="override backend._gripper_stall_speed")
-parser.add_argument("--object", default="bottle", choices=("bottle", "knife"))
+parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
 parser.add_argument("--object-usda", default="")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
 parser.add_argument("--object-yaw-axis", default="x", choices=("x", "y"), help="which tool axis the object's long axis is aligned to (knife)")
+parser.add_argument("--object-yaw-deg", type=float, default=None, help="absolute world yaw of the object (overrides --object-yaw-axis)")
+parser.add_argument("--object-offset", default="0,0", help="dx,dy (base/world frame) of the object ORIGIN from the TCP xy; e.g. plate near-rim pinch = 0.10,0")
+parser.add_argument("--pedestal", type=float, default=0.10, help="static pedestal side length (m); must cover the object footprint")
+# Top-down family with a real descent (the bench's pick: pregrasp above, then
+# down onto the object, then close). --tcp-xz solves the planar IK for the
+# grasp TCP; --descend-from stages the arm that much higher, spawns the object
+# there, and each trial descends before closing.
+parser.add_argument("--tcp-xz", default="", help="grasp TCP x,z in base_link (top-down planar IK; y = 0, tool z = -z); overrides --pose")
+parser.add_argument("--closing-axis", default="y", choices=("x", "y"), help="base axis the jaw closes along in the top-down family (bench yaw=pi/2 -> x)")
+parser.add_argument("--descend-from", type=float, default=0.0, help="stage the arm this much above the grasp TCP and descend onto the object before every close (0 = spawn at the grasp pose)")
+parser.add_argument("--descend-s", type=float, default=2.0, help="descent duration (joint-space interpolation)")
+parser.add_argument("--lift-dz", type=float, default=0.10, help="--lift height when the IK family is in use")
 args = parser.parse_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -350,10 +362,108 @@ if args.grasp_config:
     events = cfg.get("close_events", cfg if isinstance(cfg, list) else [])
     if events:
         grasp = events[min(args.grasp_index, len(events) - 1)]
-arm_pose = dict(BUILTIN_POSES[args.pose])
+
+
+# --------------------------------------------------- planar top-down IK (URDF)
+# Planar elbow family: joints 1/3/5 = 0, joint7 fixed (0 -> jaw closes along
+# base y, +-pi/2 -> along base x); joints 2/4/6 solve TCP (x, z) + tool z = -z.
+# FK is the artifact URDF (same file the sim's USD was built from; verified
+# against the sim's link_tcp to < 2 mm for the built-in poses).
+def _urdf_fk_factory():
+    import xml.etree.ElementTree as ET
+
+    urdf = manifest.parent / "robot.urdf"
+    root_el = ET.parse(urdf).getroot()
+    joints: dict[str, dict] = {}
+    child_of: dict[str, str] = {}
+    for j in root_el.findall("joint"):
+        if j.find("parent") is None or j.find("child") is None:
+            continue
+        o = j.find("origin")
+        xyz = np.array([float(v) for v in (o.get("xyz", "0 0 0") if o is not None else "0 0 0").split()])
+        r, p, y = [float(v) for v in (o.get("rpy", "0 0 0") if o is not None else "0 0 0").split()]
+        a = j.find("axis")
+        axis = np.array([float(v) for v in (a.get("xyz") if a is not None else "1 0 0").split()])
+        cr, sr, cp, sp, cy, sy = math.cos(r), math.sin(r), math.cos(p), math.sin(p), math.cos(y), math.sin(y)
+        R0 = (np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]]) @ np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+              @ np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]]))
+        joints[j.get("name")] = {"type": j.get("type"), "parent": j.find("parent").get("link"), "R0": R0, "p0": xyz, "axis": axis / np.linalg.norm(axis)}
+        child_of[j.find("child").get("link")] = j.get("name")
+
+    def chain(link: str) -> list[str]:
+        out = []
+        while link in child_of:
+            out.append(child_of[link])
+            link = joints[child_of[link]]["parent"]
+        return list(reversed(out))
+
+    tcp_chain = chain("link_tcp")
+
+    def fk(q: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
+        R = np.eye(3)
+        p = np.zeros(3)
+        for jn in tcp_chain:
+            jd = joints[jn]
+            p = p + R @ jd["p0"]
+            R = R @ jd["R0"]
+            if jd["type"] in ("revolute", "continuous"):
+                a = jd["axis"]
+                K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+                th = q.get(jn, 0.0)
+                R = R @ (np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * K @ K)
+        return R, p
+
+    return fk
+
+
+def planar_topdown_ik(x: float, z: float, joint7: float, seed: dict[str, float] | None = None) -> dict[str, float]:
+    """Joints for TCP (x, 0, z) in base_link with tool z pointing straight down."""
+    fk = planar_topdown_ik._fk
+    q = dict(BUILTIN_POSES["topdown"] if seed is None else seed)
+    q["joint7"] = joint7
+    free = ("joint2", "joint4", "joint6")
+
+    def err(qd: dict[str, float]) -> np.ndarray:
+        R, p = fk(qd)
+        tz = R[:, 2]
+        pitch = math.atan2(tz[0], -tz[2])  # 0 when tool z == -base z (planar family: tz[1] == 0)
+        return np.array([p[0] - x, p[2] - z, 0.3 * pitch])
+
+    for _ in range(200):
+        e = err(q)
+        if np.linalg.norm(e) < 1e-7:
+            break
+        J = np.zeros((3, 3))
+        for c, jn in enumerate(free):
+            q2 = dict(q)
+            q2[jn] += 1e-6
+            J[:, c] = (err(q2) - e) / 1e-6
+        try:
+            step = -np.linalg.solve(J.T @ J + 1e-9 * np.eye(3), J.T @ e)
+        except np.linalg.LinAlgError:
+            break
+        for c, jn in enumerate(free):
+            q[jn] = float(q[jn] + step[c])
+    e = err(q)
+    if abs(e[0]) > 1e-3 or abs(e[1]) > 1e-3 or abs(e[2]) / 0.3 > 1e-2:
+        raise SystemExit(f"planar IK failed for x={x} z={z}: residual {e}")
+    return {j: float(q[j]) for j in ARM}
+
+
+ik_family = bool(args.tcp_xz)
+if ik_family:
+    planar_topdown_ik._fk = _urdf_fk_factory()  # type: ignore[attr-defined]
+    _gx, _gz = (float(v) for v in args.tcp_xz.split(","))
+    _j7 = 0.0 if args.closing_axis == "y" else math.pi / 2
+    arm_pose = planar_topdown_ik(_gx, _gz, _j7)
+    arm_source = f"ik:tcp=({_gx},{_gz}),closing={args.closing_axis}"
+else:
+    arm_pose = dict(BUILTIN_POSES[args.pose])
+    arm_source = f"builtin:{args.pose}"
 if grasp and "arm_joints" in grasp:
     arm_pose = {j: float(grasp["arm_joints"][j]) for j in ARM}
-emit(event="arm_pose", source="grasp_config" if grasp else f"builtin:{args.pose}", pose=arm_pose)
+    arm_source = "grasp_config"
+emit(event="arm_pose", source=arm_source, pose=arm_pose)
 wait_gripper_open()
 command_arm(arm_pose)
 settled = wait_arm(arm_pose)
@@ -364,6 +474,35 @@ pad_mid = [(a + b) / 2 for a, b in zip(lf_p, rf_p)]
 pad_axis = [a - b for a, b in zip(lf_p, rf_p)]
 emit(event="staged", settle_s=settled, tcp=tcp_p, tcp_quat_wxyz=tcp_q, left_finger=lf_p, right_finger=rf_p, pad_mid=pad_mid, pad_axis=pad_axis, gap=math.dist(lf_p, rf_p),
      root=backend.root_state() if hasattr(backend, "root_state") else None)
+# Descent staging: park the arm above the grasp before the object appears.
+stage_pose = arm_pose
+if args.descend_from > 0.0:
+    if not ik_family:
+        raise SystemExit("--descend-from needs --tcp-xz (planar IK family)")
+    stage_pose = planar_topdown_ik(_gx, _gz + args.descend_from, _j7, seed=arm_pose)
+    command_arm(stage_pose)
+    st = wait_arm(stage_pose)
+    stage_tcp, _ = body_pose("link_tcp")
+    emit(event="staged_high", settle_s=st, tcp=stage_tcp, dz=stage_tcp[2] - tcp_p[2], pose=stage_pose)
+
+
+def descend(duration_s: float) -> dict[str, object]:
+    """Interpolate stage_pose -> arm_pose in joint space, then hold 1 s; report the TCP z reached."""
+    n = max(1, int(duration_s / DT))
+    for k in range(1, n + 1):
+        a = k / n
+        command_arm({j: stage_pose[j] + a * (arm_pose[j] - stage_pose[j]) for j in ARM})
+        backend.step()
+    for _ in range(int(1.0 / DT)):
+        backend.step()
+    tcp_now, _ = body_pose("link_tcp")
+    lf_now, _ = body_pose("left_finger")
+    rf_now, _ = body_pose("right_finger")
+    _, pos, _, _ = backend.joint_state()
+    joint_err = {j: round(float(pos[JIDX[j]]) - arm_pose[j], 4) for j in ARM}
+    pairs = [(str(p["body_a"]).split("/")[-1], str(p["body_b"]).split("/")[-1], round(float(p["normal_force"]), 1)) for p in backend.contact_pairs()]
+    return {"tcp": tcp_now, "tcp_dz_vs_commanded": tcp_now[2] - tcp_p[2], "left_finger": lf_now, "right_finger": rf_now,
+            "joint_err": joint_err, "contact_pairs": pairs[:12]}
 
 
 # ----------------------------------------------------------------- Phase A
@@ -431,6 +570,14 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
             b = bottle_reader()
             r["bottle"] = b
             bottle_rows.append(b)
+            # pad geometry per step: where the finger bodies are (world) and
+            # whether a pad touches the pedestal (desk) rather than the object
+            lfp, _ = body_pose("left_finger")
+            rfp, _ = body_pose("right_finger")
+            r["lf_pos"] = [round(v, 4) for v in lfp]
+            r["rf_pos"] = [round(v, 4) for v in rfp]
+            if k % 6 == 0:
+                r["pairs"] = [(str(p["body_a"]).split("/")[-1], str(p["body_b"]).split("/")[-1], round(float(p["normal_force"]), 1)) for p in backend.contact_pairs()][:8]
         row(**r)
         last = r
     tail = int(0.5 / DT)
@@ -492,11 +639,12 @@ if "B" in args.phase:
         # height, 0.095) for the side grasp, or 0.02 above the desk for the
         # top-down knife pinch.
         above = args.tcp_above_top if args.tcp_above_top is not None else (0.095 if args.object == "bottle" else 0.02)
-        bottle_base = [tcp_p[0], tcp_p[1], tcp_p[2] - above]
-        source = f"tcp_minus_{above}"
+        odx, ody = (float(v) for v in args.object_offset.split(","))
+        bottle_base = [tcp_p[0] + odx, tcp_p[1] + ody, tcp_p[2] - above]
+        source = f"tcp_minus_{above}+offset({odx},{ody})"
     support_top = bottle_base[2]
     object_usda = args.object_usda or args.bottle_usda or str(
-        ROOT / "simulation/assets/primitives" / ("bench-bottle.usda" if args.object == "bottle" else "bench-knife.usda")
+        ROOT / "simulation/assets/primitives" / f"bench-{args.object}.usda"
     )
     # object yaw: align its long axis (asset +x) with the tool's x or y axis in world.
     # body_quat_w comes through as XYZW here (the backend's root_state reorders
@@ -506,6 +654,8 @@ if "B" in args.phase:
     tool_y = [2 * (qx * qy - w * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz + w * qx)]
     axis_v = tool_x if args.object_yaw_axis == "x" else tool_y
     object_yaw_deg = math.degrees(math.atan2(axis_v[1], axis_v[0]))
+    if args.object_yaw_deg is not None:
+        object_yaw_deg = float(args.object_yaw_deg)
     # static support block with desk-like friction
     mat = UsdShade.Material.Define(stage, "/World/Probe/SupportMat")
     mapi = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
@@ -513,13 +663,17 @@ if "B" in args.phase:
     mapi.CreateDynamicFrictionAttr(1.0)
     mapi.CreateRestitutionAttr(0.0)
     # Narrow pedestal (bottle footprint only): a wide block intersected the
-    # gripper hulls on spawn and exploded the articulation (probe1).
-    PED = 0.10
+    # gripper hulls on spawn and exploded the articulation (probe1). With
+    # --descend-from the arm is parked high at spawn, so --pedestal can be wide.
+    PED = float(args.pedestal)
     if support_top > 0.01:
         cube = UsdGeom.Cube.Define(stage, "/World/Probe/Support")
         cube.GetSizeAttr().Set(1.0)
         xf = UsdGeom.Xformable(cube.GetPrim())
-        xf.AddTranslateOp().Set(Gf.Vec3d(bottle_base[0], bottle_base[1], support_top / 2.0))
+        # centre the pedestal under the TCP + object (covers both footprints)
+        ped_cx = (tcp_p[0] + bottle_base[0]) / 2.0 if args.descend_from > 0.0 else bottle_base[0]
+        ped_cy = (tcp_p[1] + bottle_base[1]) / 2.0 if args.descend_from > 0.0 else bottle_base[1]
+        xf.AddTranslateOp().Set(Gf.Vec3d(ped_cx, ped_cy, support_top / 2.0))
         xf.AddScaleOp().Set(Gf.Vec3f(PED, PED, float(support_top)))
         UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
         UsdShade.MaterialBindingAPI.Apply(cube.GetPrim()).Bind(mat, materialPurpose="physics")
@@ -608,11 +762,18 @@ if "B" in args.phase:
             emit(event="abort", reason="articulation not sane before trial; stopping the sweep")
             break
         pre = bottle_state()
+        if args.descend_from > 0.0:
+            d = descend(args.descend_s)
+            d["object_after_descent"] = bottle_state()
+            emit(event="descent", **d)
         m = run_close("B", cfg, bottle_reader=bottle_state)
         m["bottle_pre"] = pre
         if args.lift:
-            lifted = dict(arm_pose)
-            lifted["joint2"] = arm_pose["joint2"] - 0.15  # shoulder up ~ raises the TCP
+            if ik_family:
+                lifted = planar_topdown_ik(_gx, _gz + args.lift_dz, _j7, seed=arm_pose)
+            else:
+                lifted = dict(arm_pose)
+                lifted["joint2"] = arm_pose["joint2"] - 0.15  # shoulder up ~ raises the TCP
             command_arm(lifted)
             for _ in range(int(2.0 / DT)):
                 backend.step()
@@ -624,8 +785,10 @@ if "B" in args.phase:
             # release BEFORE returning: a closed jaw descending onto an object
             # left on the pedestal jams the drive past its limit (probe6)
             wait_gripper_open()
-            command_arm(arm_pose)
-            wait_arm(arm_pose, timeout_s=5.0)
+        else:
+            wait_gripper_open()
+        command_arm(stage_pose)
+        wait_arm(stage_pose, timeout_s=5.0)
         emit(event="phaseB", **m)
 
 emit(event="done")

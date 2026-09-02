@@ -4,6 +4,78 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-02 — bench retention follow-ons: knife and plate are grasp-geometry, not sim bugs
+
+The mimic fix (below) turned the bench's first physically retained grasps
+(bottle held 2/3 at pure defaults, the campaign's first). The two remaining
+0/3 objects — knife and plate — were run down in the headless probe with the
+fixed backend and contacts ON; neither is a gripper-physics fault.
+
+**Aperture-vs-drive map (URDF FK, verified against the sim).** Pad-face gap by
+drive angle: 0.00→89 mm, 0.22→69 mm (bottle), 0.43→99 mm finger-origin sep,
+0.54→36 mm, 0.61→30 mm, 0.85→~6 mm. And the fingertips travel ~13 mm along the
+tool axis over a close (parallelogram arc): 3 mm short of the TCP plane at open,
+~9 mm PAST it near full close. So every top-down grasp height must add the arc:
+the commanded TCP sits ~9 mm above where the fingertips actually end.
+
+**Plate — infeasible geometry on the solid-disc asset (probe18).** The bench
+`bench-plate.usda` was a solid cylinder r=0.10 h=0.025 lying flush on the desk.
+A top-down radial rim pinch cannot grip it: with the jaw open 140 mm and closing
+along the radius, the inner pad lands 74 mm IN from the near rim, flat on the
+solid top face, and the arm's descent jams it there at ~120 N before the close
+starts; the outer pad closes through air and stops 32 mm short of the rim (7 N
+graze). The single-DOF linkage halts on the jammed knuckle at drive 0.36 and
+nothing is pinched (lift retains 0 N). The bench read 0.54/zero-force because
+`/sim/parity/finger_contact` is structurally silent in the sensor-rich profile,
+so the 120 N jam was invisible; those descent jams are also the source of the
+>120 N force-trace spikes (fingertip-on-rigid-surface strikes, not close
+punches — the close itself never exceeds ~20 N with the mirror fix). A side/edge
+pinch is equally blocked because the flush disc has no clearance beneath the
+rim. A real deep-plate asset (foot ring raising a shallow bowl with a raised
+rim, so a top-down rim pinch has clearance beneath) was authored and probed —
+and it revealed a deeper truth: **the plate is not the asset, it's the gripper
+model.** Across four rim geometries (6/16/25 mm walls, both jaw-centre biases)
+and with compliant contact enabled, a top-down rim pinch loads only the
+drive-side pad (~10 N) and the follower pad never engages (~1 N), so it never
+holds. The reason is the single-DOF mirror doing exactly what the mechanism
+says: the drive joint is the LEFT outer knuckle and the five followers track its
+MEASURED angle through a rigid coupling, so the instant the left pad jams on the
+rim's outer face the whole jaw freezes — before the right pad has closed the
+last few mm onto the inner face. Small objects trapped symmetrically between the
+pads (bottle 69 mm, knife 30 mm) load both sides and hold; a large object
+gripped at a local off-centre rim loads one side. This is faithful to a rigid
+single-motor gripper, not a bug (the OLD target mirror would load both pads here
+precisely because it drove the followers independently — the same
+independence that curled the pads and punched the bottle). Consequences: the
+plate needs either a grasp that traps it symmetrically (hard for a 200 mm disc),
+or the drive modeled as a CENTRAL actuator so a blocked finger doesn't halt its
+partner (a URDF/backend change, a follow-up), or removal from the goalset. The
+deep-plate asset and the four probes live in the session's evidence; the shipped
+`bench-plate.usda` is unchanged pending that decision.
+
+**Knife — graspable across the width; the failures were candidate + facade
+(probe19).** A correct top-down centre pinch with the knife's 30 mm width across
+the closing axis holds it 3/3: descent clean (pads straddle the width, no jam),
+close stalls at drive 0.61 (=30 mm), pads bite the two sides (18 N / 8 N), lift
+raises the knife +94 mm with the TCP at ~15 N hold. The bench's failures: (a)
+candidate idx 0 sits 60 mm off-centre and closes on air — drive runs 0→0.825 at
+full speed then sits dead flat, the exact signature in the bench mimic trace;
+(b) the settled knife yaw is not guaranteed to land the 30 mm width across the
+closing axis (a spawn-rotation quirk the benchmark owns); (c) the running bridge
+facade on the main checkout (task50-stage-a-repair @ d8cc0ff) predates the
+contact-free position-stall path (`stall_dwell`, added on task-sim-bugfixes at
+a46d108), so an air-close never latches `stalled=true` and instead times out
+three times as "native gripper: execution failed" (~111 s = 3 × the 5 s sim
+timeout at sub-1.0 RTF). Benchmark-side geometry + a facade heal on the main
+checkout; not the sim's gripper.
+
+**Community cross-check.** Isaac Sim's own closed-loop tutorial (Robotiq 2F-85)
+breaks the parallelogram loop and drives followers via the PhysX Mimic Joint API
+referencing the drive joint's state — never by copying a commanded target — and
+ros2_control's gripper action controller aborts on stall by default
+(`allow_stalling: false`), which is the generic shape of the facade abort. Both
+corroborate the fixes here.
+
 ## 2026-09-02 — close-phase punch root cause: the mimic mirror copied the TARGET, not the drive's angle
 
 Closes Task #19 at the source. Five reactive/solver-level cycles (below) treated
