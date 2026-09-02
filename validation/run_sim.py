@@ -1035,7 +1035,18 @@ def main() -> int:
                 map_yaml=args.map_yaml,
                 seed=args.seed,
                 render=False,
-                enable_contacts=False,
+                # Opt-in for grasp/retention work: without PhysX contact
+                # reporting, /sim/parity/finger_contact is structurally zero
+                # and the gripper facade can never recognize a physical
+                # stall on an object as a grasp (its stall-as-success path
+                # requires fresh contact force) — every stalled close times
+                # out and aborts ("native gripper: execution failed").
+                # manipulation-core always runs with contacts on; default
+                # stays off here to keep the camera-heavy profile's step
+                # cost unchanged for existing campaigns.
+                enable_contacts=(
+                    os.environ.get("TINKER_SIM_SENSOR_RICH_CONTACTS") == "1"
+                ),
                 add_ground_plane=True,
                 expected_objects=expected_objects,
                 scenario=args.scenario,
@@ -1044,7 +1055,11 @@ def main() -> int:
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
             )
-            from tinker_sim_isaac.camera_rig import CameraRig, load_camera_specs
+            from tinker_sim_isaac.camera_rig import (
+                CameraRig,
+                load_camera_specs,
+                load_spectator_spec,
+            )
 
             camera_specs = load_camera_specs(
                 root / "simulation/sensors/hardware-parity.json"
@@ -1082,6 +1097,19 @@ def main() -> int:
                 print(
                     f"[sim] {WRIST_AIM_ENV} active: wrist camera aim corrected in "
                     "simulation only -- hardware parity is deliberately broken",
+                    flush=True,
+                )
+            # Opt-in, sim-only world-fixed spectator camera; a separate spec
+            # file so the hardware-parity contract stays unedited. Appended
+            # before the arena camera so that camera, when enabled, stays
+            # last (_arena_camera_enabled relies on it).
+            spectator_path = os.environ.get("TINKER_SIM_SPECTATOR_CAMERA")
+            if spectator_path:
+                spectator = load_spectator_spec(Path(spectator_path))
+                camera_specs = camera_specs + (spectator,)
+                print(
+                    f"[sim] spectator camera enabled at {spectator.tick_rate_hz:g} Hz, "
+                    f"{spectator.width}x{spectator.height} -> {spectator.color_topic}",
                     flush=True,
                 )
             filtered_camera_specs = _without_wrist_camera(camera_specs, os.environ)
