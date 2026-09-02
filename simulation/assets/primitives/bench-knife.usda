@@ -4,6 +4,12 @@
     upAxis = "Z"
     metersPerUnit = 1
 )
+# Knife modeled as two collision boxes under one rigid body: a metal blade
+# (front 0.12 m) and a wooden handle (rear 0.08 m). They share the original
+# 0.03 x 0.025 cross-section and abut end-to-end, so the union footprint is
+# byte-identical to the old single 0.20 m cube -- the top-down cross-width
+# grasp near the blade/handle junction is physically unchanged; only the
+# colouring differs (blade grey, handle wood).
 def Xform "BenchKnife" (
     prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysxRigidBodyAPI", "PhysicsMassAPI"]
 )
@@ -14,10 +20,23 @@ def Xform "BenchKnife" (
     )
     {
         double size = 1
-        float3 xformOp:scale = (0.20, 0.03, 0.025)
-        double3 xformOp:translate = (0, 0, 0.0125)
+        float3 xformOp:scale = (0.12, 0.03, 0.025)
+        double3 xformOp:translate = (-0.04, 0, 0.0125)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
-        color3f[] primvars:displayColor = [(0.7, 0.7, 0.72)]
+        color3f[] primvars:displayColor = [(0.72, 0.72, 0.75)]
+        rel material:binding:physics = </BenchKnife/PhysicsMat> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
+    }
+    def Cube "Handle" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        double size = 1
+        float3 xformOp:scale = (0.08, 0.03, 0.025)
+        double3 xformOp:translate = (0.06, 0, 0.0125)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        color3f[] primvars:displayColor = [(0.55, 0.33, 0.16)]
         rel material:binding:physics = </BenchKnife/PhysicsMat> (
             bindMaterialAs = "weakerThanDescendants"
         )
