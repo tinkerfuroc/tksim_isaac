@@ -15,7 +15,32 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
+
+# Module-name prefixes the tests stub into sys.modules; snapshot + restore so a
+# fake isaacsim/omni/pxr never leaks into other test files in the same session.
+_STUB_PREFIXES = ("isaacsim", "omni", "pxr")
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    saved = {
+        name: mod
+        for name, mod in sys.modules.items()
+        if name == "run_sim" or name.split(".")[0] in _STUB_PREFIXES
+    }
+    try:
+        yield
+    finally:
+        for name in [
+            n
+            for n in sys.modules
+            if n == "run_sim" or n.split(".")[0] in _STUB_PREFIXES
+        ]:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
 
 
 def _load_run_sim():
@@ -42,17 +67,26 @@ class _FakePrim:
         return types.SimpleNamespace(pathString=self._path)
 
 
-def _install_fakes(prim: _FakePrim) -> None:
-    # pxr.UsdPhysics with distinct API sentinels.
+def _install_fake_isaacsim() -> None:
+    # A fake isaacsim package whose derived extension dir does not exist on disk
+    # (so the path splice is skipped) but whose submodules resolve from the
+    # stubs installed below.
+    isaacsim = types.ModuleType("isaacsim")
+    isaacsim.__file__ = "/nonexistent/isaacsim/__init__.py"
+    isaacsim.__path__ = []
+    sys.modules["isaacsim"] = isaacsim
+
+
+def _install_fakes_for_guard(prim: _FakePrim) -> None:
     pxr = types.ModuleType("pxr")
     pxr.UsdPhysics = types.SimpleNamespace(
         RigidBodyAPI="RigidBodyAPI", ArticulationRootAPI="ArticulationRootAPI"
     )
     sys.modules["pxr"] = pxr
 
-    # omni.usd.get_context().get_stage().GetPrimAtPath(path) -> prim.
     stage = types.SimpleNamespace(GetPrimAtPath=lambda path: prim)
     omni = types.ModuleType("omni")
+    omni.__path__ = []
     omni_usd = types.ModuleType("omni.usd")
     omni_usd.get_context = lambda: types.SimpleNamespace(get_stage=lambda: stage)
     omni.usd = omni_usd
@@ -68,17 +102,18 @@ def _install_fake_sim_control():
             seen["original_called"] += 1
             return response
 
+    _install_fake_isaacsim()
     for name in (
-        "isaacsim",
         "isaacsim.ros2",
         "isaacsim.ros2.sim_control",
         "isaacsim.ros2.sim_control.impl",
     ):
-        sys.modules.setdefault(name, types.ModuleType(name))
+        module = types.ModuleType(name)
+        module.__path__ = []
+        sys.modules[name] = module
     module = types.ModuleType("isaacsim.ros2.sim_control.impl.simulation_control")
     module.SimulationControl = _SimulationControl
     sys.modules["isaacsim.ros2.sim_control.impl.simulation_control"] = module
-    # `from ...impl import simulation_control` binds via the parent attribute.
     sys.modules["isaacsim.ros2.sim_control.impl"].simulation_control = module
     return module, seen
 
@@ -118,9 +153,10 @@ def _run(coro):
 
 
 def test_installer_skips_when_extension_absent() -> None:
-    sys.modules.pop("isaacsim.ros2.sim_control.impl.simulation_control", None)
+    # A fake isaacsim whose extension module is absent -> import fails -> the
+    # installer skips gracefully without raising.
+    _install_fake_isaacsim()
     run_sim = _load_run_sim()
-    # Pre-enable import unavailable -> returns without raising.
     run_sim._install_set_entity_state_physics({"backend": None})
 
 
@@ -131,7 +167,7 @@ def test_patched_handler_writes_physics_pose_for_free_rigid_body() -> None:
     root = _FakePrim("/", set(), None)
     world = _FakePrim("/World", set(), root)
     prim = _FakePrim("/World/Scenario/bench_bottle_100", {"RigidBodyAPI"}, world)
-    _install_fakes(prim)
+    _install_fakes_for_guard(prim)
 
     holder = {"backend": None}
     run_sim._install_set_entity_state_physics(holder)
@@ -163,7 +199,7 @@ def test_patched_handler_skips_articulation_root() -> None:
     root = _FakePrim("/", set(), None)
     robot = _FakePrim("/World/Tinker", {"ArticulationRootAPI"}, root)
     link = _FakePrim("/World/Tinker/base_link", {"RigidBodyAPI"}, robot)
-    _install_fakes(link)
+    _install_fakes_for_guard(link)
 
     holder = {"backend": None}
     run_sim._install_set_entity_state_physics(holder)

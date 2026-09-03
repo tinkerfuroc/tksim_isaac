@@ -703,9 +703,19 @@ def _install_set_entity_state_physics(backend_holder: dict) -> None:
     the body.
 
     MUST be installed BEFORE ``enable_extension("isaacsim.ros2.sim_control")``:
-    the handler bound-method is captured inside the ROS service closure at
-    registration time (during the extension's ``on_startup``) and never looked
-    up again, so a later patch would not be seen.
+    ``enable_extension`` enables the extension IMMEDIATELY
+    (``set_extension_enabled_immediate``), so it registers the extension's
+    python path AND runs its ``on_startup`` -- which constructs
+    ``SimulationControl`` and captures ``self._handle_set_entity_state`` as a
+    bound method inside the ROS service registry -- all in one call. A patch
+    applied after ``enable_extension`` would be too late for that captured
+    bound method, and the module is not importable before it because the
+    extension's ``isaacsim.ros2.*`` path is only spliced in at enable time.
+
+    So we splice the extension's own ``isaacsim/`` directory into the
+    ``isaacsim`` namespace path ourselves, import + patch the class BEFORE
+    enable, and let ``on_startup`` construct from the patched class (the module
+    is cached in ``sys.modules``, so Kit's own import reuses it).
 
     Scope guard: only prims that are free rigid bodies (``RigidBodyAPI`` and no
     ``ArticulationRootAPI`` on the prim or an ancestor) are written this way.
@@ -714,6 +724,23 @@ def _install_set_entity_state_physics(backend_holder: dict) -> None:
     is only safe for parked (never-deleted) prims -- callers must park-not-delete.
     """
     try:
+        import isaacsim as _isaacsim
+
+        # The extension's python path (isaacsim.ros2.sim_control) is registered
+        # only when the extension is enabled, but we must patch before that.
+        # Splice the extension's own namespace directory into isaacsim.__path__
+        # so the module imports now; enable_extension will reuse the cached,
+        # patched module for on_startup.
+        _ext_isaacsim = os.path.join(
+            os.path.dirname(_isaacsim.__file__),
+            "exts",
+            "isaacsim.ros2.sim_control",
+            "isaacsim",
+        )
+        if os.path.isdir(_ext_isaacsim) and _ext_isaacsim not in list(
+            getattr(_isaacsim, "__path__", [])
+        ):
+            _isaacsim.__path__.append(_ext_isaacsim)
         from isaacsim.ros2.sim_control.impl import simulation_control as _sc
     except (Exception, SystemExit) as error:  # noqa: BLE001 - optional; a failed
         # pre-enable import (unavailable, or a Kit/EULA bootstrap SystemExit in a
