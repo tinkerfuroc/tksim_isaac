@@ -331,6 +331,116 @@ def test_stale_contact_from_previous_goal_does_not_stall(ros_context) -> None:
         source.destroy_node()
 
 
+def test_settled_grasp_keeps_clamping_after_success(ros_context) -> None:
+    # The GripperCommand action returns once the close settles, but the physical
+    # grip must persist -- the simulator's command mux drops any source it has
+    # not heard from within 0.5 s and replaces it with a zero-effort measured
+    # hold (the object slides out at ~5 N).  So after a settled/stalled success
+    # the facade must keep streaming the full-effort clamp, not go silent.
+    node = GripperFacade()
+    _clear_safety(node)
+    node.set_parameters([Parameter("stall_dwell_s", Parameter.Type.DOUBLE, 0.15)])
+    source = Node("gripper_executor_keepalive_source")
+    state_publisher = source.create_publisher(JointState, "/isaac_joint_states", 20)
+    command_messages = []
+    source.create_subscription(
+        JointState,
+        "/sim/controller/gripper_commands",
+        command_messages.append,
+        20,
+    )
+    goal = _GoalHandle(target=1.0)  # max_effort defaults to 1.0
+    _run_goal_with_timer(node, goal)
+
+    def publish_state() -> None:
+        message = JointState()
+        message.name = ["drive_joint"]
+        message.position = [0.4]  # parked short -> position stall -> settled
+        state_publisher.publish(message)
+
+    state_timer = source.create_timer(0.02, publish_state)
+    executor, spin_thread = _spin(node, source)
+    try:
+        assert goal.finished.wait(3.0)
+        assert goal.outcome == "succeeded"
+
+        def clamp_count() -> int:
+            return sum(
+                1
+                for message in list(command_messages)
+                if message.effort == pytest.approx([1.0])
+            )
+
+        count_at_success = clamp_count()
+        time.sleep(0.4)  # many multiples of the 0.05 s keepalive period
+        # The clamp keeps being published after the action already returned.
+        assert clamp_count() >= count_at_success + 3
+        clamp = next(
+            message
+            for message in reversed(command_messages)
+            if message.effort == pytest.approx([1.0])
+        )
+        assert clamp.position == pytest.approx([1.0])  # commanded target, full effort
+    finally:
+        state_timer.cancel()
+        executor.shutdown()
+        spin_thread.join(timeout=2.0)
+        node.destroy_node()
+        source.destroy_node()
+
+
+def test_fresh_contact_requires_dwell_before_success(ros_context) -> None:
+    # Success is a settled grasp, not first touch: a finger brushing the object
+    # at threshold force has not yet clamped it.  A fresh contact must persist
+    # for stall_dwell_s before it counts, so the grasp does not "succeed" the
+    # instant a pad touches (which would latch a feather-light clamp).
+    node = GripperFacade()
+    _clear_safety(node)
+    node.set_parameters([Parameter("stall_dwell_s", Parameter.Type.DOUBLE, 0.3)])
+    source = Node("gripper_executor_contact_dwell_source")
+    state_publisher = source.create_publisher(JointState, "/isaac_joint_states", 20)
+    contact_publisher = source.create_publisher(
+        WrenchStamped, "/sim/parity/finger_contact", 20
+    )
+    goal = _GoalHandle(target=1.0)
+    _run_goal_with_timer(node, goal)
+
+    # Keep the measured position improving toward the target so the contact-free
+    # position-stall path never latches -- only sustained contact can end this
+    # grasp, isolating the contact-dwell behaviour under test.
+    progress = {"p": 0.0}
+
+    def publish_state() -> None:
+        progress["p"] = min(0.9, progress["p"] + 0.01)
+        message = JointState()
+        message.name = ["drive_joint"]
+        message.position = [progress["p"]]
+        state_publisher.publish(message)
+
+    def publish_contact() -> None:
+        contact = WrenchStamped()
+        contact.wrench.force.z = 10.0  # well above the 1 N threshold
+        contact_publisher.publish(contact)
+
+    state_timer = source.create_timer(0.02, publish_state)
+    contact_timer = source.create_timer(0.02, publish_contact)
+    executor, spin_thread = _spin(node, source)
+    try:
+        # First touch must NOT instantly succeed inside the dwell window.
+        assert not goal.finished.wait(0.2)
+        # Sustained contact past the dwell settles into a stalled success.
+        assert goal.finished.wait(3.0)
+        assert goal.outcome == "succeeded"
+        assert any(feedback.stalled for feedback in goal.feedback)
+    finally:
+        state_timer.cancel()
+        contact_timer.cancel()
+        executor.shutdown()
+        spin_thread.join(timeout=2.0)
+        node.destroy_node()
+        source.destroy_node()
+
+
 def test_finger_parked_short_of_target_stalls_without_contact(ros_context) -> None:
     # A close that stops advancing toward its target while still short of it --
     # with no contact telemetry at all -- is a physical stall and must report a

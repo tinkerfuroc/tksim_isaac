@@ -54,6 +54,14 @@ class GripperFacade(Node):
         self._active_goal_reserved = False
         self._active_goal_handle = None
         self._cancel_requested = False
+        # A settled grasp must keep clamping.  The GripperCommand action returns
+        # once the close has settled, but the physical grip has to persist after
+        # that -- and the simulator's command mux drops any source it has not
+        # heard from within 0.5 s, replacing it with a zero-effort measured hold
+        # (the object slides out at ~5 N).  So once a grasp settles we latch the
+        # clamp command here and a steady-time timer republishes it faster than
+        # that watchdog, holding full effort until the next goal or a safety stop.
+        self._keepalive_command: JointState | None = None
         self._lock = threading.Lock()
         self._commands = self.create_publisher(
             JointState, "/sim/controller/gripper_commands", 20
@@ -91,6 +99,16 @@ class GripperFacade(Node):
             clock=Clock(clock_type=ClockType.STEADY_TIME),
             callback_group=callbacks,
         )
+        # Republish a latched grasp clamp on wall-clock cadence (20 Hz keeps a
+        # 10x margin under the mux's 0.5 s source watchdog).  Steady-time, not
+        # sim-time: the watchdog measures wall seconds, so a sim-time timer would
+        # slow past the deadline whenever RTF drops under load.
+        self.create_timer(
+            0.05,
+            self._keepalive_tick,
+            clock=Clock(clock_type=ClockType.STEADY_TIME),
+            callback_group=callbacks,
+        )
         self._server = ActionServer(
             self,
             GripperCommand,
@@ -124,8 +142,10 @@ class GripperFacade(Node):
         with self._lock:
             self._safety_last_sample_at = time.monotonic()
             self._stopped = bool(message.data)
-            retire = self._stopped and self._active_goal_reserved
-            if retire:
+            if self._stopped:
+                # A safety stop overrides any latched grasp clamp: drop the
+                # keepalive and fall back to a zero-effort measured hold.
+                self._keepalive_command = None
                 self._publish_hold_locked(self._position)
 
     def _enforce_safety_deadline(self, now: float | None = None) -> None:
@@ -137,8 +157,10 @@ class GripperFacade(Node):
             if self._stopped:
                 return
             self._stopped = True
-            if self._active_goal_reserved:
-                self._publish_hold_locked(self._position)
+            # Losing the safety heartbeat is a stop: drop any latched clamp and
+            # hold at the measured position with zero effort.
+            self._keepalive_command = None
+            self._publish_hold_locked(self._position)
 
     def _cancel(self, _goal_handle) -> CancelResponse:
         with self._lock:
@@ -155,7 +177,25 @@ class GripperFacade(Node):
                 return GoalResponse.REJECT
             self._active_goal_reserved = True
             self._cancel_requested = False
+            # A new grasp owns the command stream; retire any prior clamp so a
+            # cancel/abort of this goal cannot resume the old hold.
+            self._keepalive_command = None
             return GoalResponse.ACCEPT
+
+    def _keepalive_tick(self) -> None:
+        with self._lock:
+            # An in-flight goal owns the command stream (its execute loop
+            # publishes); the keepalive only runs between goals.
+            if self._active_goal_handle is not None or self._active_goal_reserved:
+                return
+            command = self._keepalive_command
+            if command is None:
+                return
+            if self._stopped:
+                self._keepalive_command = None
+                self._publish_hold_locked(self._position)
+                return
+            self._commands.publish(command)
 
     def _publish_hold(self, position: float) -> None:
         with self._lock:
@@ -215,6 +255,7 @@ class GripperFacade(Node):
             stall_epsilon = float(self.get_parameter("stall_epsilon").value)
             best_error: float | None = None
             last_progress_at = time.monotonic()
+            contact_since: float | None = None
             with self._lock:
                 position = self._position
                 effort = self._effort
@@ -269,17 +310,39 @@ class GripperFacade(Node):
                     and error > tolerance
                     and now_monotonic - last_progress_at >= stall_dwell
                 )
+                # Success is a SETTLED grasp, not first touch.  A finger that
+                # brushes the object at 1 N has not yet clamped it; declaring
+                # success there returns before the grip is established and (with
+                # the keepalive now holding whatever we latch) would clamp only a
+                # feather-light force.  So a contact must persist for stall_dwell
+                # -- the same dwell the position path uses -- before it counts.
+                # With stall_dwell <= 0 (the isolation-test / contact-only
+                # fallback) this reduces to the original instantaneous contact
+                # stall, since a zero dwell is satisfied immediately.
+                if contact_is_fresh and contact >= contact_threshold:
+                    if contact_since is None:
+                        contact_since = now_monotonic
+                else:
+                    contact_since = None
+                contact_stalled = (
+                    contact_since is not None
+                    and error > tolerance
+                    and now_monotonic - contact_since >= stall_dwell
+                )
                 feedback = GripperCommand.Feedback()
                 feedback.position = position
                 feedback.effort = effort
                 feedback.reached_goal = error <= tolerance
-                feedback.stalled = (
-                    contact_is_fresh
-                    and contact >= contact_threshold
-                    and error > tolerance
-                ) or position_stalled
+                feedback.stalled = position_stalled or contact_stalled
                 goal_handle.publish_feedback(feedback)
                 if feedback.reached_goal or feedback.stalled:
+                    # Latch the clamp so it survives past the action's return:
+                    # the keepalive timer keeps streaming this command (full
+                    # effort at the commanded target) until the next goal or a
+                    # safety stop, holding the grasp instead of decaying to the
+                    # mux's zero-effort measured hold.
+                    with self._lock:
+                        self._keepalive_command = command
                     goal_handle.succeed()
                     result.reached_goal = feedback.reached_goal
                     result.stalled = feedback.stalled
