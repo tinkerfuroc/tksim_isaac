@@ -689,6 +689,123 @@ def validate_arena_spawn(arena_dir: Path, spawn_xy: tuple[float, float]) -> None
     )
 
 
+def _install_set_entity_state_physics(backend_holder: dict) -> None:
+    """Make the standard simulation_interfaces ``/set_entity_state`` service
+    physics-effective for spawned free rigid bodies.
+
+    NVIDIA's ``isaacsim.ros2.sim_control`` handler wraps the target prim in a
+    ``RigidPrim`` whose tensor view is not yet resolved for a freshly spawned
+    body and silently falls back to authoring the USD layer -- a physics no-op
+    for a body already bound to PhysX (the parked "set_entity_state does not
+    move spawned objects" defect, Task #5/#12). We wrap the handler so that,
+    after it runs, the pose+twist are also written straight through the
+    backend's rigid-body view (``set_entity_pose_physics``), which does move
+    the body.
+
+    MUST be installed BEFORE ``enable_extension("isaacsim.ros2.sim_control")``:
+    the handler bound-method is captured inside the ROS service closure at
+    registration time (during the extension's ``on_startup``) and never looked
+    up again, so a later patch would not be seen.
+
+    Scope guard: only prims that are free rigid bodies (``RigidBodyAPI`` and no
+    ``ArticulationRootAPI`` on the prim or an ancestor) are written this way.
+    That deliberately excludes the robot articulation, whose root pose is a
+    different write path. A view is cached per prim and never released, so this
+    is only safe for parked (never-deleted) prims -- callers must park-not-delete.
+    """
+    try:
+        from isaacsim.ros2.sim_control.impl import simulation_control as _sc
+    except (Exception, SystemExit) as error:  # noqa: BLE001 - optional; a failed
+        # pre-enable import (unavailable, or a Kit/EULA bootstrap SystemExit in a
+        # degenerate env) must never abort the boot -- skip the enhancement.
+        print(
+            json.dumps(
+                {
+                    "set_entity_state_physics": "patch_skipped",
+                    "reason": f"sim_control not importable pre-enable: {error}",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return
+
+    original = _sc.SimulationControl._handle_set_entity_state
+    if getattr(original, "_tinker_physics_wrapped", False):
+        return
+
+    def _is_free_rigid_body(entity_path: str) -> bool:
+        try:
+            import omni.usd
+            from pxr import UsdPhysics
+
+            stage = omni.usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath(entity_path)
+            if not prim or not prim.IsValid():
+                return False
+            if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                return False
+            node = prim
+            while node and node.GetPath().pathString not in ("", "/"):
+                if node.HasAPI(UsdPhysics.ArticulationRootAPI):
+                    return False  # part of an articulation (e.g. the robot)
+                node = node.GetParent()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _patched(self, request, response):
+        result = await original(self, request, response)
+        backend = backend_holder.get("backend")
+        entity_path = str(getattr(request, "entity", ""))
+        if backend is not None and entity_path and _is_free_rigid_body(entity_path):
+            try:
+                state = request.state
+                position = state.pose.position
+                orientation = state.pose.orientation
+                linear = state.twist.linear
+                angular = state.twist.angular
+                applied = backend.set_entity_pose_physics(
+                    entity_path,
+                    [position.x, position.y, position.z],
+                    [orientation.x, orientation.y, orientation.z, orientation.w],
+                    [linear.x, linear.y, linear.z],
+                    [angular.x, angular.y, angular.z],
+                )
+                if not applied:
+                    print(
+                        json.dumps(
+                            {
+                                "set_entity_state_physics": "write_not_applied",
+                                "entity": entity_path,
+                                "hint": "no rigid-body view resolved under the prim",
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+            except Exception as error:  # noqa: BLE001
+                print(
+                    json.dumps(
+                        {
+                            "set_entity_state_physics": "write_error",
+                            "entity": entity_path,
+                            "error": str(error),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+        return result
+
+    _patched._tinker_physics_wrapped = True
+    _sc.SimulationControl._handle_set_entity_state = _patched
+    print(
+        json.dumps({"set_entity_state_physics": "patched"}, sort_keys=True),
+        flush=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -826,9 +943,14 @@ def main() -> int:
     visual_capture = None
     failed = False
     try:
+        # Holds the backend so the /set_entity_state physics-effective patch
+        # (installed before the extension registers its services) can reach it
+        # once it is constructed further below.
+        set_entity_state_backend_holder: dict = {"backend": None}
         if args.ros:
             from isaacsim.core.utils.extensions import enable_extension
 
+            _install_set_entity_state_physics(set_entity_state_backend_holder)
             enable_extension("isaacsim.ros2.sim_control")
             app.update()
         if args.sensor_profile == "navigation-parity":
@@ -860,6 +982,7 @@ def main() -> int:
                 expected_objects=expected_objects, scenario=args.scenario,
                 task=args.scenario,
             )
+            set_entity_state_backend_holder["backend"] = backend
             arena_camera_eye = None
             arena_camera_target = None
             arena_bounds = None
@@ -1055,6 +1178,7 @@ def main() -> int:
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
             )
+            set_entity_state_backend_holder["backend"] = backend
             from tinker_sim_isaac.camera_rig import (
                 CameraRig,
                 load_camera_specs,
@@ -1359,6 +1483,7 @@ def main() -> int:
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
             )
+            set_entity_state_backend_holder["backend"] = backend
             if backend.physics_device != "cpu":
                 raise RuntimeError("manipulation-core selected a non-CPU physics device")
             # Task-8 fix round 3 (Option A+): qualification-only occupancy for

@@ -531,6 +531,11 @@ class IsaacWholeRobotBackend:
         self.scenario = str(scenario)
         self.task = str(task or scenario)
         self._object_views: dict[str, Any] = {}
+        # Physics-effective pose-write views for PARKED rigid bodies, keyed by
+        # prim path (see set_entity_pose_physics). Same never-released tensor
+        # views as _object_views and the same never-delete safety contract:
+        # only prims that are parked and never deleted may be written here.
+        self._park_views: dict[str, Any] = {}
         # Diagnostic pose tracker for arbitrary rigid-body prims, opt-in via
         # TINKER_SIM_TRACK_OBJECTS=/World/Scenario/a,/World/Scenario/b.
         # Prints one JSON line per tracked prim every ~0.25 s of control
@@ -2910,6 +2915,95 @@ class IsaacWholeRobotBackend:
                 }
             )
         return states
+
+    def set_entity_pose_physics(
+        self,
+        prim_path: str,
+        position: "list[float]",
+        quaternion_xyzw: "list[float]",
+        linear_velocity: "list[float]" = (0.0, 0.0, 0.0),
+        angular_velocity: "list[float]" = (0.0, 0.0, 0.0),
+    ) -> bool:
+        """Move a rigid body to a world pose PHYSICS-EFFECTIVELY (tensor write).
+
+        Routes the write through the shared PhysX SimulationView's rigid-body
+        view (``set_transforms``/``set_velocities``) -- the same view mechanism
+        the truth stream reads through in ``_refresh_object_views`` -- so the
+        body actually moves in physics. The standard ``/set_entity_state``
+        wraps a freshly spawned prim in a ``RigidPrim`` whose tensor view is
+        not yet resolved and silently falls back to authoring the USD layer,
+        which is a physics no-op for a body already bound to PhysX; this write
+        is the effective path.
+
+        ``position`` is world xyz; ``quaternion_xyzw`` is [qx, qy, qz, qw]
+        (scalar last), matching the tensor transform row exactly (no reorder).
+
+        The per-prim view is cached and NEVER released (these views have no
+        release API). Holding a view on a prim that is later DELETED
+        invalidates the shared SimulationView and kills the whole boot (see
+        ``_refresh_object_views`` / ``_heal_detached_scenario_bodies``), so
+        this is safe ONLY for PARKED prims that are never deleted -- callers
+        must park-not-delete. A deletable spawn must not be moved through here.
+
+        Returns True once the tensor write is applied (the move takes effect on
+        the next physics step); False if no rigid body resolves under
+        ``prim_path`` or the runtime lacks the write API.
+        """
+        view = self._park_views.get(prim_path)
+        if view is None:
+            try:
+                from isaaclab_physx.physics import PhysxManager
+
+                physics_view = PhysxManager.get_physics_sim_view()
+                view = physics_view.create_rigid_body_view(prim_path)
+                count = int(view.count) if view is not None else 0
+            except (AttributeError, ImportError, RuntimeError, TypeError):
+                return False
+            if not count:
+                return False
+            self._park_views[prim_path] = view
+        device = getattr(self._robot, "device", None)
+        transforms = self._torch.tensor(
+            [
+                [
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2]),
+                    float(quaternion_xyzw[0]),
+                    float(quaternion_xyzw[1]),
+                    float(quaternion_xyzw[2]),
+                    float(quaternion_xyzw[3]),
+                ]
+            ],
+            dtype=self._torch.float32,
+            device=device,
+        )
+        velocities = self._torch.tensor(
+            [
+                [
+                    float(linear_velocity[0]),
+                    float(linear_velocity[1]),
+                    float(linear_velocity[2]),
+                    float(angular_velocity[0]),
+                    float(angular_velocity[1]),
+                    float(angular_velocity[2]),
+                ]
+            ],
+            dtype=self._torch.float32,
+            device=device,
+        )
+        indices = self._torch.tensor([0], dtype=self._torch.int32, device=device)
+        try:
+            try:
+                view.set_transforms(transforms, indices)
+                view.set_velocities(velocities, indices)
+            except TypeError:
+                # Some runtime builds expose the single-argument form.
+                view.set_transforms(transforms)
+                view.set_velocities(velocities)
+        except (AttributeError, RuntimeError):
+            return False
+        return True
 
     def _robot_truth_state(self) -> dict[str, object]:
         data = self._robot.data

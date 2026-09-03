@@ -2199,6 +2199,60 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertNotRegex(backend_source, r"self\._gripper_max_lead = 0\.015")
         self.assertIn("TINKER_SIM_GRIPPER_MAX_LEAD_RAD", backend_source)
 
+    def test_set_entity_pose_physics_writes_transform_and_velocity(self) -> None:
+        """A physics-effective park write pushes the world pose + zeroed twist
+        straight into a cached rigid-body view, in xyzw order (no reorder), and
+        reuses the cached view instead of rebuilding it (poison-safe)."""
+
+        class _RecordingView:
+            count = 1
+
+            def __init__(self) -> None:
+                self.transforms = None
+                self.velocities = None
+
+            def set_transforms(self, data, indices=None) -> None:
+                self.transforms = data
+
+            def set_velocities(self, data, indices=None) -> None:
+                self.velocities = data
+
+        backend = object.__new__(IsaacWholeRobotBackend)
+        backend._torch = torch
+        backend._robot = SimpleNamespace(device="cpu")
+        view = _RecordingView()
+        path = "/World/Scenario/bench_bottle_100"
+        backend._park_views = {path: view}
+
+        ok = backend.set_entity_pose_physics(
+            path,
+            position=[1.0, 2.0, 0.05],
+            quaternion_xyzw=[0.0, 0.0, 0.3826834, 0.9238795],  # yaw 45 deg, xyzw
+            linear_velocity=[0.0, 0.0, 0.0],
+            angular_velocity=[0.0, 0.0, 0.0],
+        )
+        self.assertTrue(ok)
+        row = view.transforms[0].tolist()
+        self.assertEqual([round(v, 4) for v in row[:3]], [1.0, 2.0, 0.05])
+        self.assertEqual(
+            [round(v, 6) for v in row[3:7]], [0.0, 0.0, 0.382683, 0.92388]
+        )
+        vel = view.velocities[0].tolist()
+        self.assertEqual([round(v, 4) for v in vel], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertIs(backend._park_views[path], view)
+
+    def test_set_entity_pose_physics_false_without_resolvable_view(self) -> None:
+        """No cached view and no live PhysX (unit env) -> graceful False."""
+        backend = object.__new__(IsaacWholeRobotBackend)
+        backend._torch = torch
+        backend._robot = SimpleNamespace(device="cpu")
+        backend._park_views = {}
+        self.assertFalse(
+            backend.set_entity_pose_physics(
+                "/World/Scenario/missing", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
