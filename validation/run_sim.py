@@ -693,14 +693,14 @@ def _install_set_entity_state_physics(backend_holder: dict) -> None:
     """Make the standard simulation_interfaces ``/set_entity_state`` service
     physics-effective for spawned free rigid bodies.
 
-    NVIDIA's ``isaacsim.ros2.sim_control`` handler wraps the target prim in a
-    ``RigidPrim`` whose tensor view is not yet resolved for a freshly spawned
-    body and silently falls back to authoring the USD layer -- a physics no-op
-    for a body already bound to PhysX (the parked "set_entity_state does not
-    move spawned objects" defect, Task #5/#12). We wrap the handler so that,
-    after it runs, the pose+twist are also written straight through the
-    backend's rigid-body view (``set_entity_pose_physics``), which does move
-    the body.
+    Under fabric-ON, NVIDIA's ``isaacsim.ros2.sim_control`` handler authors only
+    the USD layer for a spawned body -- a physics no-op for a body already bound
+    to PhysX (the "set_entity_state does not move spawned objects" defect, Task
+    #5/#12). Under fabric-OFF (the grasp/manipulation configs) the handler's own
+    tensor write already propagates to PhysX. We wrap the handler so that, after
+    it runs, the pose+twist are ALSO written through the backend's rigid-body
+    view (``set_entity_pose_physics``) -- belt-and-suspenders that covers
+    fabric-on and is idempotent (same pose) when fabric-off already moved it.
 
     MUST be installed BEFORE ``enable_extension("isaacsim.ros2.sim_control")``:
     ``enable_extension`` enables the extension IMMEDIATELY

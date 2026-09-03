@@ -2201,8 +2201,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_set_entity_pose_physics_writes_transform_and_velocity(self) -> None:
         """A physics-effective park write pushes the world pose + zeroed twist
-        straight into a cached rigid-body view, in xyzw order (no reorder), and
-        reuses the cached view instead of rebuilding it (poison-safe)."""
+        into a cached rigid-body view as WARP arrays (the PhysxManager view's
+        frontend), in xyzw order (no reorder), reusing the cached view."""
+        import warp as wp
 
         class _RecordingView:
             count = 1
@@ -2211,10 +2212,15 @@ class ManipulationRuntimeTest(unittest.TestCase):
                 self.transforms = None
                 self.velocities = None
 
-            def set_transforms(self, data, indices=None) -> None:
-                self.transforms = data
+            def get_transforms(self):
+                # The method reads .device off this to place the warp arrays.
+                return SimpleNamespace(device="cpu")
 
-            def set_velocities(self, data, indices=None) -> None:
+            def set_transforms(self, data, indices) -> None:
+                self.transforms = data
+                self.transform_indices = indices
+
+            def set_velocities(self, data, indices) -> None:
                 self.velocities = data
 
         backend = object.__new__(IsaacWholeRobotBackend)
@@ -2232,12 +2238,15 @@ class ManipulationRuntimeTest(unittest.TestCase):
             angular_velocity=[0.0, 0.0, 0.0],
         )
         self.assertTrue(ok)
-        row = view.transforms[0].tolist()
+        # Warp arrays, required by the warp frontend (torch/numpy dtypes rejected).
+        self.assertIsInstance(view.transforms, wp.array)
+        self.assertIsInstance(view.transform_indices, wp.array)
+        row = view.transforms.numpy()[0].tolist()
         self.assertEqual([round(v, 4) for v in row[:3]], [1.0, 2.0, 0.05])
         self.assertEqual(
-            [round(v, 6) for v in row[3:7]], [0.0, 0.0, 0.382683, 0.92388]
+            [round(v, 5) for v in row[3:7]], [0.0, 0.0, 0.38268, 0.92388]
         )
-        vel = view.velocities[0].tolist()
+        vel = view.velocities.numpy()[0].tolist()
         self.assertEqual([round(v, 4) for v in vel], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.assertIs(backend._park_views[path], view)
 
