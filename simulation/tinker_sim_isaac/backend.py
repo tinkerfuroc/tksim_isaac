@@ -2929,11 +2929,13 @@ class IsaacWholeRobotBackend:
         Routes the write through the shared PhysX SimulationView's rigid-body
         view (``set_transforms``/``set_velocities``) -- the same view mechanism
         the truth stream reads through in ``_refresh_object_views`` -- so the
-        body actually moves in physics. The standard ``/set_entity_state``
-        wraps a freshly spawned prim in a ``RigidPrim`` whose tensor view is
-        not yet resolved and silently falls back to authoring the USD layer,
-        which is a physics no-op for a body already bound to PhysX; this write
-        is the effective path.
+        body actually moves in physics. Under fabric-ON the standard
+        ``/set_entity_state`` authors only the USD layer (a physics no-op for a
+        body already bound to PhysX); under fabric-OFF (the grasp/manipulation
+        configs, use_fabric=False via TINKER_SIM_SPAWN_YAW) the standard write
+        already propagates to PhysX, so this path is a belt-and-suspenders that
+        is effective regardless of fabric state (idempotent when the standard
+        write already moved the body).
 
         ``position`` is world xyz; ``quaternion_xyzw`` is [qx, qy, qz, qw]
         (scalar last), matching the tensor transform row exactly (no reorder).
@@ -2947,7 +2949,8 @@ class IsaacWholeRobotBackend:
 
         Returns True once the tensor write is applied (the move takes effect on
         the next physics step); False if no rigid body resolves under
-        ``prim_path`` or the runtime lacks the write API.
+        ``prim_path`` or the write arrays cannot be built. Backend write
+        failures raise (surfaced by the caller) rather than returning False.
         """
         view = self._park_views.get(prim_path)
         if view is None:
@@ -2962,47 +2965,59 @@ class IsaacWholeRobotBackend:
             if not count:
                 return False
             self._park_views[prim_path] = view
-        device = getattr(self._robot, "device", None)
-        transforms = self._torch.tensor(
-            [
-                [
-                    float(position[0]),
-                    float(position[1]),
-                    float(position[2]),
-                    float(quaternion_xyzw[0]),
-                    float(quaternion_xyzw[1]),
-                    float(quaternion_xyzw[2]),
-                    float(quaternion_xyzw[3]),
-                ]
-            ],
-            dtype=self._torch.float32,
-            device=device,
-        )
-        velocities = self._torch.tensor(
-            [
-                [
-                    float(linear_velocity[0]),
-                    float(linear_velocity[1]),
-                    float(linear_velocity[2]),
-                    float(angular_velocity[0]),
-                    float(angular_velocity[1]),
-                    float(angular_velocity[2]),
-                ]
-            ],
-            dtype=self._torch.float32,
-            device=device,
-        )
-        indices = self._torch.tensor([0], dtype=self._torch.int32, device=device)
+        # The PhysxManager SimulationView uses the WARP frontend, whose
+        # set_transforms/set_velocities require WARP arrays: they call
+        # wp.types.type_ctype(tensor.dtype), which rejects a torch tensor's
+        # (or numpy's) dtype. Build warp arrays on the view's own device.
         try:
-            try:
-                view.set_transforms(transforms, indices)
-                view.set_velocities(velocities, indices)
-            except TypeError:
-                # Some runtime builds expose the single-argument form.
-                view.set_transforms(transforms)
-                view.set_velocities(velocities)
-        except (AttributeError, RuntimeError):
+            import numpy as _np
+            import warp as _wp
+
+            device = getattr(view.get_transforms(), "device", "cpu")
+            transforms = _wp.array(
+                _np.asarray(
+                    [
+                        [
+                            float(position[0]),
+                            float(position[1]),
+                            float(position[2]),
+                            float(quaternion_xyzw[0]),
+                            float(quaternion_xyzw[1]),
+                            float(quaternion_xyzw[2]),
+                            float(quaternion_xyzw[3]),
+                        ]
+                    ],
+                    dtype=_np.float32,
+                ),
+                dtype=_wp.float32,
+                device=device,
+            )
+            velocities = _wp.array(
+                _np.asarray(
+                    [
+                        [
+                            float(linear_velocity[0]),
+                            float(linear_velocity[1]),
+                            float(linear_velocity[2]),
+                            float(angular_velocity[0]),
+                            float(angular_velocity[1]),
+                            float(angular_velocity[2]),
+                        ]
+                    ],
+                    dtype=_np.float32,
+                ),
+                dtype=_wp.float32,
+                device=device,
+            )
+            indices = _wp.array(
+                _np.asarray([0], dtype=_np.uint32), dtype=_wp.uint32, device=device
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError):
             return False
+        # Let a backend write failure raise: the caller wraps this and logs the
+        # exact error, which is more useful than a silent False.
+        view.set_transforms(transforms, indices)
+        view.set_velocities(velocities, indices)
         return True
 
     def _robot_truth_state(self) -> dict[str, object]:
