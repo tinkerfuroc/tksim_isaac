@@ -77,6 +77,7 @@ parser.add_argument("--closing-axis", default="y", choices=("x", "y"), help="bas
 parser.add_argument("--descend-from", type=float, default=0.0, help="stage the arm this much above the grasp TCP and descend onto the object before every close (0 = spawn at the grasp pose)")
 parser.add_argument("--descend-s", type=float, default=2.0, help="descent duration (joint-space interpolation)")
 parser.add_argument("--lift-dz", type=float, default=0.10, help="--lift height when the IK family is in use")
+parser.add_argument("--lift-s", type=float, default=0.0, help="--lift: interpolate the arm from the grasp pose to the raised pose over this many seconds (0 = sudden step command, the original behavior). A gentle lift avoids yanking a marginal grasp out of the jaw.")
 parser.add_argument("--render-dir", default="", help="if set, capture RGB frames of the close (replicator camera looking at the TCP) into this dir")
 parser.add_argument("--render-cam", default="0.45,-0.5,0.35", help="camera position offset (dx,dy,dz world) from the TCP for --render-dir")
 parser.add_argument("--render-every", type=float, default=0.08, help="capture a frame each time the drive advances this many rad")
@@ -910,14 +911,48 @@ if "B" in args.phase:
             else:
                 lifted = dict(arm_pose)
                 lifted["joint2"] = arm_pose["joint2"] - 0.15  # shoulder up ~ raises the TCP
-            command_arm(lifted)
-            for _ in range(int(2.0 / DT)):
-                backend.step()
-                video_tick()
+            # Object pose at lift start, to measure lift-induced SLIDE (does the
+            # lift shove/drag the object across the surface?) separately from the
+            # close-phase displacement.
+            obj_ls = bottle_state()
+            _ls_xy = (obj_ls["x"], obj_ls["y"])
+            _slide = {"max": 0.0, "arm_v": 0.0}
+
+            def _track_lift() -> None:
+                b = bottle_state()
+                _slide["max"] = max(_slide["max"], math.hypot(b["x"] - _ls_xy[0], b["y"] - _ls_xy[1]))
+                _, _, v, _ = backend.joint_state()
+                _slide["arm_v"] = max(_slide["arm_v"], max(abs(float(v[JIDX[j]])) for j in ARM))
+
+            if args.lift_s > 0.0:
+                # Gentle lift: interpolate the arm from the grasp pose to the
+                # raised pose (mirrors descend()), then hold. Avoids the
+                # step-command yank that can shear a marginal grasp loose.
+                n_lift = max(1, int(args.lift_s / DT))
+                for k_lift in range(1, n_lift + 1):
+                    a_lift = k_lift / n_lift
+                    command_arm({j: arm_pose[j] + a_lift * (lifted[j] - arm_pose[j]) for j in ARM})
+                    backend.step()
+                    _track_lift()
+                    video_tick()
+                for _ in range(int(1.5 / DT)):  # settle at the top
+                    backend.step()
+                    _track_lift()
+                    video_tick()
+            else:
+                command_arm(lifted)
+                for _ in range(int(2.0 / DT)):
+                    backend.step()
+                    _track_lift()
+                    video_tick()
             tcp_after, _ = body_pose("link_tcp")
             bl = bottle_state()
             lf, rf = pad_forces()
             m["lift"] = {"tcp_dz": tcp_after[2] - tcp_p[2], "bottle_dz": bl["z"] - pre["z"], "bottle_tilt": bl["tilt_deg"], "hold_force": lf + rf,
+                         "slide_xy_max": _slide["max"],
+                         "slide_xy_end": math.hypot(bl["x"] - _ls_xy[0], bl["y"] - _ls_xy[1]),
+                         "peak_arm_joint_speed": _slide["arm_v"],
+                         "obj_at_lift_start": obj_ls,
                          "tcp_after": tcp_after, "object_after": bl}
             capture_frame("LIFT", 0.0, force=f"dz{bl['z']-pre['z']:+.02f}_tilt{bl['tilt_deg']:.0f}")
             # release BEFORE returning: a closed jaw descending onto an object
