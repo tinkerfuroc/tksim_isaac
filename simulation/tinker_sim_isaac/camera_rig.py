@@ -102,6 +102,47 @@ class CameraStreamSpec:
     #: user of a non-zero value today (clearing the head camera's own
     #: housing mesh out of the corrected, level-forward view).
     view_axis_forward_offset_m: float = 0.0
+    #: Translation (metres) in the *mount prim's own* frame, applied before
+    #: ``mount_rotation_wxyz`` (see ``camera_xform_ops``): where the camera
+    #: sits relative to the URDF link it is mounted on, when the description
+    #: puts that link somewhere the camera is not. ``(0, 0, 0)`` (the
+    #: default) is unchanged behaviour. The one user today is the wrist
+    #: camera's ``cam-stand`` preset (``tinker_sim_isaac.head_camera_aim``),
+    #: which moves the render origin from the description's placeholder
+    #: flange mount onto xArm's D435 cam-stand bracket.
+    mount_frame_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+def camera_xform_ops(
+    spec: CameraStreamSpec,
+) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    """The rtx_camera prim's xformOpOrder for *spec*, outermost first.
+
+    USD applies the LAST listed op to the geometry first, so the first op in
+    this tuple is the one expressed in the mount prim's frame and the last
+    is the one expressed in the camera's own (already oriented) frame:
+
+    * ``mount_frame_offset_xyz`` -> ``translate`` listed BEFORE ``orient``:
+      a bracket offset in the mount link's axes. Listing it after would
+      rotate it with the aim (a wrist bracket would swing back onto the
+      gripper housing the moment the aim tilts).
+    * ``mount_rotation_wxyz`` -> ``orient``.
+    * ``view_axis_forward_offset_m`` -> ``translate`` listed AFTER
+      ``orient``: a dolly along the camera's own local -Z (its view axis).
+      Verified empirically against ``UsdGeom.XformCache`` on the robot
+      artifact -- swapping this order silently changes which axis the
+      offset lands on.
+
+    Pure data so the order is unit-testable without Kit;
+    ``CameraRig.initialize`` authors exactly this sequence.
+    """
+    ops: list[tuple[str, tuple[float, ...]]] = []
+    if any(spec.mount_frame_offset_xyz):
+        ops.append(("translate", tuple(float(v) for v in spec.mount_frame_offset_xyz)))
+    ops.append(("orient", tuple(float(v) for v in spec.mount_rotation_wxyz)))
+    if spec.view_axis_forward_offset_m:
+        ops.append(("translate", (0.0, 0.0, -float(spec.view_axis_forward_offset_m))))
+    return tuple(ops)
 
 
 def is_color_only(spec: CameraStreamSpec) -> bool:
@@ -700,22 +741,19 @@ class CameraRig:
             # match it or AddOrientOp raises a precision-mismatch Tf error.
             xform = UsdGeom.Xformable(prim)
             xform.ClearXformOpOrder()
-            xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
-                Gf.Quatd(*spec.mount_rotation_wxyz)
-            )
-            if spec.view_axis_forward_offset_m:
-                # Listed *after* the orient op: xformOpOrder ops compose
-                # left-to-right as applied-first-to-last, so a translate
-                # listed after orient lands in the already-rotated (camera)
-                # frame, i.e. this shifts the rendered origin along the
-                # camera's own local -Z (forward, by the USD camera
-                # convention above) rather than along the mount's raw axes.
-                # Verified empirically against UsdGeom.XformCache on the
-                # robot artifact -- swapping the op order silently changes
-                # which axis this offset lands on.
-                xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
-                    Gf.Vec3d(0.0, 0.0, -spec.view_axis_forward_offset_m)
-                )
+            # Op order matters and is documented (and unit-tested) on
+            # camera_xform_ops: a mount-frame bracket offset goes BEFORE
+            # orient, the view-axis dolly AFTER it. Two translate ops need
+            # distinct suffixes or the second AddTranslateOp raises.
+            for index, (kind, value) in enumerate(camera_xform_ops(spec)):
+                if kind == "orient":
+                    xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
+                        Gf.Quatd(*value)
+                    )
+                else:
+                    xform.AddTranslateOp(
+                        UsdGeom.XformOp.PrecisionDouble, f"op{index}"
+                    ).Set(Gf.Vec3d(*value))
             color_only = is_color_only(spec)
             if color_only:
                 self._color_only.add(spec.name)

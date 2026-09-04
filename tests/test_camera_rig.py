@@ -4,12 +4,14 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 
 from tinker_sim_isaac.camera_rig import (
+    camera_xform_ops,
     CAMERA_NAMES,
     CameraStreamSpec,
     load_camera_specs,
@@ -39,8 +41,15 @@ class LoadCameraSpecsTest(unittest.TestCase):
                 "/camera/xarm_camera/aligned_depth_to_color/camera_info",
             ),
         )
-        self.assertEqual(wrist.mount_rotation_wxyz, (0.0, 0.0, 1.0, 0.0))
+        # REP-103 optical (z forward, y down) -> USD camera: 180 deg about X
+        # (e2996f8; the y-flip variant rendered the wrist upside down).
+        self.assertEqual(wrist.mount_rotation_wxyz, (0.0, 1.0, 0.0, 0.0))
         self.assertEqual((wrist.width, wrist.height), (848, 480))
+
+    def test_mount_frame_offset_defaults_to_zero(self) -> None:
+        """Code-only like the dolly: the contract never places a bracket."""
+        for spec in load_camera_specs(CONTRACT):
+            self.assertEqual(spec.mount_frame_offset_xyz, (0.0, 0.0, 0.0))
 
     def test_view_axis_forward_offset_defaults_to_zero(self) -> None:
         """The contract never sets this; it's a code-only, opt-in field.
@@ -230,3 +239,36 @@ class BackendWallColorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CameraXformOpsTest(unittest.TestCase):
+    """The op ORDER is the contract: mount offset outside, dolly inside."""
+
+    def _wrist(self):
+        return next(s for s in load_camera_specs(CONTRACT) if s.name == "wrist_camera")
+
+    def test_default_is_orient_only(self) -> None:
+        spec = self._wrist()
+        self.assertEqual(camera_xform_ops(spec), (("orient", spec.mount_rotation_wxyz),))
+
+    def test_mount_offset_is_listed_before_orient(self) -> None:
+        spec = replace(self._wrist(), mount_frame_offset_xyz=(0.065, -0.0112, 0.05686))
+        self.assertEqual(
+            camera_xform_ops(spec),
+            (("translate", (0.065, -0.0112, 0.05686)), ("orient", spec.mount_rotation_wxyz)),
+        )
+
+    def test_view_dolly_is_listed_after_orient(self) -> None:
+        spec = replace(self._wrist(), view_axis_forward_offset_m=0.03)
+        self.assertEqual(
+            camera_xform_ops(spec),
+            (("orient", spec.mount_rotation_wxyz), ("translate", (0.0, 0.0, -0.03))),
+        )
+
+    def test_both_offsets_bracket_the_orient(self) -> None:
+        spec = replace(
+            self._wrist(), mount_frame_offset_xyz=(0.1, 0.0, 0.0), view_axis_forward_offset_m=0.03
+        )
+        kinds = [kind for kind, _ in camera_xform_ops(spec)]
+        self.assertEqual(kinds, ["translate", "orient", "translate"])
+
