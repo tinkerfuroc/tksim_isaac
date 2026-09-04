@@ -331,6 +331,46 @@ def test_stale_contact_from_previous_goal_does_not_stall(ros_context) -> None:
         source.destroy_node()
 
 
+def test_keepalive_publishes_without_holding_lock(ros_context) -> None:
+    # Regression: the 20 Hz keepalive timer must publish OUTSIDE self._lock.
+    # Publishing while holding the lock lock-inverts with rclpy internals and
+    # hangs every lock-waiting callback (goal_callback included), freezing the
+    # action server (all executor threads parked in futex_wait, no goals
+    # accepted). This asserts the lock is free at the moment of publish.
+    node = GripperFacade()
+    _clear_safety(node)
+
+    lock_free_at_publish = []
+
+    class _SpyPublisher:
+        def __init__(self, lock) -> None:
+            self._lock = lock
+
+        def publish(self, _message) -> None:
+            acquired = self._lock.acquire(blocking=False)
+            lock_free_at_publish.append(acquired)
+            if acquired:
+                self._lock.release()
+
+    node._commands = _SpyPublisher(node._lock)
+
+    command = JointState()
+    command.name = ["drive_joint"]
+    command.position = [0.85]
+    command.effort = [50.0]
+    with node._lock:
+        node._keepalive_command = command
+        node._active_goal_handle = None
+        node._active_goal_reserved = False
+        node._stopped = False
+
+    try:
+        node._keepalive_tick()
+        assert lock_free_at_publish == [True]  # published, and the lock was free
+    finally:
+        node.destroy_node()
+
+
 def test_settled_grasp_keeps_clamping_after_success(ros_context) -> None:
     # The GripperCommand action returns once the close settles, but the physical
     # grip must persist -- the simulator's command mux drops any source it has
