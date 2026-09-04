@@ -71,7 +71,21 @@ xarm7_traj_controller:
       # error 0.0019 rad. Kept at 0.1 not 0.01 to absorb the residual
       # tracking-lag class; tightening further is a future round once the
       # grasp benchmark confirms offsets stay small under load.
-      joint1: {trajectory: 1.0, goal: 0.1}
+      # R19 (2026-09-03, grasp-bench keepalive campaign): the R18 condition is
+      # MET, so GOAL tolerances tighten to 0.01 on ALL seven joints -- hardware
+      # parity with tk25 xarm7_controllers.yaml (goal 0.01). The grasp benchmark
+      # measured settled |reference-actual| under load (gripper closed on an
+      # object, effort 50, upright carry j4~=75deg): worst per joint <= 0.0036
+      # rad across validation11/12/13 plus the flat-0.01 tolerance controls --
+      # i.e. the R15/R17 joint7 (+0.0139) / joint4 (0.07-0.4) offsets are gone
+      # on this runtime. Negative control: a deliberately blocked descent now
+      # aborts ("goal_time_tolerance exceeding") instead of a silent success
+      # (the block showed joint4 0.0455, which a loose joint4 exception would
+      # mask -- so flat 0.01, no per-joint exception). Positive control: knife
+      # 3/3 + bottle 3/3 pipeline, zero goal_time/tolerance hangs. goal_time
+      # stays 60 as the sim-liveness completion backstop (a blocked descent
+      # takes ~60 s sim before the abort lands).
+      joint1: {trajectory: 1.0, goal: 0.01}
       # P2 (round-6): joint2 trajectory tolerance 1.0 -> 1.5.  The execute-pose
       # TCP path overshoots joint2 by ~1.002 rad (PATH_TOLERANCE_VIOLATED);
       # k=3.0 slowdown did not change the tracking error, so this is a genuine
@@ -84,13 +98,13 @@ xarm7_traj_controller:
       # the actual failing joint was joint3, still at 1.0.  physics_truth.jsonl
       # shows joint3 oscillating with growing amplitude through the pose sweep
       # (same ~1.0 rad overshoot class P2 fixed for joint2).
-      joint2: {trajectory: 1.5, goal: 0.1}
+      joint2: {trajectory: 1.5, goal: 0.01}
       # P4 (round-16): joint3 trajectory tolerance 1.5 -> 2.0.  rerun-16 execute-pose
       # "State tolerances failed for joint 2: Position Error: 1.529296, Position
       # Tolerance: 1.500000" — JTC "joint 2" = joint3 (0-based index).  Same
       # P-family tracking-lag overshoot as joint2/joint3/joint4; 1.529 is a
       # marginal 0.029 over 1.5, so 2.0 absorbs the sim controller lag.
-      joint3: {trajectory: 2.0, goal: 0.1}
+      joint3: {trajectory: 2.0, goal: 0.01}
       # R11 (round-11): joint4 trajectory tolerance 1.0 -> 1.5.  rerun-10 humble.log
       # "State tolerances failed for joint 3: Position Error: 1.000309" — the JTC
       # message uses the 0-based joint index, so "joint 3" = joint4 (same overshoot
@@ -114,9 +128,9 @@ xarm7_traj_controller:
       # 0.5 accepts the observed worst case with margin.  Path monitoring is
       # unchanged (trajectory tolerance stays 2.0), so a genuinely wedged
       # elbow still aborts mid-trajectory.
-      joint4: {trajectory: 2.0, goal: 0.1}
-      joint5: {trajectory: 1.0, goal: 0.1}
-      joint6: {trajectory: 1.0, goal: 0.1}
+      joint4: {trajectory: 2.0, goal: 0.01}
+      joint5: {trajectory: 1.0, goal: 0.01}
+      joint6: {trajectory: 1.0, goal: 0.01}
       # R15 (round-15): joint7 GOAL tolerance 0.01 -> 0.02.  rerun-15 execute-pose
       # aborted with GOAL_TOLERANCE_VIOLATED at the trajectory end: "State
       # tolerances failed for joint 6: Position Error: -0.013749, Position
@@ -128,6 +142,6 @@ xarm7_traj_controller:
       # variant of the P-family tracking-lag class; 0.02 accepts the steady-state
       # offset with margin.  The plan itself (canonicalize-replan) is short and
       # tracks correctly -- this is a sim controller convergence limit.
-      joint7: {trajectory: 1.0, goal: 0.02}
+      joint7: {trajectory: 1.0, goal: 0.01}
     state_publish_rate: 25.0
     action_monitor_rate: 10.0
