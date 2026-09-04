@@ -125,6 +125,38 @@ both).** Relaunched the shared GPU0 sim from this branch with the bench's exact 
 
 The after-capture is at the boot pose, where the tool-aligned camera looks at the robot's own chassis and lidar dome at close range (median depth 75 mm) — the home-pose view, not the housing; the housing band is pose-independent and gone. At the bench's four scan joint poses the URDF-FK-reposed frustum model gives tool-forward 9.6% (housing) vs cam-stand 0.1% (356 px of fingertip at 110–138 mm along the bottom edge) in every pose. Frames: `wrist_baseline_toolforward_color.png` / `wrist_camstand_color.png` in the job tmp dir; the grasp bench session is re-measuring at its scan poses against the plain optical frame.
 
+**Second round (same day): the first cam-stand authoring froze the wrist render.**
+The grasp bench's first live check of `cam-stand` at its wide scan pose
+showed the robot's own chassis and lidar dome filling the wrist frame with
+5–8 cm depths, which read as "the camera looks back along the tool". It
+did not: that frame was pixel-for-pixel my boot-pose capture from 40
+minutes earlier (mean difference 6.6 grey levels, 4% of pixels over 20 —
+AA dither), while the spectator camera showed the arm at the scan pose;
+the bench then moved to the close-scan pose and the wrist frame again
+changed by dither only. The RTX render product had stopped tracking the
+arm the moment `cam-stand` was on: every frame was the boot frame.
+
+The one thing the first authoring changed on the prim was a SECOND,
+suffix-named translate op — `xformOp:translate:op0` listed before
+`xformOp:orient` (a distinct suffix is required to author two translates,
+and the head's dolly already used the plain name after orient). Every
+camera that tracks fine (head with its dolly, wrist under `tool-forward`)
+carries only standard-named ops. The pose math was never wrong: the USD
+`XformCache` result for the authored ops matched the vendor chain to 4e-8
+both times — the static stage composes the suffixed op correctly, the
+renderer's live hierarchy evidently does not. Suffix vs. non-standard
+order was not separated (each test costs the shared sim a restart); the
+fix removes both. `camera_xform_ops` now folds every offset into ONE
+standard `xformOp:translate` listed before `xformOp:orient` (plain TRS
+order): the mount-frame bracket offset as is, the view-axis dolly rotated
+by the mount rotation into the mount frame first (`R · (0, 0, −d)`), which
+is exactly what "translate listed after orient" composed to. Head
+level-forward pose under the fold vs. the old `[orient, translate]`: 0.0
+difference in USD. Rule for the rig from here on: standard op names only,
+at most one translate, orient last.
+
+Live after the second relaunch: boot-pose capture, 8/8 frames, top-edge band 0 px, 0.0% black pixels anywhere, depth 100% valid with median 0.568 m; the frame differs from the frozen one by a mean of 120 grey levels (70% of pixels over 20) and shows the desk ahead with the two fingertip pads just entering the bottom edge, the framing the frustum model predicted. The grasp bench session is re-measuring at its scan poses (frame change with the arm, band, desk-plane fit).
+
 **Still open.** The durable fix is the description: give the `sensor_d435`
 instantiation in `tinker_full.urdf.xacro` the cam-stand origin (or restore
 xArm's `add_realsense_d435i` mount) and republish the robot artifact, after

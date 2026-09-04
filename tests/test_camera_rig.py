@@ -242,7 +242,9 @@ if __name__ == "__main__":
 
 
 class CameraXformOpsTest(unittest.TestCase):
-    """The op ORDER is the contract: mount offset outside, dolly inside."""
+    """Standard names, plain TRS order, at most one translate -- the RTX
+    render product stopped tracking the arm when a second, suffix-named
+    translate was authored (2026-09-04); the offsets fold instead."""
 
     def _wrist(self):
         return next(s for s in load_camera_specs(CONTRACT) if s.name == "wrist_camera")
@@ -251,24 +253,43 @@ class CameraXformOpsTest(unittest.TestCase):
         spec = self._wrist()
         self.assertEqual(camera_xform_ops(spec), (("orient", spec.mount_rotation_wxyz),))
 
-    def test_mount_offset_is_listed_before_orient(self) -> None:
+    def test_mount_offset_is_a_translate_listed_before_orient(self) -> None:
         spec = replace(self._wrist(), mount_frame_offset_xyz=(0.065, -0.0112, 0.05686))
         self.assertEqual(
             camera_xform_ops(spec),
             (("translate", (0.065, -0.0112, 0.05686)), ("orient", spec.mount_rotation_wxyz)),
         )
 
-    def test_view_dolly_is_listed_after_orient(self) -> None:
+    def test_view_dolly_folds_into_the_mount_frame_translate(self) -> None:
+        # The wrist mount rotation is 180 deg about X, so the camera's local
+        # -Z (its view axis) is the mount's +Z: a 3 cm dolly forward is
+        # (0, 0, +0.03) in the mount frame.
         spec = replace(self._wrist(), view_axis_forward_offset_m=0.03)
-        self.assertEqual(
-            camera_xform_ops(spec),
-            (("orient", spec.mount_rotation_wxyz), ("translate", (0.0, 0.0, -0.03))),
-        )
+        ops = camera_xform_ops(spec)
+        self.assertEqual([kind for kind, _ in ops], ["translate", "orient"])
+        for got, want in zip(ops[0][1], (0.0, 0.0, 0.03)):
+            self.assertAlmostEqual(got, want, places=12)
+        self.assertEqual(ops[1], ("orient", spec.mount_rotation_wxyz))
 
-    def test_both_offsets_bracket_the_orient(self) -> None:
+    def test_both_offsets_become_one_translate(self) -> None:
         spec = replace(
             self._wrist(), mount_frame_offset_xyz=(0.1, 0.0, 0.0), view_axis_forward_offset_m=0.03
         )
-        kinds = [kind for kind, _ in camera_xform_ops(spec)]
-        self.assertEqual(kinds, ["translate", "orient", "translate"])
+        ops = camera_xform_ops(spec)
+        self.assertEqual([kind for kind, _ in ops], ["translate", "orient"])
+        for got, want in zip(ops[0][1], (0.1, 0.0, 0.03)):
+            self.assertAlmostEqual(got, want, places=12)
+
+    def test_never_more_than_two_ops_and_never_two_translates(self) -> None:
+        for spec in load_camera_specs(CONTRACT):
+            for mutated in (
+                spec,
+                replace(spec, view_axis_forward_offset_m=0.03),
+                replace(spec, mount_frame_offset_xyz=(0.01, 0.02, 0.03)),
+                replace(spec, mount_frame_offset_xyz=(0.01, 0.02, 0.03), view_axis_forward_offset_m=0.03),
+            ):
+                kinds = [kind for kind, _ in camera_xform_ops(mutated)]
+                self.assertLessEqual(len(kinds), 2, spec.name)
+                self.assertEqual(kinds[-1], "orient", spec.name)
+                self.assertLessEqual(kinds.count("translate"), 1, spec.name)
 

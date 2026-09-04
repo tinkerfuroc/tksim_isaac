@@ -113,35 +113,61 @@ class CameraStreamSpec:
     mount_frame_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
+def _rotate_by_quaternion(
+    quaternion_wxyz: tuple[float, float, float, float], vector: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    """``q v q^-1`` for a unit quaternion (w, x, y, z)."""
+    w, x, y, z = quaternion_wxyz
+    vx, vy, vz = vector
+    tx, ty, tz = 2.0 * (y * vz - z * vy), 2.0 * (z * vx - x * vz), 2.0 * (x * vy - y * vx)
+    return (
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    )
+
+
 def camera_xform_ops(
     spec: CameraStreamSpec,
 ) -> tuple[tuple[str, tuple[float, ...]], ...]:
-    """The rtx_camera prim's xformOpOrder for *spec*, outermost first.
+    """The rtx_camera prim's xformOpOrder for *spec*: plain ``[translate, orient]``.
 
-    USD applies the LAST listed op to the geometry first, so the first op in
-    this tuple is the one expressed in the mount prim's frame and the last
-    is the one expressed in the camera's own (already oriented) frame:
+    Always the standard USD "TRS" order with the standard, suffix-free op
+    names -- at most ONE ``xformOp:translate`` (listed first, expressed in
+    the mount prim's frame) followed by ``xformOp:orient``. Both offsets a
+    spec can carry are folded into that single translate:
 
-    * ``mount_frame_offset_xyz`` -> ``translate`` listed BEFORE ``orient``:
-      a bracket offset in the mount link's axes. Listing it after would
-      rotate it with the aim (a wrist bracket would swing back onto the
-      gripper housing the moment the aim tilts).
-    * ``mount_rotation_wxyz`` -> ``orient``.
-    * ``view_axis_forward_offset_m`` -> ``translate`` listed AFTER
-      ``orient``: a dolly along the camera's own local -Z (its view axis).
-      Verified empirically against ``UsdGeom.XformCache`` on the robot
-      artifact -- swapping this order silently changes which axis the
-      offset lands on.
+    * ``mount_frame_offset_xyz``: already in the mount frame (a bracket
+      offset in the mount link's axes) -- used as is.
+    * ``view_axis_forward_offset_m``: a dolly along the camera's own local
+      -Z (its view axis, by the USD camera convention), so it is rotated by
+      ``mount_rotation_wxyz`` into the mount frame first. Identical to the
+      earlier authoring as a translate listed AFTER orient (verified against
+      ``UsdGeom.XformCache``: a translate listed after orient lands in the
+      already-oriented frame, i.e. ``R . t_local``).
 
-    Pure data so the order is unit-testable without Kit;
+    Why the fold, rather than two translate ops bracketing the orient: the
+    first cam-stand round authored the bracket offset as a second,
+    suffix-named ``xformOp:translate:op0`` listed before ``orient`` and the
+    RTX render product stopped tracking the arm -- every wrist frame was
+    the boot frame (2026-09-04 developer log). Cameras whose ops are the
+    standard names only (head with its dolly, wrist tool-forward) track
+    fine, so the rig sticks to those.
+
+    Pure data so the composition is unit-testable without Kit;
     ``CameraRig.initialize`` authors exactly this sequence.
     """
-    ops: list[tuple[str, tuple[float, ...]]] = []
-    if any(spec.mount_frame_offset_xyz):
-        ops.append(("translate", tuple(float(v) for v in spec.mount_frame_offset_xyz)))
-    ops.append(("orient", tuple(float(v) for v in spec.mount_rotation_wxyz)))
+    rotation = tuple(float(v) for v in spec.mount_rotation_wxyz)
+    offset = [float(v) for v in spec.mount_frame_offset_xyz]
     if spec.view_axis_forward_offset_m:
-        ops.append(("translate", (0.0, 0.0, -float(spec.view_axis_forward_offset_m))))
+        dolly = _rotate_by_quaternion(
+            rotation, (0.0, 0.0, -float(spec.view_axis_forward_offset_m))  # type: ignore[arg-type]
+        )
+        offset = [a + b for a, b in zip(offset, dolly)]
+    ops: list[tuple[str, tuple[float, ...]]] = []
+    if any(offset):
+        ops.append(("translate", tuple(offset)))
+    ops.append(("orient", rotation))
     return tuple(ops)
 
 
@@ -741,19 +767,18 @@ class CameraRig:
             # match it or AddOrientOp raises a precision-mismatch Tf error.
             xform = UsdGeom.Xformable(prim)
             xform.ClearXformOpOrder()
-            # Op order matters and is documented (and unit-tested) on
-            # camera_xform_ops: a mount-frame bracket offset goes BEFORE
-            # orient, the view-axis dolly AFTER it. Two translate ops need
-            # distinct suffixes or the second AddTranslateOp raises.
-            for index, (kind, value) in enumerate(camera_xform_ops(spec)):
+            # Standard-named ops in plain TRS order only (at most one
+            # xformOp:translate, then xformOp:orient) -- see
+            # camera_xform_ops for why nothing else is authored here.
+            for kind, value in camera_xform_ops(spec):
                 if kind == "orient":
                     xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
                         Gf.Quatd(*value)
                     )
                 else:
-                    xform.AddTranslateOp(
-                        UsdGeom.XformOp.PrecisionDouble, f"op{index}"
-                    ).Set(Gf.Vec3d(*value))
+                    xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
+                        Gf.Vec3d(*value)
+                    )
             color_only = is_color_only(spec)
             if color_only:
                 self._color_only.add(spec.name)
