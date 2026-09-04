@@ -139,6 +139,7 @@ class GripperFacade(Node):
             self._contact_received_at = time.monotonic()
 
     def _safety(self, message: Bool) -> None:
+        hold_position = None
         with self._lock:
             self._safety_last_sample_at = time.monotonic()
             self._stopped = bool(message.data)
@@ -146,10 +147,13 @@ class GripperFacade(Node):
                 # A safety stop overrides any latched grasp clamp: drop the
                 # keepalive and fall back to a zero-effort measured hold.
                 self._keepalive_command = None
-                self._publish_hold_locked(self._position)
+                hold_position = self._position
+        if hold_position is not None:
+            self._publish_hold(hold_position)
 
     def _enforce_safety_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
+        hold_position = None
         with self._lock:
             last = self._safety_last_sample_at
             if last is not None and now - last < self._safety_timeout_s:
@@ -160,14 +164,18 @@ class GripperFacade(Node):
             # Losing the safety heartbeat is a stop: drop any latched clamp and
             # hold at the measured position with zero effort.
             self._keepalive_command = None
-            self._publish_hold_locked(self._position)
+            hold_position = self._position
+        if hold_position is not None:
+            self._publish_hold(hold_position)
 
     def _cancel(self, _goal_handle) -> CancelResponse:
+        hold_position = None
         with self._lock:
-            retire = self._active_goal_reserved
-            if retire:
+            if self._active_goal_reserved:
                 self._cancel_requested = True
-                self._publish_hold_locked(self._position)
+                hold_position = self._position
+        if hold_position is not None:
+            self._publish_hold(hold_position)
         return CancelResponse.ACCEPT
 
     def _goal(self, _goal) -> GoalResponse:
@@ -183,25 +191,36 @@ class GripperFacade(Node):
             return GoalResponse.ACCEPT
 
     def _keepalive_tick(self) -> None:
+        # Decide + snapshot under the lock, then publish OUTSIDE it. This timer
+        # runs at 20 Hz continuously after any grasp; publishing while holding
+        # self._lock can lock-invert with rclpy internals and freeze every
+        # callback that needs the lock -- goal_callback included -- hanging the
+        # action server (observed: all executor threads parked in futex_wait,
+        # no goals accepted).
+        publish_command = None
+        hold_position = None
         with self._lock:
             # An in-flight goal owns the command stream (its execute loop
             # publishes); the keepalive only runs between goals.
             if self._active_goal_handle is not None or self._active_goal_reserved:
                 return
-            command = self._keepalive_command
-            if command is None:
+            if self._keepalive_command is None:
                 return
             if self._stopped:
                 self._keepalive_command = None
-                self._publish_hold_locked(self._position)
-                return
-            self._commands.publish(command)
+                hold_position = self._position
+            else:
+                publish_command = self._keepalive_command
+        if publish_command is not None:
+            self._commands.publish(publish_command)
+        elif hold_position is not None:
+            self._publish_hold(hold_position)
 
     def _publish_hold(self, position: float) -> None:
-        with self._lock:
-            self._publish_hold_locked(position)
-
-    def _publish_hold_locked(self, position: float) -> None:
+        # Publish a zero-effort measured-position hold. MUST be called WITHOUT
+        # self._lock held: a publish under the lock can lock-invert with rclpy
+        # internals and hang every lock-waiting callback (see _keepalive_tick).
+        # Callers snapshot the position under the lock, then call this outside.
         command = JointState()
         command.name = [self._joint]
         command.position = [float(position)]
@@ -283,10 +302,13 @@ class GripperFacade(Node):
                     cancel_requested = (
                         self._cancel_requested or goal_handle.is_cancel_requested
                     )
-                    if not stopped and not cancel_requested:
-                        self._commands.publish(command)
-                    else:
+                    should_publish = not stopped and not cancel_requested
+                    if not should_publish:
                         position = self._position
+                if should_publish:
+                    # Publish OUTSIDE the lock (see _publish_hold): holding
+                    # self._lock across a publish risks a lock-inversion hang.
+                    self._commands.publish(command)
                 if stopped:
                     self._publish_hold(position)
                     goal_handle.abort()
