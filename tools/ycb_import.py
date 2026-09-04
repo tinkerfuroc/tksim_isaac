@@ -243,6 +243,30 @@ def run_import(
     return publication
 
 
+# Published YCB catalog masses (kg), keyed by the artifact object-directory
+# name. Authored explicitly so a grasped object loads the grip at its real mass
+# instead of PhysX's density-derived estimate (~2x off). Overridable; the four
+# grasp-bench objects (mustard/soup/sugar/bleach) were cross-checked against the
+# catalog.
+YCB_OBJECT_MASSES_KG: dict[str, float] = {
+    "ycb_001_cheez-it": 0.411,          # cracker box
+    "ycb_002_sugar_box": 0.514,
+    "ycb_005_spam": 0.370,              # potted meat can
+    "ycb_006_mustard_bottle": 0.603,
+    "ycb_008_pudding_box": 0.187,
+    "ycb_010_tomato_soup_can": 0.349,
+    "ycb_011_banana": 0.066,
+    "ycb_021_bleach_cleanser": 1.131,
+    "ycb_024_bowl": 0.147,
+    "ycb_025_mug": 0.118,
+}
+
+# Realistic plastic/metal default (grasp-bench-specified), bound onto every
+# object collider so a closed grip can hold it under fabric-off.
+YCB_STATIC_FRICTION = 0.8
+YCB_DYNAMIC_FRICTION = 0.7
+
+
 def repair_physics(repo_root: Path) -> AssetPublication:
     """Republish the current YCB artifact with rigid-body physics authored.
 
@@ -263,6 +287,8 @@ def repair_physics(repo_root: Path) -> AssetPublication:
     from pxr import Usd
 
     from tinker_sim_deploy.arena_convert import (
+        author_object_friction_material,
+        author_object_mass,
         author_object_rigid_body,
         author_preview_surface_material,
     )
@@ -287,8 +313,18 @@ def repair_physics(repo_root: Path) -> AssetPublication:
                 work.mkdir(parents=True, exist_ok=True)
                 source = work / "object.usd"
                 source.write_bytes(data)
+                mass_kg = YCB_OBJECT_MASSES_KG.get(object_id)
+                if mass_kg is None:
+                    raise AssetArtifactError(
+                        f"no catalog mass for {object_id!r}; add it to "
+                        "YCB_OBJECT_MASSES_KG before repairing"
+                    )
                 stage = Usd.Stage.Open(str(source))
                 author_object_rigid_body(stage)
+                author_object_mass(stage, mass_kg)
+                author_object_friction_material(
+                    stage, YCB_STATIC_FRICTION, YCB_DYNAMIC_FRICTION
+                )
                 author_preview_surface_material(stage)
                 repaired_path = work / "object.repaired.usd"
                 if not stage.GetRootLayer().Export(str(repaired_path)):

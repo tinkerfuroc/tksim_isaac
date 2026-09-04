@@ -673,6 +673,74 @@ def author_object_rigid_body(stage) -> None:
         pass
 
 
+def author_object_mass(stage, mass_kg: float) -> None:
+    """Author an explicit rigid-body mass on a composed object's default prim.
+
+    ``author_object_rigid_body`` leaves mass to PhysX's density-derived
+    estimate (scene default 1000 kg/m^3 over the convex-decomposition hulls),
+    which lands ~2x off the published YCB catalog mass -- a grasped object at
+    the wrong mass loads the grip differently. Mirror
+    ``simulation/assets/primitives/bench-bottle.usda`` (``PhysicsMassAPI`` +
+    ``physics:mass`` on the rigid-body root) so retention matches the real
+    object. No-op guard: requires a positive mass and a default prim.
+    """
+    from pxr import UsdPhysics
+
+    if not mass_kg > 0.0:
+        raise RuntimeError(f"object mass must be positive, got {mass_kg!r}")
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError("mass authoring requires a default prim")
+    mass_api = UsdPhysics.MassAPI.Apply(default_prim)
+    mass_api.CreateMassAttr().Set(float(mass_kg))
+
+
+def author_object_friction_material(
+    stage, static_friction: float, dynamic_friction: float, restitution: float = 0.0
+) -> int:
+    """Author + bind a physics friction material onto an object's colliders.
+
+    A composed object carries no ``PhysicsMaterialAPI``, and under fabric-off
+    (the placement-correct mode ``TINKER_SIM_SPAWN_YAW`` selects) a convex-hull
+    mesh collider does NOT inherit the ``PhysicsScene`` default material -- it
+    is effectively frictionless, so a closed grip cannot hold it: the object
+    extrudes out of the two-pad pinch even at high normal force (observed as a
+    35->10 N decay at near-zero arm speed on spawned YCB objects). Mirror
+    ``simulation/assets/primitives/bench-bottle.usda``: a sibling ``Material``
+    prim with ``PhysicsMaterialAPI`` (static/dynamic friction, zero restitution
+    by default), bound onto every collider prim via ``material:binding:physics``
+    with ``weakerThanDescendants`` strength. Returns the number of colliders
+    bound; fails closed if the object has no authored collider.
+    """
+    from pxr import Usd, UsdPhysics, UsdShade
+
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError("friction-material authoring requires a default prim")
+    material_path = default_prim.GetPath().AppendChild("PhysicsMaterial")
+    material = UsdShade.Material.Define(stage, material_path)
+    physics_material = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    physics_material.CreateStaticFrictionAttr().Set(float(static_friction))
+    physics_material.CreateDynamicFrictionAttr().Set(float(dynamic_friction))
+    physics_material.CreateRestitutionAttr().Set(float(restitution))
+    bound = 0
+    for prim in Usd.PrimRange(default_prim):
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        binding = UsdShade.MaterialBindingAPI.Apply(prim)
+        binding.Bind(
+            material,
+            bindingStrength=UsdShade.Tokens.weakerThanDescendants,
+            materialPurpose="physics",
+        )
+        bound += 1
+    if not bound:
+        raise RuntimeError(
+            f"{default_prim.GetPath()}: friction-material authoring requires an authored collider"
+        )
+    return bound
+
+
 def author_preview_surface_material(stage) -> int:
     """Rewrite every MDL-shaded material to a native UsdPreviewSurface network.
 
