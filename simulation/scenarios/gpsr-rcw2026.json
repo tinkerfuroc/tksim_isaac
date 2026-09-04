@@ -35,7 +35,7 @@
   "objects": [
     {
       "id": "soup",
-      "asset_uri": "artifacts/objects/ycb/4b635c93c704f52a0a6c7c65199660cea93401677a4f79ac47a6bcd423ee3052/ycb_010_tomato_soup_can/object.usd",
+      "asset_uri": "artifacts/objects/ycb/f342a496fc34fa2a1d2721cef5e03cb629d74ec41fa0d8f68b5e6b1e42edc866/ycb_010_tomato_soup_can/object.usd",
       "pose": {
         "xyz": [
           2.5,
@@ -52,7 +52,7 @@
     },
     {
       "id": "mug",
-      "asset_uri": "artifacts/objects/ycb/4b635c93c704f52a0a6c7c65199660cea93401677a4f79ac47a6bcd423ee3052/ycb_025_mug/object.usd",
+      "asset_uri": "artifacts/objects/ycb/f342a496fc34fa2a1d2721cef5e03cb629d74ec41fa0d8f68b5e6b1e42edc866/ycb_025_mug/object.usd",
       "pose": {
         "xyz": [
           2.7,
@@ -69,7 +69,7 @@
     },
     {
       "id": "banana",
-      "asset_uri": "artifacts/objects/ycb/4b635c93c704f52a0a6c7c65199660cea93401677a4f79ac47a6bcd423ee3052/ycb_011_banana/object.usd",
+      "asset_uri": "artifacts/objects/ycb/f342a496fc34fa2a1d2721cef5e03cb629d74ec41fa0d8f68b5e6b1e42edc866/ycb_011_banana/object.usd",
       "pose": {
         "xyz": [
           0.43,
@@ -86,7 +86,7 @@
     },
     {
       "id": "bowl",
-      "asset_uri": "artifacts/objects/ycb/4b635c93c704f52a0a6c7c65199660cea93401677a4f79ac47a6bcd423ee3052/ycb_024_bowl/object.usd",
+      "asset_uri": "artifacts/objects/ycb/f342a496fc34fa2a1d2721cef5e03cb629d74ec41fa0d8f68b5e6b1e42edc866/ycb_024_bowl/object.usd",
       "pose": {
         "xyz": [
           0.312,
