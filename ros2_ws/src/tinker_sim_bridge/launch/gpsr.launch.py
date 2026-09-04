@@ -14,6 +14,7 @@ from tinker_sim_deploy.runtime import (
     resolve_arena_map_yaml,
     resolve_current_artifact,
     scenario_arena_id,
+    sim_robot_description,
     topic_control_description,
 )
 
@@ -103,7 +104,10 @@ def _resolve(context):
     # Exactly one robot_state_publisher. manipulation's
     # topic_control_description() form is a superset (control-topic
     # augmented) of navigation's raw URDF read, so it is used here.
-    robot_description = topic_control_description(resolved_artifact.robot_urdf)
+    # sim_robot_description: topic_control_description plus the wrist camera
+    # cam-stand TF rewrite, keyed on TINKER_SIM_WRIST_CAMERA_AIM (the frame the
+    # wrist images advertise must be the one they were rendered from).
+    robot_description = sim_robot_description(resolved_artifact.robot_urdf)
 
     calibration = root / "simulation/calibration/tinker2-missing.json"
     # AMCL must localize on the arena the simulator raycasts its lidar

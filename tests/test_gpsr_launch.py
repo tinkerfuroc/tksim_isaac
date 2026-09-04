@@ -40,6 +40,19 @@ class GpsrLaunchTest(unittest.TestCase):
         self.assertIn("scenario_arena_id(", source)
         self.assertIn("resolve_arena_map_yaml(", source)
 
+    def test_robot_description_carries_the_wrist_cam_stand_rewrite(self):
+        """Every bridge launch must publish the description the sim renders
+        from: sim_robot_description (topic_control + cam-stand TF rewrite),
+        not the bare topic_control_description."""
+        for name in ("gpsr", "manipulation", "whole_robot", "integrated_ompl_manipulation"):
+            source = (LAUNCH.parent / f"{name}.launch.py").read_text(encoding="utf-8")
+            self.assertIn(
+                "robot_description = sim_robot_description(", source, name
+            )
+            self.assertNotIn(
+                "robot_description = topic_control_description(", source, name
+            )
+
     def test_manipulation_side_is_present(self):
         for name in ("ros2_control_node", "xarm_facade", "gripper_facade",
                      "pan_tilt_facade", "audio_fixtures"):
