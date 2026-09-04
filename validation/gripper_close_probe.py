@@ -61,6 +61,7 @@ parser.add_argument("--mirror-mode", default="target",
                     help="target = stock mirror (followers track drive TARGET); measured = followers track the drive joint's MEASURED angle (single-DOF jaw); measured_ff = measured + one-step velocity feed-forward (q + qdot*dt); central = virtual central command: all six gripper joints track the applied drive target c (symmetric gains + stall-gated lead clamp)")
 parser.add_argument("--max-lead", type=float, default=None, help="override backend._gripper_max_lead (0 disables the stall-gated lead clamp)")
 parser.add_argument("--stall-speed", type=float, default=None, help="override backend._gripper_stall_speed")
+parser.add_argument("--drive-effort-limit", type=float, default=None, help="raise the drive_joint effort ceiling (Nm) to sweep the clamp force; URDF default 50. The bench close is capped at this ceiling, so this is the only way to press past 50 Nm")
 parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
 parser.add_argument("--object-usda", default="")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
@@ -354,6 +355,20 @@ def parse_configs(text: str) -> list[dict[str, float]]:
 
 
 CONFIGS = parse_configs(args.configs)
+
+if args.drive_effort_limit is not None:
+    # Raise the drive_joint effort ceiling so the close can press past the URDF
+    # 50 Nm cap (reuses the backend's own effort-limit writer + actuator-model
+    # sync). This is the #20 sweep: quantify the clamp-normal force each object
+    # geometry reaches as the drive ceiling rises.
+    backend._default_gripper_effort_limit = float(args.drive_effort_limit)
+    backend._gripper_effort_limit_written = False
+    backend._set_gripper_effort_limit(float(args.drive_effort_limit))
+    print(json.dumps({
+        "event": "drive_effort_limit_set",
+        "requested": args.drive_effort_limit,
+        "gripper_effort_limit": backend.gripper_effort_limit,
+    }), flush=True)
 
 if args.mirror_mode == "central":
     set_follower_gains(55.0, 1500.0, drive_stiffness=1500.0, drive_damping=55.0)
