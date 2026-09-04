@@ -33,7 +33,7 @@
     ],
     "frame_id": "xarm_camera_color_optical_frame",
     "mount_prim": "xarm_camera_color_optical_frame",
-    "mount_rotation_wxyz": [0.0, 0.0, 1.0, 0.0],
+    "mount_rotation_wxyz": [0.0, 1.0, 0.0, 0.0],
     "width": 848,
     "height": 480,
     "horizontal_fov_deg": 69.4,
