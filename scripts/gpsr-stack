@@ -58,6 +58,10 @@ from typing import Optional
 # constant was last edited. scripts/gpsr-stack lives at <repo>/scripts/, so
 # parents[1] is the repo root.
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: Wrist camera render + TF pose preset, shared by the sim and bridge
+#: stages (see tinker_sim_isaac.head_camera_aim, cam-stand section).
+WRIST_CAMERA_AIM = "cam-stand"
 TINKER_WS = "/home/tinker/tk25_ws"
 CENSUS_SCRIPT = str(REPO_ROOT / "tools" / "gpsr_interface_census.py")
 
@@ -258,11 +262,15 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
         "TINKER_SIM_CONTROL_HZ": "60",
         "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
         # Same defect class as the head aim, same sanctioned parity break:
-        # the description mounts the wrist camera 90 deg off the tool
-        # approach axis (ceiling frames at every table-scan pose), so no
-        # live grasp can see its target without this. See
-        # tinker_sim_isaac.head_camera_aim's wrist section.
-        "TINKER_SIM_WRIST_CAMERA_AIM": "tool-forward",
+        # the description mounts the wrist camera at a placeholder flange
+        # origin -- 90 deg off the tool approach axis (ceiling frames at
+        # every table-scan pose) and on the gripper housing surface (with
+        # the earlier in-place "tool-forward" tilt, the housing rendered as
+        # a black band across the top of every frame). "cam-stand" renders
+        # from xArm's D435 bracket pose instead. See
+        # tinker_sim_isaac.head_camera_aim's wrist section. The bridge
+        # stage below gets the same value so TF moves with the render.
+        "TINKER_SIM_WRIST_CAMERA_AIM": WRIST_CAMERA_AIM,
         # RTX camera strides stall the stepping loop for multiple wall
         # seconds; at the 1.0 s / 0.5 s defaults every stall re-latches a
         # safety hold and severs the command stream (frozen base + arm
@@ -331,7 +339,12 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
         # file under ros2_ws/install and the fallback resolves nowhere.
         # Export the root explicitly so the bridge stage survives either
         # build mode (bitten 2026-08-28: a plain rebuild broke bring-up).
-        "env": _preamble_env({"TINKER_SIM_ROOT": str(REPO_ROOT)}),
+        "env": _preamble_env({
+            "TINKER_SIM_ROOT": str(REPO_ROOT),
+            # The bridge launches rewrite the wrist camera joint in
+            # robot_description under cam-stand; must match the sim stage.
+            "TINKER_SIM_WRIST_CAMERA_AIM": WRIST_CAMERA_AIM,
+        }),
         "cwd": REPO_ROOT,
         "gate": "bridge",
     })

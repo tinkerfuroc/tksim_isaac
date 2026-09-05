@@ -52,6 +52,7 @@ Positive tilt then looks *down*, which is what ``tk26_vision``'s
 """
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from typing import Iterable, Sequence
 
@@ -105,29 +106,30 @@ def _normalise(quaternion: Sequence[float]) -> tuple[float, float, float, float]
 
 def _resolve_correction(
     env_name: str,
-    preset_name: str,
-    preset_value: tuple[float, float, float, float],
+    presets: dict[str, tuple[float, float, float, float]],
     value: str | None,
 ) -> tuple[float, float, float, float] | None:
     """Shared parser for the aim-override env vars; ``None`` keeps parity.
 
-    Accepts the named preset or an explicit ``w,x,y,z`` quaternion.
-    Anything else raises: a silently ignored typo here looks exactly like
-    the override working, and the whole point of these flags is that a
-    parity break is never accidental.
+    Accepts one of the named *presets* or an explicit ``w,x,y,z``
+    quaternion. Anything else raises: a silently ignored typo here looks
+    exactly like the override working, and the whole point of these flags
+    is that a parity break is never accidental.
     """
     if value is None:
         return None
     text = value.strip()
     if not text:
         return None
-    if text.lower() == preset_name:
-        return preset_value
+    preset = presets.get(text.lower())
+    if preset is not None:
+        return preset
 
     parts = [item.strip() for item in text.split(",")]
     if len(parts) != 4:
+        names = " / ".join(repr(name) for name in presets)
         raise ValueError(
-            f"{env_name}: expected {preset_name!r} or four comma-separated "
+            f"{env_name}: expected {names} or four comma-separated "
             f"quaternion components (w,x,y,z), got {value!r}"
         )
     try:
@@ -144,7 +146,7 @@ def resolve_head_aim_correction(
 ) -> tuple[float, float, float, float] | None:
     """Parse ``TINKER_SIM_HEAD_CAMERA_AIM``; ``None`` means leave parity alone."""
     return _resolve_correction(
-        HEAD_AIM_ENV, _PRESET_NAME, LEVEL_FORWARD_CORRECTION_WXYZ, value
+        HEAD_AIM_ENV, {_PRESET_NAME: LEVEL_FORWARD_CORRECTION_WXYZ}, value
     )
 
 
@@ -187,14 +189,158 @@ TOOL_FORWARD_CORRECTION_WXYZ = (
 
 WRIST_CAMERA_NAME = "wrist_camera"
 
+#: ``cam-stand``: render the wrist camera from where the real one IS.
+#:
+#: ``tool-forward`` fixed the aim but rotates the camera IN PLACE, and the
+#: place is wrong. The sim description (tk26_sim ``tinker_full.urdf.xacro``)
+#: layers Intel's ``sensor_d435`` macro onto ``link_eef`` with a placeholder
+#: ``<origin xyz="0 0 0" rpy="0 0 0"/>``, so the colour optical frame sits at
+#: link_eef + (0.0106, 0.0325, 0.0125): 12.5 mm above the flange, 33 mm off
+#: the tool axis -- on the surface of ``xarm_gripper_base_link``'s housing,
+#: looking 90 deg off the tool. Tilt that view 60 deg toward the tool and
+#: the housing's far wall sits just past the rig's 0.05 m near clip at the
+#: top of the frustum: the black band across the top of every wrist frame
+#: (grasp bench, 2026-09-04: 9.4% of the 848x480 image, depth 50-60 mm,
+#: worst on the right). An offline USD frustum model of ``robot.usd``
+#: reproduces that band to within a row and names the gripper base link as
+#: the only occluder (developer log, 2026-09-04).
+#:
+#: The real robot (``tinker_real.urdf`` / xArm's
+#: ``realsense_d435i.urdf.xacro``, "vendor factory-nominal" extrinsics)
+#: mounts ``xarm_camera_link`` on the D435 cam-stand bracket at
+#: ``CAM_STAND_CAMERA_LINK_XYZ`` / ``_RPY`` below: 67 mm out along +X_eef,
+#: 24 mm up, looking straight along the tool axis with image-up pointing
+#: radially outward. From there the same frustum model shows zero housing
+#: pixels -- only the fingertips at the bottom edge, which is what a wrist
+#: camera sees. ``cam-stand`` places the render origin at exactly that
+#: pose: ``CAM_STAND_MOUNT_OFFSET_XYZ`` is the bracket translation and
+#: ``CAM_STAND_CORRECTION_WXYZ`` the rotation, both expressed in the
+#: artifact's (placeholder) colour optical frame, i.e.
+#: ``inv(T_artifact_optical) . T_vendor_optical`` (tests re-derive both from
+#: the two URDF chains). Still opt-in and sim-only; the durable fix is the
+#: description's origin, after which this preset becomes a no-op.
+#:
+#: TF must move with the render: ``cam_stand_robot_description`` rewrites
+#: the artifact URDF's ``xarm_camera_joint`` so ``robot_state_publisher``
+#: puts ``xarm_camera_color_optical_frame`` at the same vendor pose the
+#: camera renders from (``tinker_sim_deploy.runtime.sim_robot_description``
+#: applies it in every bridge launch under the same env value).
+_CAM_STAND_PRESET_NAME = "cam-stand"
+
+#: xArm cam-stand bracket: ``link_eef -> xarm_camera_link`` (URDF origin).
+CAM_STAND_CAMERA_LINK_XYZ = (0.06746, -0.0175, 0.0237)
+CAM_STAND_CAMERA_LINK_RPY = (3.141592653589793, -1.5707963267948966, 0.0)
+
+#: Intel ``sensor_d435`` macro: ``bottom_screw_frame -> camera_link`` (URDF
+#: origin, no rotation) -- the artifact's chain above the placeholder joint.
+INTEL_D435_CAMERA_LINK_XYZ = (0.0106, 0.0175, 0.0125)
+
+#: Bracket translation in the artifact's colour optical frame (x right,
+#: y down, z forward): R_opt^T . (t_vendor - t_artifact) with
+#: t_vendor = (0.06746, -0.0325, 0.0237), t_artifact = (0.0106, 0.0325,
+#: 0.0125) in link_eef, and the optical axes x = -Y_eef, y = -Z_eef,
+#: z = +X_eef.
+CAM_STAND_MOUNT_OFFSET_XYZ = (0.065, -0.0112, 0.05686)
+
+#: Bracket rotation in the same frame: 180 deg about (0, -1, 1)/sqrt(2) --
+#: maps the optical view axis (+z) onto -y_opt = +Z_eef (the tool axis)
+#: and image-up (-y) onto +z_opt = +X_eef (radially outward).
+CAM_STAND_CORRECTION_WXYZ = (
+    0.0,
+    0.0,
+    -0.7071067811865476,
+    0.7071067811865476,
+)
+
+_WRIST_PRESETS = {
+    _WRIST_PRESET_NAME: TOOL_FORWARD_CORRECTION_WXYZ,
+    _CAM_STAND_PRESET_NAME: CAM_STAND_CORRECTION_WXYZ,
+}
+
+#: Mount-frame translations that ride along with a preset rotation (the
+#: head's ``view_axis_forward_offset_m`` is the same idea on the other side
+#: of the orient op). Keyed on the exact preset quaternion, like the head
+#: dolly: an explicit non-preset correction gets no offset.
+_PRESET_MOUNT_OFFSETS = {
+    CAM_STAND_CORRECTION_WXYZ: CAM_STAND_MOUNT_OFFSET_XYZ,
+}
+
 
 def resolve_wrist_aim_correction(
     value: str | None,
 ) -> tuple[float, float, float, float] | None:
     """Parse ``TINKER_SIM_WRIST_CAMERA_AIM``; ``None`` means leave parity alone."""
-    return _resolve_correction(
-        WRIST_AIM_ENV, _WRIST_PRESET_NAME, TOOL_FORWARD_CORRECTION_WXYZ, value
+    return _resolve_correction(WRIST_AIM_ENV, _WRIST_PRESETS, value)
+
+
+def _rpy_matrix(
+    roll: float, pitch: float, yaw: float
+) -> tuple[tuple[float, float, float], ...]:
+    """URDF ``rpy`` -> rotation matrix (Rz(yaw) . Ry(pitch) . Rx(roll))."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+        (-sp, cp * sr, cp * cr),
     )
+
+
+def cam_stand_camera_joint_origin() -> tuple[
+    tuple[float, float, float], tuple[float, float, float]
+]:
+    """``(xyz, rpy)`` for the artifact's ``xarm_camera_joint`` under cam-stand.
+
+    That joint is ``link_eef -> xarm_camera_bottom_screw_frame`` (the
+    placeholder identity). Re-authoring it as
+    ``T_vendor_camera_link . inv(T_intel_bottom_screw_to_camera_link)``
+    leaves the Intel macro chain above it untouched and lands
+    ``xarm_camera_link`` -- hence the colour optical frame -- exactly on the
+    vendor cam-stand pose.
+    """
+    rotation = _rpy_matrix(*CAM_STAND_CAMERA_LINK_RPY)
+    back = tuple(-v for v in INTEL_D435_CAMERA_LINK_XYZ)
+    xyz = tuple(
+        CAM_STAND_CAMERA_LINK_XYZ[i] + sum(rotation[i][k] * back[k] for k in range(3))
+        for i in range(3)
+    )
+    return xyz, CAM_STAND_CAMERA_LINK_RPY  # type: ignore[return-value]
+
+
+CAM_STAND_CAMERA_JOINT = "xarm_camera_joint"
+
+
+def cam_stand_robot_description(urdf: str) -> str:
+    """Return *urdf* with ``xarm_camera_joint``'s origin moved to the cam-stand.
+
+    For ``robot_state_publisher``: with ``cam-stand`` active the rendered
+    wrist camera sits on the vendor bracket, so the TF the images advertise
+    (``xarm_camera_color_optical_frame``) has to say the same or every
+    deprojection lands 6 cm off and 90 deg rotated. Raises if the joint is
+    missing: a description without the placeholder joint is not the
+    artifact this preset was measured against, and silently publishing the
+    old pose is exactly the mismatch this exists to prevent.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(urdf)
+    joints = [
+        joint for joint in root.findall("joint")
+        if joint.get("name") == CAM_STAND_CAMERA_JOINT
+    ]
+    if len(joints) != 1:
+        raise ValueError(
+            f"cam-stand: expected exactly one {CAM_STAND_CAMERA_JOINT!r} in the "
+            f"robot description, found {len(joints)}"
+        )
+    origin = joints[0].find("origin")
+    if origin is None:
+        origin = ET.SubElement(joints[0], "origin")
+    xyz, rpy = cam_stand_camera_joint_origin()
+    origin.set("xyz", " ".join(repr(float(v)) for v in xyz))
+    origin.set("rpy", " ".join(repr(float(v)) for v in rpy))
+    return ET.tostring(root, encoding="unicode")
 
 
 def _multiply(
@@ -223,10 +369,12 @@ def apply_head_aim_correction(
 
     When *correction* is exactly ``LEVEL_FORWARD_CORRECTION_WXYZ``, this also
     sets ``view_axis_forward_offset_m`` to ``LEVEL_FORWARD_VIEW_OFFSET_M`` --
-    see that constant's docstring for why the level-forward aim needs it. An
-    explicit, non-preset correction gets no offset: the measured clearance
-    is specific to the preset's geometry, not a general property of "some
-    rotation was applied".
+    see that constant's docstring for why the level-forward aim needs it.
+    Likewise ``CAM_STAND_CORRECTION_WXYZ`` carries
+    ``CAM_STAND_MOUNT_OFFSET_XYZ`` into ``mount_frame_offset_xyz``. An
+    explicit, non-preset correction gets no offset of either kind: the
+    measured geometry is specific to the preset, not a general property of
+    "some rotation was applied".
     """
     specs = tuple(specs)
     if not any(spec.name == camera_name for spec in specs):
@@ -237,6 +385,7 @@ def apply_head_aim_correction(
         if correction == LEVEL_FORWARD_CORRECTION_WXYZ
         else 0.0
     )
+    mount_offset_xyz = _PRESET_MOUNT_OFFSETS.get(correction, (0.0, 0.0, 0.0))
     corrected = []
     for spec in specs:
         if spec.name != camera_name:
@@ -249,6 +398,7 @@ def apply_head_aim_correction(
                     _multiply(correction, spec.mount_rotation_wxyz)
                 ),
                 view_axis_forward_offset_m=forward_offset_m,
+                mount_frame_offset_xyz=mount_offset_xyz,
             )
         )
     return tuple(corrected)

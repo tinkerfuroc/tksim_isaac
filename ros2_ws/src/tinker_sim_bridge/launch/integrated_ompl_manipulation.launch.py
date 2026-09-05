@@ -14,7 +14,11 @@ _tools = _project_root / "tools"
 if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
-from tinker_sim_deploy.runtime import resolve_current_artifact, topic_control_description
+from tinker_sim_deploy.runtime import (
+    resolve_current_artifact,
+    sim_robot_description,
+    topic_control_description,
+)
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -219,7 +223,10 @@ def _resolve(context):
     physics_ready_path = attempt_dir / "physics-ready.json"
 
     resolved_artifact = resolve_current_artifact(root)
-    robot_description = topic_control_description(resolved_artifact.robot_urdf)
+    # sim_robot_description: topic_control_description plus the wrist camera
+    # cam-stand TF rewrite, keyed on TINKER_SIM_WRIST_CAMERA_AIM (the frame the
+    # wrist images advertise must be the one they were rendered from).
+    robot_description = sim_robot_description(resolved_artifact.robot_urdf)
     python_env = {"PYTHONPATH": str(root / "simulation") + os.pathsep + os.environ.get("PYTHONPATH", "")}
 
     scenario_arguments = [
