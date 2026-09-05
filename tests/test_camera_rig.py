@@ -4,12 +4,14 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 
 from tinker_sim_isaac.camera_rig import (
+    camera_xform_ops,
     CAMERA_NAMES,
     CameraStreamSpec,
     load_camera_specs,
@@ -39,8 +41,15 @@ class LoadCameraSpecsTest(unittest.TestCase):
                 "/camera/xarm_camera/aligned_depth_to_color/camera_info",
             ),
         )
-        self.assertEqual(wrist.mount_rotation_wxyz, (0.0, 0.0, 1.0, 0.0))
+        # REP-103 optical (z forward, y down) -> USD camera: 180 deg about X
+        # (e2996f8; the y-flip variant rendered the wrist upside down).
+        self.assertEqual(wrist.mount_rotation_wxyz, (0.0, 1.0, 0.0, 0.0))
         self.assertEqual((wrist.width, wrist.height), (848, 480))
+
+    def test_mount_frame_offset_defaults_to_zero(self) -> None:
+        """Code-only like the dolly: the contract never places a bracket."""
+        for spec in load_camera_specs(CONTRACT):
+            self.assertEqual(spec.mount_frame_offset_xyz, (0.0, 0.0, 0.0))
 
     def test_view_axis_forward_offset_defaults_to_zero(self) -> None:
         """The contract never sets this; it's a code-only, opt-in field.
@@ -230,3 +239,57 @@ class BackendWallColorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CameraXformOpsTest(unittest.TestCase):
+    """Standard names, plain TRS order, at most one translate -- the RTX
+    render product stopped tracking the arm when a second, suffix-named
+    translate was authored (2026-09-04); the offsets fold instead."""
+
+    def _wrist(self):
+        return next(s for s in load_camera_specs(CONTRACT) if s.name == "wrist_camera")
+
+    def test_default_is_orient_only(self) -> None:
+        spec = self._wrist()
+        self.assertEqual(camera_xform_ops(spec), (("orient", spec.mount_rotation_wxyz),))
+
+    def test_mount_offset_is_a_translate_listed_before_orient(self) -> None:
+        spec = replace(self._wrist(), mount_frame_offset_xyz=(0.065, -0.0112, 0.05686))
+        self.assertEqual(
+            camera_xform_ops(spec),
+            (("translate", (0.065, -0.0112, 0.05686)), ("orient", spec.mount_rotation_wxyz)),
+        )
+
+    def test_view_dolly_folds_into_the_mount_frame_translate(self) -> None:
+        # The wrist mount rotation is 180 deg about X, so the camera's local
+        # -Z (its view axis) is the mount's +Z: a 3 cm dolly forward is
+        # (0, 0, +0.03) in the mount frame.
+        spec = replace(self._wrist(), view_axis_forward_offset_m=0.03)
+        ops = camera_xform_ops(spec)
+        self.assertEqual([kind for kind, _ in ops], ["translate", "orient"])
+        for got, want in zip(ops[0][1], (0.0, 0.0, 0.03)):
+            self.assertAlmostEqual(got, want, places=12)
+        self.assertEqual(ops[1], ("orient", spec.mount_rotation_wxyz))
+
+    def test_both_offsets_become_one_translate(self) -> None:
+        spec = replace(
+            self._wrist(), mount_frame_offset_xyz=(0.1, 0.0, 0.0), view_axis_forward_offset_m=0.03
+        )
+        ops = camera_xform_ops(spec)
+        self.assertEqual([kind for kind, _ in ops], ["translate", "orient"])
+        for got, want in zip(ops[0][1], (0.1, 0.0, 0.03)):
+            self.assertAlmostEqual(got, want, places=12)
+
+    def test_never_more_than_two_ops_and_never_two_translates(self) -> None:
+        for spec in load_camera_specs(CONTRACT):
+            for mutated in (
+                spec,
+                replace(spec, view_axis_forward_offset_m=0.03),
+                replace(spec, mount_frame_offset_xyz=(0.01, 0.02, 0.03)),
+                replace(spec, mount_frame_offset_xyz=(0.01, 0.02, 0.03), view_axis_forward_offset_m=0.03),
+            ):
+                kinds = [kind for kind, _ in camera_xform_ops(mutated)]
+                self.assertLessEqual(len(kinds), 2, spec.name)
+                self.assertEqual(kinds[-1], "orient", spec.name)
+                self.assertLessEqual(kinds.count("translate"), 1, spec.name)
+

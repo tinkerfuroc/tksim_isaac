@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -291,6 +294,38 @@ def resolve_arena_map_yaml(project_root: Path, arena_id: str) -> Path:
     if not map_yaml.is_file():
         raise RuntimeError(f"arena artifact missing map.yaml: {map_yaml}")
     return map_yaml
+
+
+def sim_robot_description(
+    urdf: str | bytes, environ: Mapping[str, str] | None = None
+) -> str:
+    """The robot_description every sim bridge launch should publish.
+
+    ``topic_control_description`` plus the sim-only wrist camera rewrite:
+    under ``TINKER_SIM_WRIST_CAMERA_AIM=cam-stand`` the simulator renders
+    the wrist camera from xArm's D435 cam-stand bracket rather than the
+    artifact's placeholder flange mount, and TF has to follow the pixels
+    (``tinker_sim_isaac.head_camera_aim``, the cam-stand section). Keyed on
+    the same env value the sim stage reads so the two cannot disagree by
+    construction; any other value (unset, ``tool-forward``, an explicit
+    quaternion) leaves the description exactly as ``topic_control_description``.
+    """
+    description = topic_control_description(urdf)
+    env = os.environ if environ is None else environ
+    aim = _head_camera_aim()
+    if aim.resolve_wrist_aim_correction(env.get(aim.WRIST_AIM_ENV)) == aim.CAM_STAND_CORRECTION_WXYZ:
+        description = aim.cam_stand_robot_description(description)
+    return description
+
+
+def _head_camera_aim():
+    """Import the (pure-python, Kit-free) aim module from ``simulation/``."""
+    simulation = Path(__file__).resolve().parents[2] / "simulation"
+    if simulation.is_dir() and str(simulation) not in sys.path:
+        sys.path.insert(0, str(simulation))
+    from tinker_sim_isaac import head_camera_aim
+
+    return head_camera_aim
 
 
 def topic_control_description(urdf: str | bytes) -> str:

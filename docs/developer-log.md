@@ -4,6 +4,168 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-04 — Wrist camera blackout band: the camera was rendered from inside the gripper housing
+
+**Symptom (grasp bench, sensor-rich profile, `TINKER_SIM_WRIST_CAMERA_AIM=tool-forward`).**
+Every wrist frame carried a curved black band along the TOP edge, growing
+toward the right: first non-black row 0 at x<=212, 40 at x=318, 56 at
+x=424, 68 at x=530, 76 at x=636, 80 at x=742, 81 at x=847 — 9.4% of the
+848x480 image, present in color and aligned depth alike, fixed relative to
+the camera in every arm pose (close scan, wide scans, approach, carry).
+Pixels were unlit (mean grey 1.1, half exactly 0), and the aligned depth
+inside the band read a NEAR-RANGE 50–60 mm, not 0; deprojected through the
+URDF optical frame it landed on `xarm_gripper_base_link` at z ≈ 0.07.
+AnyGrasp's depth mask dropped those pixels (row 5: 241/848 valid). A
+brighter patch on the right edge came with it. Task-list item #18.
+
+**Reproduction without a GPU.** An offline USD frustum model (pure `pxr`,
+no Kit: project every `/visuals/` mesh of `robot.usd` through the rig's
+camera — 848x480, 69.4° HFOV, the rig's 0.05 m near clip — placed exactly
+as `CameraRig.initialize` places it: mount prim xform · orient(correction ·
+`mount_rotation_wxyz`)) reproduces the live band to within a row:
+
+| | live (bench) | offline model |
+|---|---|---|
+| occluded fraction | 9.4% | 9.6% |
+| first clear row @ x=318/424/530/636/742/847 | 40/56/68/76/80/81 | 40/57/69/77/81/82 |
+| depth in band | 50–60 mm | 50–66 mm |
+| occluder | (deprojects to gripper base) | `xarm_gripper_base_link/visuals/base_link/mesh` — the ONLY hit |
+
+With no aim correction (parity) the model shows zero self-occlusion, so the
+band is a product of the `tool-forward` tilt — but the tilt was only the
+proximate cause.
+
+**Root cause: the description mounts the wrist camera at a placeholder.**
+`tk26_sim/src/isaac_bringup/urdf/tinker_full.urdf.xacro` (the sim
+description the robot artifact is built from) layers Intel's
+`sensor_d435` macro onto `link_eef` with `<origin xyz="0 0 0" rpy="0 0 0"/>`.
+The Intel macro then adds its own bottom-screw → camera_link offset
+(0.0106, 0.0175, 0.0125) and the colour frame's +0.015 in Y, so the colour
+optical frame sits at link_eef + (0.0106, 0.0325, 0.0125): 12.5 mm above
+the flange, 33 mm off the tool axis — i.e. on the surface of the gripper
+base housing — looking along +X_eef, 90° off the tool. (That 90° is the
+defect `tool-forward` was written for; see 2026-08-31.) The real robot
+(`tinker_real.urdf`, xArm's `realsense_d435i.urdf.xacro`, "vendor
+factory-nominal" extrinsics with the per-robot hand-eye override hook)
+mounts `xarm_camera_link` on the D435 cam-stand bracket at link_eef + xyz
+(0.06746, −0.0175, 0.0237) rpy (π, −π/2, 0): 67 mm out along +X_eef, 24 mm
+up, looking straight down the tool axis with image-up radially outward.
+Tilting the placeholder camera 60° toward the tool IN PLACE swings the
+housing's far wall into the top of the frustum, just past the 0.05 m near
+clip — hence "black, 50–60 mm". The bright right-edge patch is the lit
+exterior of the same housing / left finger.
+
+**Ruled out / not the cause.** Rendering settings (the head camera under
+the same profile has no band); the annotator/CUDA-700 class of stale-read
+faults (the band is geometrically stable and depth-consistent); the
+`mount_rotation_wxyz` fix e2996f8 (parity pose shows no self-occlusion);
+lighting (unlit because it is the inside of a closed mesh).
+
+**What would also have "worked", and why not.** In the model, dollying the
+tool-forward camera forward by as little as 10–20 mm along its view axis
+already clears the housing (it was only 0–16 mm past the near plane), and a
+50 mm shift up the optical −y does too. Both keep the render origin inside
+the gripper assembly and keep the 60° in-place tilt that was itself a
+sweep-picked compromise ("30° shy of the tool because a tool-aligned view
+stares into the co-axial hand" — true only because the camera was
+co-located with the hand).
+
+**Fix: render from where the real camera is (`cam-stand`).** A second wrist
+preset, `TINKER_SIM_WRIST_CAMERA_AIM=cam-stand`, places the render camera
+at exactly the vendor cam-stand pose: `CAM_STAND_MOUNT_OFFSET_XYZ` =
+(0.065, −0.0112, 0.05686) is the bracket translation and
+`CAM_STAND_CORRECTION_WXYZ` = (0, 0, −√½, √½) the rotation, both in the
+artifact's (placeholder) optical frame — `inv(T_artifact_optical) ·
+T_vendor_optical`, which `tests/test_wrist_camera_aim.py` re-derives from
+both URDF chains so the constants cannot drift from the geometry they
+claim. Rendered from there the model shows ZERO housing pixels; only the
+fingertips at the bottom edge (~750 px, 0.2%) — what a wrist camera sees.
+Authoring the exact op sequence the rig produces onto `robot.usd`
+(`AddTranslateOp(op0)`, `AddOrientOp`) lands the origin at link_eef +
+(0.06746, −0.0325, 0.0237), view +Z_eef, image-up +X_eef, to 4e-8.
+
+Mechanics: `CameraStreamSpec.mount_frame_offset_xyz` (new; default zero)
+is a translation in the MOUNT prim's frame, authored as a translate op
+listed BEFORE the orient op — USD applies the last-listed op to the
+geometry first, so a translate before orient stays in the mount's axes
+while the existing `view_axis_forward_offset_m` dolly (after orient) stays
+in the camera's. Listing the bracket after the orient would rotate it with
+the aim and put the camera straight back on the housing. `camera_xform_ops`
+returns the op list as data so the order is unit-tested without Kit
+(`tests/test_camera_rig.py`). `tool-forward` is kept as the A/B baseline;
+`scripts/gpsr-stack` now hands the sim stage `cam-stand`.
+
+**TF has to move with the pixels.** The artifact URDF still carries the
+placeholder joint, so `robot_state_publisher` would put
+`xarm_camera_color_optical_frame` 6 cm and 90° away from where the pixels
+were rendered — every consumer deprojecting through TF (AnyGrasp's desk
+plane fit, detections in base/map) would be wrong by construction, and the
+bench had been compensating with a private `_aimed` alias frame.
+`tinker_sim_deploy.runtime.sim_robot_description` = `topic_control_description`
+plus a rewrite of `xarm_camera_joint`'s origin to (0.05496, 0, 0.0131) rpy
+(π, −π/2, 0) — `T_vendor_camera_link · inv(T_intel_bottom_screw)`, which leaves
+the Intel chain above it untouched and lands the colour optical frame on the
+vendor pose. It is keyed on the SAME env value the sim stage reads
+(`TINKER_SIM_WRIST_CAMERA_AIM=cam-stand`; any other value is a no-op), all
+four bridge launches (gpsr, manipulation, whole_robot,
+integrated_ompl_manipulation) call it, and `gpsr-stack` exports the value to
+the bridge stage too. `tests/test_wrist_cam_stand_description.py` checks the
+rewritten chain's FK equals the render pose exactly. A custom stack must set
+the variable for BOTH the sim and the bridge or TF and pixels disagree.
+
+**Live result (GPU0 relaunch of the bench recipe, same measurement tool on
+both).** Relaunched the shared GPU0 sim from this branch with the bench's exact recipe (`launch_isaac_bench.sh`: sensor-rich, rcw2026, seed 7, spawn (−2.99, 3.80), `TINKER_SIM_CAMERA_HZ=4`) and only the wrist preset changed. Same subscriber-side metric on both (first non-black row per column, top-edge-connected black region, aligned-depth stats):
+
+| | tool-forward (before) | cam-stand (after) |
+|---|---|---|
+| top-edge black band | 6.7% of the frame, 7/7 frames | 0 px, 8/8 frames |
+| first non-black row @ x=318/636/742/847 | 39/76/80/81 | 0/0/0/0 |
+| aligned depth inside the band | 50–64 mm | (no band) |
+| camera_info frame / fx | `xarm_camera_color_optical_frame` / 612.3 | unchanged |
+
+The after-capture is at the boot pose, where the tool-aligned camera looks at the robot's own chassis and lidar dome at close range (median depth 75 mm) — the home-pose view, not the housing; the housing band is pose-independent and gone. At the bench's four scan joint poses the URDF-FK-reposed frustum model gives tool-forward 9.6% (housing) vs cam-stand 0.1% (356 px of fingertip at 110–138 mm along the bottom edge) in every pose. Frames: `wrist_baseline_toolforward_color.png` / `wrist_camstand_color.png` in the job tmp dir; the grasp bench session is re-measuring at its scan poses against the plain optical frame.
+
+**Second round (same day): the first cam-stand authoring froze the wrist render.**
+The grasp bench's first live check of `cam-stand` at its wide scan pose
+showed the robot's own chassis and lidar dome filling the wrist frame with
+5–8 cm depths, which read as "the camera looks back along the tool". It
+did not: that frame was pixel-for-pixel my boot-pose capture from 40
+minutes earlier (mean difference 6.6 grey levels, 4% of pixels over 20 —
+AA dither), while the spectator camera showed the arm at the scan pose;
+the bench then moved to the close-scan pose and the wrist frame again
+changed by dither only. The RTX render product had stopped tracking the
+arm the moment `cam-stand` was on: every frame was the boot frame.
+
+The one thing the first authoring changed on the prim was a SECOND,
+suffix-named translate op — `xformOp:translate:op0` listed before
+`xformOp:orient` (a distinct suffix is required to author two translates,
+and the head's dolly already used the plain name after orient). Every
+camera that tracks fine (head with its dolly, wrist under `tool-forward`)
+carries only standard-named ops. The pose math was never wrong: the USD
+`XformCache` result for the authored ops matched the vendor chain to 4e-8
+both times — the static stage composes the suffixed op correctly, the
+renderer's live hierarchy evidently does not. Suffix vs. non-standard
+order was not separated (each test costs the shared sim a restart); the
+fix removes both. `camera_xform_ops` now folds every offset into ONE
+standard `xformOp:translate` listed before `xformOp:orient` (plain TRS
+order): the mount-frame bracket offset as is, the view-axis dolly rotated
+by the mount rotation into the mount frame first (`R · (0, 0, −d)`), which
+is exactly what "translate listed after orient" composed to. Head
+level-forward pose under the fold vs. the old `[orient, translate]`: 0.0
+difference in USD. Rule for the rig from here on: standard op names only,
+at most one translate, orient last.
+
+Live after the second relaunch: boot-pose capture, 8/8 frames, top-edge band 0 px, 0.0% black pixels anywhere, depth 100% valid with median 0.568 m; the frame differs from the frozen one by a mean of 120 grey levels (70% of pixels over 20) and shows the desk ahead with the two fingertip pads just entering the bottom edge, the framing the frustum model predicted. Grasp bench verification at its two scan poses (dccfdff): the frame follows the arm (wide-scan vs. frozen frame: mean difference 121.6 grey levels, 70% of pixels over 20); first non-black row 0 at all nine sampled columns at both poses, 0.0% dark pixels, nothing dark along the bottom edge either; depth 100% valid, median 0.861 m (wide) / 0.571 m (close). Desk-plane fit deprojected through the plain vendor optical pose, no in-plane flip: wide pose 48% of desk-footprint points in a plane at z 0.7328 m, tilt 0.12°, residual 1.2 mm; close pose 72% at z 0.7334 m, tilt 0.08°, residual 0.8 mm (desk top is 0.734 m). Flipped variants fail (3–5% in a 40° tilted plane), so image rows/cols match the camera_info convention. Operator trap recorded by the bench: a stale +60° alias publisher from an older recovery script re-latched over the new alias and put the first fit 13 cm low — kill old static_transform_publishers before re-latching.
+
+**Still open.** The durable fix is the description: give the `sensor_d435`
+instantiation in `tinker_full.urdf.xacro` the cam-stand origin (or restore
+xArm's `add_realsense_d435i` mount) and republish the robot artifact, after
+which both `cam-stand` and the TF rewrite become no-ops and hardware parity
+is restored rather than broken. Until then the preset is opt-in and
+sim-only like the head's `level-forward`. The head camera has the same TF
+gap (its `level-forward` correction is not in TF; the alias is identity) —
+not addressed here.
+
 ## 2026-09-02 — bench retention follow-ons: knife and plate are grasp-geometry, not sim bugs
 
 The mimic fix (below) turned the bench's first physically retained grasps
