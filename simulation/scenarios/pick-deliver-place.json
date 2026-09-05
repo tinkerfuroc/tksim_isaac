@@ -1,17 +1,48 @@
 {
   "schema_version": 2,
   "id": "pick-deliver-place",
-  "world": {"mode": "current"},
-  "robot": {"id": "tinker2", "initial_pose": [0.0, 0.0, 0.0]},
+  "world": {
+    "mode": "current"
+  },
+  "robot": {
+    "id": "tinker2",
+    "initial_pose": [
+      -2.0,
+      -2.0,
+      0.0
+    ]
+  },
   "actors": [],
   "objects": [
     {
       "id": "delivery_object",
       "asset_uri": "simulation/assets/primitives/task-object.usda",
-      "pose": {"xyz": [0.65, 0.0, 0.8], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+      "pose": {
+        "xyz": [
+          -1.35,
+          -2.0,
+          0.8
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
     }
   ],
-  "regions": [{"id": "delivery_target", "center": [1.5, 0.0, 0.8], "radius": 0.15}],
+  "regions": [
+    {
+      "id": "delivery_target",
+      "center": [
+        -0.5,
+        -2.0,
+        0.8
+      ],
+      "radius": 0.15
+    }
+  ],
   "events": [],
   "dialogue": [],
   "postconditions": [

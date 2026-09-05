@@ -679,13 +679,27 @@ class QualificationRunner:
             "database_path": None,
             "open": False,
         }
+        # G3 (round 3): confirm the output database WITHOUT opening a sqlite
+        # connection.  The previous read-only probe (``mode=ro``, ``timeout=0.2``)
+        # took a SHARED lock on the live recorder's fresh db3 while the rosbag2
+        # recorder committed its schema in ``journal_mode=delete``; the recorder's
+        # zero busy-timeout then aborted with ``SQLite error (5): database is
+        # locked`` (RERUN-3 cancel evidence).  A valid sqlite file carries the
+        # ``SQLite format 3\0`` header once any schema page is written, and a
+        # zero-length file is a valid empty sqlite database, so checking the raw
+        # header bytes (plus the empty-file case) confirms the database without
+        # ever contending with the recorder's writer lock.
         for database in databases:
             try:
-                uri = f"file:{database}?mode=ro"
-                with sqlite3.connect(uri, uri=True, timeout=0.2) as connection:
-                    connection.execute("PRAGMA schema_version").fetchone()
-            except (OSError, sqlite3.Error) as error:
+                with open(database, "rb") as handle:
+                    header = handle.read(16)
+            except OSError as error:
                 evidence["error"] = f"output database is not openable: {error}"
+                continue
+            if len(header) != 0 and header != b"SQLite format 3\x00":
+                evidence["error"] = (
+                    f"output database is not openable: {database} is not a sqlite file"
+                )
                 continue
             evidence.update({"database_path": str(database), "open": True})
             break
@@ -1493,9 +1507,17 @@ class QualificationRunner:
         return False
 
     def _write_pre_gate_baseline(self, manifest: QualificationManifest) -> bool:
-        safety_ok, safety, safety_reason = self._safety_readiness(manifest)
-        contract_ok, contract, contract_reason = self._contract_readiness(manifest)
-        controller_ok, controller, controller_reason = self._controller_readiness(manifest)
+        # Retry briefly: each probe opens a fresh subscriber, and transient-local
+        # topics can lose the DDS discovery race on a single shot even when the
+        # main readiness poll observed them healthy moments earlier.
+        deadline = time.monotonic() + 30.0
+        while True:
+            safety_ok, safety, safety_reason = self._safety_readiness(manifest)
+            contract_ok, contract, contract_reason = self._contract_readiness(manifest)
+            controller_ok, controller, controller_reason = self._controller_readiness(manifest)
+            if (safety_ok and contract_ok and controller_ok) or time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
         evidence: dict[str, Any] = {
             "status": "ready" if safety_ok and contract_ok and controller_ok else "failed",
             "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -2260,9 +2282,12 @@ class QualificationRunner:
         signals_sent: list[str] = []
         forced = False
         if planned:
+            # A ros2 launch tree needs to propagate shutdown through every
+            # child; 5s+3s was measured too short on slow hosts and a forced
+            # kill poisons the attempt (teardown_failures -> verification skip).
             for sig, label, timeout in (
-                (signal.SIGINT, "SIGINT", 5),
-                (signal.SIGTERM, "SIGTERM", 3),
+                (signal.SIGINT, "SIGINT", 20),
+                (signal.SIGTERM, "SIGTERM", 10),
             ):
                 if process.poll() is not None:
                     break
@@ -2369,10 +2394,7 @@ class QualificationRunner:
             for record in self._attempt_processes()
             if int(record["pid"]) not in managed_pids
             and int(record["pgid"]) not in managed_pgids
-            and not (
-                isaac_live
-                and "omni.telemetry.transmitter" in str(record.get("cmdline", ""))
-            )
+            and not (isaac_live and qualification_orphan_transient(record))
         ]
 
     def _terminate_attempt_orphans(self, *, grace_s: float = 1.0) -> list[dict[str, Any]]:
@@ -3125,7 +3147,9 @@ class QualificationRunner:
                 "remaining": orphan_cleanup.get("survivors", orphan_remaining),
                 "forced": bool(orphan_cleanup.get("forced_targets", [])),
             }
-            if orphan_initial:
+            if qualification_orphan_failure(
+                orphan_initial, orphan_cleanup.get("survivors", orphan_remaining)
+            ):
                 status = "failed"
             teardown_failures = [
                 name for name, record in self._termination.items()
@@ -3137,7 +3161,14 @@ class QualificationRunner:
             resources_clean = self._write_resource_evidence(manifest, gpu_baseline)
             if not resources_clean:
                 status = "failed"
-            evidence_ready = drained and rosbag_ok and not orphan_initial and not teardown_failures
+            evidence_ready = (
+                drained
+                and rosbag_ok
+                and not qualification_orphan_failure(
+                    orphan_initial, orphan_cleanup.get("survivors", orphan_remaining)
+                )
+                and not teardown_failures
+            )
             prior_evidence_invalid = status == "evidence-invalid"
             if status in {
                 "verification-pending",
@@ -3462,6 +3493,25 @@ def qualification_stop_process(runner: QualificationRunner, name: str) -> int | 
 def qualification_attempt_processes(runner: QualificationRunner) -> list[dict[str, Any]]:
     """Find descendants that escaped a launcher process group."""
     return runner._attempt_processes()
+
+
+def qualification_orphan_transient(record: dict[str, Any]) -> bool:
+    """Return True only for the known detached telemetry-transmitter transient."""
+    return "omni.telemetry.transmitter" in str(record.get("cmdline", ""))
+
+
+def qualification_orphan_failure(
+    initial: Sequence[dict[str, Any]], survivors: Sequence[dict[str, Any]]
+) -> bool:
+    """Return True when escaped attempt processes must demote an attempt.
+
+    Any cleanup survivor demotes (the transmitter included).  A transmitter-only
+    raw scan with zero survivors does not demote, but any unexpected process seen
+    in the strict raw scan demotes even when cleanup terminates it, and a mixed
+    transmitter + unexpected initial scan is unexpected and fails.
+    """
+    unexpected = [record for record in initial if not qualification_orphan_transient(record)]
+    return bool(survivors) or bool(unexpected)
 
 
 def qualification_terminate_attempt_orphans(

@@ -440,7 +440,7 @@ def _set_twist(message: Any, twist: Mapping[str, Any]) -> None:
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
     from tinker_sim_interfaces.msg import ContactTruth, ObjectTruth, RobotTruth, TaskTruth
 except ImportError:  # pragma: no cover - exercised only in non-ROS unit tests
@@ -456,6 +456,7 @@ if rclpy is not None:
             super().__init__("tinker_truth_evaluator")
             self.declare_parameter("physics_truth_topic", "/sim/internal/physics_truth")
             self.declare_parameter("jsonl_path", "")
+            self.declare_parameter("raw_jsonl_path", "")
             self.declare_parameter("scenario", "")
             self.declare_parameter("task", "")
             self.declare_parameter("thresholds_json", "")
@@ -463,6 +464,9 @@ if rclpy is not None:
             thresholds = json.loads(thresholds_raw) if thresholds_raw else None
             self._core = TruthEvaluatorCore(thresholds)
             self._writer = JsonlWriter(str(self.get_parameter("jsonl_path").value) or None)
+            self._raw_writer = JsonlWriter(
+                str(self.get_parameter("raw_jsonl_path").value) or None
+            )
             reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
             self._robot_pub = self.create_publisher(RobotTruth, "/sim/truth/robot_state", reliable)
             self._object_pub = self.create_publisher(ObjectTruth, "/sim/truth/object_state", reliable)
@@ -472,7 +476,7 @@ if rclpy is not None:
                 String,
                 str(self.get_parameter("physics_truth_topic").value),
                 self._on_truth,
-                qos_profile_sensor_data,
+                reliable,
             )
 
         def _on_truth(self, message: String) -> None:
@@ -523,10 +527,12 @@ if rclpy is not None:
                 task_message.detail = record["task_truth"]["detail"]
                 self._task_pub.publish(task_message)
                 self._writer.write(record)
+                self._raw_writer.write(payload)
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 self.get_logger().error(f"invalid physics truth frame: {error}")
 
         def close(self) -> None:
+            self._raw_writer.close()
             self._writer.close()
 
 

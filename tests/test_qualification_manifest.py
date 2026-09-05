@@ -12,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1964,6 +1964,175 @@ class QualificationManifestTest(unittest.TestCase):
                 # The strict query used during final teardown still sees every
                 # tagged survivor, including managed process trees.
                 self.assertEqual(runner._attempt_processes(), tagged)
+
+    # -- telemetry-transmitter orphan classification ---------------------------
+
+    def _run_with_orphan_scanner(
+        self,
+        root: Path,
+        *,
+        attempt_processes: Callable[[], list[dict[str, Any]]],
+        post_gate_processes: Callable[[], list[dict[str, Any]]] | None = None,
+    ):
+        """Run the full six-gate lifecycle with a fake orphan scanner.
+
+        The scanner is the only injected seam: every other phase uses the same
+        live-process/rosbag/drain fakes as the manifest tests.  This exercises
+        the real teardown/finalization classification in ``run()`` instead of
+        asserting on a helper constant.
+        """
+        runner = self._runner(root)
+        runner.gate_commands = {"retention": ["/bin/true"]}
+
+        class LiveProcess:
+            _next_pid = 2_000_300
+
+            def __init__(self):
+                self.pid = LiveProcess._next_pid
+                LiveProcess._next_pid += 1
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, **_kwargs):
+                self.returncode = 0
+                return self.returncode
+
+        def popen(command, **kwargs):
+            if command[:3] == ["ros2", "bag", "record"]:
+                bag_dir = Path(kwargs["env"]["TINKER_SIM_ROSBAG_DIR"])
+                bag_dir.mkdir()
+                (bag_dir / "metadata.yaml").write_text(self._bag_metadata(), encoding="utf-8")
+                self._write_rosbag_log(bag_dir.parent)
+            if command[0] == "humble-wrapper":
+                attempt_dir = Path(kwargs["env"]["TINKER_SIM_ATTEMPT_DIR"])
+                (attempt_dir / "scenario-runner.json").write_text(
+                    json.dumps(
+                        {
+                            "scenario": "qualification-retention",
+                            "seed": 7,
+                            "operations": [
+                                {
+                                    "operation": "set_simulation_state",
+                                    "accepted": True,
+                                    "state": 1,
+                                    "boundary": "PHYSICS_READY",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return LiveProcess()
+
+        runner._popen = popen
+        runner._command_runner = lambda command, **_kwargs: self._ros_output(list(command))
+        runner._gpu_processes = lambda: {
+            "available": True,
+            "gpus": [{"index": 0, "uuid": "GPU-orphan", "memory_used_mib": 0}],
+            "processes": [],
+        }
+        runner._attempt_processes = attempt_processes
+        if post_gate_processes is not None:
+            runner._post_gate_attempt_processes = post_gate_processes
+        return runner.run(), runner
+
+    def test_transient_telemetry_orphan_in_raw_scan_does_not_demote_attempt(self) -> None:
+        transmitter = {
+            "pid": 900_001,
+            "ppid": 1,
+            "pgid": 900_001,
+            "cmdline": "/isaac/omni.telemetry.transmitter --detached",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            observed_scans: list[list[dict[str, Any]]] = []
+            scans = iter([[transmitter], []])
+
+            def attempt_processes() -> list[dict[str, Any]]:
+                value = next(scans, [])
+                observed_scans.append(list(value))
+                return value
+
+            result, _runner = self._run_with_orphan_scanner(
+                root,
+                attempt_processes=attempt_processes,
+                post_gate_processes=lambda: [],
+            )
+            # The raw scan/cleanup still saw the transmitter...
+            self.assertEqual(observed_scans[0], [transmitter])
+            # ...but it terminated during cleanup and no other orphan exists, so
+            # the otherwise valid attempt is neither demoted nor has its evidence
+            # verification suppressed.
+            self.assertEqual(result.status, "unverified")
+
+    def test_orphans_surviving_cleanup_still_fail(self) -> None:
+        transmitter = {
+            "pid": 900_001,
+            "ppid": 1,
+            "pgid": 900_001,
+            "cmdline": "/isaac/omni.telemetry.transmitter --detached",
+        }
+        unexpected = {
+            "pid": 900_002,
+            "ppid": 1,
+            "pgid": 900_002,
+            "cmdline": "escaped-helper",
+        }
+        for label, survivors in (
+            ("transmitter", [transmitter]),
+            ("unexpected", [unexpected]),
+            ("both", [transmitter, unexpected]),
+        ):
+            with self.subTest(orphans=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+
+                def attempt_processes() -> list[dict[str, Any]]:
+                    return [dict(record) for record in survivors]
+
+                with patch("validation.manipulation_qualification.os.kill"), patch(
+                    "validation.manipulation_qualification.time.sleep"
+                ):
+                    result, _runner = self._run_with_orphan_scanner(
+                        root, attempt_processes=attempt_processes
+                    )
+                # Any orphan that survives cleanup — the transmitter included —
+                # must still demote the attempt.
+                self.assertEqual(result.status, "failed")
+
+    def test_unexpected_orphan_terminated_by_cleanup_still_fails(self) -> None:
+        """An unexpected orphan observed in the raw scan must demote the attempt
+        even when cleanup terminates it successfully (no survivors)."""
+        unexpected = {
+            "pid": 900_002,
+            "ppid": 1,
+            "pgid": 900_002,
+            "cmdline": "escaped-helper",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = {"calls": 0}
+
+            def attempt_processes() -> list[dict[str, Any]]:
+                state["calls"] += 1
+                # The raw scan sees the orphan; cleanup terminates it, so no
+                # later scan reports it.
+                return [unexpected] if state["calls"] <= 2 else []
+
+            with patch("validation.manipulation_qualification.os.kill"):
+                result, _runner = self._run_with_orphan_scanner(
+                    root,
+                    attempt_processes=attempt_processes,
+                    post_gate_processes=lambda: [],
+                )
+            self.assertEqual(result.status, "failed")
+            termination = json.loads((result.attempt_dir / "termination.json").read_text())
+            orphan = termination["orphan-cleanup"]
+            # The raw scan included the unexpected orphan and cleanup had no
+            # survivors — the attempt must still be demoted.
+            self.assertEqual(orphan["initial"], [unexpected])
+            self.assertEqual(orphan["survivors"], [])
 
     def test_late_log_append_is_settled_before_evidence_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

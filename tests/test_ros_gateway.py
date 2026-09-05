@@ -27,6 +27,7 @@ class _SnapshotBackend:
         self.pending_count = 0
         self.pending_index = 0
         self.begin_calls: list[int] = []
+        self._contact_pairs: list[dict[str, str]] = []
 
     def set_safety_stop(self, active: bool) -> None:
         self.safety_stopped = bool(active)
@@ -34,6 +35,14 @@ class _SnapshotBackend:
             self.pending.clear()
             self.pending_count = 0
             self.pending_index = 0
+
+    def contact_pairs(self) -> list[dict[str, str]]:
+        return list(self._contact_pairs)
+
+    def arm_scenario_collision(self) -> bool:
+        from tinker_sim_isaac.backend import IsaacWholeRobotBackend
+
+        return IsaacWholeRobotBackend.is_arm_scenario_collision(self.contact_pairs())
 
     def begin_command_snapshot(self, snapshot: int) -> None:
         from tinker_sim_core.command_mux import decode_snapshot_packet
@@ -320,5 +329,310 @@ class RosGatewayOrderingTest(unittest.TestCase):
         self.assertEqual(backend.stop_calls[-2:], [True, False])
 
 
+class CollisionHeartbeatTest(unittest.TestCase):
+    """RED: collision must keep publishing while Isaac is paused.
+
+    /sim/safety/collision is the supervisor's required source with a 1.0s
+    deadline.  The physics-tick publish() is gated by is_playing(); on the
+    first cold start the timeline is still paused (world load/spawn) so the
+    collision source goes stale >1s, the supervisor asserts stop, and it
+    issues a STRICT deactivate of the freshly-activated trajectory controller
+    that the controller manager cannot satisfy — the joint-scenario
+    controller-switch storm.  A pause-independent wall-clock heartbeat must
+    keep the collision Bool fresh regardless of the timeline state.
+    """
+
+    def _gateway_with_capture(self, backend: _SnapshotBackend):
+        gateway = _gateway(backend)
+        gateway._Bool = _TestBool
+        gateway.collision_pub = _CollisionCapture()
+        return gateway
+
+    def test_heartbeat_publishes_false_when_no_collision(self) -> None:
+        backend = _SnapshotBackend()
+        gateway = self._gateway_with_capture(backend)
+        gateway.collision_pub.captured.clear()
+
+        gateway.publish_safety_heartbeat()
+
+        self.assertEqual(
+            gateway.collision_pub.captured,
+            [False],
+            "pause-independent heartbeat must publish the collision Bool",
+        )
+
+    def test_heartbeat_publishes_true_when_arm_touches_scenario(self) -> None:
+        backend = _SnapshotBackend()
+        backend._contact_pairs = [
+            {
+                "body_a": "/World/Tinker/link1",
+                "body_b": "/World/Scenario/sim_fixture/public_target",
+            }
+        ]
+        gateway = self._gateway_with_capture(backend)
+
+        gateway.publish_safety_heartbeat()
+
+        self.assertEqual(
+            gateway.collision_pub.captured,
+            [True],
+            "arm/scenario contact must surface as an active collision sample",
+        )
+
+    def test_heartbeat_ignores_arm_arm_contact(self) -> None:
+        backend = _SnapshotBackend()
+        backend._contact_pairs = [
+            {"body_a": "/World/Tinker/link_tcp", "body_b": "/World/Tinker/link7"}
+        ]
+        gateway = self._gateway_with_capture(backend)
+
+        gateway.publish_safety_heartbeat()
+
+        self.assertEqual(gateway.collision_pub.captured, [False])
+
+
+class _CollisionCapture:
+    """Stand-in for the gateway's rclpy collision publisher."""
+
+    def __init__(self) -> None:
+        self.captured: list[bool] = []
+
+    def publish(self, message: object) -> None:
+        self.captured.append(bool(message.data))
+
+
+class _TestBool:
+    """Minimal stand-in for std_msgs/msg/Bool used by object.__new__ harness."""
+
+    def __init__(self) -> None:
+        self.data = False
+
+
+class _CloudBackend:
+    """Minimal backend for the development-lidar publish path."""
+
+    def __init__(self, occupancy: object | None) -> None:
+        self.occupancy = occupancy
+        self.root_state_calls = 0
+
+    def root_state(self) -> dict[str, object]:
+        self.root_state_calls += 1
+        return {
+            "position": [0.0, 0.0, 0.0],
+            "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+        }
+
+
+def _cloud_gateway(*, development_lidar: bool, occupancy: object | None) -> RosStandardGateway:
+    from builtin_interfaces.msg import Time  # type: ignore[import-untyped]
+    from sensor_msgs.msg import PointCloud2, PointField  # type: ignore[import-untyped]
+
+    gateway = object.__new__(RosStandardGateway)
+    gateway.backend = _CloudBackend(occupancy)
+    gateway.development_lidar = development_lidar
+    gateway._tick = 0
+    gateway._lidar_stride = 1
+    gateway._PointCloud2 = PointCloud2
+    gateway._PointField = PointField
+    gateway._stamp = lambda: Time(sec=0, nanosec=0)
+    return gateway
+
+
+def _cloud_stamp() -> object:
+    from builtin_interfaces.msg import Time  # type: ignore[import-untyped]
+
+    return Time(sec=0, nanosec=0)
+
+
+class RosDevelopmentLidarTest(unittest.TestCase):
+    def test_development_lidar_publishes_without_occupancy(self) -> None:
+        """RED (R2): the development lidar cloud must publish even when the
+        backend has no occupancy map.  Live rerun-5 raised
+        ``environment_cloud_provider raised: no live environment PointCloud2 is
+        available`` because the observer received zero ``/livox/lidar`` clouds;
+        the cloud-publish gate hard-required ``backend.occupancy is not None``
+        (manipulation-core qualification has no PGM map), so the dev lidar never
+        fired.  The gate must not depend on occupancy, and
+        ``_development_point_cloud`` must emit a non-empty finite cloud from a
+        deterministic fallback."""
+        gateway = _cloud_gateway(development_lidar=True, occupancy=None)
+        self.assertTrue(
+            gateway._cloud_publish_enabled(),
+            "development lidar must publish without an occupancy map",
+        )
+        cloud = gateway._development_point_cloud(_cloud_stamp())
+        self.assertGreaterEqual(
+            cloud.width, 1, "development cloud must be non-empty when occupancy is None"
+        )
+        self.assertEqual(cloud.height, 1)
+        self.assertTrue(cloud.is_dense)
+        self.assertGreaterEqual(len(cloud.data), 12, "non-empty cloud must carry point data")
+
+    def test_development_lidar_uses_occupancy_raycast_when_present(self) -> None:
+        """The occupancy raycast path stays the primary source when a map
+        exists. The sensor origin's own cell must be free (unlike
+        ``test_development_lidar_empty_when_origin_occupied``) so this
+        exercises the raycast path rather than the occupied-origin guard.
+
+        This asserts a geometry-derived point, not just non-emptiness: a
+        regression that reinstated the raycast-floor ring (every ray at the
+        0.3 m minimum) would still satisfy a bare ``width >= 1`` check with
+        181 fake points, so that alone is not a real guard on the dev-lidar
+        occupied-origin fix (``0a42eec``).
+
+        Geometry, independent of the implementation under test:
+        ``_CloudBackend.root_state`` fixes position (0, 0, 0) and an identity
+        orientation, so yaw = 0 and the sensor origin sits 0.12 m ahead of
+        the robot at world (0.12, 0.0) -- see the 0.12 m mount offset in
+        ``_development_point_cloud``. The fixture's ``OccupancyMap`` is 4x4
+        at 1.0 m resolution with origin (-2.0, -2.0), free (not occupied)
+        only at grid cell (gx=2, gy=2) -- i.e. world x in [0, 1), y in
+        [0, 1) -- and occupied everywhere else (including out of bounds).
+        The sensor origin (0.12, 0.0) falls inside that one free cell.
+
+        The straight-ahead ray (local angle 0, i.e. index 90 of the 181 rays
+        for degrees -90..90) walks outward from ``minimum=0.3`` in
+        ``step = resolution / 2 = 0.5`` increments along +x: 0.3 -> world
+        x=0.42 (still inside the free cell, x in [0,1)) -> 0.8 -> world
+        x=0.92 (still inside) -> 1.3 -> world x=1.42, grid cell (gx=3, gy=2),
+        which is occupied. So the ray must stop at distance 1.3 m, landing
+        the point at local (1.3, 0.0, 0.0) in the sensor frame.
+        """
+        import struct
+
+        from tinker_sim_core.occupancy import OccupancyMap
+
+        rows = tuple(
+            tuple(not (gy == 2 and gx == 2) for gx in range(4)) for gy in range(4)
+        )
+        occ = OccupancyMap(4, 4, 1.0, -2.0, -2.0, rows)
+        gateway = _cloud_gateway(development_lidar=True, occupancy=occ)
+        cloud = gateway._development_point_cloud(_cloud_stamp())
+        self.assertEqual(cloud.width, 181, "every ray must resolve inside the 4x4 grid")
+
+        straight_ahead_index = 90  # degrees == 0 within range(-90, 91)
+        offset = straight_ahead_index * cloud.point_step
+        px, py, pz = struct.unpack_from("<fff", cloud.data, offset)
+        self.assertAlmostEqual(px, 1.3, places=5)
+        self.assertAlmostEqual(py, 0.0, places=5)
+        self.assertAlmostEqual(pz, 0.0, places=5)
+
+    def test_cloud_disabled_without_development_lidar(self) -> None:
+        gateway = _cloud_gateway(development_lidar=False, occupancy=None)
+        self.assertFalse(
+            gateway._cloud_publish_enabled(),
+            "cloud must not publish when the development lidar flag is off",
+        )
+
+    def test_development_lidar_empty_when_origin_occupied(self) -> None:
+        """A sensor origin inside an occupied cell has no valid returns; the
+        cloud must be empty rather than a fake ring at the raycast floor."""
+
+        class _OccupiedEverywhere:
+            def occupied_at_world(self, x: float, y: float) -> bool:
+                return True
+
+            def raycast(
+                self,
+                x: float,
+                y: float,
+                angle: float,
+                minimum: float = 0.3,
+                maximum: float = 40.0,
+            ) -> float:
+                return minimum
+
+        gateway = _cloud_gateway(
+            development_lidar=True, occupancy=_OccupiedEverywhere()
+        )
+        message = gateway._development_point_cloud(_cloud_stamp())
+        self.assertEqual(message.width, 0)
+
+    def test_cloud_publish_gate_respects_stride(self) -> None:
+        gateway = _cloud_gateway(development_lidar=True, occupancy=None)
+        gateway._tick = 1
+        gateway._lidar_stride = 2
+        self.assertFalse(gateway._cloud_publish_enabled())
+        gateway._tick = 2
+        self.assertTrue(gateway._cloud_publish_enabled())
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeHandle:
+    """Mimics rclpy's subscription handle: a context manager with take_message."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.takes = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def take_message(self, msg_type, raw):
+        self.takes += 1
+        if not self._messages:
+            return None
+        return (self._messages.pop(0), {"fake": True})
+
+
+class _FakeSubscription:
+    def __init__(self, messages):
+        self.handle = _FakeHandle(messages)
+        self.msg_type = object
+        self.raw = False
+
+
+class MainThreadIntakeTest(unittest.TestCase):
+    """spin_once takes inbound messages straight from the DDS readers.
+
+    An executor thread could only take one message per wait-set pass and had
+    to win the GIL back from the simulation loop each time; under a live
+    bridge it fell behind the command stream and the reliable transport
+    replayed a stale arm trajectory tens of seconds later.
+    """
+
+    def test_take_pending_drains_every_reader_in_one_call(self) -> None:
+        gateway = _gateway()
+        seen = []
+        commands = _FakeSubscription([f"c{i}" for i in range(5)])
+        safety = _FakeSubscription(["s0"])
+        gateway._intake_subscriptions = (
+            (commands, lambda m: seen.append(("command", m))),
+            (safety, lambda m: seen.append(("safety", m))),
+        )
+        self.assertEqual(gateway._take_pending(), 6)
+        self.assertEqual([m for kind, m in seen if kind == "command"], [f"c{i}" for i in range(5)])
+        self.assertEqual([m for kind, m in seen if kind == "safety"], ["s0"])
+        # One extra take per reader to observe the empty reader.
+        self.assertEqual(commands.handle.takes, 6)
+        self.assertEqual(safety.handle.takes, 2)
+        self.assertEqual(gateway._take_pending(), 0)
+
+    def test_take_pending_bounds_a_single_pass(self) -> None:
+        gateway = _gateway()
+        limit = RosStandardGateway.INTAKE_BATCH_LIMIT
+        flood = _FakeSubscription(range(limit + 10))
+        gateway._intake_subscriptions = ((flood, lambda m: None),)
+        self.assertEqual(gateway._take_pending(), limit)
+        self.assertEqual(gateway._take_pending(), 10)
+
+    def test_spin_once_takes_before_draining_events(self) -> None:
+        gateway = _gateway()
+        gateway._safety_active = False
+        received = []
+        gateway._intake_subscriptions = (
+            (_FakeSubscription(["only"]), lambda m: received.append(m)),
+        )
+        gateway.spin_once()
+        self.assertEqual(received, ["only"])
+
+    def test_gateway_without_intake_attribute_still_spins(self) -> None:
+        gateway = _gateway()
+        gateway._safety_active = False
+        gateway.spin_once()  # no _intake_subscriptions: nothing to take

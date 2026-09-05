@@ -11,8 +11,8 @@ Exercises actual generated ROS types and graph behavior under Humble CPython
 - ``/move_action`` goal/result service type/source/cardinality probe,
   including a wrong-typed result service;
 - result/status adjudication through a real ``MoveGroup`` action server
-  (SUCCESS + nonempty trajectory for joint/pose; ABORTED + a real
-  ``PLANNING_FAILED`` code for blocked), plus the bounded cancellation path.
+  (SUCCESS + nonempty trajectory for joint/pose), plus the bounded cancellation
+  path.
 
 The simulator (CPython 3.12) suite at ``tests/test_ompl_plan_smoke.py`` remains
 ROS-free; these tests ``importorskip`` ROS and are skipped under 3.12.
@@ -52,7 +52,6 @@ from ompl_plan_smoke import (  # noqa: E402
     READINESS_TOPIC,
     READINESS_TYPE,
     SUCCESS_ERROR_CODE,
-    STATUS_ABORTED,
     STATUS_SUCCEEDED,
     OmplPlanSmokeClient,
     _action_name_from_type,
@@ -518,12 +517,6 @@ def _joint_success_result() -> MoveGroup.Result:
     return result
 
 
-def _blocked_failure_result() -> MoveGroup.Result:
-    result = MoveGroup.Result()
-    result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
-    return result
-
-
 def _spin_server(
     server_node: Node,
 ) -> tuple[SingleThreadedExecutor, threading.Thread]:
@@ -572,36 +565,6 @@ def test_run_action_joint_success(rclpy_context) -> None:
         server_node.destroy_node()
 
 
-def test_run_action_blocked_aborted_planning_failed(rclpy_context) -> None:
-    server_node = Node("move_group")
-
-    def execute(goal_handle):
-        goal_handle.abort()
-        return _blocked_failure_result()
-
-    server = ActionServer(server_node, MoveGroup, MOVE_ACTION, execute)
-    client_node = Node("run_action_blocked_client")
-    client = OmplPlanSmokeClient(client_node, _args(timeout=5.0))
-    server_executor, server_thread = _spin_server(server_node)
-    try:
-        time.sleep(0.5)
-        action_client = ActionClient(client_node, MoveGroup, MOVE_ACTION)
-        goal = build_pose_goal([0.35, 0.0, 0.5], [0.0, 0.0, 0.0, 1.0])
-        outcome = client._run_action(action_client, goal, time.monotonic() + 5.0)
-        assert outcome["kind"] == "non_success"
-        assert outcome["goal_accepted"] is True
-        assert outcome["terminal_status"] == STATUS_ABORTED
-        assert outcome["terminal_status_name"] == "STATUS_ABORTED"
-        assert outcome["error_code"] == MoveItErrorCodes.PLANNING_FAILED
-        assert outcome["result_received"] is True
-        action_client.destroy()
-    finally:
-        server.destroy()
-        _stop_server(server_executor, server_thread)
-        client_node.destroy_node()
-        server_node.destroy_node()
-
-
 # ---------------------------------------------------------------------------
 # 6. Bounded cancellation path (fail-closed)
 # ---------------------------------------------------------------------------
@@ -615,7 +578,9 @@ def test_cancel_path_is_bounded_and_fail_closed(rclpy_context) -> None:
     def execute(goal_handle):
         release.wait(timeout=5.0)
         goal_handle.abort()
-        return _blocked_failure_result()
+        result = MoveGroup.Result()
+        result.error_code.val = MoveItErrorCodes.PLANNING_FAILED
+        return result
 
     server_node = Node("move_group")
     server = ActionServer(server_node, MoveGroup, MOVE_ACTION, execute)

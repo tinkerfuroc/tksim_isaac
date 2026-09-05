@@ -1,4 +1,4 @@
-# Claude Code handoff: Tinker manipulation core
+# Tinker manipulation core handoff
 
 Date: 2026-07-29
 

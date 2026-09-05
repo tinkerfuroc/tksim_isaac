@@ -18,11 +18,32 @@ from tinker_sim_core.command_mux import (
     decode_command_frame,
     decode_snapshot_packet,
 )
+from tinker_sim_isaac.camera_rig import (
+    camera_info_fields,
+    depth_to_16uc1_mm,
+    is_color_only,
+    pack_registered_cloud,
+    rgb8_array,
+)
 
 
-SAFETY_HEARTBEAT_TIMEOUT_S = 1.0
-COMMAND_STREAM_TIMEOUT_S = 0.5
+# Wall-clock freshness deadlines. The 1.0 s / 0.5 s defaults assume the
+# gateway spins continuously; under RTX camera rendering the stepping loop
+# (which pumps this gateway) stalls for multiple wall seconds per stride, so
+# every stall re-latched a safety stop mid-trajectory — arm stiffness dropped
+# 20000 -> 600 and the command stream was severed ("randomly hanging" arm).
+# Raise via env for camera-loaded runs; defaults preserve existing behavior.
+# (Ported from the shared checkout, where the grasp-benchmark session
+# diagnosed the same latch-up 2026-08-27.)
+SAFETY_HEARTBEAT_TIMEOUT_S = float(
+    os.environ.get("TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S", "1.0"))
+COMMAND_STREAM_TIMEOUT_S = float(
+    os.environ.get("TINKER_SIM_COMMAND_STREAM_TIMEOUT_S", "0.5"))
 MAX_RETIRED_COMMAND_EPOCHS = 64
+# R2: fixed range for the deterministic development-lidar fallback ring emitted
+# when the backend carries no occupancy map.  Finite and inside the 40 m lidar
+# bound so the qualification cloud consumer always receives a non-empty cloud.
+_FALLBACK_LIDAR_RANGE_M = 1.0
 # Safety and command messages use separate ROS topics.  Tolerate only a short
 # bounded packet gap at that boundary; no packet is applied while resyncing.
 BASELINE_RESYNC_WINDOW_S = 0.25
@@ -75,7 +96,14 @@ class RosStandardGateway:
     API. All actuator commands arrive through one JointState topic.
     """
 
-    def __init__(self, backend: Any, *, development_lidar: bool = False) -> None:
+    def __init__(
+        self,
+        backend: Any,
+        *,
+        development_lidar: bool = False,
+        camera_rig: Any | None = None,
+        camera_pointcloud: bool = False,
+    ) -> None:
         import rclpy
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
@@ -96,7 +124,6 @@ class RosStandardGateway:
         self.rclpy = rclpy
         self.backend = backend
         self.development_lidar = development_lidar
-        self._truth_writer = PhysicsTruthJsonlWriter.from_environment()
         self.node = Node("tinker_isaac_gateway")
         # Keep commands and safety transitions in one FIFO.  Draining separate
         # queues by category can apply an old command after a stop has been
@@ -172,10 +199,53 @@ class RosStandardGateway:
         self.contact_pub = self.node.create_publisher(
             WrenchStamped, "/sim/parity/finger_contact", reliable
         )
+        self._camera_rig = camera_rig
+        self.camera_skipped_frames = 0
+        self._camera_streams: list[dict[str, Any]] = []
+        self._camera_cloud_pub = None
+        if camera_rig is not None:
+            from sensor_msgs.msg import CameraInfo, Image
+
+            self._Image = Image
+            self._CameraInfo = CameraInfo
+            # The real drivers publish RELIABLE + VOLATILE + KEEP_LAST(10)
+            # (tk26_vision realsense_qos.yaml).  Every tk26_vision CameraInfo
+            # subscription is RELIABLE; a best-effort publisher would deliver
+            # zero messages to them, silently.
+            camera_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            for spec in camera_rig.specs:
+                self._camera_streams.append(
+                    {
+                        "spec": spec,
+                        "info_fields": camera_info_fields(spec),
+                        "color_pub": self.node.create_publisher(
+                            Image, spec.color_topic, camera_qos
+                        ),
+                        "depth_pub": (
+                            None
+                            if is_color_only(spec)
+                            else self.node.create_publisher(
+                                Image, spec.depth_topic, camera_qos
+                            )
+                        ),
+                        "info_pubs": [
+                            self.node.create_publisher(CameraInfo, topic, camera_qos)
+                            for topic in spec.camera_info_topics
+                        ],
+                    }
+                )
+            if camera_pointcloud:
+                self._camera_cloud_pub = self.node.create_publisher(
+                    PointCloud2, "/camera/depth_registered/points", camera_qos
+                )
         initial_collision = Bool()
         initial_collision.data = False
         self.collision_pub.publish(initial_collision)
-        self.node.create_subscription(
+        command_subscription = self.node.create_subscription(
             JointState, "/isaac_joint_commands", self._joint_command, reliable
         )
         safety_qos = QoSProfile(
@@ -183,29 +253,65 @@ class RosStandardGateway:
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.node.create_subscription(
+        safety_subscription = self.node.create_subscription(
             Bool, "/sim/hardware/safety_stop", self._safety_stop, safety_qos
         )
-        # NVIDIA's simulation-control extension owns a MultiThreadedExecutor.
-        # Never use rclpy's global executor here: spin_once may execute
-        # unrelated work and block the Kit/physics thread.  DDS callbacks run
-        # in this private executor and only enqueue immutable commands.
-        self._executor = SingleThreadedExecutor()
-        self._executor.add_node(self.node)
-        self._executor_thread = threading.Thread(
-            target=self._spin_executor,
-            name="tinker-isaac-ros-gateway",
-            daemon=True,
+        # Inbound messages are taken on the simulation thread, inside
+        # spin_once(), straight from the DDS readers (see _take_pending).  A
+        # private executor thread used to do this, but it could only take one
+        # message per wait-set pass and each pass had to win the GIL back from
+        # the simulation loop: under a live bridge it fell behind the command
+        # stream, the reliable transport buffered the surplus, and the
+        # simulator then re-executed a 20 s-old arm trajectory ~40 s late
+        # (2026-08-21, docs/developer-log.md).  TINKER_SIM_GATEWAY_EXECUTOR=1
+        # restores the thread for comparison.
+        self._intake_subscriptions = (
+            (command_subscription, self._joint_command),
+            (safety_subscription, self._safety_stop),
         )
-        self._executor_thread.start()
+        self._executor = None
+        self._executor_thread = None
+        if os.environ.get("TINKER_SIM_GATEWAY_EXECUTOR") == "1":
+            # NVIDIA's simulation-control extension owns a MultiThreadedExecutor.
+            # Never use rclpy's global executor here: spin_once may execute
+            # unrelated work and block the Kit/physics thread.
+            self._intake_subscriptions = ()
+            self._executor = SingleThreadedExecutor()
+            self._executor.add_node(self.node)
+            self._executor_thread = threading.Thread(
+                target=self._spin_executor,
+                name="tinker-isaac-ros-gateway",
+                daemon=True,
+            )
+            self._executor_thread.start()
         self._state_stride = max(1, round((1.0 / 50.0) / backend.dt))
         self._lidar_stride = max(1, round((1.0 / 10.0) / backend.dt))
         self._imu_stride = max(1, round((1.0 / 200.0) / backend.dt))
         self._status_stride = max(1, round((1.0 / 2.0) / backend.dt))
         self._tick = 0
+        # Opt-in wall-time attribution of publish() (TINKER_SIM_PROFILE=1,
+        # read through the backend's profile flag so the two stay in step).
+        self._publish_profile_enabled = bool(
+            getattr(backend, "step_profile", {}).get("enabled", False)
+        )
+        self._publish_profile = {
+            "clock": 0.0, "joint_state": 0.0, "imu": 0.0, "cloud": 0.0,
+            "status": 0.0, "truth": 0.0, "n": 0,
+        }
+        self._camera_profile = {
+            "capture": 0.0, "rgb_convert": 0.0, "depth_convert": 0.0,
+            "image_fill": 0.0, "image_publish": 0.0, "info": 0.0, "n": 0,
+        }
+        # spin_once() attribution: events drained, command packets applied and
+        # the wall time spent inside backend.command_joints (the only part of
+        # the drain that touches PhysX buffers).
+        self._spin_profile = {
+            "events": 0, "commands": 0, "safety": 0, "command_joints_s": 0.0, "n": 0,
+        }
 
     def _spin_executor(self) -> None:
         from rclpy.executors import ExternalShutdownException
+        from rclpy._rclpy_pybind11 import RCLError
 
         try:
             self._executor.spin()
@@ -213,6 +319,11 @@ class RosStandardGateway:
             # The standard simulation-control node installs the process signal
             # handler and may shut down the shared rclpy context first.
             pass
+        except RCLError:
+            # rcl_shutdown() can also invalidate the context between wait-set
+            # rebuilds without raising ExternalShutdownException.
+            if self.node.context.ok():
+                raise
 
     def _stamp(self):
         from builtin_interfaces.msg import Time
@@ -236,6 +347,24 @@ class RosStandardGateway:
             self._incoming_events.put(
                 ("command", (command, epoch, snapshot, time.monotonic()))
             )
+            _st = self._spin_stats()
+            _st["received"] = _st.get("received", 0) + 1
+            try:
+                _logical, _count, _index = decode_snapshot_packet(snapshot)
+                _by = _st.setdefault("by_index", {})
+                _by[_index] = _by.get(_index, 0) + 1
+                if "first_logical" not in _st:
+                    _st["first_logical"] = _logical
+                _st["last_logical"] = _logical
+                _newest = _st.get("newest_snapshot", -1)
+                if _logical > _newest:
+                    _st["newest_snapshot"] = _logical
+                else:
+                    _lag = _newest - _logical
+                    if _lag > _st.get("max_snapshot_lag", 0):
+                        _st["max_snapshot_lag"] = _lag
+            except Exception:
+                pass
         except Exception as error:
             self._last_command_error = str(error)
             self.node.get_logger().error(f"rejected joint command: {error}")
@@ -244,6 +373,7 @@ class RosStandardGateway:
         try:
             received_at = time.monotonic()
             self._safety_last_sample_at = received_at
+            self._safety_last_sample_sim_at = self._sim_receipt_time()
             self._safety_sample_sequence = (
                 getattr(self, "_safety_sample_sequence", 0) + 1
             )
@@ -379,6 +509,9 @@ class RosStandardGateway:
             # rollback boundary for a backend without a stopped-state command
             # transaction API.
             self.backend.set_safety_stop(True)
+            # set_safety_stop early-returns when the stop is already active,
+            # so it cannot be relied on to drop staging on the abort path.
+            self._discard_backend_snapshot_staging()
         except Exception as stop_error:
             error = RuntimeError(
                 f"{error}; failed to reassert safety stop: {stop_error}"
@@ -388,6 +521,16 @@ class RosStandardGateway:
         get_logger = getattr(node, "get_logger", None)
         if get_logger is not None:
             get_logger().error(f"rejected command baseline: {error}")
+
+    def _discard_backend_snapshot_staging(self) -> None:
+        """Drop the backend's partial snapshot staging, if it supports it.
+
+        Older backends without the API keep the previous behaviour rather
+        than failing the transaction.
+        """
+        discard = getattr(self.backend, "discard_command_snapshot_staging", None)
+        if discard is not None:
+            discard()
 
     def _commit_staged_baseline(
         self, packets_to_apply: list[tuple[Any, int, float]]
@@ -417,7 +560,14 @@ class RosStandardGateway:
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
                 self._validate_staged_command(staged_command)
-            self.backend.set_safety_stop(True)
+            # `set_safety_stop(True)` cannot serve as this reset: the backend
+            # is already stopped here, and its early return on a repeated
+            # identical sample means the call is a no-op.  Preflight has left
+            # the staging index at `packet_count`, so without an explicit
+            # discard the commit pass below restarts at packet one and strict
+            # ordering refuses it ("expected packet count+1, got 1"), which
+            # fails every multi-packet baseline permanently.
+            self._discard_backend_snapshot_staging()
 
             # This is the only non-atomic portion for the legacy backend.  No
             # physics step can interleave with this single gateway turn, and
@@ -426,7 +576,10 @@ class RosStandardGateway:
             self.backend.set_safety_stop(False)
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
+                _cj_t0 = time.perf_counter()
                 accepted = self.backend.command_joints(staged_command)
+                self._spin_stats()['command_joints_s'] += time.perf_counter() - _cj_t0
+                self._spin_stats()['commands'] += 1
                 if accepted is False:
                     raise RuntimeError("command rejected during baseline commit")
         except Exception as error:
@@ -504,6 +657,40 @@ class RosStandardGateway:
         self.backend.set_safety_stop(True)
         self._last_command_error = "command stream expired"
 
+    def _sim_receipt_time(self) -> float | None:
+        """Backend simulation time for stamping a message receipt, or None."""
+        try:
+            value = getattr(self.backend, "simulation_time", None)
+            return None if value is None else float(value)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _sim_age_stale(self, received_sim_at: object, timeout: float) -> bool:
+        """Whether a receipt is also stale measured in *simulation* time.
+
+        The heartbeat/command publishers run on wall clock in separate
+        processes, but this loop's wall clock is not a fair judge of their
+        liveness: an RTX render stride or a loaded box stalls the stepping
+        loop for multiple wall seconds while perfectly healthy samples queue
+        in DDS, and a wall-only deadline then re-latches the limp safety
+        hold on every stride (observed 2026-08-31 by the grasp-bench stack).
+        Simulation time freezes with the loop, so requiring the sample to be
+        stale in BOTH clocks keeps every real guarantee -- a dead publisher
+        still trips the deadline within one simulated timeout while the sim
+        is stepping, and a faster-than-realtime sim cannot trip it early
+        (wall age still gates) -- without punishing the loop for its own
+        stalls.  While the timeline is paused nothing moves, so deferring
+        expiry until stepping resumes is safe by construction.  Receipts
+        with no simulation stamp (older tests, exotic backends) keep the
+        wall-only behavior.
+        """
+        if received_sim_at is None:
+            return True
+        sim_now = self._sim_receipt_time()
+        if sim_now is None:
+            return True
+        return sim_now - float(received_sim_at) >= timeout
+
     def _enforce_command_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
         if getattr(self, "_command_stream_lost", False):
@@ -512,8 +699,13 @@ class RosStandardGateway:
         timeout = getattr(
             self, "_command_stream_timeout_s", COMMAND_STREAM_TIMEOUT_S
         )
-        if last is not None and now - last >= timeout:
-            self._enter_command_stream_lost(now)
+        if last is None or now - last < timeout:
+            return
+        if not self._sim_age_stale(
+            getattr(self, "_last_command_received_sim_at", None), timeout
+        ):
+            return
+        self._enter_command_stream_lost(now)
 
     def _enforce_safety_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -522,6 +714,10 @@ class RosStandardGateway:
         last = self._safety_last_sample_at
         timeout = getattr(self, "_safety_timeout_s", SAFETY_HEARTBEAT_TIMEOUT_S)
         if last is not None and now - last < timeout:
+            return
+        if last is not None and not self._sim_age_stale(
+            getattr(self, "_safety_last_sample_sim_at", None), timeout
+        ):
             return
         if self._safety_active:
             return
@@ -536,15 +732,69 @@ class RosStandardGateway:
                     f"failed to apply safety heartbeat timeout: {error}"
                 )
 
+    # Upper bound on messages taken per subscription per spin_once; a
+    # backlog larger than this is drained over the following steps.
+    INTAKE_BATCH_LIMIT = 512
+
+    def _take_pending(self) -> int:
+        """Take every waiting message from the gateway's DDS readers.
+
+        Runs on the simulation thread.  Each take is a direct reader call (no
+        wait set), so a 150 Hz command stream costs a few tens of microseconds
+        per control step and never queues up behind the GIL.
+        """
+        taken = 0
+        for subscription, handler in getattr(self, "_intake_subscriptions", ()):
+            handle = subscription.handle
+            for _ in range(self.INTAKE_BATCH_LIMIT):
+                with handle:
+                    message_info = handle.take_message(
+                        subscription.msg_type, subscription.raw
+                    )
+                if message_info is None:
+                    break
+                self._note_message_info(message_info)
+                handler(message_info[0])
+                taken += 1
+        return taken
+
+    def _note_message_info(self, message_info) -> None:
+        """Profile-only: source-timestamp age and distinct writer GIDs."""
+        try:
+            info = message_info[1]
+            source_ns = None
+            gid = None
+            if isinstance(info, dict):
+                source_ns = info.get("source_timestamp")
+                gid = info.get("publisher_gid")
+            else:
+                source_ns = getattr(info, "source_timestamp", None)
+                gid = getattr(info, "publisher_gid", None)
+            stats = self._spin_stats()
+            if source_ns:
+                age_ms = (time.time_ns() - int(source_ns)) / 1e6
+                stats["source_age_max_ms"] = max(stats.get("source_age_max_ms", 0.0), age_ms)
+                stats["source_age_min_ms"] = min(stats.get("source_age_min_ms", 1e12), age_ms)
+            if gid is not None:
+                gids = stats.setdefault("writer_gids", set())
+                if len(gids) < 8:
+                    gids.add(bytes(gid).hex() if not isinstance(gid, str) else gid)
+        except Exception:
+            pass
+
     def spin_once(self) -> None:
+        self._take_pending()
         self._enforce_safety_deadline()
         self._enforce_command_deadline()
+        self._spin_stats()["n"] += 1
         while True:
             try:
                 event_type, payload = self._incoming_events.get_nowait()
             except queue.Empty:
                 return
+            self._spin_stats()["events"] += 1
             if event_type == "safety_stop":
+                self._spin_stats()["safety"] += 1
                 if isinstance(payload, tuple):
                     active, received_at = payload[:2]
                     sequence = payload[2] if len(payload) > 2 else None
@@ -575,6 +825,13 @@ class RosStandardGateway:
                     )
                 continue
             command, epoch, snapshot, received_at = payload
+            _st = self._spin_stats()
+            _age = time.monotonic() - float(received_at)
+            if _age > _st.get("max_age_s", 0.0):
+                _st["max_age_s"] = _age
+            _st["queue_depth_max"] = max(
+                _st.get("queue_depth_max", 0), self._incoming_events.qsize()
+            )
             if not getattr(self, "_session_protocol_enabled", False):
                 if epoch != self._command_epoch:
                     self._last_command_error = (
@@ -599,7 +856,10 @@ class RosStandardGateway:
                         continue
                     begin_snapshot(snapshot)
                     self._last_snapshot_id = snapshot
+                _cj_t0 = time.perf_counter()
                 accepted = self.backend.command_joints(command)
+                self._spin_stats()['command_joints_s'] += time.perf_counter() - _cj_t0
+                self._spin_stats()['commands'] += 1
                 if accepted is False:
                     self._last_command_error = (
                         "command ignored while safety stop is active"
@@ -774,6 +1034,7 @@ class RosStandardGateway:
                 self._snapshot_baseline_pending = False
                 self._snapshot_recovery_floor = None
                 self._last_command_received_at = time.monotonic()
+                self._last_command_received_sim_at = self._sim_receipt_time()
                 self._last_command_error = None
                 continue
 
@@ -782,12 +1043,17 @@ class RosStandardGateway:
                 self._last_command_error = "rejected command: backend lacks snapshot boundary"
                 continue
             try:
+                _stats = self._spin_stats()
+                _stats["replayed"] = _stats.get("replayed", 0) + max(0, len(packets_to_apply) - 1)
                 for staged_command, staged_snapshot, _ in packets_to_apply:
                     begin_snapshot(staged_snapshot)
                     if self._command_stream_lost:
                         self.backend.set_safety_stop(False)
                         self._command_stream_lost = False
+                    _cj_t0 = time.perf_counter()
                     accepted = self.backend.command_joints(staged_command)
+                    self._spin_stats()['command_joints_s'] += time.perf_counter() - _cj_t0
+                    self._spin_stats()['commands'] += 1
                     if accepted is False:
                         self._command_stream_lost = True
                         self._last_command_error = (
@@ -802,16 +1068,106 @@ class RosStandardGateway:
                     self._snapshot_baseline_pending = False
                     self._snapshot_recovery_floor = None
                     self._last_command_received_at = time.monotonic()
+                    self._last_command_received_sim_at = self._sim_receipt_time()
                     self._last_command_error = None
             except Exception as error:
                 self._last_command_error = str(error)
                 self.node.get_logger().error(f"rejected joint command: {error}")
 
+    def _spin_stats(self) -> dict:
+        """spin_once() counters; created lazily so gateways built without
+        __init__ (tests) still account."""
+        prof = self.__dict__.get("_spin_profile")
+        if prof is None:
+            prof = self._spin_profile = {
+                "events": 0, "commands": 0, "safety": 0, "command_joints_s": 0.0, "n": 0,
+            }
+        return prof
+
+    def spin_profile_snapshot(self) -> dict:
+        """spin_once() attribution since the last snapshot; resets the window."""
+        prof = self._spin_stats()
+        out = {
+            "calls": prof["n"],
+            "events": prof["events"],
+            "commands": prof["commands"],
+            "safety": prof["safety"],
+            "command_joints_ms": round(1000.0 * prof["command_joints_s"], 3),
+            "gripper_limit_writes": int(
+                getattr(self.backend, "gripper_effort_limit_writes", 0)
+            ),
+            "replayed": prof.get("replayed", 0),
+            "received": prof.get("received", 0),
+            "max_age_ms": round(1000.0 * prof.get("max_age_s", 0.0), 1),
+            "queue_depth_max": prof.get("queue_depth_max", 0),
+            "by_index": dict(prof.get("by_index", {})),
+            "max_snapshot_lag": prof.get("max_snapshot_lag", 0),
+            "source_age_ms": [
+                round(prof.get("source_age_min_ms", 0.0), 1),
+                round(prof.get("source_age_max_ms", 0.0), 1),
+            ],
+            "writers": len(prof.get("writer_gids", ())),
+            "logical_span": [prof.get("first_logical"), prof.get("last_logical")],
+        }
+        prof.pop("first_logical", None)
+        prof.pop("last_logical", None)
+        prof["source_age_min_ms"] = 1e12
+        prof["source_age_max_ms"] = 0.0
+        prof["writer_gids"] = set()
+        prof["by_index"] = {}
+        prof["max_snapshot_lag"] = 0
+        prof["replayed"] = 0
+        prof["received"] = 0
+        prof["max_age_s"] = 0.0
+        prof["queue_depth_max"] = 0
+        for key in ("events", "commands", "safety", "n"):
+            prof[key] = 0
+        prof["command_joints_s"] = 0.0
+        return out
+
+    def publish_profile_snapshot(self) -> dict:
+        """Per-call ms attribution of publish(); resets the window."""
+        prof = self._publish_profile
+        n = max(1, prof["n"])
+        out = {
+            key: round(1000.0 * prof[key] / n, 3)
+            for key in ("clock", "joint_state", "imu", "cloud", "status", "truth")
+        }
+        out["calls"] = prof["n"]
+        for key in ("clock", "joint_state", "imu", "cloud", "status", "truth"):
+            prof[key] = 0.0
+        prof["n"] = 0
+        return out
+
+    def camera_profile_snapshot(self) -> dict:
+        """Per-call ms attribution of publish_cameras(); resets the window."""
+        prof = self._camera_profile
+        n = max(1, prof["n"])
+        keys = ("capture", "rgb_convert", "depth_convert", "image_fill", "image_publish", "info")
+        out = {key: round(1000.0 * prof[key] / n, 3) for key in keys}
+        out["calls"] = prof["n"]
+        for key in keys:
+            prof[key] = 0.0
+        prof["n"] = 0
+        return out
+
     def publish(self) -> None:
+        _prof = self._publish_profile if self._publish_profile_enabled else None
+        _t = time.monotonic if _prof is not None else None
+        _mark = _t() if _t else 0.0
+
+        def _lap(key: str) -> None:
+            nonlocal _mark
+            if _t is not None:
+                now = _t()
+                _prof[key] += now - _mark
+                _mark = now
+
         stamp = self._stamp()
         clock = self._Clock()
         clock.clock = stamp
         self.clock_pub.publish(clock)
+        _lap("clock")
         if self._tick % self._state_stride == 0:
             names, positions, velocities, efforts = self.backend.joint_state()
             message = self._JointState()
@@ -821,6 +1177,7 @@ class RosStandardGateway:
             message.velocity = velocities
             message.effort = efforts
             self.joint_pub.publish(message)
+        _lap("joint_state")
         if self._tick % self._imu_stride == 0:
             state = self.backend.root_state()
             message = self._Imu()
@@ -834,25 +1191,23 @@ class RosStandardGateway:
                 message.angular_velocity.z,
             ) = angular
             self.imu_pub.publish(message)
-        if (
-            self.development_lidar
-            and self._tick % self._lidar_stride == 0
-            and self.backend.occupancy is not None
-        ):
+        _lap("imu")
+        if self._cloud_publish_enabled():
             self.cloud_pub.publish(self._development_point_cloud(stamp))
+        _lap("cloud")
         if self._tick % self._status_stride == 0:
+            status = {
+                "physics_device": self.backend.physics_device,
+                "standard_simulation_control": True,
+                "joint_command_topic": "/isaac_joint_commands",
+                "last_command_error": self._last_command_error,
+                "development_lidar": self.development_lidar,
+                "safety_stop": bool(self.backend.safety_stopped),
+            }
+            if self._camera_rig is not None:
+                status["camera_skipped_frames"] = self.camera_skipped_frames
             message = self._String()
-            message.data = json.dumps(
-                {
-                    "physics_device": self.backend.physics_device,
-                    "standard_simulation_control": True,
-                    "joint_command_topic": "/isaac_joint_commands",
-                    "last_command_error": self._last_command_error,
-                    "development_lidar": self.development_lidar,
-                    "safety_stop": bool(self.backend.safety_stopped),
-                },
-                sort_keys=True,
-            )
+            message.data = json.dumps(status, sort_keys=True)
             self.status_pub.publish(message)
             contacts = self.backend.contact_state()
             force = sum(
@@ -865,6 +1220,7 @@ class RosStandardGateway:
             contact.header.frame_id = "link_tcp"
             contact.wrench.force.z = float(force)
             self.contact_pub.publish(contact)
+        _lap("status")
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {
@@ -873,12 +1229,176 @@ class RosStandardGateway:
             "active_epoch": self._command_epoch,
             "last_snapshot_id": self._last_logical_snapshot_id,
         }
-        physics_truth.data = self._truth_writer.append(frame)
+        physics_truth.data = json.dumps(
+            frame, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
         self.physics_truth_pub.publish(physics_truth)
+        _lap("truth")
+        if _prof is not None:
+            _prof["n"] += 1
+        self._tick += 1
+
+    def publish_cameras(self) -> None:
+        """Publish one same-stamp color+depth+info set per camera.
+
+        A camera whose annotator has no frame this tick is skipped and counted
+        rather than fabricated; the counter keeps stalls observable.
+        """
+        if self._camera_rig is None:
+            return
+        _prof = self._camera_profile if self._publish_profile_enabled else None
+        _t = time.monotonic if _prof is not None else None
+        _mark = _t() if _t else 0.0
+
+        def _lap(key: str) -> None:
+            nonlocal _mark
+            if _t is not None:
+                now = _t()
+                _prof[key] += now - _mark
+                _mark = now
+
+        stamp = self._stamp()
+        frames = self._camera_rig.capture()
+        _lap("capture")
+        for entry in self._camera_streams:
+            spec = entry["spec"]
+            color_only = entry["depth_pub"] is None
+            rgb, depth = frames.get(spec.name, (None, None))
+            if rgb is None or (not color_only and depth is None):
+                self.camera_skipped_frames += 1
+                continue
+            color_array = rgb8_array(rgb, spec.height, spec.width)
+            _lap("rgb_convert")
+            if not color_only:
+                depth_array = depth_to_16uc1_mm(depth)
+                _lap("depth_convert")
+                if depth_array.shape != (spec.height, spec.width):
+                    raise RuntimeError(
+                        f"{spec.name} depth resolution {depth_array.shape} does not "
+                        f"match the contract ({spec.height}, {spec.width})"
+                    )
+
+            color = self._Image()
+            color.header.stamp = stamp
+            color.header.frame_id = spec.frame_id
+            color.height = spec.height
+            color.width = spec.width
+            color.encoding = "rgb8"
+            color.is_bigendian = 0
+            color.step = spec.width * 3
+            # array.array('B') takes rclpy's validated fast path; raw bytes trigger a per-element __debug__ scan that costs seconds per frame at 720p.
+            color.data = array.array("B", color_array.tobytes())
+            _lap("image_fill")
+            entry["color_pub"].publish(color)
+            _lap("image_publish")
+
+            if entry["depth_pub"] is not None and depth is not None:
+                depth_msg = self._Image()
+                depth_msg.header.stamp = stamp
+                depth_msg.header.frame_id = spec.frame_id
+                depth_msg.height = spec.height
+                depth_msg.width = spec.width
+                depth_msg.encoding = "16UC1"
+                depth_msg.is_bigendian = 0
+                depth_msg.step = spec.width * 2
+                depth_msg.data = array.array("B", depth_array.tobytes())
+                _lap("image_fill")
+                entry["depth_pub"].publish(depth_msg)
+                _lap("image_publish")
+
+            fields = entry["info_fields"]
+            info = self._CameraInfo()
+            info.header.stamp = stamp
+            info.header.frame_id = spec.frame_id
+            info.height = fields["height"]
+            info.width = fields["width"]
+            info.distortion_model = fields["distortion_model"]
+            info.d = list(fields["d"])
+            info.k = fields["k"]
+            info.r = fields["r"]
+            info.p = fields["p"]
+            for publisher in entry["info_pubs"]:
+                publisher.publish(info)
+            _lap("info")
+
+            if self._camera_cloud_pub is not None and spec.name == "head_camera":
+                cloud = self._PointCloud2()
+                cloud.header.stamp = stamp
+                cloud.header.frame_id = spec.frame_id
+                cloud.height = spec.height
+                cloud.width = spec.width
+                cloud.fields = [
+                    self._PointField(
+                        name=name,
+                        offset=offset,
+                        datatype=self._PointField.FLOAT32,
+                        count=1,
+                    )
+                    for name, offset in (("x", 0), ("y", 4), ("z", 8))
+                ]
+                cloud.is_bigendian = False
+                cloud.point_step = 16
+                cloud.row_step = 16 * spec.width
+                cloud.is_dense = False
+                # depth is CameraRig.capture()'s output: since be05e61 it
+                # was pinned-buffer metres float32, straight off the
+                # annotator; the GPU depth kernel (camera_rig.py) now
+                # converts depth to 16UC1 millimetres before this function
+                # ever sees it, so pack_registered_cloud (which projects
+                # metres) needs it back: mm/1000 -> metres, and 0mm (its
+                # invalid marker) becomes 0.0, which pack_registered_cloud's
+                # own ``depth > 0.0`` check already treats as invalid.
+                # depth_array is exactly this uint16 mm frame (identical
+                # values to `depth` post-conversion; depth_to_16uc1_mm is a
+                # passthrough for it), so reuse it instead of converting twice.
+                cloud.data = array.array(
+                    "B",
+                    pack_registered_cloud(
+                        depth_array.astype("float32") * 0.001,
+                        fx=fields["k"][0],
+                        fy=fields["k"][4],
+                        cx=fields["k"][2],
+                        cy=fields["k"][5],
+                    ),
+                )
+                self._camera_cloud_pub.publish(cloud)
+
+        if _prof is not None:
+            _prof["n"] += 1
+    def publish_safety_heartbeat(self) -> None:
+        """Publish the collision source on a wall-clock cadence, pause-safe.
+
+        ``publish()`` only runs while the timeline is playing, so the
+        supervisor's required collision source would go stale during a pause
+        (world load/spawn on the first cold start) and trip a spurious stop +
+        controller deactivate.  This method republishes the current collision
+        classification regardless of the timeline state and is throttled to a
+        wall-clock period by the caller (``run_sim``).
+        """
         collision = self._Bool()
         collision.data = bool(self.backend.arm_scenario_collision())
-        self.collision_pub.publish(collision)
-        self._tick += 1
+        try:
+            self.collision_pub.publish(collision)
+        except Exception:
+            # Signal-driven rcl_shutdown() can invalidate the context between
+            # the caller's loop check and this publish; a heartbeat is moot
+            # once shutdown began, but a live-context failure is real.
+            if self.node.context.ok():
+                raise
+
+    def _cloud_publish_enabled(self) -> bool:
+        """Whether the development lidar cloud should publish on this tick.
+
+        R2: the qualification development-lidar cloud must not depend on
+        ``backend.occupancy`` being present.  The manipulation-core qualification
+        profile carries no PGM map; the legacy gate hard-required ``occupancy is
+        not None``, so ``/livox/lidar`` never fired and the cartesian-retreat
+        ``environment_cloud_provider`` failed closed ("no live environment
+        PointCloud2 is available").  Occupancy (when present) only shapes the
+        raycast in :meth:`_development_point_cloud`; the dev lidar itself is the
+        qualification sensor source and must always publish.
+        """
+        return bool(self.development_lidar) and self._tick % self._lidar_stride == 0
 
     def _development_point_cloud(self, stamp):
         state = self.backend.root_state()
@@ -888,18 +1408,35 @@ class RosStandardGateway:
             2.0 * (qw * qz + qx * qy),
             1.0 - 2.0 * (qy * qy + qz * qz),
         )
+        occupancy = getattr(self.backend, "occupancy", None)
+        origin_x = x + 0.12 * math.cos(yaw)
+        origin_y = y + 0.12 * math.sin(yaw)
+        # R4: a sensor origin inside an occupied cell (e.g. spawned inside
+        # furniture) has no valid returns; every ray would otherwise report
+        # the raycast minimum, producing a fake 0.3 m ring that poisons AMCL.
+        origin_occupied = (
+            occupancy is not None and occupancy.occupied_at_world(origin_x, origin_y)
+        )
         points = []
-        for degrees in range(-90, 91):
-            local = math.radians(degrees)
-            distance = self.backend.occupancy.raycast(
-                x + 0.12 * math.cos(yaw),
-                y + 0.12 * math.sin(yaw),
-                yaw + local,
-            )
-            if math.isfinite(distance):
-                points.append(
-                    (distance * math.cos(local), distance * math.sin(local), 0.0)
+        if not origin_occupied:
+            locals_ = [math.radians(degrees) for degrees in range(-90, 91)]
+            if occupancy is not None:
+                # One vectorised cast for all 181 rays; bit-identical to the
+                # per-ray `raycast` loop it replaces (see
+                # tests/test_occupancy_raycast_vectorised.py), ~35 ms -> <1 ms
+                # per lidar frame.
+                distances = occupancy.raycast_many(
+                    origin_x, origin_y, [yaw + local for local in locals_]
                 )
+            else:
+                # R2 deterministic fallback: a fixed keep-out ring so the
+                # cloud stays non-empty and finite for qualification
+                # consumers even when no occupancy map exists.
+                distances = [_FALLBACK_LIDAR_RANGE_M] * len(locals_)
+            for local, distance in zip(locals_, distances):
+                    points.append(
+                        (distance * math.cos(local), distance * math.sin(local), 0.0)
+                    )
         message = self._PointCloud2()
         message.header.stamp = stamp
         message.header.frame_id = "livox360"
@@ -922,12 +1459,10 @@ class RosStandardGateway:
         return message
 
     def close(self) -> None:
-        try:
+        if self._executor is not None:
             self._executor.shutdown()
             self._executor_thread.join(timeout=2.0)
             self._executor.remove_node(self.node)
-            self.node.destroy_node()
-            if self.rclpy.ok():
-                self.rclpy.shutdown()
-        finally:
-            self._truth_writer.close()
+        self.node.destroy_node()
+        if self.rclpy.ok():
+            self.rclpy.shutdown()

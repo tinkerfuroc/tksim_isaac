@@ -94,3 +94,137 @@ class OccupancyMap:
                 return distance
             distance += step
         return float("inf")
+
+    def _distance_ladder(self, minimum: float, maximum: float) -> "list[float]":
+        """The exact sample distances `raycast` visits, built the same way.
+
+        `raycast` accumulates ``distance += step`` in Python floats; the ladder
+        is produced by that very loop (not ``minimum + k * step``) so every
+        vectorised sample lands on a bit-identical distance.
+        """
+        step = self.resolution / 2.0
+        key = (minimum, maximum, step)
+        cache = self.__dict__.get("_ladder_cache")
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_ladder_cache", cache)
+        ladder = cache.get(key)
+        if ladder is None:
+            ladder = []
+            distance = minimum
+            while distance <= maximum:
+                ladder.append(distance)
+                distance += step
+            cache[key] = ladder
+        return ladder
+
+    def _grid_array(self):
+        import numpy as np
+
+        grid = self.__dict__.get("_grid_array_cache")
+        if grid is None:
+            grid = np.array(self.occupied, dtype=bool).reshape(self.height, self.width)
+            object.__setattr__(self, "_grid_array_cache", grid)
+        return grid
+
+    def raycast_many(
+        self,
+        x: float,
+        y: float,
+        angles: "list[float]",
+        minimum: float = 0.3,
+        maximum: float = 40.0,
+        chunk: int = 64,
+    ) -> "list[float]":
+        """Vectorised `raycast` for many angles from one origin; bit-identical.
+
+        Same sample ladder, same per-sample arithmetic (``x + cos(angle) *
+        distance`` with ``math.cos``), the same Python floor-division cell
+        lookup and the same out-of-bounds-is-occupied rule as `raycast`, so the
+        returned distances are exactly what the scalar loop returns. The
+        ladder is marched in chunks across all still-unresolved rays and stops
+        as soon as every ray has hit, keeping the scalar loop's early exit
+        (indoors most rays resolve within the first few chunks).
+        """
+        import math
+
+        import numpy as np
+
+        angles = list(angles)
+        if not angles:
+            return []
+        ladder = self._distance_ladder(minimum, maximum)
+        if not ladder:
+            return [float("inf")] * len(angles)
+        distances = self.__dict__.get("_ladder_array_cache", {}).get((minimum, maximum))
+        if distances is None:
+            distances = np.array(ladder, dtype=np.float64)
+            cache = self.__dict__.setdefault("_ladder_array_cache", {})
+            object.__setattr__(self, "_ladder_array_cache", cache)
+            cache[(minimum, maximum)] = distances
+        cos = np.array([math.cos(a) for a in angles], dtype=np.float64)
+        sin = np.array([math.sin(a) for a in angles], dtype=np.float64)
+        grid = self._grid_array()
+        width = self.width
+        height = self.height
+        pending = np.arange(len(angles))
+        result = np.full(len(angles), np.inf, dtype=np.float64)
+        for offset in range(0, len(ladder), chunk):
+            seg = distances[offset : offset + chunk]
+            px = x + cos[pending, None] * seg[None, :]
+            py = y + sin[pending, None] * seg[None, :]
+            gx = np.floor_divide(px - self.origin_x, self.resolution)
+            gy = np.floor_divide(py - self.origin_y, self.resolution)
+            outside = (gx < 0) | (gy < 0) | (gx >= width) | (gy >= height)
+            ix = np.clip(gx, 0, width - 1).astype(np.int64)
+            iy = np.clip(gy, 0, height - 1).astype(np.int64)
+            hit = outside | grid[iy, ix]
+            first = hit.argmax(axis=1)
+            resolved = hit[np.arange(len(pending)), first]
+            if resolved.any():
+                rays = pending[resolved]
+                result[rays] = seg[first[resolved]]
+                pending = pending[~resolved]
+                if len(pending) == 0:
+                    break
+        # Distances come straight from the ladder array, so they are the very
+        # floats the scalar loop would have returned.
+        return [float(value) for value in result]
+
+    def free_with_clearance(self, x: float, y: float, clearance_m: float) -> bool:
+        if clearance_m < 0.0:
+            raise ValueError("clearance must be non-negative")
+        step = self.resolution
+        steps = int(clearance_m / step) + 1
+        for gx in range(-steps, steps + 1):
+            for gy in range(-steps, steps + 1):
+                dx = gx * step
+                dy = gy * step
+                if dx * dx + dy * dy > clearance_m * clearance_m:
+                    continue
+                if self.occupied_at_world(x + dx, y + dy):
+                    return False
+        return True
+
+    def nearest_free_world(
+        self, x: float, y: float, clearance_m: float, max_radius_m: float = 5.0
+    ) -> "tuple[float, float] | None":
+        if self.free_with_clearance(x, y, clearance_m):
+            return (x, y)
+        step = self.resolution
+        ring = 1
+        while ring * step <= max_radius_m:
+            candidates = []
+            for gx in range(-ring, ring + 1):
+                for gy in range(-ring, ring + 1):
+                    if max(abs(gx), abs(gy)) != ring:
+                        continue
+                    cx = x + gx * step
+                    cy = y + gy * step
+                    if self.free_with_clearance(cx, cy, clearance_m):
+                        candidates.append((gx * gx + gy * gy, cx, cy))
+            if candidates:
+                _, cx, cy = min(candidates)
+                return (round(cx, 3), round(cy, 3))
+            ring += 1
+        return None

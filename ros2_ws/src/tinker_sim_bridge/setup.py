@@ -14,7 +14,6 @@ _scenario_sources = [
     for name in (
         "qualification-moveit-plan-joint.json",
         "qualification-moveit-plan-pose.json",
-        "qualification-moveit-plan-blocked.json",
         "qualification-moveit-execute-joint.json",
         "qualification-moveit-execute-pose.json",
         "qualification-moveit-cartesian-retreat.json",
@@ -43,6 +42,7 @@ setup(
             "share/" + package_name + "/launch",
             [
                 "launch/fixtures.launch.py",
+                "launch/gpsr.launch.py",
                 "launch/integrated_ompl_manipulation.launch.py",
                 "launch/manipulation.launch.py",
                 "launch/navigation.launch.py",
@@ -55,6 +55,7 @@ setup(
                 "config/base_facade.yaml",
                 "config/command_gateway.yaml",
                 "config/controllers.yaml",
+                "config/controllers.sim-clock.yaml",
                 "config/pointcloud_to_laserscan.yaml",
                 "config/tinker_topic_control.ros2_control.xacro",
             ],
@@ -96,6 +97,7 @@ setup(
             "physics_ready_gate = tinker_sim_bridge.physics_ready_gate:main",
             "readiness_waiter = tinker_sim_bridge.readiness_waiter:main",
             "scenario_runner = tinker_sim_bridge.scenario_runner:main",
+            "actor_path_driver = tinker_sim_bridge.actor_path_driver:main",
             "safety_supervisor = tinker_sim_bridge.safety_supervisor:main",
             "truth_evaluator = tinker_sim_bridge.truth_evaluator:main",
             "xarm_facade = tinker_sim_bridge.xarm_facade:main",

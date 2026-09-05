@@ -55,7 +55,7 @@
         },
         "pose": {
           "xyz": [
-            0.55,
+            0.8,
             0.0,
             0.425
           ],
@@ -93,12 +93,12 @@
         }
       }
     ],
-    "revision_digest": "554a5d2234a5a9388b69f2f055f00a4205d3184f62472c774905a148c66c9092"
+    "revision_digest": "e872d2344ee5b060861e235b6b43bd937b29621a5a1607b483954c600dd16e5c"
   },
   "integrated": {
     "stage": "D",
     "fixture_revision": "2026-08-02-moveit-execute-cartesian-retreat",
-    "fixture_digest": "554a5d2234a5a9388b69f2f055f00a4205d3184f62472c774905a148c66c9092",
+    "fixture_digest": "e872d2344ee5b060861e235b6b43bd937b29621a5a1607b483954c600dd16e5c",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {

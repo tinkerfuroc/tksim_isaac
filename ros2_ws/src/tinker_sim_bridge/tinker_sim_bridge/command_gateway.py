@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import time
+from typing import Sequence
 
 import rclpy
 from rclpy.clock import Clock, ClockType
@@ -12,8 +15,8 @@ from std_msgs.msg import Bool, String
 
 from tinker_sim_core.command_mux import (
     CommandSource,
+    JointCommand,
     JointCommandMux,
-    command_from_sequences,
     encode_command_epoch,
     encode_command_frame,
     encode_snapshot_packet,
@@ -24,6 +27,12 @@ from tinker_sim_core.command_mux import (
 class CommandGateway(Node):
     """The only ROS publisher allowed to command the Isaac articulation."""
 
+    KEEPALIVE_PERIOD_S = 1.0 / 20.0
+    # Changed snapshots are sent no faster than the simulator's control rate.
+    # ros2_control rewrites the arm command on every 150 Hz cycle while a
+    # trajectory runs, which would otherwise burst two packets per cycle
+    # (~300 msg/s) at a consumer that applies targets 60 times a second.
+    MIN_PUBLISH_PERIOD_S = 1.0 / 60.0
     SOURCE_TOPICS = {
         "base": "/sim/controller/base_commands",
         "ros2_control": "/sim/controller/ros2_control_commands",
@@ -84,6 +93,15 @@ class CommandGateway(Node):
             self._command_session_id, self._command_generation
         )
         self._snapshot_id = 0
+        # The 150 Hz tick still evaluates deadlines and composes the snapshot,
+        # but an unchanged snapshot is only re-sent at the keepalive cadence.
+        # Every packet the simulator receives costs it main-loop time (GIL
+        # hand-off plus a PhysX target write), and resending four identical
+        # packets 150 times a second was measured to cut its real-time factor
+        # from ~0.8 to ~0.23.  The simulator's command-stream watchdog is 0.5 s,
+        # so a 20 Hz keepalive keeps a 10x margin.
+        self._last_published_commands: tuple | None = None
+        self._last_publish_at = -math.inf
         reliable = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -129,14 +147,74 @@ class CommandGateway(Node):
             self._rejected[source] = "blocked by safety stop"
             return
         try:
-            command = command_from_sequences(
-                message.name, message.position, message.velocity, message.effort
+            command = self._owned_command(
+                source,
+                message.name,
+                message.position,
+                message.velocity,
+                message.effort,
             )
             self._mux.accept(source, command, time.monotonic())
             self._rejected.pop(source, None)
         except Exception as error:
             self._rejected[source] = str(error)
             self.get_logger().error(f"rejected {source} joint command: {error}")
+
+    def _owned_command(
+        self,
+        source: str,
+        names: Sequence[str],
+        positions: Sequence[float],
+        velocities: Sequence[float],
+        efforts: Sequence[float],
+    ) -> JointCommand:
+        """Project a source message onto the joints that source is allowed to own.
+
+        The vendored topic_based_ros2_control publishes all eight joints in
+        ``names`` (the seven arm joints plus a state-only ``drive_joint``) but
+        carries values only for the seven arm joints, so a raw JointCommand is
+        rejected before mux ownership filtering can drop ``drive_joint``.
+        Normalize before validation: unowned names are removed together with
+        their values, and the live value-shorter-than-names shape is accepted
+        only when the owned names form a contiguous prefix so the value-to-name
+        mapping is unambiguous.  Any other layout is malformed and rejected.
+        """
+        owned = self._mux.sources[source].joints
+        owned_names = [name for name in names if name in owned]
+        if not owned_names:
+            raise ValueError(f"{source} message contains no owned joints")
+        owned_name_count = len(owned_names)
+        name_count = len(names)
+
+        def project(values: Sequence[float]) -> tuple[float, ...]:
+            if not values:
+                # Empty channels are absent, matching JointCommand defaults.
+                return ()
+            value_count = len(values)
+            if value_count == name_count:
+                # Canonical parallel arrays: value[i] belongs to name[i], so
+                # drop each unowned name together with its value.
+                return tuple(
+                    float(value) for name, value in zip(names, values) if name in owned
+                )
+            if (
+                value_count == owned_name_count
+                and owned_names == list(names[:owned_name_count])
+            ):
+                # Live shape: values are emitted only for the owned joints in
+                # name order; the prefix guard keeps this unambiguous.
+                return tuple(float(value) for value in values)
+            raise ValueError(
+                f"{source} {value_count} values do not align with "
+                f"{name_count} names / {owned_name_count} owned joints"
+            )
+
+        return JointCommand(
+            tuple(owned_names),
+            project(positions),
+            project(velocities),
+            project(efforts),
+        )
 
     def _advance_command_epoch(self) -> None:
         """Advance the gateway-owned epoch without a peer-local counter."""
@@ -165,6 +243,9 @@ class CommandGateway(Node):
         # A clear boundary starts a fresh command baseline.  Stopped packets
         # published during discovery cannot consume the post-clear sequence.
         self._snapshot_id = 0
+        # A new epoch must reach the simulator on the next tick even if the
+        # composed packets are unchanged.
+        self._last_published_commands = None
 
     def _enforce_safety_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -178,6 +259,9 @@ class CommandGateway(Node):
         self._advance_command_epoch()
         self._mux.stop(True)
         self._snapshot_id = 0
+        # A new epoch must reach the simulator on the next tick even if the
+        # composed packets are unchanged.
+        self._last_published_commands = None
         self._rejected["safety"] = "safety heartbeat expired"
 
     def _joint_state(self, message: JointState) -> None:
@@ -190,7 +274,27 @@ class CommandGateway(Node):
 
     def _publish(self) -> None:
         self._enforce_safety_deadline()
-        commands = self._mux.compose(time.monotonic())
+        now = time.monotonic()
+        commands = tuple(self._mux.compose(now))
+        since_last = now - getattr(self, "_last_publish_at", -math.inf)
+        last_published = getattr(self, "_last_published_commands", None)
+        if last_published is not None and commands == last_published:
+            if since_last < self.KEEPALIVE_PERIOD_S:
+                return
+        elif (
+            last_published is not None
+            and since_last < self.MIN_PUBLISH_PERIOD_S
+            and not self._mux.safety_stop
+        ):
+            # Rate-limit changes; the next tick re-composes the latest state.
+            # A safety-stop snapshot is never delayed.
+            return
+        self._last_published_commands = commands
+        self._last_publish_at = now
+        _probe = getattr(self, "_publish_probe", None)
+        if _probe is None and os.environ.get("TINKER_SIM_GATEWAY_PROBE") == "1":
+            _probe = self._publish_probe = {"t": now, "n": 0, "max_s": 0.0, "sum_s": 0.0}
+        _t0 = time.perf_counter() if _probe is not None else 0.0
         snapshot_id = self._snapshot_id
         self._snapshot_id += 1
         packet_count = len(commands)
@@ -221,6 +325,20 @@ class CommandGateway(Node):
             sort_keys=True,
         )
         self._status.publish(status)
+        if _probe is not None:
+            _dt = time.perf_counter() - _t0
+            _probe["n"] += 1
+            _probe["sum_s"] += _dt
+            _probe["max_s"] = max(_probe["max_s"], _dt)
+            if now - _probe["t"] >= 1.0:
+                print(
+                    f"gateway_probe t={time.time():.1f} snapshot_id={snapshot_id} "
+                    f"publishes/s={_probe['n']} packets={packet_count} "
+                    f"publish_ms max={1000 * _probe['max_s']:.1f} "
+                    f"mean={1000 * _probe['sum_s'] / max(1, _probe['n']):.2f}",
+                    flush=True,
+                )
+                _probe.update({"t": now, "n": 0, "max_s": 0.0, "sum_s": 0.0})
 
 
 def main() -> None:

@@ -246,12 +246,14 @@ def _resolve(context):
     evaluator_jsonl = ""
     if os.environ.get("TINKER_SIM_EVALUATOR_JSONL"):
         evaluator_jsonl = os.environ["TINKER_SIM_EVALUATOR_JSONL"]
+    raw_jsonl_path = os.environ.get("TINKER_SIM_TRUTH_JSONL", "")
     evaluator_parameters = [
         {
             "use_sim_time": True,
             "scenario": scenario,
             "task": scenario,
             "jsonl_path": evaluator_jsonl,
+            "raw_jsonl_path": raw_jsonl_path,
         }
     ]
 

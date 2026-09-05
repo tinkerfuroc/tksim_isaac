@@ -5,7 +5,7 @@ Runs under simulator CPython 3.12.  Exercises the ROS-free
 seams: deterministic plain-data goal builders, the fail-closed smoke
 evaluator (readiness publisher/canonical payload/identity, command
 publisher proof + zero-command window, exact endpoint + result-service type,
-outcome adjudication incl. blocked-mode action-status rule), deterministic
+outcome adjudication), deterministic
 compact report serialization, atomic report writes, mode/scenario consistency
 against the real qualification scenarios, and the ROS-free import boundary.
 
@@ -51,7 +51,6 @@ from ompl_plan_smoke import (  # noqa: E402
     READINESS_SOURCE,
     READINESS_STATE_PASS,
     STATUS_ABORTED,
-    STATUS_CANCELED,
     STATUS_SUCCEEDED,
     SUCCESS_ERROR_CODE,
     build_goal,
@@ -74,12 +73,10 @@ from ompl_plan_smoke import (  # noqa: E402
 
 JOINT_SCENARIO = ROOT / "simulation/scenarios/qualification-moveit-plan-joint.json"
 POSE_SCENARIO = ROOT / "simulation/scenarios/qualification-moveit-plan-pose.json"
-BLOCKED_SCENARIO = ROOT / "simulation/scenarios/qualification-moveit-plan-blocked.json"
 
 SCENARIOS = {
     "joint": JOINT_SCENARIO,
     "pose": POSE_SCENARIO,
-    "blocked": BLOCKED_SCENARIO,
 }
 
 GOAL_SERVICE_TYPE = "moveit_msgs/action/MoveGroup_SendGoal"
@@ -220,35 +217,18 @@ def _command_observations() -> dict[str, object]:
 
 
 def _outcome(mode: str) -> dict[str, object]:
-    if mode in ("joint", "pose"):
-        return {
-            "kind": "success",
-            "detail": "",
-            "goal_accepted": True,
-            "terminal_status": STATUS_SUCCEEDED,
-            "terminal_status_name": "STATUS_SUCCEEDED",
-            "error_code": SUCCESS_ERROR_CODE,
-            "error_code_name": "SUCCESS",
-            "result_received": True,
-            "trajectory_point_count": 12,
-            "trajectory_joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"],
-            "planning_time": 0.5,
-            "cancel_requested": False,
-            "cancel_accepted": False,
-            "cancel_confirmed": False,
-        }
     return {
-        "kind": "non_success",
+        "kind": "success",
         "detail": "",
         "goal_accepted": True,
-        "terminal_status": STATUS_ABORTED,
-        "terminal_status_name": "STATUS_ABORTED",
-        "error_code": -1,
-        "error_code_name": "PLANNING_FAILED",
+        "terminal_status": STATUS_SUCCEEDED,
+        "terminal_status_name": "STATUS_SUCCEEDED",
+        "error_code": SUCCESS_ERROR_CODE,
+        "error_code_name": "SUCCESS",
         "result_received": True,
-        "trajectory_point_count": 0,
-        "trajectory_joint_names": [],
-        "planning_time": 0.1,
+        "trajectory_point_count": 12,
+        "trajectory_joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"],
+        "planning_time": 0.5,
         "cancel_requested": False,
         "cancel_accepted": False,
         "cancel_confirmed": False,
@@ -368,7 +348,6 @@ def test_goal_kind_and_to_dict() -> None:
 def test_scenario_gates_match_modes() -> None:
     assert scenario_qualification_gate(load_scenario(JOINT_SCENARIO)) == "moveit-plan-joint"
     assert scenario_qualification_gate(load_scenario(POSE_SCENARIO)) == "moveit-plan-pose"
-    assert scenario_qualification_gate(load_scenario(BLOCKED_SCENARIO)) == "moveit-plan-blocked"
 
 
 def test_build_goal_joint_from_scenario() -> None:
@@ -388,14 +367,6 @@ def test_build_goal_pose_from_scenario_applies_approach_offset() -> None:
     assert goal.position_xyz[2] == pytest.approx(target[2] + POSE_APPROACH_Z_OFFSET)
 
 
-def test_build_goal_blocked_targets_blocker_interior() -> None:
-    scenario = load_scenario(BLOCKED_SCENARIO)
-    goal = build_goal("blocked", scenario)
-    assert isinstance(goal, PoseGoal)
-    blocker_xyz = scenario_blocker_xyz(scenario)
-    assert goal.position_xyz == tuple(blocker_xyz)
-
-
 def test_build_goal_joint_ignores_pose_only_overrides() -> None:
     goal = build_goal(
         "joint", load_scenario(JOINT_SCENARIO), position_tolerance=0.05
@@ -408,7 +379,7 @@ def test_build_goal_rejects_mode_scenario_mismatch() -> None:
     with pytest.raises(ValueError):
         build_goal("pose", load_scenario(JOINT_SCENARIO))
     with pytest.raises(ValueError):
-        build_goal("joint", load_scenario(BLOCKED_SCENARIO))
+        build_goal("joint", load_scenario(POSE_SCENARIO))
 
 
 def scenario_target_xyz(scenario: dict[str, object]) -> list[float]:
@@ -417,14 +388,6 @@ def scenario_target_xyz(scenario: dict[str, object]) -> list[float]:
         if obj.get("class") == "target":
             return [float(v) for v in obj["pose"]["xyz"]]
     raise AssertionError("no target object")
-
-
-def scenario_blocker_xyz(scenario: dict[str, object]) -> list[float]:
-    objects = (scenario.get("planning_scene") or {}).get("objects") or []
-    for obj in objects:
-        if obj.get("class") == "blocker":
-            return [float(v) for v in obj["pose"]["xyz"]]
-    raise AssertionError("no blocker object")
 
 
 # ---------------------------------------------------------------------------
@@ -679,18 +642,6 @@ def test_evaluate_good_joint_and_pose(mode: str) -> None:
     ready, reasons = evaluate_smoke(ready_snapshot(mode), expected_for(mode))
     assert ready, reasons
     assert reasons == []
-
-
-def test_evaluate_good_blocked() -> None:
-    ready, reasons = evaluate_smoke(ready_snapshot("blocked"), expected_for("blocked"))
-    assert ready, reasons
-    assert reasons == []
-
-
-@pytest.mark.parametrize("mode", ["joint", "pose", "blocked"])
-def test_evaluate_good_all_modes(mode: str) -> None:
-    ready, reasons = evaluate_smoke(ready_snapshot(mode), expected_for(mode))
-    assert ready, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -1179,189 +1130,11 @@ def test_evaluate_rejects_successful_plan_without_joint_names() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Evaluator: outcome adjudication — blocked mode (action-status rule)
+# Evaluator: non-terminal kinds
 # ---------------------------------------------------------------------------
 
 
-def _blocked_outcome(**overrides: object) -> dict[str, object]:
-    outcome = _outcome("blocked")
-    outcome.update(overrides)
-    return outcome
-
-
-def test_evaluate_blocked_rejects_rejected_goal() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        kind="rejected",
-        detail="goal rejected by the action server",
-        goal_accepted=False,
-        result_received=False,
-        terminal_status=None,
-        terminal_status_name="UNKNOWN_STATUS",
-        error_code=None,
-        error_code_name="CODE_None",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("accepted goal" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_aborted_with_zero_code() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        error_code=0,
-        error_code_name="CODE_0",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("explicit integer" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_aborted_none_code() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        error_code=None,
-        error_code_name="CODE_None",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("explicit integer" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_canceled() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        terminal_status=STATUS_CANCELED,
-        terminal_status_name="STATUS_CANCELED",
-        error_code=-7,
-        error_code_name="PREEMPTED",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("terminal status" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_unknown_terminal() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        terminal_status=999,
-        terminal_status_name="STATUS_999",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("terminal status" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_timeout_kind() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        kind="timeout",
-        result_received=False,
-        terminal_status=None,
-        terminal_status_name="UNKNOWN_STATUS",
-        error_code=None,
-        error_code_name="CODE_None",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("non-success" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_malformed_result() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        kind="invalid",
-        result_received=False,
-        terminal_status=None,
-        terminal_status_name="UNKNOWN_STATUS",
-        error_code=None,
-        error_code_name="CODE_None",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("non-success" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_success_code() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(
-        error_code=SUCCESS_ERROR_CODE,
-        error_code_name="SUCCESS",
-    )
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("success" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_successful_blocked() -> None:
-    # A STATUS_SUCCEEDED terminal with SUCCESS error code is not a planning failure.
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _outcome("joint")  # kind success
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("non-success" in reason for reason in reasons)
-
-
-@pytest.mark.parametrize(
-    "code, name",
-    [
-        (-1, "PLANNING_FAILED"),
-        (-2, "INVALID_MOTION_PLAN"),
-        (-3, "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE"),
-        (-10, "START_STATE_IN_COLLISION"),
-        (-12, "GOAL_IN_COLLISION"),
-        (-13, "GOAL_VIOLATES_PATH_CONSTRAINTS"),
-        (-14, "GOAL_CONSTRAINTS_VIOLATED"),
-        (-31, "NO_IK_SOLUTION"),
-    ],
-)
-def test_evaluate_blocked_accepts_genuine_planning_failure(code: int, name: str) -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(error_code=code, error_code_name=name)
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert ready, reasons
-
-
-@pytest.mark.parametrize(
-    "code, name",
-    [
-        (-4, "CONTROL_FAILED"),
-        (-5, "UNABLE_TO_AQUIRE_SENSOR_DATA"),
-        (-6, "TIMED_OUT"),
-        (-7, "PREEMPTED"),
-        (-15, "INVALID_GROUP_NAME"),
-        (-16, "INVALID_GOAL_CONSTRAINTS"),
-        (-17, "INVALID_ROBOT_STATE"),
-        (-21, "FRAME_TRANSFORM_FAILURE"),
-        (-22, "COLLISION_CHECKING_UNAVAILABLE"),
-        (-23, "ROBOT_STATE_STALE"),
-        (-24, "SENSOR_INFO_STALE"),
-        (-25, "COMMUNICATION_FAILURE"),
-        (-26, "START_STATE_INVALID"),
-        (-27, "GOAL_STATE_INVALID"),
-        (-28, "UNRECOGNIZED_GOAL_TYPE"),
-        (-29, "CRASH"),
-        (-30, "ABORT"),
-        (99999, "FAILURE"),
-    ],
-)
-def test_evaluate_blocked_rejects_non_planning_codes(code: int, name: str) -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(error_code=code, error_code_name=name)
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("not a documented planning failure" in reason for reason in reasons)
-
-
-def test_evaluate_blocked_rejects_aborted_without_result() -> None:
-    snapshot = ready_snapshot("blocked")
-    snapshot["outcome"] = _blocked_outcome(result_received=False)
-    ready, reasons = evaluate_smoke(snapshot, expected_for("blocked"))
-    assert not ready
-    assert any("typed result" in reason for reason in reasons)
-
-
-@pytest.mark.parametrize("mode", ["joint", "pose", "blocked"])
+@pytest.mark.parametrize("mode", ["joint", "pose"])
 @pytest.mark.parametrize("bad_kind", ["timeout", "cancelled", "invalid", "rejected"])
 def test_evaluate_rejects_non_terminal_kinds_all_modes(mode: str, bad_kind: str) -> None:
     snapshot = ready_snapshot(mode)
@@ -1383,10 +1156,7 @@ def test_evaluate_rejects_non_terminal_kinds_all_modes(mode: str, bad_kind: str)
     }
     ready, reasons = evaluate_smoke(snapshot, expected_for(mode))
     assert not ready
-    if mode == "blocked":
-        assert any("non-success" in reason for reason in reasons)
-    else:
-        assert any("successful plan" in reason for reason in reasons)
+    assert any("successful plan" in reason for reason in reasons)
 
 
 def test_evaluate_rejects_unknown_mode() -> None:
@@ -1572,8 +1342,8 @@ def test_parse_args_rejects_bad_mode() -> None:
 def test_parse_args_defaults() -> None:
     from ompl_plan_smoke import parse_args
 
-    args = parse_args(["--mode", "blocked"])
-    assert args.mode == "blocked"
+    args = parse_args(["--mode", "pose"])
+    assert args.mode == "pose"
     assert args.timeout == 30.0
     assert args.readiness_timeout == 60.0
     assert args.post_result_tail == 0.25

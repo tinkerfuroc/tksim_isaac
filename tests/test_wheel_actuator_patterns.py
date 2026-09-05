@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "simulation"))
+
+from tinker_sim_isaac.backend import (  # noqa: E402
+    CASTER_JOINT_PATTERNS,
+    WHEEL_ACTUATOR_JOINT_PATTERNS,
+)
+
+DRIVE_WHEEL_JOINTS = ("front_left_wheel_joint", "front_right_wheel_joint")
+CASTER_JOINTS = (
+    "rear_left_swivel_joint",
+    "rear_right_swivel_joint",
+    "rear_left_wheel_joint",
+    "rear_right_wheel_joint",
+)
+
+
+def _matches(patterns: tuple[str, ...], name: str) -> bool:
+    # Isaac Lab resolves joint_names_expr with re.fullmatch per pattern.
+    return any(re.fullmatch(pattern, name) for pattern in patterns)
+
+
+def test_wheel_actuator_group_drives_exactly_the_front_wheels() -> None:
+    for name in DRIVE_WHEEL_JOINTS:
+        assert _matches(WHEEL_ACTUATOR_JOINT_PATTERNS, name), name
+    for name in CASTER_JOINTS:
+        assert not _matches(WHEEL_ACTUATOR_JOINT_PATTERNS, name), name
+
+
+def test_caster_group_frees_swivels_and_caster_wheels() -> None:
+    """Casters must be passive: a driven or held caster brakes the base.
+
+    A swivel left to the USD's importer drive is held straight; a caster wheel
+    driven at the front wheels' angular velocity is braked by the radius
+    mismatch.  Either way the base cannot turn in place.
+    """
+    for name in CASTER_JOINTS:
+        assert _matches(CASTER_JOINT_PATTERNS, name), name
+    for name in DRIVE_WHEEL_JOINTS:
+        assert not _matches(CASTER_JOINT_PATTERNS, name), name
+
+
+def _actuator_joint_names_expr(group: str) -> list[str]:
+    """Read ``joint_names_expr`` of one ``actuators`` entry from backend source.
+
+    The entries are kept as literal lists (not ``list(CONSTANT)``) because
+    ``test_manipulation_runtime`` ``ast.literal_eval``s every actuator kwarg.
+    """
+    import ast
+
+    source = (ROOT / "simulation" / "tinker_sim_isaac" / "backend.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == group:
+                for kw in value.keywords:
+                    if kw.arg == "joint_names_expr":
+                        return ast.literal_eval(kw.value)
+    raise AssertionError(f"actuator group {group!r} not found")
+
+
+def test_backend_actuator_literals_match_exported_patterns() -> None:
+    assert _actuator_joint_names_expr("wheels") == list(WHEEL_ACTUATOR_JOINT_PATTERNS)
+    assert _actuator_joint_names_expr("casters") == list(CASTER_JOINT_PATTERNS)

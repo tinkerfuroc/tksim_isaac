@@ -6,6 +6,7 @@
   "robot": "tinker2",
   "headless": true,
   "render": false,
+  "execution_timeout_s": 900.0,
   "physics": {
     "device": "cpu",
     "use_gpu": false,

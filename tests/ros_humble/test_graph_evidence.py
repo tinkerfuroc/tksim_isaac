@@ -236,3 +236,89 @@ def test_controller_manager_service_correct_source_observed(rclpy_context) -> No
         executor.shutdown()
         reader.destroy_node()
         provider.destroy_node()
+
+
+def test_joint_evidence_accepts_broadcaster_source_and_reorders_by_name(rclpy_context) -> None:
+    """A real /joint_states publisher from ``joint_state_broadcaster`` with
+    RELIABLE + TRANSIENT_LOCAL QoS and the live broadcast order is accepted;
+    names/positions/velocities are reordered to the canonical joint order."""
+    provider = Node("joint_state_broadcaster")
+    correct_qos = QoSProfile(
+        depth=10,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    publisher = provider.create_publisher(JointState, "/joint_states", correct_qos)
+    reader = _readiness_node("graph_probe_broadcaster_joint")
+    executor = SingleThreadedExecutor()
+    executor.add_node(provider)
+    executor.add_node(reader)
+    try:
+        _spin(executor, count=40)
+        live_order = ["joint2", "joint3", "joint5", "joint6", "joint1", "joint4", "joint7", "drive_joint"]
+        live_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        live_velocities = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]
+        message = JointState()
+        message.header.stamp.sec = 1
+        message.header.stamp.nanosec = 0
+        message.name = live_order
+        message.position = live_positions
+        message.velocity = live_velocities
+        for _ in range(8):
+            publisher.publish(message)
+        _spin(executor, count=80)
+        # The 80 post-publish spins (~4 s) leave the retained sample stale past
+        # the 0.25 s freshness budget; republish one fresh sample so the
+        # name-indexed evidence is evaluated while it is still fresh.
+        publisher.publish(message)
+        _spin(executor, count=5)
+        assert reader._joint_sample is not None, "joint_state sample was not received"
+        evidence = reader._joint_evidence()
+        assert evidence["ready"] is True
+        assert evidence["names"] == [
+            "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "drive_joint"
+        ]
+        assert evidence["publisher_source"] == "/joint_state_broadcaster"
+        # Positions/velocities reordered to canonical name order.
+        assert evidence["positions"] == [0.5, 0.1, 0.2, 0.6, 0.3, 0.4, 0.7, 0.8]
+        assert evidence["velocities"] == [0.05, 0.01, 0.02, 0.06, 0.03, 0.04, 0.07, 0.08]
+    finally:
+        executor.remove_node(provider)
+        executor.remove_node(reader)
+        executor.shutdown()
+        reader.destroy_node()
+        provider.destroy_node()
+
+
+def test_graph_services_deduplicates_duplicate_fqn_and_owns_moveit_private_source(rclpy_context) -> None:
+    """Two rclpy nodes sharing the identical FQN ``move_group_private_123``
+    (a launch global-remap duplicate) hosting /get_planning_scene on one must
+    be observed as exactly-one with MoveIt private-helper ownership
+    ``/move_group``."""
+    def handle(request, response):
+        del request
+        return response
+
+    primary = Node("move_group_private_123")
+    duplicate = Node("move_group_private_123")
+    primary.create_service(GetPlanningScene, "/get_planning_scene", handle)
+    reader = _readiness_node("graph_probe_duplicate_fqn")
+    executor = SingleThreadedExecutor()
+    executor.add_node(primary)
+    executor.add_node(duplicate)
+    executor.add_node(reader)
+    try:
+        _spin(executor, count=60)
+        services = reader._graph_services()
+        entry = services["/get_planning_scene"]
+        assert entry["count"] == 1
+        assert entry["source"] == "/move_group"
+        assert entry["ready"] is True
+    finally:
+        executor.remove_node(primary)
+        executor.remove_node(duplicate)
+        executor.remove_node(reader)
+        executor.shutdown()
+        reader.destroy_node()
+        primary.destroy_node()
+        duplicate.destroy_node()

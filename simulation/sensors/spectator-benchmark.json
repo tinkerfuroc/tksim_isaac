@@ -1,0 +1,21 @@
+{
+  "comment": "Opt-in sim-only third-person camera (TINKER_SIM_SPECTATOR_CAMERA). Not part of the hardware-parity contract: no real-robot counterpart exists. World-fixed mount in the rcw2026 laundry room looking at the benchmark station: robot at (-2.99,3.80) facing the laundry desk (top 0.734 m).",
+  "spectator_camera": {
+    "color_topic": "/camera/spectator/color/image_raw",
+    "depth_topic": "/camera/spectator/depth/image_raw",
+    "camera_info_topics": [
+      "/camera/spectator/color/camera_info"
+    ],
+    "frame_id": "spectator_camera_optical_frame",
+    "mount_prim": "/World/SpectatorCameraMount",
+    "mount_translation_xyz": [-1.5, 2.7, 2.1],
+    "mount_rotation_wxyz": [0.804897, 0.446823, 0.189532, 0.341419],
+    "width": 960,
+    "height": 540,
+    "horizontal_fov_deg": 65.0,
+    "tick_rate_hz": 30,
+    "color_encoding": "rgb8",
+    "depth_encoding": "16UC1",
+    "depth_unit": "millimeter"
+  }
+}

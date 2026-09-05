@@ -33,6 +33,7 @@ from tinker_sim_bridge.integrated_readiness import (  # noqa: E402
     build_integrated_mapping,
     canonical_json,
     evaluate_integrated_readiness,
+    json_safe_value,
     parse_canonical_report,
     public_integrated_mapping,
     serialize_report,
@@ -44,7 +45,7 @@ from tinker_sim_bridge.integrated_readiness import (  # noqa: E402
 SCENARIO_ID = "qualification-moveit-plan-joint"
 SEED = 7
 PLANNING_SCENE_REVISION = "2026-08-01-moveit-qualification-joint"
-PLANNING_SCENE_REVISION_DIGEST = "d684a3d2270ab6d935b8e5c94dd5d4512760e06a1d09a41582177680536ccd8d"
+PLANNING_SCENE_REVISION_DIGEST = "77b26bb8bc35649f5b25e95c2d4a56c30cf6933d918a8419d956b1ca987d0510"
 PLANNING_SCENE_OWNED_IDS = ["sim_fixture/pedestal", "sim_fixture/public_target"]
 PLANNING_SCENE_TARGET_SOURCE_ID = "sim_fixture/public_target"
 PLANNING_SCENE_TARGET_HANDOFF = "pick_and_place/object_mesh"
@@ -399,6 +400,27 @@ def test_ready_snapshot_passes() -> None:
     report = evaluate_integrated_readiness(ready_snapshot(), contract())
     assert report.ready is True
     assert report.reasons == ()
+
+
+def test_readiness_status_with_report_bytes_is_json_serializable() -> None:
+    report = evaluate_integrated_readiness(ready_snapshot(), contract())
+    raw_bytes = report.evidence["shared_report"]["scenario_report_sha256_bytes"]
+    status = {
+        "schema_version": 1,
+        "state": "pass" if report.ready else "fail",
+        "ready": report.ready,
+        "reasons": list(report.reasons),
+        "evidence": report.evidence,
+    }
+
+    encoded = json.dumps(
+        json_safe_value(status), sort_keys=True, separators=(",", ":")
+    )
+    decoded = json.loads(encoded)
+
+    assert isinstance(raw_bytes, bytes)
+    assert report.evidence["shared_report"]["scenario_report_sha256_bytes"] is raw_bytes
+    assert decoded["evidence"]["shared_report"]["scenario_report_sha256_bytes"] == raw_bytes.hex()
 
 
 def test_mismatching_snapshot_preserves_ready() -> None:
@@ -798,3 +820,39 @@ def test_public_vs_runtime_mapping_distinct() -> None:
     assert set(public) == {"execution_profile"}
     assert "execution_profile" not in runtime
     assert sha256_json(public) != sha256_json(runtime)
+
+
+def test_operator_subscription_qos_matches_transient_local_publisher() -> None:
+    """RED (J): the integrated_readiness operator subscription must use the
+    same TRANSIENT_LOCAL durability the executor publishes on
+    ``/sim/safety/operator``.  A VOLATILE subscriber misses the latched False
+    baseline on a cold start, so the readiness node reports ``operator_input:
+    publisher count is 0`` / ``no sample received`` (execute-joint/cancel/
+    safety).  The subscription spec must agree with the canonical publisher
+    contract in ``INTEGRATED_PUBLISHERS``."""
+    from tinker_sim_bridge.integrated_readiness import OPERATOR_SUB_QOS_SPEC
+
+    contract = INTEGRATED_PUBLISHERS["/sim/safety/operator"]
+    assert OPERATOR_SUB_QOS_SPEC["reliability"] == contract["reliability"].lower()
+    assert OPERATOR_SUB_QOS_SPEC["durability"] == contract["durability"].lower()
+    assert OPERATOR_SUB_QOS_SPEC["depth"] >= 1
+    assert OPERATOR_SUB_QOS_SPEC["durability"] == "transient_local"
+
+
+def test_r_joint_states_contract_is_volatile_matching_joint_state_broadcaster() -> None:
+    """RED (R): the canonical ``/joint_states`` publisher contract must match the
+    ros2_control ``joint_state_broadcaster`` which publishes with
+    ``rclcpp::SystemDefaultsQoS()`` (RELIABLE / VOLATILE / KeepLast(10)).  The
+    contract table previously claimed TRANSIENT_LOCAL; once the joint_state
+    broadcaster is discovered the readiness publisher-metadata check would fail
+    ``/joint_states durability 'VOLATILE' != expected 'TRANSIENT_LOCAL'`` and
+    gate every Stage-D scenario (cartesian-retreat external C++ readiness)."""
+    contract = INTEGRATED_PUBLISHERS["/joint_states"]
+    assert contract["source"] == "/joint_state_broadcaster"
+    assert contract["reliability"] == "RELIABLE"
+    assert contract["durability"] == "VOLATILE", (
+        "joint_state_broadcaster publishes /joint_states with "
+        "rclcpp::SystemDefaultsQoS() = RELIABLE/VOLATILE/KeepLast(10); the "
+        "readiness publisher contract must agree or the gate fails closed"
+    )
+    assert contract["depth"] >= 10

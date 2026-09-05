@@ -46,7 +46,14 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("destination", type=Path)
     restore.add_argument("--profile", choices=("whole_robot", "physics_only"), default="whole_robot")
 
-    launch = commands.add_parser("launch", help="launch through the isolated Isaac ROS boundary")
+    # allow_abbrev=False: --arena is a prefix of --arena-colors, and any
+    # future run_sim flag not mirrored here must fail loudly instead of
+    # being silently rewritten onto its nearest prefix match.
+    launch = commands.add_parser(
+        "launch",
+        help="launch through the isolated Isaac ROS boundary",
+        allow_abbrev=False,
+    )
     launch.add_argument(
         "--sensor-profile",
         choices=(
@@ -65,7 +72,34 @@ def _parser() -> argparse.ArgumentParser:
     launch.add_argument("--ros", action=argparse.BooleanOptionalAction, default=False)
     launch.add_argument("--duration", type=float, default=0.0)
     launch.add_argument("--qualification", action="store_true")
-    launch.add_argument("--dds-profile", choices=("local", "lan"), default="local")
+    launch.add_argument(
+        "--livestream",
+        action="store_true",
+        help="stream the navigation-parity arena through NVIDIA WebRTC",
+    )
+    launch.add_argument(
+        "--dds-profile", choices=("local", "lan", "large-images"), default="local"
+    )
+    launch.add_argument(
+        "--camera-pointcloud",
+        action="store_true",
+        help="publish /camera/depth_registered/points under sensor-rich",
+    )
+    launch.add_argument(
+        "--arena-colors",
+        action="store_true",
+        help="color the occupancy walls with the deterministic palette",
+    )
+    launch.add_argument(
+        "--arena",
+        default=None,
+        help="load the named content-addressed arena artifact (e.g. rcw2026)",
+    )
+    launch.add_argument(
+        "--spawn-xy",
+        default=None,
+        help="override the robot spawn as X,Y world metres (e.g. -2.0,-2.0)",
+    )
     launch.add_argument("isaac_args", nargs=argparse.REMAINDER)
 
     lock = commands.add_parser("workspace-lock", help="capture read-only Tinker source hashes")
@@ -108,12 +142,25 @@ def _streaming_lock(root: Path) -> Path:
     return lock
 
 
-def _launch(config: Config, args: argparse.Namespace) -> int:
-    env = clean_isaac_environment(config, dds_profile=args.dds_profile)
-    streaming = args.sensor_profile == "streaming"
-    lock: Path | None = _streaming_lock(config.root) if streaming else None
+def _camera_stream_arguments(args) -> list[str]:
+    """Optional sensor-rich camera flags forwarded to run_sim."""
+    flags = []
+    if args.camera_pointcloud:
+        flags.append("--camera-pointcloud")
+    if args.arena_colors:
+        flags.append("--arena-colors")
+    return flags
+
+
+def _launch_command(args: argparse.Namespace) -> list[str]:
+    if args.livestream:
+        if args.sensor_profile != "navigation-parity":
+            raise RuntimeError("--livestream is supported only with navigation-parity")
+        if not args.headless:
+            raise RuntimeError("--livestream requires --headless")
+
     common = ["uv", "run", "--frozen", "--no-sync"]
-    if streaming:
+    if args.sensor_profile == "streaming":
         command = common + [
             "isaacsim",
             "isaacsim.exp.full.streaming",
@@ -143,7 +190,29 @@ def _launch(config: Config, args: argparse.Namespace) -> int:
             command.extend(["--duration", str(args.duration)])
         if args.qualification:
             command.append("--qualification")
+        if args.arena:
+            command.extend(["--arena", args.arena])
+        if args.spawn_xy:
+            # "=" form: a separate "-2.0,-2.0" token would be parsed by
+            # run_sim's argparse as an option string, not a value.
+            command.append(f"--spawn-xy={args.spawn_xy}")
+        command.extend(_camera_stream_arguments(args))
+        if args.livestream:
+            command.append("--livestream")
     command.extend(args.isaac_args)
+    return command
+
+
+def _launch(config: Config, args: argparse.Namespace) -> int:
+    command = _launch_command(args)
+    env = clean_isaac_environment(config, dds_profile=args.dds_profile)
+    if os.environ.get("TINKER_ACCEPT_OMNIVERSE_EULA") == "Y":
+        # Kit prompts interactively without these; headless launches would
+        # abort at EOF. Mirrors bootstrap.base_environment.
+        env["ACCEPT_EULA"] = "Y"
+        env["OMNI_KIT_ACCEPT_EULA"] = "YES"
+    streaming = args.sensor_profile == "streaming" or args.livestream
+    lock: Path | None = _streaming_lock(config.root) if streaming else None
     try:
         process = subprocess.Popen(command, cwd=config.root, env=env)
         try:

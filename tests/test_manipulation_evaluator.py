@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import sys
 import tempfile
@@ -260,6 +261,61 @@ class ManipulationEvaluatorTest(unittest.TestCase):
         invalid = frame(0.0, [float("nan"), 0.0, 0.8], [0.65, 0.0, 0.8], [])
         with self.assertRaises(ValueError):
             evaluator.process(invalid)
+
+    def test_evaluator_node_accepts_separate_raw_jsonl_path_parameter(self) -> None:
+        source = (
+            ROOT
+            / "ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/truth_evaluator.py"
+        ).read_text(encoding="utf-8")
+        # The evaluator owns raw-truth persistence and must accept the attempt's
+        # physics_truth.jsonl path separately from the evaluated record path.
+        self.assertIn('self.declare_parameter("raw_jsonl_path", "")', source)
+        self.assertIn('self.declare_parameter("jsonl_path", "")', source)
+
+
+def _node_writes(node: ast.AST, writer_attr: str) -> bool:
+    """True when ``node`` contains a ``<writer_attr>.write(...)`` or ``.close()`` call."""
+    for call in ast.walk(node):
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr not in {"write", "close"}:
+            continue
+        value = func.value
+        if isinstance(value, ast.Attribute) and value.attr == writer_attr:
+            return True
+    return False
+
+
+def test_evaluator_persists_raw_and_evaluated_from_same_callback() -> None:
+    source = (
+        ROOT
+        / "ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/truth_evaluator.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node_class = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "TruthEvaluatorNode"
+    )
+    on_truth = next(
+        node
+        for node in ast.walk(node_class)
+        if isinstance(node, ast.FunctionDef) and node.name == "_on_truth"
+    )
+    close = next(
+        node
+        for node in ast.walk(node_class)
+        if isinstance(node, ast.FunctionDef) and node.name == "close"
+    )
+    # The validated raw payload and the evaluated record are persisted together
+    # in the same received-truth callback, and both writers are closed.
+    assert _node_writes(on_truth, "_raw_writer"), "raw payload not written in _on_truth"
+    assert _node_writes(on_truth, "_writer"), "evaluated record not written in _on_truth"
+    assert _node_writes(close, "_raw_writer"), "raw writer not closed"
+    assert _node_writes(close, "_writer"), "evaluated writer not closed"
 
 
 if __name__ == "__main__":

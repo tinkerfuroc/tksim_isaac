@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Run the repo's pytest from the project venv with the ROS overlay unset.
+#
+# With a sourced ROS environment the venv's pytest fails at collection:
+# ROS's launch_testing plugins auto-register via the system site-packages
+# (`pytest_launch_collect_makemodule` / missing `lark`). Mirrors the
+# runbook's Stage 1 preamble (docs/gpsr-sim-runbook.md).
+#
+#   scripts/pytest-clean tests/test_arena_camera.py -q
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+unset PYTHONPATH AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH ROS_PACKAGE_PATH LD_LIBRARY_PATH
+cd "$ROOT"
+VENV="$ROOT/.venv"
+if [ ! -x "$VENV/bin/python" ]; then
+  # Worktrees share the main checkout's venv (.venv is not part of the tree).
+  MAIN="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+  VENV="$MAIN/.venv"
+fi
+exec "$VENV/bin/python" -m pytest "$@"

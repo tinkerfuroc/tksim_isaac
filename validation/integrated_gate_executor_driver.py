@@ -47,6 +47,7 @@ import math
 import os
 import sys
 import tempfile
+import threading
 import time
 import uuid as _uuid
 from pathlib import Path
@@ -92,7 +93,17 @@ EXECUTOR_ARTIFACT_FILENAMES = (
     "planning-scene.jsonl",
     "integrated-execution.json",
     "planning-scene.json",
+    "gate-window.json",
 )
+
+#: Attempt-local readiness timing trace.  ``run_driver`` always emits
+#: ``executor-readiness-trace.jsonl`` beside the attempt; ``_wait_for_readiness``
+#: and ``_build_readiness_snapshot`` append one JSON object per line (flushed
+#: immediately) so a synchronous readiness stage that burns the whole deadline
+#: still leaves durable per-stage start/end/elapsed wall-clock evidence and, on
+#: timeout, a terminal ``readiness_timeout`` event carrying the exact last
+#: rejected values plus a compact JSON-safe raw summary.
+READINESS_TRACE_FILENAME = "executor-readiness-trace.jsonl"
 
 #: The E transport kinds (per committed ``_E_TRANSPORT_KINDS``) that require the
 #: observed ``post_grasp_lift_m >= 0.10`` runtime parameter before any Pick traffic.
@@ -124,22 +135,110 @@ _CONTRACT_DEPTH_BY_TOPIC: Mapping[str, int] = {
 #: gate.  5.0 s comfortably covers the 10 Hz lidar plus a dropped frame.
 ENV_CLOUD_MAX_AGE_S = 5.0
 
+#: Wall-clock bound for the first ``/livox/lidar`` cloud frame the retreat
+#: provider waits for.  The development lidar publishes at 10 Hz on
+#: best-effort/volatile sensor-data QoS (``ros_gateway._development_point_cloud``
+#: every ``_lidar_stride`` tick), so a late-joining observer can miss every
+#: pre-join frame and ``latest_cloud`` stays None (rerun-8 cartesian-retreat:
+#: "no live environment PointCloud2 is available" in 0.0099 s).  The provider
+#: spins the shared executor/observer for up to this bound before failing closed
+#: (R3).  Kept well under ``ENV_CLOUD_MAX_AGE_S`` so a delivered first frame is
+#: never already stale.
+ENV_CLOUD_FIRST_WAIT_S = 2.0
+
 #: The neutral-ish long-motion joint target pre-sent for the cancel/safety
 #: scenarios.  A real accepted ExecuteTrajectory goal handle is retained and
 #: passed to the immutable run method; the UUIDs/digest come from the in-memory
 #: action recorders.
-_LONG_MOTION_JOINT_TARGET = (0.0, -0.3, 0.0, 0.6, 0.0, 0.3, 0.0)
+#
+# G4: the earlier ``(0.0, -0.3, 0.0, 0.6, 0.0, 0.3, 0.0)`` put the TCP at
+#: (0.461, 0.0, 0.764) — inside the Stage-D pedestal fixture (x in 0.45..1.15,
+#: z top 0.85) — so OMPL could not sample the goal tree.  Mirror joint2 to
+#: +0.3: TCP (0.358, 0.0, 0.492), every frame clear of the pedestal, joints
+#: within xarm7 limits, and still a meaningful swing from home for the safety
+#: stop to trigger mid-motion.
+_LONG_MOTION_JOINT_TARGET = (0.0, 0.3, 0.0, 0.6, 0.0, 0.3, 0.0)
+
+#: Operator subscription QoS spec (J): the executor publishes
+#: ``/sim/safety/operator`` with RELIABLE/TRANSIENT_LOCAL/depth 1 (latched
+#: state, ``_operator_qos`` in integrated_gate_executor.py).  The driver's live
+#: observer must subscribe with the same durability so a late-joining observer
+#: receives the latched False baseline immediately; a VOLATILE observer misses
+#: the latched value on a cold start and the readiness gate fails closed
+#: (``operator_input: no sample received`` / ``publisher count is 0``).  Depth is
+#: the observer queue depth (a resource policy, not a compatibility constraint).
+_OPERATOR_SUB_QOS_SPEC = {
+    "reliability": "reliable",
+    "durability": "transient_local",
+    "depth": 10,
+}
 
 #: rcl_interfaces ``ParameterType.PARAMETER_DOUBLE``.
 _PARAMETER_DOUBLE = 3
 
 #: Wall-clock bound for a single ``ListControllers`` query from the readiness
 #: snapshot.  The controller manager responds on the shared spinner within
-#: ~100 ms; a 1.0 s bound keeps a dead manager from stalling readiness.
+#: ~100 ms; a 1.0 s bound keeps a dead manager from stalling readiness.  The
+#: late-observer ``list_controllers`` path is persistent/nonblocking and no
+#: longer uses this bound; it remains for any generic caller of
+#: :func:`_call_service_with_spinner`.
 _CONTROLLER_QUERY_TIMEOUT_S = 1.0
+
+#: The raw ``ros2_control`` controller-resource graph node that may host the FJT
+#: action server instead of the logical ``/controller_manager``.  Provider-only
+#: inventory additionally queries this node so FJT served there still reports
+#: ``server_count >= 1``; ``_action_servers_and_source`` canonicalizes the FJT
+#: source back to the logical ``/controller_manager`` owner (other endpoints'
+#: source mapping is unchanged).
+_CONTROLLER_RESOURCE_NODE = "/xarm7_traj_controller"
+
+#: Nonzero ``GetPlanningScene`` ``components`` mask the late readback requests
+#: on ``/get_planning_scene``: scene + robot state (+ attached objects) + world
+#: object names/geometry + octomap + allowed-collision matrix, so the normalized
+#: cache carries the owned/attached ids, ACM, and robot-state digests the
+#: readiness snapshot reads.
+_PLANNING_SCENE_READBACK_COMPONENTS = (
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 7)
+)
+
+#: Bounded wall-clock TTL for a pending ``/get_planning_scene`` readback future.
+#: In the live cold start move_group can DROP the response server-side (RMW
+#: ``failed to send response ... timeout``), so the client future never
+#: completes and the readback would stall the whole readiness deadline.  After
+#: this TTL the stale future is discarded; the next snapshot tick issues a fresh
+#: request on the same client (mirrors the fixture node's timeout-retry
+#: pattern).
+_PLANNING_SCENE_READBACK_TIMEOUT_S = 5.0
+
+#: Bounded wall-clock TTL for a pending ``/controller_manager/list_controllers``
+#: future.  In the live cold start ros2_control_node can DROP the response
+#: server-side (RMW ``failed to send response ... timeout``), so the single
+#: in-flight future never completes and the ``list_controllers`` cache would
+#: stay ``None`` forever, failing the ``integrated_readiness`` controller-manager
+#: gate for the whole run.  After this TTL the stale future (and its cache) is
+#: discarded and a fresh request is re-issued on the same client in the same
+#: call (mirrors the planning-scene readback timeout-retry pattern).
+_CONTROLLERS_LIST_TIMEOUT_S = 5.0
 
 #: Wall-clock bound for each ``/pick_and_place`` parameter set/get transaction.
 _PARAMETER_SERVICE_TIMEOUT_S = 5.0
+
+#: Wall-clock operator heartbeat cadence (seconds) during readiness.  The
+#: committed ``/sim/safety/operator`` max-age is 0.25 s (config
+#: ``operator_fresh_s``, fallback ``fixture_fresh_s``).  Publishing False every
+#: 0.125 s keeps the topic fresh at half the limit, independent of how long a
+#: readiness snapshot takes (the controller-manager query plus graph
+#: introspection can exceed the max age).  See :func:`_start_operator_heartbeat`.
+_OPERATOR_HEARTBEAT_PERIOD_S = 0.125
+
+#: Bounded nonblocking drain batch for the cold readiness observer.  Continuous
+#: subscriptions (joint/fixture/safety/operator/collision/TF/lidar) can enqueue
+#: many callbacks per wait-set cycle while the observer is still cold, so each
+#: readiness poll follows its one ``executor._spin_once()`` with this many
+#: zero-timeout ``_spinner.spin_once(timeout_sec=0.0)`` calls (see
+#: :func:`_spin_readiness_callbacks`).  Kept well above the observed backlog so
+#: the drain clears it without ever blocking the readiness loop.
+_READINESS_DRAIN_SPINS = 64
 
 
 class DriverError(Exception):
@@ -187,11 +286,11 @@ def derive_terminal_timeout(config: Mapping[str, Any]) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Dispatch table (F2.2) — exactly the 17 canonical scenario ids
+# Dispatch table (F2.2) — exactly the 16 canonical scenario ids
 # --------------------------------------------------------------------------- #
 
 def canonical_dispatch() -> dict[str, str]:
-    """Return the exact 17-scenario dispatch table (id -> executor run method)."""
+    """Return the exact 16-scenario dispatch table (id -> executor run method)."""
     table: dict[str, str] = {}
     for name in STAGE_C_SCENARIOS:
         table[name] = "run_gate_c_plan_only"
@@ -204,9 +303,9 @@ def canonical_dispatch() -> dict[str, str]:
     for name in STAGE_E_SCENARIOS:
         table[name] = "run_pick_place_sequence"
     expected = set(STAGE_C_SCENARIOS) | set(STAGE_D_SCENARIOS) | set(STAGE_E_SCENARIOS)
-    if len(expected) != 17 or set(table) != expected:
-        raise ValueError("dispatch table must cover exactly the 17 canonical scenario ids")
-    if len(set(table)) != 17:
+    if len(expected) != 16 or set(table) != expected:
+        raise ValueError("dispatch table must cover exactly the 16 canonical scenario ids")
+    if len(set(table)) != 16:
         raise ValueError("dispatch table has duplicate scenario ids")
     return dict(table)
 
@@ -216,7 +315,7 @@ def run_method_for(scenario_id: str) -> str:
     method = canonical_dispatch().get(str(scenario_id))
     if method is None:
         raise DriverError(
-            f"unknown scenario id {scenario_id!r}; not one of the 17 canonical scenarios"
+            f"unknown scenario id {scenario_id!r}; not one of the 16 canonical scenarios"
         )
     return method
 
@@ -325,6 +424,48 @@ def build_executor_scenario(bundle: Mapping[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Terminal marker (F2.2) — never before executor finalization
 # --------------------------------------------------------------------------- #
+
+def _count_valid_jsonl_records(path: Path) -> int:
+    """Count nonblank lines that contain one valid JSONL record each."""
+    if not path.is_file():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            count += 1
+    return count
+
+
+def _write_gate_window(attempt_dir: Path, gate: str, attempt_id: str) -> None:
+    """Record the append-only evidence boundary immediately before a gate run.
+
+    Mirrors ``manipulation_qualification._write_gate_window``: the raw/evaluator
+    start indices are the valid JSONL record counts at gate start, so the
+    integrated verifier can slice physics truth from exactly this boundary.
+    Raw and evaluator are 1:1 correlated; if a frame lands between the two
+    sequential count reads, take the earlier (min) boundary so both tails
+    start from a frame present in both files and stay aligned.
+    """
+    raw_start_index = _count_valid_jsonl_records(attempt_dir / "physics_truth.jsonl")
+    evaluator_start_index = _count_valid_jsonl_records(attempt_dir / "evaluator.jsonl")
+    consistent_start = min(raw_start_index, evaluator_start_index)
+    _atomic_write_json(
+        attempt_dir / "gate-window.json",
+        {
+            "schema_version": 1,
+            "gate": gate,
+            "attempt_id": attempt_id,
+            "raw_start_index": consistent_start,
+            "evaluator_start_index": consistent_start,
+        },
+    )
+
 
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -667,6 +808,61 @@ def _endpoint_label(node_name: str, node_namespace: str | None = None) -> str:
     return "/" + name
 
 
+_MOVE_GROUP_PRIVATE_PREFIX = "/move_group_private_"
+_MOVE_GROUP_OWNER = "/move_group"
+
+
+def _canonicalize_graph_source(label: str) -> str:
+    """Map MoveIt private-helper labels ``/move_group_private_<suffix>`` to the
+    logical ``/move_group`` owner; any other source label is returned unchanged."""
+    if label.startswith(_MOVE_GROUP_PRIVATE_PREFIX):
+        return _MOVE_GROUP_OWNER
+    return label
+
+
+#: Canonical joint name order for the Stage-C qualification robot.
+_REQUIRED_JOINT_NAMES: tuple[str, ...] = tuple(f"joint{index}" for index in range(1, 8)) + (
+    "drive_joint",
+)
+
+
+def _canonicalize_joint_state(
+    names: Any,
+    positions: Any,
+    velocities: Any,
+) -> tuple[list[str], list[float], list[float]]:
+    """Canonicalize a JointState to the required name order.
+
+    The required canonical names are accepted in any broadcast order (each name
+    exactly once, no unknown names); positions and velocities are reordered to
+    the canonical order with the same indices.  Any missing/duplicate/unknown/
+    unaligned/non-finite input returns the raw arrays unchanged so the executor
+    rejects it fail-closed.
+    """
+    raw_names = list(names) if names is not None else []
+    raw_positions = list(positions) if positions is not None else []
+    raw_velocities = list(velocities) if velocities is not None else []
+    if sorted(raw_names) != sorted(_REQUIRED_JOINT_NAMES):
+        return raw_names, raw_positions, raw_velocities
+    try:
+        index = {name: position for position, name in enumerate(raw_names)}
+        if len(index) != len(raw_names):
+            return raw_names, raw_positions, raw_velocities
+        positions_f = [float(value) for value in raw_positions]
+        velocities_f = [float(value) for value in raw_velocities]
+        if len(positions_f) != len(_REQUIRED_JOINT_NAMES) or len(velocities_f) != len(_REQUIRED_JOINT_NAMES):
+            return raw_names, raw_positions, raw_velocities
+        if not all(math.isfinite(value) for value in positions_f) or not all(
+            math.isfinite(value) for value in velocities_f
+        ):
+            return raw_names, raw_positions, raw_velocities
+        ordered_positions = [positions_f[index[name]] for name in _REQUIRED_JOINT_NAMES]
+        ordered_velocities = [velocities_f[index[name]] for name in _REQUIRED_JOINT_NAMES]
+        return list(_REQUIRED_JOINT_NAMES), ordered_positions, ordered_velocities
+    except (TypeError, ValueError, KeyError, IndexError):
+        return raw_names, raw_positions, raw_velocities
+
+
 def _normalize_qos_value(value: Any) -> str:
     """Normalize a Humble QoS enum value to its short uppercase name."""
     text = str(value)
@@ -695,15 +891,32 @@ def _topic_qos_lower(qos_profile: Any) -> dict[str, object]:
     }
 
 
+def _controller_list_client(executor: Any) -> Any:
+    """Return the executor-owned ``/controller_manager/list_controllers`` client.
+
+    The ``IntegratedGateExecutor`` already creates this service client in
+    ``_create_clients`` and stores it at
+    ``executor._service_clients['/controller_manager/list_controllers']``.  The
+    readiness observer must reuse that exact client (same graph node, same
+    context, serviced by the shared spinner) instead of creating a second
+    client on the observer node.  Returns it by identity; a missing
+    ``_service_clients`` map or missing endpoint raises naturally (AttributeError
+    / KeyError), which is the intended fail-fast.
+    """
+    return executor._service_clients["/controller_manager/list_controllers"]
+
+
 class _LiveProviderObserver:
     """Driver-owned observer node in the executor's private rclpy context.
 
     F3.1: records latest message, wall-monotonic receipt time, sample count, and
     real endpoint metadata for every stream the readiness snapshot and runtime
-    providers consume.  Hosts the TF buffer/listener, the controller-manager
-    ``ListControllers`` client, and the ``/livox/lidar`` subscription.  The node
-    is added to ``executor._spinner`` so one ``_spin_once()`` services both the
-    executor and observer nodes.
+    providers consume.  Hosts the TF buffer/listener and the ``/livox/lidar``
+    subscription; the controller-manager ``ListControllers`` client is the
+    executor-owned service client (reused by identity via
+    :func:`_controller_list_client`).  The node is added to
+    ``executor._spinner`` so one ``_spin_once()`` services both the executor and
+    observer nodes.
     """
 
     def __init__(self, executor: Any, *, node_name: str = "tinker_integrated_gate_executor_observer") -> None:
@@ -717,7 +930,6 @@ class _LiveProviderObserver:
             qos_profile_sensor_data,
         )
         from action_msgs.msg import GoalStatusArray
-        from controller_manager_msgs.srv import ListControllers
         from sensor_msgs.msg import JointState, PointCloud2
         from std_msgs.msg import Bool, String
         from tf2_msgs.msg import TFMessage
@@ -797,7 +1009,11 @@ class _LiveProviderObserver:
 
         joint_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
         fixture_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        operator_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
+        operator_qos = QoSProfile(
+            depth=_OPERATOR_SUB_QOS_SPEC["depth"],
+            reliability=ReliabilityPolicy[_OPERATOR_SUB_QOS_SPEC["reliability"].upper()],
+            durability=DurabilityPolicy[_OPERATOR_SUB_QOS_SPEC["durability"].upper()],
+        )
 
         self._subscriptions = [
             self.node.create_subscription(JointState, "/joint_states", _on_joint, joint_qos),
@@ -824,23 +1040,97 @@ class _LiveProviderObserver:
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10), node=self.node)
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self.node, spin_thread=False)
 
-        # Controller-manager ListControllers client (synchronous call in the
-        # readiness snapshot).
-        self._controllers_client = self.node.create_client(ListControllers, "/controller_manager/list_controllers")
+        # Controller-manager ListControllers client: reuse the executor-owned
+        # service client by identity (never a second client on this node).  The
+        # persistent + nonblocking mechanics below are unchanged: at most one
+        # async request is in flight and the last successful records are cached,
+        # so repeated readiness snapshots reuse the cache instead of restarting
+        # (and synchronously waiting on) a fresh request each time.
+        self._controllers_client = _controller_list_client(executor)
+        self._controllers_future: Any = None
+        self._controllers_cache: list[Any] | None = None
 
         # Share the executor spinner: one _spin_once() services both nodes.
         executor._spinner.add_node(self.node)
 
     def list_controllers(self) -> list[Any] | None:
-        """Return the live ``ListControllers`` controller records or ``None``."""
-        client = self._controllers_client
-        request = client.srv_type.Request()
-        response = _call_service_with_spinner(
-            self._executor, client, request, timeout_s=_CONTROLLER_QUERY_TIMEOUT_S
-        )
-        if response is None:
+        """Return the live ``ListControllers`` controller records or ``None``.
+
+        Persistent + nonblocking (late-observer): at most one ``call_async`` is
+        in flight at a time.  The first call with no pending request and no
+        cache starts one async request and returns ``None`` immediately (no
+        bounded spinner wait); a concurrent call while pending reuses the
+        in-flight future and never starts a second request; when that same
+        future completes, the next call consumes the result into the cache,
+        clears the future, and returns the records; later calls reuse the
+        cache.  A failed completed future clears the cache so the next call
+        retries.  The per-snapshot synchronous wait is removed from this path;
+        the generic :func:`_call_service_with_spinner` (used by the parameter
+        path) is unchanged.
+
+        Pending futures are bounded: a cold-start ros2_control_node can DROP
+        the ListControllers response server-side (RMW ``failed to send response
+        ... timeout``), leaving the single in-flight future pending forever.  A
+        call that finds the pending future older than
+        ``_CONTROLLERS_LIST_TIMEOUT_S`` discards the stale future (and its
+        cache) and re-issues a fresh request on the same client in the same
+        call (rclpy allows a new ``call_async`` on an abandoned future), so a
+        dropped response never stalls the readiness gate.
+        """
+        client = getattr(self, "_controllers_client", None)
+        if client is None:
             return None
-        return list(getattr(response, "controller", ()))
+        future = getattr(self, "_controllers_future", None)
+        if future is None:
+            cached = getattr(self, "_controllers_cache", None)
+            if cached is not None:
+                return cached
+            return self._start_controllers_request()
+        if future.done():
+            try:
+                self._controllers_cache = list(getattr(future.result(), "controller", ()))
+            except Exception:  # noqa: BLE001 - fail-closed service boundary
+                self._controllers_cache = None
+            self._controllers_future = None
+            self._controllers_future_started_mono = None
+            return getattr(self, "_controllers_cache", None)
+        # Pending: a cold-start ros2_control_node can drop the response (RMW
+        # send timeout), leaving this future pending forever.  After a bounded
+        # TTL the stale future (and its cache) is discarded and a fresh request
+        # is re-issued on the same client in the same call.  The old future is
+        # cleared before the new one starts, preserving the single-in-flight
+        # invariant.
+        started_mono = getattr(self, "_controllers_future_started_mono", None)
+        if (
+            started_mono is not None
+            and time.monotonic() - started_mono > _CONTROLLERS_LIST_TIMEOUT_S
+        ):
+            self._controllers_future = None
+            self._controllers_future_started_mono = None
+            self._controllers_cache = None
+            return self._start_controllers_request()
+        return None
+
+    def _start_controllers_request(self) -> list[Any] | None:
+        """Start one async ``ListControllers`` request and record its start time.
+
+        Returns ``None`` on any fail-closed boundary (client missing, client not
+        ready, or ``call_async`` raised).  The wall-monotonic start time lets the
+        pending-future TTL in :meth:`list_controllers` bound a cold-start dropped
+        response.  Nonblocking: the caller never waits on the returned future.
+        """
+        client = getattr(self, "_controllers_client", None)
+        if client is None:
+            return None
+        try:
+            if not client.service_is_ready():
+                return None
+            future = client.call_async(client.srv_type.Request())
+        except Exception:  # noqa: BLE001 - fail-closed service boundary
+            return None
+        self._controllers_future = future
+        self._controllers_future_started_mono = time.monotonic()
+        return None
 
     def destroy(self) -> None:
         """Remove the node from the spinner and destroy it (idempotent)."""
@@ -1079,15 +1369,133 @@ def _subscribers_for(node: Any, topic: str) -> tuple[list[str], list[Any]]:
     return labels, infos
 
 
-def _service_servers_and_clients(node: Any, service_name: str) -> tuple[list[str], list[str]]:
-    """Return (server labels, client labels) hosting a named service."""
+def _collect_service_inventory(
+    node: Any,
+    *,
+    provider_only: bool = False,
+) -> dict[str, tuple[list[str], list[str]]]:
+    """Collect one deduplicated per-node service/client inventory for a graph.
+
+    Queries each unique graph node at most once for servers and once for
+    clients (2*N total) and returns every discovered service mapped to its
+    (server labels, client labels).  Duplicate identical ``(node_name,
+    node_namespace)`` graph pairs are counted once so a server is never
+    double-reported; per-node duplicate names are collapsed, and label ordering
+    matches :func:`_service_servers_and_clients` (node iteration order).
+
+    When ``provider_only`` is set the collection is narrowed to the readiness
+    snapshot's needs: canonical expected provider labels are derived from
+    ``_REQUIRED_ENDPOINT_SOURCES.values()``, only *server* names are queried,
+    only on raw graph nodes whose canonical label is one of those providers
+    (``move_group_private_*`` helpers canonicalize to ``/move_group``), and
+    irrelevant nodes are never touched.  This issues exactly one server query
+    per unique relevant provider and zero client queries, avoiding the
+    full-graph client scan that blocked the live snapshot ~29.8 s past the 30 s
+    readiness deadline.  Callers that need clients or the full graph omit
+    ``provider_only`` and get the general 2*N behavior.
+    """
+    try:
+        pairs = list(node.get_node_names_and_namespaces())
+    except Exception:  # noqa: BLE001 - live graph boundary
+        return {}
+
+    if provider_only:
+        from integrated_gate_executor import _REQUIRED_ENDPOINT_SOURCES
+
+        expected_labels = {
+            _canonicalize_graph_source(str(label))
+            for label in _REQUIRED_ENDPOINT_SOURCES.values()
+        }
+        # F3.x: the FJT action may be hosted by the raw controller-resource node
+        # ``/xarm7_traj_controller`` rather than the logical ``/controller_manager``.
+        # Provider-only inventory must still query that node (still zero client
+        # queries, still never touching unrelated noise nodes) so FJT reports
+        # ``server_count >= 1``; ``_action_servers_and_source`` maps the source
+        # back to ``/controller_manager``.
+        expected_labels.add(_CONTROLLER_RESOURCE_NODE)
+        servers_by_service: dict[str, list[str]] = {}
+        seen: set[tuple[str, str]] = set()
+        for node_name, node_namespace in pairs:
+            pair = (node_name, node_namespace)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            if _canonicalize_graph_source(_endpoint_label(node_name, node_namespace)) not in expected_labels:
+                continue
+            label = _endpoint_label(node_name, node_namespace)
+            try:
+                server_names = {n for n, _types in node.get_service_names_and_types_by_node(node_name, node_namespace)}
+            except Exception:  # noqa: BLE001 - per-node boundary
+                continue
+            for service_name in server_names:
+                servers_by_service.setdefault(service_name, []).append(label)
+        return {
+            service_name: (servers, [])
+            for service_name, servers in servers_by_service.items()
+        }
+
+    servers_by_service = {}
+    clients_by_service: dict[str, list[str]] = {}
+    seen = set()
+    for node_name, node_namespace in pairs:
+        pair = (node_name, node_namespace)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        label = _endpoint_label(node_name, node_namespace)
+        try:
+            server_names = {n for n, _types in node.get_service_names_and_types_by_node(node_name, node_namespace)}
+            for service_name in server_names:
+                servers_by_service.setdefault(service_name, []).append(label)
+        except Exception:  # noqa: BLE001 - per-node boundary
+            pass
+        try:
+            client_names = {n for n, _types in node.get_client_names_and_types_by_node(node_name, node_namespace)}
+            for service_name in client_names:
+                clients_by_service.setdefault(service_name, []).append(label)
+        except Exception:  # noqa: BLE001 - per-node boundary
+            pass
+    return {
+        service_name: (
+            servers_by_service.get(service_name, []),
+            clients_by_service.get(service_name, []),
+        )
+        for service_name in set(servers_by_service) | set(clients_by_service)
+    }
+
+
+def _service_servers_and_clients(
+    node: Any,
+    service_name: str,
+    *,
+    inventory: Mapping[str, tuple[list[str], list[str]]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (server labels, client labels) hosting a named service.
+
+    Duplicate identical ``(node_name, node_namespace)`` graph pairs (a launch
+    global-remap surfacing the same FQN twice) are counted once so a server is
+    never double-reported.
+
+    When ``inventory`` (from :func:`_collect_service_inventory`) is supplied the
+    per-node graph queries are skipped and the precomputed per-service result is
+    reused; the caller builds it once per snapshot so the whole readiness run
+    issues at most one server and one client inventory query per unique node.
+    """
+    if inventory is not None:
+        servers, clients = inventory.get(service_name, ([], []))
+        return list(servers), list(clients)
     servers: list[str] = []
     clients: list[str] = []
     try:
         pairs = list(node.get_node_names_and_namespaces())
     except Exception:  # noqa: BLE001 - live graph boundary
         return [], []
+    seen: set[tuple[str, str]] = set()
     for node_name, node_namespace in pairs:
+        pair = (node_name, node_namespace)
+        if pair in seen:
+            continue
+        seen.add(pair)
         label = _endpoint_label(node_name, node_namespace)
         try:
             server_names = [n for n, _types in node.get_service_names_and_types_by_node(node_name, node_namespace)]
@@ -1104,23 +1512,239 @@ def _service_servers_and_clients(node: Any, service_name: str) -> tuple[list[str
     return servers, clients
 
 
-def _action_servers_and_source(node: Any, action_name: str) -> tuple[int, str]:
+def _action_servers_and_source(
+    node: Any,
+    action_name: str,
+    *,
+    inventory: Mapping[str, tuple[list[str], list[str]]] | None = None,
+) -> tuple[int, str]:
     """Derive action server count + source from the send_goal service graph."""
     send_goal_service = f"{action_name}/_action/send_goal"
-    servers, _clients = _service_servers_and_clients(node, send_goal_service)
+    servers, _clients = _service_servers_and_clients(node, send_goal_service, inventory=inventory)
     if not servers:
         return 0, ""
-    return len(servers), servers[0]
+    source = _canonicalize_graph_source(servers[0])
+    # F3.x: ``ros2_control`` may host FJT on the raw controller-resource node
+    # ``/xarm7_traj_controller``; the readiness contract reports the logical
+    # ``/controller_manager`` owner.  Only FJT is remapped; other endpoints'
+    # source mapping is unchanged.
+    if action_name == FJT_ENDPOINT and source == _CONTROLLER_RESOURCE_NODE:
+        source = "/controller_manager"
+    return len(servers), source
 
 
-def _service_servers_and_source(node: Any, service_name: str) -> tuple[int, str]:
-    servers, _clients = _service_servers_and_clients(node, service_name)
+def _service_servers_and_source(
+    node: Any,
+    service_name: str,
+    *,
+    inventory: Mapping[str, tuple[list[str], list[str]]] | None = None,
+) -> tuple[int, str]:
+    servers, _clients = _service_servers_and_clients(node, service_name, inventory=inventory)
     if not servers:
         return 0, ""
-    return len(servers), servers[0]
+    return len(servers), _canonicalize_graph_source(servers[0])
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce ``value`` to JSON-safe primitives (best-effort diagnostics).
+
+    Non-finite floats degrade to ``None`` and unsupported container values to
+    strings so a diagnostic write can never fail on an exotic snapshot value.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (bool, int, str)) or value is None:
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _write_readiness_trace_record(
+    diagnostics_path: Path | None,
+    record: Mapping[str, Any],
+) -> None:
+    """Best-effort append one JSONL record to the attempt-local readiness trace.
+
+    Diagnostics are strictly best-effort: a write failure must never alter
+    readiness return/raise semantics, so every boundary swallows exceptions.
+    Each record is flushed immediately so a hung readiness stage still leaves
+    durable timing evidence on disk.
+    """
+    if diagnostics_path is None:
+        return
+    try:
+        diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(_json_safe(record), sort_keys=True) + "\n"
+        with diagnostics_path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+    except Exception:  # noqa: BLE001 - best-effort diagnostics
+        pass
+
+
+def _readiness_raw_summary(executor: Any) -> dict[str, Any]:
+    """Compact JSON-safe raw-value summary of the last readiness snapshot.
+
+    Extracts the exact rejected joint names/positions/velocities/stamp/age/
+    source, the controller-manager health + logical controller states, the FJT
+    action count/source, and the PlanningScene owned/attached ids + cache
+    sequence — all the values otherwise lost on a readiness timeout — into
+    JSON-safe primitives for the terminal trace event.
+    """
+    snapshot = getattr(executor, "_last_readiness_snapshot", None)
+    if not isinstance(snapshot, Mapping):
+        return {}
+    joint_state = snapshot.get("joint_state") if isinstance(snapshot.get("joint_state"), Mapping) else {}
+    controllers = snapshot.get("controllers") if isinstance(snapshot.get("controllers"), Mapping) else {}
+    actions = snapshot.get("actions") if isinstance(snapshot.get("actions"), Mapping) else {}
+    planning_scene = snapshot.get("planning_scene") if isinstance(snapshot.get("planning_scene"), Mapping) else {}
+    summary: dict[str, Any] = {
+        "joint_names": list(joint_state.get("names", ())),
+        "joint_positions": [float(v) for v in joint_state.get("positions", ())],
+        "joint_velocities": [float(v) for v in joint_state.get("velocities", ())],
+        "joint_header_stamp_ns": int(joint_state.get("header_stamp_ns", 0)),
+        "joint_age_s": joint_state.get("age_s", 0.0),
+        "joint_source": str(joint_state.get("source_node", "")),
+        "controller_manager_healthy": bool(controllers.get("manager_healthy", False)),
+        "logical_controllers": controllers.get("logical_controllers", {}),
+    }
+    fjt = actions.get(FJT_ENDPOINT)
+    if isinstance(fjt, Mapping):
+        summary["fjt_action_count"] = int(fjt.get("server_count", 0))
+        summary["fjt_source"] = str(fjt.get("source_node", ""))
+    else:
+        summary["fjt_action_count"] = 0
+        summary["fjt_source"] = ""
+    summary["planning_scene_owned_ids"] = list(planning_scene.get("owned_ids", ()))
+    summary["planning_scene_attached_ids"] = list(planning_scene.get("attached_ids", ()))
+    latest_planning_scene = getattr(executor, "_latest_planning_scene", None)
+    summary["planning_scene_sequence"] = (
+        int(
+            latest_planning_scene.get(
+                "scene_sequence", latest_planning_scene.get("sequence", 0)
+            )
+        )
+        if isinstance(latest_planning_scene, Mapping)
+        else 0
+    )
+    return summary
+
+
+def _step_planning_scene_readback(executor: Any) -> None:
+    """Drive one persistent nonblocking ``/get_planning_scene`` readback step.
+
+    Late-observer: a PlanningScene that arrives after readiness begins is never
+    seeded by the fixture/subscription path, so ``_build_readiness_snapshot``
+    would read an empty/None cache.  Each step starts at most one async request
+    on the executor's existing ``_service_clients['/get_planning_scene']``
+    client with a nonzero ``PlanningSceneComponents.components`` mask; while the
+    single persistent future is pending no second request starts; once it
+    completes with ``response.scene`` the scene is normalized via
+    ``executor._normalize_planning_scene(source='/get_planning_scene')``,
+    stored in ``executor._latest_planning_scene``, and completion is latched so
+    later steps do not re-query.  A failed or scene-less response clears the
+    future for retry.  ROS-free-testable via ``client.srv_type.Request`` and a
+    controllable fake future.
+    """
+    client = getattr(executor, "_planning_scene_client", None)
+    if client is None:
+        try:
+            client = executor._service_clients.get("/get_planning_scene")
+        except Exception:  # noqa: BLE001 - fail-closed readback boundary
+            return
+    if client is None:
+        return
+    if getattr(executor, "_ps_readback_done", False):
+        # A late topic clobber (e.g. an empty diff) may have emptied the world
+        # fields of the cache after it was seeded.  Rearm and re-query instead
+        # of staying latched forever on an empty owned-id world.  The pending
+        # future check below still guarantees only one request is ever in flight.
+        latest_planning_scene = getattr(executor, "_latest_planning_scene", None)
+        owned_ids = (
+            list(latest_planning_scene.get("owned_ids", ()))
+            if isinstance(latest_planning_scene, Mapping)
+            else []
+        )
+        if owned_ids:
+            return  # latched: cache still seeded, never duplicate the request
+        executor._ps_readback_done = False
+    future = getattr(executor, "_ps_readback_future", None)
+    if future is None:
+        try:
+            if not client.service_is_ready():
+                return
+            request = client.srv_type.Request()
+            request.components.components = _PLANNING_SCENE_READBACK_COMPONENTS
+            future = client.call_async(request)
+        except Exception:  # noqa: BLE001 - fail-closed readback boundary
+            return
+        executor._ps_readback_future = future
+        executor._ps_readback_started_mono = time.monotonic()
+        return
+    if future.done():
+        executor._ps_readback_future = None
+        executor._ps_readback_started_mono = None
+        try:
+            response = future.result()
+            scene = getattr(response, "scene", None)
+            if scene is None:
+                raise ValueError("no scene in /get_planning_scene response")
+            normalized = executor._normalize_planning_scene(
+                scene, source="/get_planning_scene"
+            )
+            executor._latest_planning_scene = normalized
+            executor._ps_readback_done = True
+        except Exception:  # noqa: BLE001 - fail-closed readback boundary
+            return
+    # Pending: a move_group cold start can drop the response (RMW send timeout),
+    # leaving this future pending forever.  After a bounded TTL the stale future
+    # is discarded so the next snapshot tick issues a fresh request on the same
+    # client (rclpy allows a new call_async on an abandoned future).  Never
+    # re-issue in this tick -- the next call follows the existing step discipline.
+    started_mono = getattr(executor, "_ps_readback_started_mono", None)
+    if (
+        started_mono is not None
+        and time.monotonic() - started_mono > _PLANNING_SCENE_READBACK_TIMEOUT_S
+    ):
+        executor._ps_readback_future = None
+        executor._ps_readback_started_mono = None
+        return
 
 
 def _build_readiness_snapshot(
+    executor: Any,
+    bundle: Mapping[str, Any],
+    config: Mapping[str, Any],
+    attempt_dir: Path,
+) -> Mapping[str, Any]:
+    """Time and build the exact ``evaluate_executor_readiness`` snapshot.
+
+    Thin timing wrapper over :func:`_build_readiness_snapshot_inner`: records a
+    ``snapshot_build`` stage record to the attempt-local trace (if the executor
+    carries a diagnostics path) without changing the snapshot value or raising.
+    """
+    diagnostics_path = getattr(executor, "_readiness_diagnostics_path", None)
+    start = time.monotonic()
+    try:
+        return _build_readiness_snapshot_inner(executor, bundle, config, attempt_dir)
+    finally:
+        end = time.monotonic()
+        _write_readiness_trace_record(
+            diagnostics_path,
+            {
+                "event": "stage",
+                "stage": "snapshot_build",
+                "start_mono_s": start,
+                "end_mono_s": end,
+                "elapsed_s": end - start,
+            },
+        )
+
+
+def _build_readiness_snapshot_inner(
     executor: Any,
     bundle: Mapping[str, Any],
     config: Mapping[str, Any],
@@ -1153,6 +1777,7 @@ def _build_readiness_snapshot(
     if observer is None or getattr(observer, "node", None) is None:
         raise DriverError("live observer is not available; readiness cannot be observed")
     node = executor.node
+    diagnostics_path = getattr(executor, "_readiness_diagnostics_path", None)
     thresholds = _as_thresholds(config)
     tf_fresh = float(thresholds.get("tf_fresh_s", 0.25))
     joint_fresh = float(thresholds.get("joint_state_fresh_s", 0.25))
@@ -1183,9 +1808,11 @@ def _build_readiness_snapshot(
 
     # ---- Joint state ------------------------------------------------------
     joint = getattr(executor, "_latest_joint_state", None)
-    joint_names = list(getattr(joint, "name", None) or [])
-    joint_positions = list(getattr(joint, "position", None) or [])
-    joint_velocities = list(getattr(joint, "velocity", None) or [])
+    joint_names, joint_positions, joint_velocities = _canonicalize_joint_state(
+        list(getattr(joint, "name", None) or []),
+        list(getattr(joint, "position", None) or []),
+        list(getattr(joint, "velocity", None) or []),
+    )
     stamp = getattr(getattr(joint, "header", None), "stamp", None)
     header_stamp_ns = (
         int(getattr(stamp, "sec", 0)) * 1_000_000_000 + int(getattr(stamp, "nanosec", 0))
@@ -1240,12 +1867,31 @@ def _build_readiness_snapshot(
     )
 
     # ---- PlanningScene cache ------------------------------------------------
+    # F3.x/late-observer: seed a scene that arrives after readiness begins by
+    # driving one nonblocking /get_planning_scene readback step before reading
+    # the cache.  First snapshot starts the request (returns without blocking);
+    # a later snapshot consumes the response and latches it into the cache.
+    _step_planning_scene_readback(executor)
     planning_scene_state = getattr(executor, "_latest_planning_scene", None) or {}
     owned_ids = list(planning_scene_state.get("owned_ids", ()))
     attached_ids = list(planning_scene_state.get("attached_ids", ()))
 
     # ---- Controller manager --------------------------------------------------
-    controller_records_raw = observer.list_controllers()
+    _controller_list_start = time.monotonic()
+    try:
+        controller_records_raw = observer.list_controllers()
+    finally:
+        _controller_list_end = time.monotonic()
+        _write_readiness_trace_record(
+            diagnostics_path,
+            {
+                "event": "stage",
+                "stage": "controller_list_controllers",
+                "start_mono_s": _controller_list_start,
+                "end_mono_s": _controller_list_end,
+                "elapsed_s": _controller_list_end - _controller_list_start,
+            },
+        )
     controllers = _controllers_block(node, controller_records_raw)
 
     # ---- Operator (real publish_operator(False) baseline + observed receipt) --
@@ -1253,6 +1899,7 @@ def _build_readiness_snapshot(
     # baseline and a real observer subscription receipt.  Re-publish the baseline
     # immediately before building the block and spin the shared spinner so the
     # observer receipt is fresh (the operator topic carries no continuous stream).
+    _operator_spin_start = time.monotonic()
     try:
         executor.publish_operator(False)
     except Exception:  # noqa: BLE001 - fail-closed operator baseline
@@ -1261,6 +1908,17 @@ def _build_readiness_snapshot(
         executor._spin_once()
     except Exception:  # noqa: BLE001 - fail-closed operator baseline
         pass
+    _operator_spin_end = time.monotonic()
+    _write_readiness_trace_record(
+        diagnostics_path,
+        {
+            "event": "stage",
+            "stage": "operator_publish_spin",
+            "start_mono_s": _operator_spin_start,
+            "end_mono_s": _operator_spin_end,
+            "elapsed_s": _operator_spin_end - _operator_spin_start,
+        },
+    )
     # The operator receipt is stamped after the publish+spin; refresh the age
     # base so ``operator_age_s`` is non-negative.
     now = time.monotonic()
@@ -1293,6 +1951,28 @@ def _build_readiness_snapshot(
         collision_value = True
 
     # ---- Actions / services ---------------------------------------------------
+    # F3.2/query-budget: collect one deduplicated per-node service inventory and
+    # reuse it for every required endpoint.  The provider-only narrow path
+    # queries exactly one *server* inventory per unique ``_REQUIRED_ENDPOINT_SOURCES``
+    # provider node (``move_group_private_*`` canonicalized to ``/move_group``),
+    # issues zero client queries, and never touches irrelevant nodes — the full
+    # graph/client rescan is what blocked the live snapshot ~29.8 s past the
+    # 30 s readiness deadline.
+    _service_inventory_start = time.monotonic()
+    try:
+        inventory = _collect_service_inventory(node, provider_only=True)
+    finally:
+        _service_inventory_end = time.monotonic()
+        _write_readiness_trace_record(
+            diagnostics_path,
+            {
+                "event": "stage",
+                "stage": "service_inventory",
+                "start_mono_s": _service_inventory_start,
+                "end_mono_s": _service_inventory_end,
+                "elapsed_s": _service_inventory_end - _service_inventory_start,
+            },
+        )
     actions: dict[str, Any] = {}
     for name, action_type in REQUIRED_ACTIONS.items():
         client = executor._action_clients.get(name)
@@ -1302,7 +1982,7 @@ def _build_readiness_snapshot(
                 ready = bool(client.server_is_ready())
             except Exception:  # noqa: BLE001 - live client boundary
                 ready = False
-        server_count, source_node = _action_servers_and_source(node, name)
+        server_count, source_node = _action_servers_and_source(node, name, inventory=inventory)
         actions[name] = {
             "type": action_type,
             "ready": ready,
@@ -1318,7 +1998,7 @@ def _build_readiness_snapshot(
                 ready = bool(client.service_is_ready())
             except Exception:  # noqa: BLE001 - live client boundary
                 ready = False
-        server_count, source_node = _service_servers_and_source(node, name)
+        server_count, source_node = _service_servers_and_source(node, name, inventory=inventory)
         services[name] = {
             "type": service_type,
             "ready": ready,
@@ -1638,6 +2318,7 @@ def _observe_journal_graph(executor: Any) -> dict[str, Any]:
     planner_qos = JOURNAL_PLANNING_SCENE_TOPIC_QOS
     fixture_qos = JOURNAL_FIXTURE_TOPIC_QOS
     service_qos = JOURNAL_SERVICE_QOS
+    service_inventory = _collect_service_inventory(node)
 
     def _topic_entry(
         name: str,
@@ -1662,7 +2343,9 @@ def _observe_journal_graph(executor: Any) -> dict[str, Any]:
         }
 
     def _service_entry(name: str, expected_type: str) -> dict[str, Any]:
-        servers, clients = _service_servers_and_clients(node, name)
+        servers, clients = _service_servers_and_clients(
+            node, name, inventory=service_inventory
+        )
         return {
             "type": expected_type,
             "requested_qos": dict(service_qos),
@@ -1749,18 +2432,46 @@ def _tf_duration(seconds: float) -> Any:
     return Duration(seconds=float(seconds))
 
 
-def _environment_cloud_provider(executor: Any) -> Callable[[], Any]:
+def _environment_cloud_provider(
+    executor: Any, *, first_cloud_wait_s: float | None = None
+) -> Callable[[], Any]:
     """Provide the fresh non-empty ``base_link`` PointCloud2 (Option A+).
 
     F3.3: the provider transforms the live ``/livox/lidar`` cloud (frame
     ``livox360``) into ``base_link`` with ``tf2_sensor_msgs.do_transform_cloud``.
     Rejects missing, stale, empty, malformed, wrong-frame, or untransformable
     clouds.  Never constructs provider success data from PlanningScene objects.
+
+    R3: before failing on a missing cloud the provider spins the shared
+    executor/observer for a bounded first-cloud window (``first_cloud_wait_s``,
+    default ``ENV_CLOUD_FIRST_WAIT_S``).  The dev lidar publishes
+    best-effort/volatile sensor-data QoS at 10 Hz, so a late-joining observer
+    can miss every pre-join frame and ``latest_cloud`` stays None; a short
+    bounded spin catches the next 10 Hz frame instead of failing the whole
+    retreat in <10 ms (rerun-8 cartesian-retreat regression).  The window is
+    strictly bounded and the missing/stale/empty/wrong-frame/untransformable
+    rejections are unchanged.
     """
+    wait_s = (
+        float(first_cloud_wait_s)
+        if first_cloud_wait_s is not None
+        else ENV_CLOUD_FIRST_WAIT_S
+    )
+    if not math.isfinite(wait_s) or wait_s < 0.0:
+        wait_s = ENV_CLOUD_FIRST_WAIT_S
 
     def _provider() -> Any:
         observer = getattr(executor, "_driver_observer", None)
-        if observer is None or getattr(observer, "latest_cloud", None) is None:
+        if observer is None:
+            raise DriverError("no live environment PointCloud2 is available")
+        # R3: bounded first-cloud wait — spin the shared executor/observer so a
+        # late-arriving first frame is accepted rather than treated as absent.
+        deadline = time.monotonic() + wait_s
+        spin = getattr(executor, "_spin_once", None)
+        while getattr(observer, "latest_cloud", None) is None and time.monotonic() < deadline:
+            if callable(spin):
+                spin()
+        if getattr(observer, "latest_cloud", None) is None:
             raise DriverError("no live environment PointCloud2 is available")
         cloud = observer.latest_cloud
         width = int(getattr(cloud, "width", 0) or 0)
@@ -2208,13 +2919,23 @@ def _presend_long_motion(executor: Any, scenario_id: str) -> dict[str, Any]:
     artifact files (which are written only at finalization).
     """
     from integrated_gate_executor import (  # noqa: F401 - live-only
+        apply_execution_slowdown,
         build_execute_trajectory_goal,
         build_joint_move_group_goal,
         stage_d_dispatch,
     )
 
     spec = stage_d_dispatch(scenario_id, scenario=executor.scenario)
-    plan_goal = build_joint_move_group_goal(_LONG_MOTION_JOINT_TARGET, plan_only=True)
+    # F6: the plan-only long-motion goal must pin the executor's current joint
+    # state exactly like ``_build_d_goal``.  Without ``start_state`` move_group
+    # observes an empty JointState ("Found empty JointState message"), cannot
+    # sample the goal tree, and the plan fails — the same empty-JointState bug
+    # fixed in Stage C reappearing on the cancel/safety presend path.
+    plan_goal = build_joint_move_group_goal(
+        _LONG_MOTION_JOINT_TARGET,
+        plan_only=True,
+        start_state=executor._latest_joint_state,
+    )
     plan_record = executor._send_plan_only_retaining_handle(scenario_id, plan_goal, spec)
     # The immutable executor normalizes the planning UUID from bytes/str; for a
     # real rclpy handle the UUID message carries a numpy uint8 array, so fall
@@ -2231,6 +2952,20 @@ def _presend_long_motion(executor: Any, scenario_id: str) -> dict[str, Any]:
         )
     if planned_trajectory is None:
         raise DriverError("pre-send long-motion planning produced no planned trajectory")
+    # C/F1: the presend execute goal must carry the SAME production-slowed
+    # trajectory that ``run_execute_sequence`` executes (``apply_execution_slowdown``,
+    # applied in place AFTER planning, BEFORE building the ExecuteTrajectory goal).
+    # C2 (rerun-5): the presend joint motion at k=2.0 completed in ~2.3 s, which
+    # is exactly the time the cancel arbitration (FJT-executing join + motion
+    # trigger) took to confirm the in-flight motion — so ``run_cancel_sequence``
+    # issued ``cancel_goal_async`` against an already-SUCCEEDED goal and got
+    # return_code=3 ERROR_GOAL_ALREADY_TERMINATED (cancel_response "rejected",
+    # execute_trajectory_goal_sent false, fjt_status null).  The presend is a
+    # synthetic test fixture, not production motion, so it is slowed harder
+    # (k=4.0 -> ~4.6 s) so the goal stays EXECUTING for the entire cancel-setup
+    # + FJT-discovery + arbitration window with margin.  Keeping it slowed also
+    # gives the safety-stop arbitration the same in-flight observation window.
+    apply_execution_slowdown(planned_trajectory, k=4.0)
     execute_goal = build_execute_trajectory_goal(planned_trajectory)
     # F4.4: the transaction baseline is captured immediately before sending the
     # presend ExecuteTrajectory goal, so the distinct controller FJT goal that
@@ -2346,11 +3081,8 @@ def _cleanup_retained_presend(executor: Any) -> dict[str, object]:
 # --------------------------------------------------------------------------- #
 
 def _build_journal_graph_projection(executor: Any) -> Mapping[str, Any]:
-    from integrated_gate_executor import build_journal_graph_projection  # noqa: F401
-
-    payload = getattr(executor, "_fixture_payload", None) or ""
-    observed = _observe_journal_graph(executor)
-    return build_journal_graph_projection(fixture_payload=str(payload), observed_graph=observed)
+    """Return raw live graph evidence for the executor's single validation pass."""
+    return _observe_journal_graph(executor)
 
 
 def _construct_executor(
@@ -2380,7 +3112,11 @@ def _construct_executor(
         current = holder.get("executor")
         if current is None:
             raise DriverError("executor is not yet constructed")
-        return _build_readiness_snapshot(current, bundle, config, attempt_dir)
+        snapshot = _build_readiness_snapshot(current, bundle, config, attempt_dir)
+        # Preserve the exact last raw snapshot so a readiness timeout trace can
+        # report the true rejected values (joint/controller/FJT/planning-scene).
+        current._last_readiness_snapshot = snapshot
+        return snapshot
 
     def _graph_observation_provider() -> Mapping[str, Any]:
         current = holder.get("executor")
@@ -2453,9 +3189,20 @@ def _live_runtime_provider_factory(
             kwargs["fjt_goal_id"] = presend["fjt_goal_id"]
             kwargs["transaction_baseline"] = presend["transaction_baseline"]
             if method_name == "run_cancel_sequence":
+                # run_cancel_sequence accepts the plan/execute id strings so the
+                # cancel evidence keys on the exact presend goals.
                 kwargs["planning_goal_id"] = presend["planning_goal_id"]
                 kwargs["execute_goal_id"] = presend["execute_goal_id"]
-                kwargs["execute_goal_handle"] = presend["execute_goal_handle"]
+            # S2 (round-6): run_safety_sequence's signature accepts
+            # ``execute_goal_handle`` but NOT ``planning_goal_id`` /
+            # ``execute_goal_id``; the round-5 driver passed all three to BOTH
+            # methods and the live safety run crashed instantly with ``TypeError:
+            # run_safety_sequence() got an unexpected keyword argument
+            # 'planning_goal_id'``.  The handle is needed by BOTH methods —
+            # run_safety_sequence cancels the presend ExecuteTrajectory goal on
+            # the exact retained handle after operator-clear so the FJT
+            # controller stops streaming a commanded target into the frozen arm.
+            kwargs["execute_goal_handle"] = presend["execute_goal_handle"]
         else:
             kwargs["fjt_transaction_provider"] = _fjt_transaction_provider(executor)
     if method_name == "run_cartesian_retreat":
@@ -2475,35 +3222,202 @@ def _live_runtime_provider_factory(
 # Core transaction (F2.2, F3.2) — testable with ROS-free executor doubles
 # --------------------------------------------------------------------------- #
 
-def _wait_for_readiness(executor: Any, *, timeout_s: float) -> Mapping[str, Any]:
+def _start_operator_heartbeat(
+    executor: Any, *, period_s: float
+) -> Callable[[], None]:
+    """Publish ``/sim/safety/operator False`` on a wall-clock cadence until stopped.
+
+    The operator topic carries no continuous stream: the readiness snapshot
+    provider publishes one baseline per snapshot, so a slow snapshot (the
+    controller-manager ``ListControllers`` query plus graph-introspection
+    warm-up) leaves the topic stale for most of its duration, exceeding the
+    0.25 s max-age limit.  This daemon thread publishes the operator-clear
+    baseline at a cadence safely below the limit, independent of the snapshot
+    duration.  Returns a stop function that sets the stop event and joins the
+    thread (clean shutdown).
+
+    Publishing uses the existing executor ``operator_publisher`` (rclpy
+    ``publish`` is thread-safe); an executor without a callable
+    ``publish_operator`` (ROS-free doubles) returns a no-op stop function.
+    """
+    if not callable(getattr(executor, "publish_operator", None)):
+        return lambda: None
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop.is_set():
+            try:
+                executor.publish_operator(False)
+            except Exception:  # noqa: BLE001 - fail-closed heartbeat boundary
+                pass
+            stop.wait(float(period_s))
+
+    thread = threading.Thread(target=_heartbeat, daemon=True)
+    thread.start()
+
+    def _stop() -> None:
+        stop.set()
+        thread.join(timeout=1.0)
+
+    return _stop
+
+
+def _spin_readiness_callbacks(executor: Any) -> None:
+    """Let the shared spinner drain its readiness callback backlog.
+
+    One ``executor._spin_once()`` services both the executor and the observer
+    nodes on the shared spinner (F3.2), letting the executor dispatch its
+    already-queued readiness callbacks.  Continuous subscriptions
+    (joint/fixture/safety/operator/collision/TF/lidar) can then enqueue more
+    callbacks while the observer is still cold, so the drain follows with a
+    bounded batch of ``_READINESS_DRAIN_SPINS`` nonblocking
+    ``executor._spinner.spin_once(timeout_sec=0.0)`` calls to clear that
+    backlog without ever blocking the readiness loop.
+
+    Fail-closed: callback and spinner exceptions never escape; a spinner
+    exception breaks the drain so a broken spinner cannot wedge the wait.
+    """
+    try:
+        executor._spin_once()
+    except Exception:  # noqa: BLE001 - fail-closed readiness boundary
+        pass
+    spinner = getattr(executor, "_spinner", None)
+    spin_once = getattr(spinner, "spin_once", None)
+    if not callable(spin_once):
+        return
+    for _ in range(_READINESS_DRAIN_SPINS):
+        try:
+            spin_once(timeout_sec=0.0)
+        except Exception:  # noqa: BLE001 - fail-closed readiness boundary
+            break
+
+
+def _wait_for_readiness(
+    executor: Any,
+    *,
+    timeout_s: float,
+    operator_heartbeat_period_s: float | None = _OPERATOR_HEARTBEAT_PERIOD_S,
+    diagnostics_path: Path | None = None,
+) -> Mapping[str, Any]:
     """Spin the executor/observer spinner and poll readiness until ready.
 
     F3.2: ``executor._spin_once()`` services both the executor and the observer
     nodes on the shared spinner, so subscriptions (joint/fixture/safety/
     operator/collision/TF/lidar) fire and the real caches populate before each
-    readiness evaluation.
+    readiness evaluation.  Each poll additionally runs a bounded nonblocking
+    drain (:func:`_spin_readiness_callbacks`): one executor spin plus
+    ``_READINESS_DRAIN_SPINS`` zero-timeout ``_spinner.spin_once`` calls, so a
+    continuous subscription backlog left by the cold observer is cleared
+    without ever blocking the readiness loop.
+
+    ``/sim/safety/operator`` is refreshed continuously during the wait by an
+    independent wall-clock heartbeat (:func:`_start_operator_heartbeat`) so a
+    slow readiness snapshot never leaves the operator topic stale.  Pass
+    ``operator_heartbeat_period_s=None`` to disable the heartbeat (used only by
+    the once-per-snapshot regression test).
+
+    ``diagnostics_path`` (optional) enables best-effort attempt-local readiness
+    tracing: every poll emits an ``executor_spin`` and a ``readiness_evaluate``
+    stage record, the snapshot provider emits its inner stage records, and a
+    timeout appends a terminal ``readiness_timeout`` event carrying the exact
+    last mapping/reasons plus a compact JSON-safe raw summary of the last
+    rejected snapshot.  Diagnostics never alter the readiness return/raise
+    semantics; a write failure is swallowed.
     """
-    deadline = time.monotonic() + float(timeout_s)
-    last: Mapping[str, Any] = {"ready": False, "reasons": ["readiness wait timeout"]}
-    while time.monotonic() < deadline:
-        try:
-            executor._spin_once()
-        except Exception:  # noqa: BLE001 - fail-closed readiness boundary
-            pass
-        try:
-            readiness = executor._readiness()
-        except Exception as error:  # noqa: BLE001 - fail-closed readiness boundary
-            last = {"ready": False, "reasons": [f"readiness provider raised: {error}"]}
-        else:
-            if isinstance(readiness, Mapping) and readiness.get("ready") is True:
-                return readiness
-            last = (
-                readiness
-                if isinstance(readiness, Mapping)
-                else {"ready": False, "reasons": ["readiness provider returned a non-mapping"]}
+    if diagnostics_path is not None:
+        executor._readiness_diagnostics_path = diagnostics_path
+    stop_heartbeat = (
+        _start_operator_heartbeat(executor, period_s=operator_heartbeat_period_s)
+        if operator_heartbeat_period_s is not None
+        else None
+    )
+    try:
+        deadline = time.monotonic() + float(timeout_s)
+        last: Mapping[str, Any] = {"ready": False, "reasons": ["readiness wait timeout"]}
+        while time.monotonic() < deadline:
+            spin_start = time.monotonic()
+            try:
+                _spin_readiness_callbacks(executor)
+            except Exception:  # noqa: BLE001 - fail-closed readiness boundary
+                pass
+            spin_end = time.monotonic()
+            _write_readiness_trace_record(
+                diagnostics_path,
+                {
+                    "event": "stage",
+                    "stage": "executor_spin",
+                    "start_mono_s": spin_start,
+                    "end_mono_s": spin_end,
+                    "elapsed_s": spin_end - spin_start,
+                },
             )
-        time.sleep(0.05)
-    return last
+            evaluate_start = time.monotonic()
+            try:
+                readiness = executor._readiness()
+            except Exception as error:  # noqa: BLE001 - fail-closed readiness boundary
+                last = {"ready": False, "reasons": [f"readiness provider raised: {error}"]}
+                evaluate_end = time.monotonic()
+                _write_readiness_trace_record(
+                    diagnostics_path,
+                    {
+                        "event": "stage",
+                        "stage": "readiness_evaluate",
+                        "start_mono_s": evaluate_start,
+                        "end_mono_s": evaluate_end,
+                        "elapsed_s": evaluate_end - evaluate_start,
+                    },
+                )
+            else:
+                if isinstance(readiness, Mapping) and readiness.get("ready") is True:
+                    evaluate_end = time.monotonic()
+                    _write_readiness_trace_record(
+                        diagnostics_path,
+                        {
+                            "event": "stage",
+                            "stage": "readiness_evaluate",
+                            "start_mono_s": evaluate_start,
+                            "end_mono_s": evaluate_end,
+                            "elapsed_s": evaluate_end - evaluate_start,
+                        },
+                    )
+                    return readiness
+                last = (
+                    readiness
+                    if isinstance(readiness, Mapping)
+                    else {"ready": False, "reasons": ["readiness provider returned a non-mapping"]}
+                )
+                evaluate_end = time.monotonic()
+                _write_readiness_trace_record(
+                    diagnostics_path,
+                    {
+                        "event": "stage",
+                        "stage": "readiness_evaluate",
+                        "start_mono_s": evaluate_start,
+                        "end_mono_s": evaluate_end,
+                        "elapsed_s": evaluate_end - evaluate_start,
+                    },
+                )
+            time.sleep(0.05)
+        try:
+            raw_summary = _readiness_raw_summary(executor)
+        except Exception:  # noqa: BLE001 - best-effort timeout diagnostics
+            raw_summary = {}
+        _write_readiness_trace_record(
+            diagnostics_path,
+            {
+                "event": "readiness_timeout",
+                "last_ready": bool(last.get("ready", False)),
+                "last_reasons": [str(reason) for reason in last.get("reasons") or []],
+                "raw_summary": raw_summary,
+            },
+        )
+        return last
+    finally:
+        if stop_heartbeat is not None:
+            try:
+                stop_heartbeat()
+            except Exception:  # noqa: BLE001 - best-effort heartbeat teardown
+                pass
 
 
 def run_driver(
@@ -2546,12 +3460,32 @@ def run_driver(
         seed=seed,
     )
     try:
-        readiness = _wait_for_readiness(executor, timeout_s=readiness_timeout_s)
+        readiness = _wait_for_readiness(
+            executor,
+            timeout_s=readiness_timeout_s,
+            diagnostics_path=attempt_path / READINESS_TRACE_FILENAME,
+        )
         if not readiness.get("ready"):
             reasons = readiness.get("reasons") or ["readiness wait timeout"]
             raise DriverError(
                 "executor readiness did not become ready: " + "; ".join(str(r) for r in reasons)
             )
+        # F-gate: record the append-only evidence boundary before the executor
+        # gate run so the independent verifier can slice physics truth from
+        # exactly the raw/evaluator start indices.
+        _write_gate_window(attempt_path, scenario_id, attempt_id)
+        # Re-drain the shared spinner after the synchronous gate-window parse.
+        # _write_gate_window counts every line of physics_truth.jsonl and
+        # evaluator.jsonl on the SingleThreadedExecutor's main thread (1.19 s for
+        # a large blocked scenario), starving the spinner so no DDS callbacks
+        # dispatch.  Without a drain here the gate method's OWN _readiness()
+        # re-check moments later snapshots every stream stale and fail-closes
+        # with reason_code readiness-failed on all six checks even though
+        # _wait_for_readiness had returned ready.  The bounded nonblocking drain
+        # (one _spin_once plus _READINESS_DRAIN_SPINS zero-timeout spinner spins)
+        # dispatches the callbacks queued during the parse without hanging the
+        # run.
+        _spin_readiness_callbacks(executor)
         provider_factory = runtime_provider_factory or _live_runtime_provider_factory
         runtime_kwargs = provider_factory(
             executor=executor,

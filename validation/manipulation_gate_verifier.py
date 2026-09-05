@@ -19,6 +19,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 SCHEMA_VERSION = 1
+# Float guard for the one-frame pre-start skew window in ``_raw_gate_window``.
+# ``gate_start`` and frame timestamps are ``k/physics_hz`` values whose exact
+# difference can land a hair outside ``gate_start - 1/physics_hz`` purely from
+# floating-point rounding (observed 1e-12 for 1303/120 vs 1304/120).  1e-9 is
+# far below any real tick (1/physics_hz ~= 8.3e-3), so it cannot admit a frame
+# two ticks back; it only preserves the genuinely-adjacent pre-start frame.
+PHYSICS_TOLERANCE_EPS = 1e-9
 TRAJECTORY_ACTION = "/xarm7_traj_controller/follow_joint_trajectory"
 GRIPPER_ACTION = "/xarm_gripper/gripper_action"
 SAFETY_TOPIC = "/sim/safety/operator"
@@ -563,7 +570,27 @@ def _raw_gate_window(
             raise EvidenceError("gate-window.json requires a non-negative integer raw_start_index")
         if raw_start_index >= len(records):
             raise EvidenceError("gate-window.json raw_start_index is beyond physics truth")
-        records = records[raw_start_index:]
+        # The executor's raw_start_index is the count of physics-truth records AT
+        # the gate boundary (the first in-gate frame), so slicing [N:] would drop
+        # the pre-start frame the integrated verifier requires.  Keep the frame
+        # immediately before the boundary; the tolerance filter below removes
+        # anything further back, so the shared non-integrated path is unaffected
+        # and raw_start_index=0 stays a no-op.
+        slice_start = max(0, raw_start_index - 1)
+        # The journal's fixture-ready can land ON the boundary frame itself:
+        # raw_start_index counts that frame, so the frame at raw_start_index-1
+        # has timestamp == gate_start rather than strictly before it.  Back the
+        # slice up one more frame so the integrated verifier always retains a
+        # genuinely-before frame (timestamp < gate_start).  Monotonic physics
+        # timestamps make a single back-up sufficient; the tolerance filter
+        # below keeps the extra frame only when it sits within the one-frame
+        # sampling skew it was designed to permit.
+        if (
+            slice_start > 0
+            and _timestamp(records[slice_start], "physics truth gate window") >= gate_start
+        ):
+            slice_start -= 1
+        records = records[slice_start:]
         window_path = path
     if not records:
         raise EvidenceError("gate execution raw_start_index leaves no physics truth records")
@@ -577,7 +604,12 @@ def _raw_gate_window(
         timestamp = _timestamp(record, "physics truth gate window")
         if gate_start <= timestamp <= gate_end:
             has_exact_overlap = True
-        if gate_start - tolerance <= timestamp <= gate_end:
+        # Epsilon only on the lower bound: it preserves the one-frame pre-start
+        # skew frame whose timestamp is marginally below the bound from float
+        # rounding.  The upper (terminal) bound stays authoritative -- never
+        # admit post-terminal truth that could satisfy a predicate after the
+        # executor completed.
+        if gate_start - tolerance - PHYSICS_TOLERANCE_EPS <= timestamp <= gate_end:
             selected.append(record)
     if not has_exact_overlap:
         raise EvidenceError("physics truth does not overlap the executor gate window")
@@ -1036,8 +1068,18 @@ def _verify_gate(gate: str, frames: Sequence[Mapping[str, Any]], execution: Sequ
         if not stop_indices:
             checks.append(_check("effective_safety_stop", False, reasons=("no effective safety stop in raw truth",)))
             raise EvidenceError("safety gate requires safety-stop samples")
-        stop_position = stop_indices[0]
-        first = next(index for index, item in enumerate(frames) if item["index"] == stop_position)
+        # Group contiguous safety-flagged frames into episodes and measure the
+        # longest one: recurring single-frame spawn transients otherwise hijack
+        # the window and hide the deliberate stop-and-restore cycle entirely.
+        flagged_positions = [index for index, item in enumerate(frames) if _safety(item["raw"])]
+        episodes: list[list[int]] = [[flagged_positions[0]]]
+        for position in flagged_positions[1:]:
+            if position == episodes[-1][-1] + 1:
+                episodes[-1].append(position)
+            else:
+                episodes.append([position])
+        first = max(episodes, key=len)[0]
+        stop_position = frames[first]["index"]
         compliant = None
         velocities: list[float] = []
         for index in range(first, len(frames)):

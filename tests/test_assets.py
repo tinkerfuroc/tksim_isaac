@@ -89,6 +89,110 @@ class AssetManifestTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 verify_assets(config)
 
+    def test_optional_arena_group_validated_when_present(self) -> None:
+        base = Config.load(ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = copy.deepcopy(base.raw)
+            config = Config(root=root, raw=raw)
+            artifacts = config.path("artifacts")
+            artifacts.mkdir(parents=True)
+            robot = artifacts / "tinker.usd"
+            cache = config.path("isaac_cache") / "assets" / "room.usd"
+            cache.parent.mkdir(parents=True)
+            robot.write_text("robot", encoding="utf-8")
+            cache.write_text("room", encoding="utf-8")
+            arena = artifacts / "arena.usd"
+            arena.write_text("arena", encoding="utf-8")
+            manifest = {
+                "schema_version": 1,
+                "generated_robot_usds": [
+                    {
+                        "path": robot.relative_to(root).as_posix(),
+                        "sha256": sha256_file(robot),
+                    }
+                ],
+                "warmed_isaac_assets": [
+                    {
+                        "path": cache.relative_to(root).as_posix(),
+                        "sha256": sha256_file(cache),
+                    }
+                ],
+                "generated_arena_usds": [
+                    {
+                        "path": arena.relative_to(root).as_posix(),
+                        "sha256": "0" * 64,
+                    }
+                ],
+            }
+            (artifacts / "asset-manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(RuntimeError, "asset checksum mismatch"):
+                verify_assets(config)
+
+    def test_optional_groups_absent_is_fine(self) -> None:
+        base = Config.load(ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = copy.deepcopy(base.raw)
+            config = Config(root=root, raw=raw)
+            artifacts = config.path("artifacts")
+            artifacts.mkdir(parents=True)
+            robot = artifacts / "tinker.usd"
+            cache = config.path("isaac_cache") / "assets" / "room.usd"
+            cache.parent.mkdir(parents=True)
+            robot.write_text("robot", encoding="utf-8")
+            cache.write_text("room", encoding="utf-8")
+            manifest = {
+                "schema_version": 1,
+                "generated_robot_usds": [
+                    {
+                        "path": robot.relative_to(root).as_posix(),
+                        "sha256": sha256_file(robot),
+                    }
+                ],
+                "warmed_isaac_assets": [
+                    {
+                        "path": cache.relative_to(root).as_posix(),
+                        "sha256": sha256_file(cache),
+                    }
+                ],
+            }
+            (artifacts / "asset-manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(verify_assets(config), manifest)
+
+    def test_optional_group_present_but_empty_is_fine(self) -> None:
+        base = Config.load(ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = copy.deepcopy(base.raw)
+            config = Config(root=root, raw=raw)
+            artifacts = config.path("artifacts")
+            artifacts.mkdir(parents=True)
+            robot = artifacts / "tinker.usd"
+            cache = config.path("isaac_cache") / "assets" / "room.usd"
+            cache.parent.mkdir(parents=True)
+            robot.write_text("robot", encoding="utf-8")
+            cache.write_text("room", encoding="utf-8")
+            manifest = {
+                "schema_version": 1,
+                "generated_robot_usds": [
+                    {
+                        "path": robot.relative_to(root).as_posix(),
+                        "sha256": sha256_file(robot),
+                    }
+                ],
+                "warmed_isaac_assets": [
+                    {
+                        "path": cache.relative_to(root).as_posix(),
+                        "sha256": sha256_file(cache),
+                    }
+                ],
+                "generated_arena_usds": [],
+                "generated_object_usds": [],
+            }
+            (artifacts / "asset-manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(verify_assets(config), manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

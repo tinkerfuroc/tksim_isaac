@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import queue
+import re
 import sys
 import tempfile
 import time
@@ -24,6 +26,7 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
 )
 from tinker_sim_isaac.backend import IsaacWholeRobotBackend
+from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
 from manipulation_qualification import QualificationManifest, QualificationRunner
 from run_sim import _content_addressed_tinker_usd, _expected_scenario_objects
@@ -59,6 +62,22 @@ class _FakeRobot:
                 [[[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]]], dtype=torch.float32
             ),
         )
+        # Isaac Lab articulations own actuator models keyed by group name. Each
+        # ImplicitActuator keeps its own effort_limit tensor that is re-applied on
+        # reset/reinit; the runtime effort-limit writer must keep this in sync
+        # (Isaac Lab issue #128).
+        self.actuators = {
+            "gripper": SimpleNamespace(
+                joint_names=("drive_joint",),
+                effort_limit=torch.tensor([[12.0]], dtype=torch.float32),
+            ),
+            "arm": SimpleNamespace(
+                joint_names=("joint1",),
+                effort_limit=torch.tensor([[30.0]], dtype=torch.float32),
+                stiffness=torch.tensor([[20000.0]], dtype=torch.float32),
+                damping=torch.tensor([[1500.0]], dtype=torch.float32),
+            ),
+        }
         self.limit_calls: list[dict[str, object]] = []
         self.gain_calls: list[tuple[str, dict[str, object]]] = []
         self.target_calls: list[tuple[str, torch.Tensor]] = []
@@ -131,6 +150,7 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._safety_nominal_damping = (1500.0,)
     backend._safety_nominal_effort_limits = (30.0,)
     backend._safety_gains_applied = False
+    backend._safety_hold_steps = 0
     backend._pending_snapshot_id = None
     backend._pending_snapshot_count = 0
     backend._pending_snapshot_index = 0
@@ -141,12 +161,21 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._contact_pairs_by_key = {}
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
+    backend._clock_elapsed_steps = 0
     backend._sim = SimpleNamespace(
         get_physics_step_count=lambda: 0,
         step=lambda render=False: None,
     )
     backend.render = False
     backend.dt = 1.0 / 120.0
+    backend.physics_dt = 1.0 / 120.0
+    backend.physics_hz = 120.0
+    backend.control_hz = 120.0
+    backend.physics_substeps = 1
+    backend._target_write_gate = TargetWriteGate()
+    backend.step_profile = {"enabled": False, "target_writes": 0}
+    backend.chassis_ballast_mass_kg = 0.0
+    backend._object_views = {}
     backend._refresh_object_views = lambda: None
     return backend
 
@@ -177,6 +206,36 @@ def _protocol_gateway(epoch: int = 11) -> RosStandardGateway:
     gateway._safety_last_sample_at = time.monotonic()
     gateway._last_safety_clear_at = gateway._safety_last_sample_at
     return gateway
+
+
+def _spawn_usd_file_cfg_source(backend_source: str) -> str:
+    """Return the source text of the ``UsdFileCfg`` used as the Articulation spawn.
+
+    The backend builds ``ArticulationCfg(...)`` with a ``spawn=sim_utils.UsdFileCfg(...)``
+    keyword.  This extracts exactly that spawn call so the test can assert the
+    spawn-time joint-drive contract without importing Isaac or inspecting USD.
+    """
+    tree = ast.parse(backend_source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "spawn":
+                continue
+            value = keyword.value
+            if not isinstance(value, ast.Call):
+                continue
+            value_func = value.func
+            if not (
+                isinstance(value_func, ast.Attribute)
+                and value_func.attr == "UsdFileCfg"
+            ):
+                continue
+            return ast.get_source_segment(backend_source, value) or ""
+    return ""
 
 
 class ManipulationRuntimeTest(unittest.TestCase):
@@ -352,25 +411,35 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 0.0]])
         self.assertAlmostEqual(float(backend._effort_targets[0, 0]), 0.0)
-        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 3.7, places=4)
+        # Gravity feed-forward only (fake gravity 1.5 at base-DoF-offset index 3);
+        # the position/velocity correction is PhysX's drive.
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 1.5, places=4)
         self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.25)
         self.assertAlmostEqual(float(backend._position_targets[0, 1]), -0.4)
-        self.assertEqual(backend._robot.write_count, 2)
+        # The measured state did not change between the two steps, so the
+        # recomputed effort target is identical and the write gate skips the
+        # second push (PhysX holds the target it already has).
+        self.assertEqual(backend._robot.write_count, 1)
+        # The hold's drive configuration (ceiling, stiffness 0, damping 0) is
+        # constant for the whole hold and is written once on entry; each of
+        # those is a PhysX model-property write (measured 2.9 ms per step when
+        # repeated). The effort target is still recomputed and pushed every
+        # step, see the target_calls assertions below.
         self.assertEqual(
             [name for name, _ in backend._robot.gain_calls],
-            ["stiffness", "damping", "stiffness", "damping"],
+            ["stiffness", "damping"],
         )
         self.assertEqual(
-            [call["limits"].tolist() for call in backend._robot.limit_calls[-2:]],
-            [[[100.0]], [[100.0]]],
+            [call["limits"].tolist() for call in backend._robot.limit_calls[-1:]],
+            [[[100.0]]],
         )
         self.assertEqual(
             [call["stiffness"] for name, call in backend._robot.gain_calls if name == "stiffness"],
-            [IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS] * 2,
+            [IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS],
         )
         self.assertEqual(
             [call["damping"] for name, call in backend._robot.gain_calls if name == "damping"],
-            [IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING] * 2,
+            [IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING],
         )
         self.assertEqual(
             [kind for kind, _ in backend._robot.target_calls[-3:]],
@@ -378,15 +447,15 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(
             [kind for kind, _ in backend._robot.target_calls],
-            ["position", "velocity", "effort"] * 2,
+            ["position", "velocity", "effort"],
         )
         effort_targets = [
             target for kind, target in backend._robot.target_calls if kind == "effort"
         ]
-        self.assertEqual(len(effort_targets), 2)
+        self.assertEqual(len(effort_targets), 1)
         for target in effort_targets:
             self.assertAlmostEqual(float(target[0, 0]), 0.0)
-            self.assertAlmostEqual(float(target[0, 1]), 3.7, places=4)
+            self.assertAlmostEqual(float(target[0, 1]), 1.5, places=4)
 
         backend.set_safety_stop(False)
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 0.0]])
@@ -404,10 +473,13 @@ class ManipulationRuntimeTest(unittest.TestCase):
             backend.command_joints(JointCommand(("joint1",), positions=(0.75,)))
         )
 
-    def test_safety_hold_uses_explicit_drive_and_restores_nominal_gain(self) -> None:
+    def test_safety_hold_uses_physx_drive_and_restores_nominal_gain(self) -> None:
+        """The hold is PhysX's drive: hold gains on entry, gravity fed forward."""
         backend = _backend()
         backend.set_safety_stop(True)
         backend.step()
+        self.assertEqual(IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS, 600.0)
+        self.assertEqual(IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING, 80.0)
 
         self.assertEqual(
             [call["stiffness"] for name, call in backend._robot.gain_calls if name == "stiffness"],
@@ -418,7 +490,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             [IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING],
         )
         self.assertEqual(backend._robot.target_calls[-1][0], "effort")
-        self.assertAlmostEqual(float(backend._robot.target_calls[-1][1][0, 1]), 17.5)
+        self.assertAlmostEqual(float(backend._robot.target_calls[-1][1][0, 1]), 1.5)
         self.assertAlmostEqual(float(backend._robot.target_calls[-1][1][0, 0]), 0.0)
 
         backend.set_safety_stop(False)
@@ -448,10 +520,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend.step()
 
         # The arm joint is data index 1, and gravity index 1 + num_base_dofs.
-        # The measured error is -0.01 rad and velocity is +0.01 rad/s.
-        # -0.5 + 600(-0.01) - 80(0.01) = -7.3.
+        # Only gravity (-0.5) is fed forward; the -0.01 rad error and the
+        # +0.01 rad/s velocity are corrected by PhysX's drive at 600 / 80.
         self.assertAlmostEqual(float(backend._effort_targets[0, 0]), 0.0)
-        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), -7.3, places=4)
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), -0.5, places=4)
 
     def test_safety_effort_clips_to_100_nm_ceiling_and_zeroes_non_arm_joints(self) -> None:
         backend = _backend()
@@ -467,7 +539,11 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._robot.data.gravity_compensation_forces = torch.tensor(
             [[-1000.0, -1000.0, -1000.0, -1000.0]], dtype=torch.float32
         )
-        backend.step()
+        # The feed-forward is refreshed every SAFETY_HOLD_GRAVITY_REFRESH_STEPS
+        # control steps; until then the entry value is held.
+        self.assertEqual(backend._effort_targets.tolist(), [[0.0, 100.0]])
+        for _ in range(IsaacWholeRobotBackend.SAFETY_HOLD_GRAVITY_REFRESH_STEPS):
+            backend.step()
         self.assertEqual(backend._effort_targets.tolist(), [[0.0, -100.0]])
         self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[100.0]])
 
@@ -492,6 +568,99 @@ class ManipulationRuntimeTest(unittest.TestCase):
             backend._robot.limit_calls[-1]["limits"].tolist(),
             [[11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0]],
         )
+
+    def test_safety_hold_mirrors_gains_into_the_actuator_model(self) -> None:
+        """applied_torque telemetry and reset re-sync come from the actuator
+        model's own tensors (Isaac Lab issue #128), so the hold gains and the
+        nominal restore must be mirrored there, not only written to PhysX."""
+        backend = _backend()
+        arm = backend._robot.actuators["arm"]
+        backend.set_safety_stop(True)
+        backend.step()
+        self.assertEqual(float(arm.stiffness[0, 0]), IsaacWholeRobotBackend.SAFETY_HOLD_STIFFNESS)
+        self.assertEqual(float(arm.damping[0, 0]), IsaacWholeRobotBackend.SAFETY_HOLD_DAMPING)
+        self.assertEqual(float(arm.effort_limit[0, 0]), 100.0)
+        # The gripper group owns drive_joint only; it must be untouched.
+        self.assertEqual(float(backend._robot.actuators["gripper"].effort_limit[0, 0]), 12.0)
+
+        backend.set_safety_stop(False)
+        self.assertEqual(float(arm.stiffness[0, 0]), 20000.0)
+        self.assertEqual(float(arm.damping[0, 0]), 1500.0)
+        self.assertEqual(float(arm.effort_limit[0, 0]), 30.0)
+
+    def test_safety_hold_writes_drive_config_once_per_hold(self) -> None:
+        """Ceiling/stiffness/damping are constant for a hold: written on entry only."""
+        backend = _backend()
+        backend.set_safety_stop(True)
+        for index in range(5):
+            # A moving measured state is PhysX's business now: the drive
+            # corrects it at every substep without a Python push.
+            backend._robot.data.joint_vel = torch.tensor(
+                [[0.1, -0.2 + 0.01 * index]], dtype=torch.float32
+            )
+            backend.step()
+
+        self.assertEqual(len(backend._robot.gain_calls), 2)
+        self.assertEqual(
+            [call["limits"].tolist() for call in backend._robot.limit_calls],
+            [[[100.0]]],
+        )
+        # One push on entry (latched pose, zero velocity, gravity feed-forward),
+        # then nothing while the hold is steady.
+        self.assertEqual(backend._robot.write_count, 1)
+        self.assertEqual(
+            [kind for kind, _ in backend._robot.target_calls].count("effort"), 1
+        )
+        # The gravity feed-forward is refreshed every
+        # SAFETY_HOLD_GRAVITY_REFRESH_STEPS control steps.
+        backend._robot.data.gravity_compensation_forces = torch.tensor(
+            [[0.1, 0.2, 0.3, 2.5]], dtype=torch.float32
+        )
+        refresh = IsaacWholeRobotBackend.SAFETY_HOLD_GRAVITY_REFRESH_STEPS
+        for _ in range(refresh - 5):
+            backend.step()
+        # Still the entry value one step before the refresh boundary...
+        self.assertEqual(backend._robot.write_count, 1)
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 1.5, places=4)
+        backend.step()
+        # ...and refreshed (one push) on it.
+        self.assertEqual(backend._robot.write_count, 2)
+        self.assertAlmostEqual(float(backend._effort_targets[0, 1]), 2.5, places=4)
+
+        # Clearing restores nominal gains exactly once; a second hold writes
+        # the hold configuration again.
+        backend.set_safety_stop(False)
+        self.assertEqual(
+            [name for name, _ in backend._robot.gain_calls[-2:]],
+            ["stiffness", "damping"],
+        )
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[30.0]])
+        backend.set_safety_stop(True)
+        backend.step()
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 6)
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[100.0]])
+
+    def test_safety_hold_rewrites_drive_config_after_view_refresh(self) -> None:
+        """A re-resolved articulation view carries the actuator model's nominal
+        gains, so the hold configuration must be pushed again after one."""
+        backend = _backend()
+        backend.set_safety_stop(True)
+        backend.step()
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 2)
+
+        # Standard STOP -> PLAY: Isaac Lab recreates the root view.
+        backend._robot.root_view = object()
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 4)
+        self.assertEqual(
+            [name for name, _ in backend._robot.gain_calls[-2:]],
+            ["stiffness", "damping"],
+        )
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[100.0]])
+        backend.step()
+        self.assertEqual(len(backend._robot.gain_calls), 4)
 
     def test_safety_effort_rejects_missing_nonfinite_and_malformed_gravity(self) -> None:
         for gravity in (
@@ -525,6 +694,58 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
         self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[6.0]])
 
+    def test_gripper_effort_limit_updates_implicit_actuator_model_entry(self) -> None:
+        """RED runtime contract: _set_gripper_effort_limit must update the actuator model.
+
+        Isaac Lab issue #128: write_joint_effort_limit_to_sim_index writes only the
+        PhysX/shared buffer. The owning ImplicitActuator keeps its own effort_limit
+        tensor, which is re-applied to the simulator on reset/reinit. If the runtime
+        call does not update that entry, the actuator re-sync clobbers the request.
+        A zero request restores the existing default and a negative request still
+        rejects without touching either writer or model entry.
+        """
+        backend = _backend()
+        gripper = backend._robot.actuators["gripper"]
+        self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
+
+        backend._set_gripper_effort_limit(6.0)
+        self.assertEqual(backend.gripper_effort_limit, 6.0)
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[6.0]])
+        self.assertEqual(
+            float(gripper.effort_limit[0, 0]),
+            6.0,
+            "drive_joint's owning implicit actuator model effort_limit must be updated "
+            "alongside the PhysX writer so an actuator re-sync does not clobber it "
+            "(Isaac Lab issue #128)",
+        )
+
+        backend._set_gripper_effort_limit(0.0)
+        self.assertEqual(backend.gripper_effort_limit, 12.0)
+        self.assertEqual(backend._robot.limit_calls[-1]["limits"].tolist(), [[12.0]])
+        self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
+
+        with self.assertRaises(ValueError):
+            backend._set_gripper_effort_limit(-1.0)
+        self.assertEqual(backend.gripper_effort_limit, 12.0)
+        self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
+
+    def test_repeated_identical_gripper_effort_limit_writes_once(self) -> None:
+        """The bridge re-sends the gripper packet at 150 Hz; an unchanged ceiling
+        must not reach the PhysX writer again (each write costs a physics step)."""
+        backend = _backend()
+        backend._set_gripper_effort_limit(6.0)
+        writes = len(backend._robot.limit_calls)
+        for _ in range(5):
+            backend._set_gripper_effort_limit(6.0)
+        self.assertEqual(len(backend._robot.limit_calls), writes)
+        self.assertEqual(backend.gripper_effort_limit_writes, 1)
+        backend._set_gripper_effort_limit(0.0)
+        self.assertEqual(len(backend._robot.limit_calls), writes + 1)
+        self.assertEqual(backend.gripper_effort_limit, 12.0)
+        # A zero request that restores the default is also a no-op when repeated.
+        backend._set_gripper_effort_limit(0.0)
+        self.assertEqual(len(backend._robot.limit_calls), writes + 1)
+
     def test_position_only_command_clears_affected_velocity_target(self) -> None:
         backend = _backend()
 
@@ -543,7 +764,11 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend.command_joints(JointCommand(("drive_joint",), positions=(0.6,)))
 
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 0.0]])
-        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.6)
+        # drive_joint positions defer to the close ramp (_ramp_drive_target in
+        # step()), so the snapshot captures the target rather than writing it
+        # straight into _position_targets. The velocity retirement above is the
+        # subject; the captured target confirms the command committed.
+        self.assertAlmostEqual(float(backend._drive_command_target), 0.6)
 
     def test_snapshot_boundary_preserves_active_mixed_base_and_arm_packets(self) -> None:
         backend = _backend()
@@ -567,7 +792,114 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend.begin_command_snapshot(second)
         backend.command_joints(JointCommand(("drive_joint",), positions=(0.6,)))
         self.assertEqual(backend._velocity_targets.tolist(), [[0.0, 1.25]])
-        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.6)
+        # drive_joint positions defer to the close ramp; the final packet
+        # commits the captured target (see _apply_joint_command).
+        self.assertAlmostEqual(float(backend._drive_command_target), 0.6)
+
+    def test_gripper_close_slews_and_bounded_lead_stops_on_stalled_pads(self) -> None:
+        # The close target must not jump to the command; it slews. And once the
+        # pads stall against an object (measured pad position stops advancing),
+        # the applied target must clamp at pad + max_lead and STOP -- never
+        # running on to the fully-closed command (the open-loop runaway that
+        # climbed to 248 N and defeated the facade stall detector).
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_max_lead = 0.015
+        backend._gripper_contact_halt_force = 0.0
+        backend._position_targets = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+
+        step = 1.5 / 120.0
+        # Pads stalled at 0.0 (object blocks them) and NOT moving -> the stall
+        # gate lets the lead clamp engage.
+        backend._measured_finger_closure = lambda: 0.0  # type: ignore[assignment]
+        backend._measured_finger_speed = lambda: 0.0  # type: ignore[assignment]
+        backend._ramp_drive_target()
+        # First step: slew (0.0125) is below the lead cap (0.0 + 0.015).
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), step, places=6)
+        for _ in range(30):
+            backend._ramp_drive_target()
+        # Converges to pad + lead and stays there -- nowhere near 0.85.
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.015, places=5)
+
+    def test_gripper_close_advances_while_pads_follow(self) -> None:
+        # While the pads are MOVING, the stall gate holds the lead clamp OFF and
+        # the target advances at the slew rate toward the command.
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_max_lead = 0.015
+        backend._gripper_stall_speed = 0.1
+        backend._gripper_contact_halt_force = 0.0
+        backend._position_targets = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+        backend._measured_finger_closure = lambda: 0.0  # type: ignore[assignment]
+        backend._measured_finger_speed = lambda: 1.5  # moving at slew rate
+        for _ in range(20):
+            backend._ramp_drive_target()
+        self.assertGreater(float(backend._position_targets[0, 0]), 0.2)
+
+    def test_gripper_close_does_not_ratchet_backward_under_dynamic_lag(self) -> None:
+        # cycle-3 regression: while the pads move, target - pad is dominated by
+        # dynamic tracking lag (0.03 > lead 0.015). If the clamp engaged there,
+        # min(slew, pad + lead) would drive the target BACKWARD and deadlock the
+        # jaw open. The stall gate must hold it off while the pads are moving.
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_max_lead = 0.015
+        backend._gripper_stall_speed = 0.1
+        backend._gripper_contact_halt_force = 0.0
+        backend._position_targets = torch.tensor([[0.1, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+        backend._measured_finger_closure = lambda: float(  # lags by 0.03
+            backend._position_targets[0, 0]
+        ) - 0.03
+        backend._measured_finger_speed = lambda: 1.5  # moving
+        before = float(backend._position_targets[0, 0])
+        backend._ramp_drive_target()
+        self.assertGreater(float(backend._position_targets[0, 0]), before)
+
+    def test_gripper_close_ramp_disabled_applies_target_instantly(self) -> None:
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 0.0  # ramp disabled
+        backend._gripper_max_lead = 0.015
+        backend._gripper_contact_halt_force = 0.0
+        backend._position_targets = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+        backend._ramp_drive_target()
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.85, places=6)
+
+    def test_gripper_open_ignores_close_bounds(self) -> None:
+        # Only the closing stroke is bounded; an opening command must slew
+        # freely even with stalled pads / contact force, so release is prompt.
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_max_lead = 0.015
+        backend._gripper_contact_halt_force = 15.0
+        backend._position_targets = torch.tensor([[0.85, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.0  # open
+        backend._measured_finger_closure = lambda: 0.85  # type: ignore[assignment]
+        backend._gripper_grip_force = lambda: 50.0  # type: ignore[assignment]
+        backend._ramp_drive_target()
+        self.assertLess(float(backend._position_targets[0, 0]), 0.85)
+
+    def test_gripper_optional_force_cap_freezes_when_enabled(self) -> None:
+        # The optional hard force cap is off by default; when enabled it freezes
+        # the close once raw pad contact force exceeds it.
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._gripper_close_slew = 1.5
+        backend._gripper_max_lead = 0.0  # isolate the force cap
+        backend._gripper_contact_halt_force = 15.0
+        backend._position_targets = torch.tensor([[0.2, 0.0]], dtype=torch.float32)
+        backend._drive_command_target = 0.85
+        backend._gripper_grip_force = lambda: 20.0  # type: ignore[assignment]
+        backend._ramp_drive_target()
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.2, places=6)
 
     def test_gateway_applies_callbacks_in_arrival_order_across_safety_and_commands(self) -> None:
         class _GatewayBackend:
@@ -810,6 +1142,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(gateway.backend._velocity_targets.tolist(), [[0.0, 1.75]])
 
         gateway._last_command_received_at = 10.0
+        # Expiry needs the receipt stale in simulation time too (the sim has
+        # stepped a full timeout past it), not only in wall time.
+        gateway._last_command_received_sim_at = float(gateway.backend.simulation_time) - 1.0
         gateway._enforce_command_deadline(now=10.5)
 
         self.assertTrue(gateway._command_stream_lost)
@@ -835,6 +1170,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway._last_snapshot_packet_count = 1
         gateway._last_snapshot_packet_index = 1
         gateway._last_command_received_at = 10.0
+        # Expiry needs the receipt stale in simulation time too (the sim has
+        # stepped a full timeout past it), not only in wall time.
+        gateway._last_command_received_sim_at = float(gateway.backend.simulation_time) - 1.0
         gateway._enforce_command_deadline(now=10.5)
 
         gateway._safety_stop(SimpleNamespace(data=False))
@@ -1419,8 +1757,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_expected_object_pose_and_twist_comes_from_scenario(self) -> None:
         expected = _expected_scenario_objects(ROOT, "pick-deliver-place")
+        # Pose pinned to the arena-safe layout (e5d4312): the old (0.65, 0)
+        # point sits inside shelf_02's rasterized footprint in rcw2026.
         self.assertEqual(
-            expected["delivery_object"]["pose"]["position"], [0.65, 0.0, 0.8]
+            expected["delivery_object"]["pose"]["position"], [-1.35, -2.0, 0.8]
         )
         self.assertEqual(expected["delivery_object"]["twist"]["linear"], [0.0, 0.0, 0.0])
         self.assertEqual(
@@ -1443,6 +1783,20 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertIn("backend.arm_scenario_collision()", source)
         self.assertIn("/sim/internal/physics_truth", source)
         self.assertNotIn("self.truth_pub", source)
+
+    def test_gateway_publishes_raw_truth_without_persisting_physics_truth(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        # The gateway still publishes the raw serialized payload on the internal
+        # physics-truth topic for the evaluator to consume.
+        self.assertIn('"/sim/internal/physics_truth"', source)
+        self.assertIn("physics_truth.data", source)
+        self.assertIn("self.physics_truth_pub.publish(physics_truth)", source)
+        # Raw truth persistence is owned by the evaluator callback, so the
+        # gateway must not hold a physics-truth jsonl writer (the TINKER_SIM_TRUTH_JSONL
+        # leak that double-wrote physics_truth.jsonl in the Isaac process).
+        self.assertNotIn("self._truth_writer", source)
 
     def test_physics_truth_writer_appends_sorted_finite_json_once_per_frame(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1505,6 +1859,408 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertNotIn("filter_prim_paths_expr", backend_source)
         self.assertIn("exit_code=1 if failed else 0", run_source)
         self.assertIn("return process.wait()", cli_source)
+
+    def test_spawned_joint_drives_are_force_mode_before_articulation_init(self) -> None:
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        spawn_source = _spawn_usd_file_cfg_source(backend_source)
+        self.assertTrue(
+            spawn_source,
+            "backend must spawn Tinker through a UsdFileCfg; no spawn call found",
+        )
+        # Spawned dynamic joint drives must be force-mode before the articulation
+        # initializes, so the spawn's UsdFileCfg carries the joint-drive props.
+        self.assertIn("joint_drive_props", spawn_source)
+        self.assertIn("drive_type", spawn_source)
+        self.assertIn("force", spawn_source)
+        # The existing per-group ImplicitActuatorCfg gains remain authoritative.
+        # The arm group carries per-joint stiffness/damping tiers as dicts;
+        # head/gripper/wheels carry stiffness and damping as scalar keyword
+        # arguments.
+        self.assertIn('"joint[1-2]": 20000.0,', backend_source)
+        self.assertIn('"joint[3]": 6000.0,', backend_source)
+        self.assertIn('"joint[4]": 7000.0,', backend_source)
+        self.assertIn('"joint[5]": 6000.0,', backend_source)
+        self.assertIn('"joint[6]": 12000.0,', backend_source)
+        self.assertIn('"joint[7]": 4000.0,', backend_source)
+        self.assertIn('"joint[1-2]": 1500.0,', backend_source)
+        self.assertIn('"joint[3]": 450.0,', backend_source)
+        self.assertIn('"joint[4]": 600.0,', backend_source)
+        self.assertIn('"joint[5]": 450.0,', backend_source)
+        self.assertIn('"joint[6]": 800.0,', backend_source)
+        self.assertIn('"joint[7]": 300.0,', backend_source)
+        self.assertIn("stiffness=500.0", backend_source)
+        self.assertIn("damping=50.0", backend_source)
+        self.assertIn("stiffness=200.0", backend_source)
+        self.assertIn("damping=20.0", backend_source)
+        self.assertIn("stiffness=0.0", backend_source)
+        self.assertIn("damping=200.0", backend_source)
+
+    def test_arm_effort_limit_sim_resolves_to_seven_joint_tiers(self) -> None:
+        """RED source contract: joint4 must be raised to 50 Nm, all other tiers preserved.
+
+        A fresh-attempt live smoke (task43-force-truth-free-space-fjt) showed joint4
+        alone had RMS ~0.180 rad / peak 0.342 rad because the USD/vendor cap pinned it
+        at 30 Nm for ~72% of the action. The `arm` ImplicitActuatorCfg must therefore
+        carry an ``effort_limit_sim`` dict that resolves across joint1..joint7 to
+        [50, 50, 30, 50, 30, 20, 20] with a strict one-to-one match (exactly Isaac Lab's
+        ``resolve_matching_names_values`` semantics via ``re.fullmatch``). No specific
+        regex spelling is hard-coded; the keys only need full, non-overlapping coverage.
+        """
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(backend_source)
+
+        arm_call: ast.Call | None = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "actuators":
+                    continue
+                actuators = keyword.value
+                if not isinstance(actuators, ast.Dict):
+                    continue
+                for key, value in zip(actuators.keys, actuators.values):
+                    if isinstance(key, ast.Constant) and key.value == "arm":
+                        arm_call = value
+
+        self.assertIsNotNone(
+            arm_call,
+            "backend ArticulationCfg.actuators has no 'arm' ImplicitActuatorCfg",
+        )
+        self.assertIsInstance(
+            arm_call,
+            ast.Call,
+            "backend 'arm' actuator must be an ImplicitActuatorCfg(...) call",
+        )
+
+        effort_limit_sim = None
+        for keyword in arm_call.keywords:
+            if keyword.arg == "effort_limit_sim":
+                effort_limit_sim = keyword.value
+        self.assertIsNotNone(
+            effort_limit_sim,
+            "arm ImplicitActuatorCfg has no effort_limit_sim; joint4 stays pinned at "
+            "the inherited 30 Nm vendor cap for most of the action",
+        )
+
+        limits = ast.literal_eval(effort_limit_sim)
+        self.assertIsInstance(
+            limits,
+            dict,
+            "arm effort_limit_sim must be a per-joint dict[str, float] so joint4 can "
+            "be raised independently of its siblings",
+        )
+
+        joint_names = [f"joint{index}" for index in range(1, 8)]
+        match_counts = {name: 0 for name in joint_names}
+        resolved: dict[str, float] = {}
+        for pattern, value in limits.items():
+            self.assertIsInstance(
+                pattern,
+                str,
+                "arm effort_limit_sim keys must be joint-name regex strings",
+            )
+            compiled = re.compile(pattern)
+            for name in joint_names:
+                if compiled.fullmatch(name) is not None:
+                    match_counts[name] += 1
+                    resolved[name] = float(value)
+
+        self.assertEqual(
+            match_counts,
+            {name: 1 for name in joint_names},
+            "arm effort_limit_sim regex keys must cover each of joint1..joint7 exactly "
+            f"once; missing or multiply matched joints: {match_counts}",
+        )
+        self.assertEqual(
+            [resolved[name] for name in joint_names],
+            [100.0, 100.0, 30.0, 50.0, 30.0, 20.0, 20.0],
+            "arm effort_limit_sim must provide 100 Nm shoulder authority for the "
+            "measured 60-90 Nm grasp coupling load while preserving the elbow and "
+            "distal tiers (j3:30, j4:50, j5:30, j6-7:20)",
+        )
+
+    def test_gripper_mimic_joints_driven_and_mirrored_to_drive_joint(self) -> None:
+        """Source contract: the gripper mimic joints are actively driven and
+        mirror drive_joint 1:1.
+
+        The tinker2 gripper is a mimic linkage -- the URDF mimics all five
+        finger/knuckle joints (left_finger_joint, left_inner_knuckle_joint,
+        right_inner_knuckle_joint, right_outer_knuckle_joint, right_finger_joint)
+        to drive_joint 1:1. But the URDF->USD import DROPPED every <mimic>: in
+        robot.usd those joints carry no drive and no coupling (proven), so the
+        earlier "leave them passive" contract let drive_joint close while the
+        fingers flopped and the jaw closed straight through the object. The
+        repair restores the coupling in software: the five mimics live in a
+        distinct 'gripper_mimic' group with NON-ZERO gains, and step() mirrors
+        drive_joint's target into them each step
+        (_mirror_gripper_mimic_targets). The 'gripper' actuator still scopes to
+        drive_joint only.
+        """
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(backend_source)
+
+        actuators: ast.Dict | None = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "actuators" and isinstance(keyword.value, ast.Dict):
+                    actuators = keyword.value
+        self.assertIsNotNone(
+            actuators,
+            "backend ArticulationCfg.actuators must be a dict literal of actuator groups",
+        )
+
+        gripper_universe = {
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_finger_joint",
+        }
+        mimic_joints = frozenset(gripper_universe - {"drive_joint"})
+
+        def cfg_kwargs(cfg: ast.expr) -> dict[str, object]:
+            self.assertIsInstance(
+                cfg,
+                ast.Call,
+                "each actuator group must be an ImplicitActuatorCfg(...) call",
+            )
+            assert isinstance(cfg, ast.Call)
+            call_func = cfg.func
+            if isinstance(call_func, ast.Name):
+                self.assertEqual(
+                    call_func.id,
+                    "ImplicitActuatorCfg",
+                    "actuator groups must be implicit actuator configs",
+                )
+            kwargs: dict[str, object] = {}
+            for kw in cfg.keywords:
+                if kw.arg is None:
+                    continue
+                kwargs[kw.arg] = ast.literal_eval(kw.value)
+            return kwargs
+
+        def matched_joints(exprs: object) -> set[str]:
+            self.assertIsInstance(
+                exprs, list, "joint_names_expr must be a literal list of regex strings"
+            )
+            matched: set[str] = set()
+            for pattern in exprs:
+                self.assertIsInstance(pattern, str)
+                compiled = re.compile(pattern)
+                for name in gripper_universe:
+                    if compiled.fullmatch(name) is not None:
+                        matched.add(name)
+            return matched
+
+        groups: dict[str, dict[str, object]] = {}
+        for key, value in zip(actuators.keys, actuators.values):
+            if not isinstance(key, ast.Constant):
+                continue
+            groups[str(key.value)] = cfg_kwargs(value)
+
+        self.assertIn("gripper", groups, "backend must define a 'gripper' actuator group")
+        gripper = groups["gripper"]
+        gripper_matched = matched_joints(gripper.get("joint_names_expr"))
+        self.assertEqual(
+            gripper_matched,
+            {"drive_joint"},
+            "the 'gripper' actuator must actively drive only drive_joint; it currently "
+            f"also claims {sorted(gripper_matched - {'drive_joint'})}",
+        )
+        gripper_stiffness = gripper.get("stiffness")
+        self.assertIsNotNone(
+            gripper_stiffness,
+            "the 'gripper' actuator must carry an explicit non-zero stiffness",
+        )
+        self.assertNotEqual(
+            float(gripper_stiffness),  # type: ignore[arg-type]
+            0.0,
+            "the 'gripper' actuator must keep a non-zero stiffness to actively drive drive_joint",
+        )
+
+        driven = [
+            (name, cfg)
+            for name, cfg in groups.items()
+            if matched_joints(cfg.get("joint_names_expr")) == set(mimic_joints)
+        ]
+        self.assertTrue(
+            driven,
+            "no actuator group claims exactly the five mimic joints "
+            f"{sorted(mimic_joints)}; they must live in a distinct group",
+        )
+        for name, cfg in driven:
+            self.assertNotEqual(
+                float(cfg.get("stiffness", 0.0)),  # type: ignore[arg-type]
+                0.0,
+                f"mimic group {name!r} must be actively driven (non-zero "
+                "stiffness): robot.usd dropped the URDF mimic coupling, so a "
+                "passive group leaves the fingers flopping and the jaw closes "
+                "through the object",
+            )
+
+        # The coupling the USD dropped is restored in software: step() must
+        # mirror drive_joint's MEASURED angle into the five mimic joints so
+        # they track the master 1:1 (URDF mimic semantics; see the behavioral
+        # test below).
+        self.assertIn(
+            "_mirror_gripper_mimic_targets",
+            backend_source,
+            "backend must mirror drive_joint's measured angle into the mimic joints",
+        )
+        for joint in mimic_joints:
+            self.assertIn(
+                joint,
+                backend_source,
+                f"the gripper mimic mirror must reference {joint}",
+            )
+
+    def test_gripper_mimic_followers_track_measured_drive_angle(self) -> None:
+        """URDF ``<mimic joint="drive_joint" multiplier="1">`` means
+        ``q_follower = q_drive`` -- the driving joint's ACTUAL angle. The real
+        xArm gripper is one motor plus gear-coupled, parallelogram fingers, so
+        a blocked drive knuckle stops the whole linkage.
+
+        Mirroring the COMMANDED target instead breaks that the moment the
+        object blocks the drive: the five followers keep chasing the far
+        target as independent k=1500 motors -- the right knuckle over-runs
+        the stalled left one and shoves the object into the weak pad, and the
+        finger joints curl the pads about the finger axis (measured in-process:
+        drive stalled at 0.43 rad while the pads ran to 0.845, 25 N vs 5 N
+        pads, the object tilted 12 deg; the grasp bench's "pads close through
+        to 0.728, 18 mm past the knife"). With the measured-angle mirror the
+        same closes pinch symmetrically and retain through a lift.
+        """
+        names = (
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_finger_joint",
+            "right_inner_knuckle_joint",
+            "joint1",
+        )
+        backend = object.__new__(IsaacWholeRobotBackend)
+        backend._torch = torch
+        backend.dt = 1.0 / 120.0
+        backend._drive_joint_index = 0
+        backend._gripper_mimic_indices = (1, 2, 3, 4, 5)
+        # Drive blocked by the object at 0.43 rad, still pushing at 1.2 rad/s
+        # commanded slew; the command target sits far ahead at 0.85.
+        backend._robot = SimpleNamespace(
+            data=SimpleNamespace(
+                joint_names=names,
+                joint_pos=torch.tensor([[0.43, 0.6, 0.6, 0.6, 0.6, 0.6, 0.0]], dtype=torch.float32),
+                joint_vel=torch.tensor([[1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+            )
+        )
+        backend._position_targets = torch.tensor(
+            [[0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.0]], dtype=torch.float32
+        )
+        backend._mirror_gripper_mimic_targets()
+        expected = 0.43 + 1.2 / 120.0  # measured angle + one control step of feed-forward
+        for index in backend._gripper_mimic_indices:
+            self.assertAlmostEqual(
+                float(backend._position_targets[0, index]),
+                expected,
+                places=6,
+                msg=f"follower {names[index]} must track the drive's measured angle, not its 0.85 target",
+            )
+        # The drive's own target is untouched (the master keeps its command).
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.85, places=6)
+        # At stall (zero drive velocity) the followers hold exactly the drive angle.
+        backend._robot.data.joint_vel[0, 0] = 0.0
+        backend._mirror_gripper_mimic_targets()
+        for index in backend._gripper_mimic_indices:
+            self.assertAlmostEqual(float(backend._position_targets[0, index]), 0.43, places=6)
+
+    def test_gripper_lead_clamp_defaults_off_with_measured_mirror(self) -> None:
+        """With mimic-correct followers the press is bounded by drive_joint's
+        effort limit, and the stall-gated lead clamp self-locks the close into
+        a 0.1 rad/s crawl (pads trail the drive by one step, so pad speed sits
+        at the gate). It must default OFF; the env knob keeps it available."""
+        backend_source = (ROOT / "simulation/tinker_sim_isaac/backend.py").read_text(encoding="utf-8")
+        self.assertRegex(backend_source, r"self\._gripper_max_lead = 0\.0\s*\n")
+        self.assertNotRegex(backend_source, r"self\._gripper_max_lead = 0\.015")
+        self.assertIn("TINKER_SIM_GRIPPER_MAX_LEAD_RAD", backend_source)
+
+    def test_set_entity_pose_physics_writes_transform_and_velocity(self) -> None:
+        """A physics-effective park write pushes the world pose + zeroed twist
+        into a cached rigid-body view as WARP arrays (the PhysxManager view's
+        frontend), in xyzw order (no reorder), reusing the cached view."""
+        import warp as wp
+
+        class _RecordingView:
+            count = 1
+
+            def __init__(self) -> None:
+                self.transforms = None
+                self.velocities = None
+
+            def get_transforms(self):
+                # The method reads .device off this to place the warp arrays.
+                return SimpleNamespace(device="cpu")
+
+            def set_transforms(self, data, indices) -> None:
+                self.transforms = data
+                self.transform_indices = indices
+
+            def set_velocities(self, data, indices) -> None:
+                self.velocities = data
+
+        backend = object.__new__(IsaacWholeRobotBackend)
+        backend._torch = torch
+        backend._robot = SimpleNamespace(device="cpu")
+        view = _RecordingView()
+        path = "/World/Scenario/bench_bottle_100"
+        backend._park_views = {path: view}
+
+        ok = backend.set_entity_pose_physics(
+            path,
+            position=[1.0, 2.0, 0.05],
+            quaternion_xyzw=[0.0, 0.0, 0.3826834, 0.9238795],  # yaw 45 deg, xyzw
+            linear_velocity=[0.0, 0.0, 0.0],
+            angular_velocity=[0.0, 0.0, 0.0],
+        )
+        self.assertTrue(ok)
+        # Warp arrays, required by the warp frontend (torch/numpy dtypes rejected).
+        self.assertIsInstance(view.transforms, wp.array)
+        self.assertIsInstance(view.transform_indices, wp.array)
+        row = view.transforms.numpy()[0].tolist()
+        self.assertEqual([round(v, 4) for v in row[:3]], [1.0, 2.0, 0.05])
+        self.assertEqual(
+            [round(v, 5) for v in row[3:7]], [0.0, 0.0, 0.38268, 0.92388]
+        )
+        vel = view.velocities.numpy()[0].tolist()
+        self.assertEqual([round(v, 4) for v in vel], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertIs(backend._park_views[path], view)
+
+    def test_set_entity_pose_physics_false_without_resolvable_view(self) -> None:
+        """No cached view and no live PhysX (unit env) -> graceful False."""
+        backend = object.__new__(IsaacWholeRobotBackend)
+        backend._torch = torch
+        backend._robot = SimpleNamespace(device="cpu")
+        backend._park_views = {}
+        self.assertFalse(
+            backend.set_entity_pose_physics(
+                "/World/Scenario/missing", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]
+            )
+        )
 
 
 if __name__ == "__main__":

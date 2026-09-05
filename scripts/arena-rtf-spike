@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Phase 0 RTF spike: six sim-only variants, 120 s sim each, profile on.
+# Usage: scripts/arena-rtf-spike [OUTDIR]   (default: outputs/rtf-spike-<date>)
+# Prints a Markdown table; raw logs stay in OUTDIR.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT="${1:-$ROOT/outputs/rtf-spike-$(date +%Y%m%d-%H%M)}"
+mkdir -p "$OUT"
+cd "$ROOT"
+set -a; source .deployment.env; set +a
+unset PYTHONPATH AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH ROS_PACKAGE_PATH LD_LIBRARY_PATH
+export ROS_DOMAIN_ID=42 CUDA_VISIBLE_DEVICES="${SIM_GPU:-1}"
+export TINKER_SIM_PROFILE=1 TINKER_SIM_PROFILE_EVERY=10
+export TINKER_SIM_CAMERA_HZ=12 TINKER_SIM_CONTROL_HZ=60 TINKER_SIM_HEAD_CAMERA_AIM=level-forward
+
+run_variant() {  # label, then env assignments
+  local label="$1"; shift
+  echo "== $label ==" >&2
+  env "$@" ./scripts/tinker-sim launch \
+    --sensor-profile sensor-rich --scenario gpsr-rcw2026-bench --seed 0 \
+    --arena rcw2026 --spawn-xy=-2.0,-2.0 --ros --headless --duration 120 \
+    > "$OUT/$label.log" 2>&1 || echo "variant $label exited $?" >&2
+  sleep 5   # let the GPU context drain before the next variant
+}
+
+run_variant A_arena_off       TINKER_SIM_ARENA_CAMERA=0
+run_variant B_arena_2hz       TINKER_SIM_ARENA_CAMERA=1 TINKER_SIM_ARENA_CAMERA_HZ=2
+run_variant C_capture_skip    TINKER_SIM_ARENA_CAMERA=1 TINKER_SIM_ARENA_CAMERA_HZ=2 TINKER_SIM_CAPTURE_SKIP=arena_camera
+run_variant D_dlaa_only       TINKER_SIM_ARENA_CAMERA=0 TINKER_SIM_STABLE_AA=1
+run_variant E_arena_640       TINKER_SIM_ARENA_CAMERA=1 TINKER_SIM_ARENA_CAMERA_HZ=2 TINKER_SIM_ARENA_CAMERA_SIZE=640x360
+run_variant F_arena_0p5hz     TINKER_SIM_ARENA_CAMERA=1 TINKER_SIM_ARENA_CAMERA_HZ=0.5
+
+echo "| variant | windows | kit_pump ms | cameras ms | physics ms | wall ms | RTF |"
+echo "|---|---|---|---|---|---|---|"
+for f in "$OUT"/*.log; do
+  python3 tools/step_profile_summary.py "$(basename "$f" .log)" "$f" --skip-first-s 30
+done
