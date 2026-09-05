@@ -252,11 +252,73 @@ def resolve_current_artifact(project_root: Path) -> ArtifactResolution:
     raise RuntimeError("current artifact pointer schema is unsupported")
 
 
+def scenario_arena_id(scenario_data: object) -> str | None:
+    """Return the arena id a scenario's ``world`` block names, if any."""
+    if not isinstance(scenario_data, dict):
+        return None
+    world = scenario_data.get("world")
+    if not isinstance(world, dict):
+        return None
+    arena = world.get("arena")
+    if not isinstance(arena, str) or not arena.strip():
+        return None
+    return arena.strip()
+
+
+def resolve_arena_map_yaml(project_root: Path, arena_id: str) -> Path:
+    """Resolve ``artifacts/arena/<arena_id>/<current>/map.yaml``.
+
+    Mirrors ``validation/run_sim.py``'s ``resolve_arena_artifact``: the
+    ``current.json`` pointer names the selected manifest, and the map is
+    colocated with it.  This is the map the simulator raycasts its synthetic
+    lidar against, so it is the only map AMCL can localize on when the
+    simulator runs with ``--arena``; the robot artifact's own ``map.yaml`` is
+    the hardware arena and shares no occupied cell with it.
+    """
+    if not arena_id or "/" in arena_id or "\\" in arena_id or arena_id in {".", ".."}:
+        raise RuntimeError(f"unsafe arena id: {arena_id!r}")
+    pointer = Path(project_root) / "artifacts" / "arena" / arena_id / "current.json"
+    if not pointer.is_file():
+        raise RuntimeError(f"arena artifact pointer does not exist: {pointer}")
+    current = json.loads(pointer.read_text(encoding="utf-8"))
+    manifest_value = current.get("manifest") if isinstance(current, dict) else None
+    if not isinstance(manifest_value, str) or not manifest_value:
+        raise RuntimeError(f"arena artifact pointer has no manifest: {pointer}")
+    manifest = Path(manifest_value)
+    if not manifest.is_absolute():
+        manifest = Path(project_root) / manifest
+    map_yaml = manifest.parent / "map.yaml"
+    if not map_yaml.is_file():
+        raise RuntimeError(f"arena artifact missing map.yaml: {map_yaml}")
+    return map_yaml
+
+
 def topic_control_description(urdf: str | bytes) -> str:
     raw = urdf.decode("utf-8") if isinstance(urdf, bytes) else urdf
     root = ET.fromstring(raw)
     for existing in list(root.findall("ros2_control")):
         root.remove(existing)
+    # Strip the URDF's world fixture (<link name="world"/> plus the fixed
+    # world -> base_link joint). It exists for offline model tooling, but
+    # fed to robot_state_publisher it publishes a STATIC identity
+    # world->base_link TF — giving base_link a SECOND parent besides the
+    # real odom->base_link. With gpsr.launch's static world->map, TF
+    # lookups that resolve through the static chain pin the robot at the
+    # map origin: the costmap obstacle layer then inserts every lidar
+    # scan as if the robot stood at (0,0,0), fabricating phantom walls
+    # and erasing real ones (2026-08-28 doorway-wedge root cause — four
+    # controller/costmap tuning rounds were no-ops against it). Runtime
+    # consumers that want a world anchor still get one via
+    # world->map->odom->base_link.
+    for joint in list(root.findall("joint")):
+        parent = joint.find("parent")
+        if joint.get("name") == "world_joint" or (
+            parent is not None and parent.get("link") == "world"
+        ):
+            root.remove(joint)
+    for link in list(root.findall("link")):
+        if link.get("name") == "world":
+            root.remove(link)
     control = ET.SubElement(root, "ros2_control", name="TinkerTopicSystem", type="system")
     hardware = ET.SubElement(control, "hardware")
     ET.SubElement(hardware, "plugin").text = "topic_based_ros2_control/TopicBasedSystem"

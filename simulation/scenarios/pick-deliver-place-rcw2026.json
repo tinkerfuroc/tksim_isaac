@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "id": "pick-deliver-place-rcw2026",
+  "world": {"mode": "arena", "arena": "rcw2026"},
+  "robot": {"id": "tinker2", "initial_pose": [-2.0, -2.0, 0.0]},
+  "actors": [],
+  "objects": [
+    {
+      "id": "delivery_object",
+      "asset_uri": "simulation/assets/primitives/task-object.usda",
+      "pose": {"xyz": [2.587, -3.058, 0.734], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]}
+    }
+  ],
+  "regions": [{"id": "delivery_target", "center": [0.43, 1.755, 0.61], "radius": 0.15}],
+  "events": [],
+  "dialogue": [],
+  "postconditions": [
+    {
+      "name": "correct object in target region",
+      "path": "delivery.object_in_target",
+      "operator": "equals",
+      "value": true
+    },
+    {
+      "name": "object released",
+      "path": "delivery.retained_by_gripper",
+      "operator": "equals",
+      "value": false
+    },
+    {
+      "name": "placement stable",
+      "path": "delivery.object_speed",
+      "operator": "less_than_or_equal",
+      "value": 0.02
+    },
+    {
+      "name": "no safety stop",
+      "path": "robot.safety_stop",
+      "operator": "equals",
+      "value": false
+    }
+  ]
+}

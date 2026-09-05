@@ -442,14 +442,55 @@ class ManipulationGateExecutorTest(unittest.TestCase):
                 + '{"timestamp": 10.0, "frame_index": 2',
                 encoding="utf-8",
             )
-            with self.assertRaises(RuntimeError):
-                executor._truth_contact_sides()
+            # A valid complete line followed by a partial append fragment is the
+            # mid-append case: the reader discards only the fragment and returns
+            # the last complete record.
+            self.assertEqual(executor._truth_contact_sides(), (False, False))
             executor.physics_truth_path.write_text(
                 json.dumps({"timestamp": 9.0, "frame_index": 1, "contacts": []}) + "\n",
                 encoding="utf-8",
             )
             with self.assertRaises(RuntimeError):
                 executor._truth_contact_sides()
+
+    def test_latest_physics_truth_returns_last_complete_record_before_partial_append(self) -> None:
+        """The reader must return the last complete nonblank JSONL record when
+        the file currently ends with an incomplete append fragment (no trailing
+        newline), instead of rejecting the file on the trailing fragment."""
+        executor = object.__new__(gate_executor.RosGateExecutor)
+        with tempfile.TemporaryDirectory() as directory:
+            executor.physics_truth_path = Path(directory) / "physics_truth.jsonl"
+            executor.clock = 10.0
+            executor.config = {"physics": {"hz": 120.0}}
+            complete = {
+                "timestamp": 10.0,
+                "frame_index": 7,
+                "contacts": [
+                    {"body_a": "left_finger_link", "body_b": "qualification_cube"},
+                    {"body_a": "right_finger_link", "body_b": "qualification_cube"},
+                ],
+                "objects": [{"id": "qualification_cube", "pose": {"xyz": [0.1, 0.2, 0.3]}}],
+            }
+            # A full record followed by a truncated append fragment: the writer
+            # is mid-append, so the file ends without a trailing newline.
+            executor.physics_truth_path.write_bytes(
+                json.dumps(complete).encode("utf-8") + b"\n" + b'{"timestamp": 10.0, "frame_index": 8'
+            )
+            truth = executor._latest_physics_truth()
+            self.assertEqual(truth["frame_index"], 7)
+            self.assertEqual(truth["timestamp"], 10.0)
+
+    def test_latest_physics_truth_fails_closed_when_only_partial_fragment_remains(self) -> None:
+        """When no complete valid record exists (only a truncated fragment), the
+        reader must still fail closed instead of synthesizing evidence."""
+        executor = object.__new__(gate_executor.RosGateExecutor)
+        with tempfile.TemporaryDirectory() as directory:
+            executor.physics_truth_path = Path(directory) / "physics_truth.jsonl"
+            executor.clock = 10.0
+            executor.config = {"physics": {"hz": 120.0}}
+            executor.physics_truth_path.write_bytes(b'{"timestamp": 10.0, "frame_index": 3')
+            with self.assertRaises(RuntimeError):
+                executor._latest_physics_truth()
 
     def test_ros_executor_has_no_raw_truth_subscription(self) -> None:
         source = inspect.getsource(gate_executor.RosGateExecutor.__init__)

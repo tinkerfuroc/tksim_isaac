@@ -75,6 +75,10 @@ _PHASE_FAILED = "failed"
 _SOLID_PRIMITIVE_TYPE = {"box": 1, "sphere": 2, "cylinder": 3}
 _SERVICE_TTL_S = 30.0
 _SERVICE_TIMEOUT_S = 5.0
+# The planning-scene services (/get_planning_scene, /apply_planning_scene) are
+# served by MoveGroup while it is still initializing; an in-flight request must
+# survive the full MoveGroup startup delay (20.0 s) before the node fails closed.
+_PLANNING_SCENE_SERVICE_TIMEOUT_S = 20.0
 
 
 def _pose_from_seven(pose7: Sequence[float]) -> Pose:
@@ -315,6 +319,37 @@ class FixturePlanningScene(Node):
     def _past_start_deadline(self, now_s: float) -> bool:
         return now_s - self._phase_started_at > self._start_deadline_s
 
+    def _fail_on_hard_error(
+        self, state: dict[str, object], reason_prefix: str
+    ) -> bool:
+        """Fail on a hard service error, but retry transient *timeouts*.
+
+        A planning-scene service *timeout* means the server did not answer in
+        time — in the live cold start the response is DROPPED server-side
+        (move_group ``failed to send response ... timeout``), so the client
+        never receives it and a fresh request succeeds a moment later.  Treating
+        that timeout as fatal tore down the whole Humble stack (joint scenario
+        2026-08-07).  Timeouts are therefore cleared and retried on the next
+        tick within the per-phase deadline; only hard errors (call exception,
+        malformed response) fail closed immediately.
+
+        Returns True when the caller must stop (hard error or deadline).
+        """
+        error = state.get("error")
+        if error is not None:
+            if "timed out" in str(error):
+                self.get_logger().warning(
+                    "{}: planning-scene service timed out; retrying: {}".format(
+                        reason_prefix, error
+                    )
+                )
+                state["error"] = None
+                # step_service already reset the client; next tick re-creates it.
+            else:
+                self._fail("{}: {}".format(reason_prefix, error))
+                return True
+        return False
+
     # ------------------------------------------------------------------
     # State machine tick
     # ------------------------------------------------------------------
@@ -358,7 +393,14 @@ class FixturePlanningScene(Node):
             oid = str(getattr(obj, "id", "") or "")
             if oid.startswith(FIXTURE_NAMESPACE_PREFIX):
                 try:
-                    geometry = readback_geometry(obj)
+                    planning_scene = getattr(self, "_planning_scene", {})
+                    canonical_frame_id = planning_scene.get("frame_id")
+                    geometry = readback_geometry(
+                        obj,
+                        canonical_frame_id=(
+                            str(canonical_frame_id) if canonical_frame_id else None
+                        ),
+                    )
                 except FixtureContractError as exc:
                     raise FixtureContractError(
                         "malformed readback collision object: {}".format(exc)
@@ -398,7 +440,7 @@ class FixturePlanningScene(Node):
                 reset_client=reset_client,
                 now_s=now_s,
                 ttl_s=_SERVICE_TTL_S,
-                timeout_s=_SERVICE_TIMEOUT_S,
+                timeout_s=_PLANNING_SCENE_SERVICE_TIMEOUT_S,
             )
 
         return step
@@ -457,16 +499,18 @@ class FixturePlanningScene(Node):
     # ------------------------------------------------------------------
 
     def _advance_discover(self, now_s: float) -> None:
-        if self._discover_state.get("error"):
-            self._fail(str(self._discover_state["error"]))
+        if self._fail_on_hard_error(
+            self._discover_state, "discover existing fixtures"
+        ):
             return
         if self._past_start_deadline(now_s):
             self._fail("timed out discovering the existing planning scene")
             return
         step = self._make_get_service(self._discover_state)
         step(now_s)
-        if self._discover_state.get("error"):
-            self._fail(str(self._discover_state["error"]))
+        if self._fail_on_hard_error(
+            self._discover_state, "discover existing fixtures"
+        ):
             return
         if self._discover_state.get("succeeded"):
             existing = tuple(
@@ -501,8 +545,7 @@ class FixturePlanningScene(Node):
         return request
 
     def _advance_apply(self, now_s: float) -> None:
-        if self._apply_state.get("error"):
-            self._fail(str(self._apply_state["error"]))
+        if self._fail_on_hard_error(self._apply_state, "apply fixture scene"):
             return
         if self._past_start_deadline(now_s):
             self._fail("timed out applying the fixture planning scene")
@@ -546,10 +589,9 @@ class FixturePlanningScene(Node):
             reset_client=reset_client,
             now_s=now_s,
             ttl_s=_SERVICE_TTL_S,
-            timeout_s=_SERVICE_TIMEOUT_S,
+            timeout_s=_PLANNING_SCENE_SERVICE_TIMEOUT_S,
         )
-        if self._apply_state.get("error"):
-            self._fail(str(self._apply_state["error"]))
+        if self._fail_on_hard_error(self._apply_state, "apply fixture scene"):
             return
         if self._apply_state.get("succeeded"):
             self._phase = _PHASE_READBACK
@@ -561,16 +603,14 @@ class FixturePlanningScene(Node):
     # ------------------------------------------------------------------
 
     def _advance_readback(self, now_s: float) -> None:
-        if self._readback_state.get("error"):
-            self._fail(str(self._readback_state["error"]))
+        if self._fail_on_hard_error(self._readback_state, "read back fixture scene"):
             return
         if self._past_start_deadline(now_s):
             self._fail("timed out reading back the fixture planning scene")
             return
         step = self._make_get_service(self._readback_state)
         step(now_s)
-        if self._readback_state.get("error"):
-            self._fail(str(self._readback_state["error"]))
+        if self._fail_on_hard_error(self._readback_state, "read back fixture scene"):
             return
         if self._readback_state.get("succeeded"):
             self._scene_objects = tuple(

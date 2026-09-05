@@ -157,12 +157,43 @@ def spec_geometry(
     }
 
 
-def readback_geometry(obj) -> Mapping[str, object]:
+def _compose_pose(parent: Sequence[float], child: Sequence[float]) -> list[float]:
+    """Compose canonical ``parent * child`` poses without ROS dependencies."""
+    px, py, pz, qx, qy, qz, qw = (float(value) for value in parent)
+    cx, cy, cz, rx, ry, rz, rw = (float(value) for value in child)
+
+    # Rotate the child translation by the parent quaternion.
+    uvx = qy * cz - qz * cy
+    uvy = qz * cx - qx * cz
+    uvz = qx * cy - qy * cx
+    uuvx = qy * uvz - qz * uvy
+    uuvy = qz * uvx - qx * uvz
+    uuvz = qx * uvy - qy * uvx
+    tx = cx + 2.0 * (qw * uvx + uuvx)
+    ty = cy + 2.0 * (qw * uvy + uuvy)
+    tz = cz + 2.0 * (qw * uvz + uuvz)
+
+    return [
+        _quant(px + tx),
+        _quant(py + ty),
+        _quant(pz + tz),
+        _quant(qw * rx + qx * rw + qy * rz - qz * ry),
+        _quant(qw * ry - qx * rz + qy * rw + qz * rx),
+        _quant(qw * rz + qx * ry - qy * rx + qz * rw),
+        _quant(qw * rw - qx * rx - qy * ry - qz * rz),
+    ]
+
+
+def readback_geometry(
+    obj, *, canonical_frame_id: str | None = None
+) -> Mapping[str, object]:
     """Return the canonical ROS-free geometry descriptor for a readback object.
 
-    *obj* is a ``moveit_msgs/CollisionObject`` message; the function reads only
-    attributes (id, header.frame_id, primitives, primitive_poses, meshes,
-    mesh_poses) so this module stays import-time ROS-free.
+    MoveIt may canonicalize an object into its root ``world`` frame and move the
+    object's transform into ``CollisionObject.pose``, leaving shape poses local.
+    The returned descriptor composes those poses.  When *canonical_frame_id* is
+    provided, only MoveIt's root ``world`` alias is rewritten; arbitrary frame
+    changes remain visible and fail geometry comparison.
     """
     oid = str(getattr(obj, "id", ""))
     if not oid:
@@ -172,6 +203,16 @@ def readback_geometry(obj) -> Mapping[str, object]:
         raise FixtureContractError(
             "readback collision object {!r} has an empty frame_id".format(oid)
         )
+    if canonical_frame_id is not None and frame_id == "world":
+        frame_id = str(canonical_frame_id)
+        if not frame_id:
+            raise FixtureContractError("canonical_frame_id must not be empty")
+    object_pose_msg = getattr(obj, "pose", None)
+    object_pose = (
+        _pose_readback(object_pose_msg)
+        if object_pose_msg is not None
+        else [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    )
     primitives: list[dict[str, object]] = []
     for primitive in getattr(obj, "primitives", ()) or ():
         primitive_type = int(getattr(primitive, "type", -1))
@@ -211,12 +252,13 @@ def readback_geometry(obj) -> Mapping[str, object]:
         "frame_id": frame_id,
         "primitives": primitives,
         "primitive_poses": [
-            _pose_readback(pose)
+            _compose_pose(object_pose, _pose_readback(pose))
             for pose in getattr(obj, "primitive_poses", ()) or ()
         ],
         "meshes": meshes,
         "mesh_poses": [
-            _pose_readback(pose) for pose in getattr(obj, "mesh_poses", ()) or ()
+            _compose_pose(object_pose, _pose_readback(pose))
+            for pose in getattr(obj, "mesh_poses", ()) or ()
         ],
     }
 

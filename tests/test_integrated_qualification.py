@@ -15,6 +15,7 @@ Isaac/ROS graph.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -120,7 +121,6 @@ class IntegratedRunnerDouble:
     qualification_scenario_names = [
         "qualification-moveit-plan-joint",
         "qualification-moveit-plan-pose",
-        "qualification-moveit-plan-blocked",
         "qualification-moveit-execute-joint",
         "qualification-moveit-execute-pose",
         "qualification-moveit-cartesian-retreat",
@@ -221,13 +221,12 @@ def test_every_live_scenario_gets_unique_domain_and_attempt_dir(integrated_runne
     assert all(path.name in path.as_posix() for path in attempt_dirs)
 
 
-def test_exactly_seventeen_unique_scenarios_are_declared(integrated_runner):
-    assert len(integrated_runner.qualification_scenario_names) == 17
-    assert len(set(integrated_runner.qualification_scenario_names)) == 17
+def test_exactly_sixteen_unique_scenarios_are_declared(integrated_runner):
+    assert len(integrated_runner.qualification_scenario_names) == 16
+    assert len(set(integrated_runner.qualification_scenario_names)) == 16
     assert integrated_runner.qualification_scenario_names == [
         "qualification-moveit-plan-joint",
         "qualification-moveit-plan-pose",
-        "qualification-moveit-plan-blocked",
         "qualification-moveit-execute-joint",
         "qualification-moveit-execute-pose",
         "qualification-moveit-cartesian-retreat",
@@ -290,7 +289,7 @@ def test_real_runner_constants_match_double():
         IntegratedRunner.qualification_scenario_names
         == IntegratedRunnerDouble.qualification_scenario_names
     )
-    assert len(set(IntegratedRunner.qualification_scenario_names)) == 17
+    assert len(set(IntegratedRunner.qualification_scenario_names)) == 16
 
 
 def test_real_allocate_live_attempts_are_unique_and_bounded():
@@ -674,6 +673,8 @@ def test_real_shutdown_appended_frames_are_verified_after_final_frame():
         runner, "_verify_attempt", side_effect=fake_verify
     ), patch.object(
         iq, "qualification_stop_process", side_effect=appending_stop
+    ), patch.object(
+        iq.QualificationRunner, "_start_rosbag", return_value=True
     ):
         result = runner._execute_scenario(allocation, SCENARIO_C, "C")
 
@@ -749,6 +750,40 @@ def test_real_source_lock_fail_is_evidence_invalid():
     )
     result = runner.run_stage("B")
     assert result["status"] == STATUS_EVIDENCE_INVALID
+
+
+def test_real_default_production_root_matches_committed_policy():
+    """The default production root is the committed package-repository path
+    resolved into the real source-lock policy, and Gate B passes that exact
+    resolved path as ``--production-root`` to the manifest producer."""
+    runner = IntegratedRunner(attempt_root=Path(_tmp()))
+    policy_path = runner.production_root / "integration/source-locks.json"
+    assert policy_path.is_file()
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    resolved_root = Path(policy["root"]).resolve()
+    assert runner.production_root == resolved_root
+
+    seam_dir = Path(_tmp())
+    attempt_start = seam_dir / "attempt-start.json"
+    attempt_start.write_text(
+        json.dumps({"schema_version": 1, "attempt_id": "seam"}), encoding="utf-8"
+    )
+    captured: list[list[str]] = []
+
+    def fake_command_runner(command, **kwargs):
+        captured.append(list(command))
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    runner._command_runner = fake_command_runner
+    _path, evidence = runner._invoke_source_lock_manifest(
+        attempt_start, seam_dir / "source-lock-manifest.json"
+    )
+    # The future qualification lock is absent, so the producer fails closed;
+    # the regression is that the resolved package-repository path reaches it.
+    assert evidence["status"] == STATUS_EVIDENCE_INVALID
+    assert len(captured) == 1
+    production_flag = captured[0].index("--production-root")
+    assert captured[0][production_flag + 1] == str(resolved_root)
 
 
 def test_real_static_contract_producer_exit_zero_without_output_is_invalid():
@@ -1025,8 +1060,8 @@ def test_real_terminal_cross_binds_reject_wrong_identity():
 
 
 def test_real_executor_launches_after_physics_ready_with_exact_wiring():
-    """F2.3: the executor driver launches as a third child only after canonical
-    PHYSICS_READY, with the exact source-run command and ros-tooling env."""
+    """F2.3: the executor driver launches after the rosbag recorder only after
+    canonical PHYSICS_READY, with the exact source-run command and ros-tooling env."""
     order: list[str] = []
 
     def on_start(name, command, env):
@@ -1046,18 +1081,26 @@ def test_real_executor_launches_after_physics_ready_with_exact_wiring():
     def fake_verify(attempt_dir, name, stage):
         return {"status": "verified-pass", "scenario": name}
 
+    def fake_start_rosbag(scenario_runner, manifest):
+        iq.qualification_start_process(
+            scenario_runner, "rosbag", ["ros2", "bag", "record"], manifest
+        )
+        return True
+
     with patch.object(runner, "_wait_for_physics_ready", side_effect=fake_ready), patch.object(
         runner, "_wait_for_scenario_terminal", side_effect=fake_terminal
-    ), patch.object(runner, "_verify_attempt", side_effect=fake_verify):
+    ), patch.object(runner, "_verify_attempt", side_effect=fake_verify), patch.object(
+        iq.QualificationRunner, "_start_rosbag", new=fake_start_rosbag
+    ):
         result = runner._execute_scenario(allocation, SCENARIO_C, "C")
 
     # Launch-after-readiness ordering: isaac + humble first, PHYSICS_READY
-    # validated, only then the executor.
-    assert order == ["start:isaac", "start:humble", "physics-ready", "start:executor"]
-    assert len(popen.calls) == 3
-    assert [call["name"] for call in popen.calls] == ["isaac", "humble", "executor"]
+    # validated, the rosbag recorder next, and only then the executor.
+    assert order == ["start:isaac", "start:humble", "physics-ready", "start:rosbag", "start:executor"]
+    assert len(popen.calls) == 4
+    assert [call["name"] for call in popen.calls] == ["isaac", "humble", "rosbag", "executor"]
 
-    executor_call = popen.calls[2]
+    executor_call = popen.calls[3]
     command = executor_call["command"]
     assert command[0] == "/usr/bin/python3"
     assert command[1].endswith("validation/integrated_gate_executor_driver.py")
@@ -1261,13 +1304,23 @@ def test_real_finalize_phase_exception_does_not_skip_next_scenario(inject_at):
             raise RuntimeError("settle boom")
 
     def fake_ready(attempt_dir, name, *, manifest=None):
-        # The first scenario reaches canonical PHYSICS_READY so its executor
-        # driver is actually launched as a third child (this is what makes the
-        # executor-stop injection reachable and exercises the full F2.3 path);
-        # later scenarios are left to fail readiness and never launch.
+        # The first scenario reaches canonical PHYSICS_READY so its rosbag
+        # recorder is registered and the executor driver then launches as the
+        # fourth owned child (this is what makes the executor-stop injection
+        # reachable and exercises the full F2.3 path); later scenarios are left
+        # to fail readiness and never launch.
         if Path(attempt_dir) == first_dir["dir"]:
             return True, {"ready": True}, None
         return False, {}, "physics-ready timeout"
+
+    def fake_start_rosbag(scenario_runner, manifest):
+        # Register a real rosbag-owned child so the executor (which launches
+        # only after a successful recorder start) is genuinely started and the
+        # executor-stop injection below is reachable.
+        iq.qualification_start_process(
+            scenario_runner, "rosbag", ["ros2", "bag", "record"], manifest
+        )
+        return True
 
     with patch.object(iq, "qualification_start_process", side_effect=recording_start), patch.object(
         iq, "qualification_stop_process", side_effect=stop
@@ -1275,14 +1328,16 @@ def test_real_finalize_phase_exception_does_not_skip_next_scenario(inject_at):
         iq, "qualification_attempt_processes", side_effect=orphans
     ), patch.object(iq, "qualification_write_resource_evidence", side_effect=resource), patch.object(
         iq, "qualification_settle_evidence_files", side_effect=settle
-    ), patch.object(runner, "_wait_for_physics_ready", side_effect=fake_ready):
+    ), patch.object(iq.QualificationRunner, "_start_rosbag", new=fake_start_rosbag), patch.object(
+        runner, "_wait_for_physics_ready", side_effect=fake_ready
+    ):
         result = runner._run_scenario_stage("C")
 
     names = runner._stage_scenarios("C")
     assert result["scenario_names"] == names
     # Every scenario was attempted; none was skipped.
     assert runner.started_scenarios == names
-    assert len(result["scenario_names"]) == 3
+    assert len(result["scenario_names"]) == 2
     # The first scenario is evidence-invalid and records the injected phase.
     first = result[names[0]]
     assert first["status"] == STATUS_EVIDENCE_INVALID
@@ -1293,3 +1348,1150 @@ def test_real_finalize_phase_exception_does_not_skip_next_scenario(inject_at):
     # Process store and GPU baselines are fully cleared.
     assert runner._scenario_manifest_store == {}
     assert runner._gpu_baselines == {}
+
+
+# --------------------------------------------------------------------------- #
+# Task 8 fix round 3 — telemetry-transmitter orphan classification
+# --------------------------------------------------------------------------- #
+
+TRANSMITTER_ORPHAN = {
+    "pid": 900_001,
+    "ppid": 1,
+    "pgid": 900_001,
+    "cmdline": "/isaac/omni.telemetry.transmitter --detached",
+}
+UNEXPECTED_ORPHAN = {
+    "pid": 900_002,
+    "ppid": 1,
+    "pgid": 900_002,
+    "cmdline": "escaped-helper",
+}
+
+
+def test_real_transient_telemetry_orphan_does_not_demote_finalize():
+    """A telemetry transmitter observed in the raw orphan scan but terminating
+    during cleanup must not demote an otherwise valid integrated attempt."""
+    popen = FakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+    scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+    baseline = runner._gpu_baselines[allocation.attempt_dir]
+
+    scans = iter([[TRANSMITTER_ORPHAN], []])
+
+    def fake_attempt_processes(rnr):
+        value = next(scans, [])
+        return [dict(record) for record in value]
+
+    def fake_terminate(rnr, *, grace_s=1.0):
+        # The transmitter terminates during cleanup; no other orphan exists.
+        return []
+
+    with patch.object(iq, "qualification_stop_process", return_value=0), patch.object(
+        iq, "qualification_wait_for_evaluator_drain", return_value=True
+    ), patch.object(iq, "qualification_attempt_processes", side_effect=fake_attempt_processes), patch.object(
+        iq, "qualification_terminate_attempt_orphans", side_effect=fake_terminate
+    ), patch.object(iq, "qualification_write_resource_evidence", return_value=True), patch.object(
+        iq, "qualification_settle_evidence_files", return_value=None
+    ):
+        finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+
+    # The raw scan included the transmitter and cleanup was required...
+    assert finalize["orphan_cleanup_required"] is True
+    # ...but the transmitter terminated during cleanup and no other orphan
+    # exists, so finalize must not report an orphan failure.
+    assert not any("orphan" in reason for reason in finalize["failures"]), finalize["failures"]
+
+
+def test_real_orphans_surviving_cleanup_still_fail():
+    """Any orphan that survives cleanup — the transmitter included — must fail."""
+    for label, survivors in [
+        ("transmitter", [TRANSMITTER_ORPHAN]),
+        ("unexpected", [UNEXPECTED_ORPHAN]),
+        ("both", [TRANSMITTER_ORPHAN, UNEXPECTED_ORPHAN]),
+    ]:
+        popen = FakePopen()
+        runner = _evidence_runner(popen=popen)
+        allocation = runner._allocate_one(SCENARIO_C, "C")
+        scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+        baseline = runner._gpu_baselines[allocation.attempt_dir]
+
+        def fake_attempt_processes(rnr):
+            return [dict(record) for record in survivors]
+
+        def fake_terminate(rnr, *, grace_s=1.0):
+            return [dict(record) for record in survivors]
+
+        with patch.object(iq, "qualification_stop_process", return_value=0), patch.object(
+            iq, "qualification_wait_for_evaluator_drain", return_value=True
+        ), patch.object(iq, "qualification_attempt_processes", side_effect=fake_attempt_processes), patch.object(
+            iq, "qualification_terminate_attempt_orphans", side_effect=fake_terminate
+        ), patch.object(iq, "qualification_write_resource_evidence", return_value=True), patch.object(
+            iq, "qualification_settle_evidence_files", return_value=None
+        ):
+            finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+
+        assert finalize["orphan_cleanup_required"] is True
+        assert any("orphan" in reason for reason in finalize["failures"]), (
+            label,
+            finalize["failures"],
+        )
+
+
+def test_real_unexpected_orphan_terminated_by_cleanup_still_fails():
+    """An unexpected orphan observed in the raw orphan scan must fail the
+    scenario even when cleanup terminates it successfully (no survivors)."""
+    popen = FakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+    scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+    baseline = runner._gpu_baselines[allocation.attempt_dir]
+
+    state = {"calls": 0}
+
+    def fake_attempt_processes(rnr):
+        # The raw scan sees the unexpected orphan; cleanup terminates it, so no
+        # later scan reports it.
+        state["calls"] += 1
+        return [dict(UNEXPECTED_ORPHAN)] if state["calls"] <= 1 else []
+
+    def fake_terminate(rnr, *, grace_s=1.0):
+        # Cleanup succeeds: the orphan is terminated, no survivors remain.
+        return []
+
+    with patch.object(iq, "qualification_stop_process", return_value=0), patch.object(
+        iq, "qualification_wait_for_evaluator_drain", return_value=True
+    ), patch.object(iq, "qualification_attempt_processes", side_effect=fake_attempt_processes), patch.object(
+        iq, "qualification_terminate_attempt_orphans", side_effect=fake_terminate
+    ), patch.object(iq, "qualification_write_resource_evidence", return_value=True), patch.object(
+        iq, "qualification_settle_evidence_files", return_value=None
+    ):
+        finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+
+    # The raw scan included the unexpected orphan and cleanup had no survivors,
+    # but the scenario must still be demoted.
+    assert finalize["orphan_cleanup_required"] is True
+    assert any("orphan" in reason for reason in finalize["failures"]), finalize["failures"]
+
+
+# --------------------------------------------------------------------------- #
+# Task 10 — Stage records and Gate F
+# --------------------------------------------------------------------------- #
+
+import hashlib  # noqa: E402
+
+sys.path.insert(0, str(ROOT / "tests"))  # noqa: E402
+from test_integrated_evidence_index import write_canonical_evidence_tree  # noqa: E402
+
+T10_STAGE_RECORD = iq.STAGE_RECORD_FILENAMES
+T10_DERIVED = (iq.INDEX_NAME, iq.SUMMARY_NAME, iq.AGENT_SHEET_NAME, iq.USER_SHEET_NAME)
+
+
+def _write_valid_suite(tmp_path: Path) -> tuple[IntegratedRunner, Path]:
+    """Write a valid immutable integrated suite with sibling core + A-E records.
+
+    Reuses the production-shaped Task-9 ``write_canonical_evidence_tree`` for the
+    evidence bytes, persists write-once stage records through the real
+    ``_persist_stage_record``, and allocates a unique existing attempt directory
+    under the suite for every configured C/D/E scenario.  The sibling
+    ``<suite>-core/suite-result.json`` carries the lowercase SHA-256 bound into
+    the stage-A record.
+    """
+    suite_dir = tmp_path / "suite"
+    write_canonical_evidence_tree(suite_dir)
+    runner = IntegratedRunner(attempt_root=suite_dir)
+    configured_gates = runner._core_gates()
+    core_root = suite_dir.parent / f"{suite_dir.name}{iq.CORE_SUITE_DIRNAME_SUFFIX}"
+    core_root.mkdir(parents=True, exist_ok=True)
+    core_payload = {
+        "status": STATUS_VERIFIED_PASS,
+        "gates": {gate: {"status": STATUS_VERIFIED_PASS} for gate in configured_gates},
+    }
+    core_bytes = json.dumps(core_payload, sort_keys=True).encode("utf-8")
+    (core_root / "suite-result.json").write_bytes(core_bytes)
+    runner._persist_stage_record("A", {
+        "stage": "A",
+        "status": STATUS_VERIFIED_PASS,
+        "invoked_gates": list(configured_gates),
+        "executed_gates": list(configured_gates),
+        "duplicate_gate_names": [],
+        "core_suite": {
+            "status": STATUS_VERIFIED_PASS,
+            "suite_dir": str(core_root),
+            "suite_result_sha256": hashlib.sha256(core_bytes).hexdigest(),
+            "gate_results": {gate: {"status": STATUS_VERIFIED_PASS} for gate in configured_gates},
+        },
+    })
+    runner._persist_stage_record("B", {"stage": "B", "status": STATUS_VERIFIED_PASS})
+    for stage in ("C", "D", "E"):
+        names = runner._stage_scenarios(stage)
+        record = {"stage": stage, "status": STATUS_VERIFIED_PASS, "scenario_names": list(names)}
+        for name in names:
+            attempt_dir = suite_dir / stage / name
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            record[name] = {"status": STATUS_VERIFIED_PASS, "attempt_dir": str(attempt_dir)}
+        runner._persist_stage_record(stage, record)
+    return runner, suite_dir
+
+
+def _read_stage_record(suite_dir: Path, stage: str) -> dict[str, object]:
+    return json.loads((suite_dir / T10_STAGE_RECORD[stage]).read_text(encoding="utf-8"))
+
+
+def _write_stage_record(suite_dir: Path, stage: str, record: dict[str, object]) -> None:
+    (suite_dir / T10_STAGE_RECORD[stage]).write_text(
+        json.dumps(record, sort_keys=True), encoding="utf-8"
+    )
+
+
+def _core_result_path(suite_dir: Path) -> Path:
+    return suite_dir.parent / f"{suite_dir.name}{iq.CORE_SUITE_DIRNAME_SUFFIX}" / "suite-result.json"
+
+
+def test_real_valid_predecessors_standalone_f_verified_pass(tmp_path):
+    """Valid persisted A-E predecessors validate; standalone F is verified-pass
+    (never not-implemented) and writes the four derived outputs."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    validation = runner._validate_f_predecessors(suite_dir)
+    assert validation["status"] == STATUS_VERIFIED_PASS, validation["reasons"]
+    result = runner.run_stage("F")
+    assert result["status"] == STATUS_VERIFIED_PASS, result["reasons"]
+    assert result["status"] != STATUS_NOT_IMPLEMENTED
+    for name in T10_DERIVED:
+        assert (suite_dir / name).is_file(), name
+    index = json.loads((suite_dir / iq.INDEX_NAME).read_text(encoding="utf-8"))
+    assert index["kind"] == "integrated-evidence-index"
+    assert index["checksum_algorithm"] == "sha256"
+    indexed = {entry["path"] for entry in index["files"]}
+    assert iq.INDEX_NAME not in indexed  # the index excludes only itself
+    assert iq.SUMMARY_NAME in indexed
+    assert iq.AGENT_SHEET_NAME in indexed
+    assert iq.USER_SHEET_NAME in indexed
+
+
+def test_real_repeated_f_regenerates_derived_outputs(tmp_path):
+    """Repeated F regenerates the derived summary/index deterministically."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    first = runner.run_stage("F")
+    assert first["status"] == STATUS_VERIFIED_PASS, first["reasons"]
+    first_index = json.loads((suite_dir / iq.INDEX_NAME).read_text(encoding="utf-8"))
+    (suite_dir / iq.SUMMARY_NAME).unlink()
+    second = runner.run_stage("F")
+    assert second["status"] == STATUS_VERIFIED_PASS, second["reasons"]
+    assert (suite_dir / iq.SUMMARY_NAME).is_file()
+    second_index = json.loads((suite_dir / iq.INDEX_NAME).read_text(encoding="utf-8"))
+    assert second_index["files"] == first_index["files"]
+    assert second_index["index_checksum"] == first_index["index_checksum"]
+
+
+def test_real_semantic_tamper_to_predecessor_fails_closed(tmp_path):
+    """A semantic tamper to a persisted predecessor fails F closed."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    record = _read_stage_record(suite_dir, "C")
+    name = record["scenario_names"][0]
+    record[name]["status"] = STATUS_VERIFIED_FAIL
+    _write_stage_record(suite_dir, "C", record)
+    result = runner.run_stage("F")
+    assert result["status"] == STATUS_EVIDENCE_INVALID
+    assert "is not verified-pass" in " ".join(result["reasons"])
+
+
+@pytest.mark.parametrize("stage,kind,expect", [
+    ("A", "missing", "stage-a-result.json is missing"),
+    ("A", "malformed", "not finite JSON"),
+    ("A", "failed", "stage A record status is verified-fail"),
+    ("C", "missing", "stage-c-result.json is missing"),
+    ("B", "malformed", "not finite JSON"),
+    ("D", "failed", "record status is not verified-pass"),
+])
+def test_real_bad_predecessor_blocks_before_derived_writes(tmp_path, stage, kind, expect):
+    """A missing/malformed/failed predecessor blocks F before any derived write."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    record_path = suite_dir / T10_STAGE_RECORD[stage]
+    if kind == "missing":
+        record_path.unlink()
+    elif kind == "malformed":
+        record_path.write_text("{not-json", encoding="utf-8")
+    else:
+        record = _read_stage_record(suite_dir, stage)
+        record["status"] = STATUS_VERIFIED_FAIL
+        _write_stage_record(suite_dir, stage, record)
+    (suite_dir / iq.INDEX_NAME).unlink(missing_ok=True)
+    result = runner.run_stage("F")
+    assert result["status"] == STATUS_EVIDENCE_INVALID
+    assert expect in " ".join(result["reasons"])
+    for name in T10_DERIVED:
+        assert not (suite_dir / name).exists(), name
+
+
+@pytest.mark.parametrize("kind,expect", [
+    ("hash", "SHA-256 no longer matches the record"),
+    ("status", "status no longer matches the record"),
+    ("gate-removed", "gates keys do not equal the configured gates exactly"),
+    ("gate-extra", "gates keys do not equal the configured gates exactly"),
+])
+def test_real_core_suite_mutation_fails_closed(tmp_path, kind, expect):
+    """Core suite current-byte/hash/status/gate-key mutation fails F closed."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    core_path = _core_result_path(suite_dir)
+    value = json.loads(core_path.read_text(encoding="utf-8"))
+    if kind == "hash":
+        core_path.write_bytes(core_path.read_bytes() + b"\n")
+    elif kind == "status":
+        value["status"] = STATUS_VERIFIED_FAIL
+        core_path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    elif kind == "gate-removed":
+        del value["gates"]["retention"]
+        core_path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    else:
+        value["gates"]["ghost"] = {"status": STATUS_VERIFIED_PASS}
+        core_path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    result = runner.run_stage("F")
+    assert result["status"] == STATUS_EVIDENCE_INVALID
+    assert expect in " ".join(result["reasons"]), result["reasons"]
+
+
+def test_real_stage_a_persists_bound_sibling_core_record(tmp_path):
+    """A real Stage-A run persists a record binding the external sibling core
+    suite: resolved path, lowercase SHA-256 of the current suite-result bytes,
+    and exactly the configured six gate keys/statuses — with no core files
+    inside the integrated suite."""
+    suite_dir = tmp_path / "suite"
+    runner = IntegratedRunner(attempt_root=suite_dir)
+    gates = runner._core_gates()
+    core_root = suite_dir.parent / f"{suite_dir.name}{iq.CORE_SUITE_DIRNAME_SUFFIX}"
+
+    def fake_core_suite():
+        core_root.mkdir(parents=True, exist_ok=True)
+        core_payload = {
+            "status": STATUS_VERIFIED_PASS,
+            "gates": {gate: {"status": STATUS_VERIFIED_PASS} for gate in gates},
+        }
+        core_bytes = json.dumps(core_payload, sort_keys=True).encode("utf-8")
+        (core_root / "suite-result.json").write_bytes(core_bytes)
+        return {
+            "status": STATUS_VERIFIED_PASS,
+            "attempt_dir": str(core_root),
+            "suite_dir": str(core_root),
+            "suite_result_sha256": hashlib.sha256(core_bytes).hexdigest(),
+            "gate_results": {gate: {"status": STATUS_VERIFIED_PASS} for gate in gates},
+        }
+
+    with patch.object(runner, "_run_core_suite", side_effect=fake_core_suite):
+        result = runner.run_stage("A")
+
+    assert result["status"] == STATUS_VERIFIED_PASS, result.get("reasons")
+    record = _read_stage_record(suite_dir, "A")
+    core = record["core_suite"]
+    assert Path(core["suite_dir"]).resolve() == core_root.resolve()
+    recorded_sha = core["suite_result_sha256"]
+    current_sha = hashlib.sha256(
+        (core_root / "suite-result.json").read_bytes()
+    ).hexdigest()
+    assert recorded_sha == current_sha == recorded_sha.lower()
+    assert len(recorded_sha) == 64
+    assert sorted(core["gate_results"]) == sorted(gates)
+    assert all(
+        entry["status"] == STATUS_VERIFIED_PASS
+        for entry in core["gate_results"].values()
+    )
+    # The sibling core root is external: no core files lie under the suite.
+    assert core_root.is_relative_to(suite_dir) is False
+    assert {path.name for path in suite_dir.iterdir()} == {T10_STAGE_RECORD["A"]}
+
+
+def _pass_write_once_seam(suite_dir, runner, stage, seam, calls):
+    """Return a seam double that makes a real first stage invocation persist a
+    verified-pass record (writing the external sibling core for stage A)."""
+    gates = runner._core_gates()
+
+    def pass_seam(*args, **kwargs):
+        calls.append(seam)
+        if stage == "A":
+            core_root = suite_dir.parent / f"{suite_dir.name}{iq.CORE_SUITE_DIRNAME_SUFFIX}"
+            core_root.mkdir(parents=True, exist_ok=True)
+            core_payload = {
+                "status": STATUS_VERIFIED_PASS,
+                "gates": {gate: {"status": STATUS_VERIFIED_PASS} for gate in gates},
+            }
+            core_bytes = json.dumps(core_payload, sort_keys=True).encode("utf-8")
+            (core_root / "suite-result.json").write_bytes(core_bytes)
+            return {
+                "status": STATUS_VERIFIED_PASS,
+                "attempt_dir": str(core_root),
+                "suite_dir": str(core_root),
+                "suite_result_sha256": hashlib.sha256(core_bytes).hexdigest(),
+                "gate_results": {gate: {"status": STATUS_VERIFIED_PASS} for gate in gates},
+            }
+        if stage == "B":
+            return (Path(args[1]), {"status": "pass", "manifest": {"status": "pass"}})
+        names = runner._stage_scenarios(stage)
+        return {
+            "stage": stage,
+            "status": STATUS_VERIFIED_PASS,
+            "scenario_names": list(names),
+            **{name: {"status": STATUS_VERIFIED_PASS} for name in names},
+        }
+
+    return pass_seam
+
+
+@pytest.mark.parametrize("stage,seam", [
+    ("A", "_run_core_suite"),
+    ("B", "_invoke_source_lock_manifest"),
+    ("C", "_run_scenario_stage"),
+    ("D", "_run_scenario_stage"),
+    ("E", "_run_scenario_stage"),
+])
+def test_real_stage_records_write_once_and_refuse_duplicate_invocation(
+    tmp_path, stage, seam
+):
+    """A/B/C/D/E persist write-once: the first invocation writes the record, a
+    second invocation returns evidence-invalid without re-invoking the stage's
+    implementation/launch seam, and the persisted bytes are unchanged."""
+    suite_dir = tmp_path / "suite"
+    runner = IntegratedRunner(attempt_root=suite_dir)
+    calls: list[str] = []
+    pass_seam = _pass_write_once_seam(suite_dir, runner, stage, seam, calls)
+    patches = [patch.object(runner, seam, side_effect=pass_seam)]
+    if stage == "B":
+        patches.append(patch.object(
+            runner,
+            "_invoke_static_contracts",
+            return_value={
+                "status": STATUS_VERIFIED_PASS,
+                "static_contract": {"status": STATUS_VERIFIED_PASS},
+            },
+        ))
+    with ExitStack() as stack:
+        for item in patches:
+            stack.enter_context(item)
+        first = runner.run_stage(stage)
+    assert first["status"] == STATUS_VERIFIED_PASS, first.get("reasons")
+    record_path = suite_dir / T10_STAGE_RECORD[stage]
+    assert record_path.is_file()
+    record_bytes = record_path.read_bytes()
+
+    with patch.object(runner, seam, side_effect=pass_seam):
+        second = runner.run_stage(stage)
+    assert second["status"] == STATUS_EVIDENCE_INVALID
+    assert "already exists" in " ".join(second["reasons"])
+    assert record_path.read_bytes() == record_bytes
+    assert calls == [seam]
+
+
+def test_real_run_all_retains_a_and_b_blocks_live_stages_when_a_fails():
+    """A Gate-A failure retains the A and B results, blocks C/D/E/F before any
+    live stage runs, and preserves the fail-dominant overall status."""
+    runner = IntegratedRunner(attempt_root=Path(_tmp()))
+    invoked: list[str] = []
+
+    def fake_stage_a():
+        invoked.append("_run_stage_a")
+        return {"stage": "A", "status": STATUS_EVIDENCE_INVALID, "reasons": ["a boom"]}
+
+    def fake_stage_b():
+        invoked.append("_run_stage_b")
+        return {"stage": "B", "status": STATUS_VERIFIED_PASS}
+
+    def blocked(name):
+        def fake():
+            invoked.append(name)
+            return None
+
+        return fake
+
+    with patch.object(runner, "_run_stage_a", side_effect=fake_stage_a), patch.object(
+        runner, "_run_stage_b", side_effect=fake_stage_b
+    ), patch.object(runner, "_run_stage_c", side_effect=blocked("_run_stage_c")), patch.object(
+        runner, "_run_stage_d", side_effect=blocked("_run_stage_d")
+    ), patch.object(runner, "_run_stage_e", side_effect=blocked("_run_stage_e")), patch.object(
+        runner, "_run_stage_f", side_effect=blocked("_run_stage_f")
+    ):
+        result = runner.run_stage("all")
+
+    assert invoked == ["_run_stage_a", "_run_stage_b"]
+    assert result["A"]["status"] == STATUS_EVIDENCE_INVALID
+    assert result["B"]["status"] == STATUS_VERIFIED_PASS
+    assert all(result[s]["status"] == STATUS_BLOCKED for s in ("C", "D", "E", "F"))
+    assert _overall_status(result) == STATUS_EVIDENCE_INVALID
+
+
+@pytest.mark.parametrize("kind", ["predecessor-invalid", "producer-exception"])
+def test_real_f_failure_modes_keep_stable_derived_paths(tmp_path, kind):
+    """Both a predecessor-invalid F and a producer-exception F fail closed with
+    stable derived-output path strings; a predecessor-invalid F performs no
+    derived generation writes."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    for name in T10_DERIVED:
+        (suite_dir / name).unlink(missing_ok=True)
+    if kind == "predecessor-invalid":
+        (suite_dir / T10_STAGE_RECORD["A"]).unlink()
+        result = runner.run_stage("F")
+    else:
+        with patch.object(
+            runner, "_regenerate_contact_sheets", side_effect=RuntimeError("sheet boom")
+        ):
+            result = runner.run_stage("F")
+
+    expected_paths = {
+        "index": suite_dir / iq.INDEX_NAME,
+        "summary": suite_dir / iq.SUMMARY_NAME,
+        "agent_sheet": suite_dir / iq.AGENT_SHEET_NAME,
+        "user_sheet": suite_dir / iq.USER_SHEET_NAME,
+    }
+    assert result["status"] == STATUS_EVIDENCE_INVALID
+    for key, path in expected_paths.items():
+        assert result[key] == str(path)
+    evidence = result["evidence"]
+    assert evidence["status"] == STATUS_EVIDENCE_INVALID
+    if kind == "predecessor-invalid":
+        for name in T10_DERIVED:
+            assert not (suite_dir / name).exists(), name
+    else:
+        assert evidence["producer_exception"] is True
+        assert evidence["reasons"] == result["reasons"]
+
+
+@pytest.mark.parametrize("kind,expect", [
+    ("scenario-mismatch", "scenario set does not match"),
+    ("scenario-duplicate", "scenario_names are not unique"),
+    ("extra-key", "record keys do not equal"),
+    ("attempt-escape", "escapes the integrated suite"),
+    ("attempt-missing", "attempt directory does not exist"),
+    ("attempt-shared", "is shared across scenarios"),
+])
+def test_real_cde_record_mutation_fails_closed(tmp_path, kind, expect):
+    """C/D/E scenario_names mismatch/duplicate, extra key, and attempt
+    escape/missing/shared directory failures all fail F closed."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    record = _read_stage_record(suite_dir, "C")
+    names = list(record["scenario_names"])
+    if kind == "scenario-mismatch":
+        record["scenario_names"] = [names[0], names[1], "extra-scenario"]
+    elif kind == "scenario-duplicate":
+        record["scenario_names"] = names + [names[0]]
+    elif kind == "extra-key":
+        record["ghost"] = 1
+    elif kind == "attempt-escape":
+        record[names[0]]["attempt_dir"] = str(tmp_path / "outside")
+    elif kind == "attempt-missing":
+        record[names[0]]["attempt_dir"] = str(suite_dir / "C" / "no-such-attempt")
+    else:
+        record[names[1]]["attempt_dir"] = record[names[0]]["attempt_dir"]
+    _write_stage_record(suite_dir, "C", record)
+    result = runner.run_stage("F")
+    assert result["status"] == STATUS_EVIDENCE_INVALID
+    assert expect in " ".join(result["reasons"]), result["reasons"]
+
+
+def test_real_run_all_registers_cde_in_stage_results_before_f():
+    """_run_all stores C/D/E in _stage_results before invoking F."""
+    runner = IntegratedRunner(attempt_root=Path(_tmp()))
+    snapshot: dict[str, object] = {}
+
+    def fake_stage_f():
+        snapshot.update(dict(runner._stage_results))
+        return {"stage": "F", "status": STATUS_VERIFIED_PASS}
+
+    pass_record = {"status": STATUS_VERIFIED_PASS, "scenario_names": []}
+    with patch.object(runner, "_run_stage_a", return_value={"stage": "A", "status": STATUS_VERIFIED_PASS}), patch.object(
+        runner, "_run_stage_b", return_value={"stage": "B", "status": STATUS_VERIFIED_PASS}
+    ), patch.object(runner, "_run_stage_c", return_value=dict(pass_record, stage="C")), patch.object(
+        runner, "_run_stage_d", return_value=dict(pass_record, stage="D")
+    ), patch.object(runner, "_run_stage_e", return_value=dict(pass_record, stage="E")), patch.object(
+        runner, "_run_stage_f", side_effect=fake_stage_f
+    ):
+        result = runner.run_stage("all")
+    assert set(snapshot) == {"A", "B", "C", "D", "E"}
+    assert result["F"]["status"] == STATUS_VERIFIED_PASS
+    assert runner._stage_results["F"]["status"] == STATUS_VERIFIED_PASS
+
+
+def test_real_standalone_f_launches_no_children(tmp_path):
+    """Standalone F spawns no child processes and never invokes the command runner."""
+    runner, suite_dir = _write_valid_suite(tmp_path)
+    popen = FakePopen()
+    runner._popen = popen
+
+    def _no_subprocess(*args, **kwargs):
+        raise AssertionError("standalone F must not spawn a child process")
+
+    runner._command_runner = _no_subprocess
+    result = runner.run_stage("F")
+    assert result["status"] == STATUS_VERIFIED_PASS, result["reasons"]
+    assert popen.calls == []
+
+
+@pytest.mark.parametrize("status,expected", [
+    (STATUS_VERIFIED_PASS, 0),
+    (STATUS_VERIFIED_FAIL, 1),
+    (STATUS_EVIDENCE_INVALID, 2),
+])
+def test_real_cli_stage_f_statuses_map_to_exit_codes(status, expected):
+    with patch.object(IntegratedRunner, "run_stage", return_value={"stage": "F", "status": status}):
+        assert main(["--stage", "F"]) == expected
+
+
+@pytest.mark.parametrize("stage", ["A", "C", "D", "E", "F", "all"])
+def test_real_offline_rejected_for_non_b_stages_before_run_stage(stage):
+    """--offline is rejected for A/C/D/E/F/all before run_stage is invoked."""
+    calls: list[str] = []
+
+    def fake_run_stage(self, requested):
+        calls.append(str(requested))
+        raise AssertionError("run_stage must not be invoked for rejected --offline")
+
+    with patch.object(IntegratedRunner, "run_stage", fake_run_stage):
+        assert main(["--stage", stage, "--offline"]) == 2
+    assert calls == []
+
+
+def test_real_offline_accepted_only_for_stage_b():
+    with patch.object(IntegratedRunner, "run_stage", return_value={"stage": "B", "status": STATUS_VERIFIED_PASS}):
+        assert main(["--stage", "B", "--offline"]) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Task 10 — load-bearing integrated rosbag lifecycle
+# --------------------------------------------------------------------------- #
+
+import sqlite3  # noqa: E402
+import yaml  # noqa: E402
+
+_T10_RECORD_TOPIC_TYPES = {
+    "/clock": "rosgraph_msgs/msg/Clock",
+    "/isaac_joint_states": "sensor_msgs/msg/JointState",
+    "/isaac_joint_commands": "sensor_msgs/msg/JointState",
+    "/sim/truth/robot_state": "tinker_sim_interfaces/msg/RobotTruth",
+    "/sim/truth/object_state": "tinker_sim_interfaces/msg/ObjectTruth",
+    "/sim/truth/contacts": "tinker_sim_interfaces/msg/ContactTruth",
+    "/sim/truth/task_state": "tinker_sim_interfaces/msg/TaskTruth",
+    "/sim/safety/collision": "std_msgs/msg/Bool",
+    "/sim/hardware/safety_stop": "std_msgs/msg/Bool",
+    "/sim/status/contract": "std_msgs/msg/String",
+    "/sim/status/command_gateway": "std_msgs/msg/String",
+}
+
+# Humble rosbag2 serializes the full nine-field rmw_qos_profile_t; the two
+# ROSBAG_QOS_OVERRIDE topics carry keep_last/depth1/reliable/transient_local and
+# the remaining approved publishers are RELIABLE with VOLATILE durability.
+_T10_OVERRIDE_QOS = (
+    "- history: 1\n  depth: 1\n  reliability: 1\n  durability: 1\n"
+    "  deadline: 0\n  lifespan: 0\n  liveliness: 1\n"
+    "  liveliness_lease_duration: 0\n  avoid_ros_namespace_conventions: false\n"
+)
+_T10_VOLATILE_QOS = (
+    "- history: 1\n  depth: 10\n  reliability: 1\n  durability: 3\n"
+    "  deadline: 0\n  lifespan: 0\n  liveliness: 1\n"
+    "  liveliness_lease_duration: 0\n  avoid_ros_namespace_conventions: false\n"
+)
+_T10_TOPIC_QOS = {
+    "/sim/hardware/safety_stop": _T10_OVERRIDE_QOS,
+    "/sim/status/contract": _T10_OVERRIDE_QOS,
+}
+
+
+class StoppableFakeProcess:
+    """A process double that is alive until stopped, then reports returncode 0.
+
+    ``QualificationRunner._stop`` classifies a live child as
+    ``planned-termination`` (SIGINT-then-SIGTERM) with ``forced=False``, which
+    is exactly the load-bearing recorder termination contract.  ``poll()``
+    returns None until ``wait()`` is called, so the double never trips the
+    unexpected-exit or forced branches.
+    """
+
+    def __init__(self, pid: int = 424242):
+        self.pid = pid
+        self._stopped = False
+        self.returncode = 0
+
+    def poll(self):
+        return None if not self._stopped else self.returncode
+
+    def wait(self, timeout=None):
+        self._stopped = True
+        return self.returncode
+
+    def send_signal(self, sig):
+        return None
+
+    def terminate(self):
+        self._stopped = True
+
+    def kill(self):
+        self._stopped = True
+
+
+class LifecycleFakePopen(FakePopen):
+    """A FakePopen whose rosbag child is a StoppableFakeProcess so the recorder
+    stop records a planned, non-forced termination."""
+
+    def __call__(self, command, **kwargs):
+        name = self._infer_name(list(command))
+        env = dict(kwargs.get("env", {}))
+        self.calls.append({"name": name, "command": list(command), "env": env})
+        self._on_start(name, list(command), env)
+        if name == "rosbag":
+            return StoppableFakeProcess(pid=424242 + len(self.calls))
+        return FakeProcess(pid=424242 + len(self.calls))
+
+
+def _rosbag_document(bag: Path) -> dict[str, object]:
+    return yaml.safe_load((bag / "metadata.yaml").read_text(encoding="utf-8"))
+
+
+def _write_rosbag_document(bag: Path, document: object) -> None:
+    (bag / "metadata.yaml").write_text(
+        yaml.safe_dump(document, sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+
+
+def _set_rosbag_message_count(bag: Path, topics: set[str], count: int) -> None:
+    document = _rosbag_document(bag)
+    root = document["rosbag2_bagfile_information"]
+    for record in root["topics_with_message_count"]:
+        if record["topic_metadata"]["name"] in topics:
+            record["message_count"] = count
+    _write_rosbag_document(bag, document)
+
+
+def _write_scenario_bundle(
+    attempt_dir: Path,
+    scenario_id: str,
+    stage: str,
+    expected_physical: list[str],
+) -> Path:
+    """Write a minimal scenario-bundle.json carrying stage + expected_physical.
+
+    The live runner writes a complete bundle before the executor starts; the
+    integrated rosbag evidence reads ``integrated.stage`` and
+    ``integrated.expected_physical`` from it to decide per-scenario zero-allowed
+    truth topics.  Tests write only the fields the evidence path consumes.
+    """
+    bundle = attempt_dir / "scenario-bundle.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scenario_id": scenario_id,
+                "scenario": {"id": scenario_id},
+                "integrated": {
+                    "stage": stage,
+                    "expected_physical": list(expected_physical),
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return bundle
+
+
+def _write_valid_integrated_rosbag(attempt_dir: Path) -> Path:
+    """Write a real, semantically valid rosbag (metadata.yaml + openable db3)."""
+    bag = attempt_dir / "rosbag"
+    bag.mkdir(parents=True, exist_ok=True)
+    metadata_topics = [
+        {
+            "topic_metadata": {
+                "name": topic,
+                "type": topic_type,
+                "offered_qos_profiles": _T10_TOPIC_QOS.get(topic, _T10_VOLATILE_QOS),
+            },
+            "message_count": 100,
+        }
+        for topic, topic_type in _T10_RECORD_TOPIC_TYPES.items()
+    ]
+    _write_rosbag_document(bag, {
+        "rosbag2_bagfile_information": {
+            "storage_identifier": "sqlite3",
+            "duration": {"nanoseconds": 10_000_000_000},
+            "message_count": 1100,
+            "relative_file_paths": ["rosbag_0.db3"],
+            "topics_with_message_count": metadata_topics,
+        }
+    })
+    connection = sqlite3.connect(bag / "rosbag_0.db3")
+    connection.execute("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, x TEXT)")
+    connection.commit()
+    connection.close()
+    return bag
+
+
+def _mutate_rosbag(bag: Path, kind: str) -> None:
+    """Mutate a valid bag to exercise one load-bearing semantic failure."""
+    if kind == "corrupt-metadata":
+        (bag / "metadata.yaml").write_text(
+            "rosbag2_bagfile_information: [unclosed\n", encoding="utf-8"
+        )
+        return
+    document = _rosbag_document(bag)
+    root = document["rosbag2_bagfile_information"]
+    topics = root["topics_with_message_count"]
+    if kind == "missing-topic":
+        root["topics_with_message_count"] = topics[1:]
+    elif kind == "malformed-qos":
+        topics[0]["topic_metadata"]["offered_qos_profiles"] = "- history: invalid\n"
+    elif kind == "wrong-type":
+        topics[0]["topic_metadata"]["type"] = "std_msgs/msg/Float32"
+    elif kind == "bad-count":
+        topics[0]["message_count"] = 0
+    elif kind == "missing-storage":
+        for db3 in bag.glob("*.db3"):
+            db3.unlink()
+    elif kind == "unopenable-storage":
+        for db3 in bag.glob("*.db3"):
+            db3.write_bytes(b"not-a-real-sqlite-database")
+    _write_rosbag_document(bag, document)
+
+
+def test_t10_recorder_starts_after_physics_ready_and_bundle_before_executor():
+    """Recorder starts only after PHYSICS_READY + scenario-bundle write and
+    before the executor, with the exact real QoS override path and exactly the
+    approved record-topic set (no extras/omissions)."""
+    order: list[str] = []
+    popen = FakePopen(on_start=lambda name, command, env: order.append(f"start:{name}"))
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+    observed: dict[str, object] = {}
+
+    def fake_ready(attempt_dir, name, *, manifest=None):
+        order.append("physics-ready")
+        return True, {"ready": True}, None
+
+    def fake_start_rosbag(scenario_runner, manifest):
+        observed["scenario_runner"] = scenario_runner
+        observed["manifest"] = manifest
+        observed["bundle_present_at_start"] = (
+            scenario_runner._attempt_dir / "scenario-bundle.json"
+        ).is_file()
+        iq.qualification_start_process(
+            scenario_runner, "rosbag", ["ros2", "bag", "record"], manifest
+        )
+        return True
+
+    def fake_terminal(attempt_dir, name, *, runner=None, attempt_id=None):
+        return {"ok": True, "source": "executor-driver"}
+
+    def fake_verify(attempt_dir, name, stage):
+        return {"status": "verified-pass", "scenario": name}
+
+    with patch.object(runner, "_wait_for_physics_ready", side_effect=fake_ready), patch.object(
+        runner, "_wait_for_scenario_terminal", side_effect=fake_terminal
+    ), patch.object(runner, "_verify_attempt", side_effect=fake_verify), patch.object(
+        iq.QualificationRunner, "_start_rosbag", new=fake_start_rosbag
+    ):
+        result = runner._execute_scenario(allocation, SCENARIO_C, "C")
+
+    assert order.index("physics-ready") < order.index("start:rosbag") < order.index("start:executor")
+    assert observed["bundle_present_at_start"] is True
+    manifest = observed["manifest"]
+    assert manifest.attempt_dir == allocation.attempt_dir
+    recorded = json.loads((allocation.attempt_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert recorded["attempt_id"] == manifest.attempt_id
+    command = observed["scenario_runner"]._default_rosbag_command(manifest)
+    assert command[:3] == ["ros2", "bag", "record"]
+    qos_index = command.index("--qos-profile-overrides-path")
+    assert Path(command[qos_index + 1]).resolve() == (
+        allocation.attempt_dir / "rosbag-qos-overrides.yaml"
+    ).resolve()
+    assert command[qos_index + 2:] == list(iq.APPROVED_RECORD_TOPICS)
+
+
+def test_t10_rosbag_start_failure_blocks_executor_and_finalizes_isaac_humble():
+    popen = FakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+
+    def fake_ready(attempt_dir, name, *, manifest=None):
+        return True, {}, None
+
+    def fake_start_rosbag(scenario_runner, manifest):
+        return False
+
+    with patch.object(runner, "_wait_for_physics_ready", side_effect=fake_ready), patch.object(
+        iq.QualificationRunner, "_start_rosbag", new=fake_start_rosbag
+    ):
+        result = runner._execute_scenario(allocation, SCENARIO_C, "C")
+
+    assert result["status"] == STATUS_EVIDENCE_INVALID
+    assert any(
+        "rosbag recorder failed to start" in reason for reason in result.get("reasons", [])
+    )
+    assert [call["name"] for call in popen.calls] == ["isaac", "humble"]
+    finalize = result.get("finalize", {})
+    assert finalize.get("exit_codes", {}).get("isaac") == 0
+    assert finalize.get("exit_codes", {}).get("humble") == 0
+    assert "executor" not in finalize.get("exit_codes", {})
+
+
+def test_t10_recorder_stop_precedes_bag_evidence_and_valid_contract_is_load_bearing():
+    popen = LifecycleFakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+
+    def fake_ready(attempt_dir, name, *, manifest=None):
+        return True, {}, None
+
+    def fake_start_rosbag(scenario_runner, manifest):
+        iq.qualification_start_process(
+            scenario_runner, "rosbag", ["ros2", "bag", "record"], manifest
+        )
+        return True
+
+    def fake_terminal(attempt_dir, name, *, runner=None, attempt_id=None):
+        return {"ok": True, "source": "executor-driver"}
+
+    def fake_verify(attempt_dir, name, stage):
+        return {"status": "verified-pass", "scenario": name}
+
+    events: list[str] = []
+    real_stop = iq.qualification_stop_process
+    real_bag = runner._integrated_rosbag_evidence
+
+    def recording_stop(rnr, name):
+        if name == "rosbag":
+            events.append("stop:rosbag")
+        return real_stop(rnr, name)
+
+    def recording_bag(attempt_dir):
+        events.append("bag-evidence")
+        return real_bag(attempt_dir)
+
+    with patch.object(runner, "_wait_for_physics_ready", side_effect=fake_ready), patch.object(
+        runner, "_wait_for_scenario_terminal", side_effect=fake_terminal
+    ), patch.object(runner, "_verify_attempt", side_effect=fake_verify), patch.object(
+        iq.QualificationRunner, "_start_rosbag", new=fake_start_rosbag
+    ), patch.object(iq, "qualification_stop_process", side_effect=recording_stop), patch.object(
+        runner, "_integrated_rosbag_evidence", side_effect=recording_bag
+    ), patch.object(
+        # Narrow the non-rosbag finalize seams so the verdict depends only on the
+        # rosbag lifecycle, not live GPU/resource state.
+        iq, "qualification_wait_for_evaluator_drain", return_value=True
+    ), patch.object(
+        iq, "qualification_attempt_processes", return_value=[]
+    ), patch.object(
+        iq, "qualification_write_resource_evidence", return_value=True
+    ), patch.object(
+        iq, "qualification_settle_evidence_files", return_value=None
+    ):
+        result = runner._execute_scenario(allocation, SCENARIO_C, "C")
+
+    assert events.index("stop:rosbag") < events.index("bag-evidence")
+    assert result["status"] == STATUS_VERIFIED_PASS, result.get("reasons")
+    finalize = result.get("finalize", {})
+    assert finalize.get("exit_codes", {}).get("rosbag") == 0
+    termination = finalize.get("rosbag_termination", {})
+    assert termination.get("classification") == "planned-termination"
+    assert termination.get("returncode") == 0
+    assert termination.get("forced") is False
+
+
+@pytest.mark.parametrize("termination,expect", [
+    ({"classification": "unexpected-exit", "returncode": 0, "forced": False},
+     "termination classification is unexpected-exit, expected planned-termination"),
+    ({"classification": "planned-termination", "returncode": 1, "forced": False},
+     "termination returncode is 1, expected 0"),
+    ({"classification": "planned-termination", "returncode": 0, "forced": True},
+     "termination forced is True, expected false"),
+    (None, "rosbag recorder has no termination record after stop"),
+])
+def test_t10_bad_recorder_termination_makes_final_rosbag_ok_false(termination, expect):
+    popen = FakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+    scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+    iq.qualification_start_process(scenario_runner, "rosbag", ["ros2", "bag", "record"], manifest)
+    baseline = runner._gpu_baselines[allocation.attempt_dir]
+    real_stop = iq.qualification_stop_process
+
+    def fake_stop(rnr, name):
+        if name == "rosbag":
+            if termination is None:
+                rnr._termination.pop("rosbag", None)
+            else:
+                rnr._termination["rosbag"] = dict(termination)
+            return 0
+        return real_stop(rnr, name)
+
+    with patch.object(iq, "qualification_stop_process", side_effect=fake_stop):
+        finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+    assert finalize["rosbag_ok"] is False
+    assert any(expect in reason for reason in finalize["failures"]), finalize["failures"]
+
+
+@pytest.mark.parametrize("mutate,expect", [
+    ("corrupt-metadata", "not structured rosbag2 metadata"),
+    ("missing-topic", "is missing approved topic"),
+    ("malformed-qos", "has malformed RMW QoS fields"),
+    ("wrong-type", "does not match"),
+    ("bad-count", "has an invalid message count"),
+    ("missing-storage", "output database is missing or not openable"),
+    ("unopenable-storage", "output database is missing or not openable"),
+])
+def test_t10_present_bag_semantic_failures_are_load_bearing(mutate, expect):
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "attempt"
+    attempt_dir.mkdir(parents=True)
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _mutate_rosbag(bag, mutate)
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is False
+    assert any(expect in reason for reason in failures), failures
+
+
+def test_t10_valid_present_bag_passes_integrated_evidence():
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "attempt"
+    attempt_dir.mkdir(parents=True)
+    _write_valid_integrated_rosbag(attempt_dir)
+    ok, evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is True, failures
+    assert evidence["status"] == "valid"
+
+
+def test_t10_stage_c_plan_only_allows_zero_object_and_contact_counts():
+    """Stage C plan-only evidence may have no object/contact samples."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "C" / SCENARIO_C
+    attempt_dir.mkdir(parents=True)
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(
+        bag,
+        {"/sim/truth/object_state", "/sim/truth/contacts"},
+        0,
+    )
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is True, failures
+
+
+@pytest.mark.parametrize("topic", ["/clock", "/sim/truth/robot_state"])
+def test_t10_stage_c_plan_only_zero_required_topic_still_fails(topic):
+    """Stage C still requires clock and non-object truth topics."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "C" / SCENARIO_C
+    attempt_dir.mkdir(parents=True)
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(bag, {topic}, 0)
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is False
+    assert topic in " ".join(failures)
+
+
+@pytest.mark.parametrize("scenario,physical", [
+    ("qualification-moveit-gripper", ["gripper_travel_predicates", "terminal_success"]),
+    ("qualification-moveit-execute-joint", ["joint_execution_tracks", "terminal_success"]),
+    ("qualification-moveit-execute-pose", ["pose_execution_reaches_tcp", "terminal_success"]),
+    ("qualification-moveit-cartesian-retreat", ["cartesian_retreat_collision_aware", "terminal_success"]),
+    ("qualification-moveit-cancel", ["execute_goal_canceled", "quiescent_after_cancel", "no_later_stage"]),
+    ("qualification-moveit-safety", ["safety_effective_stop", "target_frozen", "no_auto_resume"]),
+])
+def test_t10_stage_d_no_contact_scenario_allows_zero_object_and_contact_counts(scenario, physical):
+    """Stage D free-space / gripper-only evidence may have no object/contact
+    samples: the arm never touches an object, so 0 contacts + 0 object_state is
+    physically correct (mirrors the Stage C plan-only exception)."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "D" / scenario
+    attempt_dir.mkdir(parents=True)
+    _write_scenario_bundle(attempt_dir, scenario, "D", physical)
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(
+        bag,
+        {"/sim/truth/object_state", "/sim/truth/contacts"},
+        0,
+    )
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is True, failures
+
+
+def test_t10_stage_d_contact_requiring_scenario_still_requires_counts():
+    """A scenario whose expected_physical needs object/contact truth still
+    requires positive rosbag counts on those topics (fail-closed)."""
+    runner = _evidence_runner()
+    attempt_dir = Path(_tmp()) / "E" / "qualification-pick-place-positive"
+    attempt_dir.mkdir(parents=True)
+    _write_scenario_bundle(
+        attempt_dir,
+        "qualification-pick-place-positive",
+        "E",
+        ["bilateral_contact", "lift", "transport", "settled_speed"],
+    )
+    bag = _write_valid_integrated_rosbag(attempt_dir)
+    _set_rosbag_message_count(
+        bag,
+        {"/sim/truth/object_state", "/sim/truth/contacts"},
+        0,
+    )
+    ok, _evidence, failures = runner._integrated_rosbag_evidence(attempt_dir)
+    assert ok is False
+    assert "/sim/truth/contacts" in " ".join(failures)
+
+
+def test_t10_integrated_finalization_uses_integrated_bag_evidence_only():
+    popen = FakePopen()
+    runner = _evidence_runner(popen=popen)
+    allocation = runner._allocate_one(SCENARIO_C, "C")
+    scenario_runner, manifest = runner._launch_scenario(allocation, SCENARIO_C, "C")
+    baseline = runner._gpu_baselines[allocation.attempt_dir]
+    calls: list[str] = []
+
+    def fake_integrated_evidence(attempt_dir):
+        calls.append("integrated")
+        return True, {"status": "not-recorded", "load_bearing": False}, []
+
+    def fake_rosbag_final_evidence(*args, **kwargs):
+        calls.append("rosbag_final_evidence")
+        return False, {}, ["must never be used"]
+
+    with patch.object(
+        runner, "_integrated_rosbag_evidence", side_effect=fake_integrated_evidence
+    ), patch.object(
+        iq, "qualification_rosbag_final_evidence", side_effect=fake_rosbag_final_evidence
+    ), patch.object(
+        iq.QualificationRunner, "_rosbag_final_evidence", side_effect=fake_rosbag_final_evidence
+    ):
+        finalize = runner._finalize_attempt(scenario_runner, manifest, baseline)
+    assert calls == ["integrated"]
+    assert finalize["rosbag_ok"] is True
+
+
+def test_t10_output_evidence_does_not_lock_a_live_recorder_database():
+    """RED (G3): the rosbag startup poll must not open the live recorder's db3
+    read-only.  In ``journal_mode=delete`` a concurrent read-only connection
+    (``_rosbag_output_evidence``, ``mode=ro``, ``timeout=0.2``) takes a SHARED
+    lock while the rosbag2 recorder commits its fresh schema, and the recorder's
+    zero busy-timeout then aborts with ``SQLite error (5): database is locked``
+    (RERUN-3 cancel evidence).  The evidence probe must confirm the database
+    without acquiring any sqlite lock, so a writer holding the file open never
+    sees contention from the readiness loop."""
+    import time as _time
+
+    runner = _evidence_runner()
+    with tempfile.TemporaryDirectory() as temporary:
+        bag = Path(temporary)
+        db = bag / "rosbag_0.db3"
+        writer = sqlite3.connect(str(db), timeout=10.0)
+        writer.execute("PRAGMA locking_mode=EXCLUSIVE")
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute("CREATE TABLE IF NOT EXISTS t (id INTEGER)")
+        writer.execute("COMMIT")
+        writer.execute("BEGIN EXCLUSIVE")  # writer now holds the schema lock open
+
+        # The probe must report the db openable WITHOUT blocking on (or
+        # contending with) the writer's lock.  The old read-only connection
+        # would busy-timeout after 0.2 s and report open=False.
+        started = _time.monotonic()
+        evidence = iq.qualification_rosbag_output_evidence(bag)
+        elapsed = _time.monotonic() - started
+
+        assert evidence["open"] is True, evidence
+        assert evidence["database_path"] == str(db)
+        assert elapsed < 0.1, (
+            "output-database evidence must not block on a live recorder lock; "
+            f"took {elapsed:.3f}s and returned {evidence}"
+        )
+        writer.rollback()
+        writer.close()

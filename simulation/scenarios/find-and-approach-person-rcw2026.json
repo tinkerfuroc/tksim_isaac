@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "id": "find-and-approach-person-rcw2026",
+  "world": {"mode": "arena", "arena": "rcw2026"},
+  "robot": {"id": "tinker2", "initial_pose": [-2.0, -2.0, 0.0]},
+  "actors": [
+    {
+      "id": "target_person",
+      "asset_uri": "simulation/assets/primitives/person.usda",
+      "pose": {"xyz": [-2.0, -3.5, 0.0], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+      "path": [[-2.0, -3.5], [-1.0, -3.0]]
+    }
+  ],
+  "objects": [],
+  "regions": [],
+  "events": [{"at_sim_time": 0.0, "type": "actor_path_start", "actor": "target_person"}],
+  "dialogue": [],
+  "postconditions": [
+    {
+      "name": "target person perceived",
+      "path": "person.target_visible",
+      "operator": "equals",
+      "value": true
+    },
+    {
+      "name": "robot approached target",
+      "path": "person.base_distance",
+      "operator": "less_than_or_equal",
+      "value": 1.2
+    },
+    {
+      "name": "base stopped safely",
+      "path": "robot.base_speed",
+      "operator": "less_than_or_equal",
+      "value": 0.05
+    }
+  ]
+}

@@ -118,7 +118,7 @@ Example launch profiles:
 ```bash
 ./scripts/launch-isaac --sensor-profile physics-only --scenario empty
 ./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \
-  --scenario find-and-approach-person --seed 7
+  --scenario empty --seed 7 --ros
 ./scripts/launch-isaac --sensor-profile streaming --dds-profile lan
 ```
 
@@ -126,6 +126,505 @@ Streaming uses Isaac's headless WebRTC experience, explicitly disables GPU
 physics, and uses a local process lock to
 enforce one viewer per simulator instance. Restrict its ports to a trusted LAN
 or VPN. Use SSH for installation, process management, logs, tests, and bags.
+For the common remote-viewing case, `./scripts/launch-streaming` loads
+`.deployment.env`, removes inherited system-ROS paths, and starts this streaming
+profile in one command. Set `TINKER_SIM_DDS_PROFILE=local` to override its
+default `lan` DDS profile, or `TINKER_SIM_ENV_FILE=/path/to/env` to load a
+different deployment environment.
+
+To stream the Tinker robot inside the committed RoboCup Arena 3 map instead of
+opening an empty full Isaac UI, run:
+
+```bash
+./scripts/launch-arena-streaming
+```
+
+This standalone development viewer loads the current content-addressed
+`robot.usd` and its colocated `map.yaml`, renders the map as visible collidable
+walls, selects a deterministic arena overview camera, and listens on TCP 49100
+and UDP 47998 for NVIDIA's WebRTC Streaming Client. The primary stream starts
+at 1280x720 and uses Isaac Sim's supported dynamic-resize path to follow the
+client window; spectator streams are not enabled. The launcher pumps Kit at a
+bounded 10 Hz so WebRTC mouse, keyboard, and video are handled without coupling
+the 120 Hz CPU-PhysX clock to ray-traced render latency; the guarded update
+cannot step PhysX a second time. The occupancy-map cuboids are deliberately
+kinematic static arena geometry, not loose props, so moving one in the stage
+does not make it fall under gravity. It
+also augments the robot's existing 20 kg low-mounted chassis ballast with 10 kg
+(30 kg total, with proportionally scaled inertia). Base wheel velocity targets
+are applied directly; navigation or another upstream controller is responsible
+for acceleration and deceleration limits. It preserves Isaac's normal
+single-session lifecycle: disconnecting the client
+terminates the simulator and releases its ports. It
+deliberately starts no external Humble/ROS processes; use the navigation
+two-process workflow when ROS control is required. Optional launch arguments
+such as `--duration 30` are forwarded to `launch-isaac`.
+
+When the client network cannot return UDP packets directly to tkserver, carry
+both WebRTC transports over the existing SSH connection. Keep the arena server
+running in its tkserver shell, then run this on the GUI/client machine:
+
+```bash
+./scripts/connect-arena-streaming tinker@tkserver.example.net
+```
+
+The SSH destination is required and can be a hostname, SSH configuration alias,
+or `user@host`; there is no client-machine-specific `tkserver` default. The
+launcher needs only Bash, Python 3, and OpenSSH on Linux or macOS. It fetches the
+matching relay helper from the authenticated server into a private temporary
+directory, runs it locally, and removes it on exit, so the client does not need
+a Tinker Sim checkout. To install the single launcher on another machine:
+
+```bash
+scp tinker@tkserver.example.net:/home/tinker/tinker-sim/6.0.1/scripts/connect-arena-streaming .
+chmod +x connect-arena-streaming
+./connect-arena-streaming tinker@tkserver.example.net
+```
+
+Use `--ssh-port` and `--identity-file` for connections not fully described by
+the local SSH configuration. `--remote-root` changes the server checkout path;
+it defaults to `/home/tinker/tinker-sim/6.0.1`. Key- or agent-based SSH access
+is required because the connector deliberately uses non-interactive
+`BatchMode=yes`.
+
+The connector forwards TCP signaling and preserves UDP datagram boundaries
+while framing media packets over the SSH byte stream. It waits up to 180
+seconds for a process- and port-validated readiness marker written only after
+the arena, robot, viewport, and Kit input loop have initialized; override this
+with `--ready-timeout`. Do not open the NVIDIA client until the connector prints
+`SSH WebRTC tunnel ready`.
+
+Keep the connector running and configure NVIDIA's native client with Server
+`2130706433`, Signal `49100`, and Stream `47998`. `2130706433` is the IPv4
+numeric form of `127.0.0.1`: it never leaves the client machine, needs no
+hosts-file entry, stays IPv4-only, and avoids a client 2.0 bug where literal
+`localhost` or dotted `127.x` makes the client omit the explicit media endpoint
+and bypass the UDP tunnel. The server also advertises `127.0.0.1` as its fixed
+WebRTC media address, ensuring ICE uses the SSH relay instead of tkserver's
+physical interface. Streaming ports and loopback values can be overridden with
+`--client-host`, `--local-bind`, `--signal-port`, and `--media-port`. Close the
+client first, then press Ctrl-C in the tunnel shell. Because UDP is encapsulated
+in TCP, packet loss can produce head-of-line delay; this path favors reliable
+access over minimum streaming latency.
+
+After connecting with NVIDIA's native client, move the pointer completely
+outside the streamed video once and then move it back in before clicking. The
+2.0 client enables mouse/keyboard forwarding on the video's pointer-enter
+event; if the pointer remains over the Connect button while that form is
+replaced by the video, the first clicks can remain local to the client instead
+of being sent to Isaac Sim.
+
+## Vision hardware-parity cameras
+
+The RTX camera graphs publish the same seven topics, encodings, and QoS that
+`tk26_vision` expects from real RealSense drivers, so the existing vision
+stack subscribes without modification. The contract's single source of truth
+is [`simulation/sensors/hardware-parity.json`](simulation/sensors/hardware-parity.json)
+(schema v2, `gateway_rtx_camera_publishers`), loaded fail-closed by
+[`simulation/tinker_sim_isaac/camera_rig.py`](simulation/tinker_sim_isaac/camera_rig.py) —
+including a per-camera `mount_rotation_wxyz`. The current artifact's xarm
+optical frame is authored y-up (nonstandard), so the wrist camera uses the
+rot_y(180) mount variant while the head camera uses rot_x(180).
+
+| Topic | Content | Encoding |
+| --- | --- | --- |
+| `/camera/color/image_raw` | head color | rgb8 |
+| `/camera/depth/image_raw` | head depth | 16UC1, millimetres |
+| `/camera/color/camera_info` | head intrinsics | — |
+| `/camera/xarm_camera/color/image_raw` | wrist color | rgb8 |
+| `/camera/xarm_camera/aligned_depth_to_color/image_raw` | wrist depth | 16UC1, millimetres |
+| `/camera/xarm_camera/color/camera_info` | wrist color intrinsics | — |
+| `/camera/xarm_camera/aligned_depth_to_color/camera_info` | wrist depth intrinsics | — |
+| `/camera/depth_registered/points` (optional, `--camera-pointcloud`) | organized head-camera cloud | point_step 16, x/y/z, real-driver layout |
+
+Color and depth from one capture share one identical sim-time stamp. Every
+publisher uses RELIABLE + VOLATILE + KEEP_LAST(10) QoS, matching the real
+drivers after `tk26_vision`'s `realsense_qos.yaml` override: every
+`tk26_vision` `CameraInfo` subscription is RELIABLE, so a best-effort
+publisher would deliver zero messages to it, silently.
+
+Two opt-in `launch-isaac` flags extend the stream under `--sensor-profile
+sensor-rich`: `--arena-colors` paints the occupancy walls with a
+deterministic six-hue palette from `tinker_sim_core.arena_palette` (used by
+the live acceptance run below to prove hue delivery end to end), and
+`--camera-pointcloud` additionally publishes the organized
+`/camera/depth_registered/points` topic above, derived from the head camera.
+
+Measured on this dev host (2x RTX 2080 Ti, driver 560.35.05 — below the
+595.58.03 release baseline — with an arena-streaming session co-resident):
+cameras hold 7.5–7.8 Hz wall-clock steady and `/clock` advances at roughly 30
+steps/s, i.e. physics runs at about 25% of real time under `sensor-rich` —
+the profile trades physics realtime for camera rate. The declared
+`tick_rate_hz` of 30 in the contract is real-driver parity and is achieved in
+full on a qualified host.
+
+The head camera's spawn pose aims it at the sky (the tilt joint's default),
+so its frames are uniform sky-gray at spawn — a correct render of that pose,
+not a defect. Operational use commands the pan/tilt facade before reading
+frames.
+
+### Live acceptance runbook
+
+Three terminals, all on `ROS_DOMAIN_ID=42` to isolate the run from the
+default deployment domain (`25`):
+
+Terminal A — launch the sim:
+
+```bash
+export ROS_DOMAIN_ID=42
+./scripts/launch-isaac --sensor-profile sensor-rich --profile parity \
+  --scenario empty --seed 7 --ros --arena-colors
+```
+
+(`--sensor-profile sensor-rich` implies `--ros` when it is omitted, printing
+a note to that effect; it is passed explicitly above for clarity.)
+
+Terminal B — the Humble vision overlay, same domain:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/tk25_ws/install/setup.bash
+export ROS_DOMAIN_ID=42
+ros2 run vision_util get_image   # optional — see the defect note below
+```
+
+Terminal C — the acceptance test:
+
+```bash
+TINKER_SIM_VISION_LIVE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python3 -m pytest -v tests/ros_humble/test_vision_get_image_live.py
+```
+
+This was run and recorded (3/3 passed, `ROS_DOMAIN_ID=42`): direct RELIABLE
+subscriptions decode both cameras with `tk26_vision` conventions, and the
+wrist frame carried all six palette hues (45.3% chromatic pixels). Evidence
+is under `reports/vision-roundtrip/` (gitignored, host-local).
+
+**Real defect found in `~/tk25_ws/src/tk26_vision`** (documented here for the
+record; out of scope to patch from this repo): `vision_util`'s `get_image`
+and `get_point_cloud` register `async def` callbacks directly on
+`message_filters`' `ApproximateTimeSynchronizer` (`get_image.py:49,65,77,81`,
+`get_point_cloud.py:43,66,100,104`). Humble's `message_filters` invokes
+callbacks synchronously, so those coroutines are never awaited, the node's
+cached frames never update, and both services always answer "No camera
+data" — on real hardware too, not only in sim. The sim run still proved that
+delivery and stamp-pairing both work: the node's own "coroutine was never
+awaited" `RuntimeWarning`s fired for both cameras. The acceptance test's
+third case probes this service directly and will fail loudly — prompting a
+test upgrade — once the node is fixed upstream.
+
+Status: development-validated with a recorded live round-trip; **not
+release-qualified**.
+
+## RoboCup 2026 arena
+
+`--arena rcw2026` replaces the procedurally generated occupancy world with an
+imported RoboCup 2026 @Home-style arena: 20 furniture models across 32
+placements (kitchen table, sofa, shelf, sink, washing machine, and so on)
+plus the room's wall layout, converted from the real upstream Gazebo world.
+A companion importer publishes ten graspable YCB tabletop objects (cracker
+box, sugar box, potted meat can, mustard bottle, pudding box, tomato soup
+can, banana, bleach cleanser, bowl, mug) for pick/place work. Both are
+pulled from pinned upstream commits and published as immutable,
+content-addressed asset artifacts, mirroring the existing robot-artifact
+convention: `artifacts/arena/rcw2026/<identity>/` and
+`artifacts/objects/ycb/<identity>/`, each with a `current.json` pointer, a
+`manifest.json`, a `source-lock.json` (per consumed upstream file: relative
+path, size, sha256), and an `ATTRIBUTION.md`. Re-running an importer against
+unchanged upstream content and config is a byte-identical no-op (proven live
+by two consecutive runs of each importer publishing under the same identity:
+the second run reports `created=False` and atomically rewrites `current.json`
+with identical bytes).
+
+Provenance: the arena is converted from
+[`TeamSOBITS/sobits_gazebo_worlds`](https://github.com/TeamSOBITS/sobits_gazebo_worlds)
+at `feature/hri`, pinned to commit `293b4057d26a673c3f09ff7d8f3118234d42ba24`
+(BSD-3-Clause; `ATTRIBUTION.md` carries the upstream `LICENSE` text plus the
+per-file source records). The YCB objects are converted from
+[`TeamSOBITS/tmc_wrs_gz`](https://github.com/TeamSOBITS/tmc_wrs_gz) at
+`jazzy-devel`, pinned to commit `48157eec99bfc50f8d24ad95736d4d10bb344c14`
+(`ATTRIBUTION.md` carries a CC BY 4.0 attribution block naming the
+Yale-CMU-Berkeley (YCB) Object and Model Set, the license obligation for
+that content, plus the Clear BSD text for the `tmc_wrs_gz` wrapper itself).
+Both importers verify the checkout's `HEAD` against the pinned commit and
+fail closed on a mismatch before converting anything.
+
+Run either importer from the simulator venv, on a host with network access
+(to clone the pinned commit) and a GPU (Isaac Sim Kit conversion), with the
+same `TINKER_ACCEPT_OMNIVERSE_EULA=Y` gate as the rest of this README's
+`.deployment.env`-sourcing bootstrap (see "Online bootstrap" above). Both
+importers call `SimulationApp` directly rather than going through the
+deploy CLI's `launch` command, so they bypass the one place
+(`tools/tinker_sim_deploy/cli.py`) that bridges a confirmed
+`TINKER_ACCEPT_OMNIVERSE_EULA=Y` into the `ACCEPT_EULA`/`OMNI_KIT_ACCEPT_EULA`
+variables Kit itself reads; export those two explicitly, once the TINKER
+gate is confirmed, or Kit prompts interactively and a headless run aborts
+at EOF:
+
+```bash
+source .deployment.env
+export ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES  # only after TINKER_ACCEPT_OMNIVERSE_EULA=Y above
+./.venv/bin/python tools/arena_import.py --config config/arena-import.json
+./.venv/bin/python tools/ycb_import.py --config config/ycb-import.json
+```
+
+`config/arena-import.json` carries the pin, the furniture allowlist, a
+`model_skiplist` for benign non-furniture includes, `bounds_check_exceptions`
+for the two models whose upstream SDF deliberately under-sizes the collision
+box (see Status below), the placement-surface definitions, and
+`bounds_tolerance_m`. `config/ycb-import.json` carries the pin, `models_root`,
+and the object allowlist. Both accept `--checkout <path>` to reuse an
+existing pinned checkout instead of cloning fresh; `tools/arena_import.py`
+additionally accepts `--report-bounds` to print per-model measured bounds and
+exit without publishing. Every Kit/pxr call is isolated behind a converter
+adapter in
+[`tools/tinker_sim_deploy/arena_convert.py`](tools/tinker_sim_deploy/arena_convert.py),
+so the importers' own orchestration logic is unit-tested under plain system
+Python with no GPU or Isaac Sim installed; the adapter itself is exercised
+only by the live import.
+
+The arena's `map.yaml`/`map.pgm` (ROS `map_server` PGM/YAML, resolution
+0.05m, trinary mode) is derived, not hand-authored: it rasterizes the same
+pinned world file's wall and furniture collision footprints, sliced at the
+tinker2 Livox sensor's mounted height (read from the robot URDF's
+`livox_joint` origin) — the pinned world file is the single source of truth
+for both the 3D scene and the 2D navigation map. `placement.json` records
+world-frame placement surfaces (for example `kitchen_table#top`, the
+`rcw26_` model-id prefix stripped) for tabletop object spawning.
+
+Select the arena on launch with `--arena rcw2026`, forwarded like any other
+`validation/run_sim.py` flag through `./scripts/launch-isaac`. `--arena` is
+mutually exclusive with `--map` (`--arena and --map are mutually exclusive`)
+and with `--arena-colors` (`--arena-colors applies only to occupancy cuboid
+walls` — that flag colors the procedurally generated occupancy walls, which
+the imported arena's real geometry replaces), both enforced at
+argument-parse time. A scenario selects the same arena declaratively via
+`world: {"mode": "arena", "arena": "rcw2026"}`; validated fail-closed by
+`tinker_sim_core.scenario.validate_world_selection`, which requires the
+declared `arena` to be a non-empty string matching the launcher's `--arena`
+value exactly (missing, mismatched, or combined with a `uri` key all raise
+`ValueError`) — `mode: "current"`, or `mode` absent, is unaffected regardless
+of `--arena`.
+
+The robot's default spawn is world (0, 0), which in the rcw2026 arena lies
+inside `shelf_02`'s physical and rasterized footprint: the robot would stand
+under the shelf plate, the dev lidar's occupied sensor origin would publish
+an empty cloud rather than useful returns, wheel odometry would accumulate
+contact slip, and AMCL would be initialized inside an occupied map cell. The
+launch now fails closed on this instead of spawning into it — see "the
+default robot spawn" under Known arena limitations below for the exact
+error and its evidence. Navigation work in this arena therefore passes
+`--spawn-xy=X,Y` (world metres; use the `=` form — argparse treats a
+separate `-2.0,-2.0` token as an option string) to place the robot on a free
+map cell, e.g. `--spawn-xy=-2.0,-2.0` (1.0 m clearance on the derived map).
+The override is validated fail-closed (two finite comma-separated numbers)
+and requires a profile that loads the robot backend, like `--arena` itself.
+On the Humble side, `./scripts/launch-humble navigation
+map_yaml:=/abs/path/to/artifacts/arena/rcw2026/<identity>/map.yaml` points
+AMCL's map server at the arena's derived map instead of the robot artifact's
+colocated default; the override fails closed on a missing file. See
+"Navigation launch and scenario execution" immediately below for how
+`navigation.launch.py` now manages its own safety source.
+
+**Navigation launch and scenario execution.** `navigation.launch.py` now
+starts its own `safety_supervisor` node (`manage_controllers:=false
+required_sources:=["collision"]`), so the workflow that previously needed a
+separate 10 Hz CLI heartbeat to keep `/sim/safety/operator` cleared no
+longer applies when launching navigation this way. **This path is
+code-complete but not yet live-verified**: the live-wave step meant to prove
+it (asserting `/sim/status/command_gateway` reports `"safety_stop": false`
+with the arena nav stack up on the Isaac-side domain) never validly ran — it
+was misconfigured onto `ROS_DOMAIN_ID=25` while Isaac ran on 42, so the two
+halves of the stack never shared a domain and never spoke to each other (see
+the `ROS_DOMAIN_ID` trap under Known arena limitations).
+
+Two arena-native scenario variants exercise the arena directly:
+`find-and-approach-person-rcw2026` and `pick-deliver-place-rcw2026`
+(`simulation/scenarios/`), declaring `world: {"mode": "arena", "arena":
+"rcw2026"}` with poses verified against the committed derived occupancy map.
+Run either with `scenario_runner`:
+
+```bash
+PYTHONPATH=$PWD/simulation:$PYTHONPATH \
+  ros2 run tinker_sim_bridge scenario_runner \
+  --root $PWD --scenario find-and-approach-person-rcw2026 --seed 7
+```
+
+(`scenario_runner` imports `tinker_sim_core` at module level, so a bare
+`ros2 run` needs the `PYTHONPATH` above — see Known arena limitations.) A
+scenario's `actor_path_start` events (for example the person walking toward
+the robot) are executed separately by `actor_path_driver`, a one-shot node
+that drives actors along their declared paths via `/set_entity_state`:
+
+```bash
+ros2 run tinker_sim_bridge actor_path_driver \
+  --root $PWD --scenario find-and-approach-person-rcw2026
+```
+
+`actor_path_driver` resolves `tinker_sim_core` from `--root` itself (commit
+`bd4b553`) and does not need `PYTHONPATH` set. Both commands require
+`ROS_DOMAIN_ID` to match the Isaac-side domain the arena sim was launched
+on (`42` in the live acceptance runbook above). `actor_path_driver` itself
+is NOT proven live: the 2026-08-20 wave found it crashed immediately on the
+first `/clock` message (`TypeError: 'ROSClock' object is not callable`,
+`reports/arena-fixes-2026-08-19/person-walk.json`) because its callback
+shadowed an `rclpy.node.Node` instance attribute; that bug is fixed (commit
+`de95b71`, with AST regression guards), but the fix itself has not been
+re-run live.
+
+The streaming wrapper `scripts/launch-arena-streaming` and `--livestream`
+forwarding in the deploy CLI are **not** part of this branch — they live in
+separate, uncommitted work. The headless streaming smoke recorded below was
+therefore run by invoking `validation/run_sim.py` directly, not through
+either wrapper.
+
+Offline bundling does not pick up arena/object USDs automatically: register
+`arena.usd`'s path and sha256 under the optional `generated_arena_usds`
+array, and each object's `object.usd` path and sha256 under
+`generated_object_usds`, in `artifacts/asset-manifest.json`
+([`tools/tinker_sim_deploy/assets.py`](tools/tinker_sim_deploy/assets.py)).
+Both groups are optional — an absent group is fine — but every entry is
+hash-verified when either group is present.
+
+Validation performed on this branch (development-validated only):
+
+- unit suites are green, with a stable failing/erroring name-set matched
+  against this repo's pre-existing environmental failures (see "Developer
+  verification" below);
+- both artifacts hash-verify clean (`verify_asset_artifact(...) == []`) and
+  re-import is a proven byte-identical no-op;
+- visual/collision AABB agreement was spot-verified: within 1.4mm on three
+  YCB objects (cracker box, mug, bowl); arena furniture bounds were checked
+  against the upstream SDF within the configured 0.02m tolerance, with two
+  documented per-model exceptions (`rcw26_door`, `rcw26_sink`) whose upstream
+  SDFs deliberately under-size the collision box (a trimmed door-panel depth
+  and a floor-anchored sink height, both for gripper-reach affordance, not
+  data errors);
+- a headless streaming smoke (`validation/run_sim.py --sensor-profile
+  navigation-parity --profile parity --scenario empty --seed 7 --headless
+  --livestream --arena rcw2026 --duration 45`) ran the full 45 simulated
+  seconds to a clean exit, with only headless-windowing/driver diagnostic
+  warnings in the log and no importer-scratch-path leakage;
+- a live end-to-end `./scripts/launch-arena-streaming --arena rcw2026` run
+  (2026-08-18) reached streaming readiness — ready file written, TCP 49100
+  listening, `viewport_ready: true`, arena `robocup-arena3` with 38
+  colliders loaded — and stayed up awaiting a client;
+- sensor-rich camera imagery of the arena's furniture: head and wrist
+  hardware-parity color/depth frames captured live against `--arena
+  rcw2026` (shelf close-ups plus a base-rotation panorama showing the TV
+  cabinet, trash bin, door, tiled floor, and plant), with per-frame content
+  statistics — `reports/arena-sensor-rich-2026-08-18/`; the wrist camera's
+  mount/intrinsics and arm-following viewpoint were verified separately in
+  `reports/arena-arm-camera-2026-08-18/`;
+- AMCL convergence on the derived map: with the spawn moved to a free cell
+  (`--spawn-xy=-2.0,-2.0`) and the Humble stack pointed at the arena map
+  (`map_yaml:=...`), AMCL locked to physics-truth within 0.07 m after
+  seeding and, over truth-validated gentle-motion runs, contracted to
+  position variance 0.035/0.050 m² (std ~0.2 m) at 0.14 rad yaw error —
+  `reports/arena-amcl-2026-08-18/SUMMARY.md`, which also records two real
+  findings: the default (0, 0) arena spawn sits inside `shelf_02`'s
+  footprint (hence the new `--spawn-xy` override), and sustained in-place
+  skid-steer rotation accumulates wheel-odometry yaw slip that drags the
+  filter (a base-odometry characteristic, not a map defect).
+
+- head pan/tilt effort override: with the backend's `effort_limit_sim`
+  override extended to the `head` actuator group, commanded pan/tilt
+  converged from spawn to within the 0.05 rad tolerance of a (1.0, -0.3)
+  rad target — final (0.9506, -0.2853) rad at sim t=0.317 s — closing the
+  2026-08-18 finding that pan/tilt drives inherited the URDF's 1.0 Nm
+  effort cap. Live-proven:
+  `reports/arena-fixes-2026-08-19/head-tracking.json`;
+- physics interaction (an object resting on arena furniture): the
+  pick-deliver-place `delivery_object` (0.08 m cube), spawned via the
+  standard `spawn_entity` path at its declared z=0.8 pose, fell onto and
+  came to rest statically (zero twist across 387 truth samples) on a 0.5 m
+  board of `rcw26_shelf` —
+  `reports/arena-scenario-spawn-2026-08-19/object-spawn-verification.md`.
+  **Superseded 2026-08-20**: this evidence came from `/get_entity_state`
+  polling, not physics truth; a later run under a profile that reports
+  physics truth found no trace of the object in it at all. See "Scenario-
+  spawned objects may not be physics-simulated" under Known arena
+  limitations below — that finding is SUSPECTED, not confirmed, so treat
+  this bullet as open again rather than either closed or refuted;
+- scenario entity spawning in the arena: `scenario_runner` executed
+  find-and-approach-person and pick-deliver-place against an `--arena
+  rcw2026` sim with every operation accepted; the person capsule and task
+  cube spawn at their exact declared world poses (verified via
+  `/get_entities`/`/get_entity_state` and `expected_objects` truth
+  correlation), and spawned entities are live rigid bodies
+  (`/set_entity_state` round-trips) —
+  `reports/arena-scenario-spawn-2026-08-19/`. Caveats: nothing implements
+  scenario `events` (the person's `actor_path_start` walk never runs), and
+  scenario poses were authored for the procedural world (the arena has no
+  pedestal at the object spawn; the person's declared pose sits in
+  furniture-dense space).
+
+Not yet validated (open):
+
+- textured-frame visual confirmation by a human viewer (the streaming
+  session above is up for exactly this; connect with NVIDIA's client).
+
+Known arena limitations (development findings, 2026-08-18 through 2026-08-20):
+
+- the default robot spawn (0, 0) lies inside `shelf_02`'s physical and
+  rasterized footprint. The launch now fails closed on this instead of
+  spawning into it: `validate_arena_spawn()` exits non-zero and names the
+  nearest free cell in the error (`arena spawn (0.0, 0.0) lacks 0.35 m
+  clearance on the derived map; try --spawn-xy=-0.4,0.4`) — pass the
+  suggested `--spawn-xy` for navigation work (see launch docs above).
+  Live-proven: `reports/arena-fixes-2026-08-19/spawn-fail-closed.log`
+  (exit 1, suggestion printed);
+- under `sensor-rich`, an occupied dev-lidar sensor origin (for example the
+  spawn-in-`shelf_02` case above) used to publish a dense ring at ~0.3 m
+  for every ray. The 2026-08-18 note here misdescribed this as an RTX-lidar
+  self-hit; there is no RTX lidar in this path, and the ring was the
+  occupancy raycast's minimum-range floor being returned when every ray
+  starts inside an occupied cell. An occupied ray origin now publishes an
+  empty cloud instead. Unit-proven only, no live run has targeted this
+  path: `tests/test_ros_gateway.py`
+  (`RosDevelopmentLidarTest.test_development_lidar_empty_when_origin_occupied`);
+- wheel-velocity commands are slew-limited to 60 rad/s² (≈3.1 m/s² linear
+  at the 0.0525 m wheel radius), set deliberately ABOVE Nav2's `acc_lim`
+  (~2.5 m/s²) so planner-shaped velocity profiles pass through unchanged —
+  the bound exists to floor non-planner commanders and stale-target
+  transients, not to shape Nav2 output. Live-proven: after a 30 s in-place
+  rotation, an idle base commanded to coast drifted only 8.0e-05 m in XY
+  over the following 30 s, far inside the 0.1 m bound —
+  `reports/arena-fixes-2026-08-19/coast.json`;
+- sustained in-place skid-steer rotation accumulates wheel-odometry yaw
+  slip (a base-odometry characteristic, not a map defect — see the AMCL
+  validation note above). This is a dead end for IMU fusion: the sim IMU
+  publishes only world-frame angular velocity, marks
+  `orientation_covariance[0] = -1.0` (REP-145 "orientation not provided"),
+  and never populates linear acceleration, so fusing it into an EKF would
+  only duplicate odom's own vyaw rather than correct it.
+
+Found on 2026-08-20, while the live evidence wave was closing out the
+fixes above:
+
+1. **Scenario-spawned objects may not be physics-simulated.** Isaac logs
+   `Physics tensor entity not valid for rigid body /World/Scenario/<id>`
+   and the object was observed holding its exact spawn pose with
+   fabricated zero velocities. This is SUSPECTED, not confirmed: it was
+   seen through a run whose profile could not report objects at all
+   (fixed since, commit `02d1785`), so it may prove to be an artifact of
+   that. This supersedes the 2026-08-19 claim above that the "object
+   rests on furniture" item was closed — that evidence came from
+   `/get_entity_state`, not physics truth. Evidence:
+   `reports/arena-fixes-2026-08-19/object-on-table.json`.
+2. **`ROS_DOMAIN_ID` trap.** `.deployment.env` sets `ROS_DOMAIN_ID=25` and
+   `scripts/launch-humble` defaults to `${ROS_DOMAIN_ID:-25}`, so sourcing
+   `.deployment.env` silently overrides the 42 that live arena runs use.
+   Export 42 AFTER sourcing, in every shell, including the one that runs
+   `launch-humble`. `.deployment.env` must still be sourced — it carries
+   the Isaac EULA acceptance variable.
+3. **`scenario_runner` needs `PYTHONPATH` under a bare `ros2 run`.** It
+   imports `tinker_sim_core` at module level (`scenario_runner.py:22`),
+   so CLI invocations need `PYTHONPATH=$PWD/simulation:$PYTHONPATH`.
+   `actor_path_driver` does NOT need this — it resolves
+   `tinker_sim_core` from `--root` as of commit `bd4b553`.
+
+Status: development-validated only, **not release-qualified**.
 
 ## Offline provisioning
 
@@ -276,6 +775,136 @@ derived hash/contract from the real source and fails on mutations.  The two
 repository-local source-lock files are Task 9 only.  See
 `integration/MANIPULATION.md` for the operator workflow.
 
+## Integrated OMPL qualification CLI
+
+`validation/integrated_qualification.py` orchestrates the integrated OMPL
+qualification Gates A-F.  It is an offline orchestration layer over the
+six-gate core suite, the offline static closure, and the live C/D/E scenario
+attempts, with an offline Gate-F evidence rebuild/verify.  Task 10's own tests
+and this documentation make no live Gate F/OMPL/cuMotion claim.
+
+Use one consistent suite path variable:
+
+```bash
+SUITE_DIR=outputs/integrated/integrated-ompl-seed-7
+```
+
+`SUITE_DIR` is passed as the runner's `--attempt-root`.  It is the exact
+integrated suite directory; nothing is silently appended below it.  A repeated
+qualification run must choose a fresh `--attempt-root`; never merge a new run
+into an old suite.  The six-gate Stage-A core suite runs in the sibling root
+`<SUITE_DIR>-core/` (here `outputs/integrated/integrated-ompl-seed-7-core/`),
+outside the integrated Gate-F index.
+
+Gate A (six-gate core suite):
+
+```bash
+./.venv/bin/python validation/integrated_qualification.py \
+  --attempt-root "$SUITE_DIR" --stage A
+```
+
+Gate B (offline static closure; `--offline` is an explicit compatibility flag
+for the already-offline B implementation and must not make any live stage
+offline or bypass checks):
+
+```bash
+./.venv/bin/python validation/integrated_qualification.py \
+  --attempt-root "$SUITE_DIR" --stage B --offline
+```
+
+Gate C (three OMPL plan-only scenarios):
+
+```bash
+./.venv/bin/python validation/integrated_qualification.py \
+  --attempt-root "$SUITE_DIR" --stage C
+```
+
+Gate D (six execute scenarios):
+
+```bash
+./.venv/bin/python validation/integrated_qualification.py \
+  --attempt-root "$SUITE_DIR" --stage D
+```
+
+Gate E (eight pick-place scenarios):
+
+```bash
+./.venv/bin/python validation/integrated_qualification.py \
+  --attempt-root "$SUITE_DIR" --stage E
+```
+
+Gate F (standalone offline rebuild/verify):
+
+```bash
+./.venv/bin/python validation/integrated_qualification.py \
+  --attempt-root "$SUITE_DIR" --stage F
+```
+
+All stages (`--stage all`):
+
+```bash
+./.venv/bin/python validation/integrated_qualification.py \
+  --attempt-root "$SUITE_DIR" --stage all
+```
+
+The standalone Gates A through F above and `--stage all` are alternatives.
+`--stage all` must use a fresh suite path and must not be run against a suite
+that already has write-once A-E stage records.
+
+Independent verifier replay against the selected immutable C/D/E attempt
+directory.  Every C/D/E scenario runs in a newly created immutable attempt
+directory named `STAGE-<scenario>-<invocation>-<counter>`.  The selection
+below finds the exact single immutable matching attempt under `$SUITE_DIR`,
+fails unless exactly one match is found, and binds it to `ATTEMPT_DIR`:
+
+```bash
+ATTEMPT_DIR="$(find "$SUITE_DIR" -maxdepth 1 -type d \
+  -name 'C-qualification-moveit-plan-joint-*' | sort)"
+test "$(printf '%s\n' "$ATTEMPT_DIR" | sed '/^$/d' | wc -l)" -eq 1
+./.venv/bin/python validation/integrated_gate_verifier.py \
+  --scenario qualification-moveit-plan-joint \
+  --attempt-dir "$ATTEMPT_DIR" \
+  --config simulation/qualification/integrated-ompl.json
+```
+
+Integrated contact-sheet regeneration against `$SUITE_DIR`:
+
+```bash
+./.venv/bin/python validation/integrated_contact_sheets.py --suite-dir "$SUITE_DIR"
+```
+
+Standalone evidence-index rebuild and Gate-F validation (writes
+`evidence-index.json` and `qualification-summary.json`):
+
+```bash
+./.venv/bin/python validation/integrated_evidence_index.py \
+  --suite-dir "$SUITE_DIR" --summary "$SUITE_DIR/qualification-summary.json" \
+  --validate
+```
+
+Failed-attempt retention/rerun rule: never delete or reuse a failed, stale, or
+old attempt or suite.  Every C/D/E scenario runs in a freshly created immutable
+attempt directory; repeated allocation yields distinct preserved paths.  To
+rerun, choose a fresh suite path (a fresh `--attempt-root`); never merge a new
+run into an old suite.
+
+Bounded build command (never raw colcon).  The wrapper ignores CLI args and
+internally executes colcon with `--parallel-workers 2`:
+
+```bash
+MAKEFLAGS='-j2 -l2' ./scripts/build-humble-overlay
+```
+
+Truthful scope:
+
+- The runtime config has three source-lock roles
+  (`simulator_overlay` / `production` / `qualification_tooling`).  The
+  qualification-tooling source-lock role is created only after Task 10 is
+  review-clean, in a separate lock-only commit, and only before live attempts.
+- No live Gate F/OMPL/cuMotion claim comes from Task 10's offline tests.
+- `_image_stats` thresholds still require live RTX calibration.
+- cuMotion remains prohibited until Task 37's live OMPL qualification passes.
+
 ## Developer verification
 
 The non-GPU tests run with the Ubuntu system Python:
@@ -313,6 +942,293 @@ References:
 - [Isaac Lab installation](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)
 
 ## Changelog
+
+- 2026-08-21 (bridge attached while driving / arm moving — "test when the
+  robot actually drives, and then when the arm moves"): Measured with a
+  `/cmd_vel` drive and `xarm7_traj_controller` trajectories: idle 0.71 ->
+  **0.81**, driving 0.59 -> **0.68**, arm 0.50 -> **0.63**. The simulator's
+  ROS gateway now takes inbound messages on the simulation thread
+  (`spin_once` -> `_take_pending`) instead of a private executor thread
+  (`TINKER_SIM_GATEWAY_EXECUTOR=1` restores it); `command_gateway` caps
+  changed snapshots at 60 Hz (`MIN_PUBLISH_PERIOD_S`); profile lines carry
+  `wall_time`/`sim_time` and a `spin_breakdown` with reception counters.
+  `TINKER_SIM_CPU_THREADS=16` recommended for live-stack runs. Remaining
+  cost while moving is PhysX (contact while driving, drives + target pushes
+  while the arm moves). Tests: `MainThreadIntakeTest` in
+  `tests/test_ros_gateway.py`, rate-limit cases in
+  `tests/test_command_gateway_keepalive.py`.
+- 2026-08-21 (ROS bridge RTF collapse — "check the accompanying ros bridge as
+  it slows the rtf down to ~0.2 when ROS stacks are active"): Measured and
+  fixed. With the Stage 2 bridge attached and idle the simulator fell from
+  RTF 0.77 to 0.23 because `command_gateway` re-sent every mux packet as a
+  full snapshot on its 150 Hz tick (~300-600 JointState/s), and each packet
+  cost the simulator ~0.9 ms plus a GIL tax on every other bucket. The
+  gateway now publishes only on change or every 50 ms (`KEEPALIVE_PERIOD_S`,
+  well inside the simulator's 0.5 s command watchdog): bridge-attached RTF
+  **0.71** (0.77 standalone). Simulator side: batched target apply, gripper
+  effort-limit dedup, `spin`/`unaccounted`/`wall` and `spin_breakdown` in the
+  step profile, opt-in `TINKER_SIM_GIL_SWITCH_INTERVAL_MS` and
+  `TINKER_SIM_CPU_THREADS`. Ruled out by measurement: CPU oversubscription,
+  GPU sharing, Fast DDS synchronous publish, camera fan-out. Runbook: the
+  Stage 2 command no longer passes `map_yaml:=""` (shell-expands to a
+  malformed argument that `ros2 launch` rejects); the default already
+  resolves to the artifact map. Tests: `tests/test_command_gateway_keepalive.py`,
+  gripper dedup in `tests/test_manipulation_runtime.py`.
+- 2026-08-21 (physics step cadence for live parity — "optimize its physics
+  step frequency for more live parity"): Split the simulator's single rate
+  into a PhysX solver rate (`TINKER_SIM_PHYSICS_HZ`, default 120, unchanged)
+  and an opt-in control rate (`TINKER_SIM_CONTROL_HZ`, default = physics
+  rate) at which Isaac Lab, target writes, wheel slew, gateway publish and
+  `/clock` run; each control step runs explicit `physics_hz / control_hz`
+  solver substeps of the validated 1/120 s. Measured (gpsr-rcw2026, RTF):
+  physics-only 0.75 -> 1.18 at control 60 (1.88 at 30) with the robot root
+  within 0.5 mm of the default after 10 s, versus 5 mm drift for the old
+  `TINKER_SIM_PHYSICS_HZ=60` advice; sensor-rich with ROS and 15 Hz cameras
+  0.35 -> 0.64 by default and 0.70 at control 60 (0.78 at 30) once combined
+  with the lidar, hold, actuator-launch and camera fixes below. Found along
+  the way via a new
+  `publish_breakdown_ms` in the `TINKER_SIM_PROFILE=1` output that the
+  development-lidar ray-cast cost ~35 ms per lidar frame (~350 ms per
+  simulated second); `OccupancyMap.raycast_many` now casts all 181 rays
+  vectorised with chunked early exit, proven bit-identical to the scalar
+  loop (`tests/test_occupancy_raycast_vectorised.py`), ~2-5 ms per frame.
+  Also opt-in `TINKER_SIM_SOLVER_POSITION_ITERATIONS` /
+  `TINKER_SIM_SOLVER_VELOCITY_ITERATIONS` (robot USD authors 32 / 1;
+  fidelity-affecting, not for evidence runs). Measured non-results: omni.physx
+  `simulate(elapsed)` does not substep (a `timeStepsPerSecond` override
+  silently integrates at the control dt — caught by a step-count check and
+  replaced by explicit substeps), and PhysX worker-thread count (4/8/16)
+  changes nothing. Runbook: "Control cadence under a live stack".
+  Follow-up the same day (result-neutral, no knobs): the safety hold is now
+  PhysX's own drive at the latched pose (stiffness 600 / damping 80 / 100 Nm
+  ceiling, gravity fed forward and refreshed every 30 control steps) instead
+  of a Python PD pushed every step that limit-cycled (joint1 pinned at
+  -100 Nm) -- stopped control step 13.3 -> 4.5 ms, arm within 0.005 rad at
+  rest, hold telemetry computed with the hold gains; actuator groups are
+  applied with two Warp launches instead of ten per target push
+  (bit-identical buffers, push 4.3-6.4 -> 1.8 ms,
+  `TINKER_SIM_STOCK_ACTUATOR_MODEL=1` restores Isaac Lab's loop); camera
+  RGB/depth conversions reuse scratch buffers (byte-identical,
+  `tests/test_camera_publish_equivalence.py`). Found, not fixed: the
+  gripper's five finger/knuckle joints have no mimic constraint in
+  `robot.usd` (URDF `<mimic>` lost in conversion) and swing freely.
+  `tests/test_manipulation_runtime.py`'s fixture had silently errored 15
+  tests since `b6b6f0f`; repaired.
+  Later the same day: cameras at 12 Hz (`TINKER_SIM_CAMERA_HZ=12`, exact at
+  control 60/120) measured RTF 0.77 at control 60; the Kit render pump
+  (~30 ms per camera frame) was probed and is not render-mode, GI,
+  async-rendering or readback bound (each <1 ms) -- it is Kit's
+  per-render-product pipeline at the parity resolutions, so no result-neutral
+  lever remains there; depth metres->mm conversion moved to a Warp kernel on
+  the GPU (banker's rounding, byte-identical): RTF 0.80 at control 60 /
+  12 Hz, simulator VRAM peak 2.6 GB (old code 2.7-3.6 GB). The optional
+  `--camera-pointcloud` cloud is now built from millimetre depth (1 mm
+  quantisation).
+- 2026-08-21 (arena-findings fixes wrap-up — "Tasks 1-14 of the
+  arena-findings plan"): Landed eleven fixes against the arena findings
+  documented below: occupancy clearance and nearest-free-cell search
+  helpers; fail-closed arena spawn validation with a nearest-free
+  `--spawn-xy` suggestion (`b311a5b`); the dev lidar now publishes an empty
+  cloud from an occupied sensor origin instead of a raycast-floor ring
+  (`0a42eec`); the head `pan_joint`/`tilt_joint` actuator group now gets
+  the same `effort_limit_sim` override as arm/wheels (`5e07c5c`);
+  `slew_velocity_target` plus safety-stop idempotence (`e72574d`) and a
+  per-tick wheel-velocity slew bound of 60 rad/s² (`86ec363`);
+  actor-path interpolation with fail-closed `actor_path_start` validation
+  (`e780295`) and an `actor_path_driver` node that executes those paths via
+  `/set_entity_state` (`46ac8ae`); two arena-native scenario variants with
+  map-verified poses, `find-and-approach-person-rcw2026` and
+  `pick-deliver-place-rcw2026` (`9abaa74`, guarded for artifact-less
+  checkouts by `d0e36d4`); and a supervisor navigation mode so
+  `navigation.launch.py` runs its own `safety_supervisor` with
+  parameterized sources (`e36f606`).
+
+  A live evidence wave (2026-08-19/20, `reports/arena-fixes-2026-08-19/`)
+  then tried to prove all of the above, plus the navigation-safety and
+  object-resting claims, live. It confirmed three: the head-effort fix
+  converged to 0.9506/-0.2853 rad against a 1.0/-0.3 rad target, within
+  0.05 rad at sim t=0.317 s (`head-tracking.json`); the fail-closed spawn
+  check exited 1 with the `try --spawn-xy=` suggestion
+  (`spawn-fail-closed.log`); and the wheel-slew/coast bound held an idle
+  base to 8.0e-05 m of XY drift over 30 s post-rotation, far inside the
+  0.1 m bound (`coast.json`). It also found two real regressions and left
+  one step unrun: `actor_path_driver` crashed on its first `/clock`
+  message because its callback shadowed an `rclpy.node.Node` instance
+  attribute (`person-walk.json`); the pick-deliver-place object never
+  appeared in `/sim/internal/physics_truth` at all, because the
+  `navigation-parity` backend construction never passed
+  `expected_objects`/`scenario` (`object-on-table.json`), with Isaac
+  separately logging `Physics tensor entity not valid for rigid body` for
+  it on every query; and the navigation-safety-clear step never validly
+  ran because the nav stack was misconfigured onto `ROS_DOMAIN_ID=25`
+  while Isaac ran on 42.
+
+  Three post-wave repairs followed: `actor_path_driver` resolves
+  `tinker_sim_core` from `--root` instead of importing it at module level,
+  so a bare `ros2 run ... --root $PWD` is self-sufficient (`bd4b553`); the
+  `/clock` callback was renamed off the shadowed `_clock` attribute to
+  `_on_clock`, with two new AST regression guards (`de95b71`); and Task 14
+  fixed the `navigation-parity` backend construction to pass
+  `expected_objects`/`scenario` like its sibling branches (`02d1785`,
+  `bddc0f9`), closing the H1 cause of the physics-truth blindness **in code
+  only — unit-proven by `tests/test_scenario_object_tracking.py`, not yet
+  re-run live**. A second, suspected cause (H2:
+  the object's pose and zero velocities looking frozen rather than
+  settled) remains unconfirmed — it was observed through a run that could
+  not see the object in physics truth at all, so it may be an artifact of
+  that, and needs its own live re-run to separate from H1.
+
+  Remaining unverified on this branch: `actor_path_driver`'s path-execution
+  fix (the crash is fixed; the walk itself has not been re-run live);
+  Task 14's fix (unit-proven — the gate suite went from 111 to 113 passing
+  — but not live-verified, since the wave that would have re-run this step
+  was stopped by the user); and the navigation-profile safety-clear
+  path (code-complete, never validly run). The dev-lidar occupied-origin
+  fix and the occupancy/safety-gating/actor-path helper suites remain
+  unit-proven only.
+
+  Test gates: the 13-file focused arena/CLI/safety suite under
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest` — 113 passed;
+  `tests/test_safety_contract.py` run separately — 20 passed, 1
+  pre-existing failure
+  (`test_stopped_command_packets_are_blocked_before_parse_without_error_logging`,
+  a teammate gateway rework predating this branch, report-don't-fix, not
+  this plan's regression); `python3 -m unittest discover -s tests` — 601
+  tests, 19 failures (all `test_provenance.Task8OMPLOverlayProvenanceTest`,
+  the known `tk25_ws` branch-state issue) and 22 errors (19 PIL
+  `Resampling` failures on `ManipulationContactSheetsTest`, plus 3 loader
+  errors for `test_manipulation_runtime`/`test_actuator_safety_startup`/
+  `test_scenario_runner` — torch and `tinker_sim_bridge` unavailable under
+  system Python). `test_base_velocity_slew.py` and `test_safety_contract.py`
+  define module-level pytest functions, not `unittest.TestCase` subclasses,
+  so `unittest discover` cannot collect them; their status is the pytest
+  results above, not the discovery run. `tests/test_chassis_ballast.py`
+  fails 6/6 against currently committed code
+  (`CHASSIS_BALLAST_ADDED_MASS_KG` raised to 30.0 by a different, concurrent
+  workstream on this shared branch, whose 50 kg total the test's 30 kg
+  assertion no longer matches) — an external branch condition, not a
+  regression from this plan's work.
+
+- 2026-08-19 (arena scenario entity spawning — "verify person and object
+  spawn"): Verified the standard scenario spawn path inside `--arena
+  rcw2026`: `scenario_runner` ran find-and-approach-person and
+  pick-deliver-place with every operation accepted; the person capsule and
+  delivery cube spawn at their exact declared world poses (checked via
+  `/get_entities`, `/get_entity_state`, and the physics-truth
+  `expected_objects` prim correlation), spawned entities are live rigid
+  bodies (`/set_entity_state` round-trips), and the delivery cube fell from
+  its declared z=0.8 onto a 0.5 m `rcw26_shelf` board and came to rest
+  statically — closing the "object resting on arena furniture" physics
+  item. Evidence: `reports/arena-scenario-spawn-2026-08-19/` (gitignored,
+  dev host). Findings recorded there: scenario `events` (actor paths) are
+  not implemented by any component, scenario poses were authored for the
+  procedural world rather than the arena, and an idle base coasts ~1.5 m
+  after a rotation sweep before settling.
+
+- 2026-08-18 (RoboCup arena validation evidence + spawn/map overrides —
+  "run the arena streaming launch and capture the outstanding validation
+  evidence"): Ran `./scripts/launch-arena-streaming --arena rcw2026` end to
+  end to streaming readiness; captured sensor-rich head/wrist camera
+  evidence of the arena furniture
+  (`reports/arena-sensor-rich-2026-08-18/`), verified the wrist camera's
+  mount, intrinsics, and arm-following viewpoint
+  (`reports/arena-arm-camera-2026-08-18/`), and validated AMCL on the
+  derived arena map against `/sim/internal/physics_truth`
+  (`reports/arena-amcl-2026-08-18/SUMMARY.md`). Two defects surfaced and
+  were addressed: the default arena spawn (0, 0) sits inside `shelf_02`'s
+  physical/rasterized footprint — fixed by an opt-in, fail-closed
+  `--spawn-xy X,Y` override threaded `deploy CLI -> run_sim.py ->
+  IsaacWholeRobotBackend.spawn_xy` (defaults unchanged;
+  `tests/test_spawn_override.py`, 11 tests) — and
+  `navigation.launch.py` hard-wired AMCL's map to the robot artifact's
+  colocated `map.yaml` — fixed by an optional fail-closed `map_yaml:=`
+  launch argument (`resolve_map_yaml`;
+  `tests/test_navigation_launch_map.py`, 5 tests). Documented findings:
+  head pan/tilt effort starvation (1.0 Nm URDF cap, no backend
+  `effort_limit_sim` override), sensor-rich lidar self-hit ring, and
+  skid-steer rotational odometry yaw slip. Focused arena/CLI suites pass
+  78/78; full `unittest discover` failing set is environmental/external
+  only (system PIL lacks `Image.Resampling`, `torch`/`tinker_sim_bridge`
+  unavailable to system Python, and `test_provenance` pins a
+  `tk25_manipulation` commit unreachable while that workspace sits on
+  `collision-aware-grasp`), plus the pre-existing uncommitted
+  `tests/test_base_velocity_slew.py`, which imports a
+  `slew_velocity_target` that no commit implements (in-progress task50
+  work). Textured-frame human confirmation remains the open item; the
+  streaming session is left up for it.
+
+- 2026-08-17 (RoboCup 2026 arena import, Tasks 1-11 — "import, launch, and
+  document the RoboCup 2026 arena and YCB objects"): Added a RoboCup 2026
+  arena importer (`tools/arena_import.py`, `config/arena-import.json`,
+  pinned `TeamSOBITS/sobits_gazebo_worlds@feature/hri`
+  `293b4057d26a673c3f09ff7d8f3118234d42ba24`) and a YCB tabletop-object
+  importer (`tools/ycb_import.py`, `config/ycb-import.json`, pinned
+  `TeamSOBITS/tmc_wrs_gz@jazzy-devel`
+  `48157eec99bfc50f8d24ad95736d4d10bb344c14`), sharing pin-verification/
+  clone/source-record helpers in new `tools/tinker_sim_deploy/import_common.py`
+  and a new Kit conversion adapter `tools/tinker_sim_deploy/arena_convert.py`.
+  New library modules parse the pinned Gazebo world and its model colliders
+  (`tools/tinker_sim_deploy/arena_world.py`), rasterize a derived
+  `map.yaml`/`map.pgm` from the wall/furniture collision footprints sliced
+  at the tinker2 Livox scan height (`arena_map.py`), and record world-frame
+  placement surfaces (`arena_surfaces.py`, `placement.json`). Publication
+  reuses the existing content-addressed artifact machinery
+  (`arena_artifact.py`) under `artifacts/arena/rcw2026/` and
+  `artifacts/objects/ycb/`, each with a `current.json` pointer,
+  `source-lock.json`, and `ATTRIBUTION.md` (arena: SOBITS BSD-3-Clause;
+  YCB: CC BY 4.0 attribution to the Yale-CMU-Berkeley Object and Model Set
+  plus the Toyota `tmc_wrs_gz` wrapper's Clear BSD).
+  `validation/run_sim.py` gained a `--arena` flag (mutually exclusive with
+  `--map` and with `--arena-colors`) and
+  `simulation/tinker_sim_core/scenario.py` gained `validate_world_selection`,
+  validating a scenario's `world: {"mode": "arena", "arena": "rcw2026"}`
+  declaration fail-closed against the launcher's `--arena` value;
+  `simulation/tinker_sim_isaac/backend.py` gained an opt-in `arena_artifact`
+  construction path. `tools/tinker_sim_deploy/assets.py` gained optional,
+  validated-when-present `generated_arena_usds`/`generated_object_usds`
+  asset-manifest groups for offline bundling. Both importers were live-run
+  on the dev host to a hash-verified artifact
+  (`verify_asset_artifact(...) == []`) proven byte-identical on re-import;
+  visual/collision AABB agreement was spot-verified (within 1.4mm on three
+  YCB objects; arena furniture within the configured 0.02m of its
+  SDF-declared collision box, with two documented per-model exceptions,
+  `rcw26_door`/`rcw26_sink`); a headless streaming smoke with `--arena
+  rcw2026` ran 45 simulated seconds to a clean exit, invoking
+  `validation/run_sim.py` directly on this dev host — the
+  `scripts/launch-arena-streaming` wrapper and the deploy-CLI's
+  `--livestream` forwarding are separate, uncommitted work and are not part
+  of this branch. Textured-frame visual confirmation by a human viewer,
+  physics interaction with arena furniture, sensor-rich camera imagery of
+  the arena, and AMCL convergence on the derived map remain unvalidated.
+  New `README.md` "RoboCup 2026 arena" section documents provenance, import
+  commands, launch usage, and this status. Status: development-validated
+  only, **not release-qualified**.
+
+- 2026-08-05 (integrated qualification Task 10 — "document integrated
+  qualification CLI"): Documented the offline integrated OMPL qualification
+  CLI with one consistent `SUITE_DIR` variable and exact standalone command
+  blocks for Gates A-F (Gate B with the explicit `--offline` compatibility
+  flag), `--stage all`, the deterministic single-match verifier replay
+  (`ATTEMPT_DIR` selection that fails unless exactly one immutable matching
+  attempt exists), the integrated contact-sheet regeneration, and the bounded
+  `MAKEFLAGS='-j2 -l2' ./scripts/build-humble-overlay` build command (the
+  wrapper ignores CLI args and internally executes colcon with
+  `--parallel-workers 2`).  Standalone Gates A-F and `--stage all` are
+  documented as alternatives; `--stage all` must use a fresh suite path and
+  must not be run against a suite that already has write-once A-E stage
+  records.  The evidence-index command writes `qualification-summary.json` via
+  `--summary`.  The documentation states the fresh-suite retention rule (never
+  delete/reuse; choose a fresh `--attempt-root`), the three source-lock roles
+  with the qualification-tooling role created only after review-clean Task 10,
+  and the live-only caveats (no live Gate F/OMPL/cuMotion claim from Task 10
+  offline tests, `_image_stats` still requires live RTX calibration, and
+  cuMotion remains prohibited until Task 37 live OMPL passes).  New
+  `tests/test_integrated_acceptance_docs.py` asserts the exact command
+  blocks/paths, fresh-suite retention wording, bounded build command,
+  three-lock sequence, live-only caveats, and cuMotion prohibition verbatim in
+  `docs/acceptance.md`, `integration/MANIPULATION.md`, and `README.md`.  No
+  build, no live Isaac/ROS/GPU/cuMotion, and no source-lock file changed; the
+  future qualification-tooling source-lock role remains absent until Task 36.
 
 - 2026-08-04 (integrated qualification Task 9, fix round 5 — "final narrow
   production-suite closure"): Closed the last offline production-suite residuals

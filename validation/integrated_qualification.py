@@ -48,7 +48,11 @@ verifier never overrides failed teardown/drain/bag/resource evidence.  Teardown
 failures downgrade a scenario to ``evidence-invalid``; every attempt is
 preserved; a malformed scenario fails closed without skipping later controls.
 
-Stage F is the explicit Tasks 9-10 extension point and is not implemented here.
+Stage F closes the reproducibility/visual-evidence gate: it validates the
+persisted A-E stage records, then regenerates the evidence index, both
+integrated contact sheets, and the qualification summary through the Task 9
+producers, returning the validator verdict.  Standalone ``--stage F`` is pure
+offline verification and never launches live processes.
 
 The module is ROS-free Python 3.12 (it imports no ``rclpy`` and no generated
 messages); the live Isaac/ROS processes it launches are children invoked via
@@ -71,6 +75,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
+# ROOT itself is required so the Task-9 producers (``integrated_evidence_index``
+# imports ``simulation.tinker_sim_isaac.qualification_visual_capture``) resolve
+# under every invocation form, including ``python validation/...py`` where the
+# script directory, not ROOT, is the first sys.path entry.
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "validation"))
 sys.path.insert(0, str(ROOT / "simulation"))
 sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge"))
@@ -97,6 +106,7 @@ try:
         qualification_rosbag_qos_profiles,
         qualification_attempt_processes,
         qualification_compare_truth_records,
+        qualification_orphan_failure,
         qualification_record_topics,
         qualification_settle_evidence_files,
         qualification_start_process,
@@ -127,6 +137,7 @@ except ModuleNotFoundError:
         qualification_rosbag_qos_profiles,
         qualification_attempt_processes,
         qualification_compare_truth_records,
+        qualification_orphan_failure,
         qualification_record_topics,
         qualification_settle_evidence_files,
         qualification_start_process,
@@ -158,7 +169,6 @@ CORE_GATE_NAMES = tuple(GATES)
 QUALIFICATION_SCENARIO_NAMES = (
     "qualification-moveit-plan-joint",
     "qualification-moveit-plan-pose",
-    "qualification-moveit-plan-blocked",
     "qualification-moveit-execute-joint",
     "qualification-moveit-execute-pose",
     "qualification-moveit-cartesian-retreat",
@@ -183,8 +193,63 @@ STATUS_EVIDENCE_INVALID = "evidence-invalid"
 STATUS_BLOCKED = BLOCKED_BY_GATE_B
 STATUS_NOT_IMPLEMENTED = "not-implemented"
 
+# Write-once, atomic per-stage records persisted under the integrated suite.
+# Stage F is the only repeatable stage and regenerates only derived outputs.
+STAGE_RECORD_FILENAMES = {
+    "A": "stage-a-result.json",
+    "B": "stage-b-result.json",
+    "C": "stage-c-result.json",
+    "D": "stage-d-result.json",
+    "E": "stage-e-result.json",
+}
+
+#: Integrated Stage C plan-only evidence may record zero messages only for the
+#: truth topics that a plan-only attempt never produces: object state and
+#: contacts.  Every other approved topic, including ``/clock`` and
+#: ``/sim/truth/robot_state``, still requires a positive count.  The exception is
+#: scoped to Stage C and is never applied to manipulation gates or to any other
+#: bag.
+STAGE_C_ZERO_ALLOWED_TOPICS = frozenset(
+    {"/sim/truth/object_state", "/sim/truth/contacts"}
+)
+
+#: Integrated Stage D scenarios that never produce object/contact truth may
+#: record zero messages for the same truth topics as Stage C plan-only: object
+#: state and contacts.  The allowance is per-scenario: a D scenario whose
+#: ``expected_physical`` requires object/contact interaction still requires
+#: positive counts.
+STAGE_D_ZERO_ALLOWED_TOPICS = frozenset(
+    {"/sim/truth/object_state", "/sim/truth/contacts"}
+)
+
+#: Integrated physical predicates that are evaluated from object/contact truth.
+#: A Stage D scenario whose ``expected_physical`` intersects this set requires
+#: positive rosbag counts on the object/contact truth topics; a D scenario with
+#: none of these (free-space execute, gripper-only) may record zero.
+CONTACT_OBJECT_PHYSICAL = frozenset(
+    {
+        "bilateral_contact",
+        "lift",
+        "transport",
+        "bounded_tcp_object_drift",
+        "release_in_place_region",
+        "settled_speed",
+        "no_arm_obstacle_contact",
+    }
+)
+
+# The six-gate Stage-A core suite lives outside the integrated Gate-F index in
+# the sibling ``<suite>-core`` root (C1).
+CORE_SUITE_DIRNAME_SUFFIX = "-core"
+
+# Derived Stage-F outputs (the only artifacts F may regenerate).
+INDEX_NAME = "evidence-index.json"
+SUMMARY_NAME = "qualification-summary.json"
+AGENT_SHEET_NAME = "contact-sheet-integrated-agent.png"
+USER_SHEET_NAME = "contact-sheet-integrated-user.png"
+
 DEFAULT_CONFIG = ROOT / "simulation/qualification/integrated-ompl.json"
-DEFAULT_PRODUCTION_ROOT = Path("/home/tinker/tk25_ws")
+DEFAULT_PRODUCTION_ROOT = Path("/home/tinker/tk25_ws/src/tk25_manipulation")
 DEFAULT_ATTEMPT_ROOT = ROOT / "outputs/integrated"
 DEFAULT_MODEL_BUNDLE_MANIFEST = ROOT / "outputs/ompl-overlay/model-bundle-r2/model-bundle.json"
 DEFAULT_PROVIDER_MANIFEST = ROOT / "ros2_ws/src/tinker_sim_bridge/integration/provider-manifest.json"
@@ -573,9 +638,15 @@ class IntegratedRunner:
 
     def _run_core_suite(self) -> dict[str, Any]:
         core_config_path = self._core_config_path()
+        # C1: the six-gate Stage-A core suite lives in the sibling
+        # ``<suite>-core`` root, outside the integrated Gate-F index.
+        core_attempt_root = (
+            self.attempt_root.parent
+            / f"{self.attempt_root.name}{CORE_SUITE_DIRNAME_SUFFIX}"
+        )
         result = _run_suite(
             root=self.root,
-            attempt_root=self.attempt_root / "core",
+            attempt_root=core_attempt_root,
             config_path=core_config_path,
             artifact_path=None,
             seed=self.seed,
@@ -585,15 +656,49 @@ class IntegratedRunner:
             gate_commands={},
             base_domain_id=self.base_domain_id,
         )
+        suite_dir = Path(result.attempt_dir).resolve()
+        suite_result_path = suite_dir / "suite-result.json"
+        try:
+            suite_result_sha256 = (
+                hashlib.sha256(suite_result_path.read_bytes()).hexdigest()
+                if suite_result_path.is_file()
+                else None
+            )
+        except OSError:
+            suite_result_sha256 = None
+        core_status = str(result.status)
+        if core_status not in {
+            STATUS_VERIFIED_PASS,
+            STATUS_VERIFIED_FAIL,
+            STATUS_EVIDENCE_INVALID,
+        }:
+            core_status = STATUS_EVIDENCE_INVALID
         return {
-            "status": result.status,
+            "status": core_status,
             "attempt_dir": str(result.attempt_dir),
+            "suite_dir": str(suite_dir),
+            "suite_result_sha256": suite_result_sha256,
             "gate_results": {
                 str(gate): dict(record) for gate, record in result.gate_results.items()
             },
         }
 
     def _run_stage_a(self) -> dict[str, Any]:
+        record_path = self._stage_record_path("A")
+        if record_path.is_file():
+            try:
+                invoked_gates = self._core_gates()
+            except (OSError, ValueError, KeyError, TypeError):
+                invoked_gates = []
+            return {
+                "stage": "A",
+                "status": STATUS_EVIDENCE_INVALID,
+                "invoked_gates": invoked_gates,
+                "reasons": [
+                    f"{record_path.name} already exists; refusing to overwrite or relaunch"
+                ],
+                "stage_record": record_path.name,
+            }
         gates = self._core_gates()
         duplicate_gate_names = sorted(
             {name for name in gates if gates.count(name) > 1}
@@ -601,15 +706,26 @@ class IntegratedRunner:
         try:
             executed_gates = self._core_config_gates()
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            return {
+            return self._persist_stage_record("A", {
                 "stage": "A",
                 "status": STATUS_EVIDENCE_INVALID,
                 "invoked_gates": gates,
                 "duplicate_gate_names": duplicate_gate_names,
                 "reasons": [f"core config could not be read: {error}"],
-            }
+            })
+        if duplicate_gate_names:
+            return self._persist_stage_record("A", {
+                "stage": "A",
+                "status": STATUS_EVIDENCE_INVALID,
+                "invoked_gates": gates,
+                "duplicate_gate_names": duplicate_gate_names,
+                "reasons": [
+                    "integrated config required_core_gates are not unique: "
+                    + ", ".join(duplicate_gate_names)
+                ],
+            })
         if gates != executed_gates:
-            return {
+            return self._persist_stage_record("A", {
                 "stage": "A",
                 "status": STATUS_EVIDENCE_INVALID,
                 "invoked_gates": gates,
@@ -619,17 +735,57 @@ class IntegratedRunner:
                     "integrated config required_core_gates does not equal the "
                     "core config gate list exactly (order and uniqueness)"
                 ],
-            }
+            })
         core = self._run_core_suite()
-        return {
+        core_status = str(core.get("status", STATUS_VERIFIED_PASS))
+        core_reasons: list[str] = []
+        if core_status == STATUS_VERIFIED_PASS:
+            # A purported verified-pass core is load-bearing: it must carry a
+            # lowercase 64-hex suite_result_sha256, exact configured
+            # gate_results keys, and every configured gate verified-pass;
+            # otherwise the record is evidence-invalid.  A genuine core
+            # verified-fail is preserved verbatim.
+            suite_sha = core.get("suite_result_sha256")
+            if (
+                not isinstance(suite_sha, str)
+                or len(suite_sha) != 64
+                or suite_sha != suite_sha.lower()
+                or any(char not in "0123456789abcdef" for char in suite_sha)
+            ):
+                core_reasons.append(
+                    "verified-pass core suite_result_sha256 is not a lowercase 64-hex SHA-256"
+                )
+            gate_results = core.get("gate_results")
+            if not isinstance(gate_results, Mapping):
+                core_reasons.append("verified-pass core has no gate_results object")
+            else:
+                result_keys = sorted(str(key) for key in gate_results)
+                if result_keys != sorted(gates):
+                    core_reasons.append(
+                        "verified-pass core gate_results keys do not equal the "
+                        "configured gates exactly"
+                    )
+                for gate in gates:
+                    entry = gate_results.get(gate)
+                    if (
+                        not isinstance(entry, Mapping)
+                        or str(entry.get("status")) != STATUS_VERIFIED_PASS
+                    ):
+                        core_reasons.append(f"core gate {gate} is not verified-pass")
+            if core_reasons:
+                core_status = STATUS_EVIDENCE_INVALID
+        record: dict[str, Any] = {
             "stage": "A",
             "invoked_gates": gates,
             "executed_gates": executed_gates,
             "duplicate_gate_names": duplicate_gate_names,
-            "status": str(core.get("status", STATUS_VERIFIED_PASS)),
+            "status": core_status,
             "attempt_dir": core.get("attempt_dir"),
             "core_suite": core,
         }
+        if core_reasons:
+            record["reasons"] = core_reasons
+        return self._persist_stage_record("A", record)
 
     # ------------------------------------------------------------------ #
     # Gate B — offline static closure, fail closed, never trusts current state
@@ -859,15 +1015,25 @@ class IntegratedRunner:
         return evidence
 
     def _run_stage_b(self) -> dict[str, Any]:
+        record_path = self._stage_record_path("B")
+        if record_path.is_file():
+            return {
+                "stage": "B",
+                "status": STATUS_EVIDENCE_INVALID,
+                "reasons": [
+                    f"{record_path.name} already exists; refusing to overwrite or relaunch"
+                ],
+                "stage_record": str(record_path),
+            }
         attempt_start_path = self._write_attempt_start()
         try:
             attempt_start = _json_file(attempt_start_path)
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            return {
+            return self._persist_stage_record("B", {
                 "stage": "B",
                 "status": STATUS_EVIDENCE_INVALID,
                 "reasons": [f"attempt-start identity is invalid: {error}"],
-            }
+            })
         attempt_id = str(attempt_start.get("attempt_id", attempt_start_path.stem))
         reference_epoch = self._wall_epoch(attempt_start)
         gate_b_dir = self.attempt_root / f"gate-b-{attempt_id}"
@@ -876,14 +1042,14 @@ class IntegratedRunner:
         _, source_lock = self._invoke_source_lock_manifest(attempt_start_path, manifest_path)
         if source_lock.get("status") != "pass":
             self.static_contract_status = STATUS_EVIDENCE_INVALID
-            return {
+            return self._persist_stage_record("B", {
                 "stage": "B",
                 "status": STATUS_EVIDENCE_INVALID,
                 "source_lock": source_lock,
                 "reasons": [
                     str(source_lock.get("reason", "source-lock manifest is not authorized"))
                 ],
-            }
+            })
         static = self._invoke_static_contracts(manifest_path, gate_b_dir, reference_epoch)
         status = str(static.get("status", STATUS_EVIDENCE_INVALID))
         self.static_contract_status = status
@@ -897,7 +1063,7 @@ class IntegratedRunner:
             result["reasons"] = [
                 str(static.get("reason", "offline static closure did not pass"))
             ]
-        return result
+        return self._persist_stage_record("B", result)
 
     # ------------------------------------------------------------------ #
     # Stages C-E — per-scenario child-domain execution
@@ -1300,15 +1466,119 @@ class IntegratedRunner:
             **dict(verdict),
         }
 
+    @staticmethod
+    def _minimal_rosbag_index(attempt_dir: Path) -> dict[str, Any]:
+        """Build a minimal Task-9 evidence index for one attempt's rosbag.
+
+        ``_validate_rosbag`` consumes a real ``files`` projection categorized by
+        ``_category``; this minimal index carries only the rosbag metadata and
+        storage entries so the load-bearing QoS/type/count/storage semantics
+        apply to the attempt's bag without a full suite index.
+        """
+        attempt_dir = Path(attempt_dir).resolve()
+        bag_dir = attempt_dir / "rosbag"
+        files: list[dict[str, Any]] = []
+        if bag_dir.is_dir():
+            for path in sorted(bag_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                try:
+                    rel = path.relative_to(attempt_dir).as_posix()
+                except ValueError:
+                    continue
+                if rel == "rosbag/metadata.yaml":
+                    category = "rosbag-metadata"
+                elif rel.startswith("rosbag/"):
+                    category = "rosbag-storage"
+                else:
+                    continue
+                files.append({"path": rel, "category": category})
+        return {
+            "schema_version": 1,
+            "kind": "integrated-evidence-index",
+            "files": files,
+        }
+
+    def _is_stage_c_plan_only(self, attempt_dir: Path) -> bool:
+        """True for an integrated Stage-C plan-only attempt directory.
+
+        Production attempt dirs are ``<root>/C-<scenario>-<run_id>-<n>``; the
+        offline test shape is ``<root>/C/<scenario>``.  A committed
+        ``scenario-bundle.json`` ``integrated.stage == "C"`` is authoritative
+        when present; otherwise the directory path marker is used.
+        """
+        bundle_path = Path(attempt_dir) / "scenario-bundle.json"
+        if bundle_path.is_file():
+            try:
+                value = json.loads(bundle_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                value = None
+            if isinstance(value, Mapping):
+                integrated = value.get("integrated")
+                # A readable committed ``integrated.stage`` is authoritative in
+                # both directions (C vs not-C); only an absent stage falls back
+                # to the path marker.
+                if isinstance(integrated, Mapping) and isinstance(integrated.get("stage"), str):
+                    return integrated["stage"] == "C"
+        attempt_path = Path(attempt_dir).resolve()
+        if attempt_path.parent.name.upper() == "C":
+            return True
+        return attempt_path.name.startswith("C-")
+
+    def _integrated_zero_allowed_topics(self, attempt_dir: Path) -> frozenset[str]:
+        """Return the approved truth topics allowed to record zero messages.
+
+        Stage C plan-only attempts may record zero only for object/contact truth
+        (the plan never moves the arm).  A Stage D scenario may do the same when
+        its ``expected_physical`` requires no object/contact interaction
+        (free-space execute, gripper-only); a D/E scenario whose
+        ``expected_physical`` requires object/contact truth still requires
+        positive counts.  An absent/unreadable bundle stays fail-closed and
+        requires every approved topic.
+        """
+        if self._is_stage_c_plan_only(attempt_dir):
+            return STAGE_C_ZERO_ALLOWED_TOPICS
+        bundle_path = Path(attempt_dir) / "scenario-bundle.json"
+        if not bundle_path.is_file():
+            return frozenset()
+        try:
+            value = json.loads(bundle_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return frozenset()
+        if not isinstance(value, Mapping):
+            return frozenset()
+        integrated = value.get("integrated")
+        if not isinstance(integrated, Mapping):
+            return frozenset()
+        if integrated.get("stage") != "D":
+            return frozenset()
+        expected_physical = integrated.get("expected_physical")
+        if not isinstance(expected_physical, (list, tuple)):
+            return frozenset()
+        physical = tuple(str(item) for item in expected_physical)
+        if CONTACT_OBJECT_PHYSICAL.isdisjoint(physical):
+            return STAGE_D_ZERO_ALLOWED_TOPICS
+        return frozenset()
+
     def _integrated_rosbag_evidence(
         self, attempt_dir: Path
     ) -> tuple[bool, dict[str, Any], list[str]]:
-        """Tolerantly validate any rosbag recorded in the attempt directory.
+        """Validate any rosbag recorded in the attempt directory (C5).
 
-        The integrated-ompl overlay does not run the six-gate recorder, so a
+        Approved-topic availability remains a live qualification check, so a
         missing ``rosbag`` directory is non-load-bearing evidence.  A present
-        but unstructured/corrupt bag is a durable teardown/evidence failure that
-        downgrades the scenario to ``evidence-invalid``.
+        bag is load-bearing: corrupt/incomplete metadata, storage, a missing
+        approved topic, bad QoS, or an invalid count downgrades the scenario to
+        ``evidence-invalid`` before verifier success can be accepted.  This is
+        the integrated finalizer and never delegates to
+        ``qualification_rosbag_final_evidence`` (its six-gate minimum-count
+        lookup rejects the ``integrated`` gate).
+
+        Integrated Stage C plan-only attempts and Stage D scenarios that never
+        produce object/contact truth may record zero messages only for
+        ``/sim/truth/object_state`` and ``/sim/truth/contacts``; every other
+        approved topic, including ``/clock`` and ``/sim/truth/robot_state``,
+        still requires a positive count (F2.7).
         """
         bag_dir = attempt_dir / "rosbag"
         evidence: dict[str, Any] = {
@@ -1327,25 +1597,73 @@ class IntegratedRunner:
                 evidence,
                 ["integrated rosbag directory is present but has no metadata.yaml"],
             )
+        zero_allowed_topics = self._integrated_zero_allowed_topics(attempt_dir)
+        minimum_message_counts: dict[str, int] | None = None
+        if zero_allowed_topics:
+            minimum_message_counts = {topic: 1 for topic in APPROVED_RECORD_TOPICS}
+            for topic in zero_allowed_topics:
+                minimum_message_counts[topic] = 0
         try:
             metadata = qualification_rosbag_metadata_evidence(
                 metadata_path.read_text(encoding="utf-8"),
-                minimum_message_counts=None,
+                minimum_message_counts=minimum_message_counts,
             )
         except (OSError, ValueError) as error:
             evidence["status"] = "invalid"
             evidence["load_bearing"] = True
             return False, evidence, [f"integrated rosbag metadata is unreadable: {error}"]
         structured = bool(metadata.get("parsed"))
-        evidence["status"] = "valid" if structured else "invalid"
-        evidence["load_bearing"] = True
         evidence["metadata"] = metadata
+        evidence["load_bearing"] = True
         if not structured:
+            evidence["status"] = "invalid"
             return (
                 False,
                 evidence,
                 ["integrated rosbag metadata is not structured rosbag2 metadata"],
             )
+        # Storage: the output database must be present and openable.
+        output = qualification_rosbag_output_evidence(bag_dir)
+        evidence["output"] = output
+        # The present bag is also validated by the Task-9 semantic rosbag
+        # validator against a minimal metadata/storage index; every QoS, type,
+        # count, or storage semantic reason is load-bearing.
+        try:
+            from integrated_evidence_index import _validate_rosbag  # noqa: PLC0415
+        except ModuleNotFoundError:
+            from validation.integrated_evidence_index import _validate_rosbag  # noqa: PLC0415
+        semantic_reasons: list[str] = []
+        try:
+            _validate_rosbag(
+                self._minimal_rosbag_index(attempt_dir),
+                attempt_dir.resolve(),
+                semantic_reasons,
+                zero_allowed_topics=(
+                    set(zero_allowed_topics) if zero_allowed_topics else None
+                ),
+            )
+        except Exception as error:  # noqa: BLE001 - semantic validator boundary
+            semantic_reasons.append(f"integrated rosbag semantic validation failed: {error}")
+        evidence["semantic"] = {
+            "load_bearing": True,
+            "reasons": semantic_reasons,
+        }
+        failures: list[str] = []
+        for topic in metadata.get("missing_topics", []):
+            failures.append(f"integrated rosbag is missing approved topic {topic}")
+        for topic in metadata.get("below_minimum_topics", []):
+            failures.append(
+                f"integrated rosbag has an invalid message count for approved topic {topic}"
+            )
+        for topic in metadata.get("missing_qos_metadata", []):
+            failures.append(f"integrated rosbag is missing QoS metadata for {topic}")
+        if not output.get("open"):
+            failures.append("integrated rosbag output database is missing or not openable")
+        failures.extend(semantic_reasons)
+        if failures:
+            evidence["status"] = "invalid"
+            return False, evidence, failures
+        evidence["status"] = "valid"
         return True, evidence, []
 
     def _finalize_attempt(
@@ -1410,12 +1728,56 @@ class IntegratedRunner:
         except Exception as error:  # noqa: BLE001 - per-phase isolation
             failures.append(f"humble stop failed: {error}")
 
-        # Phase 5 — recorder stop (six-gate only; integrated path has no bag).
+        # Phase 5 — recorder stop (both the six-gate and integrated paths own a
+        # bag when the recorder was started; SIGINT-then-SIGTERM before the
+        # load-bearing integrated bag evidence in Phase 6).
+        rosbag_registered = "rosbag" in runner._processes
         try:
-            if "rosbag" in runner._processes:
+            if rosbag_registered:
                 exit_codes["rosbag"] = qualification_stop_process(runner, "rosbag")
         except Exception as error:  # noqa: BLE001 - per-phase isolation
             failures.append(f"rosbag stop failed: {error}")
+
+        # Phase 5b — the recorder must terminate as a planned stop: a
+        # classification of ``planned-termination``, returncode 0, and forced
+        # false.  A missing, malformed, unexpected, or forced termination fails
+        # closed before the load-bearing bag evidence is accepted.
+        rosbag_termination: dict[str, Any] | None = None
+        rosbag_termination_ok = not rosbag_registered
+        if rosbag_registered:
+            rosbag_termination = runner._termination.get("rosbag")
+            if not isinstance(rosbag_termination, Mapping):
+                failures.append("rosbag recorder has no termination record after stop")
+                rosbag_termination = None
+            else:
+                classification = str(rosbag_termination.get("classification", ""))
+                returncode = rosbag_termination.get("returncode")
+                forced = rosbag_termination.get("forced")
+                if classification != "planned-termination":
+                    failures.append(
+                        f"rosbag recorder termination classification is {classification}, "
+                        "expected planned-termination"
+                    )
+                if (
+                    not isinstance(returncode, int)
+                    or isinstance(returncode, bool)
+                    or returncode != 0
+                ):
+                    failures.append(
+                        f"rosbag recorder termination returncode is {returncode!r}, expected 0"
+                    )
+                if forced is not False:
+                    failures.append(
+                        f"rosbag recorder termination forced is {forced!r}, expected false"
+                    )
+            rosbag_termination_ok = (
+                rosbag_termination is not None
+                and str(rosbag_termination.get("classification", "")) == "planned-termination"
+                and isinstance(rosbag_termination.get("returncode"), int)
+                and not isinstance(rosbag_termination.get("returncode"), bool)
+                and rosbag_termination.get("returncode") == 0
+                and rosbag_termination.get("forced") is False
+            )
 
         # Phase 6 — tolerant integrated rosbag evidence (F2.7 semantics).
         rosbag_ok = False
@@ -1424,6 +1786,13 @@ class IntegratedRunner:
             rosbag_ok, rosbag_evidence, rosbag_failures = self._integrated_rosbag_evidence(
                 manifest.attempt_dir
             )
+            # An invalid registered-rosbag termination contract always fails the
+            # finalize evidence: rosbag_ok must never be true while termination
+            # is missing/malformed/unexpected/nonzero/forced.
+            if not rosbag_termination_ok:
+                rosbag_ok = False
+            if rosbag_termination is not None:
+                rosbag_evidence["termination"] = rosbag_termination
             if rosbag_failures:
                 failures.extend(rosbag_failures)
         except Exception as error:  # noqa: BLE001 - per-phase isolation
@@ -1434,8 +1803,10 @@ class IntegratedRunner:
         orphan_initial: list[dict[str, Any]] = []
         try:
             orphan_initial = qualification_attempt_processes(runner)
-            if orphan_initial:
-                qualification_terminate_attempt_orphans(runner)
+            orphan_survivors = (
+                qualification_terminate_attempt_orphans(runner) if orphan_initial else []
+            )
+            if qualification_orphan_failure(orphan_initial, orphan_survivors):
                 failures.append("orphan attempt processes remained after teardown")
         except Exception as error:  # noqa: BLE001 - per-phase isolation
             failures.append(f"orphan termination failed: {error}")
@@ -1466,6 +1837,7 @@ class IntegratedRunner:
             "drained": drained,
             "rosbag_ok": rosbag_ok,
             "rosbag_evidence": rosbag_evidence,
+            "rosbag_termination": rosbag_termination,
             "orphan_cleanup_required": bool(orphan_initial),
             "resources_clean": resources_clean,
         }
@@ -1523,16 +1895,34 @@ class IntegratedRunner:
                         # under the exact same ROS domain and attempt directory.
                         try:
                             self._write_scenario_bundle(attempt_dir, name, manifest)
-                            qualification_start_process(
-                                runner,
-                                "executor",
-                                self._executor_scenario_command(
-                                    name, attempt_dir, allocation.domain_id
-                                ),
-                                manifest,
-                            )
-                        except Exception as error:  # noqa: BLE001 - fail-closed executor launch
-                            failure_reasons.append(f"executor launch failed: {error}")
+                        except Exception as error:  # noqa: BLE001 - fail-closed bundle write
+                            failure_reasons.append(f"scenario bundle write failed: {error}")
+                        if not failure_reasons:
+                            try:
+                                # C5: the load-bearing rosbag recorder starts
+                                # after canonical PHYSICS_READY/bundle and before
+                                # the executor, through the existing
+                                # ``_start_rosbag`` QoS/output/readiness path.
+                                if not runner._start_rosbag(manifest):
+                                    failure_reasons.append(
+                                        "rosbag recorder failed to start; executor not launched"
+                                    )
+                            except Exception as error:  # noqa: BLE001 - fail-closed rosbag startup
+                                failure_reasons.append(
+                                    f"rosbag recorder startup raised: {error}"
+                                )
+                        if not failure_reasons:
+                            try:
+                                qualification_start_process(
+                                    runner,
+                                    "executor",
+                                    self._executor_scenario_command(
+                                        name, attempt_dir, allocation.domain_id
+                                    ),
+                                    manifest,
+                                )
+                            except Exception as error:  # noqa: BLE001 - fail-closed executor launch
+                                failure_reasons.append(f"executor launch failed: {error}")
                         if not failure_reasons:
                             terminal = self._wait_for_scenario_terminal(
                                 attempt_dir,
@@ -1583,6 +1973,7 @@ class IntegratedRunner:
                 failure_reasons,
                 finalize=finalize_evidence,
                 error=error_text,
+                attempt_dir=str(attempt_dir),
             )
         try:
             verdict = self._verify_attempt(attempt_dir, name, stage)
@@ -1593,6 +1984,7 @@ class IntegratedRunner:
                 STATUS_EVIDENCE_INVALID,
                 [f"verification failed: {error}"],
                 finalize=finalize_evidence,
+                attempt_dir=str(attempt_dir),
             )
         return self._scenario_result(
             name,
@@ -1601,6 +1993,7 @@ class IntegratedRunner:
             [],
             verdict=verdict,
             finalize=finalize_evidence,
+            attempt_dir=str(attempt_dir),
         )
 
     @staticmethod
@@ -1613,6 +2006,7 @@ class IntegratedRunner:
         verdict: Mapping[str, Any] | None = None,
         finalize: Mapping[str, Any] | None = None,
         error: str | None = None,
+        attempt_dir: str | None = None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "scenario": name,
@@ -1620,6 +2014,8 @@ class IntegratedRunner:
             "status": status,
             "started": True,
         }
+        if attempt_dir is not None:
+            result["attempt_dir"] = str(attempt_dir)
         if reasons:
             result["reasons"] = [str(reason) for reason in reasons]
         if verdict is not None:
@@ -1701,26 +2097,451 @@ class IntegratedRunner:
         return {"stage": stage, "status": status, "scenario_names": names, **results}
 
     def _run_stage_c(self) -> dict[str, Any]:
-        return self._run_scenario_stage("C")
+        return self._run_scenario_stage_write_once("C")
 
     def _run_stage_d(self) -> dict[str, Any]:
-        return self._run_scenario_stage("D")
+        return self._run_scenario_stage_write_once("D")
 
     def _run_stage_e(self) -> dict[str, Any]:
-        return self._run_scenario_stage("E")
+        return self._run_scenario_stage_write_once("E")
+
+    def _run_scenario_stage_write_once(self, stage: str) -> dict[str, Any]:
+        """Run a C/D/E scenario stage and persist its record write-once.
+
+        When the stage record already exists the stage fails closed before any
+        attempt allocation or launch, so a repeated run never merges new
+        attempts into an old suite (C1).
+        """
+        record_path = self._stage_record_path(stage)
+        if record_path.is_file():
+            try:
+                scenario_names = self._stage_scenarios(stage)
+            except (OSError, ValueError, KeyError, TypeError):
+                scenario_names = []
+            return {
+                "stage": stage,
+                "status": STATUS_EVIDENCE_INVALID,
+                "scenario_names": scenario_names,
+                "reasons": [
+                    f"{record_path.name} already exists; refusing to overwrite or relaunch"
+                ],
+                "stage_record": str(record_path),
+            }
+        return self._persist_stage_record(stage, self._run_scenario_stage(stage))
+
+    # ------------------------------------------------------------------ #
+    # Write-once stage records + Stage-F predecessor validation
+    # ------------------------------------------------------------------ #
+
+    def _stage_record_path(self, stage: str) -> Path:
+        return self.attempt_root / STAGE_RECORD_FILENAMES[str(stage).upper()]
+
+    def _persist_stage_record(self, stage: str, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Atomically persist a write-once stage record under the suite.
+
+        The record path is created under the integrated suite; an existing
+        record fails closed instead of being overwritten, so a repeated run can
+        never merge into or replace an old suite's evidence (C1).
+        """
+        path = self._stage_record_path(stage)
+        if path.is_file():
+            return {
+                **dict(result),
+                "status": STATUS_EVIDENCE_INVALID,
+                "reasons": [
+                    f"{path.name} already exists; refusing to overwrite or relaunch"
+                ],
+                "stage_record": str(path),
+            }
+        payload = {**dict(result), "stage_record": path.name}
+        _write_json_atomic(path, payload)
+        return dict(payload)
+
+    def _read_stage_record(self, stage: str) -> dict[str, Any] | None:
+        """Return the persisted stage record, or None when absent.
+
+        A present-but-malformed record raises ValueError so the predecessor
+        validation fails closed instead of trusting partial evidence.
+        """
+        path = self._stage_record_path(stage)
+        if not path.is_file():
+            return None
+        try:
+            value = _json_file(path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"stage record {path.name} is not finite JSON: {error}"
+            ) from error
+        if not isinstance(value, Mapping):
+            raise ValueError(f"stage record {path.name} is not a JSON object")
+        return dict(value)
+
+    def _validate_f_predecessors(self, suite_dir: Path) -> dict[str, Any]:
+        """C3: validate the persisted A-E records before any Stage-F write.
+
+        Returns ``verified-pass`` only when every predecessor is complete,
+        consistent with the configured gate/scenario sets, and the referenced
+        core evidence is still byte-current.  Any missing/malformed/mismatched
+        predecessor yields ``evidence-invalid`` with explicit reasons and
+        performs no index/sheet/summary generation.
+        """
+        suite_dir = Path(suite_dir).resolve()
+        reasons: list[str] = []
+        in_memory = {
+            key: value
+            for key, value in self._stage_results.items()
+            if key in STAGE_RECORD_FILENAMES
+        }
+        configured_gates = self._core_gates()
+        duplicate_configured_gates = sorted(
+            {name for name in configured_gates if configured_gates.count(name) > 1}
+        )
+        if duplicate_configured_gates:
+            reasons.append(
+                "configured core gates are not unique: "
+                + ", ".join(duplicate_configured_gates)
+            )
+
+        # ---- Stage A ----------------------------------------------------
+        try:
+            record_a = self._read_stage_record("A")
+        except ValueError as error:
+            reasons.append(str(error))
+            record_a = None
+        if record_a is None:
+            reasons.append(f"{STAGE_RECORD_FILENAMES['A']} is missing")
+        else:
+            a_status = str(record_a.get("status", ""))
+            if a_status != STATUS_VERIFIED_PASS:
+                reasons.append(
+                    f"stage A record status is {a_status}, expected {STATUS_VERIFIED_PASS}"
+                )
+            invoked = [str(name) for name in record_a.get("invoked_gates", [])]
+            if invoked != configured_gates:
+                reasons.append(
+                    "stage A record invoked_gates do not match the configured core gates"
+                )
+            core = record_a.get("core_suite")
+            if not isinstance(core, Mapping):
+                reasons.append("stage A record has no core_suite reference")
+            else:
+                recorded_core_status = str(core.get("status", ""))
+                if recorded_core_status != a_status:
+                    reasons.append(
+                        "stage A record top-level status conflicts with its core_suite status"
+                    )
+                core_gate_results = core.get("gate_results")
+                if not isinstance(core_gate_results, Mapping):
+                    reasons.append("stage A record core_suite has no gate_results object")
+                else:
+                    result_keys = sorted(str(key) for key in core_gate_results)
+                    if result_keys != sorted(configured_gates):
+                        reasons.append(
+                            "stage A record core_suite gate_results keys do not equal the "
+                            "configured gates exactly"
+                        )
+                    for gate in configured_gates:
+                        entry = core_gate_results.get(gate)
+                        if (
+                            not isinstance(entry, Mapping)
+                            or str(entry.get("status")) != STATUS_VERIFIED_PASS
+                        ):
+                            reasons.append(
+                                f"stage A gate {gate} is not verified-pass in the record"
+                            )
+                core_dir_value = core.get("suite_dir") or core.get("attempt_dir")
+                core_path: Path | None = None
+                if core_dir_value is None:
+                    reasons.append("stage A record core_suite has no suite_dir/attempt_dir")
+                else:
+                    try:
+                        core_path = Path(str(core_dir_value)).resolve()
+                    except (TypeError, ValueError):
+                        reasons.append("stage A record core_suite path is not a path")
+                if core_path is not None:
+                    expected_core_root = (
+                        suite_dir.parent / f"{suite_dir.name}{CORE_SUITE_DIRNAME_SUFFIX}"
+                    ).resolve()
+                    if not core_path.is_relative_to(expected_core_root):
+                        reasons.append(
+                            "stage A core suite does not live under the expected sibling core root"
+                        )
+                    suite_result_path = core_path / "suite-result.json"
+                    if not suite_result_path.is_file():
+                        reasons.append("stage A core suite-result.json is missing")
+                    else:
+                        try:
+                            current_sha = hashlib.sha256(
+                                suite_result_path.read_bytes()
+                            ).hexdigest()
+                        except OSError as error:
+                            reasons.append(
+                                f"stage A core suite-result.json is unreadable: {error}"
+                            )
+                        else:
+                            recorded_sha = core.get("suite_result_sha256")
+                            if not isinstance(recorded_sha, str) or recorded_sha != current_sha:
+                                reasons.append(
+                                    "stage A core suite-result.json SHA-256 no longer matches the record"
+                                )
+                        try:
+                            current_suite = _json_file(suite_result_path)
+                        except (OSError, ValueError, json.JSONDecodeError) as error:
+                            reasons.append(
+                                f"stage A core suite-result.json is not finite JSON: {error}"
+                            )
+                        else:
+                            current_status = str(current_suite.get("status", ""))
+                            if current_status != recorded_core_status:
+                                reasons.append(
+                                    "stage A core suite-result.json status no longer matches the record"
+                                )
+                            gates_map = current_suite.get("gates")
+                            if not isinstance(gates_map, Mapping):
+                                reasons.append(
+                                    "stage A core suite-result.json gates are not an object"
+                                )
+                            else:
+                                current_gate_keys = sorted(str(key) for key in gates_map)
+                                if current_gate_keys != sorted(configured_gates):
+                                    reasons.append(
+                                        "stage A core suite-result.json gates keys do not equal "
+                                        "the configured gates exactly"
+                                    )
+                                for gate in configured_gates:
+                                    entry = gates_map.get(gate)
+                                    if (
+                                        not isinstance(entry, Mapping)
+                                        or str(entry.get("status")) != STATUS_VERIFIED_PASS
+                                    ):
+                                        reasons.append(
+                                            f"stage A core suite gate {gate} is not verified-pass"
+                                        )
+            if "A" in in_memory:
+                mem_a = in_memory["A"]
+                if str(mem_a.get("status")) != a_status:
+                    reasons.append(
+                        "stage A in-memory status conflicts with the persisted record"
+                    )
+                mem_invoked = [str(name) for name in mem_a.get("invoked_gates", [])]
+                if mem_invoked != invoked:
+                    reasons.append(
+                        "stage A in-memory gate set conflicts with the persisted record"
+                    )
+
+        # ---- Stage B ----------------------------------------------------
+        try:
+            record_b = self._read_stage_record("B")
+        except ValueError as error:
+            reasons.append(str(error))
+            record_b = None
+        if record_b is None:
+            reasons.append(f"{STAGE_RECORD_FILENAMES['B']} is missing")
+        elif str(record_b.get("status")) != STATUS_VERIFIED_PASS:
+            reasons.append("stage B record status is not verified-pass")
+        if "B" in in_memory and record_b is not None:
+            if str(in_memory["B"].get("status")) != str(record_b.get("status")):
+                reasons.append(
+                    "stage B in-memory status conflicts with the persisted record"
+                )
+
+        # ---- Stages C/D/E ------------------------------------------------
+        seen_attempt_dirs: set[Path] = set()
+        for stage in ("C", "D", "E"):
+            try:
+                record = self._read_stage_record(stage)
+            except ValueError as error:
+                reasons.append(str(error))
+                record = None
+            if record is None:
+                reasons.append(f"{STAGE_RECORD_FILENAMES[stage]} is missing")
+                continue
+            if str(record.get("status")) != STATUS_VERIFIED_PASS:
+                reasons.append(f"stage {stage} record status is not verified-pass")
+            expected = self._stage_scenarios(stage)
+            recorded_names = [str(name) for name in record.get("scenario_names", [])]
+            if recorded_names != expected:
+                reasons.append(
+                    f"stage {stage} record scenario set does not match the configured scenario set"
+                )
+            if len(recorded_names) != len(set(recorded_names)):
+                reasons.append(f"stage {stage} record scenario_names are not unique")
+            expected_keys = {str(name) for name in expected} | {
+                "stage",
+                "status",
+                "scenario_names",
+                "stage_record",
+            }
+            recorded_keys = {str(key) for key in record}
+            if recorded_keys != expected_keys:
+                reasons.append(
+                    f"stage {stage} record keys do not equal the expected scenario/summary key set"
+                )
+            for name in expected:
+                entry = record.get(name)
+                if not isinstance(entry, Mapping):
+                    reasons.append(f"stage {stage} record is missing scenario {name}")
+                    continue
+                if str(entry.get("status")) != STATUS_VERIFIED_PASS:
+                    reasons.append(f"stage {stage} scenario {name} is not verified-pass")
+                attempt_value = entry.get("attempt_dir")
+                if not attempt_value:
+                    reasons.append(f"stage {stage} scenario {name} has no attempt_dir")
+                else:
+                    try:
+                        attempt_path = Path(str(attempt_value)).resolve()
+                    except (TypeError, ValueError):
+                        reasons.append(
+                            f"stage {stage} scenario {name} attempt_dir is not a path"
+                        )
+                        attempt_path = None
+                    if attempt_path is not None:
+                        if not attempt_path.is_relative_to(suite_dir):
+                            reasons.append(
+                                f"stage {stage} scenario {name} attempt directory escapes the integrated suite"
+                            )
+                        if not attempt_path.is_dir():
+                            reasons.append(
+                                f"stage {stage} scenario {name} attempt directory does not exist"
+                            )
+                        if attempt_path in seen_attempt_dirs:
+                            reasons.append(
+                                f"stage {stage} scenario {name} attempt directory is shared across scenarios"
+                            )
+                        seen_attempt_dirs.add(attempt_path)
+            if stage in in_memory and record is not None:
+                mem = in_memory[stage]
+                if str(mem.get("status")) != str(record.get("status")):
+                    reasons.append(
+                        f"stage {stage} in-memory status conflicts with the persisted record"
+                    )
+                mem_names = [str(name) for name in mem.get("scenario_names", [])]
+                if mem_names != recorded_names:
+                    reasons.append(
+                        f"stage {stage} in-memory scenario set conflicts with the persisted record"
+                    )
+
+        if reasons:
+            return {"status": STATUS_EVIDENCE_INVALID, "reasons": reasons}
+        return {"status": STATUS_VERIFIED_PASS, "reasons": []}
+
+    def _regenerate_contact_sheets(self, suite_dir: Path) -> None:
+        """Regenerate both canonical integrated contact sheets from the index."""
+        try:
+            from integrated_contact_sheets import (  # noqa: PLC0415
+                _all_bound_capture_entries,
+                build_contact_sheet,
+            )
+        except ModuleNotFoundError:
+            from validation.integrated_contact_sheets import (  # noqa: PLC0415
+                _all_bound_capture_entries,
+                build_contact_sheet,
+            )
+        suite_resolved = Path(suite_dir).resolve()
+        entries = _all_bound_capture_entries(suite_resolved)
+        paths = [suite_resolved / entry["path"] for entry in entries]
+        build_contact_sheet(
+            suite_resolved, paths, output=suite_resolved / AGENT_SHEET_NAME
+        )
+        build_contact_sheet(
+            suite_resolved,
+            paths,
+            output=suite_resolved / USER_SHEET_NAME,
+            user=True,
+        )
 
     def _run_stage_f(self) -> dict[str, Any]:
-        section = self._stages_config().get("F", {})
+        suite_dir = self.attempt_root.resolve()
+        index_path = suite_dir / INDEX_NAME
+        summary_path = suite_dir / SUMMARY_NAME
+        agent_sheet_path = suite_dir / AGENT_SHEET_NAME
+        user_sheet_path = suite_dir / USER_SHEET_NAME
+        try:
+            section = self._stages_config().get("F", {})
+        except (OSError, ValueError, KeyError, TypeError):
+            section = {}
+        checksum_algorithm = (
+            section.get("checksum_algorithm") if isinstance(section, Mapping) else None
+        )
+        cameras = (
+            list(section.get("cameras", [])) if isinstance(section, Mapping) else []
+        )
+        try:
+            validation = self._validate_f_predecessors(suite_dir)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            validation = {
+                "status": STATUS_EVIDENCE_INVALID,
+                "reasons": [f"stage predecessor validation failed: {error}"],
+            }
+        if validation["status"] != STATUS_VERIFIED_PASS:
+            return {
+                "stage": "F",
+                "status": STATUS_EVIDENCE_INVALID,
+                "reasons": validation["reasons"],
+                "suite_dir": str(suite_dir),
+                "index": str(index_path),
+                "summary": str(summary_path),
+                "agent_sheet": str(agent_sheet_path),
+                "user_sheet": str(user_sheet_path),
+                "extension_point": "tasks-9-10",
+                "checksum_algorithm": checksum_algorithm,
+                "cameras": cameras,
+                "evidence": validation,
+            }
+        try:
+            # C4 step 2: remove only a prior derived summary so a repeated F can
+            # rebuild a current checksum cycle.  Raw evidence, stage records,
+            # attempts, bags, captures, and verdicts are never deleted.
+            if summary_path.is_file():
+                summary_path.unlink()
+            # C4 steps 3-5: direct import-callable Task-9 producers.
+            try:
+                from integrated_evidence_index import (  # noqa: PLC0415
+                    build_evidence_index,
+                    build_qualification_summary,
+                )
+            except ModuleNotFoundError:
+                from validation.integrated_evidence_index import (  # noqa: PLC0415
+                    build_evidence_index,
+                    build_qualification_summary,
+                )
+            build_evidence_index(suite_dir=suite_dir, output=index_path)
+            self._regenerate_contact_sheets(suite_dir)
+            verdict = build_qualification_summary(suite_dir)
+        except Exception as error:  # noqa: BLE001 - producer boundary
+            reason = f"stage F generation failed: {error}"
+            return {
+                "stage": "F",
+                "status": STATUS_EVIDENCE_INVALID,
+                "reasons": [reason],
+                "suite_dir": str(suite_dir),
+                "index": str(index_path),
+                "summary": str(summary_path),
+                "agent_sheet": str(agent_sheet_path),
+                "user_sheet": str(user_sheet_path),
+                "checksum_algorithm": checksum_algorithm,
+                "cameras": cameras,
+                "evidence": {
+                    "status": STATUS_EVIDENCE_INVALID,
+                    "producer_exception": True,
+                    "reasons": [reason],
+                },
+            }
+        status = str(verdict.get("status", STATUS_VERIFIED_FAIL))
+        if status not in {STATUS_VERIFIED_PASS, STATUS_VERIFIED_FAIL}:
+            status = STATUS_VERIFIED_FAIL
         return {
             "stage": "F",
-            "status": STATUS_NOT_IMPLEMENTED,
-            "extension_point": "tasks-9-10",
-            "checksum_algorithm": section.get("checksum_algorithm")
-            if isinstance(section, Mapping)
-            else None,
-            "cameras": list(section.get("cameras", []))
-            if isinstance(section, Mapping)
-            else [],
+            "status": status,
+            "reasons": [str(reason) for reason in verdict.get("reasons", [])],
+            "suite_dir": str(suite_dir),
+            "index": str(index_path),
+            "summary": str(summary_path),
+            "agent_sheet": str(agent_sheet_path),
+            "user_sheet": str(user_sheet_path),
+            "checksum_algorithm": checksum_algorithm,
+            "cameras": cameras,
+            "evidence": dict(verdict),
         }
 
     def _run_all(self) -> dict[str, Any]:
@@ -1728,7 +2549,10 @@ class IntegratedRunner:
         self._stage_results["A"] = a
         b = self._run_stage_b()
         self._stage_results["B"] = b
-        if b.get("status") != STATUS_VERIFIED_PASS:
+        if (
+            a.get("status") != STATUS_VERIFIED_PASS
+            or b.get("status") != STATUS_VERIFIED_PASS
+        ):
             return {
                 "A": a,
                 "B": b,
@@ -1738,10 +2562,15 @@ class IntegratedRunner:
                 },
             }
         c = self._run_stage_c()
+        self._stage_results["C"] = c
         d = self._run_stage_d()
+        self._stage_results["D"] = d
         e = self._run_stage_e()
+        self._stage_results["E"] = e
+        # Stage F cross-checks the persisted C/D/E records against the
+        # in-memory results, so C/D/E must be registered before F runs.
         f = self._run_stage_f()
-        self._stage_results.update({"C": c, "D": d, "E": e, "F": f})
+        self._stage_results["F"] = f
         return {"A": a, "B": b, "C": c, "D": d, "E": e, "F": f}
 
     def run_stage(self, stage: str) -> dict[str, Any]:
@@ -1772,8 +2601,9 @@ def _overall_status(result: Mapping[str, Any]) -> str:
 
     Stage A is always retained.  ``blocked-by-gate-b`` child placeholders are
     diagnostic consequences: the underlying Gate B status is the overall
-    failure cause.  While Stage F is ``not-implemented`` the overall run is not
-    a pass even when A-E pass.
+    failure cause.  ``not-implemented`` is treated only as a backward-
+    compatibility status for older stage records; current Stage F always
+    reports ``verified-pass``, ``verified-fail``, or ``evidence-invalid``.
     """
     statuses: list[str] = []
     for key in ("A", "B", "C", "D", "E", "F"):
@@ -1832,7 +2662,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--provider-manifest-path", type=Path)
     parser.add_argument("--isaac-command", help="override Isaac wrapper command")
     parser.add_argument("--humble-command", help="override Humble wrapper command")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Stage-B compatibility flag (Stage B is already offline and never "
+            "launches live processes)"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.offline and str(args.stage).upper() != "B":
+        print(
+            json.dumps(
+                {
+                    "status": STATUS_EVIDENCE_INVALID,
+                    "reasons": [
+                        "--offline is accepted only as a Stage-B compatibility "
+                        "flag; it must not make a live stage offline or bypass checks"
+                    ],
+                },
+                sort_keys=True,
+                indent=2,
+            )
+        )
+        return _exit_code_for_status(STATUS_EVIDENCE_INVALID)
 
     runner = IntegratedRunner(
         root=args.root,

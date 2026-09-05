@@ -55,7 +55,7 @@
         },
         "pose": {
           "xyz": [
-            0.55,
+            0.8,
             0.0,
             0.425
           ],
@@ -93,12 +93,12 @@
         }
       }
     ],
-    "revision_digest": "053a1c688870776a610046df70d2e24937af22d24df80254c8eb2267d55eec08"
+    "revision_digest": "80739d42bd7544bdb6c491d90d792bab4050264f3c708c6d7a094e25dca43400"
   },
   "integrated": {
     "stage": "D",
     "fixture_revision": "2026-08-02-moveit-execute-safety",
-    "fixture_digest": "053a1c688870776a610046df70d2e24937af22d24df80254c8eb2267d55eec08",
+    "fixture_digest": "80739d42bd7544bdb6c491d90d792bab4050264f3c708c6d7a094e25dca43400",
     "authority": "physics_truth",
     "execution_profile": "sim_ompl",
     "goal": {

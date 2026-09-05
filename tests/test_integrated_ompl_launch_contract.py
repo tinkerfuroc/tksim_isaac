@@ -323,3 +323,12 @@ def test_ready_snapshot_reuses_shared_helpers() -> None:
     source = load_launch_source(LAUNCH_PATH)
     assert "build_integrated_mapping" in source
     assert "from tinker_sim_bridge.integrated_readiness import" in source
+
+
+def test_integrated_launch_passes_attempt_physics_truth_as_raw_jsonl_path() -> None:
+    """The evaluator receives a separate raw_jsonl_path (the attempt's raw
+    physics-truth artifact) while jsonl_path remains the evaluated record file."""
+    source = load_launch_source(LAUNCH_PATH)
+    assert '"jsonl_path": evaluator_jsonl' in source
+    assert '"raw_jsonl_path"' in source
+    assert "TINKER_SIM_TRUTH_JSONL" in source or "physics_truth.jsonl" in source

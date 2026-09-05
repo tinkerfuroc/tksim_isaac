@@ -388,7 +388,7 @@ decision, and VLA remain outside this milestone.
 
 Continuation details, the 2026-07-29 focused safety evidence, mirror-only
 changes, and the ordered qualification path are recorded in
-[`claude-code-handoff-manipulation-core-2026-07-29.md`](claude-code-handoff-manipulation-core-2026-07-29.md).
+[`manipulation-core-handoff-2026-07-29.md`](manipulation-core-handoff-2026-07-29.md).
 At the user's request, the manipulation qualification checksum/index layer
 was removed on 2026-07-29 without weakening physical verification, rosbag
 validation, truth correlation, ownership checks, or process/GPU cleanup.

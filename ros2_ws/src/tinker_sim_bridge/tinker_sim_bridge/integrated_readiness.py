@@ -154,10 +154,15 @@ INTEGRATED_SERVICES: Mapping[str, Mapping[str, str]] = {
 INTEGRATED_PUBLISHERS: Mapping[str, Mapping[str, object]] = {
     "/joint_states": {
         "type": "sensor_msgs/msg/JointState",
-        "source": "/controller_manager",
+        "source": "/joint_state_broadcaster",
         "logical_resource": "joint_state_broadcaster",
         "cardinality": 1,
         "max_age_s": 0.25,
+        # R: the ros2_control joint_state_broadcaster publishes /joint_states
+        # with rclcpp::SystemDefaultsQoS() = RELIABLE / VOLATILE / KeepLast(10).
+        # The contract must agree with the real publisher (and with the node's
+        # own _joint_sub_qos); a TRANSIENT_LOCAL expectation fails the readiness
+        # publisher-metadata check once the broadcaster is discovered.
         "durability": "VOLATILE",
         "reliability": "RELIABLE",
         "depth": 10,
@@ -222,6 +227,20 @@ INTEGRATED_PUBLISHERS: Mapping[str, Mapping[str, object]] = {
         "reliability": "RELIABLE",
         "depth": 1,
     },
+}
+
+#: Operator subscription QoS spec (J).  The executor publishes
+#: ``/sim/safety/operator`` as latched state (RELIABLE/TRANSIENT_LOCAL/depth 1,
+#: see ``INTEGRATED_PUBLISHERS``).  The integrated_readiness node must subscribe
+#: with the same durability so a late-joining subscriber receives the latched
+#: False baseline immediately; a VOLATILE subscriber misses it on a cold start
+#: and the readiness gate fails closed (``operator_input: no sample received``
+#: / ``publisher count is 0``).  Depth is the subscriber queue depth (a resource
+#: policy, not a compatibility constraint).
+OPERATOR_SUB_QOS_SPEC = {
+    "reliability": "reliable",
+    "durability": "transient_local",
+    "depth": 10,
 }
 
 INTEGRATED_JOINT_STATE_NAMES = tuple(f"joint{index}" for index in range(1, 8)) + (
@@ -308,6 +327,22 @@ def canonical_json(value) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
+
+
+def json_safe_value(value):
+    """Return a JSON-serializable copy without mutating evaluator evidence.
+
+    Raw report bytes remain load-bearing inside the readiness evaluator.  The
+    published status represents bytes as lowercase hexadecimal strings only at
+    the wire boundary.
+    """
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, Mapping):
+        return {key: json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_value(item) for item in value]
+    return value
 
 
 def sha256_json(value) -> str:

@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Bring up / tear down / status-check the six-stack GPSR-in-simulation stack.
+
+Automates docs/gpsr-sim-runbook.md, Stages 1-5 (Stage 6 -- the GPSR
+orchestrator itself -- lives in the tk25_ws decision repo and is started
+separately). Every stage's command line, argument, and environment variable
+below is taken verbatim from that runbook; read it first if anything here
+looks surprising.
+
+Design notes:
+
+- ``stage_commands(cfg)`` builds the ordered stage plan as plain dicts.
+  It never spawns a subprocess, but in live-manipulation mode
+  (``cfg.manipulation == "live"``) it does read the filesystem:
+  ``resolve_model_bundle_manifest(REPO_ROOT)`` stats/resolves
+  ``outputs/ompl-overlay/model-bundle/model-bundle.json`` so the
+  manipulation stage's launch line can carry ``model_bundle_manifest:=``.
+  So "no side effects" here means no writes and no subprocesses, not "no
+  filesystem reads" -- mock-mode calls remain fully read-free. It is the
+  only part of this script exercised by the test suite
+  (tests/test_gpsr_stack_dryrun.py) and by ``up --dry-run``.
+- A stage's ``cmd`` is normally a single argv list (``list[str]``) for one
+  process. The "vision" stage needs three concurrent processes (the vision
+  bringup launch file, plus the runbook's two manual gaps: the
+  ``head_camera_server``-named camera_server node, and the pan/tilt state
+  publisher that stitches ``/pan_tilt_controller/state`` into
+  ``/joint_states``), and stage "manipulation" needs three as well
+  (planning-only manipulation launch, arm_api's grasp_action, anygrasp). For
+  those, ``cmd`` is a list of argv lists -- callers detect this with
+  ``isinstance(cmd[0], list)`` and Popen each one.
+- Readiness gating: tools/gpsr_interface_census.py has no subset/filter flag
+  -- it always checks every GPSR interface across all six stacks and prints
+  one exit code for the whole graph. Since manipulation is commonly mocked
+  (``--manipulation mock``), its interfaces (stack "tk25_manipulation" in the
+  census) are permanently absent in that mode, so a bare "exit code == 0"
+  gate would never clear after Stage 3. Instead, readiness for a given stage
+  is decided by *parsing* the census's stdout for "MISSING [<stack>]"
+  section headers and checking only the census stack name(s) relevant to
+  that stage (see GATE_CENSUS_STACKS below); an unrelated stack being
+  missing (e.g. manipulation, while mocked) does not block the gate.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+# Derived from this script's own location, not hardcoded, so gpsr-stack
+# always launches against the checkout it lives in (the invoking worktree)
+# rather than whichever checkout happened to be "the main one" when this
+# constant was last edited. scripts/gpsr-stack lives at <repo>/scripts/, so
+# parents[1] is the repo root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TINKER_WS = "/home/tinker/tk25_ws"
+CENSUS_SCRIPT = str(REPO_ROOT / "tools" / "gpsr_interface_census.py")
+
+# The main checkout -- used only as a fallback source for locally-built ROS
+# artifacts (ros2_ws/install, .ros-vendor) that a worktree hasn't built for
+# itself. The bridge code those artifacts contain is unchanged on feature
+# branches like this one, so sourcing the main checkout's build is
+# equivalent; this is never a source for *project* assets (the scenario
+# JSON, this script's own tools/) -- those always come from REPO_ROOT, e.g.
+# via project_root:=REPO_ROOT in the bridge launch below.
+MAIN_CHECKOUT_ROOT = Path("/home/tinker/tinker-sim/6.0.1")
+MAIN_CHECKOUT_ROS2_WS = MAIN_CHECKOUT_ROOT / "ros2_ws" / "install" / "setup.bash"
+MAIN_CHECKOUT_ROS_VENDOR = MAIN_CHECKOUT_ROOT / ".ros-vendor" / "humble" / "local_setup.bash"
+
+
+def resolve_ros2_ws(repo_root) -> Path:
+    """Return the ros2_ws/install/setup.bash to source for ``repo_root``.
+
+    Pure and filesystem-read-only (a single ``is_file`` stat) so it is
+    directly testable with tmp dirs. Prefers a build local to ``repo_root``;
+    falls back to MAIN_CHECKOUT_ROS2_WS when the repo (e.g. a fresh worktree)
+    has never run colcon build for ros2_ws itself -- see the module-level
+    comment on MAIN_CHECKOUT_ROOT for why that fallback is safe.
+    """
+    candidate = Path(repo_root) / "ros2_ws" / "install" / "setup.bash"
+    return candidate if candidate.is_file() else MAIN_CHECKOUT_ROS2_WS
+
+
+def resolve_ros_vendor(repo_root) -> Path:
+    """Same resolution as resolve_ros2_ws, for .ros-vendor/humble instead."""
+    candidate = Path(repo_root) / ".ros-vendor" / "humble" / "local_setup.bash"
+    return candidate if candidate.is_file() else MAIN_CHECKOUT_ROS_VENDOR
+
+
+#: The exact two-command recipe from ros2_ws/src/tinker_sim_bridge/README.md
+#: ("Joint-limit synthesis" / "model_bundle") that produces the canonical
+#: model-bundle.json resolve_model_bundle_manifest() requires. Kept as one
+#: constant so the error message below and any future doc sync stay in
+#: lockstep with the README instead of drifting independently.
+MODEL_BUNDLE_GENERATION_RECIPE = """\
+ros2 run tinker_sim_bridge model_limits \\
+  --arm-joint-limits "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm7/joint_limits.yaml" \\
+  --gripper-joint-limits "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm_gripper/joint_limits.yaml" \\
+  --output "$PWD/outputs/ompl-overlay/model-bundle/joint_limits.yaml"
+ros2 run tinker_sim_bridge model_bundle \\
+  --simulator-full-urdf "$(./scripts/model-bundle-sim-urdf.sh)" \\
+  --planning-urdf "$TINKER_WS/src/tk25_basic/src/cumotion_description/config/xarm7.urdf" \\
+  --planning-srdf "$TINKER_WS/src/tk25_basic/src/cumotion_description/config/xarm7.srdf" \\
+  --joint-limits "$PWD/outputs/ompl-overlay/model-bundle/joint_limits.yaml" \\
+  --kinematics "$TINKER_WS/src/tk25_manipulation/src/xarm_ros2/xarm_moveit_config/config/xarm7/kinematics.yaml" \\
+  --prefix "" --mount-parent world --mount-child base_link \\
+  --output "$PWD/outputs/ompl-overlay/model-bundle/model-bundle.json"
+"""
+
+
+def resolve_model_bundle_manifest(repo_root: Path) -> Path:
+    """Return the absolute path to the produced model-bundle manifest.
+
+    Pure and filesystem-read-only (a single ``is_file`` stat) so it is
+    directly testable with tmp dirs. The only valid input is the canonical
+    bundle produced per ros2_ws/src/tinker_sim_bridge/README.md
+    ("model_limits" + "model_bundle") at ``repo_root/outputs/ompl-overlay/
+    model-bundle/model-bundle.json``.
+
+    There is deliberately no fallback to the robot-artifact
+    ``artifacts/robot/.../manifest.json``: that file does NOT satisfy
+    mobile_bringup's model-bundle schema (it is missing the artifacts/
+    contract/normalization/producer fields the schema requires). An earlier
+    version of this function fell back to it silently, which reproduced
+    exactly the Task 9 blocker c01e1af/c2c21e9 were written to remove --
+    just moved downstream, from a clear message here to an opaque stage-4
+    launch failure. So when the produced bundle is absent, this raises with
+    the exact generation recipe instead of guessing.
+
+    Raises RuntimeError (naming ``MODEL_BUNDLE_GENERATION_RECIPE``) if the
+    produced bundle does not exist.
+    """
+    repo_root = Path(repo_root)
+    produced = repo_root / "outputs" / "ompl-overlay" / "model-bundle" / "model-bundle.json"
+    if produced.is_file():
+        return produced.resolve()
+
+    raise RuntimeError(
+        f"produced model bundle not found at {produced}. "
+        "outputs/ is git-ignored, so it must be generated locally before "
+        "--manipulation live can be used. Generate it with:\n\n"
+        f"{MODEL_BUNDLE_GENERATION_RECIPE}"
+    )
+
+# Env keys the runbook's shared preamble unsets before every stage 2-6
+# command, so a terminal that previously sourced a different workspace can't
+# leak into this one.
+PREAMBLE_UNSET = (
+    "PYTHONPATH",
+    "AMENT_PREFIX_PATH",
+    "CMAKE_PREFIX_PATH",
+    "COLCON_PREFIX_PATH",
+    "ROS_PACKAGE_PATH",
+    "LD_LIBRARY_PATH",
+)
+
+# The overlay sourcing order Stage 2 (bridge) uses -- the broadest of any
+# stage, since gpsr.launch.py needs both this repo's ros2_ws install and the
+# tk25_ws workspace install. tools/gpsr_interface_census.py checks
+# interfaces across every stack, so its subprocess needs this same full
+# sourcing (see _run_census/_census_argv below) rather than relying on
+# whatever the invoking shell happened to have sourced already.
+CENSUS_SOURCES: tuple[str, ...] = (
+    "/opt/ros/humble/setup.bash",
+    str(resolve_ros_vendor(REPO_ROOT)),
+    f"{TINKER_WS}/install/setup.bash",
+    str(resolve_ros2_ws(REPO_ROOT)),
+)
+
+# gate name -> the census's own stack name(s) (SERVICES/ACTIONS/TOPICS keys
+# in tools/gpsr_interface_census.py) that must show no "MISSING [...]"
+# section for that gate to be considered ready. "bridge" covers both the
+# sim-bridge interfaces (announce, listen_action, gripper_action, pan/tilt
+# state) and nav2's navigate_to_pose, since gpsr.launch.py (Stage 2) starts
+# Nav2/AMCL as part of the same composite launch.
+GATE_CENSUS_STACKS: dict[str, tuple[str, ...]] = {
+    "sim": ("sim cameras",),
+    "bridge": ("sim bridge", "nav2"),
+    "vision": ("tk26_vision",),
+    "manipulation": ("tk25_manipulation",),
+    "nav": ("tk26_navigation",),
+}
+
+#: GATE_CENSUS_STACKS, mutated by _run_up() for the run's own cfg (see
+#: _gate_census_stacks/_gate_ready below) so _wait_for_gate's fixed
+#: (gate: str) -> None signature stays test-mockable with a single arg.
+_ACTIVE_GATE_CENSUS_STACKS: dict[str, tuple[str, ...]] = dict(GATE_CENSUS_STACKS)
+
+
+def _gate_census_stacks(cfg: "StackConfig") -> dict[str, tuple[str, ...]]:
+    """GATE_CENSUS_STACKS, with the "sim" gate expanded to require both head
+    and wrist camera census stacks in both modes: the sim runs its stock
+    head+wrist cameras in mock and live mode alike.
+    """
+    stacks = dict(GATE_CENSUS_STACKS)
+    stacks["sim"] = GATE_CENSUS_STACKS["sim"] + ("sim cameras wrist",)
+    return stacks
+
+STAGE_READY_TIMEOUT_S = 600.0
+STAGE_READY_POLL_S = 2.0
+TEARDOWN_GRACE_S = 10.0
+SURVIVOR_POLL_TIMEOUT_S = 10.0
+SURVIVOR_POLL_INTERVAL_S = 1.0
+
+
+@dataclasses.dataclass
+class StackConfig:
+    scenario: str
+    seed: int
+    manipulation: str  # "mock" | "live"
+    manip_gpu: Optional[int]
+    sim_gpu: int  # GPU device index for the simulator
+    log_dir: str
+    evidence: bool = False  # arena observer camera on: contact-sheet evidence runs
+
+
+def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
+    """Env overrides for a stage: the shared ROS_DOMAIN_ID plus extras.
+
+    Callers merge this over a copy of the real environment at exec time
+    (see ``_full_env``); this dict alone is what stage_commands() exposes so
+    it stays plain-data and testable.
+    """
+    env = {"ROS_DOMAIN_ID": "42"}
+    env.update(extra)
+    return env
+
+
+def stage_commands(cfg: StackConfig) -> list[dict]:
+    """Pure: build the ordered stage plan for Stages 1-5. No side effects.
+
+    Returns ``[{name, cmd, env, cwd, gate}, ...]``. ``cmd`` is either an
+    argv list (one process) or a list of argv lists (several concurrent
+    processes for that stage -- see the "vision" and "manipulation" stages).
+    Stage "manipulation" (runbook Stage 4) is present only when
+    ``cfg.manipulation == "live"``, and requires ``cfg.manip_gpu`` to be set.
+    """
+    if cfg.manipulation not in ("mock", "live"):
+        raise ValueError(f"manipulation must be 'mock' or 'live', got {cfg.manipulation!r}")
+    if cfg.manipulation == "live" and cfg.manip_gpu is None:
+        raise ValueError("--manip-gpu is required when --manipulation live")
+
+    stages: list[dict] = []
+
+    # --- Stage 1: Sim -----------------------------------------------------
+    # The sim runs its stock head+wrist cameras in both mock and live mode
+    # alike. The arena observer camera is an opt-in evidence-run cost: it
+    # costs RTF (see docs/developer-log.md, 2026-08-29), so pass/fail
+    # batteries run without it by default and only --evidence runs pay for it.
+    sim_env = {
+        "CUDA_VISIBLE_DEVICES": str(cfg.sim_gpu),
+        "TINKER_SIM_CAMERA_HZ": "12",
+        "TINKER_SIM_CONTROL_HZ": "60",
+        "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
+        # Same defect class as the head aim, same sanctioned parity break:
+        # the description mounts the wrist camera 90 deg off the tool
+        # approach axis (ceiling frames at every table-scan pose), so no
+        # live grasp can see its target without this. See
+        # tinker_sim_isaac.head_camera_aim's wrist section.
+        "TINKER_SIM_WRIST_CAMERA_AIM": "tool-forward",
+        # RTX camera strides stall the stepping loop for multiple wall
+        # seconds; at the 1.0 s / 0.5 s defaults every stall re-latches a
+        # safety hold and severs the command stream (frozen base + arm
+        # mid-run). Camera-loaded runs need generous deadlines.
+        "TINKER_SIM_SAFETY_HEARTBEAT_TIMEOUT_S": "10",
+        "TINKER_SIM_COMMAND_STREAM_TIMEOUT_S": "5",
+        # Wheel colliders stay on the engineered SPHERE default. The
+        # cylinder override below was added 2026-08-27 while chasing
+        # "wheels spin, base never translates" — later proven to be a
+        # phantom from stale USD-layer reads (the robot really drove).
+        # The cylinder line contact cannot skid, so in-place turns
+        # reach 0% of the command below 0.2 rad/s and ~55% at 0.5
+        # (backend.py's own A/B numbers, re-measured 2026-08-28:
+        # cmd 0.2 -> -0.05 achieved, cmd 0.5 -> 0.15). That angular
+        # deadband deadlocked every Nav2 rotate-to-heading ramp and
+        # was the final root cause of the doorway wedging.
+        # "TINKER_SIM_WHEEL_COLLIDER": "cylinder",  # DO NOT re-enable
+    }
+    if cfg.evidence:
+        # Arena observer only for evidence runs: it costs RTF (docs/
+        # developer-log.md 2026-08-29), so pass/fail batteries run without
+        # it and keep their 600 s wall cap.
+        sim_env["TINKER_SIM_ARENA_CAMERA"] = "1"
+        sim_env["TINKER_SIM_ARENA_CAMERA_HZ"] = "2"
+    stages.append({
+        "name": "sim",
+        "cmd": [
+            "./scripts/tinker-sim", "launch",
+            "--sensor-profile", "sensor-rich",
+            "--scenario", cfg.scenario,
+            "--seed", str(cfg.seed),
+            "--arena", "rcw2026",
+            "--spawn-xy=-2.0,-2.0",
+            "--ros",
+            "--headless",
+        ],
+        "env": _preamble_env(sim_env),
+        "cwd": REPO_ROOT,
+        "gate": "sim",
+    })
+
+    # --- Stage 2: Composite bridge launch (gpsr.launch.py) -----------------
+    stages.append({
+        "name": "bridge",
+        "cmd": _ros_argv(
+            sources=(
+                "/opt/ros/humble/setup.bash",
+                str(resolve_ros_vendor(REPO_ROOT)),
+                f"{TINKER_WS}/install/setup.bash",
+                str(resolve_ros2_ws(REPO_ROOT)),
+            ),
+            argv=[
+                "ros2", "launch", "tinker_sim_bridge", "gpsr.launch.py",
+                f"project_root:={REPO_ROOT}",
+                f"tinker_workspace:={TINKER_WS}",
+                f"scenario:={cfg.scenario}",
+                f"seed:={cfg.seed}",
+                "safety_source_deadline_s:=5.0",
+            ],
+        ),
+        # TINKER_SIM_ROOT: gpsr.launch.py imports tinker_sim_deploy from
+        # REPO_ROOT/tools at module scope, finding the root via this env
+        # var or a parents[4] fallback from its own __file__. The fallback
+        # only works when the INSTALLED launch file is a symlink back into
+        # src/ (--symlink-install builds); a plain colcon build copies the
+        # file under ros2_ws/install and the fallback resolves nowhere.
+        # Export the root explicitly so the bridge stage survives either
+        # build mode (bitten 2026-08-28: a plain rebuild broke bring-up).
+        "env": _preamble_env({"TINKER_SIM_ROOT": str(REPO_ROOT)}),
+        "cwd": REPO_ROOT,
+        "gate": "bridge",
+    })
+
+    # --- Stage 3: tk26_vision (plus the two manual runbook gaps) -----------
+    vision_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+    stages.append({
+        "name": "vision",
+        "cmd": [
+            _ros_argv(
+                sources=vision_sources,
+                argv=[
+                    "ros2", "launch", "vision_bringup", "vision_bringup.launch.py",
+                    "enable_gpsr:=true", "use_sim_time:=true",
+                    # Sim depth lags color ~0.5-1s under RTX load; 0.2 default starves detectors.
+                    "img_sync_thres:=2.0",
+                ],
+            ),
+            # The node NAME is load-bearing: every service-backend vision
+            # consumer resolves frames through
+            # default_endpoint='/head_camera_server'.
+            _ros_argv(
+                sources=vision_sources,
+                argv=[
+                    "ros2", "run", "camera_server", "camera_server_node", "--ros-args",
+                    "-r", "__node:=head_camera_server",
+                    "-p", "use_sim_time:=true",
+                    "-p", "color_topic:=/camera/color/image_raw",
+                    "-p", "depth_topic:=/camera/depth/image_raw",
+                    "-p", "color_info_topic:=/camera/color/camera_info",
+                    "-p", "depth_info_topic:=/camera/color/camera_info",
+                    # Under RTX load the sim's depth stream lags color by
+                    # ~0.5-1s in stamp terms; at the 0.1s default slop the
+                    # synchronizer never pairs them ("sync starved") and every
+                    # detector downstream fails. 1.5s pairs the newest color
+                    # with a slightly older depth — fine for static-scene
+                    # detection, and sim-only.
+                    "-p", "sync_slop_sec:=1.5",
+                ],
+            ),
+            # Without this, /pan_tilt_controller/state never reaches TF and
+            # the head-camera subtree is disconnected. It must NOT publish to
+            # /joint_states: pick_and_place's live-manipulation readiness
+            # contract requires exactly ONE /joint_states publisher (the
+            # ros2_control joint_state_broadcaster) and rejects every arm goal
+            # otherwise (first live-manip run, 2026-08-31). So the state
+            # publisher writes its offset-corrected JointState to a side topic
+            # and pan_tilt_tf_publisher.py turns it into the same TF
+            # robot_state_publisher would have derived.
+            _ros_argv(
+                sources=vision_sources,
+                argv=["ros2", "run", "pan_tilt", "state_publisher", "--ros-args",
+                      "-p", "use_sim_time:=true",
+                      "-p", "joint_state_topic:=/pan_tilt/joint_states"],
+            ),
+            _ros_argv(
+                sources=vision_sources,
+                argv=["python3", str(REPO_ROOT / "tools" / "pan_tilt_tf_publisher.py"),
+                      "--ros-args", "-p", "use_sim_time:=true",
+                      "-p", "joint_state_topic:=/pan_tilt/joint_states"],
+            ),
+        ],
+        "env": _preamble_env({
+            # waving_person_server defaults to show_window:=true and needs a
+            # display; this keeps a headless bring-up from aborting on it.
+            "QT_QPA_PLATFORM": "offscreen",
+        }),
+        "cwd": REPO_ROOT,
+        "gate": "vision",
+    })
+
+    # --- Stage 4: tk25_manipulation (live only) -----------------------------
+    if cfg.manipulation == "live":
+        manip_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+        # Resolve model-bundle manifest path lazily so dry-run and tests work with
+        # fake repo roots. Resolution against the real REPO_ROOT is fine for dry-run.
+        manifest_path = resolve_model_bundle_manifest(REPO_ROOT)
+        stages.append({
+            "name": "manipulation",
+            "cmd": [
+                _ros_argv(
+                    sources=manip_sources,
+                    argv=[
+                        "ros2", "launch", "mobile_bringup",
+                        "manipulation_planning_task_only.launch.py",
+                        "execution_profile:=sim_cumotion", "use_sim_time:=true",
+                        f"model_bundle_manifest:={manifest_path}",
+                    ],
+                ),
+                _ros_argv(sources=manip_sources, argv=["ros2", "run", "arm_api", "grasp_action"]),
+                _ros_argv(sources=manip_sources, argv=["ros2", "run", "anygrasp_ros2", "anygrasp"]),
+            ],
+            "env": _preamble_env({"CUDA_VISIBLE_DEVICES": str(cfg.manip_gpu)}),
+            "cwd": REPO_ROOT,
+            "gate": "manipulation",
+        })
+
+    # --- Stage 5: tk26_navigation extras ------------------------------------
+    nav_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+    stages.append({
+        "name": "nav_extras",
+        "cmd": [
+            _ros_argv(
+                sources=nav_sources,
+                argv=["ros2", "launch", "approach_planner", "approach_planner.launch.py",
+                      "use_sim_time:=true"],
+            ),
+            _ros_argv(
+                sources=nav_sources,
+                argv=["ros2", "run", "orientation_angle_service", "orientation_angle_server"],
+            ),
+        ],
+        "env": _preamble_env({}),
+        "cwd": REPO_ROOT,
+        "gate": "nav",
+    })
+
+    return stages
+
+
+def _ros_argv(*, sources: tuple[str, ...], argv: list[str]) -> list[str]:
+    """Wrap a ros2 command in a login-shell that sources the ROS overlays.
+
+    ``source``-ing setup.bash scripts (AMENT_PREFIX_PATH, PATH, PYTHONPATH,
+    etc.) is a shell-only operation, so stages that need the ROS overlay run
+    under ``bash -lc``; the un-wrapped argv is quoted with shlex so any
+    ``:=`` launch arguments survive intact.
+    """
+    import shlex
+    parts = [f"cd {shlex.quote(str(REPO_ROOT))}"]
+    for src in sources:
+        parts.append(f"source {shlex.quote(src)}")
+    parts.append("exec " + " ".join(shlex.quote(a) for a in argv))
+    script = " && ".join(parts)
+    return ["bash", "-lc", script]
+
+
+# --------------------------------------------------------------------------
+# up / down / status -- these DO spawn subprocesses and touch the
+# filesystem; none of this is exercised by the automated test suite (which
+# only exercises stage_commands() and `up --dry-run`).
+# --------------------------------------------------------------------------
+
+def _full_env(stage_env: dict[str, str]) -> dict[str, str]:
+    env = dict(os.environ)
+    for key in PREAMBLE_UNSET:
+        env.pop(key, None)
+    env.update(_deployment_env())
+    env.update(stage_env)
+    return env
+
+
+def _deployment_env() -> dict[str, str]:
+    """Parse .deployment.env's KEY=VALUE lines without printing them.
+
+    Mirrors the runbook's ``set -a; source .deployment.env; set +a``. Never
+    logs or returns anything beyond what the file itself defines.
+    """
+    path = Path(REPO_ROOT) / ".deployment.env"
+    result: dict[str, str] = {}
+    if not path.is_file():
+        return result
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        result[key.strip()] = value.strip().strip('"').strip("'")
+    return result
+
+
+def _parse_missing(census_stdout: str) -> set[str]:
+    missing: set[str] = set()
+    for line in census_stdout.splitlines():
+        line = line.strip()
+        if line.startswith("MISSING [") and line.endswith("]"):
+            missing.add(line[len("MISSING ["):-1])
+    return missing
+
+
+def _census_argv() -> list[str]:
+    """The census subprocess's argv, wrapped in the same ROS-sourcing shell
+    every stage's own command uses (see _ros_argv/CENSUS_SOURCES).
+
+    tools/gpsr_interface_census.py imports rclpy inside main(), so without
+    this wrapper it only works when the *invoking* shell already has ROS
+    Humble + the tk25_ws overlay sourced -- not true for a plain shell, the
+    natural way to invoke a self-contained bring-up script.
+    """
+    return _ros_argv(sources=CENSUS_SOURCES, argv=[sys.executable, CENSUS_SCRIPT])
+
+
+def _run_census() -> tuple[int, str]:
+    proc = subprocess.run(
+        _census_argv(),
+        capture_output=True, text=True, cwd=REPO_ROOT,
+        env=_full_env(_preamble_env({})),
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _gate_ready(gate: str, census_stdout: str) -> bool:
+    required = _ACTIVE_GATE_CENSUS_STACKS[gate]
+    return not (_parse_missing(census_stdout) & set(required))
+
+
+def _wait_for_gate(gate: str) -> None:
+    deadline = time.monotonic() + STAGE_READY_TIMEOUT_S
+    last_output = ""
+    while time.monotonic() < deadline:
+        _rc, last_output = _run_census()
+        if _gate_ready(gate, last_output):
+            return
+        time.sleep(STAGE_READY_POLL_S)
+    raise RuntimeError(
+        f"gate {gate!r} not ready after {STAGE_READY_TIMEOUT_S:.0f}s; census output:\n{last_output}"
+    )
+
+
+def _stage_procs(cmd) -> list[list[str]]:
+    """Normalize a stage's cmd to a list of argv lists (one or many Popens)."""
+    if cmd and isinstance(cmd[0], list):
+        return cmd
+    return [cmd]
+
+
+def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
+    stages = stage_commands(cfg)
+
+    global _ACTIVE_GATE_CENSUS_STACKS
+    _ACTIVE_GATE_CENSUS_STACKS = _gate_census_stacks(cfg)
+
+    if dry_run:
+        for stage in stages:
+            print(f"=== stage: {stage['name']} (gate={stage['gate']}) ===")
+            for proc_argv in _stage_procs(stage["cmd"]):
+                print("  $", " ".join(proc_argv))
+            for key, value in stage["env"].items():
+                print(f"  env {key}={value}")
+        return 0
+
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    run_dir = Path(cfg.log_dir) / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for idx, stage in enumerate(stages, start=1):
+            env = _full_env(stage["env"])
+            procs = _stage_procs(stage["cmd"])
+            for p_idx, argv in enumerate(procs):
+                suffix = "" if len(procs) == 1 else f"-{p_idx}"
+                base = f"{idx:02d}-{stage['name']}{suffix}"
+                log_path = run_dir / f"{base}.log"
+                pgid_path = run_dir / f"{base}.pgid"
+                with open(log_path, "wb") as log_file:
+                    proc = subprocess.Popen(
+                        argv, cwd=stage["cwd"], env=env,
+                        stdout=log_file, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                pgid_path.write_text(str(os.getpgid(proc.pid)) + "\n", encoding="utf-8")
+            print(f"stage {stage['name']} launched; waiting on gate {stage['gate']!r}...")
+            _wait_for_gate(stage["gate"])
+            print(f"stage {stage['name']} ready")
+    except BaseException as exc:
+        # Any failure mid bring-up (a gate timeout's RuntimeError, a Popen
+        # OSError, an operator's KeyboardInterrupt, ...) must not leave
+        # already-started stages running unsupervised. Tear down exactly
+        # what `down` would tear down -- every PGID recorded so far, in
+        # reverse stage order -- then propagate the failure.
+        print(
+            f"gpsr-stack: bring-up failed during stage {stage['name']!r} ({exc}); "
+            f"tearing down already-started stages in {run_dir}...",
+            file=sys.stderr,
+        )
+        _teardown_run_dir(run_dir)
+        print(f"gpsr-stack: torn down. partial logs: {run_dir}", file=sys.stderr)
+        raise
+
+    print(f"stack up. logs: {run_dir}")
+    return 0
+
+
+def _newest_run_dir(log_dir: str) -> Optional[Path]:
+    base = Path(log_dir)
+    if not base.is_dir():
+        return None
+    candidates = sorted((p for p in base.iterdir() if p.is_dir()), key=lambda p: p.name)
+    return candidates[-1] if candidates else None
+
+
+def _pgrep_group(pgid: int) -> str:
+    """Return ``pgrep -g <pgid> -l`` output ("pid name" per line), stripped.
+
+    Empty string means the process group has no members left. PGID-only, no
+    name pattern -- this asks the kernel "who is still in this group",
+    never "who looks like cumotion".
+    """
+    result = subprocess.run(
+        ["pgrep", "-g", str(pgid), "-l"], capture_output=True, text=True, check=False,
+    )
+    return result.stdout.strip()
+
+
+def _poll_and_reap_survivors(
+    pgid: int,
+    *,
+    timeout_s: float = SURVIVOR_POLL_TIMEOUT_S,
+    poll_s: float = SURVIVOR_POLL_INTERVAL_S,
+) -> None:
+    """After ``pgid`` has been SIGKILL'd, poll for up to ``timeout_s``
+    seconds for its members to actually exit; if any persist, re-SIGKILL
+    the group and print the survivors (pid + name).
+
+    This is what satisfies the runbook's "``cumotion_goal_set_planner_node``
+    must be killed explicitly" requirement (docs/gpsr-sim-runbook.md:509-510):
+    that node holds ~6.6 GB of GPU and, per the runbook, can outlive a
+    careless teardown. It runs inside the manipulation stage's own recorded
+    PGID (it is a child of the ``mobile_bringup`` launch Popen'd in stage 4),
+    so polling every recorded PGID for stragglers and re-SIGKILLing catches
+    it -- and anything else slow to die -- via the PGID this script itself
+    recorded, never a name-pattern sweep of the whole box.
+    """
+    deadline = time.monotonic() + timeout_s
+    survivors = _pgrep_group(pgid)
+    while survivors and time.monotonic() < deadline:
+        time.sleep(poll_s)
+        survivors = _pgrep_group(pgid)
+
+    if not survivors:
+        return
+
+    print(
+        f"gpsr-stack: pgid {pgid} still has members {timeout_s:.0f}s after "
+        f"SIGKILL; re-SIGKILLing. survivors:\n{survivors}",
+        file=sys.stderr,
+    )
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _teardown_run_dir(run_dir: Path) -> None:
+    """SIGINT -> grace -> SIGKILL every PGID recorded in ``run_dir``, newest
+    stage first; poll each PGID for stragglers and re-SIGKILL any that
+    persist (see ``_poll_and_reap_survivors``); then report leftover GPU
+    processes.
+
+    This is the single teardown implementation, shared by ``down`` and by
+    ``_run_up``'s failure path, so a stack that dies mid bring-up is torn
+    down exactly the way an operator-requested ``down`` would tear it down.
+    """
+    pgid_files = sorted(run_dir.glob("*.pgid"), key=lambda p: p.name, reverse=True)
+    if not pgid_files:
+        print(f"no .pgid files found in {run_dir}; nothing to tear down")
+        return
+
+    pgids: list[int] = []
+    for pgid_file in pgid_files:
+        try:
+            pgid = int(pgid_file.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            continue
+        pgids.append(pgid)
+        print(f"SIGINT -> pgid {pgid} ({pgid_file.name})")
+        try:
+            os.killpg(pgid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    time.sleep(TEARDOWN_GRACE_S)
+
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    for pgid in pgids:
+        _poll_and_reap_survivors(pgid)
+
+    subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,name,used_memory", "--format=csv"],
+        check=False,
+    )
+
+
+def _run_down(cfg: StackConfig) -> int:
+    run_dir = _newest_run_dir(cfg.log_dir)
+    if run_dir is None:
+        print(f"no run directories found under {cfg.log_dir}; nothing to tear down")
+        return 0
+    _teardown_run_dir(run_dir)
+    return 0
+
+
+def _run_status(_cfg: StackConfig) -> int:
+    # Deliberately does not return the census's own exit code: that code is
+    # the whole-graph result (non-zero by construction whenever manipulation
+    # is mocked, since tk25_manipulation's interfaces are then permanently
+    # absent -- the same reason _gate_ready parses stdout instead of
+    # trusting it). Propagating it here would make `gpsr-stack status && ...`
+    # a permanent false negative in the common `--manipulation mock` case.
+    # `status` is informational; 0 means "the census ran", not "everything
+    # is present" -- read the printed MISSING sections for that.
+    _rc, output = _run_census()
+    print(output, end="" if output.endswith("\n") else "\n")
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gpsr-stack",
+        description="Bring up / tear down / status-check the GPSR-in-simulation stack.",
+    )
+    parser.add_argument("subcommand", choices=["up", "down", "status"])
+    parser.add_argument("--scenario", default="gpsr-rcw2026-bench")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--manipulation", choices=["mock", "live"], default="mock")
+    parser.add_argument("--manip-gpu", dest="manip_gpu", type=int, default=None)
+    parser.add_argument("--sim-gpu", dest="sim_gpu", type=int, default=0)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--log-dir", default="gpsr_stack_logs")
+    parser.add_argument(
+        "--evidence", action="store_true",
+        help="enable the arena observer camera (contact-sheet evidence runs; costs RTF)")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _build_parser().parse_args(argv)
+    cfg = StackConfig(
+        scenario=args.scenario,
+        seed=args.seed,
+        manipulation=args.manipulation,
+        manip_gpu=args.manip_gpu,
+        sim_gpu=args.sim_gpu,
+        log_dir=args.log_dir,
+        evidence=args.evidence,
+    )
+
+    if args.subcommand == "up":
+        try:
+            return _run_up(cfg, dry_run=args.dry_run)
+        except ValueError as exc:
+            # Config validation failure (bad --manipulation, missing
+            # --manip-gpu): raised by stage_commands() before anything was
+            # started, so there is nothing to tear down.
+            print(f"gpsr-stack: {exc}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            # _run_up already tore down whatever had started before
+            # re-raising this.
+            print("gpsr-stack: interrupted; partial stack torn down", file=sys.stderr)
+            return 130
+        except Exception as exc:
+            # _run_up already tore down whatever had started before
+            # re-raising this (gate timeout, Popen failure, ...).
+            print(f"gpsr-stack: up failed: {exc}", file=sys.stderr)
+            return 1
+    if args.subcommand == "down":
+        if args.dry_run:
+            print("down --dry-run: would SIGINT recorded PGIDs in reverse stage order")
+            return 0
+        return _run_down(cfg)
+    if args.subcommand == "status":
+        return _run_status(cfg)
+    raise AssertionError(f"unreachable subcommand {args.subcommand!r}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

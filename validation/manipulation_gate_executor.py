@@ -412,8 +412,23 @@ class RosGateExecutor:
         return bool(predicate())
 
     def wait_clock(self, target: float, timeout_s: float = 30.0) -> None:
-        if not self._spin_until(lambda: self.clock is not None and self.clock >= target, timeout_s):
-            raise RuntimeError(f"timed out waiting for /clock >= {target}")
+        # timeout_s bounds wall time WITHOUT /clock progress, not total wall
+        # time: slow hosts run physics far below real time (measured ~1/12x on
+        # tkserver), and a fixed total budget conflates slow with stalled.
+        last_clock = self.clock
+        last_progress = time.monotonic()
+        while True:
+            if self.clock is not None and self.clock >= target:
+                return
+            if self.clock != last_clock:
+                last_clock = self.clock
+                last_progress = time.monotonic()
+            elif time.monotonic() - last_progress >= timeout_s:
+                raise RuntimeError(
+                    f"simulated clock stalled at {self.clock} for {timeout_s}s "
+                    f"waiting for /clock >= {target}"
+                )
+            self.ros["rclpy"].spin_once(self.node, timeout_sec=0.05)
 
     def q0(self) -> tuple[float, ...]:
         if not self._spin_until(lambda: all(name in self.joint_state for name in JOINT_NAMES), 30.0):
@@ -690,17 +705,21 @@ class RosGateExecutor:
                 end = stream.tell()
                 if end <= 0:
                     raise RuntimeError(f"physics truth evidence is empty: {self.physics_truth_path}")
-                stream.seek(end - 1)
-                if stream.read(1) != b"\n":
-                    raise RuntimeError("physics truth evidence ends with an incomplete record")
                 start = max(0, end - PHYSICS_TRUTH_TAIL_BYTES)
                 stream.seek(start)
                 tail = stream.read(end - start)
         except (OSError, UnicodeError) as exc:
             raise RuntimeError(f"physics truth evidence unavailable: {self.physics_truth_path}") from exc
-        nonblank = [line for line in tail.split(b"\n") if line.strip()]
+        # The writer appends records without a lock, so a snapshot may end in the
+        # middle of an append with a partial fragment and no trailing newline.
+        # Discard only that incomplete fragment and parse the last complete
+        # nonblank line; a snapshot with no complete line still fails closed.
+        lines = tail.split(b"\n")
+        if tail and not tail.endswith(b"\n"):
+            lines = lines[:-1]
+        nonblank = [line for line in lines if line.strip()]
         if not nonblank:
-            raise RuntimeError(f"physics truth evidence is empty: {self.physics_truth_path}")
+            raise RuntimeError(f"physics truth evidence has no complete record: {self.physics_truth_path}")
         try:
             truth = json.loads(nonblank[-1].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -844,6 +863,9 @@ class RosGateExecutor:
 
     def run(self) -> dict[str, Any]:
         q0 = self.q0()
+        # Joint states can arrive before the first /clock sample on slow
+        # startups; every journal record needs a real simulated timestamp.
+        self.wait_clock(0.0)
         self.journal.record("gate_started", simulated_timestamp=self.clock, goals={"q0": list(q0), "actions": [item.as_dict() for item in build_gate_actions(self.gate, q0)]})
         if self.gate == "free-space-fjt":
             self._run_trajectory(

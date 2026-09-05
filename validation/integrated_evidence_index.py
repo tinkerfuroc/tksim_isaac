@@ -2234,6 +2234,29 @@ def _parse_rosbag_qos(text: str) -> list[dict[str, Any]] | None:
     return profiles
 
 
+def _rosbag_duration_ok(value: Any) -> bool:
+    """Accept an RMW duration as a nonnegative nanosecond integer or a Humble
+    duration mapping ``{sec: nonnegative int, nsec: int in [0, 1e9)}``.
+
+    Rejects booleans, floats, negative/overflowing values, and malformed
+    mappings so the QoS validator keeps its fail-closed rejection contract for
+    ``deadline``, ``lifespan``, and ``liveliness_lease_duration``.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, Mapping):
+        sec = value.get("sec")
+        nsec = value.get("nsec")
+        if isinstance(sec, bool) or not isinstance(sec, int) or sec < 0:
+            return False
+        if isinstance(nsec, bool) or not isinstance(nsec, int) or not (0 <= nsec < 1_000_000_000):
+            return False
+        return True
+    return False
+
+
 def _rosbag_qos_fields_ok(profile: Mapping[str, Any]) -> bool:
     """Require the required RMW QoS fields with valid values and validate the
     full known rmw fields when present (F4.2)."""
@@ -2257,7 +2280,7 @@ def _rosbag_qos_fields_ok(profile: Mapping[str, Any]) -> bool:
         value = profile.get(field)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if not _rosbag_duration_ok(value):
             return False
     liveliness = profile.get("liveliness")
     if liveliness is not None and (
@@ -2276,6 +2299,8 @@ def _validate_rosbag(
     index: Mapping[str, Any],
     suite_dir: Path,
     reasons: list[str],
+    *,
+    zero_allowed_topics: set[str] | frozenset[str] | None = None,
 ) -> None:
     """Real rosbag2 metadata + storage (F1.4 Rosbag, F2.7/F3.8 exact contract)."""
     metadata_entries = _entries_by_category(index, "rosbag-metadata")
@@ -2316,6 +2341,16 @@ def _validate_rosbag(
             observed[topic] = dict(metadata_record)
             if isinstance(count, int) and not isinstance(count, bool) and count > 0:
                 total_messages += count
+            elif (
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count == 0
+                and zero_allowed_topics is not None
+                and topic in zero_allowed_topics
+            ):
+                # Integrated Stage C plan-only evidence may record zero
+                # messages for /sim/truth/object_state and /sim/truth/contacts.
+                continue
             else:
                 reasons.append(f"rosbag topic {topic} has nonpositive message count")
             qos_text = metadata_record.get("offered_qos_profiles")
@@ -2336,17 +2371,20 @@ def _validate_rosbag(
                 reasons.append(f"rosbag topic {topic} offers no reliable QoS profile")
             override = ROSBAG_QOS_OVERRIDE.get(topic)
             if override is not None:
-                # F4.2: the real Humble serialization carries the full
-                # nine-field rmw_qos_profile_t.  The recorder override is a
-                # subset contract: some profile must match the override's
-                # required history/depth/reliability/durability fields; the
+                # F4.2: the real Humble rosbag2 records the publisher's offer
+                # for the recorder-override endpoints truthfully as
+                # history=UNKNOWN(3), depth=0 with
+                # reliability=RELIABLE(1), durability=TRANSIENT_LOCAL(1).  The
+                # keep_last/depth=1 intent is the recorder's own
+                # ROSBAG_QOS_OVERRIDE_PROFILES YAML, proven separately; the
+                # recorded-metadata subset contract therefore asserts only the
+                # reliability/durability offer.  The full nine-field RMW shape
+                # is still validated by ``_rosbag_qos_fields_ok`` above and the
                 # additional valid rmw fields (deadline, lifespan, liveliness,
                 # liveliness_lease_duration, avoid_ros_namespace_conventions)
                 # are permitted.
                 matched = any(
-                    profile.get("history") == override["history"]
-                    and profile.get("depth") == override["depth"]
-                    and profile.get("reliability") == override["reliability"]
+                    profile.get("reliability") == override["reliability"]
                     and profile.get("durability") == override["durability"]
                     for profile in profiles
                 )

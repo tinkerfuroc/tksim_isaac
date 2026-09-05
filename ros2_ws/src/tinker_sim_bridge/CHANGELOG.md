@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (Task 50: integrated Stage A consolidated repair)
+
+- The `gripper` implicit actuator now actively drives only `drive_joint`
+  (`stiffness=200.0`, `damping=20.0`); the five authored USD mimic joints
+  (`left_finger_joint`, `left_inner_knuckle_joint`,
+  `right_inner_knuckle_joint`, `right_outer_knuckle_joint`,
+  `right_finger_joint`) live in a distinct passive `gripper_mimic` implicit
+  actuator group with zero stiffness and zero damping.  Their authored USD
+  mimic constraints remain the mechanism, so the PD loop no longer competes
+  with the finger/knuckle mimics.  The gripper target, facade tolerance,
+  timeout, contact criteria, and requested-effort semantics are unchanged.
+- The runtime gripper effort-limit writer now also updates the owning implicit
+  actuator model's private `effort_limit` entry for `drive_joint` (Isaac Lab
+  issue #128), so an actuator re-sync on reset/reinit cannot clobber the live
+  request.  Validation, zero-means-default behavior, the PhysX/shared writer
+  call, and the public/backend limit state are unchanged; negative requests
+  still fail without touching either writer or model state.
+- The live physics-truth reader now returns the last complete nonblank JSONL
+  record when the journal ends in a mid-append partial fragment, discarding
+  only that fragment.  Missing, malformed, or stale records still fail closed,
+  and all timestamp, frame-index, freshness, and downstream exact-correlation
+  checks are preserved.
+- Detached `omni.telemetry.transmitter` processes are classified as the known
+  transient through one shared helper in both the six-gate and integrated
+  qualification teardown paths.  A transmitter-only raw scan with zero cleanup
+  survivors no longer demotes an attempt or suppresses evidence verification;
+  any cleanup survivor (transmitter included) and any unexpected initial-scan
+  process still demote, and the strict raw scan remains recorded.
+- The collision obstacle fixture is now a typed kinematic rigid body: root
+  `PhysicsRigidBodyAPI` plus `bool physics:kinematicEnabled = true` with the
+  cube collider retained, so the scenario root prim can be tracked through the
+  rigid-body view while gravity cannot move the blocker.  The asset SHA-256 is
+  re-pinned in every existing obstacle binding.
+
+Operational side effects: qualification attempt statuses are unchanged for real
+orphans and unexpected initial scans; only the previously false demotion of a
+telemetry transmitter that terminates during cleanup is removed.  Thresholds,
+trajectories, exact raw/evaluator correlation checks, and cuMotion are
+unchanged.  Stage A and OMPL live qualification have not passed and are not
+claimed here.
+
+### Fixed (Task 48: joint4 live trajectory effort saturation)
+
+- The simulator arm actuator now applies an explicit per-joint PhysX effort
+  envelope of `[50, 50, 30, 50, 30, 20, 20]` Nm. This raises only joint4 from
+  the inherited vendor-URDF 30 Nm cap to 50 Nm while preserving every other
+  joint tier. The override addresses the live free-space FJT failure where
+  joint4 remained saturated for about 72% of the action and alone produced
+  0.180 rad RMS tracking error; the trajectory and its 0.01 rad terminal / 0.05
+  rad RMS qualification thresholds remain unchanged.
+
+### Fixed (Task 43: live OMPL actuator settling and truth teardown)
+
+- Spawned Tinker articulations now override imported joint drives to force mode
+  before Isaac Lab initializes the articulation, while preserving the existing
+  arm, head, gripper, and wheel actuator gains and limits. This addresses the
+  acceleration-drive gravity sag that exceeded the xArm trajectory controller's
+  0.01 rad terminal tolerance during the live free-space FJT gate.
+- Raw physics-truth persistence now belongs to the Humble truth evaluator: the
+  Isaac gateway publishes strict finite canonical JSON only, the evaluator uses
+  RELIABLE delivery and writes the validated raw frame plus evaluated record in
+  the same callback, and both manipulation launches pass a separate
+  `raw_jsonl_path`. This eliminates the cross-process final-frame teardown race
+  without weakening exact raw/evaluator correlation.
+
 ### Added (integrated qualification executor driver — Task 8 fix round 3: observe live integrated providers)
 
 - The integrated launch now owns the `base_link -> livox360` static transform

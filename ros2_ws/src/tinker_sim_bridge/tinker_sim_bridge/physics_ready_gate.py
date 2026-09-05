@@ -156,6 +156,11 @@ class PhysicsReadyGate(Node):
         self._state_service_state: dict[str, object] = {}
         self._service_group = ReentrantCallbackGroup()
 
+        # The launch starts this node only after scenario_runner exits and its
+        # atomic report is complete.  Validate it before exposing the Trigger
+        # service so a waiter cannot observe the normal pending state and fail.
+        self._parse_report()
+
         status_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,

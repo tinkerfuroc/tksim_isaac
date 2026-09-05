@@ -10,7 +10,7 @@ _tools = _project_root / "tools"
 if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
-from tinker_sim_deploy.runtime import resolve_current_artifact
+from tinker_sim_deploy.runtime import resolve_arena_map_yaml, resolve_current_artifact
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable
@@ -18,6 +18,25 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+
+def resolve_map_yaml(
+    map_override: str, artifact_dir: Path, arena_map_yaml: Path | None = None
+) -> Path:
+    """Choose the AMCL map: an explicit ``map_yaml:=`` override, else the
+    simulated arena's own map (``arena:=``), else the robot artifact's
+    colocated ``map.yaml`` (the hardware arena).  Fails closed when the
+    chosen file is missing."""
+    value = map_override.strip()
+    if value:
+        map_yaml = Path(value).expanduser().resolve()
+    elif arena_map_yaml is not None:
+        map_yaml = arena_map_yaml
+    else:
+        map_yaml = artifact_dir / "map.yaml"
+    if not map_yaml.is_file():
+        raise RuntimeError(f"navigation map does not exist: {map_yaml}")
+    return map_yaml
 
 
 def _resolve(context):
@@ -37,6 +56,11 @@ def _resolve(context):
             path = workspace / record["path"]
             if not path.is_file():
                 raise RuntimeError(f"qualification blocked by missing Tinker source: {path}")
+    arena = LaunchConfiguration("arena").perform(context).strip()
+    arena_map_yaml = resolve_arena_map_yaml(root, arena) if arena else None
+    map_yaml = resolve_map_yaml(
+        LaunchConfiguration("map_yaml").perform(context), artifact, arena_map_yaml
+    )
     calibration = root / "simulation/calibration/tinker2-missing.json"
     calibration_raw = json.loads(calibration.read_text(encoding="utf-8"))
     if qualification and calibration_raw.get("status") != "calibrated":
@@ -54,6 +78,14 @@ def _resolve(context):
             executable="command_gateway",
             output="screen",
             parameters=[str(bridge_share / "config/command_gateway.yaml")],
+            additional_env=env,
+        ),
+        Node(
+            package="tinker_sim_bridge", executable="safety_supervisor", output="screen",
+            parameters=[{
+                "manage_controllers": False,
+                "required_sources": ["collision"],
+            }],
             additional_env=env,
         ),
         Node(package="tinker_sim_bridge", executable="contract_guard", output="screen"),
@@ -89,7 +121,7 @@ def _resolve(context):
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(str(nav_share / "launch/localization_no_ekf_launch.py")),
             launch_arguments={
-                "use_sim_time": "True", "map": str(artifact / "map.yaml"),
+                "use_sim_time": "True", "map": str(map_yaml),
                 "params_file": str(workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
@@ -119,6 +151,10 @@ def generate_launch_description():
         DeclareLaunchArgument("tinker_workspace", default_value=os.environ.get("TINKER_WS", "")),
 
         DeclareLaunchArgument("qualification", default_value="false"),
+        DeclareLaunchArgument("map_yaml", default_value=""),
+        # Arena id the simulator was launched with (--arena); selects that
+        # arena artifact's map.yaml unless map_yaml:= overrides it.
+        DeclareLaunchArgument("arena", default_value=""),
         SetEnvironmentVariable("ROBOT_NAME", "tinker2"),
         OpaqueFunction(function=_resolve),
     ])

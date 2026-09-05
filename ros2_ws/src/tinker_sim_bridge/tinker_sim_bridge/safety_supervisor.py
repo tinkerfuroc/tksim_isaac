@@ -11,6 +11,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
 
+from tinker_sim_core.safety_gating import effective_stop
+
 
 class SafetySourceTracker:
     """Track one required source with a wall-clock freshness deadline.
@@ -64,12 +66,24 @@ class SafetySupervisor(Node):
         self.declare_parameter("controller", "xarm7_traj_controller")
         self.declare_parameter("controller_management_ready", False)
         self.declare_parameter("required_source_deadline_s", 1.0)
+        self.declare_parameter("manage_controllers", True)
+        self.declare_parameter("required_sources", list(self.REQUIRED_SOURCES))
         self._controller = str(self.get_parameter("controller").value)
         self._required_source_deadline_s = float(
             self.get_parameter("required_source_deadline_s").value
         )
         if self._required_source_deadline_s <= 0.0:
             raise ValueError("required_source_deadline_s must be positive")
+        self._manage_controllers = bool(self.get_parameter("manage_controllers").value)
+        required_sources = list(self.get_parameter("required_sources").value)
+        for name in required_sources:
+            if name not in self.SOURCES:
+                raise ValueError(f"unknown required safety source: {name}")
+        # Shadow the class constant with the parameter-derived tuple so the
+        # dict comprehensions below (and any future reference to
+        # self.REQUIRED_SOURCES) build from the configured sources rather
+        # than the manipulation-default constant.
+        self.REQUIRED_SOURCES = tuple(required_sources)
         # Required sources start unknown until their transient-local state is
         # received. Optional operator input defaults clear until it is used.
         self._sources: dict[str, bool | None] = {
@@ -148,12 +162,28 @@ class SafetySupervisor(Node):
         self._desired_stop = desired
 
     def _publish_effective(self) -> None:
-        active = (
-            self._desired_stop
-            or not self._management_ready
-            or self._startup_hold
-            or self._restore_pending
-        )
+        if self._manage_controllers:
+            # Managed mode (manipulation): compute the effective stop with
+            # the exact expression the pre-navigation-mode supervisor used,
+            # verbatim, so the "default behavior is unchanged" guarantee is
+            # inspectable by diff rather than by trusting that
+            # effective_stop's managed-mode branch matches. This is also the
+            # same formula effective_stop() applies when manage_controllers
+            # is True (see tinker_sim_core.safety_gating).
+            active = (
+                self._desired_stop
+                or not self._management_ready
+                or self._startup_hold
+                or self._restore_pending
+            )
+        else:
+            active = effective_stop(
+                self._desired_stop,
+                self._management_ready,
+                self._startup_hold,
+                self._restore_pending,
+                self._manage_controllers,
+            )
         # Repeated publication is the supervisor liveness heartbeat. A
         # consumer that misses this stream must assert its own stop.
         self._publish(active)
@@ -174,6 +204,8 @@ class SafetySupervisor(Node):
             if not management_ready:
                 self._startup_hold = True
         self._publish_effective()
+        if not self._manage_controllers:
+            return
         if not self._management_ready:
             return
         if self._controllers_inflight or self._switch_inflight:
@@ -264,7 +296,12 @@ class SafetySupervisor(Node):
         request = SwitchController.Request()
         request.strictness = SwitchController.Request.STRICT
         request.activate_asap = True
-        request.timeout = Duration(seconds=2.0).to_msg()
+        # 30 s, not 2 s: the controller manager applies switches from its
+        # stepped update loop, and Isaac's stepping gaps out for multiple
+        # wall seconds during RTX camera strides / gripper contact bursts.
+        # A 2 s window then times out every attempt, leaving the arm
+        # controller stuck inactive after any transient safety stop.
+        request.timeout = Duration(seconds=30.0).to_msg()
         if activate:
             request.activate_controllers = [self._controller]
         else:

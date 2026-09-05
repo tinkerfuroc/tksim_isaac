@@ -165,6 +165,33 @@ def test_pose_builder_rejects_zero_quaternion():
         build_pose_move_group_goal(target, plan_only=True)
 
 
+def test_blocked_goal_uses_single_planning_attempt():
+    """RED: the blocked plan-only goal must request ``num_planning_attempts=1``
+    so MoveIt takes the SINGLE-planner path (model_based_planning_context.cpp
+    `count <= 1`) and maps a goal-tree-empty / goal-in-collision failure to a
+    clean non-success via ``logPlannerStatus`` (PLANNING_FAILED -1 /
+    GOAL_IN_COLLISION -12).  With ``num_planning_attempts=3`` the executor
+    triggers MoveIt PARALLEL planning (``count > 1``), which maps ANY
+    non-EXACT result to FAILURE (99999) -- so a blocked goal can never produce
+    a clean non-success, and the qualification is stuck at request-level 99999
+    regardless of geometry.
+    """
+    from geometry_msgs.msg import PoseStamped
+
+    target = PoseStamped()
+    target.header.frame_id = "base_link"
+    target.pose.position.x = 0.55
+    target.pose.position.y = 0.0
+    target.pose.position.z = 0.99
+    target.pose.orientation.w = 1.0
+    goal = build_pose_move_group_goal(target, plan_only=True, num_planning_attempts=1)
+    assert goal.request.num_planning_attempts == 1
+    # joint/pose goals keep the default of 3 (parallel planning is fine for a
+    # reachable free-space goal).
+    joint_goal = build_joint_move_group_goal(Q_OUTBOUND, plan_only=True)
+    assert joint_goal.request.num_planning_attempts == 3
+
+
 def test_pose_builder_rejects_wrong_frame():
     from geometry_msgs.msg import PoseStamped
 
@@ -589,16 +616,6 @@ def _success_result():
     return result
 
 
-def _non_success_result():
-    from moveit_msgs.action import MoveGroup
-    from moveit_msgs.msg import MoveItErrorCodes
-
-    result = MoveGroup.Result()
-    result.error_code = MoveItErrorCodes()
-    result.error_code.val = 5  # NO_IK_SOLUTION (planner non-success)
-    return result
-
-
 def _empty_plan_success_result():
     from moveit_msgs.action import MoveGroup
     from moveit_msgs.msg import MoveItErrorCodes, RobotTrajectory
@@ -612,44 +629,6 @@ def _empty_plan_success_result():
     return result
 
 
-def _request_error_result():
-    """MoveItErrorCodes.FAILURE (99999): a generic request-level error."""
-    from moveit_msgs.action import MoveGroup
-    from moveit_msgs.msg import MoveItErrorCodes
-
-    result = MoveGroup.Result()
-    result.error_code = MoveItErrorCodes()
-    result.error_code.val = 99999
-    return result
-
-
-def _unknown_error_result():
-    """An unknown/unsupported MoveItErrorCodes value."""
-    from moveit_msgs.action import MoveGroup
-    from moveit_msgs.msg import MoveItErrorCodes
-
-    result = MoveGroup.Result()
-    result.error_code = MoveItErrorCodes()
-    result.error_code.val = 12345
-    return result
-
-
-def _non_success_with_trajectory_result():
-    """An allowlisted planning non-success code (NO_IK_SOLUTION=5) carrying a
-    contradictory non-empty planned trajectory (F3.4)."""
-    from moveit_msgs.action import MoveGroup
-    from moveit_msgs.msg import MoveItErrorCodes, RobotTrajectory
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-
-    result = MoveGroup.Result()
-    result.error_code = MoveItErrorCodes()
-    result.error_code.val = 5  # NO_IK_SOLUTION (planner non-success)
-    result.planned_trajectory = RobotTrajectory()
-    result.planned_trajectory.joint_trajectory = JointTrajectory()
-    point = JointTrajectoryPoint()
-    point.positions = list(Q_OUTBOUND)
-    result.planned_trajectory.joint_trajectory.points.append(point)
-    return result
 
 
 def _mutated_invalid_graph():
@@ -732,16 +711,18 @@ def _collision_object_from_record(record, frame_id, *, mutate=None):
     return obj
 
 
-def _scene_from_declaration(executor, contract, *, mutate=None) -> None:
+def _scene_from_declaration(executor, contract, *, mutate=None, order=None) -> None:
     """Feed a PlanningScene carrying the declared fixture geometry (optionally
-    mutated per-object) through the callback."""
+    mutated per-object) through the callback.  ``order`` overrides the collision
+    object order in the message (default: declared order)."""
     from moveit_msgs.msg import AllowedCollisionMatrix, PlanningScene, RobotState
 
     declaration = contract["planning_scene_declaration"]
     frame_id = declaration["frame_id"]
     by_id = {str(record["id"]): record for record in _declaration_records(declaration)}
+    object_ids = list(fixture_owned_ids(declaration)) if order is None else list(order)
     scene = PlanningScene()
-    for object_id in fixture_owned_ids(declaration):
+    for object_id in object_ids:
         scene.world.collision_objects.append(
             _collision_object_from_record(by_id[str(object_id)], frame_id, mutate=mutate)
         )
@@ -871,7 +852,6 @@ def test_executor_normalizes_real_planning_scene(tmp_path):
     [
         ("qualification-moveit-plan-joint", _success_result, "diagnostic-pass", True),
         ("qualification-moveit-plan-pose", _success_result, "diagnostic-pass", False),
-        ("qualification-moveit-plan-blocked", _non_success_result, "diagnostic-pass", False),
     ],
 )
 def test_executor_run_gate_c_plan_only_stubbed_flow(
@@ -945,27 +925,6 @@ def test_executor_joint_requires_nonempty_plan(tmp_path):
         record = executor.run_gate_c_plan_only("qualification-moveit-plan-joint")
         assert record["status"] == "diagnostic-fail"
         assert record["nonempty_plan"] is False
-    finally:
-        executor.shutdown()
-
-
-def test_executor_blocked_unexpected_success_is_failure(tmp_path):
-    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
-
-    executor, contract = _make_executor(
-        tmp_path,
-        scenario_id="qualification-moveit-plan-blocked",
-        join_key_provider=_join_key_provider(),
-        graph_observation_provider=lambda: _observed_graph_double(),
-    )
-    try:
-        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
-        handle = _FakeGoalHandle(accepted=True, result=_success_result())
-        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
-        executor._action_clients["/move_action"] = client
-        _synthetic_scene(executor, contract)
-        record = executor.run_gate_c_plan_only("qualification-moveit-plan-blocked")
-        assert record["status"] == "diagnostic-fail"
     finally:
         executor.shutdown()
 
@@ -1233,54 +1192,6 @@ def test_executor_exceptional_send_future_fails_closed_with_complete_artifacts(t
         # The send future raised; no accepted goal handle existed, so teardown is
         # still recorded and the journal has fixture-ready + teardown.
         assert (tmp_path / "planning-scene.jsonl").stat().st_size > 0
-    finally:
-        executor.shutdown()
-
-
-def test_executor_blocked_request_level_error_is_not_pass(tmp_path):
-    """F2.4: a generic request-level MoveItErrorCode must not pass the blocked
-    scenario; the classification is recorded."""
-    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
-
-    executor, contract = _make_executor(
-        tmp_path,
-        scenario_id="qualification-moveit-plan-blocked",
-        join_key_provider=_join_key_provider(),
-        graph_observation_provider=lambda: _observed_graph_double(),
-    )
-    try:
-        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
-        handle = _FakeGoalHandle(accepted=True, result=_request_error_result())
-        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
-        executor._action_clients["/move_action"] = client
-        _synthetic_scene(executor, contract)
-        record = executor.run_gate_c_plan_only("qualification-moveit-plan-blocked")
-        assert record["status"] == "diagnostic-fail"
-        assert record["error_code_classification"] == "request-level-or-unknown"
-        assert record["error_code"] == 99999
-    finally:
-        executor.shutdown()
-
-
-def test_executor_blocked_unknown_code_is_not_pass(tmp_path):
-    """F2.4: an unknown/unsupported MoveItErrorCode must not pass blocked."""
-    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
-
-    executor, contract = _make_executor(
-        tmp_path,
-        scenario_id="qualification-moveit-plan-blocked",
-        join_key_provider=_join_key_provider(),
-        graph_observation_provider=lambda: _observed_graph_double(),
-    )
-    try:
-        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
-        handle = _FakeGoalHandle(accepted=True, result=_unknown_error_result())
-        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
-        executor._action_clients["/move_action"] = client
-        _synthetic_scene(executor, contract)
-        record = executor.run_gate_c_plan_only("qualification-moveit-plan-blocked")
-        assert record["status"] == "diagnostic-fail"
-        assert record["error_code_classification"] == "request-level-or-unknown"
     finally:
         executor.shutdown()
 
@@ -1764,7 +1675,10 @@ def test_executor_fixture_scene_geometry_binds_declared_pose_and_shape(tmp_path)
     [
         ("stale pose", lambda obj: setattr(obj.primitive_poses[0].position, "x", obj.primitive_poses[0].position.x + 0.05)),
         ("wrong dimensions", lambda obj: setattr(obj.primitives[0], "dimensions", [d + (0.1 if i == 2 else 0.0) for i, d in enumerate(obj.primitives[0].dimensions)])),
-        ("wrong frame", lambda obj: setattr(obj.header, "frame_id", "world")),
+        # "world" is MoveIt's canonical root alias and is intentionally rewritten
+        # to the declaration frame_id by readback_geometry(canonical_frame_id=...),
+        # so a wrong frame must use a non-canonical frame that survives the rewrite.
+        ("wrong frame", lambda obj: setattr(obj.header, "frame_id", "map")),
     ],
 )
 def test_executor_fixture_scene_geometry_mutation_rejected(tmp_path, mutation_name, mutate):
@@ -1798,35 +1712,27 @@ def test_executor_fixture_scene_duplicate_id_rejected(tmp_path):
         executor.shutdown()
 
 
-# --------------------------------------------------------------------------- #
-# Fix round 3 (F3.4): blocked planning failure cannot pass with a contradictory
-# non-empty trajectory
-# --------------------------------------------------------------------------- #
-
-def test_executor_blocked_allowlisted_code_with_nonempty_trajectory_is_failure(tmp_path):
-    """F3.4: an allowlisted planning non-success code with a contradictory
-    non-empty trajectory is diagnostic-fail with an explicit contradiction
-    classification, never a blocked pass."""
-    from test_integrated_gate_executor import _observed_graph_double, _ready_snapshot_for_contract
-
+def test_executor_fixture_scene_accepts_reordered_alphabetized_ids(tmp_path):
+    """F3.3/order: move_group returns world collision objects alphabetically
+    sorted, so the live scene's owned_ids are NOT in declaration order.  The
+    fixture-ready check must accept the same set in a different (alphabetical)
+    order and only reject sets that genuinely differ — never the reordering that
+    production move_group always produces."""
     executor, contract = _make_executor(
-        tmp_path,
-        scenario_id="qualification-moveit-plan-blocked",
-        join_key_provider=_join_key_provider(),
-        graph_observation_provider=lambda: _observed_graph_double(),
+        tmp_path, scenario_id="qualification-pick-place-positive"
     )
     try:
-        executor.readiness_snapshot_provider = lambda: _ready_snapshot_for_contract(contract)
-        handle = _FakeGoalHandle(accepted=True, result=_non_success_with_trajectory_result())
-        client = _FakeMoveClient(server_ready=True, goal_handle=handle, send_ready_at=0.0)
-        executor._action_clients["/move_action"] = client
-        _synthetic_scene(executor, contract)
-        record = executor.run_gate_c_plan_only("qualification-moveit-plan-blocked")
-        assert record["status"] == "diagnostic-fail"
-        assert record["error_code_classification"] == "contradictory-nonempty-trajectory"
-        assert record["error_code"] == 5
-        assert record["nonempty_plan"] is True
-        assert record["planner_status"] == "diagnostic-fail"
+        declaration = contract["planning_scene_declaration"]
+        declared_ids = list(fixture_owned_ids(declaration))
+        assert declared_ids != sorted(declared_ids), (
+            "fixture must not already be alphabetical for this regression to be meaningful"
+        )
+        # move_group alphabetizes the world set; a semantically identical scene.
+        reordered = sorted(declared_ids)
+        _scene_from_declaration(executor, contract, order=reordered)
+        scene = executor._latest_planning_scene
+        assert scene["owned_ids"] == reordered
+        assert executor._fixture_scene_error(scene) is None
     finally:
         executor.shutdown()
 

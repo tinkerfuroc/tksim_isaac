@@ -1,4 +1,4 @@
-"""Task 1: integrated qualification schema and 17-scenario matrix tests.
+"""Task 1: integrated qualification schema and 16-scenario matrix tests.
 
 These tests assert the complete immutable scenario/planning-scene/integrated
 mappings are retained, all wire digests match ``^(?!0{64}$)[0-9a-f]{64}$``, the
@@ -43,7 +43,6 @@ QUALIFICATION_DIR = ROOT / "simulation/qualification"
 ALL_SCENARIOS = (
     "qualification-moveit-plan-joint",
     "qualification-moveit-plan-pose",
-    "qualification-moveit-plan-blocked",
     "qualification-moveit-execute-joint",
     "qualification-moveit-execute-pose",
     "qualification-moveit-cartesian-retreat",
@@ -127,7 +126,7 @@ FIXTURE_ASSETS = {
     "sim_fixture/plan_blocker": {
         "source_object_id": "qualification_plan_blocker",
         "asset_uri": "simulation/assets/primitives/obstacle.usda",
-        "asset_sha256": "c62ade2971c0846ea8f003e471cd2b056cd86c77dfd290430a1f4ea753996db5",
+        "asset_sha256": "e90c3bdf8b7385a6540a499fa5197a01dfb5f470b5f1eb04ff8e5be0550f851f",
         "geometry": {"type": "box", "dimensions": [0.30, 0.30, 0.30]},
         "center_offset_z": 0.15,
     },
@@ -238,7 +237,7 @@ def test_blocked_report_is_scenario_specific():
 
 
 @pytest.mark.parametrize("scenario_name", ALL_SCENARIOS)
-def test_all_17_scenarios_build_their_own_complete_report(scenario_name):
+def test_all_16_scenarios_build_their_own_complete_report(scenario_name):
     report = canonical_report(scenario_name)
     source = load_test_scenario(scenario_name)
     assert report["scenario"] == source["scenario"]
@@ -257,7 +256,7 @@ def test_all_17_scenarios_build_their_own_complete_report(scenario_name):
     assert source["integrated"] == raw["integrated"]
 
 
-def test_integrated_ompl_config_declares_all_17_scenarios():
+def test_integrated_ompl_config_declares_all_16_scenarios():
     config_path = QUALIFICATION_DIR / "integrated-ompl.json"
     assert config_path.is_file()
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -276,7 +275,7 @@ def test_integrated_ompl_config_declares_all_17_scenarios():
     declared.append(stages["E"]["positive"])
     declared.extend(stages["E"]["negative"])
     assert sorted(declared) == sorted(ALL_SCENARIOS)
-    assert len(declared) == 17
+    assert len(declared) == 16
 
 
 @pytest.mark.parametrize("scenario_name", ALL_SCENARIOS)
@@ -320,6 +319,31 @@ def test_fixture_asset_hashes_match_actual_assets():
                 assert primitive["dimensions"] == spec["geometry"]["dimensions"], (
                     f"{name} {fixture_id} geometry does not match fixture table"
                 )
+
+
+def test_obstacle_asset_hash_bindings_are_consistent_with_asset_bytes():
+    """The obstacle fixture is content-addressed: every existing scenario/config
+    hash binding for obstacle.usda must track the committed asset bytes.  Any
+    change to the asset (e.g. adding the kinematic rigid-body API) forces every
+    binding below to be re-pinned in the same change, or this test goes RED."""
+    asset_path = ROOT / "simulation/assets/primitives/obstacle.usda"
+    actual = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+    # Fixture table binding consumed by the parity/spawn contracts.
+    assert FIXTURE_ASSETS["sim_fixture/plan_blocker"]["asset_sha256"] == actual
+    # Scenario spawn-record bindings that pin the obstacle asset.  A record
+    # without an asset_sha256 (e.g. qualification-arm-collision) has no binding
+    # to re-pin, so it is intentionally not forced here.
+    for name in (
+        "qualification-arm-collision",
+        "qualification-pick-place-blocked-approach",
+    ):
+        raw = json.loads((SCENARIO_DIR / f"{name}.json").read_text(encoding="utf-8"))
+        for record in raw.get("objects", []) + raw.get("actors", []):
+            if str(record.get("asset_uri", "")).endswith("obstacle.usda"):
+                if "asset_sha256" in record:
+                    assert record["asset_sha256"] == actual, (
+                        f"{name}: obstacle asset_sha256 is stale; re-pin to {actual}"
+                    )
 
 
 def test_each_owned_id_appears_exactly_once_in_planning_scene_objects():

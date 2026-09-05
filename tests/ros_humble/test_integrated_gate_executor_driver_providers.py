@@ -119,6 +119,7 @@ from validation.integrated_gate_executor import (  # noqa: E402
     _valid_goal_uuid,
     build_execute_trajectory_goal,
     build_joint_move_group_goal,
+    build_journal_graph_projection,
     evaluate_executor_readiness,
 )
 from planning_scene_journal import validate_graph_evidence
@@ -379,11 +380,14 @@ class _ControlledGraph:
         self._collision_node = self._add_node("sim_collision_source")
         self._tf_node = self._add_node("sim_static_tf")
         self._lidar_node = self._add_node("livox_lidar_source")
+        self._broadcaster_node = self._add_node("joint_state_broadcaster")
 
         # Continuous streams.
+        # /joint_states is published by joint_state_broadcaster with
+        # TRANSIENT_LOCAL durability, mirroring the production contract.
         self._joint_pub = self._make_pub(
-            self._joint_pub_node, JointState, JOINT_STATES_TOPIC, depth=10,
-            best_effort=self._joint_qos_best_effort,
+            self._broadcaster_node, JointState, JOINT_STATES_TOPIC, depth=10,
+            transient=True, best_effort=self._joint_qos_best_effort,
         )
         self._safety_pub = self._make_pub(self._safety_node, Bool, SAFETY_STOP_TOPIC, transient=True)
         self._fixture_pub = self._make_pub(self._fixture_node, String, FIXTURE_TOPIC, transient=True)
@@ -1337,7 +1341,12 @@ def test_journal_graph_projection_positive(graph, tmp_path):
         observed = d._observe_journal_graph(executor)
         # The observed graph passes the executor's own validator.
         _validate_observed_graph(observed)
-        projection = d._build_journal_graph_projection(executor)
+        raw_projection = d._build_journal_graph_projection(executor)
+        assert "payload" not in raw_projection["topics"][FIXTURE_TOPIC]
+        projection = build_journal_graph_projection(
+            fixture_payload=executor._fixture_payload_for_graph(),
+            observed_graph=raw_projection,
+        )
         assert projection["topics"][FIXTURE_TOPIC]["payload"]
         assert isinstance(validate_graph_evidence(projection), dict)
     finally:
@@ -2324,3 +2333,59 @@ def test_exact_uuid_cancel_service_unavailable_fails_closed(rclpy_runtime, tmp_p
     finally:
         if executor is not None:
             executor.shutdown()
+
+
+def test_build_pose_goal_pins_start_state_from_joint_sample() -> None:
+    """RED: the pose MoveGroup goal must pin start_state from the fresh joint
+    sample so move_group plans from the real sim arm, not its stale cache.
+
+    Live pose/blocked scenarios failed because the goal left
+    ``request.start_state`` empty; move_group planned from a cache whose
+    link6 sat inside the pedestal -> phantom collision -> invalid plan /
+    catastrophic failure.  The goal must carry the readiness-validated
+    ``/joint_states`` positions so OMPL starts from the actual arm.
+    """
+    from geometry_msgs.msg import PoseStamped
+    from sensor_msgs.msg import JointState
+
+    from validation.integrated_gate_executor import build_pose_move_group_goal
+
+    js = JointState()
+    js.name = list(_JOINTS)
+    js.position = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    pose = PoseStamped()
+    pose.header.frame_id = "base_link"
+    pose.pose.position.x = 0.45
+    pose.pose.position.y = 0.2
+    pose.pose.position.z = 0.99
+    pose.pose.orientation.w = 1.0
+    goal = build_pose_move_group_goal(pose, plan_only=True, start_state=js)
+    start = goal.request.start_state
+    assert start is not None, "start_state must be populated from the joint sample"
+    assert start.is_diff is False
+    assert list(start.joint_state.name) == list(_JOINTS)
+    assert list(start.joint_state.position) == pytest.approx(
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    )
+
+
+def test_build_joint_goal_pins_start_state_from_joint_sample() -> None:
+    """RED: the joint MoveGroup goal must pin start_state from the fresh
+    /joint_states sample (same reason as the pose case)."""
+    from sensor_msgs.msg import JointState
+
+    from validation.integrated_gate_executor import build_joint_move_group_goal
+
+    js = JointState()
+    js.name = list(_JOINTS)
+    js.position = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    goal = build_joint_move_group_goal(
+        list(Q_OUTBOUND), plan_only=True, start_state=js
+    )
+    start = goal.request.start_state
+    assert start is not None, "start_state must be populated from the joint sample"
+    assert start.is_diff is False
+    assert list(start.joint_state.name) == list(_JOINTS)
+    assert list(start.joint_state.position) == pytest.approx(
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    )
