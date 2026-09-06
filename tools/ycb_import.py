@@ -345,6 +345,74 @@ def repair_physics(repo_root: Path) -> AssetPublication:
     return publication
 
 
+def recenter_physics(repo_root: Path) -> tuple[AssetPublication, dict[str, tuple[float, float, float]]]:
+    """Republish the current YCB artifact with every object's geometry
+    recentred onto its rigid-body origin.
+
+    Confirmed live (Task 32): the raw upstream YCB meshes carry an
+    uncentered origin all the way through this pipeline -- for
+    ``ycb_010_tomato_soup_can`` the collision mesh's own footprint does not
+    contain the tracked rigid-body origin at all (~8.4cm outside the can
+    along Y), so physics truth, ``TINKER_SIM_TRACK_OBJECTS``, and
+    ``/spawn_entity`` placement all carry that offset independent of the
+    collider geometry being otherwise correct.
+
+    Same shape as ``repair_physics``: a pure pxr edit --
+    ``arena_convert.recenter_object_origin`` applied to each existing
+    ``object.usd``, every other payload byte (including the mass/friction
+    physics that repair already authored) carried over verbatim, the
+    source lock reused unchanged -- so it needs no Kit, no GPU, and no
+    upstream checkout, and can repair the currently-published artifact
+    without re-downloading sources. Publishing yields a new content-
+    addressed identity; the old artifact directory remains for provenance.
+
+    Returns the new publication plus a ``{object_id: (dx, dy, dz)}`` map of
+    the offset applied to each object, for a caller to log.
+    """
+    from pxr import Usd
+
+    from tinker_sim_deploy.arena_convert import recenter_object_origin
+
+    current = json.loads(
+        (repo_root / "artifacts/objects/ycb/current.json").read_text(encoding="utf-8")
+    )
+    manifest_path = repo_root / current["manifest"]
+    artifact_dir = manifest_path.parent
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_lock = json.loads((artifact_dir / "source-lock.json").read_text(encoding="utf-8"))
+
+    payload: dict[str, bytes] = {}
+    offsets: dict[str, tuple[float, float, float]] = {}
+    with tempfile.TemporaryDirectory(prefix="ycb-recenter-") as scratch_dir:
+        scratch = Path(scratch_dir)
+        for name in manifest["payload"]:
+            data = (artifact_dir / name).read_bytes()
+            if name.endswith("/object.usd"):
+                object_id = name.split("/", 1)[0]
+                work = scratch / object_id
+                work.mkdir(parents=True, exist_ok=True)
+                source = work / "object.usd"
+                source.write_bytes(data)
+                stage = Usd.Stage.Open(str(source))
+                offsets[object_id] = recenter_object_origin(stage)
+                recentred_path = work / "object.recentred.usd"
+                if not stage.GetRootLayer().Export(str(recentred_path)):
+                    raise AssetArtifactError(f"failed to export recentred USD for {name}")
+                data = recentred_path.read_bytes()
+            payload[name] = data
+    if not offsets:
+        raise AssetArtifactError("current YCB artifact contains no object.usd payloads")
+    publication = publish_asset_artifact(
+        repo_root,
+        kind="objects",
+        asset_id="ycb",
+        payload=payload,
+        source_lock=source_lock,
+    )
+    _repoint_asset_manifest(repo_root, artifact_dir.name, publication)
+    return publication, offsets
+
+
 def _repoint_asset_manifest(
     repo_root: Path, old_identity: str, publication: AssetPublication
 ) -> None:
@@ -409,6 +477,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--recenter",
+        action="store_true",
+        help=(
+            "republish the current artifact with every object's geometry "
+            "recentred onto its rigid-body origin (pure pxr, no Kit, no "
+            "checkout)"
+        ),
+    )
+    parser.add_argument(
         "--root",
         type=Path,
         default=None,
@@ -433,8 +510,24 @@ def main(argv: list[str] | None = None) -> int:
             "to the new identity"
         )
         return 0
+    if args.recenter:
+        publication, offsets = recenter_physics((args.root or ROOT).resolve())
+        print(
+            f"published recentred ycb objects artifact: "
+            f"identity={publication.identity} dir={publication.artifact_dir}"
+        )
+        print("per-object offset applied (dx, dy, dz) metres:")
+        for object_id in sorted(offsets):
+            dx, dy, dz = offsets[object_id]
+            print(f"  {object_id}: ({dx:.4f}, {dy:.4f}, {dz:.4f})")
+        print(
+            "operator reminder: update scenario asset_uris and the "
+            "generated_object_usds entries in artifacts/asset-manifest.json "
+            "to the new identity"
+        )
+        return 0
     if args.config is None:
-        parser.error("--config is required unless --repair-physics is given")
+        parser.error("--config is required unless --repair-physics or --recenter is given")
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
     repo_root = ROOT

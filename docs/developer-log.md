@@ -2417,3 +2417,109 @@ pre-#26 behaviour, confirming this round's change doesn't give flag-off a
 settle timer it never had. Full suite:
 `tests/test_manipulation_runtime.py` 105 passed, 3 subtests passed, 0
 failed. Still no GPU boot for either round of this fix.
+
+## 2026-09-06: YCB object origins uncentered on the mesh -- soup can 8.5cm off (#32)
+
+**Symptom**: bench truth for spawned YCB objects reads consistently off from
+where the physical object actually sits -- reported worst case ~8.6cm for
+the tomato soup can, with contacts (the only geometry-true signal) as the
+tell. This is independent of the retention work in #17/#20: friction and
+mass were already correctly authored on these assets, but the *origin*
+PhysX reports as the object's rigid-body pose was never the origin the
+object's own mesh is centered on.
+
+**Root cause**: `tools/tinker_sim_deploy/arena_convert.py::_compose_object`
+(via `convert_object_to_usd`) wraps each object's raw upstream DAE (visual)
+and STL (collision) conversions under `/World/geom` and `/World/collision`
+with only a unit-scale `xformOp:scale` -- no recentring translate is ever
+authored. The module's own design rationale ("every allowlisted object's
+SDF declares identity visual/collision poses, so this importer needs no
+per-model scale/pose correction") only establishes that the mesh file isn't
+offset *relative to its SDF link*; it says nothing about whether the raw
+mesh's own vertex data is centered on that link's origin. It is not: the
+upstream `tmc_wrs_gz_worlds` YCB scans carry over whatever the turntable/
+scan reference frame happened to be. Measured directly against the
+published `object.usd` files (`UsdGeom.BBoxCache` on the collision mesh,
+in the object's own `/World` frame): the soup can's collision footprint is
+`(-0.0429, 0.0508, 0.0003)..(0.0244, 0.1175, 0.1016)` -- its Y range does
+not even contain Y=0, i.e. the tracked rigid-body origin sits ~5cm *outside*
+the can's own body along Y (8.46cm full XY offset magnitude). Every
+harness-spawned object's truth is read straight off that same rigid-body
+origin (`backend.py::_iter_spawned_bodies` / `_spawned_object_states`, via
+`physx.get_rigidbody_transformation` on the referenced object's `/World`
+prim) with no correction, so the defect propagates end-to-end: PhysX
+truth, `/sim/truth/object_state`, and `/spawn_entity` placement are all
+that far from the physical mesh, independent of the collider geometry
+itself (convex-decomposition, correctly sized) being fine. The Z
+convention (base anchored at collision bbox min Z = 0) was already correct
+by design and is preserved exactly.
+
+**Fix**: `arena_convert.recenter_object_origin(stage)` -- a pure-pxr step,
+mirroring the existing `author_object_*` authoring functions -- computes
+the collision mesh's AABB in the object's own `/World` frame and authors a
+corrective `xformOp:translate` on both the `geom` and `collision` wrapper
+Xforms (same numeric offset on both, so they stay coincident) so the
+collision bbox's XY centroid lands at (0, 0); the Z component of the
+translate is `-bbox_min_z`, a no-op to floating-point noise for objects
+already satisfying the base-anchor convention. Per this module's own
+xformOp-ordering convention (top-of-file docstring: earlier-added ops end
+up outermost), the translate has to be spliced in *ahead of* the existing
+scale op rather than simply appended -- `_prepend_translate` reorders
+`xformOpOrder` accordingly, and updates an existing `recenter` translate
+in place rather than stacking a second one on a repair re-run.
+`_compose_object` now calls it during import, right before the
+rigid-body/preview-surface authoring; `ycb_import.recenter_physics`
+(mirroring `repair_physics`) re-runs it standalone against an
+already-published artifact -- no Kit, no GPU, no upstream checkout needed
+-- and a new `--recenter` CLI flag wires it into `ycb_import.py`, alongside
+the existing `--repair-physics`.
+
+New tests (`tests/test_ycb_object_recenter.py`, pxr-importorskip'd): a
+synthetic composed-object stage (mirroring `_compose_object`'s structure)
+with a mesh offset by `(0.05, 0.08, 0.0)` under an already-base-anchored Z
+-- asserts the recentred collision bbox centroid lands within 1e-6 of the
+origin, min Z stays at 0, and the visual/collision wrappers receive the
+identical translate (they stay coincident); plus idempotency and a
+missing-collision-child failure-closed case. A second test,
+`test_every_published_ycb_object_is_recentred_on_its_origin`, walks every
+`object.usd` this checkout's `artifacts/asset-manifest.json` references
+under `objects/ycb/` and asserts each collision bbox centroid is within
+5mm of (0, 0, 0); it skips cleanly when no local `artifacts/` store is
+present (the binaries are gitignored). Run directly against the live
+artifact store at `/home/tinker/tinker-sim/6.0.1/artifacts/`: all 10
+objects failed the 5mm check against the pre-fix identity `f342a496...`
+(soup can 92.4mm 3D / 84.1mm XY, sugar box 18.2mm, ..., bowl 46.4mm) and
+all 10 pass exactly (centroid and min Z reported as `0.000000` to six
+decimals) against the republished identity below.
+
+**Republish**: ran `tools/ycb_import.py --recenter --root
+/home/tinker/tinker-sim/6.0.1` against the live artifact store (old
+identity `f342a496fc34fa2a1d2721cef5e03cb629d74ec41fa0d8f68b5e6b1e42edc866`
+preserved untouched for provenance -- confirmed no file under it newer than
+the new `current.json`). New content-addressed identity
+`b533a2e5dff60c79ab0f4ec9c6cee2f568735c036ac2b7dc684e12590ad41cca`; mass
+and friction material authored by #17/#20 verified carried over unchanged
+onto the recentred geometry (soup can: rigid body + mass 0.349kg + static/
+dynamic friction 0.8/0.7, spot-checked). `current.json` and
+`asset-manifest.json` (10 `generated_object_usds` entries) auto-repointed
+by the CLI; scenario `asset_uris` in `simulation/scenarios/gpsr-rcw2026.json`
+and `gpsr-rcw2026-bench.json` (4 objects each) manually repointed, same
+flow as the #17 friction/mass migration.
+
+Per-object `(dx, dy, dz)` translate applied (metres, printed by the CLI):
+
+| object | dx | dy | dz |
+|---|---|---|---|
+| ycb_001_cheez-it | 0.0131 | 0.0149 | 0.0031 |
+| ycb_002_sugar_box | 0.0074 | 0.0166 | -0.0001 |
+| ycb_005_spam | 0.0333 | 0.0267 | 0.0030 |
+| ycb_006_mustard_bottle | 0.0152 | 0.0234 | 0.0030 |
+| ycb_008_pudding_box | -0.0006 | -0.0192 | 0.0004 |
+| ycb_010_tomato_soup_can | 0.0092 | -0.0841 | -0.0003 |
+| ycb_011_banana | -0.0115 | 0.0072 | 0.0002 |
+| ycb_021_bleach_cleanser | 0.0216 | -0.0117 | 0.0007 |
+| ycb_024_bowl | 0.0151 | 0.0436 | 0.0006 |
+| ycb_025_mug | 0.0085 | -0.0179 | 0.0006 |
+
+`tests/test_ycb_object_recenter.py` (new), `tests/test_ycb_physics_repair.py`,
+`tests/test_arena_convert.py`, and `tests/test_ycb_import_cli.py` all green.
