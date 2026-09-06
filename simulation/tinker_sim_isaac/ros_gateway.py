@@ -328,7 +328,14 @@ class RosStandardGateway:
     def _stamp(self):
         from builtin_interfaces.msg import Time
 
-        value = self.backend.simulation_time
+        # ros_clock_time anchors the published clock to a boot epoch so a
+        # full sim-process restart never publishes a /clock sample that
+        # appears to precede a prior process's last one (task #21,
+        # TINKER_SIM_CLOCK_EPOCH). Fall back to the plain elapsed
+        # simulation_time for a backend double that predates that property.
+        value = getattr(self.backend, "ros_clock_time", None)
+        if value is None:
+            value = self.backend.simulation_time
         stamp = Time()
         stamp.sec = int(value)
         stamp.nanosec = int(round((value - int(value)) * 1.0e9))

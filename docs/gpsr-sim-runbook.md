@@ -228,6 +228,37 @@ are **not recommended for anything that produces evidence**:
 override the robot USD's articulation solver iteration counts (32 / 1) and
 change drive and contact convergence.
 
+### Clock boot-epoch anchor (`TINKER_SIM_CLOCK_EPOCH`)
+
+Task #21: the published `/clock` is anchored to a boot epoch so a fresh sim
+*process* never publishes a sample that appears to precede a prior process's
+last one -- a full Isaac Sim restart re-zeroing `/clock` wedges tf2 buffers
+and message filters in every long-lived ROS consumer that keeps running
+across the restart (Python `tf2_ros.Buffer` has no jump-handling; a backward
+jump is cached as stale data and dropped, or raises `ExtrapolationException`,
+until ~10 s of new sim time re-elapses). This does not change how fast the
+clock runs, only what it is anchored to; the existing in-process STOP -> PLAY
+monotonic-clock behaviour (`767fb89`) is unaffected and still applies on top
+of the epoch. See `docs/developer-log.md` (2026-09-05 entry) for the root
+cause and `simulation/tinker_sim_isaac/backend.py`'s `resolve_clock_epoch`.
+
+- unset or `wall` (default): the wall-clock time (`time.time()`) captured
+  once, when this backend/clock origin is first established -- matching
+  hardware parity (real ROS time on hardware is wall-clock and never goes
+  backward).
+- `0`: the legacy zero-based clock. Every pre-existing zero-based test,
+  replay, or offset-alignment assumption keeps its meaning.
+- any other non-negative numeric value: that epoch in seconds, letting a
+  harness pin a reproducible absolute clock across repeated runs. A negative
+  value is rejected (fails closed) -- it would let the published clock read
+  exactly `0`, or go negative, while physics is genuinely advancing.
+
+Only the *published* clock (`/clock` and outgoing ROS message header stamps)
+is anchored; `backend.simulation_time` itself is untouched and stays the
+small, process-relative elapsed value that internal timers (run-duration
+gating in `validation/run_sim.py`, the base-hold timers, truth-record `t`
+fields) already depend on starting near zero.
+
 ### Profiling and actuator-model knobs
 
 `TINKER_SIM_PROFILE=1` prints a `step_profile` line every
