@@ -3332,6 +3332,34 @@ class IsaacWholeRobotBackend:
                     flush=True,
                 )
 
+    @staticmethod
+    def _object_state_dict(
+        *,
+        object_id: str,
+        class_name: str,
+        prim_path: str,
+        xyz,
+        quaternion_xyzw,
+        twist_linear=(0.0, 0.0, 0.0),
+        twist_angular=(0.0, 0.0, 0.0),
+    ) -> dict[str, object]:
+        """Assemble one object truth-state record. Shared by the scenario-
+        declared view path and the view-free spawned path so both emit the
+        identical schema."""
+        return {
+            "id": str(object_id),
+            "class_name": str(class_name),
+            "prim_path": str(prim_path),
+            "pose": {
+                "xyz": [float(value) for value in tuple(xyz)[:3]],
+                "quaternion_xyzw": [float(value) for value in tuple(quaternion_xyzw)[:4]],
+            },
+            "twist": {
+                "linear": [float(value) for value in tuple(twist_linear)[:3]],
+                "angular": [float(value) for value in tuple(twist_angular)[:3]],
+            },
+        }
+
     def _actual_object_states(self) -> list[dict[str, object]]:
         states: list[dict[str, object]] = []
         for name, view in self._object_views.items():
@@ -3341,21 +3369,134 @@ class IsaacWholeRobotBackend:
             twist = velocities[0].detach().cpu().tolist()
             descriptor = self._expected_objects.get(name, {})
             states.append(
-                {
-                    "id": name,
-                    "class_name": str(descriptor.get("class_name", "")),
-                    "prim_path": str(descriptor.get("actual_prim_path", "")),
-                    "pose": {
-                        "xyz": [float(value) for value in pose[:3]],
-                        "quaternion_xyzw": [float(value) for value in pose[3:7]],
-                    },
-                    "twist": {
-                        "linear": [float(value) for value in twist[:3]],
-                        "angular": [float(value) for value in twist[3:6]],
-                    },
-                }
+                self._object_state_dict(
+                    object_id=name,
+                    class_name=str(descriptor.get("class_name", "")),
+                    prim_path=str(descriptor.get("actual_prim_path", "")),
+                    xyz=pose[:3],
+                    quaternion_xyzw=pose[3:7],
+                    twist_linear=twist[:3],
+                    twist_angular=twist[3:6],
+                )
+            )
+        # Task #11: append harness-SPAWNED /World/Scenario rigid bodies (not
+        # scenario-declared) after the declared ones, so objects[0] and the
+        # singular `object` field are unchanged for existing consumers.
+        states.extend(self._spawned_object_states())
+        return states
+
+    def _spawned_object_states(self) -> list[dict[str, object]]:
+        """Pose truth for harness-spawned /World/Scenario rigid bodies that are
+        not scenario-declared (Task #11): the grasp bench needs retention /
+        knock-over checks on every object its harness spawns, but those never
+        enter ``_expected_objects`` so the view path never sees them.
+
+        Read view-free through ``IPhysx.get_rigidbody_transformation`` (via
+        ``_iter_spawned_bodies``): spawned prims are exactly the ones that later
+        get deleted, and a tensor view ever held on a deleted prim invalidates
+        the SHARED SimulationView and kills the boot (see
+        ``_heal_detached_scenario_bodies``), so these must never get a view. The
+        probe returns no velocity, so spawned bodies report zero twist (motion
+        is still visible frame to frame)."""
+        expected_paths = {
+            str(descriptor.get("actual_prim_path", ""))
+            for descriptor in self._expected_objects.values()
+        }
+        states: list[dict[str, object]] = []
+        for prim_path, position, quaternion_xyzw in self._iter_spawned_bodies():
+            path = str(prim_path)
+            if not path or path in expected_paths:
+                continue
+            states.append(
+                self._object_state_dict(
+                    object_id=path.rsplit("/", 1)[-1],
+                    class_name="",
+                    prim_path=path,
+                    xyz=position,
+                    quaternion_xyzw=quaternion_xyzw,
+                )
             )
         return states
+
+    def _iter_spawned_bodies(self):
+        """Yield ``(prim_path, xyz, quaternion_xyzw)`` for every
+        /World/Scenario rigid-body child, read view-free through IPhysx.
+
+        Isaac-only: yields nothing (and never raises into the truth path) when
+        the stage or physx interface is unavailable, so the unit suite and any
+        non-Isaac caller see an empty spawned set. The stage child listing is
+        refreshed only every object-discovery interval (a spawned prim is stable
+        once attached); the per-body pose read runs each call and is cheap. The
+        quaternion convention returned by ``get_rigidbody_transformation`` is
+        mapped to scalar-last xyzw in ``_quaternion_xyzw_from_physx`` -- a wrong
+        order would corrupt orientation/knock-over checks, so it is validated on
+        the live GPU round."""
+        try:
+            import omni.usd
+            from omni.physx import get_physx_interface
+            from pxr import UsdPhysics
+        except (ImportError, AttributeError):
+            return
+        try:
+            stage = omni.usd.get_context().get_stage()
+            scenario = stage.GetPrimAtPath("/World/Scenario")
+            if not scenario.IsValid():
+                return
+            physx = get_physx_interface()
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        step = getattr(self, "_spawned_truth_step", 0) + 1
+        self._spawned_truth_step = step
+        interval = max(1, int(getattr(self, "_object_discovery_interval", 1)))
+        cached = getattr(self, "_spawned_truth_paths", None)
+        if cached is None or step % interval == 1:
+            cached = [
+                child.GetPath().pathString
+                for child in scenario.GetChildren()
+                if child.HasAPI(UsdPhysics.RigidBodyAPI)
+            ]
+            self._spawned_truth_paths = cached
+        for path in cached:
+            try:
+                result = physx.get_rigidbody_transformation(path)
+            except (AttributeError, RuntimeError, TypeError):
+                continue
+            if not result.get("ret_val"):
+                continue
+            position = tuple(float(value) for value in tuple(result.get("position", ()))[:3])
+            if len(position) != 3:
+                continue
+            quaternion_xyzw = self._quaternion_xyzw_from_physx(result.get("rotation"))
+            if quaternion_xyzw is None:
+                continue
+            yield path, position, quaternion_xyzw
+
+    @staticmethod
+    def _quaternion_xyzw_from_physx(rotation):
+        """Map IPhysx get_rigidbody_transformation's ``rotation`` to scalar-last
+        xyzw. Handles a ``Gf.Quat*`` (GetReal/GetImaginary) and a plain
+        4-sequence. The plain-sequence branch assumes scalar-last (x, y, z, w);
+        the live GPU round confirms the real convention. Returns None when the
+        rotation is missing or malformed (the body is then skipped)."""
+        if rotation is None:
+            return None
+        get_real = getattr(rotation, "GetReal", None)
+        get_imaginary = getattr(rotation, "GetImaginary", None)
+        if callable(get_real) and callable(get_imaginary):
+            imaginary = get_imaginary()
+            return (
+                float(imaginary[0]),
+                float(imaginary[1]),
+                float(imaginary[2]),
+                float(get_real()),
+            )
+        try:
+            values = tuple(float(value) for value in rotation)
+        except (TypeError, ValueError):
+            return None
+        if len(values) != 4:
+            return None
+        return values
 
     def set_entity_pose_physics(
         self,

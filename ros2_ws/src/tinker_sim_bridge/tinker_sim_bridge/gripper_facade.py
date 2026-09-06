@@ -234,6 +234,30 @@ class GripperFacade(Node):
                 self._active_goal_reserved = False
                 self._cancel_requested = False
 
+    def _log_execute_outcome(
+        self,
+        outcome: str,
+        *,
+        position: float,
+        effort: float,
+        stalled: bool,
+        reached_goal: bool,
+        start_sim: float,
+        start_wall: float,
+    ) -> None:
+        # The facade otherwise logs nothing: every diagnostic fact about a
+        # close (when it started, which predicate fired, how far the drive
+        # had actually moved) had to be reconstructed indirectly from a
+        # client's own logs and the truth evaluator (see #27). One line per
+        # terminal outcome makes that a single grep.
+        elapsed_sim = self.get_clock().now().nanoseconds * 1.0e-9 - start_sim
+        elapsed_wall = time.monotonic() - start_wall
+        self.get_logger().info(
+            "gripper close outcome=%s position=%.6f effort=%.6f stalled=%s "
+            "reached_goal=%s elapsed_sim_s=%.3f elapsed_wall_s=%.3f"
+            % (outcome, position, effort, stalled, reached_goal, elapsed_sim, elapsed_wall)
+        )
+
     def _execute(self, goal_handle):
         target = float(goal_handle.request.command.position)
         requested_effort = float(goal_handle.request.command.max_effort)
@@ -273,7 +297,12 @@ class GripperFacade(Node):
             stall_dwell = float(self.get_parameter("stall_dwell_s").value)
             stall_epsilon = float(self.get_parameter("stall_epsilon").value)
             best_error: float | None = None
-            last_progress_at = time.monotonic()
+            # Sim seconds, not wall seconds: the node runs with use_sim_time
+            # and the drive advances in SIM time, so the no-progress dwell
+            # (stall_dwell) must be measured against the same clock or it can
+            # fire before the drive has had any chance to move under RTF<1
+            # (see #27 -- bench RTF 0.27 fired a false stall at 4% stroke).
+            last_progress_at = start_sim
             contact_since: float | None = None
             with self._lock:
                 position = self._position
@@ -292,10 +321,28 @@ class GripperFacade(Node):
                 if stopped:
                     self._publish_hold(position)
                     goal_handle.abort()
+                    self._log_execute_outcome(
+                        "aborted_safety_stop",
+                        position=position,
+                        effort=effort,
+                        stalled=False,
+                        reached_goal=False,
+                        start_sim=start_sim,
+                        start_wall=start_wall,
+                    )
                     break
                 if cancel_requested:
                     self._publish_hold(position)
                     goal_handle.canceled()
+                    self._log_execute_outcome(
+                        "canceled",
+                        position=position,
+                        effort=effort,
+                        stalled=False,
+                        reached_goal=False,
+                        start_sim=start_sim,
+                        start_wall=start_wall,
+                    )
                     break
                 with self._lock:
                     stopped = self._stopped
@@ -312,10 +359,28 @@ class GripperFacade(Node):
                 if stopped:
                     self._publish_hold(position)
                     goal_handle.abort()
+                    self._log_execute_outcome(
+                        "aborted_safety_stop",
+                        position=position,
+                        effort=effort,
+                        stalled=False,
+                        reached_goal=False,
+                        start_sim=start_sim,
+                        start_wall=start_wall,
+                    )
                     break
                 if cancel_requested:
                     self._publish_hold(position)
                     goal_handle.canceled()
+                    self._log_execute_outcome(
+                        "canceled",
+                        position=position,
+                        effort=effort,
+                        stalled=False,
+                        reached_goal=False,
+                        start_sim=start_sim,
+                        start_wall=start_wall,
+                    )
                     break
                 error = abs(target - position)
                 contact_is_fresh = (
@@ -323,14 +388,18 @@ class GripperFacade(Node):
                     and contact_received_at >= start_wall
                     and time.monotonic() - contact_received_at <= contact_max_age
                 )
-                now_monotonic = time.monotonic()
+                # SIM seconds (see the comment on last_progress_at above) --
+                # the dwell must track the clock the drive actually moves in,
+                # not wall time, or it fires before RTF<1 has given the drive
+                # a chance to move.
+                now_sim = self.get_clock().now().nanoseconds * 1.0e-9
                 if best_error is None or error < best_error - stall_epsilon:
                     best_error = error
-                    last_progress_at = now_monotonic
+                    last_progress_at = now_sim
                 position_stalled = (
                     stall_dwell > 0.0
                     and error > tolerance
-                    and now_monotonic - last_progress_at >= stall_dwell
+                    and now_sim - last_progress_at >= stall_dwell
                 )
                 # Success is a DRIVE STALL (or reached_goal), not first touch --
                 # hardware parity with the real xArm gripper action, which only
@@ -349,14 +418,14 @@ class GripperFacade(Node):
                 # the original instantaneous contact stall.
                 if contact_is_fresh and contact >= contact_threshold:
                     if contact_since is None:
-                        contact_since = now_monotonic
+                        contact_since = now_sim
                 else:
                     contact_since = None
                 contact_stalled = (
                     contact_since is not None
                     and error > tolerance
-                    and now_monotonic - contact_since >= stall_dwell
-                    and now_monotonic - last_progress_at >= stall_dwell
+                    and now_sim - contact_since >= stall_dwell
+                    and now_sim - last_progress_at >= stall_dwell
                 )
                 feedback = GripperCommand.Feedback()
                 feedback.position = position
@@ -375,16 +444,32 @@ class GripperFacade(Node):
                     goal_handle.succeed()
                     result.reached_goal = feedback.reached_goal
                     result.stalled = feedback.stalled
+                    self._log_execute_outcome(
+                        "reached_goal" if feedback.reached_goal else "stalled",
+                        position=position,
+                        effort=effort,
+                        stalled=feedback.stalled,
+                        reached_goal=feedback.reached_goal,
+                        start_sim=start_sim,
+                        start_wall=start_wall,
+                    )
                     break
                 sim_elapsed = (
                     self.get_clock().now().nanoseconds * 1.0e-9 - start_sim
                 )
-                if (
-                    sim_elapsed >= simulation_timeout
-                    or time.monotonic() - start_wall >= wall_watchdog
-                ):
+                wall_elapsed = time.monotonic() - start_wall
+                if sim_elapsed >= simulation_timeout or wall_elapsed >= wall_watchdog:
                     self._publish_hold(position)
                     goal_handle.abort()
+                    self._log_execute_outcome(
+                        "timeout_wall" if wall_elapsed >= wall_watchdog else "timeout_sim",
+                        position=position,
+                        effort=effort,
+                        stalled=False,
+                        reached_goal=False,
+                        start_sim=start_sim,
+                        start_wall=start_wall,
+                    )
                     break
                 time.sleep(0.01)
             result.position = position

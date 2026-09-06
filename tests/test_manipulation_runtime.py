@@ -2213,6 +2213,71 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(truth["objects"], objects)
         self.assertEqual(truth["object"], objects[0])
 
+    def test_spawned_bodies_appear_in_object_truth_view_free(self) -> None:
+        # Task #11: harness-spawned /World/Scenario bodies (not scenario-
+        # declared, so they never get a tensor view) must still reach object
+        # truth, read view-free through _iter_spawned_bodies.
+        backend = _backend()
+        backend._object_views = {}
+        backend._expected_objects = {}
+        backend._iter_spawned_bodies = lambda: [
+            (
+                "/World/Scenario/bench_sugar_box_100_agq_a1",
+                (0.5, 0.1, 0.7),
+                (0.0, 0.0, 0.0, 1.0),
+            )
+        ]
+        objects = backend._actual_object_states()
+        self.assertEqual(len(objects), 1)
+        spawned = objects[0]
+        self.assertEqual(spawned["id"], "bench_sugar_box_100_agq_a1")
+        self.assertEqual(
+            spawned["prim_path"], "/World/Scenario/bench_sugar_box_100_agq_a1"
+        )
+        self.assertEqual(spawned["pose"]["xyz"], [0.5, 0.1, 0.7])
+        self.assertEqual(spawned["pose"]["quaternion_xyzw"], [0.0, 0.0, 0.0, 1.0])
+        self.assertEqual(spawned["twist"]["linear"], [0.0, 0.0, 0.0])
+
+    def test_spawned_states_skip_scenario_declared_and_append_after(self) -> None:
+        # A spawned path that duplicates a scenario-declared object's prim path
+        # is not double-listed; spawned bodies append AFTER declared ones so
+        # objects[0] stays the declared object (and its viewed pose).
+        backend = _backend()
+        backend._expected_objects = {
+            "delivery_object": {
+                "class_name": "dynamic_cube",
+                "actual_prim_path": "/World/Scenario/delivery_object",
+            }
+        }
+        backend._object_views = {"delivery_object": _FakeRigidView()}
+        backend._iter_spawned_bodies = lambda: [
+            ("/World/Scenario/delivery_object", (9.0, 9.0, 9.0), (0.0, 0.0, 0.0, 1.0)),
+            ("/World/Scenario/bench_spam_100_agq_a1", (0.4, 0.0, 0.72), (0.0, 0.0, 0.0, 1.0)),
+        ]
+        objects = backend._actual_object_states()
+        self.assertEqual(
+            [o["id"] for o in objects],
+            ["delivery_object", "bench_spam_100_agq_a1"],
+        )
+        self.assertEqual(objects[0]["prim_path"], "/World/Scenario/delivery_object")
+        self.assertNotEqual(objects[0]["pose"]["xyz"], [9.0, 9.0, 9.0])
+
+    def test_quaternion_xyzw_from_physx_maps_scalar_last(self) -> None:
+        from tinker_sim_isaac.backend import IsaacWholeRobotBackend as _BE
+
+        gf_like = SimpleNamespace(
+            GetReal=lambda: 0.7071, GetImaginary=lambda: (0.0, 0.7071, 0.0)
+        )
+        self.assertEqual(
+            _BE._quaternion_xyzw_from_physx(gf_like), (0.0, 0.7071, 0.0, 0.7071)
+        )
+        self.assertEqual(
+            _BE._quaternion_xyzw_from_physx((1.0, 2.0, 3.0, 4.0)),
+            (1.0, 2.0, 3.0, 4.0),
+        )
+        self.assertIsNone(_BE._quaternion_xyzw_from_physx(None))
+        self.assertIsNone(_BE._quaternion_xyzw_from_physx((1.0, 2.0)))
+
     def test_manipulation_profile_and_artifact_are_strict(self) -> None:
         profile = json.loads(
             (ROOT / "simulation/profiles/manipulation-core.json").read_text(encoding="utf-8")
