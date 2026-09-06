@@ -2383,5 +2383,95 @@ class SpawnYawViaViewApplyTest(unittest.TestCase):
         self.assertEqual(len(backend._robot.root_pose_calls), 1)
 
 
+class SpawnYawViaViewRebindTest(unittest.TestCase):
+    """#24 review Finding 1: a standard scenario reset (STOP -> spawn ->
+    PLAY) recreates the articulation root view, which ``_refresh_robot_handles``
+    detects as a new view identity. The yaw must be re-applied on that
+    rebind too, not just at the initial boot bind, or the flag's own target
+    use case (spawn objects, then reset) silently reverts to identity yaw."""
+
+    def test_reapplies_yaw_on_rebind_when_via_view_active(self) -> None:
+        backend = _backend()
+        backend._robot_view_identity = -1  # force _refresh_robot_handles to see a "new" view
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 42)
+        backend._object_views = {"delivery_object": object()}
+        backend._spawn_yaw_via_view = True
+        backend._spawn_yaw = math.pi / 2.0
+        backend.base_fixed = True
+        backend._scenario_child_signature = lambda: 9
+
+        self.assertTrue(backend._refresh_robot_handles())
+
+        self.assertEqual(len(backend._robot.root_pose_calls), 1)
+        written_row = backend._robot.root_pose_calls[0][0].tolist()
+        half = backend._spawn_yaw / 2.0
+        expected_quat = [0.0, 0.0, math.sin(half), math.cos(half)]
+        for actual, expected in zip(written_row[3:], expected_quat):
+            self.assertAlmostEqual(actual, expected, places=6)
+        # Base-hold target re-seeded too (not left stale from before reset).
+        self.assertIsNotNone(backend._base_hold_pose)
+        self.assertEqual(backend._base_hold_scene_sig, 9)
+        self.assertEqual(
+            backend._base_hold_pose.tolist(),
+            backend._robot.root_pose_calls[0].tolist(),
+        )
+
+    def test_reapplies_yaw_on_every_rebind_not_just_the_first(self) -> None:
+        backend = _backend()
+        backend._robot_view_identity = -1
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 1)
+        backend._object_views = {}
+        backend._spawn_yaw_via_view = True
+        backend._spawn_yaw = 0.4
+        backend.base_fixed = False
+
+        self.assertTrue(backend._refresh_robot_handles())
+        self.assertEqual(len(backend._robot.root_pose_calls), 1)
+
+        # A second, independent rebind (e.g. a later reset cycle) must
+        # re-apply the yaw again, not rely on the first application alone.
+        backend._robot_view_identity = -2
+        self.assertTrue(backend._refresh_robot_handles())
+        self.assertEqual(len(backend._robot.root_pose_calls), 2)
+
+    def test_no_write_on_rebind_when_via_view_inactive(self) -> None:
+        backend = _backend()
+        backend._robot_view_identity = -1
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 42)
+        backend._object_views = {}
+        backend._spawn_yaw_via_view = False
+
+        self.assertTrue(backend._refresh_robot_handles())
+
+        self.assertEqual(backend._robot.root_pose_calls, [])
+
+    def test_no_write_on_rebind_when_flag_unset(self) -> None:
+        # _backend() does not set _spawn_yaw_via_view at all -- the
+        # getattr(..., False) default in _reapply_spawn_yaw_after_rebind
+        # must hold, mirroring a real backend that never enabled the flag.
+        backend = _backend()
+        backend._robot_view_identity = -1
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 42)
+        backend._object_views = {}
+
+        self.assertTrue(backend._refresh_robot_handles())
+
+        self.assertEqual(backend._robot.root_pose_calls, [])
+
+    def test_unchanged_view_identity_does_not_reapply(self) -> None:
+        backend = _backend()
+        backend._spawn_yaw_via_view = True
+        backend._spawn_yaw = math.pi / 2.0
+        # _robot_view_identity already matches _FakeRobot().root_view's id
+        # (set by _backend()), so this call must take the early "no rebind
+        # happened" path and not touch the root-pose writer at all.
+        self.assertTrue(backend._refresh_robot_handles())
+        self.assertEqual(backend._robot.root_pose_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

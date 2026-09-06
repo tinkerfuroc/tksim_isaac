@@ -1084,12 +1084,10 @@ class IsaacWholeRobotBackend:
         self._timeline.set_end_time(365.0 * 24.0 * 60.0 * 60.0)
         if not self._refresh_robot_handles():
             raise RuntimeError("Tinker articulation did not initialize after simulation reset")
+        # _refresh_robot_handles applies TINKER_SIM_SPAWN_YAW_VIA_VIEW's yaw
+        # (via _reapply_spawn_yaw_after_rebind) on this initial bind, and
+        # again on every later rebind -- see that method's docstring.
         self._robot.update(self.dt)
-        if self._spawn_yaw_via_view:
-            # After bind/reset, before the first physics step: write the
-            # commanded heading through the root physics view instead of the
-            # (skipped, above) pre-reset USD orient authoring.
-            self._apply_spawn_yaw_via_view(self._spawn_yaw)
         self._safety_snapshot = self._robot.data.joint_pos.clone()
         if enable_contacts:
             self._contact_report_subscription = (
@@ -1586,6 +1584,12 @@ class IsaacWholeRobotBackend:
             # physics update. Keep the configured actuator fallback in that case.
             pass
         self._robot_view_identity = identity
+        # Must run after the rebuild above (needs a live, bound view to
+        # write through) and before returning to the caller, which may step
+        # physics immediately after -- see _reapply_spawn_yaw_after_rebind's
+        # docstring (#24 review Finding 1: a rebind with this skipped
+        # silently reverts the robot to identity yaw).
+        self._reapply_spawn_yaw_after_rebind()
         return True
 
     @property
@@ -2156,6 +2160,31 @@ class IsaacWholeRobotBackend:
             self._base_hold_pose = root_pose.clone()
             self._base_hold_vel = zero_vel
             self._base_hold_scene_sig = self._scenario_child_signature()
+
+    def _reapply_spawn_yaw_after_rebind(self) -> None:
+        """Re-apply TINKER_SIM_SPAWN_YAW_VIA_VIEW's yaw on every rebind.
+
+        Called from ``_refresh_robot_handles`` whenever it detects a new
+        articulation root-view identity -- which includes the very first
+        bind at boot, and every later one. #24 review Finding 1: with the
+        flag on, the pre-reset USD ``xformOp:orient`` authoring is
+        deliberately skipped, so the commanded yaw has NO durable USD
+        backing -- it lives only in the transient PhysX/warp root-view
+        tensor buffer ``_apply_spawn_yaw_via_view`` writes. The standard
+        scenario boot sequence (reset -> STOP -> spawn_entity(s) -> PLAY)
+        recreates that view on PHYSICS_READY (see the STOP -> PLAY comment
+        just above in ``_refresh_robot_handles``), and so does
+        ``_maybe_recover_simulation_view``'s manual view recreation; without
+        this, the robot silently reverts to the USD/InitialStateCfg-composed
+        identity orientation immediately after exactly the spawn sequence
+        this flag exists to make cheap. Position is re-read fresh from the
+        (new) view each time, not held at the original boot position, so
+        this is correct even if the base has moved/settled since boot.
+        No-op unless TINKER_SIM_SPAWN_YAW_VIA_VIEW is active.
+        """
+        if not getattr(self, "_spawn_yaw_via_view", False):
+            return
+        self._apply_spawn_yaw_via_view(self._spawn_yaw)
 
     def _apply_base_hold(self) -> None:
         """Kinematic braked-base hold (TINKER_SIM_FIX_BASE=1).
