@@ -286,11 +286,21 @@ def resolve_clock_epoch(value: str | None) -> float:
       captured once, when this backend/clock origin is first established.
     - ``"0"``: the legacy zero-based clock -- every pre-existing zero-based
       test, replay, or offset-alignment assumption keeps its meaning.
-    - any other numeric string: that epoch in seconds, letting a harness pin
-      a reproducible absolute clock across repeated runs.
+    - any other non-negative numeric string: that epoch in seconds, letting
+      a harness pin a reproducible absolute clock across repeated runs.
 
-    Fails closed on malformed or non-finite input, mirroring
-    ``resolve_spawn_yaw``.
+    Fails closed on malformed, non-finite, or negative input, mirroring
+    ``resolve_spawn_yaw``. Negative epochs are rejected rather than merely
+    discouraged: ``ros_clock_time`` (``simulation_time + epoch``) would
+    otherwise legitimately read exactly ``0`` -- or briefly go negative --
+    while physics is genuinely advancing, which is indistinguishable from
+    rclpy's own "no /clock sample yet" convention
+    (``evaluate_clock_domain``) and produces an invalid (negative-nanosecond)
+    ``builtin_interfaces/Time`` in ``ros_gateway.py``'s ``_stamp()``.
+    Disallowing negative epochs keeps the invariant ``ros_clock_time >= 0``
+    always, and ``== 0`` reachable only in the legacy ``"0"`` mode (or an
+    explicit ``0``-valued pin, which is the same thing) at true start --
+    exactly the case ``evaluate_clock_domain``'s zero-check is for.
     """
     text = "" if value is None else value.strip()
     if not text or text.lower() == "wall":
@@ -303,7 +313,23 @@ def resolve_clock_epoch(value: str | None) -> float:
         )
     if not math.isfinite(epoch):
         raise ValueError("TINKER_SIM_CLOCK_EPOCH must be finite")
+    if epoch < 0:
+        raise ValueError(
+            f"TINKER_SIM_CLOCK_EPOCH must be non-negative, got {value!r}"
+        )
     return epoch
+
+
+def resolve_backend_clock_epoch() -> float:
+    """``__init__``'s actual entry point for ``self._clock_epoch_s``.
+
+    A thin wrapper so a unit test can exercise the real ``TINKER_SIM_CLOCK_EPOCH``
+    env-var name (guarding against e.g. a typo in it inside ``__init__``,
+    which full backend construction -- needing Isaac Sim/PhysX/torch -- can't
+    exercise in this test suite) without going through ``resolve_clock_epoch``
+    a second, redundant, hand-wired way.
+    """
+    return resolve_clock_epoch(os.environ.get("TINKER_SIM_CLOCK_EPOCH"))
 
 
 def _fused_apply_actuator_model(self) -> None:
@@ -1005,7 +1031,7 @@ class IsaacWholeRobotBackend:
         # `simulation_time` itself (elapsed sim time since this backend was
         # constructed) is unchanged and stays the small process-relative
         # value internal timers/run-duration gating already rely on.
-        self._clock_epoch_s = resolve_clock_epoch(_os.environ.get("TINKER_SIM_CLOCK_EPOCH"))
+        self._clock_epoch_s = resolve_backend_clock_epoch()
         import omni.kit.app
 
         # Flush USD/Fabric stage notices before SimulationContext creates the
@@ -3322,7 +3348,13 @@ class IsaacWholeRobotBackend:
         return {
             "schema_version": self.PHYSICS_TRUTH_SCHEMA_VERSION,
             "frame_index": self.physics_frame_index,
-            "timestamp": self.simulation_time,
+            # Anchored, not elapsed: this feeds /sim/internal/physics_truth,
+            # which truth_evaluator.py restamps onto /sim/truth/* (RobotTruth,
+            # ObjectTruth, ContactTruth, TaskTruth). Every externally
+            # published stamp must share one clock domain with /clock and
+            # ros_gateway.py's own publishes (joint_states, cameras, IMU,
+            # /contact) -- see ros_clock_time and task #21.
+            "timestamp": self.ros_clock_time,
             "scenario": self.scenario,
             "task": self.task,
             "robot": self._robot_truth_state(),

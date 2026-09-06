@@ -248,8 +248,10 @@ cause and `simulation/tinker_sim_isaac/backend.py`'s `resolve_clock_epoch`.
   backward).
 - `0`: the legacy zero-based clock. Every pre-existing zero-based test,
   replay, or offset-alignment assumption keeps its meaning.
-- any other numeric value: that epoch in seconds, letting a harness pin a
-  reproducible absolute clock across repeated runs.
+- any other non-negative numeric value: that epoch in seconds, letting a
+  harness pin a reproducible absolute clock across repeated runs. A negative
+  value is rejected (fails closed) -- it would let the published clock read
+  exactly `0`, or go negative, while physics is genuinely advancing.
 
 Only the *published* clock (`/clock` and outgoing ROS message header stamps)
 is anchored; `backend.simulation_time` itself is untouched and stays the
