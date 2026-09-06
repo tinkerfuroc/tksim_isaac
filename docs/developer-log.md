@@ -237,6 +237,117 @@ round-2 result. A new `$TMP/stallfreeze2_launch.sh` (parallel to round 1's
 `stallfreeze_launch.sh`) wraps it into `$TMP/stallfreeze2.log` with those
 SF2 markers for a follow-up GPU session to launch and poll.
 
+## 2026-09-06 — Task #20 round 3: default is the plain freeze at measured + lead, press off (post-round-2 acceptance)
+
+**Round-2 result** (`$TMP/stallfreeze2-result.md`): the peak-hold press
+found a real plateau (19.68N, matching round 1's own cap-hit magnitude) and
+transitioned on `reason=decrease` -- but the 2-tick smoothed-decrease
+detector fired on the natural impact ring-down 1-2 press ticks after first
+contact, before any real press travel had accrued, and the resulting
+back-off left the pads separated: sustained hold force collapsed to a
+0-1.3N noise-floor band for the whole 15s hold, and the bottle was NOT
+retained on lift (left behind on the table, tilt stayed <2 deg though). The
+sugar_box leg remained unscoreable (still spawned tipped 93.9 deg with
+main's probe placement args).
+
+**Decision.** `$TMP/task20-decay-probe-findings.md`'s `freeze3-result.md`
+chain (three plain, no-press freeze legs: progress trigger, eps 0.005/0.012,
+lead 0.02/0.04, all six targets frozen at measured + lead with no advance
+and no back-off) is the validated retention configuration: all three legs
+were RETAINED ON LIFT (dz 0.3-3.8mm, tilt 0.5-6 deg), the best of them
+(`eps 0.012, lead 0.02` -- "P02e") the earliest and cleanest trigger with the
+flattest, least-noisy residual force. Both round 1 (press to a fixed cap:
+19.7N plateau collapses to 4.6N) and round 2 (peak-hold press: collapses to
+0-1.3N) tried to recover more sustained force by advancing further than the
+plateau and made things worse -- **any** advance past the plateau slides the
+pads circumferentially around the object (the still-open contact-physics
+question from `task20-decay-probe-findings.md`'s torsional-friction /
+contact-trace / jaw-closure-geometry chain: the pads travel around a curved
+object's contact patch under load regardless of friction coefficient,
+follower stiffness/cap/lag, drive cap, torsional patch radius, or contact
+generation method). Sustained hold force in the 15-30N band stays an OPEN
+item, bounded by that contact physics, not by this state machine; retention
+through lift is what the bench actually needs and what freeze3 achieves.
+
+**Fix.** `TINKER_SIM_GRIPPER_PRESS_CAP`'s default drops from 0.02 (round 2)
+to **0.0**. `_gripper_stall_freeze_check_plateau` now branches on it: when
+`<= 0.0` (the default), PLATEAU transitions straight to HOLD via a new
+`_gripper_stall_freeze_enter_hold_with_lead` -- all six targets (drive_joint
++ the five mimic followers) are frozen at their OWN measured angle plus a
+new knob, `TINKER_SIM_GRIPPER_FREEZE_LEAD` (default 0.02 rad), in one shot,
+no PRESS ticks at all. A single `"hold"` transition is logged (no separate
+`"press"` event, since PRESS never runs) carrying the lead-derived drive
+target, `reason="lead"`, and the pad force sampled at the freeze instant.
+The PRESS/peak-hold machinery from round 2 (`_gripper_stall_freeze_press_tick`
+/ `_gripper_stall_freeze_press_peak_hold`) is unchanged and stays reachable
+by setting `TINKER_SIM_GRIPPER_PRESS_CAP` back above 0.0, for anyone who
+wants to re-attempt closed-loop pressing toward `TINKER_SIM_GRIPPER_
+HOLD_FORCE_N` later.
+
+**`travel` logging fix.** Every `gripper_stall_freeze` transition's `travel`
+field is now computed by a new `_gripper_stall_freeze_current_travel()` --
+read directly from `_position_targets` against `_gsf_baseline` -- instead of
+echoing the separately incremented/decremented `_gsf_travel` counter, which
+could (and, in the round-2 live acceptance run, did) report `0.0` on every
+single transition regardless of state (`stallfreeze2-result.md`'s side
+note). `"hold"` (both the new lead path and round 2's peak-hold exit) and
+`"release"` now use this helper; `"plateau"` and PRESS's own `"press"` entry
+keep an explicit `travel=0.0` (the baseline is defined as zero travel at
+that instant, before any lead or press advance is applied) and `"reset"`
+keeps `travel=0.0` too (baseline is already cleared by the time it logs).
+
+**Env knobs** (all optional; defaults now match freeze3's P02e config):
+`TINKER_SIM_GRIPPER_STALL_FREEZE` (default `"1"`), `TINKER_SIM_GRIPPER_
+STALL_CONTACT_N` (5.0 N), `TINKER_SIM_GRIPPER_STALL_DWELL_S` (0.3 s sim),
+`TINKER_SIM_GRIPPER_STALL_EPS` (0.012 rad), `TINKER_SIM_GRIPPER_FREEZE_LEAD`
+(**new**, 0.02 rad -- the one-shot lead applied at PLATEAU when PRESS is
+off), `TINKER_SIM_GRIPPER_PRESS_CAP` (**default now 0.0** -- PRESS off;
+round 1/2's default was 0.06/0.02), `TINKER_SIM_GRIPPER_PRESS_STEP` (0.002
+rad/tick, only used when PRESS_CAP > 0), `TINKER_SIM_GRIPPER_HOLD_FORCE_N`
+(25.0 N, only used when PRESS_CAP > 0).
+
+**Tests** (`tests/test_manipulation_runtime.py`): `_gsf_backend()` now takes
+`press_cap` (default 0.0, matching the new backend default) and
+`freeze_lead` (default 0.02) parameters. The three PRESS-machinery tests
+(`test_gripper_stall_freeze_press_peak_hold_backs_off_on_decrease`,
+`test_gripper_stall_freeze_press_backs_off_at_hold_force_target`,
+`test_gripper_stall_freeze_press_cap_stops_travel`) now explicitly pass
+`press_cap=0.06` to keep exercising round 2's PRESS/peak-hold behaviour
+unchanged; `test_gripper_stall_freeze_plateau_needs_dwell_eps_and_contact`'s
+plateau-into-PRESS case does the same. Two new tests cover the default
+path: `test_gripper_stall_freeze_default_plateau_holds_with_lead` asserts
+PLATEAU with the default config lands directly in `"hold"` (no
+`_gripper_stall_freeze_press_tick` call, all six targets at measured +
+0.02) -- this FAILS against 0ce3dc8 (round 2's default `press_cap=0.02`):
+```
+AssertionError: 'press' != 'hold'
+```
+(confirmed by temporarily stashing only `backend.py`, rerunning `-k
+test_gripper_stall_freeze_default_plateau_holds_with_lead`, then restoring
+the fix). `test_gripper_stall_freeze_default_hold_logs_lead_as_travel`
+captures stdout and asserts the logged `"plateau"` event's `travel` is
+`0.0` and the `"hold"` event's `travel` is exactly the lead (`0.02`) with
+`reason="lead"` and the frozen `pad_force_n`. A third new test,
+`test_gripper_stall_freeze_release_logs_actual_travel`, asserts RELEASE's
+logged `travel` reflects the real applied-target-minus-baseline gap
+(0.01) rather than a stale/zeroed counter. Full suite:
+`tests/test_manipulation_runtime.py` 121 passed, 3 subtests passed, 0
+failed (118 pre-existing + 3 new; run via the pytest-suite-ros-env-
+incantation memory: no `set -u`, a lark-only symlink dir +
+`/opt/ros/humble/local/lib/python3.10/dist-packages` on `PYTHONPATH`,
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`).
+
+**Staged acceptance.** `$TMP/stallfreeze3_chain.sh` re-runs main's
+`validation/gripper_close_probe.py` bottle side-pinch close with the flag on
+vs off (same args as rounds 1/2's legs (a)/(b)) -- two legs only, the YCB
+sugar_box leg is dropped: main's probe placement for it has been broken
+across all three rounds (spawns tipped 93.9-94 deg before any close), and
+box retention is validated by the bench's own soup + sugar box round
+instead (`task20-decay-probe-findings.md`'s "Live datapoint" entries).
+`$TMP/stallfreeze3_launch.sh` wraps the chain with `SF3_EXIT=`/
+`SF3_CHAIN_DONE` markers in `$TMP/stallfreeze3.log` for a follow-up GPU
+session to run; `REPO_ROOT` defaults to this worktree.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported

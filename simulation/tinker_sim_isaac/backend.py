@@ -967,8 +967,18 @@ class IsaacWholeRobotBackend:
         #         TINKER_SIM_GRIPPER_STALL_EPS rad over that same trailing
         #         window, while the commanded target is still ahead of the
         #         measured angle (i.e. the ramp is still trying to close
-        #         further but the object is what is stopping it).
-        #       PRESS -> the six targets (drive_joint + the five mimic
+        #         further but the object is what is stopping it). With
+        #         TINKER_SIM_GRIPPER_PRESS_CAP at its default of 0.0 (round 3,
+        #         see below), PLATEAU goes STRAIGHT to HOLD -- no PRESS phase
+        #         at all -- with all six targets frozen at their OWN measured
+        #         angle plus TINKER_SIM_GRIPPER_FREEZE_LEAD rad. This is the
+        #         validated retention config (freeze3-result.md, P02e:
+        #         progress trigger eps 0.012, six targets = measured + lead
+        #         0.02, no press, no back-off -> retained 3/3, tilt < 2 deg).
+        #         Only when TINKER_SIM_GRIPPER_PRESS_CAP > 0 does PLATEAU
+        #         instead transition to PRESS below.
+        #       PRESS (only reachable when TINKER_SIM_GRIPPER_PRESS_CAP > 0)
+        #         -> the six targets (drive_joint + the five mimic
         #         followers) freeze at their OWN measured angles, then are
         #         PEAK-HOLD advanced: each control tick, all six are nudged
         #         together by TINKER_SIM_GRIPPER_PRESS_STEP rad only while the
@@ -999,11 +1009,30 @@ class IsaacWholeRobotBackend:
         #         of driving through it.
         #       HOLD -> targets frozen; the ramp and mirror do not run. This
         #         is what command_target_state() echoes to the facade while
-        #         holding (it reads _position_targets directly).
+        #         holding (it reads _position_targets directly). Reached
+        #         either directly from PLATEAU (default, PRESS_CAP == 0) or
+        #         from PRESS's peak-hold exit (PRESS_CAP > 0).
         #       RELEASE -> any new drive_joint command (an opening command, or
         #         another close) while in PLATEAU/PRESS/HOLD exits back to
         #         CLOSING immediately (no dwell), so a fresh close or an open
         #         is never blocked by a stale freeze.
+        #     Round 3 (docs/developer-log.md #20, 2026-09-06): round 1's press-
+        #     to-a-fixed-cap slides the pads and collapses the clamp
+        #     (stallfreeze-result.md); round 2's peak-hold press still backs
+        #     off into a near-zero force band because its 2-tick decrease
+        #     detector fires on the impact ring-down 1-2 ticks after first
+        #     contact, before any real press travel accrues (stallfreeze2-
+        #     result.md). Neither beats freeze3's plain, no-press freeze on
+        #     the acceptance bench (retained 3/3, tilt < 2 deg; sustained hold
+        #     force is a known, bounded-open item -- see task20-decay-probe-
+        #     findings.md's contact-physics investigation, not an actuation
+        #     bug). So TINKER_SIM_GRIPPER_PRESS_CAP now DEFAULTS to 0.0: every
+        #     PLATEAU goes straight to HOLD at measured + TINKER_SIM_GRIPPER_
+        #     FREEZE_LEAD (default 0.02 rad) on all six targets, no PRESS
+        #     ticks. The PRESS/peak-hold machinery above is kept, unchanged,
+        #     behind TINKER_SIM_GRIPPER_PRESS_CAP > 0 for anyone who wants to
+        #     re-attempt closed-loop pressing toward TINKER_SIM_GRIPPER_
+        #     HOLD_FORCE_N later.
         #     Gate: TINKER_SIM_GRIPPER_STALL_FREEZE (default "1"); "0"
         #     reproduces pre-#20 behaviour exactly -- step() calls
         #     _ramp_drive_target + _mirror_gripper_mimic_targets
@@ -1046,11 +1075,26 @@ class IsaacWholeRobotBackend:
                 self._gripper_hold_force_n = max(0.0, float(_v))
         except (TypeError, ValueError):
             pass
-        self._gripper_press_cap = 0.02
+        # Round 3 default: PRESS off (0.0) -- PLATEAU goes straight to HOLD
+        # at measured + TINKER_SIM_GRIPPER_FREEZE_LEAD (see the state-machine
+        # comment above). Set > 0 to re-enable the PRESS/peak-hold machinery.
+        self._gripper_press_cap = 0.0
         try:
             _v = _os.environ.get("TINKER_SIM_GRIPPER_PRESS_CAP")
             if _v is not None and _v.strip():
                 self._gripper_press_cap = max(0.0, float(_v))
+        except (TypeError, ValueError):
+            pass
+        # The plain-freeze lead (round 3 default path, PRESS_CAP == 0): all
+        # six targets freeze at their own measured angle plus this many
+        # radians the instant PLATEAU fires -- a one-shot offset, not a
+        # closed-loop nudge. Validated config (freeze3-result.md P02e):
+        # eps 0.012 (TINKER_SIM_GRIPPER_STALL_EPS default), lead 0.02.
+        self._gripper_freeze_lead = 0.02
+        try:
+            _v = _os.environ.get("TINKER_SIM_GRIPPER_FREEZE_LEAD")
+            if _v is not None and _v.strip():
+                self._gripper_freeze_lead = max(0.0, float(_v))
         except (TypeError, ValueError):
             pass
         # State machine bookkeeping. Re-armed on every RELEASE (see
@@ -2854,7 +2898,10 @@ class IsaacWholeRobotBackend:
         advanced less than TINKER_SIM_GRIPPER_STALL_EPS rad end-to-end across
         it, AND the commanded target is still ahead of the measured angle
         (the ramp is still trying to close further but the object is what is
-        stopping it), transitions CLOSING -> PRESS.
+        stopping it), the plateau fires. With TINKER_SIM_GRIPPER_PRESS_CAP at
+        its round-3 default of 0.0 this transitions CLOSING -> HOLD directly
+        (see _gripper_stall_freeze_enter_hold_with_lead); with PRESS_CAP > 0
+        it transitions CLOSING -> PRESS instead, unchanged from round 2.
         """
         drive_index = self._drive_joint_index
         command = getattr(self, "_drive_command_target", None)
@@ -2897,6 +2944,11 @@ class IsaacWholeRobotBackend:
             self._position_targets[0, idx] = value
         self._gsf_baseline = baseline
         self._gsf_travel = 0.0
+        if self._gripper_press_cap <= 0.0:
+            # Round 3 default: no PRESS phase -- freeze straight at
+            # measured + TINKER_SIM_GRIPPER_FREEZE_LEAD on all six targets.
+            self._gripper_stall_freeze_enter_hold_with_lead(force)
+            return
         # Seed the peak-hold smoothing window from this same plateau sample
         # so the very first PRESS tick's 2-tick average already has a real
         # previous value to compare against, instead of treating tick 1 as
@@ -2907,6 +2959,53 @@ class IsaacWholeRobotBackend:
         self._gsf_peak_smoothed = force
         self._gsf_state = "press"
         self._gripper_stall_freeze_log("press", drive=measured_drive, pad_force_n=force, travel=0.0)
+
+    def _gripper_stall_freeze_enter_hold_with_lead(self, force_at_freeze: float) -> None:
+        """PLATEAU -> HOLD directly at measured + TINKER_SIM_GRIPPER_FREEZE_LEAD.
+
+        This is the round-3 default path (TINKER_SIM_GRIPPER_PRESS_CAP <=
+        0.0): no PRESS phase runs at all. ``_gsf_baseline`` has already been
+        populated by the caller (_gripper_stall_freeze_check_plateau) with
+        each of the six targets' OWN measured angle at the plateau instant;
+        this adds the one-shot lead to every one of them, writes the result
+        straight into ``_position_targets``, and transitions to HOLD.
+
+        This is the validated retention configuration (freeze3-result.md,
+        leg P02e: progress trigger eps 0.012, lead 0.02 -> retained 3/3,
+        tilt < 2 deg). Round 1's press-to-a-fixed-cap and round 2's
+        peak-hold press both tried to recover more sustained pad force by
+        advancing further than this and both made things worse (round 1:
+        19.7N plateau -> 4.6N after a 0.06 rad press, stallfreeze-result.md;
+        round 2: the 2-tick decrease detector fires on the impact ring-down
+        before any real press travel accrues, leaving 0-1.3N and an
+        unretained object, stallfreeze2-result.md) -- any advance past the
+        plateau slides the pads around the object. Sustained hold force
+        (15-30N) stays an open item bounded by the still-unexplained
+        tangential-slip contact physics (task20-decay-probe-findings.md),
+        not something this state machine can fix by pressing harder.
+
+        Logs a single "hold" transition (no separate "press" event, since
+        PRESS never runs) carrying the lead-derived drive target, the pad
+        force sampled at the freeze instant, and the actual travel (the
+        lead itself, computed the same way every other transition's travel
+        is -- see _gripper_stall_freeze_current_travel).
+        """
+        lead = self._gripper_freeze_lead
+        for idx, base in self._gsf_baseline.items():
+            self._position_targets[0, idx] = base + lead
+        self._gsf_travel = lead
+        self._gsf_state = "hold"
+        drive_index = getattr(self, "_drive_joint_index", None)
+        drive_value = self._gsf_baseline.get(drive_index) if drive_index is not None else None
+        if drive_value is not None:
+            drive_value = drive_value + lead
+        self._gripper_stall_freeze_log(
+            "hold",
+            drive=drive_value,
+            pad_force_n=force_at_freeze,
+            travel=self._gripper_stall_freeze_current_travel(),
+            reason="lead",
+        )
 
     def _gripper_stall_freeze_press_tick(self) -> None:
         """PRESS-state per-tick advance -- PEAK-HOLD.
@@ -3001,10 +3100,34 @@ class IsaacWholeRobotBackend:
             "hold",
             drive=drive_value,
             pad_force_n=smoothed_force,
-            travel=self._gsf_travel,
+            travel=self._gripper_stall_freeze_current_travel(),
             reason=reason,
             peak_force_n=peak,
         )
+
+    def _gripper_stall_freeze_current_travel(self) -> float:
+        """Extra travel (rad), on the drive joint, that the currently
+        commanded frozen target sits beyond the plateau baseline.
+
+        This is the single source of truth for the ``travel`` field
+        ``_gripper_stall_freeze_log`` transitions report: it is read
+        directly from ``_position_targets`` against ``_gsf_baseline``
+        rather than trusting a separately incremented/decremented counter,
+        so it can never silently drift from what was actually written to
+        the drive target (round 2's bug -- see stallfreeze2-result.md's
+        side note -- every ``gripper_stall_freeze`` transition logged
+        ``travel: 0.0`` regardless of state). Returns 0.0 before a baseline
+        exists (PLATEAU has not fired, or has just been cleared).
+        """
+        baseline = getattr(self, "_gsf_baseline", None)
+        drive_index = getattr(self, "_drive_joint_index", None)
+        if not baseline or drive_index is None or drive_index not in baseline:
+            return 0.0
+        try:
+            target = float(self._position_targets[0, drive_index])
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+        return target - baseline[drive_index]
 
     def _gripper_stall_freeze_release(self) -> None:
         """Exit PRESS/HOLD back to CLOSING (see _gripper_stall_freeze_gate).
@@ -3019,7 +3142,12 @@ class IsaacWholeRobotBackend:
             drive_value = float(self._torch_value(self._robot.data.joint_pos)[0, drive_index])
         except (IndexError, TypeError, ValueError, AttributeError):
             drive_value = None
-        self._gripper_stall_freeze_log("release", drive=drive_value, pad_force_n=force, travel=self._gsf_travel)
+        self._gripper_stall_freeze_log(
+            "release",
+            drive=drive_value,
+            pad_force_n=force,
+            travel=self._gripper_stall_freeze_current_travel(),
+        )
         self._gsf_state = "closing"
         self._gsf_baseline = {}
         self._gsf_travel = 0.0
