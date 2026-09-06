@@ -2232,3 +2232,65 @@ the new contract (yaw seeded into `_base_hold_seed_quat`, `_base_hold_pose`
 left/reset to `None`, not immediately re-latched). Full suite:
 `tests/test_manipulation_runtime.py` 103 passed, 3 subtests passed, 0
 failed. Still no GPU boot for this fix -- same caveat as #24 above.
+
+**Round 2 (same day): the settle window is measured from process BOOT, not
+from a rebind, so the fix above reproduced its own bug on every mid-run
+reset.** Code review (`$TMP/task26-review.md`) caught it before a GPU gate:
+`_apply_base_hold`'s settle-latch gates on `if self.simulation_time <
+self._base_hold_after_sim_s: return` -- a one-shot, absolute 2.0 s deadline
+from `simulation_time == 0`. But `_reapply_spawn_yaw_after_rebind` (->
+`_apply_spawn_yaw_via_view`) runs on every genuine rebind, not just boot --
+`step()`'s PHYSICS_READY branch calls it after every standard scenario
+STOP -> spawn -> PLAY cycle -- and it unconditionally clears
+`_base_hold_pose`/`_base_hold_vel` back to `None` each time (the round-1
+fix above, needed so the settle-latch runs again after a respawn). Because
+`simulation_time` is deliberately kept MONOTONIC across a rebind (#21's own
+fix, `_clock_step_origin` re-anchored to the elapsed step count instead of
+re-zeroed), a mid-run reset happening minutes into a live run finds
+`simulation_time` already well past 2.0 s the instant the clear runs.
+`_apply_base_hold`'s very next call therefore sees `_base_hold_pose is
+None` *and* the boot-relative deadline already satisfied, skips the
+settle-wait branch entirely, and re-latches immediately from
+`data.root_pos_w` read right after the respawn -- the exact pre-settle
+height bug the round-1 fix targeted, now recurring on every subsequent
+reset for the rest of the run instead of once at boot. Flag-off has no
+equivalent defect: it never clears `_base_hold_pose` on a rebind (its
+branch of `_apply_spawn_yaw_via_view` is skipped entirely), so it just
+keeps reasserting whatever was latched at boot and never re-enters the
+`is None` branch.
+
+**Fix**: track the settle deadline relative to the LAST CLEAR, not process
+boot, on the via-view branch only. New field `_base_hold_settle_from`
+(`__init__`, initialised to `0.0` next to `_base_hold_after_sim_s` -- boot
+behaviour is unchanged, since `simulation_time - 0.0` is just
+`simulation_time`). `_apply_spawn_yaw_via_view` now records
+`self._base_hold_settle_from = self.simulation_time` in the same
+`if getattr(self, "base_fixed", False):` block that clears
+`_base_hold_pose`/`_base_hold_vel` -- so every clear (boot or a genuine
+mid-run rebind) re-arms its own 2.0 s window. `_apply_base_hold`'s gate
+branches on whether the via-view path owns the hold
+(`_base_hold_seed_quat is not None`): when it does, the check becomes
+`simulation_time - _base_hold_settle_from < _base_hold_after_sim_s`;
+otherwise (flag-off, `seed_quat is None`) the original boot-relative
+`simulation_time < _base_hold_after_sim_s` check runs unchanged, so
+flag-off stays byte-identical.
+
+New test (`SpawnYawViaViewRebindTest.test_rebind_after_boot_waits_for_settle_before_relatching`):
+fakes 40.0 s of elapsed sim time (well past the 2.0 s deadline) *before*
+triggering a rebind via `_refresh_robot_handles()` with `root_pos_w`
+z=0.20 (pre-settle), then calls `_apply_base_hold()` immediately and
+asserts `_base_hold_pose` is still `None` (not re-latched). It fails
+against a495958 with:
+```
+E       AttributeError: 'IsaacWholeRobotBackend' object has no attribute '_base_hold_settle_from'. Did you mean: '_base_hold_resettle_s'?
+```
+(the field didn't exist pre-fix). Advancing simulated time by exactly 2.0 s
+more with `root_pos_w` z=0.0775 and calling `_apply_base_hold()` again
+asserts it now latches at the settled height with the seeded yaw intact.
+A flag-off counterpart, `test_flag_off_rebind_keeps_previously_latched_hold`,
+asserts a rebind with `_spawn_yaw_via_view = False` never touches an
+already-latched `_base_hold_pose`/`_base_hold_vel` -- byte-identical to
+pre-#26 behaviour, confirming this round's change doesn't give flag-off a
+settle timer it never had. Full suite:
+`tests/test_manipulation_runtime.py` 105 passed, 3 subtests passed, 0
+failed. Still no GPU boot for either round of this fix.

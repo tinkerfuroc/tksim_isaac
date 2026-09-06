@@ -2794,6 +2794,99 @@ class SpawnYawViaViewRebindTest(unittest.TestCase):
         for actual, expected in zip(written_row[3:], expected_quat):
             self.assertAlmostEqual(actual, expected, places=6)
 
+    def test_rebind_after_boot_waits_for_settle_before_relatching(self) -> None:
+        """#26 round 2: a genuine mid-run reset (STOP -> spawn -> PLAY),
+        happening minutes into a live run, must NOT reuse the BOOT-relative
+        settle deadline. simulation_time is kept monotonic across a rebind
+        (#21), so a boot-relative 2.0s deadline is already satisfied by the
+        time a live-run reset happens, and _apply_base_hold would otherwise
+        re-latch on its very next call -- at the pre-settle respawn height.
+        The deadline must instead be measured from THIS rebind's clear."""
+        backend = _backend()
+        backend._robot_view_identity = -1  # force a "new view" rebind
+        backend._object_views = {}
+        backend._spawn_yaw_via_view = True
+        backend._spawn_yaw = math.pi / 2.0
+        backend.base_fixed = True
+        backend._base_hold_pose = None
+        backend._base_hold_vel = None
+        backend._base_hold_seed_quat = None
+        backend._base_hold_scene_sig = None
+        backend._base_hold_skip_until_sim_s = 0.0
+        backend._base_hold_resettle_s = 0.15
+        backend._base_hold_dryrun = False
+        backend._base_hold_after_sim_s = 2.0
+        backend.physics_dt = 1.0 / 120.0
+        # 40.0s of elapsed sim time BEFORE this rebind -- well past the 2.0s
+        # boot-relative deadline, representing a reset minutes into a live
+        # run rather than the initial boot bind.
+        backend._clock_elapsed_steps = 4800
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 4800)
+        backend._clock_step_origin = 0
+        # Pre-settle respawn height, exactly like a fresh spawn/boot.
+        backend._robot.data.root_pos_w = torch.tensor(
+            [[1.0, 2.0, 0.20]], dtype=torch.float32
+        )
+
+        self.assertTrue(backend._refresh_robot_handles())
+        self.assertIsNone(backend._base_hold_pose)
+        self.assertAlmostEqual(backend._base_hold_settle_from, 40.0, places=6)
+
+        # Immediately after the rebind (same step count, simulation_time
+        # still 40.0): must NOT re-latch yet, even though 40.0 >= 2.0.
+        backend._apply_base_hold()
+        self.assertIsNone(
+            backend._base_hold_pose,
+            "re-latched immediately after a mid-run rebind instead of "
+            "waiting out a fresh settle window (#26 round 2 regression)",
+        )
+
+        # Advance exactly 2.0s past the rebind's clear -- the chassis has
+        # now settled onto its wheels.
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 4800 + 240)
+        backend._robot.data.root_pos_w = torch.tensor(
+            [[1.0, 2.0, 0.0775]], dtype=torch.float32
+        )
+
+        backend._apply_base_hold()
+
+        self.assertIsNotNone(backend._base_hold_pose)
+        latched = backend._base_hold_pose[0].tolist()
+        self.assertAlmostEqual(latched[2], 0.0775, places=6)
+        half = backend._spawn_yaw / 2.0
+        expected_quat = [0.0, 0.0, math.sin(half), math.cos(half)]
+        for actual, expected in zip(latched[3:], expected_quat):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_flag_off_rebind_keeps_previously_latched_hold(self) -> None:
+        """Flag-off comparison / byte-identical-behaviour guard:
+        ``_reapply_spawn_yaw_after_rebind`` is a no-op when
+        TINKER_SIM_SPAWN_YAW_VIA_VIEW is inactive, so a rebind must never
+        clear (or otherwise disturb) an already-latched ``_base_hold_pose``
+        -- unlike the via-view path, flag-off has no equivalent settle
+        timer to fix, and this round's change must not give it one."""
+        backend = _backend()
+        backend._robot_view_identity = -1  # force a "new view" rebind
+        backend._object_views = {}
+        backend._spawn_yaw_via_view = False
+        backend.base_fixed = True
+        latched_pose = torch.tensor(
+            [[1.0, 2.0, 0.0775, 0.0, 0.0, 0.0, 1.0]], dtype=torch.float32
+        )
+        latched_vel = torch.zeros((1, 6))
+        backend._base_hold_pose = latched_pose
+        backend._base_hold_vel = latched_vel
+        backend._base_hold_seed_quat = None
+        backend._clock_elapsed_steps = 4800
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 4800)
+        backend._clock_step_origin = 0
+
+        self.assertTrue(backend._refresh_robot_handles())
+
+        self.assertIs(backend._base_hold_pose, latched_pose)
+        self.assertIs(backend._base_hold_vel, latched_vel)
+        self.assertEqual(backend._robot.root_pose_calls, [])
+
 
 class SpawnYawViaViewRecoveryRebindTest(unittest.TestCase):
     """#24 review round 2 (CONFIRMED regression in fix round 1):

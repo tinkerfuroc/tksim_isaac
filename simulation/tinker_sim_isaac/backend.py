@@ -835,6 +835,16 @@ class IsaacWholeRobotBackend:
         self._base_hold_seed_quat = None  # pending [1,4] quat(xyzw) tensor
         # Let the free base drop-settle onto its wheels before latching.
         self._base_hold_after_sim_s = 2.0
+        # #26 round 2: when the via-view path clears _base_hold_pose (boot,
+        # or a genuine mid-run rebind), the settle window below must be
+        # measured from THIS clear, not from process boot -- simulation_time
+        # is deliberately kept MONOTONIC across a STOP->spawn->PLAY rebind
+        # (#21, _clock_step_origin re-anchoring), so a boot-relative deadline
+        # is already satisfied by the time a mid-run reset happens and
+        # _apply_base_hold would re-latch on its very next call, at the
+        # pre-settle respawn height. 0.0 at construction keeps boot behavior
+        # (deadline measured from t=0) unchanged.
+        self._base_hold_settle_from = 0.0
         # A mid-play /spawn_entity (or delete) rebuilds the shared physics
         # view; a root write issued across that rebuild aliases onto the
         # freshly inserted body, teleporting the spawned object to the robot's
@@ -2283,6 +2293,16 @@ class IsaacWholeRobotBackend:
             self._base_hold_seed_quat = quat.clone()
             self._base_hold_pose = None
             self._base_hold_vel = None
+            # #26 round 2: this clear can happen at boot OR at a genuine
+            # mid-run rebind (_reapply_spawn_yaw_after_rebind runs on every
+            # STOP->spawn->PLAY cycle). Either way the chassis has just been
+            # dropped back to its unsettled spawn pose and needs a fresh
+            # settle window measured from NOW, not from process boot --
+            # simulation_time never resets (#21), so a boot-relative deadline
+            # would already be satisfied on a mid-run reset and
+            # _apply_base_hold would re-latch on its very next call at the
+            # pre-settle height.
+            self._base_hold_settle_from = self.simulation_time
 
     def _reapply_spawn_yaw_after_rebind(self) -> None:
         """Re-apply TINKER_SIM_SPAWN_YAW_VIA_VIEW's yaw after a GENUINE reset rebind.
@@ -2334,7 +2354,22 @@ class IsaacWholeRobotBackend:
         """
         data = self._robot.data
         if self._base_hold_pose is None:
-            if self.simulation_time < self._base_hold_after_sim_s:
+            seed_quat = self._base_hold_seed_quat
+            # #26 round 2: when the via-view path owns the hold (seed_quat
+            # set), the settle deadline is measured from the LAST CLEAR --
+            # boot or a genuine mid-run rebind, see _apply_spawn_yaw_via_view
+            # -- not from process boot, because simulation_time is monotonic
+            # across a rebind (#21) and a boot-relative deadline would
+            # already be satisfied by the time a mid-run reset happens.
+            # Flag-off never clears _base_hold_pose on rebind (no seed_quat),
+            # so it keeps the original boot-relative check unchanged.
+            if seed_quat is not None:
+                if (
+                    self.simulation_time - self._base_hold_settle_from
+                    < self._base_hold_after_sim_s
+                ):
+                    return
+            elif self.simulation_time < self._base_hold_after_sim_s:
                 return
             # #26: prefer TINKER_SIM_SPAWN_YAW_VIA_VIEW's pending seeded yaw
             # (_apply_spawn_yaw_via_view) over the measured orientation --
@@ -2342,7 +2377,6 @@ class IsaacWholeRobotBackend:
             # and must survive into the hold -- but always take the
             # POSITION fresh here, now that the settle wait above has
             # actually elapsed, not whatever root_pos_w read at spawn time.
-            seed_quat = self._base_hold_seed_quat
             quat = (
                 seed_quat.detach().clone()
                 if seed_quat is not None
