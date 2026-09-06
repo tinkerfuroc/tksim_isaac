@@ -340,22 +340,78 @@ def set_follower_gains(damping: float | None, stiffness: float | None,
     return gains_snapshot()
 
 
-def apply_follower_effort_limit(emit_event: bool = False) -> None:
+def _read_effective_effort_limits(ids: list[int]) -> list[float]:
+    """Read back the effective effort limit for `ids` the same way backend
+    does (gains_snapshot/_read_joint_gain_values): data.joint_effort_limits,
+    env 0. This is the buffer write_joint_effort_limit_to_sim_index populates
+    directly, so it reflects the PhysX-side write immediately; reading it
+    again at the top of each phase-B config is what makes a later clobber
+    (e.g. an actuator re-init restoring the ImplicitActuatorCfg default)
+    visible in the log instead of silently reverting.
+    """
+    data = backend._robot.data
+    limits = getattr(data, "joint_effort_limits", None)
+    if limits is None:
+        return [float("nan")] * len(ids)
+    arr = backend._torch_value(limits)[0].detach().cpu().tolist()
+    return [float(arr[i]) for i in ids]
+
+
+def _patch_actuator_effort_limit_cache(ids: list[int], limit: float) -> None:
+    """Mirror the PhysX effort-limit write into the owning ImplicitActuator's
+    cached tensors -- the same workaround backend._set_gripper_effort_limit
+    applies for drive_joint (Isaac Lab issue #128: write_joint_effort_limit_to_
+    sim_index only updates the simulator buffer, not the actuator model).
+
+    Without this, ImplicitActuator.compute()'s _clip_effort keeps clipping
+    against the stale ImplicitActuatorCfg default (180 for gripper_mimic),
+    so the per-step applied-torque telemetry the #20 analysis reads never
+    shows the requested cap, and the cached value is what gets re-applied to
+    the sim buffer if the actuator model is ever reinitialised. Patches both
+    `effort_limit` (read every step by _clip_effort) and `effort_limit_sim`
+    (read at actuator (re)construction, see Articulation._create_lab_actuator)
+    since ActuatorBase keeps them as separate tensors.
+    """
+    id_to_name = {index: name for name, index in JIDX.items()}
+    target_names = {id_to_name[i] for i in ids if i in id_to_name}
+    if not target_names:
+        return
+    for actuator in getattr(backend._robot, "actuators", {}).values():
+        names = getattr(actuator, "joint_names", None)
+        if names is None:
+            continue
+        for local_index, name in enumerate(names):
+            if name not in target_names:
+                continue
+            for attr in ("effort_limit", "effort_limit_sim"):
+                tensor = getattr(actuator, attr, None)
+                if isinstance(tensor, torch.Tensor):
+                    tensor[:, local_index] = limit
+
+
+def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower_effort_limit_set") -> None:
     """Cap the five follower joints' effort ceiling at --follower-effort-limit.
 
     Reuses the Isaac Lab writer already used for the drive joint (backend
     _set_gripper_effort_limit / _write_safety_effort_limit): PhysX
     write_joint_effort_limit_to_sim_index(limits=..., joint_ids=..., env_ids=...).
-    A no-op unless --follower-effort-limit was passed.
+    Also patches the owning ImplicitActuator's cached effort_limit/
+    effort_limit_sim tensors in place (see _patch_actuator_effort_limit_cache)
+    and reads the effective limit back for the event -- the raw PhysX write
+    alone was provably ineffective (#20: bit-identical bench rows at cap-50
+    vs cap-180). A no-op unless --follower-effort-limit was passed.
     """
     if args.follower_effort_limit is None:
         return
-    _write_gain("limits", "write_joint_effort_limit_to_sim_index", args.follower_effort_limit, mimic_ids)
+    limit = float(args.follower_effort_limit)
+    _write_gain("limits", "write_joint_effort_limit_to_sim_index", limit, mimic_ids)
+    _patch_actuator_effort_limit_cache(mimic_ids, limit)
     if emit_event:
         print(json.dumps({
-            "event": "follower_effort_limit_set",
-            "requested": args.follower_effort_limit,
+            "event": event,
+            "requested": limit,
             "indices": mimic_ids,
+            "effective": _read_effective_effort_limits(mimic_ids),
         }), flush=True)
 
 
@@ -681,7 +737,11 @@ def descend(duration_s: float) -> dict[str, object]:
 # ----------------------------------------------------------------- Phase A
 def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, object]:
     backend._gripper_close_slew = cfg["slew"]
-    apply_follower_effort_limit()  # re-pin before the per-config gains write, so phase-B configs cannot clobber it
+    # Re-pin (and re-emit a readback) before the per-config gains write, so a
+    # phase-B config that clobbers the follower cap -- or an actuator re-init
+    # that restores the ImplicitActuatorCfg default -- shows up in the log
+    # instead of silently reverting (see apply_follower_effort_limit).
+    apply_follower_effort_limit(emit_event=True, event="follower_effort_limit_check")
     gains = set_follower_gains(cfg["damping"], cfg["stiffness"], cfg.get("drive_stiffness"), cfg.get("drive_damping"))
     if _render["on"]:
         _render["next_drive"] = -1.0  # capture from the first step of this close
