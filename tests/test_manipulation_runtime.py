@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import json
 import math
 import os
@@ -171,6 +173,7 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._gripper_effort_limit = 12.0
     backend._expected_objects = {}
     backend._contact_pairs_by_key = {}
+    backend._contact_report_first_event_logged = False
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
     backend._clock_elapsed_steps = 0
@@ -1813,6 +1816,59 @@ class ManipulationRuntimeTest(unittest.TestCase):
         pair = backend.contact_pairs()[0]
         self.assertAlmostEqual(float(pair["normal_force"]), 40.0)
         self.assertEqual(pair["normal"], [0.0, 0.0, 1.0])
+
+    def test_contact_report_first_event_logged_exactly_once(self) -> None:
+        # #28 observability: a stale contacts-off boot produced a
+        # structurally-silent /sim/truth/contacts for a whole bench round
+        # with nothing in the sim log to say so. The first recorded pair
+        # must print a one-line marker exactly once per backend life, not
+        # once per contact (see _on_contact_report_event).
+        backend = _backend()
+        backend.dt = 0.1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/left_finger",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 0.5),
+            position=(0.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        )
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._on_contact_report_event([header], [sample])
+            # A second recorded contact (persist event, still above the
+            # force threshold) must not re-log the first-event marker.
+            header.type = "persist"
+            backend._on_contact_report_event([header], [sample])
+
+        lines = [
+            json.loads(line)
+            for line in captured.getvalue().splitlines()
+            if line.strip()
+        ]
+        first_event_lines = [
+            entry for entry in lines if entry.get("event") == "contact_report_first_event"
+        ]
+        self.assertEqual(len(first_event_lines), 1)
+        self.assertEqual(
+            first_event_lines[0]["pair"],
+            ["/World/Tinker/left_finger", "/World/Scenario/delivery_object"],
+        )
+        self.assertIn("simulation_time", first_event_lines[0])
 
     def test_truth_objects_are_measured_and_expected_stays_separate(self) -> None:
         backend = _backend()

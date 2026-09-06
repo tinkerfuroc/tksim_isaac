@@ -671,6 +671,10 @@ class IsaacWholeRobotBackend:
         self._spawn_attach_watch: dict[str, dict[str, int]] = {}
         self._spawn_attach_step = 0
         self._contact_pairs_by_key: dict[tuple[int, int, int, int], dict[str, object]] = {}
+        # Set once _on_contact_report_event records its first pair, so the
+        # "contact_report_first_event" diagnostic (see there) fires exactly
+        # once per backend life instead of once per contact.
+        self._contact_report_first_event_logged = False
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
         )
@@ -1160,6 +1164,33 @@ class IsaacWholeRobotBackend:
         # see both methods' docstrings.
         self._robot.update(self.dt)
         self._safety_snapshot = self._robot.data.joint_pos.clone()
+        # Whether PhysX contact reporting is on is decided once, right here,
+        # for this backend's entire process life (no later re-check) -- a
+        # stale process kept alive across a task-stack-only restart silently
+        # keeps whatever this line prints. TINKER_SIM_SENSOR_RICH_CONTACTS is
+        # the normal (sensor-rich launch) gate; callers that pass
+        # enable_contacts explicitly (manipulation-core, probes) bypass it,
+        # so fall back to naming the constructor argument itself.
+        _contacts_env_value = _os.environ.get("TINKER_SIM_SENSOR_RICH_CONTACTS")
+        _contacts_source = (
+            "TINKER_SIM_SENSOR_RICH_CONTACTS"
+            if _contacts_env_value is not None
+            else "constructor:enable_contacts"
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "contact_report",
+                    "enabled": bool(enable_contacts),
+                    "source": _contacts_source,
+                    "monitored_bodies": len(
+                        self.ARM_CONTACT_BODIES + self.GRASP_CONTACT_BODIES
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         if enable_contacts:
             self._contact_report_subscription = (
                 get_physx_simulation_interface().subscribe_contact_report_events(
@@ -3522,6 +3553,19 @@ class IsaacWholeRobotBackend:
                 "point": point,
                 "normal": normal,
             }
+            if not self._contact_report_first_event_logged:
+                self._contact_report_first_event_logged = True
+                print(
+                    json.dumps(
+                        {
+                            "event": "contact_report_first_event",
+                            "simulation_time": self.simulation_time,
+                            "pair": [actors[0], actors[1]],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
 
     @classmethod
     def is_arm_scenario_collision(
