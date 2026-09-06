@@ -4,6 +4,63 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — GPSR nav: planner refusals were phantom obstacle marks, not inflation
+
+**Symptom.** Full-stack GPSR runs (`gpsr_stack_logs/20260906T041154`, scenarios
+s2026-000 laundry_desk and s2026-019 side_table_02) lost 8 of 10 gotos:
+`GridBased: failed to create plan with tolerance 0.60` → `Invalid path, Path is
+empty` → spin/wait/backup recoveries → `Goal failed`. The first hypothesis
+(global `inflation_radius` 0.45 too large for waypoints 0.2–0.4 m from
+furniture) was wrong: the 253 ring is the footprint's inscribed radius
+(0.21 m) regardless of `inflation_radius`, and a flood fill over the static
+arena costmap reaches both goal boxes from every attempt start (goal cells cost
+0 / 48).
+
+**Measured** (evidence copied to `reports/nav-global-costmap-2026-09-06/`,
+primary capture in the s2026-019 run dir's `nav-evidence/`): 95 refusals in
+42 streaks, median streak duration 0 s (single 1 Hz tick, max 40 s); 67 % of
+streaks begin during plain driving with no recovery in the preceding 30 s;
+attempts 2–5 and 8 logged zero controller collisions; 45 % of refusals fall
+12–106 ms after `ClearEntireCostmap`, i.e. the BT replanned before the 10 Hz
+master grid was rebuilt and escalated the blip into the recovery round-robin.
+No safety-supervisor or gateway stop ever fired. The doorway at x=0 is 0.95 m
+in both USD and PGM. Humble RPP's `inCollision` threshold is `LETHAL_OBSTACLE`
+(254), not inscribed.
+
+**Ruled out.** Inflation radius (above); waypoint placement (goals connected);
+physical blockage / safety stop (none); a chain defect — the truth-pose
+raycast origin equals the `base_link→livox360` static TF, `pointcloud_to_laserscan`
+does no TF lookup (`target_frame == cloud frame`), all stamps are sim time;
+nothing in the chain can displace a return.
+
+**Root cause.** The simulated lidar is a raycast of the arena PGM from the
+robot's TRUE pose; Nav2 projects it with the AMCL/EKF ESTIMATE (wheel odometry
+only). Every pose error draws a displaced copy of nearby walls into the global
+`obstacle_layer`; the copy's inscribed ring momentarily disconnects narrow
+passages, and marks made just before a map→odom correction stay offset until
+later rays raytrace through them. Offline model reusing the real
+`OccupancyMap.raycast_many` and the gateway's 181-ray set, NavFn as BFS over
+< 253 with the 0.6 m tolerance box: zero error → 100 % connected (132/132
+route poses); a single scan displaced by 0.15 m (side_table_02 route) or
+0.20 m (laundry_desk) — the documented ~0.2 m AMCL 1σ — disconnects; the
+jump model (last 5 scans offset, robot at truth) disconnects at 0.025 m / 2°;
+pure yaw error alone is weak (1/66 poses, ~15.5°). With `static_layer` +
+`inflation_layer` only: 0 disconnections in 17,952 trials. A true-body
+footprint (inscribed 0.13 m) only doubles the tolerable error (0.15 → 0.275 m).
+
+**Fix.** `nav_params_overlay.py` emits the GPSR global costmap with
+`plugins: [static_layer, inflation_layer]` and drops the `obstacle_layer`
+block from the generated copy: the layer carried no information the static
+map lacked, so it is removed rather than tuned. Local costmap unchanged (odom
+frame; the controller's only reactive layer). `inf_is_valid` (a no-op here —
+every ray hits a wall or the map edge within 40 m) and a BT retry around
+`ComputePathToPose` were considered and left for follow-up. Live gate before
+merge: rerun s2026-019 with `nav_monitor` (`map_to_odom_jumps.csv`),
+`/sim/internal/physics_truth` vs `/amcl_pose`, and a bridge-log grep — success is
+zero `failed to create plan` during driving and the goal reached. Residual
+static-map fragility noted: a 0.50 m free channel at (-1.82, -0.06) near
+`wall_0012`/TV stand on the laundry_desk route.
+
 ## 2026-09-06 — Task #25: bound `controller_reconciler`'s post-success teardown so it cannot wedge the launch chain
 
 **Symptom.** In a live GPSR run (`gpsr_stack_logs/20260905T230818`), the

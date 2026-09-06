@@ -15,6 +15,11 @@ without searching::
 
 This module applies the documented rollback to a *copy* of the upstream file at
 launch time.  The upstream file is hardware's, and is left untouched.
+
+The global costmap is also reduced to ``static_layer`` + ``inflation_layer``:
+the simulated lidar is a raycast of the same PGM, so an obstacle layer on the
+global map can only add pose-estimate error as phantom walls (see
+``PRIOR_MAP_PLUGINS``).  The local costmap keeps its live ``/scan`` source.
 """
 
 from __future__ import annotations
@@ -27,7 +32,23 @@ from typing import Any, Mapping
 
 import yaml
 
-PRIOR_MAP_PLUGINS = ["static_layer", "obstacle_layer", "inflation_layer"]
+# Static + inflation ONLY.  In simulation the "lidar" is
+# tinker_sim_isaac.ros_gateway._development_point_cloud: a raycast of the very
+# arena PGM that map_server hands the static layer, taken from the robot's TRUE
+# pose.  Nav2 projects those returns with the AMCL/EKF ESTIMATE, so every pose
+# error draws a displaced copy of nearby walls into an obstacle layer, and the
+# copy's 0.21 m inscribed ring (cost 253, an obstacle to NavFn) momentarily
+# disconnects narrow passages.  Run 20260906T041154: 95 "failed to create plan"
+# refusals in 42 streaks, median duration 0 s, 67 % starting during plain
+# driving, zero collisions; the static map alone was fully connected.  Offline
+# model (reports/nav-global-costmap-2026-09-06/root-cause-verification.md):
+# a single scan displaced 0.15-0.20 m (the documented AMCL 1-sigma) disconnects
+# the route; marks left behind by a map->odom correction do so at 0.025 m;
+# static + inflation only: 0 disconnections in 17,952 trials.  The layer carried
+# no information the static map lacked, so it is dropped rather than tuned.
+# The LOCAL costmap keeps /scan: it lives in odom, where AMCL corrections do
+# not offset its marks, and it is the controller's only reactive layer.
+PRIOR_MAP_PLUGINS = ["static_layer", "inflation_layer"]
 
 STATIC_LAYER = {
     "plugin": "nav2_costmap_2d::StaticLayer",
@@ -56,6 +77,9 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     section["track_unknown_space"] = True
     section["plugins"] = list(PRIOR_MAP_PLUGINS)
     section["static_layer"] = dict(STATIC_LAYER)
+    # Drop the upstream block with the plugin, so the emitted YAML does not
+    # declare a layer the plugin list no longer loads (see PRIOR_MAP_PLUGINS).
+    section.pop("obstacle_layer", None)
 
     # Goal tolerances: the upstream 0.10 m / 0.10 rad are hardware-precision
     # values. The sim controller's documented steady-state offsets

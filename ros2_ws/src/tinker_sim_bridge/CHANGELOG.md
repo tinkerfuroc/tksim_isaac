@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (nav overlay: static+inflation-only global costmap)
+
+- `nav_params_overlay.prior_map_costmap_overlay` now emits the GPSR global
+  costmap with `plugins: [static_layer, inflation_layer]` and drops the
+  upstream `obstacle_layer` block from the generated copy.  The simulated
+  lidar (`ros_gateway._development_point_cloud`) raycasts the same arena PGM
+  the static layer loads, from the robot's true pose, while Nav2 projects the
+  returns with the AMCL/EKF estimate; the global obstacle layer therefore
+  only ever contributed displaced wall copies whose inscribed rings
+  disconnected NavFn for single ticks (run 20260906T041154: 95 refusals in
+  42 streaks, median 0 s, 67 % during plain driving, zero collisions).  The
+  local costmap keeps its live `/scan` source.  Hardware's
+  `nav2_dwb_params.yaml` and `navigation.launch.py` are unchanged.  Design:
+  `docs/superpowers/specs/2026-09-06-nav-global-costmap-static-only-design.md`.
+
 ### Fixed (Task 50: integrated Stage A consolidated repair)
 
 - The `gripper` implicit actuator now actively drives only `drive_joint`
