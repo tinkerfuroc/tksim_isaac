@@ -3726,7 +3726,18 @@ class IsaacWholeRobotBackend:
                     continue
                 normal_impulses.append((abs(projected_impulse), normal, sample_index))
 
-            normal_force = sum(value[0] for value in normal_impulses) / self.dt
+            # subscribe_contact_report_events fires this callback once per
+            # PhysX solver SUBSTEP (physics_dt = 1/physics_hz), independent
+            # of control_hz: with physics_substeps = physics_hz/control_hz
+            # substeps per control tick, self.dt (1/control_hz) is
+            # physics_substeps times too large whenever control_hz <
+            # physics_hz. The callback receives no per-step dt/current_time
+            # argument (only contact_headers, contact_data), so the impulse
+            # -- itself accumulated over exactly one physics_dt -- must be
+            # converted to a force with physics_dt, not the control-tick
+            # self.dt (Task #29; confirmed by A/B probe: 20.74 N at 120 Hz
+            # vs a wrong 5.12 N at 30 Hz for an identical trajectory).
+            normal_force = sum(value[0] for value in normal_impulses) / self.physics_dt
             if normal_force <= self.CONTACT_FORCE_THRESHOLD:
                 self._contact_pairs_by_key.pop(key, None)
                 continue
