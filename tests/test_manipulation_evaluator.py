@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge"))
 
-from truth_evaluator import TruthEvaluatorCore  # noqa: E402
+from truth_evaluator import TruthEvaluatorCore, TruthFrame  # noqa: E402
 
 
 def frame(
@@ -262,6 +262,51 @@ class ManipulationEvaluatorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             evaluator.process(invalid)
 
+    def test_objects_plural_parses_declared_and_spawned_entities(self) -> None:
+        # Regression for Task #11: backend.py's truth_state() puts declared
+        # objects first and spawned entities (e.g. bench_soup_..., a
+        # spawned-via-/spawn_entity object) after in the plural "objects"
+        # array, while "object" (singular) stays objects[0] for back-compat.
+        # TruthFrame must parse the full plural list, not just the singular.
+        declared = frame(0.0, [0.65, 0.0, 0.8], [0.65, 0.0, 0.8], [])["object"]
+        spawned = {
+            "id": "bench_soup_100_anygrasp_agw_a1",
+            "class_name": "spawned_object",
+            "pose": {"xyz": [1.2, 0.3, 0.5], "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            "twist": {"linear": [0.0, 0.0, 0.0], "angular": [0.0, 0.0, 0.0]},
+        }
+        payload = frame(0.0, [0.65, 0.0, 0.8], [0.65, 0.0, 0.8], [])
+        payload["objects"] = [declared, spawned]
+
+        parsed = TruthFrame.from_mapping(payload)
+
+        self.assertEqual(len(parsed.objects), 2)
+        self.assertEqual(parsed.objects[0]["id"], declared["id"])
+        self.assertEqual(parsed.objects[1]["id"], "bench_soup_100_anygrasp_agw_a1")
+        self.assertEqual(parsed.objects[1]["pose"]["position"], (1.2, 0.3, 0.5))
+        # Back-compat: the singular alias still exists and equals objects[0].
+        self.assertIsNotNone(parsed.object)
+        self.assertEqual(parsed.object["id"], declared["id"])
+
+    def test_legacy_singular_object_still_yields_exactly_one_entry(self) -> None:
+        payload = frame(0.0, [0.65, 0.0, 0.8], [0.65, 0.0, 0.8], [])
+        self.assertNotIn("objects", payload)
+
+        parsed = TruthFrame.from_mapping(payload)
+
+        self.assertEqual(len(parsed.objects), 1)
+        self.assertEqual(parsed.objects[0]["id"], payload["object"]["id"])
+        self.assertEqual(parsed.object["id"], payload["object"]["id"])
+
+    def test_no_object_yields_empty_objects_tuple(self) -> None:
+        payload = frame(0.0, None, [0.0, 0.0, 0.0], [])
+        self.assertNotIn("objects", payload)
+
+        parsed = TruthFrame.from_mapping(payload)
+
+        self.assertEqual(parsed.objects, ())
+        self.assertIsNone(parsed.object)
+
     def test_evaluator_node_accepts_separate_raw_jsonl_path_parameter(self) -> None:
         source = (
             ROOT
@@ -287,6 +332,60 @@ def _node_writes(node: ast.AST, writer_attr: str) -> bool:
         if isinstance(value, ast.Attribute) and value.attr == writer_attr:
             return True
     return False
+
+
+def _has_for_loop_publishing(node: ast.AST, iter_attr: str, pub_attr: str) -> bool:
+    """True when ``node`` contains a ``for x in <...>.<iter_attr>:`` loop whose
+    body calls ``self.<pub_attr>.publish(...)`` -- i.e. one publish call per
+    iterated item, mirroring the existing "for contact in frame.contacts"
+    pattern rather than a single publish gated by an "if" check.
+    """
+    for loop in ast.walk(node):
+        if not isinstance(loop, ast.For):
+            continue
+        iter_node = loop.iter
+        if not (isinstance(iter_node, ast.Attribute) and iter_node.attr == iter_attr):
+            continue
+        for call in ast.walk(loop):
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "publish"
+                and isinstance(func.value, ast.Attribute)
+                and func.value.attr == pub_attr
+            ):
+                return True
+    return False
+
+
+def test_on_truth_publishes_one_object_truth_per_object_in_frame() -> None:
+    # Regression for Task #11: contacts are iterated ("for contact in
+    # frame.contacts") and one ContactTruth is published per contact, but
+    # objects were published from a single "if frame.object is not None"
+    # block -- at most one ObjectTruth per frame, so spawned entities past
+    # objects[0] never reached /sim/truth/object_state. _on_truth must loop
+    # over frame.objects the same way it loops over frame.contacts.
+    source = (
+        ROOT
+        / "ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/truth_evaluator.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node_class = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "TruthEvaluatorNode"
+    )
+    on_truth = next(
+        node
+        for node in ast.walk(node_class)
+        if isinstance(node, ast.FunctionDef) and node.name == "_on_truth"
+    )
+    assert _has_for_loop_publishing(on_truth, "objects", "_object_pub"), (
+        "_on_truth must loop over frame.objects publishing one ObjectTruth "
+        "per entry, not just frame.object"
+    )
 
 
 def test_evaluator_persists_raw_and_evaluated_from_same_callback() -> None:

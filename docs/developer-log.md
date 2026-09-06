@@ -4,6 +4,79 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #11 follow-on: truth evaluator only republished the first object in `objects[]`
+
+**Symptom.** Bench round `agw`: `/sim/truth/object_state` (the public topic
+the bench's `truth_recorder.py` subscribes to) only ever carried
+`delivery_object` across 10085 frames, even though the internal stream
+(`/sim/internal/physics_truth`) carried `bench_soup_100_anygrasp_agw_a1` and
+`bench_sugar_box_100_anygrasp_agw_a1` poses from t~309s onward, and
+`ContactTruth` messages for those same bench objects reached the bench log
+fine. So the backend-side spawned-entity truth work (#11, merged as PR #14,
+`backend.py` `_spawned_object_states()`/`truth_state()`) was producing
+correct data that a downstream hop was silently dropping.
+
+**Root cause.** `truth_evaluator.py`'s `TruthFrame.from_mapping` (~line 151)
+parsed only `payload.get("object")` (singular) and never touched
+`payload.get("objects")` (plural) at all. `_on_truth` then published at most
+one `ObjectTruth` per frame from `frame.object`. `backend.py`'s
+`truth_state()` (~3417-3421) deliberately keeps `object` = `objects[0]`
+"unchanged for existing consumers" and appends spawned entities *after* the
+declared ones in `objects[]` (~2941-2944) — so any spawned body is always
+`objects[1:]` and never reaches `frame.object`, and therefore never reaches
+the public topic. Contacts were unaffected because `_on_truth` already
+loops `for contact in frame.contacts` (~512-520); only the object republish
+path lacked the equivalent loop. The internal `/sim/internal/physics_truth`
+stream already carried the full `objects[]` array — this was purely a
+bridge-side republish gap, requiring only a bridge rebuild (no backend or
+scenario changes) to fix.
+
+**Fix** (`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/truth_evaluator.py`):
+`TruthFrame` gained an `objects: tuple[Mapping[str, Any], ...]` field,
+parsed from `payload["objects"]` when present, falling back to a
+single-element tuple built from the legacy singular `payload["object"]`
+otherwise (empty tuple when neither is present). `object` (singular) is
+kept as a back-compat alias = `objects[0] if objects else None`, so nothing
+that reads `frame.object` needed to change. `_on_truth` replaced its single
+`if frame.object is not None: ... publish` block with
+`for obj in frame.objects: ... self._object_pub.publish(...)`, mirroring
+the existing contacts loop; `retained_by_gripper` is set only for the
+element that `is frame.object` (i.e. `objects[0]`) since retention is
+evaluated against a single task object, and `False` for every other
+republished entity.
+
+**Audit of `TruthEvaluatorCore.process`/`evaluate()` metrics.** These still
+key off `frame.object` only (unchanged semantics, as required — this task
+did not touch retention logic). `evaluate()` computes `lift_m`,
+`translation_m`, `drift_m`/`drift_deg`, `stable_window_s`, and `retained`
+against `frame.object`'s pose alone; if per-spawned-object retention
+metrics are ever wanted (e.g. "is `bench_soup_...` also retained"), that is
+a separate, not-yet-scoped change to `evaluate()`/`RetentionMetrics`, not
+covered here.
+
+**Tests** (`tests/test_manipulation_evaluator.py`): `test_objects_plural_parses_declared_and_spawned_entities`
+feeds a payload with `objects = [declared, spawned]` and asserts
+`TruthFrame.objects` has both entries in order with the spawned object's id
+and pose intact, and that `frame.object` still aliases `objects[0]`.
+`test_legacy_singular_object_still_yields_exactly_one_entry` and
+`test_no_object_yields_empty_objects_tuple` cover the back-compat and
+no-object cases. All three fail on the pre-fix code with
+`AttributeError: 'TruthFrame' object has no attribute 'objects'`.
+`test_on_truth_publishes_one_object_truth_per_object_in_frame` is an
+AST-based structural check (rclpy isn't importable in this venv, matching
+the existing test file's pattern for `TruthEvaluatorNode`) asserting
+`_on_truth` contains a `for x in frame.objects:` loop that calls
+`self._object_pub.publish(...)`; it fails on pre-fix code with
+`AssertionError: _on_truth must loop over frame.objects ...`. Full file:
+19 passed (was 15 before this round). No other test file in the repo
+exercises `TruthFrame`/`ObjectTruth`/`_on_truth` behaviorally — the other
+files matching `truth_evaluator` (`test_contract_guard.py`,
+`test_integrated_evidence_index.py`, `test_integrated_static_contracts.py`,
+`test_integrated_ompl_launch_contract.py`, `test_qualification_manifest.py`,
+`test_integrated_qualification.py`) only assert static contract facts
+(node/topic/message-type names, launch cardinality) unaffected by this
+change.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported
