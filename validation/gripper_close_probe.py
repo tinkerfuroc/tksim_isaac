@@ -109,6 +109,20 @@ parser.add_argument("--freeze-at-stall", action="store_true",
                           "advance (H-CMD) rather than a friction-anchor artifact (H-ANCHOR). Emits "
                           "'freeze_at_stall' with the frozen angles and time (or triggered=False if the "
                           "stall condition never holds for 0.3 s). Default off (byte-identical close).")
+parser.add_argument("--freeze-trigger", default="stall", choices=("stall", "contact"),
+                     help="Only meaningful with --freeze-at-stall. 'stall' (default) = the original "
+                          "H-CMD trigger: contact (lf+rf > 1 N) AND measured drive-joint speed < "
+                          "0.02 rad/s sustained for 0.3 s. This never armed in practice -- the drive "
+                          "creeps continuously (~0.03 rad/s) toward its unreachable target and never "
+                          "reads as stalled (see h3-result.md). 'contact' = fires on the first "
+                          "genuine clamp: lf+rf > 5 N sustained for 0.3 s, independent of drive "
+                          "speed. Same freeze action either way (see --freeze-lead).")
+parser.add_argument("--freeze-lead", type=float, default=0.005,
+                     help="Only meaningful with --freeze-at-stall. Amount (rad) added to each "
+                          "gripper joint's measured angle to form its frozen target -- 'measured + "
+                          "lead' keeps a small closing bias so the freeze doesn't immediately release "
+                          "contact. 0.0 = pure hold at the measured angles (no further press). "
+                          "Default 0.005.")
 parser.add_argument("--friction-type", default=None, choices=("patch", "one_directional", "two_directional"),
                      help="#20 H-ANCHOR discriminator: author physxScene:frictionType on the PhysicsScene "
                           "prim before the physics parse/play (via TINKER_SIM_PHYSICS_FRICTION_TYPE, read "
@@ -1150,15 +1164,27 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         lag = target - pad_pos
         lf, rf = pad_forces()
         force = lf + rf
+        drive_speed_now = abs(g["drive_joint"][1])
         if args.freeze_at_stall and not frozen:
-            # H-CMD discriminator (task20-decay-probe-findings.md): once
-            # contact exists and the drive has stopped MOVING (not just the
-            # pads -- the drive is what _ramp_drive_target keeps advancing),
-            # freeze every gripper target at its own measured angle and kill
-            # the ramp/mirror so nothing can push the jaw further round the
-            # object's curvature for the rest of the hold.
-            drive_speed = abs(g["drive_joint"][1])
-            if force > 1.0 and drive_speed < 0.02:
+            # H-CMD discriminator (task20-decay-probe-findings.md): once the
+            # trigger condition holds, freeze every gripper target at its own
+            # measured angle (+ lead) and kill the ramp/mirror so nothing can
+            # push the jaw further round the object's curvature for the rest
+            # of the hold.
+            #
+            # 'stall' (original): contact exists AND the drive has stopped
+            # MOVING (drive speed < 0.02 rad/s) -- the drive is what
+            # _ramp_drive_target keeps advancing. Per h3-result.md this never
+            # armed: the drive creeps continuously (~0.03 rad/s) toward its
+            # unreachable target and never reads as stalled.
+            #
+            # 'contact' (#20 fix): fires on the first genuine clamp, lf+rf
+            # > 5 N sustained for 0.3 s, independent of drive speed.
+            if args.freeze_trigger == "contact":
+                trigger_hold = force > 5.0
+            else:
+                trigger_hold = force > 1.0 and drive_speed_now < 0.02
+            if trigger_hold:
                 freeze_run += 1
             else:
                 freeze_run = 0
@@ -1168,15 +1194,16 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
                 freeze_targets = {}
                 for name, idx in zip(GRIP, GRIP_IDS):
                     measured = g[name][0]
-                    frozen_value = measured + 0.005
+                    frozen_value = measured + args.freeze_lead
                     freeze_targets[name] = frozen_value
                     backend._position_targets[0, idx] = frozen_value
                 backend._ramp_drive_target = lambda: None
                 backend._mirror_gripper_mimic_targets = lambda: None
                 emit(
                     event="freeze_at_stall", tag=tag, triggered=True, t=round(freeze_t, 4),
+                    trigger=args.freeze_trigger, drive_speed_at_trigger=drive_speed_now,
                     frozen_targets={n: round(v, 5) for n, v in freeze_targets.items()},
-                    lf=lf, rf=rf, drive_speed=drive_speed,
+                    lf=lf, rf=rf, drive_speed=drive_speed_now,
                 )
         moving = pad_speed > 0.1
         if moving:
@@ -1210,6 +1237,7 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
             # the actuator model's commanded value) -- see _read_physx_joint_forces.
             "physx_tau": {n: round(v, 3) for n, v in zip(GRIP, physx_taus)},
             "pos": {n: round(g[n][0], 4) for n in FOLLOWERS},
+            "frozen": frozen,
         }
         if args.trace_contacts:
             r["trace"] = trace_pairs()
@@ -1230,7 +1258,8 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         maybe_capture(tag, g["drive_joint"][0], force=f"L{lf:.0f}R{rf:.0f}")
         video_tick()
     if args.freeze_at_stall and not frozen:
-        emit(event="freeze_at_stall", tag=tag, triggered=False)
+        emit(event="freeze_at_stall", tag=tag, triggered=False, trigger=args.freeze_trigger,
+             drive_speed_at_trigger=None)
     tail = int(0.5 / DT)
     metrics: dict[str, object] = {
         "tag": tag, "config": cfg, "gains_after_write": {k: gains.get(k) for k in ("joint_damping", "joint_stiffness", "joint_effort_limits")},
@@ -1245,7 +1274,7 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
     }
     if args.freeze_at_stall:
         metrics["freeze_at_stall"] = {
-            "triggered": frozen, "t": freeze_t,
+            "triggered": frozen, "t": freeze_t, "trigger": args.freeze_trigger,
             "targets": {n: round(v, 5) for n, v in freeze_targets.items()} if freeze_targets else None,
         }
     if bottle_rows:
