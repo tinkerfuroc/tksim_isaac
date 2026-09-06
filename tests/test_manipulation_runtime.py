@@ -177,6 +177,25 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._gripper_effort_limit = 12.0
     backend._expected_objects = {}
     backend._contact_pairs_by_key = {}
+    # Mirrors __init__'s TINKER_SIM_CONTACT_TRACE_BODIES parse so a test can
+    # exercise the env-gated path via patch.dict(os.environ, ...) before
+    # calling _backend(), while every other test (env unset) gets the same
+    # empty-frozenset default __init__ would produce.
+    backend._contact_trace_bodies = frozenset(
+        item.strip()
+        for item in os.environ.get("TINKER_SIM_CONTACT_TRACE_BODIES", "").split(",")
+        if item.strip()
+    )
+    backend._contact_trace_pairs_by_key = {}
+    # Mirrors __init__'s TINKER_SIM_CONTACT_EXTRA_BODIES parse so a test can
+    # exercise the env-gated path via patch.dict(os.environ, ...) before
+    # calling _backend(), while every other test (env unset) gets the same
+    # empty-tuple default __init__ would produce.
+    backend._contact_extra_bodies = tuple(
+        item.strip()
+        for item in os.environ.get("TINKER_SIM_CONTACT_EXTRA_BODIES", "").split(",")
+        if item.strip()
+    )
     backend._contact_report_first_event_logged = False
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
@@ -1820,6 +1839,241 @@ class ManipulationRuntimeTest(unittest.TestCase):
         pair = backend.contact_pairs()[0]
         self.assertAlmostEqual(float(pair["normal_force"]), 40.0)
         self.assertEqual(pair["normal"], [0.0, 0.0, 1.0])
+
+    def test_contact_report_drops_unmonitored_pair_without_trace_env(self) -> None:
+        # TINKER_SIM_CONTACT_TRACE_BODIES unset: a Bottle<->knuckle pair (neither
+        # actor in ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES) stays invisible on
+        # both the existing and the new accessor -- unchanged default behavior.
+        backend = _backend()
+        backend.dt = 0.1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Scenario/Bottle",
+            2: "/World/Tinker/left_inner_knuckle",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 5.0),
+            position=(0.1, 0.2, 0.3),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        self.assertEqual(backend.contact_pairs(), [])
+        self.assertEqual(backend.contact_trace_pairs(), [])
+
+    def test_contact_report_trace_env_records_unmonitored_pair_with_point_and_normal(
+        self,
+    ) -> None:
+        # TINKER_SIM_CONTACT_TRACE_BODIES=Bottle: the same Bottle<->knuckle pair
+        # is now recorded (still absent from contact_pairs()/contact_state(),
+        # which stay scoped to ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES), with
+        # its force, point, and normal kept on the new trace accessor.
+        with patch.dict(os.environ, {"TINKER_SIM_CONTACT_TRACE_BODIES": "Bottle"}):
+            backend = _backend()
+        backend.dt = 0.1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Scenario/Bottle",
+            2: "/World/Tinker/left_inner_knuckle",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 5.0),
+            position=(0.1, 0.2, 0.3),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        self.assertEqual(backend.contact_pairs(), [])
+        self.assertFalse(backend.contact_state()["left_finger"]["in_contact"])
+        traced = backend.contact_trace_pairs()
+        self.assertEqual(len(traced), 1)
+        self.assertEqual(traced[0]["body_a"], "/World/Scenario/Bottle")
+        self.assertEqual(traced[0]["body_b"], "/World/Tinker/left_inner_knuckle")
+        self.assertAlmostEqual(float(traced[0]["normal_force"]), 50.0)
+        self.assertEqual(traced[0]["point_count"], 1)
+        for actual, expected in zip(traced[0]["point"], [0.1, 0.2, 0.3]):
+            self.assertAlmostEqual(float(actual), expected)
+        for actual, expected in zip(traced[0]["normal"], [0.0, 0.0, 1.0]):
+            self.assertAlmostEqual(float(actual), expected)
+        self.assertEqual(len(traced[0]["points"]), 1)
+        for actual, expected in zip(traced[0]["points"][0], [0.1, 0.2, 0.3]):
+            self.assertAlmostEqual(float(actual), expected)
+        self.assertEqual(len(traced[0]["normals"]), 1)
+        for actual, expected in zip(traced[0]["normals"][0], [0.0, 0.0, 1.0]):
+            self.assertAlmostEqual(float(actual), expected)
+
+        # a lost event clears the traced pair the same way it clears the
+        # monitored one.
+        header.type = "lost"
+        header.num_contact_data = 0
+        backend._on_contact_report_event([header], [])
+        self.assertEqual(backend.contact_trace_pairs(), [])
+
+    def test_contact_extra_bodies_unset_matches_default_monitored_set(self) -> None:
+        # TINKER_SIM_CONTACT_EXTRA_BODIES unset: a pair on a body outside
+        # ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES (e.g. the gripper base)
+        # stays invisible -- byte-identical to the pre-existing monitored set.
+        backend = _backend()
+        self.assertEqual(backend._contact_extra_bodies, ())
+        backend.dt = 0.1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/xarm_gripper_base_link",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 5.0),
+            position=(0.1, 0.2, 0.3),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        self.assertEqual(backend.contact_pairs(), [])
+
+    def test_contact_extra_bodies_env_records_pair_like_grasp_bodies(self) -> None:
+        # TINKER_SIM_CONTACT_EXTRA_BODIES=xarm_gripper_base_link,xarm_camera_link
+        # extends the monitored set: a push on the gripper base is now
+        # recorded and aggregated by name the same way GRASP_CONTACT_BODIES
+        # are, without touching left_finger/right_finger semantics.
+        with patch.dict(
+            os.environ,
+            {
+                "TINKER_SIM_CONTACT_EXTRA_BODIES": (
+                    "xarm_gripper_base_link,xarm_camera_link"
+                )
+            },
+        ):
+            backend = _backend()
+        self.assertEqual(
+            backend._contact_extra_bodies,
+            ("xarm_gripper_base_link", "xarm_camera_link"),
+        )
+        backend.dt = 0.1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/xarm_gripper_base_link",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 5.0),
+            position=(0.1, 0.2, 0.3),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pairs = backend.contact_pairs()
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["body_a"], "/World/Tinker/xarm_gripper_base_link")
+        self.assertEqual(pairs[0]["body_b"], "/World/Scenario/delivery_object")
+        state = backend.contact_state()
+        self.assertTrue(state["xarm_gripper_base_link"]["in_contact"])
+        self.assertAlmostEqual(float(state["xarm_gripper_base_link"]["force"]), 50.0)
+        self.assertFalse(state["left_finger"]["in_contact"])
+        self.assertFalse(state["right_finger"]["in_contact"])
+
+        header.type = "lost"
+        header.num_contact_data = 0
+        backend._on_contact_report_event([header], [])
+        self.assertEqual(backend.contact_pairs(), [])
+
+    def test_contact_trace_and_extra_bodies_match_full_scenario_prim_path(self) -> None:
+        # The bench's truth pairs carry full prim paths -- a spawned entity's
+        # rigid body IS its own prim, e.g.
+        # "/World/Scenario/bench_sugar_box_100_anygrasp_agt_a1" -- and the
+        # bench sets TINKER_SIM_CONTACT_TRACE_BODIES to that entity's bare
+        # leaf name (not a full path), same as TINKER_SIM_CONTACT_EXTRA_BODIES
+        # is set to bare xarm link names. Both matchers must compare leaves
+        # (see _contact_name_matches), exactly as the pre-existing
+        # ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES matching already resolves
+        # e.g. "left_finger" from "/World/Tinker/left_finger".
+        with patch.dict(
+            os.environ,
+            {
+                "TINKER_SIM_CONTACT_TRACE_BODIES": "bench_sugar_box_100_anygrasp_agw_a1",
+                "TINKER_SIM_CONTACT_EXTRA_BODIES": "xarm_gripper_base_link",
+            },
+        ):
+            backend = _backend()
+        backend.dt = 0.1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/xarm_gripper_base_link",
+            2: "/World/Scenario/bench_sugar_box_100_anygrasp_agw_a1",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 5.0),
+            position=(0.1, 0.2, 0.3),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pairs = backend.contact_pairs()
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["body_a"], "/World/Tinker/xarm_gripper_base_link")
+        self.assertEqual(
+            pairs[0]["body_b"], "/World/Scenario/bench_sugar_box_100_anygrasp_agw_a1"
+        )
+        traced = backend.contact_trace_pairs()
+        self.assertEqual(len(traced), 1)
+        self.assertEqual(traced[0]["body_a"], "/World/Tinker/xarm_gripper_base_link")
+        self.assertEqual(
+            traced[0]["body_b"], "/World/Scenario/bench_sugar_box_100_anygrasp_agw_a1"
+        )
 
     def test_contact_report_first_event_logged_exactly_once(self) -> None:
         # #28 observability: a stale contacts-off boot produced a
