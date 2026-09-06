@@ -139,6 +139,7 @@ class TruthFrame:
     task: str
     robot: Mapping[str, Any]
     object: Mapping[str, Any] | None
+    objects: tuple[Mapping[str, Any], ...]
     contacts: tuple[Mapping[str, Any], ...]
     raw: Mapping[str, Any]
 
@@ -148,7 +149,6 @@ class TruthFrame:
         if version not in SUPPORTED_RAW_SCHEMA_VERSIONS:
             raise ValueError(f"unsupported physics truth schema version: {version!r}")
         robot_raw = payload.get("robot")
-        object_raw = payload.get("object")
         if not isinstance(robot_raw, Mapping):
             raise ValueError("physics truth requires a robot mapping")
         robot = dict(robot_raw)
@@ -158,16 +158,40 @@ class TruthFrame:
         robot["joint_positions"] = tuple(_finite(item, "robot.joint_positions") for item in robot.get("joint_positions", []))
         robot["joint_velocities"] = tuple(_finite(item, "robot.joint_velocities") for item in robot.get("joint_velocities", []))
         robot["joint_efforts"] = tuple(_finite(item, "robot.joint_efforts") for item in robot.get("joint_efforts", []))
-        object_value: Mapping[str, Any] | None
-        if object_raw is None:
-            object_value = None
-        elif isinstance(object_raw, Mapping):
-            parsed_object = dict(object_raw)
-            parsed_object["pose"] = _pose(parsed_object.get("pose"), "object.pose")
-            parsed_object["twist"] = _twist(parsed_object.get("twist", {}), "object.twist")
-            object_value = parsed_object
+
+        def _parse_object(raw: Any, name: str) -> Mapping[str, Any]:
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"{name} must be a mapping")
+            parsed_object = dict(raw)
+            parsed_object["pose"] = _pose(parsed_object.get("pose"), f"{name}.pose")
+            parsed_object["twist"] = _twist(parsed_object.get("twist", {}), f"{name}.twist")
+            return parsed_object
+
+        # The public/plural contract is "objects": declared objects first,
+        # spawned entities (e.g. via /spawn_entity) appended after -- see
+        # backend.py truth_state(). Older payloads (and any producer that
+        # still only sets the legacy singular "object") are supported by
+        # falling back to a single-element list built from "object".
+        objects_raw = payload.get("objects")
+        objects_value: tuple[Mapping[str, Any], ...]
+        if objects_raw is not None:
+            if not isinstance(objects_raw, Sequence) or isinstance(objects_raw, (str, bytes)):
+                raise ValueError("objects must be an array")
+            objects_value = tuple(
+                _parse_object(raw, f"objects[{index}]") for index, raw in enumerate(objects_raw)
+            )
         else:
-            raise ValueError("physics truth object must be a mapping or null")
+            object_raw = payload.get("object")
+            if object_raw is None:
+                objects_value = ()
+            elif isinstance(object_raw, Mapping):
+                objects_value = (_parse_object(object_raw, "object"),)
+            else:
+                raise ValueError("physics truth object must be a mapping or null")
+        # Back-compat alias: "object" (singular) is always objects[0] if any
+        # object is present, so existing single-object consumers (and the
+        # per-object retention metrics in TruthEvaluatorCore) are unchanged.
+        object_value: Mapping[str, Any] | None = objects_value[0] if objects_value else None
         contacts_value = payload.get("contacts", [])
         if not isinstance(contacts_value, Sequence) or isinstance(contacts_value, (str, bytes)):
             raise ValueError("contacts must be an array")
@@ -188,6 +212,7 @@ class TruthFrame:
             task=str(payload.get("task", "")),
             robot=robot,
             object=object_value,
+            objects=objects_value,
             contacts=tuple(contacts),
             raw=payload,
         )
@@ -500,14 +525,18 @@ if rclpy is not None:
                 robot.joint_efforts = list(frame.robot["joint_efforts"])
                 robot.safety_stop = bool(frame.robot.get("safety_stop", False))
                 self._robot_pub.publish(robot)
-                if frame.object is not None:
+                for obj in frame.objects:
                     object_message = ObjectTruth()
                     _set_time(object_message, frame.timestamp)
-                    object_message.object_id = str(frame.object.get("id", frame.object.get("object_id", "")))
-                    object_message.class_name = str(frame.object.get("class_name", ""))
-                    _set_pose(object_message.pose, frame.object["pose"])
-                    _set_twist(object_message.twist, frame.object["twist"])
-                    object_message.retained_by_gripper = bool(metrics["retained"])
+                    object_message.object_id = str(obj.get("id", obj.get("object_id", "")))
+                    object_message.class_name = str(obj.get("class_name", ""))
+                    _set_pose(object_message.pose, obj["pose"])
+                    _set_twist(object_message.twist, obj["twist"])
+                    # Retention metrics are evaluated only for the primary
+                    # (objects[0] / frame.object) task object; spawned
+                    # entities past objects[0] are republished for
+                    # visibility but are not the retention target.
+                    object_message.retained_by_gripper = bool(metrics["retained"]) if obj is frame.object else False
                     self._object_pub.publish(object_message)
                 for contact in frame.contacts:
                     contact_message = ContactTruth()
