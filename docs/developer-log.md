@@ -4,6 +4,108 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #25: bound `controller_reconciler`'s post-success teardown so it cannot wedge the launch chain
+
+**Symptom.** In a live GPSR run (`gpsr_stack_logs/20260905T230818`), the
+`controller_reconciler` instance spawning `joint_state_broadcaster` logged
+`controller joint_state_broadcaster is active` at t=148.65s and then never
+logged anything else, never exited, and never wrote `process has finished
+cleanly` or `process has died`, for the remaining ~26 minutes of the run
+(final teardown at t~1788671093, ~114 min of Isaac Sim's own internal
+clock). Because `whole_robot.launch.py` / `gpsr.launch.py` chain
+`xarm7_traj_controller`'s reconciler off this process's `OnProcessExit`,
+that controller was never loaded and every arm goal was rejected for the
+whole run.
+
+**Root cause (not proven; best-supported hypothesis).** Full analysis in
+`/home/tinker/.claude/jobs/01ca17b4/tmp/task25-reconciler-hang-findings.md`.
+Key evidence:
+- Everything in `controller_reconciler.py` up to and including the logged
+  "is active" line is provably bounded by `time.monotonic()` deadlines
+  (`RosControllerManagerApi._call`, `set_remote_parameter`), independent of
+  `/clock` — the log line proves that code already finished. Task #21's
+  `/clock` re-zero mechanism is unrelated: this node has no `use_sim_time`
+  parameter and no wait in it is gated on sim time.
+- The launch arguments for this exact `Node(...)` (controllers, timeouts,
+  `--ready-node` absence) are byte-identical across `whole_robot.launch.py`,
+  `manipulation.launch.py`, and `gpsr.launch.py` — the healthy bench bridge
+  and the failing GPSR composite run the identical code path with identical
+  arguments, so whatever differs is external to this file.
+- This was the *only* process in the entire 578-line bridge log that never
+  responded to SIGINT at teardown — every sibling node (safety_supervisor,
+  contract_guard, xarm_facade, base_facade, pan_tilt_facade, etc.) printed a
+  Python traceback (`ExternalShutdownException` / `RCLError`) proving its
+  interpreter resumed and ran signal-handling code; this pid has exactly one
+  log line in the whole file and never appears again, including through the
+  full SIGINT teardown cascade. That pattern — silent, SIGINT-immune,
+  indefinite — is characteristic of a process blocked inside a
+  non-Python-interruptible C call, not a logical/Python-level hang.
+- The only unbounded, opaque segment left after the logged success is the
+  `finally` block: `node.destroy_node()` / `rclpy.shutdown()`
+  (`controller_reconciler.py:326-327` before this fix), which descends into
+  rclpy's C extension (`rcl_node_fini` / `rcl_shutdown` / rmw/Fast DDS
+  participant teardown). The leading hypothesis is that this hangs inside
+  Fast DDS participant-deletion under the GPSR composite's much larger,
+  near-simultaneous DDS discovery churn (~29 bridge nodes + Nav2 + vision +
+  manipulation all standing up participants within a few seconds) — a known
+  class of ROS 2 Humble / Fast DDS issue. **This is not proven**: no live
+  process was inspected (the investigation was read-only, no sim/stack
+  runs). The confirmation step for the next wedge is `py-spy dump --pid
+  <pid>` against the stuck `controller_reconciler` process — if the frame is
+  in `destroy_node`/`shutdown` inside `rmw_fastrtps_cpp`, that confirms it;
+  if it's still inside `reconcile_controller`/`_call`, that falsifies this
+  hypothesis and points to the `time.monotonic()` deadlines somehow not
+  firing instead.
+
+**Fix (mitigation, not a native-layer fix): bound the teardown.**
+`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/controller_reconciler.py`
+now runs `node.destroy_node()` + `rclpy.shutdown()` (in that order, same as
+before) inside a daemon thread and joins it with a timeout —
+`bounded_teardown()`, new helper, wired through `_run()`'s `finally` block
+for both the success (rc=0) and failure (rc=1) paths, since both already
+shared this one teardown call. Default timeout 5.0s, configurable via
+`--teardown-timeout-s` / `TINKER_RECONCILER_TEARDOWN_TIMEOUT_S` env var
+(`_teardown_timeout_default()` reads the env var, falling back to the
+default on unset/blank/invalid values so a bad env var cannot break
+startup). If teardown completes inside the bound, behavior and exit code
+are exactly as before. If it does not:
+- logs one line, `controller_reconciler: teardown did not complete within
+  Ns after {success|failure}; forcing exit (rc={0|1})`,
+- flushes stdout/stderr,
+- calls `os._exit(rc)` (preserving whichever exit code the run already
+  earned) instead of waiting further.
+
+Two more log lines bracket every teardown attempt (`controller_reconciler:
+starting teardown (bound Ns)` before, `controller_reconciler: teardown
+completed` after a normal finish) so the next wedge — if it recurs — is
+visible from the log alone, without needing `py-spy` just to know where the
+process is stuck.
+
+Also added a one-line readiness marker (`{label} succeeded; starting next
+stage`, logged at `info`) in `_process_exit_actions()` in
+`whole_robot.launch.py`, `manipulation.launch.py`, and `gpsr.launch.py`,
+emitted right before a successful `OnProcessExit` hands off to the next
+chained stage (e.g. right before the `xarm7_traj_controller` reconciler is
+launched). No restructuring of the chain — this only adds observability.
+
+**Tests.** `tests/test_controller_reconciler.py` gained unit tests for
+`bounded_teardown()` with a fake teardown callable: prompt completion
+returns normally with no forced exit; a teardown that blocks forever
+(`threading.Event().wait()`, never set) hits the timeout, calls a
+monkeypatched `exit_fn` instead of really exiting (recording the code), and
+emits the expected log line — checked for both the success (rc=0) and
+failure (rc=1) exit-code cases. Also covered `_teardown_timeout_default()`
+(env var present/invalid/unset). Existing tests in the file were unaffected
+except one that asserts the full parsed-args dict, updated to include the
+new `teardown_timeout_s` field.
+
+**Not fixed by this change:** the underlying native hang, if hypothesis 1
+is right, remains unconfirmed and unaddressed — this only stops it from
+wedging the launch chain. The user's explicit choice was to land the bound
+now rather than block on live-repro instrumentation first. `py-spy dump` on
+the next live wedge (see above) remains the confirmation step for the root
+cause.
+
 ## 2026-09-04 — Wrist camera blackout band: the camera was rendered from inside the gripper housing
 
 **Symptom (grasp bench, sensor-rich profile, `TINKER_SIM_WRIST_CAMERA_AIM=tool-forward`).**
