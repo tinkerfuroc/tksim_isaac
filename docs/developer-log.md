@@ -4,6 +4,482 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
+
+**The whole #20 chain, in brief.** The gripper's "creep" (an object tipping
+along the finger arc and eventually escaping the jaw under a sustained
+close) was chased through a long series of levers, each measured and
+falsified in turn: object/pad friction magnitude and type, torsional
+friction radius, contact/collision approximation (SDF vs convex hull),
+follower stiffness/damping, follower effort-limit cap alone (5 through 180,
+bit-identical 15 s hold physics -- proof `write_joint_effort_limit_to_sim_
+index` alone does not guarantee a cap reaches the PhysX solver for these
+mimic-coupled joints), drive-cap alone, mirror-mode (target vs measured),
+and a stall-triggered position freeze (PR #19, `fix-gripper-stall-freeze-20`)
+that arrested the creep in isolated bench legs but could not hold a
+sustained clamp FORCE once the object had already yielded the freeze's lead
+tolerance -- the bench acceptance round (`agy`) lost both a sugar box (force
+relaxed 16 -> 1.8 N in 0.6 s once frozen) and a soup can (crept faster than
+the freeze could arm, 0.08 rad/s). The actual mechanism, confirmed by a
+freeze-all-six-targets-at-contact trace, is that the creep is the PD's
+*continued advance* toward an unreachable close target -- the followers'
+mimic control mirrors drive_joint's target every step, so as long as the
+drive keeps asking to close further, the followers keep pushing the object
+along the arc even after contact, regardless of any friction/material lever.
+That reframes the freeze fix (PR #19) as a symptom patch, now superseded.
+
+**The lever that actually holds: torque authority, not position.** A
+real xArm gripper is position-controlled but torque-LIMITED -- it stalls at
+its own clamp torque instead of continuing to overhaul the servo target
+through the object. The sim's effort limits were nowhere near hardware
+scale (drive 50 N*m, followers 180 N*m -- the follower cap's own comment
+sized it only to keep drive_joint's 0 lower limit enforceable, not for
+grip-force parity). A hardware-scale torque-cap bracket
+(`validation/gripper_close_probe.py --drive-effort-limit`/
+`--follower-effort-limit`, ported straight PhysX tensor-API write +
+readback since the Isaac Lab writer alone was proven insufficient;
+`$TMP/hwcap-result.md`, `$TMP/hwcap2-result.md`) swept drive+follower caps
+together on a 15 s bottle side-pinch hold + lift:
+
+| cap (N*m) | drive advance | tilt @15s | pad force (N) | lift |
+|---|---|---|---|---|
+| 1.5/1.5 | holds (-0.014 rad) | ~1° | 7-10 | retained |
+| 2.0/2.0 | holds (-0.017 rad) | ~1° | 10-14 | retained (borderline tilt) |
+| 2.5/2.5 | holds (flat, target never approached) | ~0.01° | 11-18 | retained (best) |
+| 3.0/3.0 | creeps (+0.10 rad) | 16° | 18-23 | dropped |
+| 50/180 (control) | runs away (+0.57 rad) | 55° | 0 | lost before lift |
+
+2.5 N*m is the highest cap that holds; the threshold sits between 2.5 and
+3.0. Raising the follower cap independently of the drive cap (2.0 drive /
+5.0 follower) gave no force benefit -- follower `physx_tau` stayed well
+under even the 2.5 cap, confirming the drive cap alone sets the stall
+point. A sugar box at 2.0/2.0 held through 15 s with no one-pad dropout
+(the uncapped control lost it at 11.6 s).
+
+**Fix.** `simulation/tinker_sim_isaac/backend.py`:
+- `GRIPPER_EFFORT_CEILING_NM = 2.5` (module constant, env-overridable via
+  `TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`) replaces the old
+  `DEFAULT_GRIPPER_EFFORT_LIMIT = 80.0`. The "gripper" (drive_joint) and
+  "gripper_mimic" (five followers) `ImplicitActuatorCfg` groups both set
+  `effort_limit_sim=2.5` (kept as literal float, not a name reference, so
+  the AST-based config test can read it via `ast.literal_eval` -- matches
+  the module constant by construction/comment). The old "180 keeps
+  drive_joint's limit enforceable" comment on the follower cap is replaced
+  with the bracket's finding: that reasoning solved the wrong problem.
+- **Mapping.** `GripperCommand.max_effort` (N, hardware fingertip
+  convention) is no longer applied 1:1 as N*m on drive_joint. It is mapped
+  proportionally onto the hardware ceiling: `gripper_effort_limit_nm(n,
+  ceiling, full_scale) = ceiling * clamp(n / full_scale, 0, 1)`, with `n`
+  <=0/unset/non-finite resolving to the full ceiling (today's default
+  behaviour, not zero authority). `GRIPPER_EFFORT_FULL_SCALE_N = 10.0`
+  (also env-overridable, `TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N`) -- traced
+  the real commands the manipulation stack sends: `gripper_facade.py`'s
+  `_execute` forwards `request.command.max_effort` unmodified into
+  `JointState.effort` (no substitution, confirmed by reading the code, not
+  assuming from a log line -- see "facade forwarding" below), and
+  `command_gateway.py`'s `_owned_command` projection is a pure passthrough
+  too. `pick_and_place`'s grasp close and pre-open both send
+  `native_gripper_max_effort` = 10 N (no launch override), so 10 N is "full
+  commanded grip" hardware-side; `grasp_benchmark`'s pre-open sends 5 N; the
+  bridge's own reopen sends 50 N (over-range, saturates at the ceiling).
+  Mapped values: 10 N -> 2.5 N*m (ceiling), 5 N -> 1.25 N*m, 50 N -> 2.5
+  N*m (clamped), 0/None -> 2.5 N*m.
+- **Facade forwarding, verified not to need a change.** Re-read
+  `gripper_facade.py` end to end for this task: `_execute` sets
+  `max_effort = requested_effort` (the goal's own `max_effort`, no
+  substitution to 50 anywhere) and publishes it verbatim as
+  `command.effort = [max_effort]`. The "effort=50" seen in some bench logs
+  is a *different* number -- `result.effort`/`feedback.effort` echo
+  `self._effort`, which is populated from `joint_state()`'s
+  `data.applied_torque` (the real, measured PD torque), not the commanded
+  value -- so a stall reported "at 50" was the drive genuinely saturating at
+  whatever ceiling `_set_gripper_effort_limit` last wrote, not proof the
+  facade substituted 50 for the request. No bridge-side fix was needed;
+  this is a verification finding, not a behavior change.
+- **Runtime write reaches the solver.** `_set_gripper_effort_limit` still
+  calls `write_joint_effort_limit_to_sim_index` (Isaac Lab buffer) and
+  mirrors the mapped limit into the owning `ImplicitActuator`'s cached
+  `effort_limit` tensor (issue #128 workaround, unchanged), but now also
+  calls a new `_write_gripper_drive_physx_max_force`, ported from
+  `validation/gripper_close_probe.py`'s `_write_physx_max_forces_direct` /
+  `_author_usd_max_force` (the same direct PhysX tensor-view write +
+  USD DriveAPI `maxForce` author the probe used to prove the Isaac Lab
+  writer alone was insufficient for the follower joints in `cap5-analysis`).
+  It clones the current full `joint_effort_limits` row, patches only
+  drive_joint's column, and pushes the whole row back via
+  `root_view.set_dof_max_forces` using warp arrays for both payload and
+  indices (Task #12 precedent: RigidBodyView tensor-API writes need WARP
+  arrays, not torch, to land), then reads it back
+  (`get_dof_max_forces`) for the log line. Followers stay config-only at
+  2.5 -- no runtime write targets them, matching the bracket recommendation
+  (raising the follower cap independently gave no benefit). Every effective
+  write now logs `{"event": "gripper_effort_limit", "commanded_n": ...,
+  "limit_nm": ..., "physx_max_force": [...]}`.
+- Tests: `tests/test_manipulation_runtime.py` gained
+  `test_gripper_effort_limit_nm_mapping_monotone_and_capped`,
+  `test_gripper_effort_ceiling_and_full_scale_env_overrides`,
+  `test_gripper_joint_effort_limits_are_hardware_scale_in_config` (AST/eval
+  config contract, fails on main: `gripper` has no `effort_limit_sim` at
+  all and `gripper_mimic` resolves to 180.0, not 2.5),
+  `test_set_gripper_effort_limit_maps_commanded_effort_proportionally`,
+  `test_set_gripper_effort_limit_writes_direct_physx_max_force` (asserts
+  the direct PhysX setter is called with the mapped value, via a new
+  `_FakeGripperRootView` double), and
+  `test_gripper_low_effort_pre_open_maps_above_zero`. Full suite: 115
+  passed, 5 subtests passed (was 109 passed, 3 subtests on main).
+
+**Open items.**
+- **Pad force is still below hardware.** The bracket's best-holding cap
+  (2.5 N*m) produces 11-18 N of pad force; the physical gripper's clamp is
+  ~30 N. Pushing the cap higher (3.0 N*m) reliably creeps and drops the
+  object in this contact model before that force is reachable -- the sim
+  tips objects before it can match the hardware's clamp force. This is an
+  open gap in the contact model, not something this fix resolves.
+- **2.5 N*m needs pinning to a live hardware measurement.** The 2.5 N*m
+  ceiling and the bracket data behind it (`$TMP/hwcap-result.md`,
+  `hwcap2-result.md`) are simulation-only; the ceiling should be re-pinned
+  to the user's measured hardware clamp force at commanded `max_effort` =
+  10 N (native full scale) once that measurement is available. Both the
+  ceiling and full-scale constants are env-overridable
+  (`TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`,
+  `TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N`) specifically so that
+  recalibration doesn't need a code change.
+- **Low-effort OPEN commands are unverified live.** A 5 N pre-open
+  (`grasp_benchmark`) maps to 1.25 N*m, and 10 N (the native default used
+  elsewhere) maps to the full 2.5 N*m ceiling -- both comfortably above the
+  bracket's own 1.5 N*m leg, which held a grasped bottle, so opening in
+  free air (much lower resistance than holding an object) should not be
+  torque-starved. This worktree cannot launch the sim to confirm it
+  directly; `test_gripper_low_effort_pre_open_maps_above_zero` is the
+  unit-level floor (mapped limit for both real pre-open values is strictly
+  positive), and the staged acceptance
+  (`$TMP/effortcap_chain.sh`/`$TMP/effortcap_launch.sh`) exercises the
+  mapped ceiling on a live close+hold+lift; a live free-air-open timing
+  check is left to the bench round. No `TINKER_SIM_GRIPPER_OPEN_MIN_NM`
+  floor was added -- with the corrected `GRIPPER_EFFORT_FULL_SCALE_N` =
+  10.0 (not 50.0), the real low-effort commands map to 1.25-2.5 N*m, not
+  the 0.25-0.5 N*m an assumed 50 N full scale would have produced, so the
+  floor this task considered as a fallback is very likely unnecessary; add
+  it only if the bench round finds an open genuinely torque-starved.
+
+**Review fix round (`$TMP/task20-parity-review.md`, REQUEST-CHANGES on
+67cd278).** Two findings, both closed:
+
+1. `_write_gripper_drive_physx_max_force` called `wp.from_torch(...)`,
+   which -- unlike `wp.array(...)` -- does not lazily initialize the Warp
+   runtime (it reads `warp._src.context.runtime.cpu_device` directly and
+   raises `AttributeError` if Warp has not been touched yet in-process,
+   e.g. a gripper command arriving before the fused-actuator physics-step
+   path has run at least once). The bare `except Exception` swallowed that
+   with only a JSON diagnostic, while the caller still latched
+   `_gripper_effort_limit_written = True`, so a later identical-effort
+   command would be dedup-skipped forever without the mapped ceiling ever
+   having reached PhysX. Reproduced exactly as the review predicted: running
+   `test_set_gripper_effort_limit_writes_direct_physx_max_force` ALONE
+   (`-k` that name only) failed `AssertionError: 0 != 1`
+   (`set_dof_max_forces` never called) -- it only passed as part of the full
+   file because an earlier test's Warp use had already initialized the
+   runtime as a side effect. Fixed by building the payload via
+   `wp.array(full_cpu.numpy(), dtype=wp.float32, device="cpu")` (the same
+   self-initializing pattern `set_entity_pose_physics` already uses, #12)
+   plus an explicit `wp.init()` guard, and by moving
+   `_gripper_effort_limit_written = True` to fire only after the direct
+   PhysX write returns successfully -- any exception now logs a
+   `"level": "warning"` JSON line with the error text, leaves the flag
+   False so the next identical command retries, and re-raises under
+   `TINKER_SIM_STRICT_PHYSX_WRITES=1`. The now-isolated-safe test passes
+   alone; two new tests cover the failure-does-not-latch/retry path and the
+   strict re-raise path.
+2. This branch conflicted with the then-open `feat-spawn-pose-assert-30`
+   (PR #18) in `backend.py` (the `GRIPPER_EFFORT_*` constants block sits
+   directly above #30's `_yaw_deg_from_quat_xyzw`/`format_spawn_pose_trace`
+   helpers -- both are pure appends, no real overlap), the test file's
+   import list, and `docs/developer-log.md` (independent same-day entries).
+   Merged `origin/feat-spawn-pose-assert-30`; both features kept intact.
+   Full suite after merge: `tests/test_manipulation_runtime.py` 130 passed,
+   5 subtests passed (117 pre-merge + #30's 13 new).
+
+## 2026-09-06 — Task #30: boot-time spawn-pose guard (a 171 deg, 1.3 m silent spawn miss)
+
+**Symptom.** A GPSR run observed the robot base at `(-0.69, -2.19)` yaw
+`+171 deg` in the sim's own `physics_truth` while the launch command was
+`--spawn-xy=-2,-2` (yaw unset, i.e. commanded 0). Nothing in the sim log
+flagged the ~1.3 m / ~171 deg miss; it only surfaced downstream, in
+navigation.
+
+**Refuted theory: a quaternion-convention bug in `TINKER_SIM_SPAWN_YAW_VIA_VIEW`.**
+The first hypothesis was that PR #9's opt-in `_apply_spawn_yaw_via_view`
+path wrote the root quaternion in the wrong element order. This does not
+hold up: the vendored Isaac Lab 3.0.0 factory
+(`isaaclab_physx/assets/articulation/articulation.py`,
+`isaaclab/assets/articulation/base_articulation.py`) consistently documents
+`(x, y, z, w)` for every `write_root_*_pose_to_sim_*` call, and
+`backend.py`'s `_apply_spawn_yaw_via_view` already writes exactly that
+order -- confirmed live in an earlier probe (commanded yaw=1.5708 read back
+`quaternion_xyzw [0, 0, 0.70711, 0.70711]`, yaw error 0.0000 rad). More
+decisively: **the flag is dead code for this exact failing run.** Its gate,
+identical before and after PR #9,
+is `_spawn_yaw_set = abs(resolve_spawn_yaw(TINKER_SIM_SPAWN_YAW)) > 1e-9`
+(`backend.py:716-718`); with `TINKER_SIM_SPAWN_YAW` unset (as in the failing
+launch), `resolve_spawn_yaw()` returns `0.0`, so `_spawn_yaw_set` is
+`False` and `_apply_spawn_yaw_via_view`/`_reapply_spawn_yaw_after_rebind`
+never run, `via_view` on or off. No yaw-authoring code of any kind (old USD
+`xformOp:orient` path or the new view path) executes when spawn yaw is
+unset. `robot.initial_pose` in the scenario JSON is also never read by this
+repo's sim-side code (`grep -n "initial_pose"` across `scenario.py`,
+`backend.py`, `ros_gateway.py` returns zero hits) -- it is descriptive only.
+The likely actual source (out of scope for a tinker-sim-only fix) is an
+external consumer (nav-sim-fix) re-posing the robot from its own
+scan-to-map fit after reading `/physics_truth`; a ~171 deg heading error
+with no matching geometric feature in this repo's arena/scenario files is
+the classic signature of a front-back symmetric-room AMCL mismatch, not a
+deterministic coordinate-transform bug in this repo.
+
+**Guard, regardless of root cause.** Whoever eventually mis-poses the
+robot, the sim should catch its own spawn being wrong instead of staying
+silent. Added `IsaacWholeRobotBackend._check_spawn_pose`, run exactly once
+per boot and once after any genuine reset rebind (`_refresh_robot_handles`,
+only its `reapply_spawn_yaw=True` callers -- the boot bind and the standard
+scenario STOP -> spawn -> PLAY cycle, not `_maybe_recover_simulation_view`'s
+state-preserving recovery) via a new `_maybe_check_spawn_pose`, called from
+`step()`. "Settled" is the same event the base-hold latch already uses: the
+moment `_apply_base_hold` latches (`TINKER_SIM_FIX_BASE=1`) or, with the
+base free, once `_base_hold_after_sim_s` (2.0s) of sim time has elapsed
+since boot or the rebind -- `_spawn_pose_checked`/
+`_spawn_pose_check_settle_from` are reset in lockstep with
+`_base_hold_settle_from` on every genuine rebind. The check compares
+`truth_state()['robot']['base_pose']` (read via the existing
+`_robot_truth_state`) against the commanded spawn: xy is `self._spawn_x`/
+`self._spawn_y`, the exact validated values `--spawn-xy` already threads
+through `run_sim.py` -> `IsaacWholeRobotBackend.__init__(spawn_xy=...)`
+(newly stored on `self` -- previously only local variables); yaw is
+`self._spawn_yaw` (`resolve_spawn_yaw`, 0 when unset). It always prints one
+`{"event": "spawn_pose_check", "commanded": [x,y,yaw], "actual":
+[x,y,z,yaw], "dxy_m", "dyaw_deg", "ok"}` line (wrap-aware yaw delta via
+`atan2(sin(d), cos(d))`); on a mismatch (`dxy_m > 0.05` or `|dyaw_deg| > 5`,
+wrap-aware) it additionally prints a `spawn_pose_mismatch` line (same
+fields plus `"level": "warning"`), and if `TINKER_SIM_SPAWN_POSE_ASSERT=strict`
+raises `RuntimeError` to abort the boot. Default (unset or any other value)
+is warn-only -- no behaviour change for existing launches.
+
+**Tests** (`tests/test_manipulation_runtime.py::SpawnPoseCheckTest`, backend-double
+pattern): matching pose emits only `spawn_pose_check` with `ok=True`; a pose
+off by 1.3 m / 171 deg (the actual incident numbers) emits both lines with
+`dxy_m≈1.324`, `dyaw_deg≈171.0`, `ok=False`, `level=warning`; a wrap case
+(commanded 3.1 rad, actual -3.1 rad) reports the short way around (~4.77
+deg), not the ~355 deg a naive subtraction would give, and is `ok=True`;
+`TINKER_SIM_SPAWN_POSE_ASSERT=strict` raises. All 4 fail on main first with
+`AttributeError: 'IsaacWholeRobotBackend' object has no attribute
+'_maybe_check_spawn_pose'`. Full suite: `tests/test_manipulation_runtime.py`
+113 passed, 3 subtests passed, 0 failed. No GPU boot for this change.
+
+**Follow-up: live matrix on `gpsr-rcw2026-bench` narrows the trigger to Fabric,
+not this repo's spawn-yaw code, and boot instrumentation was added to watch
+the whole spawn path.** A live A/B on the `rcw2026` arena
+(`gpsr-rcw2026-bench`, `--spawn-xy=-2,-2`, commanded yaw 0) across the
+spawn-yaw/Fabric knobs:
+
+| case | `TINKER_SIM_SPAWN_YAW` | via-view | Fabric | landed pose |
+| --- | --- | --- | --- | --- |
+| 1/2 | unset | — | ON (default) | `(-0.69, -2.19, 171°)` -- the original incident, reproduced |
+| 4 | `1.5708` | ON | ON | exact |
+| 6 | `1e-6` | ON | ON | `(-2.607, -2.032, 1.7°)` STATIC, 61 cm off in x |
+| 7 | `1e-6` | OFF | OFF (forced, USD pre-reset write) | exact `(-2.000, -2.000)` |
+| 8 | unset | — | OFF (`TINKER_SIM_USE_FABRIC=0`) | TUMBLES: `(-1.29, -2.17, 165°)` -> `(-0.55, -2.56, 63°)` |
+
+Case 7 confirms the USD-authoritative path (13e4fdf's original fix) is sound
+whenever it actually runs. Case 8 is the decisive new result: forcing Fabric
+off with **no** `TINKER_SIM_SPAWN_YAW` set at all (so none of this repo's
+yaw-write code runs, USD or view) still produces a bad spawn -- worse, a
+*dynamic tumble* rather than a static offset. That rules out every write path
+in `backend.py` as the proximate cause for the yaw-unset failure mode (case
+1/2, the original incident) and points at default `InitialStateCfg`
+placement / Fabric's own root-body ingestion at spawn time being broken in
+this scenario independent of any TINKER_SIM_SPAWN_YAW code. Case 6 (via-view
+ON, Fabric ON, yaw forced tiny-but-nonzero to exercise the view-write path)
+lands statically wrong (61 cm off, not tumbling) -- a different, still
+unexplained failure mode from case 8's dynamic tumble, so "Fabric on" alone
+isn't a single clean explanation either; case 6 needs its own root-cause
+pass. Full analysis, including the ruled-out quaternion/collider/spawn-yaw
+hypotheses that predate this matrix, is in
+`task30-spawn-path-findings.md` (background) and the live matrix above
+(this session).
+
+**Boot instrumentation: `spawn_pose_trace`.** Given the matrix above shows the
+mislocation can already be present very early (case 8's first captured frame
+is off before the ~150-frame settle burst even starts), `_check_spawn_pose`'s
+single post-settle sample cannot show WHERE in the boot sequence the pose
+goes wrong. Added a `{"event": "spawn_pose_trace", "stage": ..., "t":
+sim_time, "root_pos": [x,y,z], "root_yaw_deg": ..., "base_link_pos": [...] if
+resolvable, "via"/"reason" where applicable}` line at each stage of the boot
+path, default-on and cheap (a handful of lines per boot, `backend.py`):
+
+- `"initial_state"` -- the `ArticulationCfg.InitialStateCfg` pos/rot exactly
+  as configured, before the spawner or the articulation object exist
+  (`backend.py`, right before `self._robot = Articulation(robot_cfg)`).
+- `"after_reset"` -- the truth root pose the instant `self._sim.reset()`
+  returns, from `data.root_pos_w`/`root_quat_w`, before
+  `_refresh_robot_handles` can touch it (right after the `reset()` call).
+- `"after_spawn_yaw_write"` -- after whichever spawn-yaw write actually ran,
+  with `"via": "usd"` or `"via": "view"`: the pre-reset USD `xformOp:orient`
+  branch logs the just-authored values (no live tensor view yet); the
+  post-reset `_apply_spawn_yaw_via_view` logs the tensor-view read-back
+  right after `write_root_pose_to_sim_index`. Neither prints when
+  `TINKER_SIM_SPAWN_YAW` is unset (matching case 8/1-2 above: no write of any
+  kind runs on that path -- the trace makes that absence visible instead of
+  silent).
+- `"after_first_step"` -- once, right after the first successful
+  `self._robot.update(self.dt)` following boot, from both `step()` call
+  sites that can reach it (the normal path and the PHYSICS_READY-rebind
+  early-return branch) -- guarded by `_spawn_pose_trace_first_step_logged`
+  so it never re-fires on a later scenario rebind (that gets its own
+  `after_rebind` stage instead).
+- `"after_settle"` -- inside `_check_spawn_pose` itself, alongside the
+  existing `spawn_pose_check` line, from the exact base pose that check
+  already computed.
+- `"after_rebind:<reason>"` -- inside `_refresh_robot_handles`, in the
+  branch that already detects a genuine view-identity change
+  (`self._robot_view_identity is not None`, i.e. not the initial bind).
+  `<reason>` is `reset_rebind` for the scenario's own STOP -> spawn_entity(s)
+  -> PLAY cycle (`reapply_spawn_yaw=True`) or `view_recovery` for
+  `_maybe_recover_simulation_view`'s state-preserving mid-run recovery
+  (`reapply_spawn_yaw=False`). This backend has no handle on which entity
+  triggered a STOP/PLAY cycle -- that lives cross-process, in
+  `ros2_ws/.../scenario_runner.py`'s `/spawn_entity` calls -- so only the
+  reason classification is logged here; entity identity is covered by
+  `scenario_spawn` below.
+
+`base_link` vs the articulation root: `root_pos_w`/`root_quat_w` (used
+everywhere in this file) report the ARTICULATION ROOT's pose
+(`/World/Tinker`), which for a USD-referenced import need not be the same
+prim as the URDF's own `base_link` link (`source-tinker-full.urdf` names
+`base_link` as its actual root `<link>`). New helpers
+`_base_link_body_index`/`_base_link_pose` look up `"base_link"` in
+`data.body_names` and read `body_pos_w`/`body_quat_w` at that index when
+present; `_log_spawn_pose_trace` includes `base_link_pos`/
+`base_link_yaw_deg` whenever that lookup succeeds, so a divergence between
+the two (or its absence) is visible in the trace instead of assumed away.
+Not independently confirmed live in this session (no GPU boot) whether the
+tinker2 USD's `body_names` actually contains a distinct `"base_link"` entry
+separate from body index 0 -- the code degrades to omitting the field if it
+doesn't, by design (`_log_spawn_pose_trace` never raises on a failed
+lookup).
+
+All of the above is formatted by a new pure/stateless `format_spawn_pose_trace`
+function (`backend.py`, next to `resolve_use_fabric`) so the exact JSON shape
+is unit-testable without a live sim.
+
+**Scenario spawn sequence: `scenario_spawn`.** The `/spawn_entity` and
+`/set_simulation_state` simulation_interfaces services are owned by the
+out-of-repo `isaacsim.ros2.sim_control` extension, not by any code in this
+repo -- `backend.py` never sees a spawn request directly, only its
+after-the-fact effect (a view-identity change in `_refresh_robot_handles`,
+see `after_rebind` above). The one place this repo issues those calls is
+`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/scenario_runner.py`'s
+`ScenarioRunner.execute()`, which walks the `ScenarioOperation` tuple
+`tinker_sim_core.orchestration.standard_operations` compiles. Added one
+`{"event": "scenario_spawn", "name": ..., "pose": {"xyz": ...,
+"quaternion_xyzw": ...}, "t": time.monotonic(), "stop_play_cycle": bool}`
+line per `spawn_entity` operation, right after its service response
+confirms the entity name. `stop_play_cycle` is tracked from the boundary
+names on the `set_simulation_state` operations the same loop already walks:
+`True` from the `"SPAWN_READY"` (STOPPED) boundary until the final
+`"PHYSICS_READY"` (PLAYING) boundary -- `False` throughout for the opt-in
+`--spawn-while-playing` mode, which skips that bracket entirely (see
+`orchestration.standard_operations`'s own docstring on why that mode exists).
+This `t` is wall-clock monotonic in the ROS-side runner process, a different
+clock domain from `backend.py`'s sim-time `t` above (the two processes don't
+share a clock) -- correlating a `scenario_spawn` line with a
+`spawn_pose_trace`/`after_rebind` line needs matching by proximity/ordering
+in the combined log, not by comparing `t` values directly.
+
+**Tests.** `tests/test_manipulation_runtime.py::SpawnPoseTraceFormatTest`
+(new): `format_spawn_pose_trace`'s exact JSON shape (fields present/absent
+per optional argument); `_log_spawn_pose_trace` from a backend double (no
+live sim) with a `base_link` body at a pose DIFFERENT from the root,
+confirming both are logged and differ; and the omit-when-unresolvable case
+(the stock backend double's `body_names` has no `"base_link"` entry).
+`SpawnPoseCheckTest`'s existing assertions were updated to filter for
+`spawn_pose_check`/`spawn_pose_mismatch` events specifically (the new
+`after_settle` trace line now also prints during `_maybe_check_spawn_pose`,
+in the same captured-stdout window those tests inspect) -- their pass/fail
+logic is otherwise unchanged. Full suite:
+`tests/test_manipulation_runtime.py` 117 passed, 3 subtests passed, 0
+failed (up from 113 passed pre-change: 4 new `SpawnPoseTraceFormatTest`
+cases). No GPU boot for this change; case 6's static 61 cm offset and case
+8's dynamic tumble both remain open root-cause items the new trace is meant
+to help localize on the next live run.
+
+**Root cause found: `InitialStateCfg.rot` is scalar-last, backend built it
+scalar-first -- the robot spawned upside down.** The `spawn_pose_trace`
+instrumentation above, followed live, found the actual bug the case
+1/2/6/8 matrix above was chasing without a mechanism. The vendored Isaac Lab
+3.0.0 `AssetBaseCfg.InitialStateCfg` (`.deps/IsaacLab/source/isaaclab/
+isaaclab/assets/asset_base_cfg.py:37-40`) documents its `rot` field as
+scalar-last `(x, y, z, w)`, defaulting to `(0.0, 0.0, 0.0, 1.0)`. `backend.py`
+built that keyword by hand as `(cos(yaw/2), 0, 0, sin(yaw/2))` -- scalar
+FIRST. For the common case, an unset/zero spawn yaw, that expression
+evaluates to `(1.0, 0.0, 0.0, 0.0)`, which under the real scalar-last
+contract is not identity at all: it is a 180 degree rotation about world X.
+`Articulation.reset()` *does* apply `init_state` (the old comment above the
+construction, claiming "the spawner drops this rot" for a USD-referenced
+articulation, was itself wrong/outdated for the vendored 3.0.0 spawner --
+what it was actually observing was this order bug, not a dropped write) --
+so every default-heading boot has been initializing the robot inverted.
+Live trace numbers from the run that caught it: `after_reset` root `z=0.30`
+sitting ABOVE `base_link z=0.25` (impossible right-side-up, trivial upside
+down: the root offset that is normally below `base_link` flips to above it),
+followed by a first-step ejection to `(-0.69, -2.19, 171°)` -- exactly case
+1/2's original incident numbers. Two things masked this for non-zero yaw:
+(a) `TINKER_SIM_SPAWN_YAW=1.5708` supplies `(cos(45°), 0, 0, sin(45°)) =
+(0.707, 0, 0, 0.707)`, which the scalar-last contract reads as a 90 degree
+ROLL about X, not the intended 90 degree yaw about Z -- rescued only because
+the pre-reset USD `xformOp:orient` write (Fabric-off path, correctly
+real-first for `Gf.Quatd`) or `_apply_spawn_yaw_via_view` (already
+correctly scalar-last, post-reset tensor write) overwrite the orientation
+before it matters (matrix cases 4 and 7); (b) case 8 (yaw unset, Fabric
+forced off, neither write path engaged because the `abs(spawn_yaw) > 1e-9`
+guard is false) tumbles instead of landing cleanly -- consistent with an
+upside-down spawn correcting itself dynamically rather than being rescued by
+either write path.
+
+**Fix.** Added a pure `spawn_root_rot_xyzw(yaw) -> (0.0, 0.0, sin(yaw/2),
+cos(yaw/2))` (`backend.py`, next to `resolve_spawn_yaw`) as the single
+source of a correctly-ordered heading-about-Z quaternion, and routed the
+`InitialStateCfg.rot` construction, the `"initial_state"`/
+`"after_spawn_yaw_write"` trace payloads, and `_apply_spawn_yaw_via_view`'s
+tensor-write quaternion through it (all previously duplicated the
+by-hand `sin`/`cos` construction; now there is exactly one place the order
+can go wrong). Left untouched, per the vendored contracts each site
+actually uses: `_apply_spawn_yaw_via_view` (already scalar-last -- its own
+docstring already warned not to copy the `Gf.Quatd` construction into it,
+which turned out to be exactly backwards advice for the other direction:
+the copying had happened into `InitialStateCfg.rot` instead) and the
+pre-reset USD `xformOp:orient` authoring's `Gf.Quatd(cos, 0, 0, sin)` (`Gf`
+quaternions are scalar-first by construction -- this one was already
+correct and must stay real-first, not be "fixed" to scalar-last). Corrected
+the stale "the spawner drops this rot" comment in the same edit.
+
+**Tests** (`tests/test_manipulation_runtime.py`): `SpawnRootRotXyzwTest` --
+`spawn_root_rot_xyzw(0.0) == (0.0, 0.0, 0.0, 1.0)` (the vendored identity
+default) and `spawn_root_rot_xyzw(pi/2) ≈ (0, 0, 0.7071, 0.7071)`, plus an
+explicit regression guard that a zero yaw must NOT reproduce the old
+scalar-first bug's `(1, 0, 0, 0)`. `BackendInitStateRotConstructionTest` --
+extracts the literal `rot=` keyword source off the
+`*.InitialStateCfg(...)` call in `backend.py` via `ast` (no Isaac import
+needed) and `eval`s it for an unset and a `1.5708` `TINKER_SIM_SPAWN_YAW`,
+asserting it equals `spawn_root_rot_xyzw(spawn_yaw)` exactly -- this
+exercises the backend's actual construction, not a hand-reimplementation of
+it in the test. Confirmed both new construction-test cases FAIL against the
+pre-fix (scalar-first) construction:
+`AssertionError: Tuples differ: (1.0, 0.0, 0.0, 0.0) != (0.0, 0.0, 0.0, 1.0)`
+(unset yaw) and the equivalent element-0/2/3 mismatch for yaw `1.5708`. Full
+suite after the fix: `tests/test_manipulation_runtime.py` 122 passed, 3
+subtests passed, 0 failed (up from 117: 5 new cases). No GPU boot for this
+change; PR #18's boot-time `spawn_pose_check` assertion and the
+`spawn_pose_trace` instrumentation above remain in place as the live guard
+that would have caught this immediately had they existed before it did.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported

@@ -29,17 +29,44 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
 )
 from tinker_sim_isaac.backend import (
+    GRIPPER_EFFORT_CEILING_NM,
+    GRIPPER_EFFORT_FULL_SCALE_N,
     IsaacWholeRobotBackend,
+    format_spawn_pose_trace,
+    gripper_effort_limit_nm,
     resolve_backend_clock_epoch,
     resolve_clock_epoch,
+    resolve_gripper_effort_ceiling_nm,
+    resolve_gripper_effort_full_scale_n,
     resolve_spawn_yaw,
     resolve_spawn_yaw_via_view,
     resolve_use_fabric,
+    spawn_root_rot_xyzw,
 )
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
 from manipulation_qualification import QualificationManifest, QualificationRunner
 from run_sim import _content_addressed_tinker_usd, _expected_scenario_objects
+
+
+class _FakeGripperRootView:
+    """Minimal double for the PhysX ArticulationView's max-force tensor API
+    (root_view.set_dof_max_forces / get_dof_max_forces), #20's direct-write
+    path. Holds one (1, num_joints) row, mirroring the real tensor-API shape.
+    """
+
+    def __init__(self, num_joints: int, initial: list[float]) -> None:
+        self._row = list(initial)
+        assert len(self._row) == num_joints
+        self.set_dof_max_forces_calls: list[dict[str, object]] = []
+
+    def set_dof_max_forces(self, forces: object, indices: object = None) -> None:
+        arr = forces.numpy() if hasattr(forces, "numpy") else forces
+        self._row = [float(value) for value in arr[0]]
+        self.set_dof_max_forces_calls.append({"forces": arr, "indices": indices})
+
+    def get_dof_max_forces(self) -> list[list[float]]:
+        return [list(self._row)]
 
 
 class _FakeRobot:
@@ -48,7 +75,7 @@ class _FakeRobot:
 
     def __init__(self) -> None:
         self.is_initialized = True
-        self.root_view = object()
+        self.root_view = _FakeGripperRootView(2, [12.0, 30.0])
         self.data = SimpleNamespace(
             joint_names=("drive_joint", "joint1"),
             joint_pos=torch.tensor([[0.25, -0.4]], dtype=torch.float32),
@@ -174,6 +201,11 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._pending_snapshot_index = 0
     backend._pending_snapshot_commands = []
     backend._default_gripper_effort_limit = 12.0
+    # Equal to the ceiling above so gripper_effort_limit_nm degenerates to the
+    # pre-#20 min(requested, ceiling) behaviour these existing fixtures were
+    # written against; #20-specific tests override this to exercise the real
+    # proportional map (ceiling != full scale).
+    backend._gripper_effort_full_scale_n = 12.0
     backend._gripper_effort_limit = 12.0
     backend._expected_objects = {}
     backend._contact_pairs_by_key = {}
@@ -197,6 +229,12 @@ def _backend() -> IsaacWholeRobotBackend:
     backend.chassis_ballast_mass_kg = 0.0
     backend._object_views = {}
     backend._refresh_object_views = lambda: None
+    backend._spawn_x = 0.0
+    backend._spawn_y = 0.0
+    backend._spawn_yaw = 0.0
+    backend._spawn_pose_checked = False
+    backend._spawn_pose_check_settle_from = 0.0
+    backend._base_hold_after_sim_s = 2.0
     return backend
 
 
@@ -255,6 +293,30 @@ def _spawn_usd_file_cfg_source(backend_source: str) -> str:
             ):
                 continue
             return ast.get_source_segment(backend_source, value) or ""
+    return ""
+
+
+def _init_state_rot_source(backend_source: str) -> str:
+    """Return the source text of the ``rot=`` keyword the backend passes to
+    ``ArticulationCfg.InitialStateCfg(...)``.
+
+    Task #30: the vendored Isaac Lab ``InitialStateCfg.rot`` contract is
+    scalar-last (x, y, z, w). This extracts exactly the expression the
+    backend builds for that keyword (without importing Isaac) so a test can
+    eval it and assert it matches ``spawn_root_rot_xyzw`` byte for byte,
+    instead of duplicating the construction by hand and risking the same
+    order mistake in the test itself.
+    """
+    tree = ast.parse(backend_source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "InitialStateCfg"):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "rot":
+                return ast.get_source_segment(backend_source, keyword.value) or ""
     return ""
 
 
@@ -765,6 +827,317 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # A zero request that restores the default is also a no-op when repeated.
         backend._set_gripper_effort_limit(0.0)
         self.assertEqual(len(backend._robot.limit_calls), writes + 1)
+
+    def test_gripper_effort_limit_nm_mapping_monotone_and_capped(self) -> None:
+        """#20: GripperCommand.max_effort (N) -> drive_joint ceiling (N*m).
+
+        Real commanded values from the manipulation stack: grasp close and
+        pre-open both send native_gripper_max_effort = 10 N (full scale, maps
+        to the whole ceiling); grasp_benchmark's pre-open sends 5 N (half
+        scale); the bridge's own reopen sends 50 N (over-range, saturates at
+        the ceiling rather than over-shooting it). 0/None/negative all mean
+        "no explicit request", which resolves to the ceiling, matching the
+        pre-#20 default behaviour (not zero authority).
+        """
+        ceiling, full_scale = 2.5, 10.0
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(10.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(5.0, ceiling, full_scale), 1.25
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(50.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(0.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(None, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(-5.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(float("nan"), ceiling, full_scale), 2.5
+        )
+        # Monotone over the reachable [0, full_scale] range.
+        samples = [0.0, 1.0, 2.5, 5.0, 7.5, 10.0]
+        mapped = [gripper_effort_limit_nm(value, ceiling, full_scale) for value in samples[1:]]
+        self.assertEqual(mapped, sorted(mapped))
+
+    def test_gripper_effort_ceiling_and_full_scale_env_overrides(self) -> None:
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm(None), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm(""), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(resolve_gripper_effort_ceiling_nm("3.0"), 3.0)
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm("not-a-number"), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm("-1.0"), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(
+            resolve_gripper_effort_full_scale_n(None), GRIPPER_EFFORT_FULL_SCALE_N
+        )
+        self.assertEqual(resolve_gripper_effort_full_scale_n("25"), 25.0)
+        self.assertEqual(
+            resolve_gripper_effort_full_scale_n("0"), GRIPPER_EFFORT_FULL_SCALE_N
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "TINKER_SIM_GRIPPER_EFFORT_CEILING_NM": "1.75",
+                "TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N": "20",
+            },
+        ):
+            backend = IsaacWholeRobotBackend.__new__(IsaacWholeRobotBackend)
+            backend._default_gripper_effort_limit = resolve_gripper_effort_ceiling_nm(
+                os.environ.get("TINKER_SIM_GRIPPER_EFFORT_CEILING_NM")
+            )
+            backend._gripper_effort_full_scale_n = resolve_gripper_effort_full_scale_n(
+                os.environ.get("TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N")
+            )
+        self.assertEqual(backend._default_gripper_effort_limit, 1.75)
+        self.assertEqual(backend._gripper_effort_full_scale_n, 20.0)
+
+    def test_gripper_joint_effort_limits_are_hardware_scale_in_config(self) -> None:
+        """RED config contract (#20): the 'gripper' (drive_joint) and
+        'gripper_mimic' (five followers) ImplicitActuatorCfg groups must both
+        set effort_limit_sim to the 2.5 N*m hardware-parity ceiling. Prior to
+        this fix, 'gripper' set no effort_limit_sim at all (runtime-only via
+        _set_gripper_effort_limit, default 80) and 'gripper_mimic' set 180 --
+        both far above the bracket threshold ($TMP/hwcap-result.md,
+        hwcap2-result.md) where the PD stalls at the clamp instead of tipping
+        the grasped object along the finger arc.
+
+        This must FAIL on main (2c1b51d): 'gripper' has no effort_limit_sim
+        keyword at all (AssertionError: gripper ImplicitActuatorCfg has no
+        effort_limit_sim -- runtime-only default 80, not hardware-scale) and
+        'gripper_mimic' resolves to 180.0, not 2.5.
+        """
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(backend_source)
+
+        actuators: ast.Dict | None = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "actuators" and isinstance(keyword.value, ast.Dict):
+                    actuators = keyword.value
+        self.assertIsNotNone(
+            actuators, "backend ArticulationCfg.actuators must be a dict literal"
+        )
+        assert actuators is not None
+
+        groups: dict[str, ast.Call] = {}
+        for key, value in zip(actuators.keys, actuators.values):
+            if isinstance(key, ast.Constant):
+                groups[str(key.value)] = value
+
+        for group_name in ("gripper", "gripper_mimic"):
+            self.assertIn(
+                group_name, groups, f"backend must define a '{group_name}' actuator group"
+            )
+            call = groups[group_name]
+            self.assertIsInstance(call, ast.Call)
+            effort_limit_sim = None
+            effort_limit = None
+            for kw in call.keywords:
+                if kw.arg == "effort_limit_sim":
+                    effort_limit_sim = kw.value
+                if kw.arg == "effort_limit":
+                    effort_limit = kw.value
+            self.assertIsNotNone(
+                effort_limit_sim,
+                f"'{group_name}' ImplicitActuatorCfg has no effort_limit_sim -- "
+                "must be 2.5 Nm hardware-parity ceiling",
+            )
+            value = ast.literal_eval(effort_limit_sim)
+            self.assertEqual(
+                float(value),
+                2.5,
+                f"'{group_name}' effort_limit_sim must equal the 2.5 Nm hardware "
+                f"torque ceiling (#20 bracket), got {value}",
+            )
+            if effort_limit is not None:
+                # If effort_limit is also set (not currently the case), it must
+                # agree with effort_limit_sim rather than silently diverge.
+                self.assertEqual(float(ast.literal_eval(effort_limit)), 2.5)
+
+    def test_set_gripper_effort_limit_maps_commanded_effort_proportionally(self) -> None:
+        """The runtime path (production ceiling/full-scale, not the 1:1 test
+        fixture default) must apply gripper_effort_limit_nm, not pass the
+        commanded N through as N*m."""
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+
+        backend._set_gripper_effort_limit(10.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 2.5)
+
+        backend._set_gripper_effort_limit(5.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 1.25)
+
+        backend._set_gripper_effort_limit(50.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 2.5)
+
+        backend._set_gripper_effort_limit(0.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 2.5)
+
+    def test_set_gripper_effort_limit_writes_direct_physx_max_force(self) -> None:
+        """#20: write_joint_effort_limit_to_sim_index alone was proven (probe
+        cap5-analysis) not to guarantee the cap reaches the PhysX solver for
+        these mimic-coupled joints. _set_gripper_effort_limit must also push
+        the mapped limit straight onto the PhysX tensor view
+        (root_view.set_dof_max_forces) so the runtime ceiling actually binds,
+        and the readback (root_view.get_dof_max_forces) must reflect it.
+        """
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+        root_view = backend._robot.root_view
+
+        # #20 review: must pass in isolation, not only because an earlier
+        # test in the same process happened to initialize Warp first. In a
+        # real boot Warp is initialized well before any gripper command is
+        # processed (the fused-actuator path touches it every physics
+        # step); pre-warm it here so this test does not depend on suite
+        # ordering, and so Warp's one-time init banner (printed straight to
+        # stdout, not through this module's JSON-line protocol) cannot leak
+        # into the captured output parsed below.
+        import warp as _wp
+
+        _wp.init()
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._set_gripper_effort_limit(5.0)
+
+        self.assertEqual(len(root_view.set_dof_max_forces_calls), 1)
+        drive_index = backend._joint_index["drive_joint"]
+        written = root_view.set_dof_max_forces_calls[0]["forces"]
+        self.assertAlmostEqual(float(written[0][drive_index]), 1.25)
+        self.assertAlmostEqual(
+            float(root_view.get_dof_max_forces()[0][drive_index]), 1.25
+        )
+
+        events = [
+            json.loads(line)
+            for line in captured.getvalue().splitlines()
+            if line.strip()
+        ]
+        effort_events = [event for event in events if event.get("event") == "gripper_effort_limit"]
+        self.assertEqual(len(effort_events), 1)
+        self.assertAlmostEqual(effort_events[0]["commanded_n"], 5.0)
+        self.assertAlmostEqual(effort_events[0]["limit_nm"], 1.25)
+        self.assertAlmostEqual(effort_events[0]["physx_max_force"][0], 1.25)
+        self.assertTrue(effort_events[0]["physx_write_ok"])
+        self.assertTrue(backend._gripper_effort_limit_written)
+
+    def test_set_gripper_effort_limit_physx_write_failure_does_not_latch_written(
+        self,
+    ) -> None:
+        """#20 review finding 1: if the direct PhysX write
+        (root_view.set_dof_max_forces) raises -- e.g. Warp's runtime not yet
+        initialized in-process -- the failure must be logged (not silently
+        swallowed) and _gripper_effort_limit_written must stay False so a
+        later identical-effort command is NOT dedup-skipped (L2178-2185) but
+        retries the write instead."""
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+        root_view = backend._robot.root_view
+
+        def _raise(forces: object, indices: object = None) -> None:
+            raise RuntimeError("boom: physx view not ready")
+
+        root_view.set_dof_max_forces = _raise
+
+        # Pre-warm Warp so its one-time init banner (real stdout text, not a
+        # JSON line) cannot land inside the captured window below -- see the
+        # matching note on test_set_gripper_effort_limit_writes_direct_physx_max_force.
+        import warp as _wp
+
+        _wp.init()
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._set_gripper_effort_limit(5.0)
+
+        self.assertFalse(getattr(backend, "_gripper_effort_limit_written", False))
+
+        events = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        error_events = [
+            event
+            for event in events
+            if event.get("event") == "gripper_physx_max_force_write_error"
+        ]
+        self.assertEqual(len(error_events), 1)
+        self.assertEqual(error_events[0]["level"], "warning")
+        self.assertIn("boom", error_events[0]["error"])
+
+        effort_events = [
+            event for event in events if event.get("event") == "gripper_effort_limit"
+        ]
+        self.assertEqual(len(effort_events), 1)
+        self.assertFalse(effort_events[0]["physx_write_ok"])
+
+        # Retry: restore a working setter and re-issue the SAME commanded
+        # effort. The dedup guard must not skip it (the write was never
+        # marked as landed), so the direct PhysX write actually fires now.
+        root_view.set_dof_max_forces = _FakeGripperRootView.set_dof_max_forces.__get__(
+            root_view
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            backend._set_gripper_effort_limit(5.0)
+        self.assertEqual(len(root_view.set_dof_max_forces_calls), 1)
+        self.assertTrue(backend._gripper_effort_limit_written)
+
+    def test_set_gripper_effort_limit_strict_physx_writes_reraises(self) -> None:
+        """TINKER_SIM_STRICT_PHYSX_WRITES=1 must surface the PhysX write
+        failure to the caller instead of swallowing it."""
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+        root_view = backend._robot.root_view
+
+        def _raise(forces: object, indices: object = None) -> None:
+            raise RuntimeError("boom: strict mode")
+
+        root_view.set_dof_max_forces = _raise
+
+        with patch.dict(os.environ, {"TINKER_SIM_STRICT_PHYSX_WRITES": "1"}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    backend._set_gripper_effort_limit(5.0)
+        self.assertFalse(getattr(backend, "_gripper_effort_limit_written", False))
+
+    def test_gripper_low_effort_pre_open_maps_above_zero(self) -> None:
+        """#20 coordinator correction: pre-open commands (5 N from
+        grasp_benchmark, 10 N native default elsewhere) must map to a
+        strictly positive joint ceiling -- enough authority to open the
+        gripper in free air, unlike a hypothetical zero-effort mapping. Live
+        free-air-open timing is validated by the bench round (staged
+        acceptance: $TMP/effortcap_chain.sh); this is the unit-level floor
+        the coordinator asked for as a fallback since this worktree cannot
+        launch the sim.
+        """
+        ceiling, full_scale = GRIPPER_EFFORT_CEILING_NM, GRIPPER_EFFORT_FULL_SCALE_N
+        for pre_open_n in (5.0, 10.0):
+            with self.subTest(pre_open_n=pre_open_n):
+                mapped = gripper_effort_limit_nm(pre_open_n, ceiling, full_scale)
+                self.assertGreater(mapped, 0.0)
 
     def test_position_only_command_clears_affected_velocity_target(self) -> None:
         backend = _backend()
@@ -2683,6 +3056,80 @@ class UseFabricDerivationTest(unittest.TestCase):
         self.assertFalse(spawn_yaw_set and not via_view_on)  # USD path skipped
 
 
+class SpawnRootRotXyzwTest(unittest.TestCase):
+    """#30 root cause: ``ArticulationCfg.InitialStateCfg.rot`` is scalar-last
+    (x, y, z, w) in the vendored Isaac Lab 3.0.0 (``asset_base_cfg.py``
+    defaults it to ``(0.0, 0.0, 0.0, 1.0)``), not the scalar-first
+    (w, x, y, z) order the backend used to build by hand. A zero/unset spawn
+    yaw therefore used to hand Isaac Lab ``(1, 0, 0, 0)`` -- a 180 degree
+    roll about X -- and the robot spawned upside down."""
+
+    def test_zero_yaw_matches_vendored_default_identity(self) -> None:
+        self.assertEqual(spawn_root_rot_xyzw(0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def test_quarter_turn_yaw_is_scalar_last(self) -> None:
+        qx, qy, qz, qw = spawn_root_rot_xyzw(math.pi / 2.0)
+        self.assertAlmostEqual(qx, 0.0, places=6)
+        self.assertAlmostEqual(qy, 0.0, places=6)
+        self.assertAlmostEqual(qz, 0.7071067811865476, places=6)
+        self.assertAlmostEqual(qw, 0.7071067811865476, places=6)
+
+    def test_never_matches_the_old_scalar_first_bug_at_zero_yaw(self) -> None:
+        """Regression guard: the pre-#30 construction ``(cos(0), 0, 0, sin(0))``
+        produced ``(1, 0, 0, 0)`` for a zero yaw -- a 180 degree rotation
+        about X under the scalar-last contract. The fixed helper must not
+        reproduce that."""
+        self.assertNotEqual(spawn_root_rot_xyzw(0.0), (1.0, 0.0, 0.0, 0.0))
+
+
+class BackendInitStateRotConstructionTest(unittest.TestCase):
+    """Construction test (#30): the exact ``rot=`` expression the backend
+    passes to ``ArticulationCfg.InitialStateCfg`` -- extracted from source so
+    this cannot pass by the test independently re-deriving the same order
+    bug -- must equal ``spawn_root_rot_xyzw(spawn_yaw)`` for both an unset
+    and a non-zero ``TINKER_SIM_SPAWN_YAW``.
+
+    On b6af3ce (pre-fix) the backend built this keyword as
+    ``(math.cos(yaw/2), 0.0, 0.0, math.sin(yaw/2))`` -- scalar-first -- so
+    for yaw unset (0.0) this evaluates to ``(1.0, 0.0, 0.0, 0.0)``, which
+    fails the ``(0.0, 0.0, 0.0, 1.0)`` expectation below.
+    """
+
+    def _eval_rot(self, spawn_yaw_env: str | None) -> tuple:
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        rot_source = _init_state_rot_source(backend_source)
+        self.assertTrue(
+            rot_source,
+            "no rot= keyword found on an *.InitialStateCfg(...) call in backend.py",
+        )
+        fake_os = SimpleNamespace(environ=SimpleNamespace(get=lambda *a, **k: spawn_yaw_env))
+        namespace = {
+            "math": math,
+            "spawn_root_rot_xyzw": spawn_root_rot_xyzw,
+            "resolve_spawn_yaw": resolve_spawn_yaw,
+            "_os": fake_os,
+        }
+        return eval(compile(rot_source, "<rot-source>", "eval"), namespace)
+
+    def test_unset_spawn_yaw_matches_helper(self) -> None:
+        rot = self._eval_rot(None)
+        expected = spawn_root_rot_xyzw(resolve_spawn_yaw(None))
+        self.assertEqual(tuple(rot), expected)
+        self.assertEqual(tuple(rot), (0.0, 0.0, 0.0, 1.0))
+
+    def test_nonzero_spawn_yaw_matches_helper(self) -> None:
+        rot = self._eval_rot("1.5708")
+        expected = spawn_root_rot_xyzw(resolve_spawn_yaw("1.5708"))
+        self.assertEqual(tuple(rot), expected)
+        qx, qy, qz, qw = rot
+        self.assertAlmostEqual(qx, 0.0, places=4)
+        self.assertAlmostEqual(qy, 0.0, places=4)
+        self.assertAlmostEqual(qz, 0.7071, places=4)
+        self.assertAlmostEqual(qw, 0.7071, places=4)
+
+
 class SpawnYawViaViewApplyTest(unittest.TestCase):
     """``IsaacWholeRobotBackend._apply_spawn_yaw_via_view`` (#24): writes the
     commanded yaw through the root-view writer post-reset, position
@@ -3069,6 +3516,243 @@ class SpawnYawViaViewRecoveryRebindTest(unittest.TestCase):
         self.assertEqual(backend._contact_pairs_by_key, {})
         self.assertEqual(backend._clock_step_origin, 42)
         self.assertEqual(backend._robot.root_pose_calls, [])
+
+
+def _set_root_pose(backend: IsaacWholeRobotBackend, xyz, yaw: float) -> None:
+    half = yaw / 2.0
+    backend._robot.data.root_pos_w = torch.tensor([list(xyz)], dtype=torch.float32)
+    backend._robot.data.root_quat_w = torch.tensor(
+        [[0.0, 0.0, math.sin(half), math.cos(half)]], dtype=torch.float32
+    )
+
+
+def _free_base_settled(backend: IsaacWholeRobotBackend) -> None:
+    """Arm the free-base (TINKER_SIM_FIX_BASE off) settle gate so the very
+    next ``_maybe_check_spawn_pose`` call fires: 2.0s of sim time elapsed
+    since boot/the last rebind, matching ``_base_hold_after_sim_s``."""
+    backend.base_fixed = False
+    backend._base_hold_after_sim_s = 2.0
+    backend._spawn_pose_check_settle_from = 0.0
+    backend._clock_step_origin = 0
+    backend._clock_elapsed_steps = 0
+    backend._sim = SimpleNamespace(get_physics_step_count=lambda: 240)
+    backend._spawn_pose_checked = False
+
+
+class SpawnPoseCheckTest(unittest.TestCase):
+    """Task #30: a GPSR run observed the robot base at (-0.69, -2.19) yaw
+    +171 deg in the sim's own physics_truth while the launch commanded
+    --spawn-xy=-2,-2 (yaw unset = 0) -- nothing in the sim log flagged it.
+    ``_check_spawn_pose`` compares the truth base pose against the
+    commanded spawn once the base settles and makes a mismatch loud."""
+
+    def test_matching_pose_is_ok_with_no_mismatch_line(self) -> None:
+        backend = _backend()
+        backend._spawn_x = 1.0
+        backend._spawn_y = 2.0
+        backend._spawn_yaw = 0.5
+        _set_root_pose(backend, (1.0, 2.0, 0.0775), 0.5)
+        _free_base_settled(backend)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._maybe_check_spawn_pose()
+
+        self.assertTrue(backend._spawn_pose_checked)
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        # Task #30 also emits a "spawn_pose_trace" (stage "after_settle")
+        # line alongside the check -- filter to the check/mismatch events
+        # this test cares about; the trace line's own shape is covered by
+        # SpawnPoseTraceFormatTest.
+        check_lines = [
+            entry
+            for entry in lines
+            if entry["event"] in ("spawn_pose_check", "spawn_pose_mismatch")
+        ]
+        events = [entry["event"] for entry in check_lines]
+        self.assertEqual(events, ["spawn_pose_check"])
+        self.assertIn("spawn_pose_trace", [entry["event"] for entry in lines])
+        check = check_lines[0]
+        self.assertTrue(check["ok"])
+        self.assertAlmostEqual(check["dxy_m"], 0.0, places=5)
+        # float32 root_quat_w round-trip: exact 0 isn't guaranteed.
+        self.assertAlmostEqual(check["dyaw_deg"], 0.0, places=3)
+
+    def test_pose_off_by_1_3m_171deg_emits_mismatch(self) -> None:
+        backend = _backend()
+        backend._spawn_x = -2.0
+        backend._spawn_y = -2.0
+        backend._spawn_yaw = 0.0
+        _set_root_pose(backend, (-0.69, -2.19, 0.0775), math.radians(171))
+        _free_base_settled(backend)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._maybe_check_spawn_pose()
+
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        check_lines = [
+            entry
+            for entry in lines
+            if entry["event"] in ("spawn_pose_check", "spawn_pose_mismatch")
+        ]
+        events = [entry["event"] for entry in check_lines]
+        self.assertEqual(events, ["spawn_pose_check", "spawn_pose_mismatch"])
+        check, mismatch = check_lines
+        self.assertFalse(check["ok"])
+        self.assertAlmostEqual(check["dxy_m"], 1.3237, places=3)
+        self.assertAlmostEqual(check["dyaw_deg"], 171.0, places=3)
+        self.assertEqual(mismatch["commanded"], [-2.0, -2.0, 0.0])
+        self.assertAlmostEqual(mismatch["dxy_m"], 1.3237, places=3)
+        self.assertAlmostEqual(mismatch["dyaw_deg"], 171.0, places=3)
+        self.assertFalse(mismatch["ok"])
+        self.assertEqual(mismatch.get("level"), "warning")
+
+    def test_yaw_wrap_reports_small_delta(self) -> None:
+        """Commanded 3.1 rad, actual -3.1 rad -- these are ~4.8 deg apart
+        going the short way around the circle, not the ~355 deg a naive
+        (unwrapped) subtraction would report."""
+        backend = _backend()
+        backend._spawn_x = 0.0
+        backend._spawn_y = 0.0
+        backend._spawn_yaw = 3.1
+        _set_root_pose(backend, (0.0, 0.0, 0.0775), -3.1)
+        _free_base_settled(backend)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._maybe_check_spawn_pose()
+
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        check_lines = [
+            entry
+            for entry in lines
+            if entry["event"] in ("spawn_pose_check", "spawn_pose_mismatch")
+        ]
+        self.assertEqual([entry["event"] for entry in check_lines], ["spawn_pose_check"])
+        check = check_lines[0]
+        self.assertTrue(check["ok"])
+        self.assertAlmostEqual(abs(check["dyaw_deg"]), 4.7662, places=3)
+
+    def test_strict_mode_raises_on_mismatch(self) -> None:
+        backend = _backend()
+        backend._spawn_x = -2.0
+        backend._spawn_y = -2.0
+        backend._spawn_yaw = 0.0
+        _set_root_pose(backend, (-0.69, -2.19, 0.0775), math.radians(171))
+        _free_base_settled(backend)
+
+        with patch.dict(os.environ, {"TINKER_SIM_SPAWN_POSE_ASSERT": "strict"}):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                with self.assertRaises(RuntimeError):
+                    backend._maybe_check_spawn_pose()
+
+
+class SpawnPoseTraceFormatTest(unittest.TestCase):
+    """Task #30: ``spawn_pose_trace`` boot lines instrumenting the
+    initial-state -> reset -> yaw-write -> rebind -> settle sequence the
+    #30 investigation found under-observed. ``format_spawn_pose_trace`` is
+    the pure formatter (no sim needed); ``_log_spawn_pose_trace`` wires it
+    to a backend double's live root pose and an optional distinct
+    ``base_link`` body -- also no sim needed."""
+
+    def test_format_spawn_pose_trace_shape(self) -> None:
+        payload = format_spawn_pose_trace(
+            "after_reset",
+            1.5,
+            [-2.0, -2.0, 0.0775],
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        self.assertEqual(payload["event"], "spawn_pose_trace")
+        self.assertEqual(payload["stage"], "after_reset")
+        self.assertEqual(payload["t"], 1.5)
+        self.assertEqual(payload["root_pos"], [-2.0, -2.0, 0.0775])
+        self.assertAlmostEqual(payload["root_yaw_deg"], 0.0, places=6)
+        self.assertNotIn("base_link_pos", payload)
+        self.assertNotIn("base_link_yaw_deg", payload)
+        self.assertNotIn("via", payload)
+        self.assertNotIn("reason", payload)
+
+    def test_format_spawn_pose_trace_with_base_link_via_and_reason(self) -> None:
+        payload = format_spawn_pose_trace(
+            "after_rebind:reset_rebind",
+            2.0,
+            [0.0, 0.0, 0.0775],
+            [0.0, 0.0, 1.0, 0.0],  # 180 deg about world Z
+            base_link_pos=[0.1, 0.2, 0.3],
+            base_link_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            via="view",
+            reason="reset_rebind",
+        )
+        self.assertEqual(payload["stage"], "after_rebind:reset_rebind")
+        self.assertAlmostEqual(payload["root_yaw_deg"], 180.0, places=3)
+        self.assertEqual(payload["base_link_pos"], [0.1, 0.2, 0.3])
+        self.assertAlmostEqual(payload["base_link_yaw_deg"], 0.0, places=6)
+        self.assertEqual(payload["via"], "view")
+        self.assertEqual(payload["reason"], "reset_rebind")
+
+    def test_log_spawn_pose_trace_from_backend_double_no_sim(self) -> None:
+        """A backend double (``_backend()``, no live Isaac Sim) with a
+        ``base_link`` body distinct from the articulation root, at a
+        DIFFERENT pose -- exercises "if base_link and the articulation root
+        are different prims, log both" end to end through
+        ``_log_spawn_pose_trace``."""
+        backend = _backend()
+        backend._robot.data.body_names = ("base", "link_tcp", "base_link")
+        backend._robot.data.body_pos_w = torch.cat(
+            [
+                backend._robot.data.body_pos_w,
+                torch.tensor([[[1.0, 2.0, 0.5]]], dtype=torch.float32),
+            ],
+            dim=1,
+        )
+        backend._robot.data.body_quat_w = torch.cat(
+            [
+                backend._robot.data.body_quat_w,
+                torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], dtype=torch.float32),
+            ],
+            dim=1,
+        )
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._log_spawn_pose_trace(
+                "after_reset",
+                root_pos=[-2.0, -2.0, 0.0775],
+                root_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        self.assertEqual(len(lines), 1)
+        payload = lines[0]
+        self.assertEqual(payload["event"], "spawn_pose_trace")
+        self.assertEqual(payload["stage"], "after_reset")
+        self.assertEqual(payload["root_pos"], [-2.0, -2.0, 0.0775])
+        self.assertEqual(payload["base_link_pos"], [1.0, 2.0, 0.5])
+        self.assertNotEqual(payload["base_link_pos"], payload["root_pos"])
+
+    def test_log_spawn_pose_trace_omits_base_link_when_unresolvable(self) -> None:
+        """The stock backend double has no ``base_link`` body name -- the
+        trace must omit the field rather than fail."""
+        backend = _backend()
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._log_spawn_pose_trace(
+                "after_first_step",
+                root_pos=[0.0, 0.0, 0.0775],
+                root_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        payload = json.loads(captured.getvalue().strip())
+        self.assertNotIn("base_link_pos", payload)
 
 
 if __name__ == "__main__":

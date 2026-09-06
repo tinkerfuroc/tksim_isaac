@@ -273,6 +273,28 @@ def resolve_spawn_yaw(value: str | None) -> float:
     return yaw
 
 
+def spawn_root_rot_xyzw(yaw: float) -> tuple[float, float, float, float]:
+    """Pure quaternion (about world Z) for ``ArticulationCfg.InitialStateCfg.rot``.
+
+    Task #30 root cause: the vendored Isaac Lab 3.0.0
+    ``AssetBaseCfg.InitialStateCfg.rot`` (``.deps/IsaacLab/source/isaaclab/
+    isaaclab/assets/asset_base_cfg.py``) documents its ``rot`` field as
+    scalar-last ``(x, y, z, w)``, defaulting to ``(0.0, 0.0, 0.0, 1.0)`` --
+    NOT the scalar-first ``(w, x, y, z)`` order this backend used to build by
+    hand. Supplying ``(cos(yaw/2), 0, 0, sin(yaw/2))`` for that field means a
+    zero (or unset) spawn yaw handed the contract ``(1, 0, 0, 0)``, which
+    Isaac Lab reads as a 180 degree rotation about X -- the robot spawned
+    upside down, and physics ejected it (live trace: after_reset root z 0.30
+    sitting above base_link z 0.25, then a first-step throw to
+    (-0.69, -2.19, 171 deg)). This helper is the single source of the
+    correctly-ordered quaternion; every ``InitialStateCfg.rot``/tensor-view
+    write of a yaw-about-Z heading in this file should go through it (or be
+    explicitly commented as to why it does not).
+    """
+    half = yaw / 2.0
+    return (0.0, 0.0, math.sin(half), math.cos(half))
+
+
 def resolve_spawn_yaw_via_view(value: str | None) -> bool:
     """Parse ``TINKER_SIM_SPAWN_YAW_VIA_VIEW`` (default off / "0").
 
@@ -312,6 +334,153 @@ def resolve_use_fabric(
     elif use_fabric_env == "0":
         use_fabric = False
     return use_fabric
+
+
+# Task #20 (gripper creep/retention): the hardware-scale torque-cap bracket
+# (validation/gripper_close_probe.py --drive-effort-limit/--follower-effort-
+# limit, $TMP/hwcap-result.md + hwcap2-result.md) swept drive+follower joint
+# effort limits at 1.5/2.0/2.5/3.0 N*m on a 15 s bottle side-pinch hold. 2.5
+# is the highest cap that HOLDS: drive target stays flat (no advance past the
+# contact point), tilt decays to ~0 deg, and the grasp survives lift (17.5 N
+# pad force at 2.5/2.5 vs the bracket's own 3.0/3.0 leg, which still creeps --
+# tilt to 16 deg by 15 s and drops on lift). This is the hardware mechanism,
+# not a workaround: a real position-controlled gripper stalls at its torque
+# limit instead of continuing to overhaul the servo target through the
+# object, which is what stopped the sim's PD from tipping the object along
+# the finger arc (the root cause behind every friction/material lever tried
+# and falsified earlier in #20 -- see docs/developer-log.md 2026-09-06). Pad
+# force at this cap (11-17 N) is still below the ~30 N hardware clamp; the
+# sim's contact model tips objects before that force is reachable without
+# creep (open item, docs/developer-log.md). Pin this to the user's measured
+# hardware clamp at commanded 10 N (native_gripper_max_effort) once available.
+GRIPPER_EFFORT_CEILING_NM = 2.5
+# GripperCommand.max_effort (N, hardware fingertip convention) full-scale
+# reference for the proportional map below. The manipulation stack's real
+# commands top out at 10 N (native_gripper_max_effort default used by both
+# the grasp close and the pre-open -- pick_and_place does not override it;
+# grasp_benchmark's pre-open sends 5 N; the bridge's own reopen sends 50 N),
+# confirmed by tracing gripper_facade.py's request.command.max_effort ->
+# JointState.effort passthrough (unmodified, no substitution) through
+# command_gateway.py's _owned_command projection (also unmodified) into
+# backend._apply_joint_command. 10 N is therefore "full commanded grip"
+# hardware-side and maps to the full GRIPPER_EFFORT_CEILING_NM; anything at
+# or above it (e.g. the bridge's 50 N reopen) saturates at the ceiling rather
+# than being read as an over-range request.
+GRIPPER_EFFORT_FULL_SCALE_N = 10.0
+
+
+def resolve_gripper_effort_ceiling_nm(value: str | None) -> float:
+    """Parse ``TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`` (N*m, default
+    ``GRIPPER_EFFORT_CEILING_NM``). Unset/blank/non-finite/non-positive falls
+    back to the default rather than raising -- this is an operator tuning
+    knob, not a safety-relevant input like the spawn pose resolvers.
+    """
+    if value is None or not value.strip():
+        return GRIPPER_EFFORT_CEILING_NM
+    try:
+        ceiling = float(value)
+    except (TypeError, ValueError):
+        return GRIPPER_EFFORT_CEILING_NM
+    if not math.isfinite(ceiling) or ceiling <= 0.0:
+        return GRIPPER_EFFORT_CEILING_NM
+    return ceiling
+
+
+def resolve_gripper_effort_full_scale_n(value: str | None) -> float:
+    """Parse ``TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N`` (N, default
+    ``GRIPPER_EFFORT_FULL_SCALE_N``). Same fail-open semantics as
+    ``resolve_gripper_effort_ceiling_nm``.
+    """
+    if value is None or not value.strip():
+        return GRIPPER_EFFORT_FULL_SCALE_N
+    try:
+        full_scale = float(value)
+    except (TypeError, ValueError):
+        return GRIPPER_EFFORT_FULL_SCALE_N
+    if not math.isfinite(full_scale) or full_scale <= 0.0:
+        return GRIPPER_EFFORT_FULL_SCALE_N
+    return full_scale
+
+
+def gripper_effort_limit_nm(
+    commanded_n: float | None,
+    ceiling_nm: float,
+    full_scale_n: float,
+) -> float:
+    """Map a commanded ``GripperCommand.max_effort`` (N, fingertip) onto the
+    drive_joint effort-limit ceiling (N*m).
+
+    ``0``/unset/negative/non-finite all mean "no explicit limit requested",
+    which resolves to the full ceiling -- today's default behaviour (a bare
+    close/open with no effort field still gets the hardware-parity cap, not
+    zero authority). Anything else is scaled linearly against
+    ``full_scale_n`` and clamped to ``[0, ceiling_nm]``, so a command at or
+    above full scale saturates at the ceiling instead of over-shooting it.
+    """
+    if (
+        commanded_n is None
+        or not math.isfinite(commanded_n)
+        or commanded_n <= 0.0
+    ):
+        return ceiling_nm
+    scale = full_scale_n if full_scale_n > 0.0 else GRIPPER_EFFORT_FULL_SCALE_N
+    fraction = commanded_n / scale
+    fraction = max(0.0, min(1.0, fraction))
+    return ceiling_nm * fraction
+
+
+def _yaw_deg_from_quat_xyzw(quat_xyzw: Iterable[float]) -> float:
+    qx, qy, qz, qw = (float(value) for value in quat_xyzw)
+    return math.degrees(
+        math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    )
+
+
+def format_spawn_pose_trace(
+    stage: str,
+    t: float,
+    root_pos: Iterable[float],
+    root_quat_xyzw: Iterable[float],
+    *,
+    base_link_pos: Iterable[float] | None = None,
+    base_link_quat_xyzw: Iterable[float] | None = None,
+    via: str | None = None,
+    reason: str | None = None,
+) -> dict[str, object]:
+    """Format one ``spawn_pose_trace`` boot-diagnostic line (task #30).
+
+    Pure/stateless so the exact JSON payload is unit-testable without a live
+    sim: given a stage name, a sim-time sample, and the articulation root's
+    position + ``(x, y, z, w)`` quaternion, returns the dict the boot trace
+    prints (see backend call sites for where each ``stage`` fires --
+    ``"initial_state"``, ``"after_reset"``, ``"after_spawn_yaw_write"``,
+    ``"after_first_step"``, ``"after_settle"``, ``"after_rebind:<reason>"``).
+
+    ``base_link_pos``/``base_link_quat_xyzw`` are included only when the
+    caller could resolve a distinct ``base_link`` body in the articulation
+    view (see ``TinkerIsaacBackend._base_link_pose``) -- for a USD-referenced
+    articulation the root prim need not be the URDF's own ``base_link`` link,
+    and this trace exists to make that divergence (or its absence) visible
+    instead of assumed away. ``via`` records which spawn-yaw write path ran
+    (``"usd"`` or ``"view"``, see ``_apply_spawn_yaw_via_view``); ``reason``
+    records why a rebind fired.
+    """
+    payload: dict[str, object] = {
+        "event": "spawn_pose_trace",
+        "stage": stage,
+        "t": float(t),
+        "root_pos": [float(value) for value in root_pos],
+        "root_yaw_deg": _yaw_deg_from_quat_xyzw(root_quat_xyzw),
+    }
+    if base_link_pos is not None:
+        payload["base_link_pos"] = [float(value) for value in base_link_pos]
+    if base_link_quat_xyzw is not None:
+        payload["base_link_yaw_deg"] = _yaw_deg_from_quat_xyzw(base_link_quat_xyzw)
+    if via is not None:
+        payload["via"] = via
+    if reason is not None:
+        payload["reason"] = reason
+    return payload
 
 
 def resolve_clock_epoch(value: str | None) -> float:
@@ -484,7 +653,10 @@ class IsaacWholeRobotBackend:
 
     TRUTH_TOKEN = object()
     PHYSICS_TRUTH_SCHEMA_VERSION = 2
-    DEFAULT_GRIPPER_EFFORT_LIMIT = 80.0
+    # Historical name for the class-level default; now equal to the
+    # hardware-parity ceiling (#20) rather than an arbitrary 80 Nm cap. The
+    # per-instance value is env-overridable -- see __init__.
+    DEFAULT_GRIPPER_EFFORT_LIMIT = GRIPPER_EFFORT_CEILING_NM
     # The stopped arm uses one explicit actuator path.  These fixed gains are
     # intentionally sized for a five-physics-frame (5 / 120 s) stop: the
     # velocity term removes motion immediately, while the position term keeps
@@ -528,6 +700,11 @@ class IsaacWholeRobotBackend:
         spawn_xy: tuple[float, float] = (0.0, 0.0),
     ) -> None:
         spawn_x, spawn_y = validate_spawn_xy(spawn_xy)
+        # Commanded spawn xy, remembered for the boot-time spawn-pose guard
+        # (_check_spawn_pose, task #30) -- this is the value actually applied
+        # to InitialStateCfg.pos below, not merely the raw --spawn-xy string.
+        self._spawn_x = spawn_x
+        self._spawn_y = spawn_y
         arena_usd, map_yaml = resolve_arena_inputs(arena_artifact, map_yaml)
         self._arena_usd = arena_usd  # dir holds placement.json (support surfaces)
         if arena_artifact is not None and wall_color_fn is not None:
@@ -620,7 +797,15 @@ class IsaacWholeRobotBackend:
         self._pending_snapshot_count = 0
         self._pending_snapshot_index = 0
         self._pending_snapshot_commands: list[JointCommand] = []
-        self._default_gripper_effort_limit = self.DEFAULT_GRIPPER_EFFORT_LIMIT
+        # #20: env-overridable ceiling + full-scale for the commanded-effort
+        # -> joint-limit map (gripper_effort_limit_nm). See
+        # GRIPPER_EFFORT_CEILING_NM / GRIPPER_EFFORT_FULL_SCALE_N above.
+        self._default_gripper_effort_limit = resolve_gripper_effort_ceiling_nm(
+            os.environ.get("TINKER_SIM_GRIPPER_EFFORT_CEILING_NM")
+        )
+        self._gripper_effort_full_scale_n = resolve_gripper_effort_full_scale_n(
+            os.environ.get("TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N")
+        )
         self._gripper_effort_limit = self._default_gripper_effort_limit
         # The first commanded limit always reaches PhysX; later identical
         # requests are no-ops (see _set_gripper_effort_limit).
@@ -864,6 +1049,20 @@ class IsaacWholeRobotBackend:
                 self._base_hold_resettle_s = max(0.0, float(_resettle))
         except (TypeError, ValueError):
             pass
+        # Boot-time spawn-pose guard (task #30): run _check_spawn_pose exactly
+        # once after the base settles -- the same moment the base-hold latch
+        # fires (TINKER_SIM_FIX_BASE=1, see _maybe_check_spawn_pose) or, with
+        # the base free, once _base_hold_after_sim_s of sim time has elapsed.
+        # Reset on every genuine reset rebind (_refresh_robot_handles) so a
+        # respawn gets its own settle window and its own check, exactly like
+        # _base_hold_settle_from above.
+        self._spawn_pose_checked = False
+        self._spawn_pose_check_settle_from = 0.0
+        # Task #30 trace: log "after_first_step" exactly once per PROCESS
+        # (unlike _spawn_pose_checked above, this is a boot diagnostic, not
+        # re-armed on a scenario reset rebind -- a rebind gets its own
+        # "after_rebind" stage instead, see _refresh_robot_handles).
+        self._spawn_pose_trace_first_step_logged = False
         # Diagnostic (TINKER_SIM_FIX_BASE_DRYRUN=1): run the whole hold -- settle,
         # latch, scene-change detection, logging -- but SKIP the two
         # set_root_transforms writes. If a spawn still lands at the robot pose
@@ -959,22 +1158,27 @@ class IsaacWholeRobotBackend:
                 joint_drive_props=sim_utils.JointDriveBaseCfg(drive_type="force"),
                 articulation_props=articulation_props,
             ),
-            # TINKER_SIM_SPAWN_YAW (radians, world frame): spawn heading. The
-            # spawner drops this rot for a USD-referenced articulation (it is
-            # re-authored on the root xformOp:orient just after construction),
-            # but it is set here too so the intent reads with the pose. A
+            # TINKER_SIM_SPAWN_YAW (radians, world frame): spawn heading.
+            # Task #30: the spawner DOES apply this rot to the articulation
+            # (Articulation.reset() honors init_state) -- the pre-#30 comment
+            # here claiming it "drops" the orientation was wrong/outdated for
+            # the vendored 3.0.0 spawner. It IS true that a USD-referenced
+            # articulation needs the root xformOp:orient re-authored too for
+            # the pose to read correctly pre-reset (below), and that a
             # fixed-root/held base can never be re-aimed after spawn and a
-            # post-bind /set_entity_state root write is a physics no-op, so the
-            # heading must be right from the start.
+            # post-bind /set_entity_state root write is a physics no-op, so
+            # the heading must be right from the start either way.
+            #
+            # rot is scalar-last (x, y, z, w) -- the vendored
+            # InitialStateCfg.rot contract, see spawn_root_rot_xyzw -- NOT
+            # scalar-first (w, x, y, z). Getting this backwards is exactly
+            # #30's root cause: a zero/unset yaw supplied (1, 0, 0, 0) here,
+            # which Isaac Lab reads as a 180 degree roll about X and spawned
+            # the robot upside down.
             init_state=ArticulationCfg.InitialStateCfg(
                 pos=(spawn_x, spawn_y, spawn_z),
-                rot=(
-                    math.cos(resolve_spawn_yaw(
-                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
-                    0.0,
-                    0.0,
-                    math.sin(resolve_spawn_yaw(
-                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
+                rot=spawn_root_rot_xyzw(
+                    resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
                 ),
             ),
             actuators={
@@ -1027,6 +1231,17 @@ class IsaacWholeRobotBackend:
                     joint_names_expr=["drive_joint"],
                     stiffness=200.0,
                     damping=20.0,
+                    # Hardware-parity torque ceiling (#20): must equal the
+                    # module constant GRIPPER_EFFORT_CEILING_NM (kept a
+                    # literal, not a name reference, so the config
+                    # construction test can read it via ast.literal_eval).
+                    # This is the config-time baseline the runtime effort map
+                    # (_set_gripper_effort_limit / gripper_effort_limit_nm)
+                    # overrides per commanded GripperCommand.max_effort; it
+                    # also seeds _default_gripper_effort_limit on first
+                    # articulation init (see the config-readback block after
+                    # the view rebuild).
+                    effort_limit_sim=2.5,
                 ),
                 # The gripper is a mimic linkage: the URDF mimics all five
                 # finger/knuckle joints to drive_joint 1:1, but the URDF->USD
@@ -1049,22 +1264,30 @@ class IsaacWholeRobotBackend:
                 # warm-start/Fabric parse path, so this control mirror is the
                 # permanent coupling.)
                 #
-                # effort_limit_sim caps the follower reaction. Unbounded, a
-                # follower pinned short of its target (e.g. the jaw closing onto
-                # the desk) pushes k*error ~= 1500*0.56 ~= 840, which overwhelms
-                # drive_joint's 0 lower limit and back-drives it to -0.57 (drops
-                # the object). The cap must sit below that ~840 so the drive's
-                # hard limit stays enforceable, yet above the DYNAMIC grip demand
-                # -- the static estimate (~45 = k*0.03 steady tracking) undershot
-                # badly (a cap of 80 saturated the followers under real contact,
-                # lag regressed to 0.11 rad and the 37 N squeeze was lost). 180
-                # restores the grip (measured) while staying ~4-5x below 840, so
-                # the limit holds and the coupling is preserved.
+                # effort_limit_sim caps the follower reaction. This used to be
+                # sized at 180 purely to keep drive_joint's own limit
+                # enforceable (a follower pinned short of its target pushes
+                # k*error ~= 1500*0.56 ~= 840, which back-drove drive_joint
+                # past its 0 lower limit and dropped the object unless the
+                # follower cap stayed a few times below that). #20's
+                # hardware-scale torque-cap bracket ($TMP/hwcap-result.md,
+                # hwcap2-result.md) found that reasoning was solving the
+                # wrong problem: 180 (and even a much lower cap of 5) is still
+                # high enough that the PD keeps authority to tip the grasped
+                # object along the finger arc instead of stalling like the
+                # real position-controlled gripper does at its torque limit.
+                # 2.5 N*m is the highest cap in the bracket that holds --
+                # drive target flat, tilt decaying to ~0, retained on lift --
+                # while a real hardware gripper's own clamp is torque-limited
+                # the same way. Kept a literal (must equal the module constant
+                # GRIPPER_EFFORT_CEILING_NM) so the config construction test
+                # can read it via ast.literal_eval; followers are config-only
+                # here, no runtime effort-limit write targets them.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
                     stiffness=1500.0,
                     damping=55.0,
-                    effort_limit_sim=180.0,
+                    effort_limit_sim=2.5,
                 ),
                 "casters": ImplicitActuatorCfg(
                     joint_names_expr=["rear_.*_swivel_joint", "rear_.*_wheel_joint"],
@@ -1080,11 +1303,28 @@ class IsaacWholeRobotBackend:
                 ),
             },
         )
+        # Task #30 trace: the InitialStateCfg pos/rot exactly as configured
+        # above (spawn_root_rot_xyzw, scalar-last), before the articulation
+        # itself exists. No live tensor view yet, so t is pinned to 0.0 and
+        # base_link is not attempted.
+        _initial_spawn_yaw = resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
+        self._log_spawn_pose_trace(
+            "initial_state",
+            root_pos=[spawn_x, spawn_y, spawn_z],
+            root_quat_xyzw=list(spawn_root_rot_xyzw(_initial_spawn_yaw)),
+            t=0.0,
+            include_base_link=False,
+        )
         self._robot = Articulation(robot_cfg)
-        # Author the spawn yaw directly on the robot root prim: the spawner
-        # honors InitialStateCfg.pos (xformOp:translate) but drops the
-        # orientation for this USD-referenced articulation (observed: rot
-        # (0.707, 0, 0, 0.707) requested, layer yaw 0 after spawn), and
+        # Author the spawn yaw directly on the robot root prim too. Task #30:
+        # Articulation.reset() DOES apply InitialStateCfg.rot (the previous
+        # version of this comment, claiming the spawner "drops" the
+        # orientation, was wrong/outdated for the vendored 3.0.0 spawner --
+        # that claim was actually observing the (w,x,y,z)-vs-(x,y,z,w) order
+        # bug fixed above, not a dropped write). This direct USD write is
+        # still needed because it is what 13e4fdf's fabric-parity fix
+        # targets (pre-reset xformOp:orient, so a fabric-composed render
+        # already agrees with physics before the first reset), and because
         # post-bind /set_entity_state root writes are physics no-ops.
         #
         # Skipped when TINKER_SIM_SPAWN_YAW_VIA_VIEW=1: the heading is instead
@@ -1103,6 +1343,9 @@ class IsaacWholeRobotBackend:
                 raise RuntimeError("TINKER_SIM_SPAWN_YAW: /World/Tinker not found")
             xformable = UsdGeom.Xformable(robot_prim)
             half = spawn_yaw / 2.0
+            # Gf.Quatd(real, imaginary) is scalar-first by construction --
+            # this is correct for Gf/USD (a different contract from
+            # InitialStateCfg.rot above), do not "fix" this to scalar-last.
             quat = Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half)))
             orient_op = None
             for op in xformable.GetOrderedXformOps():
@@ -1116,6 +1359,20 @@ class IsaacWholeRobotBackend:
             else:
                 orient_op.Set(quat)
             print(json.dumps({"spawn_yaw_rad": spawn_yaw}, sort_keys=True), flush=True)
+            # Task #30 trace: the pose just authored on the USD prim. No
+            # live tensor view yet (sim.reset() has not run), so this
+            # reports the WRITTEN values, not a tensor read-back, and
+            # base_link is not attempted.
+            self._log_spawn_pose_trace(
+                "after_spawn_yaw_write",
+                root_pos=[spawn_x, spawn_y, spawn_z],
+                # xyzw trace convention (see spawn_root_rot_xyzw), not the
+                # Gf.Quatd scalar-first `quat` just authored above.
+                root_quat_xyzw=list(spawn_root_rot_xyzw(spawn_yaw)),
+                t=0.0,
+                include_base_link=False,
+                via="usd",
+            )
         # Ten Warp launches per target push -> two; see _fused_apply_actuator_model.
         if _os.environ.get("TINKER_SIM_STOCK_ACTUATOR_MODEL", "") != "1":
             bind_fused_actuator_model(self._robot)
@@ -1164,6 +1421,27 @@ class IsaacWholeRobotBackend:
         self.gripper_friction_bound = self._apply_gripper_friction_material()
         omni.kit.app.get_app().update()
         self._sim.reset()
+        # Task #30 trace: the truth root pose the moment sim.reset() returns,
+        # before _refresh_robot_handles/_reapply_spawn_yaw_after_rebind can
+        # touch it -- this is the "did InitialStateCfg actually land" sample
+        # the #30 investigation lacked. Best-effort: the articulation's own
+        # is_initialized flag is only set by _refresh_robot_handles below, so
+        # a read failure here is swallowed rather than aborting boot.
+        try:
+            _reset_data = self._robot.data
+            self._log_spawn_pose_trace(
+                "after_reset",
+                root_pos=self._torch_value(_reset_data.root_pos_w)[0]
+                .detach()
+                .cpu()
+                .tolist(),
+                root_quat_xyzw=self._torch_value(_reset_data.root_quat_w)[0]
+                .detach()
+                .cpu()
+                .tolist(),
+            )
+        except Exception:
+            pass
         # UsdFileCfg imports the robot stage metadata, including its short
         # playback range.  Override it only after every USD has been authored.
         # Reaching that range stops PhysX and invalidates tensor views.
@@ -1642,6 +1920,31 @@ class IsaacWholeRobotBackend:
             self._clock_step_origin = count_now - self._clock_elapsed_steps
             self._object_views.clear()
             self._contact_pairs_by_key.clear()
+            # Task #30 trace: a genuine rebind just fired -- either the
+            # scenario's own STOP -> spawn_entity(s) -> PLAY cycle
+            # (reapply_spawn_yaw=True, the interesting case for #30: physics
+            # state was reset to the initial/commanded pose) or
+            # _maybe_recover_simulation_view's state-PRESERVING mid-run view
+            # recovery (reapply_spawn_yaw=False). This backend has no handle
+            # on the triggering entity's name -- that lives cross-process in
+            # scenario_runner.py's /spawn_entity calls (see "scenario_spawn"
+            # there) -- so only the reason classification is logged here.
+            try:
+                _rebind_data = self._robot.data
+                self._log_spawn_pose_trace(
+                    f"after_rebind:{'reset_rebind' if reapply_spawn_yaw else 'view_recovery'}",
+                    root_pos=self._torch_value(_rebind_data.root_pos_w)[0]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    root_quat_xyzw=self._torch_value(_rebind_data.root_quat_w)[0]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    reason="reset_rebind" if reapply_spawn_yaw else "view_recovery",
+                )
+            except Exception:
+                pass
         self.joint_names = tuple(self._robot.data.joint_names)
         self._joint_index = {name: index for index, name in enumerate(self.joint_names)}
         self._wheel_indices = tuple(
@@ -1727,6 +2030,14 @@ class IsaacWholeRobotBackend:
         # (#24 review round 2).
         if reapply_spawn_yaw:
             self._reapply_spawn_yaw_after_rebind()
+            # task #30: a genuine reset rebind (STOP -> spawn -> PLAY) resets
+            # physics state back to the commanded/initial pose, so the
+            # spawn-pose guard must re-arm and measure its own settle window
+            # from THIS rebind, exactly like _base_hold_settle_from above --
+            # simulation_time is monotonic across the rebind (#21), so a
+            # boot-relative deadline would already be satisfied.
+            self._spawn_pose_checked = False
+            self._spawn_pose_check_settle_from = self.simulation_time
         return True
 
     @property
@@ -2037,10 +2348,17 @@ class IsaacWholeRobotBackend:
     def _set_gripper_effort_limit(self, requested: float) -> None:
         if not math.isfinite(requested) or requested < 0.0:
             raise ValueError("drive_joint effort limit must be finite and non-negative")
-        limit = (
-            self._default_gripper_effort_limit
-            if requested == 0.0
-            else min(requested, self._default_gripper_effort_limit)
+        # #20: requested is GripperCommand.max_effort (N, hardware fingertip
+        # convention), mapped proportionally onto the hardware-parity joint
+        # ceiling rather than passed through 1:1 -- see gripper_effort_limit_nm.
+        limit = gripper_effort_limit_nm(
+            requested,
+            self._default_gripper_effort_limit,
+            getattr(
+                self,
+                "_gripper_effort_full_scale_n",
+                GRIPPER_EFFORT_FULL_SCALE_N,
+            ),
         )
         index = self._joint_index.get("drive_joint")
         if index is None:
@@ -2080,7 +2398,162 @@ class IsaacWholeRobotBackend:
                 continue
             model_limits[:, local_index] = limit
         self._gripper_effort_limit = limit
-        self._gripper_effort_limit_written = True
+        # #20 cap5-analysis: write_joint_effort_limit_to_sim_index (above) and
+        # the actuator-model mirror only touch Isaac Lab-side buffers; the
+        # probe (validation/gripper_close_probe.py _write_physx_max_forces_
+        # direct / _author_usd_max_force) proved that is NOT sufficient proof
+        # the cap reaches the PhysX solver -- bit-identical 15 s hold physics
+        # was measured across cap 5 through cap 180 on the follower joints
+        # through this same writer alone. Re-assert the mapped limit straight
+        # on the PhysX tensor view and author it onto drive_joint's USD
+        # DriveAPI so the runtime ceiling this method computes actually binds.
+        #
+        # #20 review: only latch _gripper_effort_limit_written once the direct
+        # PhysX write actually lands. If it raises, the dedup guard above
+        # (L2178-2185) must NOT skip the next identical-effort command --
+        # otherwise a write that silently failed once would never be retried.
+        physx_max_force, physx_write_ok = self._write_gripper_drive_physx_max_force(
+            index, limit
+        )
+        self._gripper_effort_limit_written = physx_write_ok
+        print(
+            json.dumps(
+                {
+                    "event": "gripper_effort_limit",
+                    "commanded_n": requested,
+                    "limit_nm": limit,
+                    "physx_max_force": physx_max_force,
+                    "physx_write_ok": physx_write_ok,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    def _write_gripper_drive_physx_max_force(
+        self, index: int, limit: float
+    ) -> tuple[list[float], bool]:
+        """Re-assert ``limit`` on drive_joint straight on the PhysX tensor
+        view (bypassing the Isaac Lab wrapper) and author it onto the USD
+        DriveAPI, then read the effective value back off PhysX.
+
+        Ported from validation/gripper_close_probe.py's
+        ``_write_physx_max_forces_direct`` / ``_author_usd_max_force`` /
+        ``_read_physx_max_forces`` (#20 hwcap probes). ``set_dof_max_forces``
+        takes the FULL per-joint row, not a sparse column, so this clones the
+        current row, patches only ``index``, and pushes the whole row back --
+        using warp arrays for both payload and indices, per the Task #12
+        precedent (RigidBodyView tensor-API writes need WARP arrays, not
+        torch, to land).
+
+        Returns ``(physx_max_force_row, ok)``. ``ok`` is False if the direct
+        PhysX write raised (the Isaac Lab-side write already issued above
+        stays in place, so it degrades to the pre-#20 behaviour); the caller
+        must NOT latch ``_gripper_effort_limit_written`` when ``ok`` is
+        False, so the next identical-effort command retries the write rather
+        than silently dedup-skipping forever. Under
+        ``TINKER_SIM_STRICT_PHYSX_WRITES=1`` the exception is re-raised
+        instead of being swallowed, for callers that would rather fail loud.
+        """
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        setter = getattr(root_view, "set_dof_max_forces", None) if root_view is not None else None
+        physx_write_ok = True
+        if setter is not None:
+            try:
+                import warp as wp
+
+                # #20 review: wp.from_torch does NOT lazily initialize the
+                # Warp runtime -- it reads
+                # warp._src.context.runtime.cpu_device directly and raises
+                # AttributeError if Warp hasn't been initialized in-process
+                # yet (e.g. a gripper command issued before the first
+                # physics step, ahead of the fused-actuator path that would
+                # otherwise have self-init'd it). wp.array(...) DOES
+                # self-init, per the Task #12 warp-array fix
+                # (set_entity_pose_physics, above) -- build the payload the
+                # same way here rather than via wp.from_torch, and also
+                # force init explicitly (idempotent) as a second guard.
+                wp.init()
+
+                full = self._robot.data.joint_effort_limits.clone()
+                full[0, index] = float(limit)
+                full_cpu = full.detach().to(
+                    device="cpu", dtype=self._torch.float32
+                ).contiguous()
+                forces_wp = wp.array(
+                    full_cpu.numpy(), dtype=wp.float32, device="cpu"
+                )
+                indices_wp = wp.array([0], dtype=wp.int32, device="cpu")
+                setter(forces_wp, indices=indices_wp)
+            except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+                physx_write_ok = False
+                print(
+                    json.dumps(
+                        {
+                            "event": "gripper_physx_max_force_write_error",
+                            "level": "warning",
+                            "error": str(error)[:160],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                if os.environ.get("TINKER_SIM_STRICT_PHYSX_WRITES") == "1":
+                    raise
+        self._author_gripper_drive_usd_max_force(limit)
+        return self._read_gripper_drive_physx_max_force(index), physx_write_ok
+
+    def _read_gripper_drive_physx_max_force(self, index: int) -> list[float]:
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        getter = getattr(root_view, "get_dof_max_forces", None) if root_view is not None else None
+        if getter is None:
+            return [float("nan")]
+        try:
+            forces = getter()
+            arr = forces.numpy() if hasattr(forces, "numpy") else forces
+            return [float(arr[0][index])]
+        except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+            print(
+                json.dumps({"gripper_physx_max_force_read_error": str(error)[:160]}),
+                flush=True,
+            )
+            return [float("nan")]
+
+    def _author_gripper_drive_usd_max_force(self, limit: float) -> None:
+        """Author ``physics:maxForce`` on drive_joint's USD DriveAPI so a
+        stage re-parse (reset going back through actuator construction)
+        still carries the runtime ceiling; the tensor-API write above only
+        touches the live PhysX buffers. Best-effort, no-op outside a live
+        Isaac Sim stage (both imports fail closed in unit tests / headless
+        construction).
+        """
+        try:
+            import omni.usd
+            from pxr import Usd, UsdPhysics
+        except ImportError:
+            return
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return
+        robot_prim_path = str(
+            getattr(getattr(self._robot, "cfg", None), "prim_path", "") or "/World/Tinker"
+        )
+        robot_prim = stage.GetPrimAtPath(robot_prim_path)
+        if not robot_prim.IsValid():
+            return
+        for prim in Usd.PrimRange(robot_prim):
+            if prim.GetName() != "drive_joint":
+                continue
+            for instance in ("angular", "linear"):
+                try:
+                    drive = UsdPhysics.DriveAPI.Apply(prim, instance)
+                    drive.CreateMaxForceAttr(float(limit))
+                except Exception:  # pragma: no cover - defensive, schema surface
+                    pass
 
     def command_joints(self, command: JointCommand) -> bool:
         if self._safety_stopped:
@@ -2282,10 +2755,12 @@ class IsaacWholeRobotBackend:
 
         Root-view quaternions are ``(x, y, z, w)`` (IsaacLab's tensor
         convention -- ``root_quat_w``'s own element order, and
-        ``write_root_pose_to_sim_index``'s docstring), which is NOT the
-        ``(w, x, y, z)`` order ``ArticulationCfg.InitialStateCfg.rot`` and the
-        USD ``xformOp:orient`` path (both above) use -- do not copy the
-        ``Gf.Quatd(cos, 0, 0, sin)`` construction from that code path here.
+        ``write_root_pose_to_sim_index``'s docstring) -- the same scalar-last
+        contract ``ArticulationCfg.InitialStateCfg.rot`` uses (see
+        ``spawn_root_rot_xyzw``; #30 fixed this file's InitialStateCfg.rot to
+        match). It is NOT the scalar-first order the USD ``xformOp:orient``
+        path (above) builds via ``Gf.Quatd`` -- do not copy that
+        ``Gf.Quatd(cos, 0, 0, sin)`` construction here.
 
         Whether this avoids 13e4fdf's spawn-mislocation defect is NOT
         verified -- needs a live GPU A/B (see the validation recipe shipped
@@ -2293,15 +2768,22 @@ class IsaacWholeRobotBackend:
         """
         torch = self._torch
         data = self._robot.data
-        half = spawn_yaw / 2.0
         pos = data.root_pos_w[:1].detach().clone()
         quat = torch.tensor(
-            [[0.0, 0.0, math.sin(half), math.cos(half)]],
+            [list(spawn_root_rot_xyzw(spawn_yaw))],
             dtype=pos.dtype,
             device=pos.device,
         )
         root_pose = torch.cat([pos, quat], dim=-1)
         self._robot.write_root_pose_to_sim_index(root_pose=root_pose)
+        # Task #30 trace: the pose just written through the tensor view.
+        # The view is live here (post sim.reset()), so base_link is attempted.
+        self._log_spawn_pose_trace(
+            "after_spawn_yaw_write",
+            root_pos=pos[0].detach().cpu().tolist(),
+            root_quat_xyzw=quat[0].detach().cpu().tolist(),
+            via="view",
+        )
         # Do NOT seed _base_hold_pose's POSITION here (#26): `pos` above is
         # data.root_pos_w read immediately after self._sim.reset(), before
         # gravity has dropped the mobile-base chassis onto its wheels/
@@ -2469,6 +2951,198 @@ class IsaacWholeRobotBackend:
             return
         self._robot.write_root_pose_to_sim_index(root_pose=self._base_hold_pose)
         self._robot.write_root_velocity_to_sim_index(root_velocity=self._base_hold_vel)
+
+    def _base_link_body_index(self) -> int | None:
+        """Body index of ``base_link`` in the articulation view, if resolvable.
+
+        ``root_pos_w``/``root_quat_w`` (used everywhere else in this file)
+        report the ARTICULATION ROOT's pose. For a USD-referenced import that
+        root prim (``/World/Tinker``) need not be the same prim as the
+        URDF's own ``base_link`` link -- task #30's trace logs both (see
+        ``_base_link_pose``) instead of assuming they coincide.
+        """
+        try:
+            body_names = tuple(getattr(self._robot.data, "body_names", ()))
+        except AttributeError:
+            return None
+        if "base_link" in body_names:
+            return body_names.index("base_link")
+        return None
+
+    def _base_link_pose(self) -> tuple[list[float], list[float]] | None:
+        """``([x, y, z], [x, y, z, w])`` for the ``base_link`` body, or None.
+
+        None both when no distinct ``base_link`` body is resolvable and when
+        the articulation view is not yet live enough to read from (boot
+        stages before the first ``sim.reset()``) -- callers treat both cases
+        identically: omit the ``base_link_pos``/``base_link_quat_xyzw`` trace
+        fields rather than fail the boot over a diagnostic read.
+        """
+        index = self._base_link_body_index()
+        if index is None:
+            return None
+        try:
+            data = self._robot.data
+            pos = self._torch_value(data.body_pos_w)[0, index].detach().cpu().tolist()
+            quat = self._torch_value(data.body_quat_w)[0, index].detach().cpu().tolist()
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+        return [float(value) for value in pos], [float(value) for value in quat]
+
+    def _log_spawn_pose_trace(
+        self,
+        stage: str,
+        *,
+        root_pos: Iterable[float],
+        root_quat_xyzw: Iterable[float],
+        t: float | None = None,
+        include_base_link: bool = True,
+        via: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Print one ``spawn_pose_trace`` line (task #30 boot instrumentation).
+
+        Default-on, cheap (a handful of lines per boot): this only formats
+        and prints already-available values, never reads back a fresh
+        tensor beyond the one optional ``base_link`` lookup, and never
+        raises -- a failure to resolve ``base_link`` (or ``t``, before
+        ``self._clock_step_origin`` exists at the very first call site)
+        degrades to omitting that one field, not aborting boot.
+        """
+        if t is None:
+            try:
+                t = self.simulation_time
+            except AttributeError:
+                t = 0.0
+        base_link_pos = None
+        base_link_quat_xyzw = None
+        if include_base_link:
+            try:
+                resolved = self._base_link_pose()
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                base_link_pos, base_link_quat_xyzw = resolved
+        payload = format_spawn_pose_trace(
+            stage,
+            t,
+            root_pos,
+            root_quat_xyzw,
+            base_link_pos=base_link_pos,
+            base_link_quat_xyzw=base_link_quat_xyzw,
+            via=via,
+            reason=reason,
+        )
+        print(json.dumps(payload, sort_keys=True), flush=True)
+
+    def _maybe_log_first_step_trace(self) -> None:
+        """Log ``spawn_pose_trace`` stage ``after_first_step`` exactly once.
+
+        A boot-only diagnostic sample, taken right after the first
+        successful ``self._robot.update(self.dt)`` following boot (both
+        ``step()`` call sites that reach one call this) -- ``getattr`` with a
+        default keeps this a no-op for test doubles built via
+        ``object.__new__`` that never ran ``__init__`` (same pattern as the
+        other ``getattr`` guards in ``step()``).
+        """
+        if getattr(self, "_spawn_pose_trace_first_step_logged", True):
+            return
+        self._spawn_pose_trace_first_step_logged = True
+        try:
+            data = self._robot.data
+            self._log_spawn_pose_trace(
+                "after_first_step",
+                root_pos=self._torch_value(data.root_pos_w)[0].detach().cpu().tolist(),
+                root_quat_xyzw=self._torch_value(data.root_quat_w)[0]
+                .detach()
+                .cpu()
+                .tolist(),
+            )
+        except Exception:
+            pass
+
+    def _maybe_check_spawn_pose(self) -> None:
+        """Run the boot-time spawn-pose guard exactly once after the base
+        settles (task #30).
+
+        "Settled" means: the same moment the base-hold latch fires
+        (``TINKER_SIM_FIX_BASE=1``, i.e. ``_base_hold_pose`` transitions out
+        of ``None`` in ``_apply_base_hold`` -- this is called right after
+        that in ``step()``), or, with the base free, once
+        ``_base_hold_after_sim_s`` of sim time has elapsed since boot or the
+        last genuine reset rebind (``_refresh_robot_handles`` resets
+        ``_spawn_pose_check_settle_from``/``_spawn_pose_checked`` on those,
+        exactly like ``_base_hold_settle_from``).
+
+        A GPSR run observed the robot base ~1.3 m / ~171 deg off its
+        commanded spawn with nothing in the sim log flagging it (see
+        docs/developer-log.md, 2026-09-06); this makes that mismatch loud at
+        boot instead of silently reaching navigation downstream.
+        """
+        if self._spawn_pose_checked:
+            return
+        if getattr(self, "base_fixed", False):
+            if self._base_hold_pose is None:
+                return
+        else:
+            elapsed = self.simulation_time - self._spawn_pose_check_settle_from
+            if elapsed < self._base_hold_after_sim_s:
+                return
+        self._check_spawn_pose()
+        self._spawn_pose_checked = True
+
+    def _check_spawn_pose(self) -> None:
+        """Compare the truth base pose against the commanded spawn and emit
+        a loud, structured mismatch line (task #30).
+
+        Always prints a ``spawn_pose_check`` line. On a mismatch (position
+        more than 5 cm off, or heading more than 5 deg off, wrap-aware) also
+        prints a ``spawn_pose_mismatch`` line at warning level, and, when
+        ``TINKER_SIM_SPAWN_POSE_ASSERT=strict``, raises to abort the boot.
+        Default (unset, or any other value) is warn-only -- no behaviour
+        change.
+        """
+        base_pose = self._robot_truth_state()["base_pose"]
+        actual_xyz = [float(value) for value in base_pose["xyz"]]
+        qx, qy, qz, qw = (float(value) for value in base_pose["quaternion_xyzw"])
+        actual_yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)
+        )
+        self._log_spawn_pose_trace(
+            "after_settle",
+            root_pos=actual_xyz,
+            root_quat_xyzw=[qx, qy, qz, qw],
+        )
+        commanded_x = float(self._spawn_x)
+        commanded_y = float(self._spawn_y)
+        commanded_yaw = float(self._spawn_yaw)
+        dxy = math.hypot(actual_xyz[0] - commanded_x, actual_xyz[1] - commanded_y)
+        dyaw = math.atan2(
+            math.sin(actual_yaw - commanded_yaw), math.cos(actual_yaw - commanded_yaw)
+        )
+        dyaw_deg = math.degrees(dyaw)
+        ok = dxy <= 0.05 and abs(dyaw_deg) <= 5.0
+        payload = {
+            "event": "spawn_pose_check",
+            "commanded": [commanded_x, commanded_y, commanded_yaw],
+            "actual": [actual_xyz[0], actual_xyz[1], actual_xyz[2], actual_yaw],
+            "dxy_m": dxy,
+            "dyaw_deg": dyaw_deg,
+            "ok": ok,
+        }
+        print(json.dumps(payload, sort_keys=True), flush=True)
+        if ok:
+            return
+        mismatch_payload = dict(payload)
+        mismatch_payload["event"] = "spawn_pose_mismatch"
+        mismatch_payload["level"] = "warning"
+        print(json.dumps(mismatch_payload, sort_keys=True), flush=True)
+        if os.environ.get("TINKER_SIM_SPAWN_POSE_ASSERT") == "strict":
+            raise RuntimeError(
+                "spawn pose mismatch: commanded "
+                f"{payload['commanded']} vs actual {payload['actual']} "
+                f"(dxy={dxy:.3f} m, dyaw={dyaw_deg:.1f} deg)"
+            )
 
     def _scenario_child_signature(self) -> int:
         """Count /World/Scenario children -- a per-step spawn/delete signal for
@@ -2683,6 +3357,7 @@ class IsaacWholeRobotBackend:
             self._sim.step(render=self.render)
             if self._refresh_robot_handles():
                 self._robot.update(self.dt)
+                self._maybe_log_first_step_trace()
             return
         if self._safety_stopped:
             if self._safety_snapshot is None:
@@ -2699,6 +3374,7 @@ class IsaacWholeRobotBackend:
             self._ramp_drive_target()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
+        self._maybe_check_spawn_pose()
         self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
@@ -2758,6 +3434,7 @@ class IsaacWholeRobotBackend:
             if not self._maybe_recover_simulation_view(error):
                 raise
             return
+        self._maybe_log_first_step_trace()
         if _t is not None:
             _sp["robot_update"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
