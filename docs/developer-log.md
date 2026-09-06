@@ -4,6 +4,65 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #11: contact-report enablement was invisible in the sim log
+
+**Symptom.** A whole bench round (`agv`) came back with `/sim/truth/contacts`
+publishing nothing, `/sim/parity/finger_contact` flat zero on every axis for
+its entire ~6100-sample force trace, and every physics-truth frame's
+`contacts` field an empty list — a structurally-silent contact pipeline with
+no error, no exception, and nothing distinguishing it in the sim's stdout
+from a genuinely contact-free round.
+
+**Diagnosis.** Not a regression in the round's own code path. PhysX contact
+reporting is decided exactly once, at `IsaacWholeRobotBackend.__init__`
+(`simulation/tinker_sim_isaac/backend.py`), from the `enable_contacts`
+constructor argument — which the sensor-rich launch path derives from
+`TINKER_SIM_SENSOR_RICH_CONTACTS` (`validation/run_sim.py`). There is no
+later re-check: if that boot's environment lacked the flag, the
+`subscribe_contact_report_events` call is skipped entirely and
+`_on_contact_report_event` (the sole writer of the backend's contact-pairs
+dict, which both `/sim/parity/finger_contact` and physics-truth's `contacts`
+list read from) never fires for the rest of that process's life — no matter
+what changes afterward in the launched task stack. Round `agv`'s bringup
+(`restart_c_by_pid.sh`) explicitly restarts only the task-stack terminal
+("Isaac + control plane stay up"), so whatever `TINKER_SIM_SENSOR_RICH_CONTACTS`
+value the *already-running* Isaac Sim process booted with is the one that
+silently governs contacts for every subsequent round until Isaac itself is
+restarted — and nothing in the log said which value that was.
+
+**Fix (observability only, no behavior change).** Two new one-line JSON
+diagnostics in `backend.py`, alongside the existing `wheel_collider` /
+`solver_iterations` boot lines:
+- At `__init__`, right where `enable_contacts` is consumed:
+  `{"event": "contact_report", "enabled": <bool>, "source":
+  "TINKER_SIM_SENSOR_RICH_CONTACTS" | "constructor:enable_contacts",
+  "monitored_bodies": <count>}` — printed unconditionally, so a stale
+  contacts-off boot is visible in sim stdout without an `/proc/<pid>/environ`
+  read or a live force probe. `source` names the env gate when it was set,
+  falling back to naming the constructor argument for callers
+  (`manipulation-core`, probes) that pass `enable_contacts` explicitly.
+- In `_on_contact_report_event`, the first time a pair actually gets
+  recorded (not merely reported and filtered out, and — after the #28 merge
+  below — only counting a monitored ARM/GRASP/EXTRA pair, not a trace-only
+  one): `{"event": "contact_report_first_event", "simulation_time": <t>,
+  "pair": [body_a, body_b]}`, gated by a one-shot bool so it never repeats
+  per-contact.
+
+**Operational rule.** For any round that depends on contacts, restart Isaac
+Sim itself — a task-stack-only restart keeps the prior process's
+`enable_contacts` decision no matter what the next launch wrapper exports.
+Before trusting a per-round env override, check the *running* process's own
+environment (`cat /proc/<pid>/environ | tr '\0' '\n' | grep
+TINKER_SIM_SENSOR_RICH_CONTACTS`), or now, simply read the `contact_report`
+boot line the backend already prints.
+
+Non-GPU coverage added (`tests/test_manipulation_runtime.py`,
+`test_contact_report_first_event_logged_exactly_once`): two recorded contact
+events (found, then persist) against a backend test double produce exactly
+one `contact_report_first_event` line, carrying the expected body-pair and a
+`simulation_time` field. Full suite (pre-#28): 103 passed, 3 subtests passed,
+0 failed.
+
 ## 2026-09-06 — Task #28: contact reporting only sees the arm and the fingers, not the gripper base or the wrist camera
 
 **Why.** A bench round on `agv` pushed the target object with the robot but
@@ -66,12 +125,32 @@ Recommended bench value:
 (`test_contact_extra_bodies_unset_matches_default_monitored_set`), extra
 bodies recorded and aggregated like a grasp body without touching
 `left_finger`/`right_finger`
-(`test_contact_extra_bodies_env_records_pair_like_grasp_bodies`), and the
-ported trace-bodies tests
+(`test_contact_extra_bodies_env_records_pair_like_grasp_bodies`), the ported
+trace-bodies tests
 (`test_contact_report_drops_unmonitored_pair_without_trace_env`,
-`test_contact_report_trace_env_records_unmonitored_pair_with_point_and_normal`).
-Full incantation from `pytest-suite-ros-env-incantation`: 109 passed, 3
-subtests passed.
+`test_contact_report_trace_env_records_unmonitored_pair_with_point_and_normal`),
+and (added on the #11 merge, below) leaf-or-full-path matching for both
+matchers against the bench's actual truth-pair shape, where a spawned
+entity's rigid body IS its own scenario prim path
+(`test_contact_trace_and_extra_bodies_match_full_scenario_prim_path`).
+Full incantation from `pytest-suite-ros-env-incantation`: see below for the
+merged suite's final count (both #11's and #28's tests included).
+
+**Follow-up (same day, on the #11 merge).** `_on_contact_report_event`'s
+`monitored`/`is_traced` checks originally matched `TINKER_SIM_CONTACT_EXTRA_BODIES`
+only by reconstructing `/World/Tinker/{name}` and `TINKER_SIM_CONTACT_TRACE_BODIES`
+only by the actor's own leaf. The bench's real truth pairs carry full prim
+paths on both sides (e.g. `a="/World/Tinker/left_finger"`,
+`b="/World/Scenario/bench_sugar_box_100_anygrasp_agt_a1"` — the spawned
+entity prim itself is the rigid body), and sets
+`TINKER_SIM_CONTACT_TRACE_BODIES`/`_EXTRA_BODIES` to bare leaf names. Added
+`_contact_name_matches(actor_path, names)`: compares the actor's leaf against
+each configured name, accepting either a bare leaf or a full path on the env
+side (falling back to that entry's own leaf) — the same leaf resolution the
+pre-existing `ARM_CONTACT_BODIES`/`GRASP_CONTACT_BODIES` matching already
+relies on structurally. `contact_report_first_event` only fires for a
+monitored (ARM/GRASP/EXTRA) pair — a trace-only pair does not count as the
+backend's first contact.
 
 ## 2026-09-06 — Task #25: bound `controller_reconciler`'s post-success teardown so it cannot wedge the launch chain
 
