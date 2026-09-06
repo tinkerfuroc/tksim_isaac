@@ -81,6 +81,23 @@ parser.add_argument("--pad-friction", type=float, default=None,
                           "material is authored once in _apply_gripper_friction_material() during "
                           "construction). A post-boot readback ('pad_friction_check') confirms the "
                           "authored value. Default off (pads keep 1.0/1.0).")
+parser.add_argument("--object-torsional-radius", type=float, default=None,
+                     help="#20 torsional-friction experiment: author PhysxSchema.PhysxCollisionAPI's "
+                          "torsionalPatchRadius on the spawned object's collision prim(s) (same prim "
+                          "discovery as --object-friction). The pads carry 0.01 (backend "
+                          "_apply_gripper_friction_material); the object collider carries 0 (no "
+                          "PhysxCollisionAPI) unless this is set -- the suspected reason the pinched "
+                          "object pivots about the contact normal with no torsional resistance "
+                          "(task20-decay-probe-findings.md, 'Impulse-vector hold'). Applied right "
+                          "after the object reference is added, before the physics parse; a "
+                          "post-play readback ('object_torsional_check') confirms what PhysX actually "
+                          "resolved via a USD attribute Get(). Default off (object keeps "
+                          "torsionalPatchRadius 0 / no PhysxCollisionAPI).")
+parser.add_argument("--object-min-torsional-radius", type=float, default=None,
+                     help="minTorsionalPatchRadius to pair with --object-torsional-radius (default "
+                          "= --object-torsional-radius / 2, matching a rubber-contact-patch profile; "
+                          "the pads use 0.01/0.01 i.e. min==max). Ignored unless "
+                          "--object-torsional-radius is also set.")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
 parser.add_argument("--object-yaw-axis", default="x", choices=("x", "y"), help="which tool axis the object's long axis is aligned to (knife)")
 parser.add_argument("--object-yaw-deg", type=float, default=None, help="absolute world yaw of the object (overrides --object-yaw-axis)")
@@ -1209,6 +1226,54 @@ if "B" in args.phase:
                 direct_binding=(direct_target == mat_path) if mat_path else None,
             )
 
+    def _author_object_torsional(root_prim, radius: float, min_radius: float, tag: str) -> None:
+        try:
+            from pxr import PhysxSchema
+        except ImportError as error:
+            emit(event=f"object_torsional_{tag}", error=f"PhysxSchema import failed: {error}")
+            return
+        for cprim in _collision_prims(root_prim):
+            collision = PhysxSchema.PhysxCollisionAPI.Apply(cprim)
+            collision.CreateTorsionalPatchRadiusAttr(radius)
+            collision.CreateMinTorsionalPatchRadiusAttr(min_radius)
+            emit(
+                event=f"object_torsional_{tag}",
+                torsional_patch_radius=radius,
+                min_torsional_patch_radius=min_radius,
+                prim=str(cprim.GetPath()),
+            )
+
+    def _check_object_torsional(root_prim, tag: str) -> None:
+        try:
+            from pxr import PhysxSchema
+        except ImportError as error:
+            emit(event=f"object_torsional_{tag}", error=f"PhysxSchema import failed: {error}")
+            return
+        for cprim in _collision_prims(root_prim):
+            has_api = cprim.HasAPI(PhysxSchema.PhysxCollisionAPI)
+            radius_v = min_radius_v = None
+            if has_api:
+                collision = PhysxSchema.PhysxCollisionAPI(cprim)
+                radius_v = collision.GetTorsionalPatchRadiusAttr().Get()
+                min_radius_v = collision.GetMinTorsionalPatchRadiusAttr().Get()
+            emit(
+                event=f"object_torsional_{tag}",
+                has_physx_collision_api=has_api,
+                torsional_patch_radius=radius_v,
+                min_torsional_patch_radius=min_radius_v,
+                prim=str(cprim.GetPath()),
+                # This is a USD-attribute readback (Get() on the authored
+                # PhysxCollisionAPI attrs), which is authoritative for what
+                # PhysX will parse on the next reset/attach. There is no
+                # shape-level tensor/physx-API readback of torsional radius
+                # exposed through isaaclab_physx's RigidBodyView/tensor API
+                # (unlike e.g. the joint-force API used elsewhere in this
+                # probe) -- if one existed it would be the harder proof; USD
+                # readback only confirms what was AUTHORED, not what a live
+                # PxShape resolved internally.
+                readback_source="usd_attribute",
+            )
+
     # bottle base position
     if grasp and "bottle_rel_base" in grasp:
         rel = grasp["bottle_rel_base"]
@@ -1277,6 +1342,18 @@ if "B" in args.phase:
         # it) so PhysX picks up the override on first parse rather than a
         # runtime material swap.
         _author_object_friction(bprim, float(args.object_friction), "set")
+    if args.object_torsional_radius is not None:
+        _radius = float(args.object_torsional_radius)
+        _min_radius = (
+            float(args.object_min_torsional_radius)
+            if args.object_min_torsional_radius is not None
+            else _radius / 2.0
+        )
+        # Author before the physics parse, same rationale as --object-friction
+        # above (PhysxCollisionAPI is a shape-level schema, not a material --
+        # PxShape::setTorsionalPatchRadius refuses while simulation is running,
+        # per the plugin's own error strings, so this must land before reset).
+        _author_object_torsional(bprim, _radius, _min_radius, "set")
     # Spawn 2 cm above the support: a body that never attached to PhysX stays
     # exactly at the authored pose, a live one drops onto the support.
     DROP = 0.02
@@ -1293,6 +1370,11 @@ if "B" in args.phase:
         # Post-play readback: confirm what PhysX actually resolved (collider's
         # own binding vs. an inherited ancestor binding).
         _check_object_friction(bprim, "check")
+    if args.object_torsional_radius is not None:
+        # Post-play readback: confirm the authored attrs survived the physics
+        # parse/reset (USD attribute Get(); see _check_object_torsional's note
+        # on why this isn't a live PhysX-side readback).
+        _check_object_torsional(bprim, "check")
     from isaaclab_physx.physics import PhysxManager
 
     view = PhysxManager.get_physics_sim_view().create_rigid_body_view(bottle_path)
