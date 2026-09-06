@@ -970,16 +970,33 @@ class IsaacWholeRobotBackend:
         #         further but the object is what is stopping it).
         #       PRESS -> the six targets (drive_joint + the five mimic
         #         followers) freeze at their OWN measured angles, then are
-        #         advanced together by TINKER_SIM_GRIPPER_PRESS_STEP rad per
-        #         control tick while the pad-force sum stays below
-        #         TINKER_SIM_GRIPPER_HOLD_FORCE_N, up to a total extra travel
-        #         of TINKER_SIM_GRIPPER_PRESS_CAP rad. This is a bounded
-        #         closed-loop nudge, not a one-shot static lead: freeze3-
-        #         result.md #4 found a static lead relaxes to near-zero force
-        #         as the compliant multi-link mimic linkage settles onto it
-        #         (k1500 followers converge to within 1e-4 rad of the frozen
-        #         target), so it must keep nudging while under the target
-        #         force the way the real motor's current limit would.
+        #         PEAK-HOLD advanced: each control tick, all six are nudged
+        #         together by TINKER_SIM_GRIPPER_PRESS_STEP rad only while the
+        #         pad-force sum -- smoothed over the trailing two ticks, to
+        #         filter single-tick contact noise -- is still RISING versus
+        #         the previous tick's smoothed value. The instant two
+        #         consecutive ticks show the smoothed force FALLING, or the
+        #         smoothed force reaches TINKER_SIM_GRIPPER_HOLD_FORCE_N, the
+        #         press stops and backs the six targets off by one
+        #         TINKER_SIM_GRIPPER_PRESS_STEP (restoring the previous
+        #         tick's targets) before entering HOLD. Travel never exceeds
+        #         TINKER_SIM_GRIPPER_PRESS_CAP rad (a hard safety bound
+        #         entered directly, no backoff, since hitting it is not an
+        #         overshoot signal). This is a bounded closed-loop nudge, not
+        #         a one-shot static lead: freeze3-result.md #4 found a static
+        #         lead relaxes to near-zero force as the compliant multi-link
+        #         mimic linkage settles onto it (k1500 followers converge to
+        #         within 1e-4 rad of the frozen target), so it must keep
+        #         nudging while under the target force the way the real
+        #         motor's current limit would. Round-1 acceptance
+        #         (stallfreeze-result.md, task20-decay-probe-findings.md)
+        #         found that driving unconditionally to a fixed cap instead
+        #         of stopping at the force's own peak slides the pads around
+        #         the object and COLLAPSES the clamp (19.7N plateau -> 4.6N
+        #         after a 0.06 rad press) -- peak-hold stops at the highest
+        #         force actually achieved and backs off one increment from
+        #         it, so the hold sits near the plateau's own clamp instead
+        #         of driving through it.
         #       HOLD -> targets frozen; the ramp and mirror do not run. This
         #         is what command_target_state() echoes to the facade while
         #         holding (it reads _position_targets directly).
@@ -1029,7 +1046,7 @@ class IsaacWholeRobotBackend:
                 self._gripper_hold_force_n = max(0.0, float(_v))
         except (TypeError, ValueError):
             pass
-        self._gripper_press_cap = 0.06
+        self._gripper_press_cap = 0.02
         try:
             _v = _os.environ.get("TINKER_SIM_GRIPPER_PRESS_CAP")
             if _v is not None and _v.strip():
@@ -1046,6 +1063,14 @@ class IsaacWholeRobotBackend:
         self._gsf_baseline: dict[int, float] = {}
         self._gsf_travel = 0.0
         self._gsf_last_command: float | None = None
+        # PRESS peak-hold bookkeeping (round 2, see the PRESS state comment
+        # above): a 2-tick pad-force smoothing window, the previous tick's
+        # smoothed value (None until the first PRESS tick), and a run count
+        # of consecutive ticks the smoothed value has been strictly falling.
+        self._gsf_force_hist: "collections.deque[float]" = collections.deque(maxlen=2)
+        self._gsf_smoothed_prev: float | None = None
+        self._gsf_decrease_run = 0
+        self._gsf_peak_smoothed: float | None = None
         articulation_props = None
         if solver_position is not None or solver_velocity is not None:
             articulation_props = sim_utils.ArticulationRootPropertiesCfg(
@@ -2872,33 +2897,114 @@ class IsaacWholeRobotBackend:
             self._position_targets[0, idx] = value
         self._gsf_baseline = baseline
         self._gsf_travel = 0.0
+        # Seed the peak-hold smoothing window from this same plateau sample
+        # so the very first PRESS tick's 2-tick average already has a real
+        # previous value to compare against, instead of treating tick 1 as
+        # an automatic rise.
+        self._gsf_force_hist = collections.deque([force], maxlen=2)
+        self._gsf_smoothed_prev = force
+        self._gsf_decrease_run = 0
+        self._gsf_peak_smoothed = force
         self._gsf_state = "press"
         self._gripper_stall_freeze_log("press", drive=measured_drive, pad_force_n=force, travel=0.0)
 
     def _gripper_stall_freeze_press_tick(self) -> None:
-        """PRESS-state per-tick advance.
+        """PRESS-state per-tick advance -- PEAK-HOLD.
 
-        Nudges the six frozen targets together by
-        TINKER_SIM_GRIPPER_PRESS_STEP rad while the pad-force sum stays below
-        TINKER_SIM_GRIPPER_HOLD_FORCE_N, up to a total extra travel of
-        TINKER_SIM_GRIPPER_PRESS_CAP rad -- a bounded closed-loop nudge (not
-        a one-shot static lead, which freeze3-result.md #4 found relaxes to
-        near-zero force as the compliant mimic linkage settles onto it).
-        Transitions PRESS -> HOLD once either bound is reached.
+        Advances the six frozen targets by TINKER_SIM_GRIPPER_PRESS_STEP rad
+        only while the pad-force sum, smoothed over the trailing two ticks
+        (to filter single-tick contact noise), is still rising versus the
+        previous tick's smoothed value -- flat (equal) counts as still
+        rising, so a force that never moves still walks the cap rather than
+        stalling forever. The moment two CONSECUTIVE ticks show the smoothed
+        force strictly falling, or the smoothed force reaches
+        TINKER_SIM_GRIPPER_HOLD_FORCE_N, the press stops, backs the six
+        targets off by one TINKER_SIM_GRIPPER_PRESS_STEP (restoring the
+        previous tick's targets), and transitions to HOLD. Travel is also
+        hard-capped at TINKER_SIM_GRIPPER_PRESS_CAP rad, entered directly
+        with no backoff since hitting a safety bound while still rising is
+        not an overshoot signal.
+
+        Round-1 acceptance (stallfreeze-result.md,
+        task20-decay-probe-findings.md) found that driving unconditionally
+        to a fixed travel cap instead of stopping at the force's own peak
+        slides the pads around the object and the pad-force sum COLLAPSES
+        (19.7N plateau -> 4.6N after a 0.06 rad press). Peak-hold stops at
+        the highest force actually achieved and backs off one increment, so
+        the hold sits near the plateau's own clamp instead of driving
+        through it.
         """
-        force = self._gripper_grip_force()
+        raw_force = self._gripper_grip_force()
+        hist = getattr(self, "_gsf_force_hist", None)
+        if not isinstance(hist, collections.deque) or hist.maxlen != 2:
+            hist = collections.deque(maxlen=2)
+            self._gsf_force_hist = hist
+        hist.append(raw_force)
+        smoothed = sum(hist) / len(hist)
+        current_peak = getattr(self, "_gsf_peak_smoothed", None)
+        self._gsf_peak_smoothed = smoothed if current_peak is None else max(current_peak, smoothed)
+        hold_force = self._gripper_hold_force_n
         cap = self._gripper_press_cap
-        if force < self._gripper_hold_force_n and self._gsf_travel < cap:
+        prev_smoothed = getattr(self, "_gsf_smoothed_prev", None)
+
+        if smoothed >= hold_force:
+            self._gripper_stall_freeze_press_peak_hold(smoothed, reason="target")
+            return
+
+        rising = prev_smoothed is None or smoothed >= prev_smoothed
+        if rising:
+            self._gsf_decrease_run = 0
+            self._gsf_smoothed_prev = smoothed
+            if self._gsf_travel >= cap:
+                self._gripper_stall_freeze_press_peak_hold(smoothed, reason="cap", backoff=False)
+                return
             self._gsf_travel = min(cap, self._gsf_travel + self._gripper_press_step)
             for idx, base in self._gsf_baseline.items():
                 self._position_targets[0, idx] = base + self._gsf_travel
             return
+
+        # Strictly falling this tick.
+        self._gsf_decrease_run = getattr(self, "_gsf_decrease_run", 0) + 1
+        self._gsf_smoothed_prev = smoothed
+        if self._gsf_decrease_run >= 2:
+            self._gripper_stall_freeze_press_peak_hold(smoothed, reason="decrease")
+
+    def _gripper_stall_freeze_press_peak_hold(
+        self, smoothed_force: float, *, reason: str, backoff: bool = True
+    ) -> None:
+        """Stop PRESS and transition to HOLD (see
+        _gripper_stall_freeze_press_tick for the full peak-hold model).
+
+        When ``backoff`` is true (the "target" and "decrease" exits), the
+        six frozen targets are first pulled back by one
+        TINKER_SIM_GRIPPER_PRESS_STEP -- restoring exactly the previous
+        tick's targets, since no advance happens on a non-rising tick -- so
+        the hold sits one increment short of whatever pushed the force past
+        its peak. ``backoff=False`` is the "cap" exit only: hitting
+        TINKER_SIM_GRIPPER_PRESS_CAP while the force is still rising is a
+        hard safety bound, not an overshoot signal, so travel is left at
+        the cap. Logs the transition with both the current smoothed force
+        (``pad_force_n``) and the highest smoothed force this PRESS ever
+        reached (``peak_force_n``) alongside the final travel.
+        """
+        if backoff and self._gsf_travel > 0.0:
+            self._gsf_travel = max(0.0, self._gsf_travel - self._gripper_press_step)
+            for idx, base in self._gsf_baseline.items():
+                self._position_targets[0, idx] = base + self._gsf_travel
         self._gsf_state = "hold"
         drive_index = getattr(self, "_drive_joint_index", None)
         drive_value = self._gsf_baseline.get(drive_index) if drive_index is not None else None
         if drive_value is not None:
             drive_value = drive_value + self._gsf_travel
-        self._gripper_stall_freeze_log("hold", drive=drive_value, pad_force_n=force, travel=self._gsf_travel)
+        peak = getattr(self, "_gsf_peak_smoothed", smoothed_force)
+        self._gripper_stall_freeze_log(
+            "hold",
+            drive=drive_value,
+            pad_force_n=smoothed_force,
+            travel=self._gsf_travel,
+            reason=reason,
+            peak_force_n=peak,
+        )
 
     def _gripper_stall_freeze_release(self) -> None:
         """Exit PRESS/HOLD back to CLOSING (see _gripper_stall_freeze_gate).
@@ -2919,6 +3025,10 @@ class IsaacWholeRobotBackend:
         self._gsf_travel = 0.0
         self._gsf_contact_run = 0
         self._gsf_drive_hist.clear()
+        self._gsf_force_hist.clear()
+        self._gsf_smoothed_prev = None
+        self._gsf_decrease_run = 0
+        self._gsf_peak_smoothed = None
 
     def _gripper_stall_freeze_reset_after_rebind(self) -> None:
         """Reset the #20 stall-freeze state machine on a GENUINE reset rebind.
@@ -2963,6 +3073,12 @@ class IsaacWholeRobotBackend:
         hist = getattr(self, "_gsf_drive_hist", None)
         if hist is not None:
             hist.clear()
+        force_hist = getattr(self, "_gsf_force_hist", None)
+        if force_hist is not None:
+            force_hist.clear()
+        self._gsf_smoothed_prev = None
+        self._gsf_decrease_run = 0
+        self._gsf_peak_smoothed = None
         self._gsf_last_command = None
         self._gripper_stall_freeze_log(
             "reset", drive=None, pad_force_n=0.0, travel=0.0, reason="rebind"
@@ -2976,6 +3092,7 @@ class IsaacWholeRobotBackend:
         pad_force_n: float,
         travel: float,
         reason: str | None = None,
+        peak_force_n: float | None = None,
     ) -> None:
         try:
             t = round(self.simulation_time, 4)
@@ -2991,6 +3108,8 @@ class IsaacWholeRobotBackend:
         }
         if reason is not None:
             payload["reason"] = reason
+        if peak_force_n is not None:
+            payload["peak_force_n"] = peak_force_n
         print(json.dumps(payload, sort_keys=True), flush=True)
 
     def step(self) -> None:

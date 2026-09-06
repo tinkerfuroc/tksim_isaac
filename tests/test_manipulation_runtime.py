@@ -239,6 +239,10 @@ def _gsf_backend(control_hz: float = 120.0) -> IsaacWholeRobotBackend:
     backend._gsf_baseline = {}
     backend._gsf_travel = 0.0
     backend._gsf_last_command = None
+    backend._gsf_force_hist = collections.deque(maxlen=2)
+    backend._gsf_smoothed_prev = None
+    backend._gsf_decrease_run = 0
+    backend._gsf_peak_smoothed = None
     backend._gripper_grip_force = lambda: 0.0
     return backend
 
@@ -2670,10 +2674,14 @@ class ManipulationRuntimeTest(unittest.TestCase):
             backend._gripper_stall_freeze_gate()
         self.assertEqual(backend._gsf_state, "press")
 
-    def test_gripper_stall_freeze_press_advances_to_hold_force(self) -> None:
-        """PRESS nudges all six frozen targets together by the press step
-        while pad force stays below the hold-force floor, and stops (HOLD)
-        the moment the (mocked) force reaches it."""
+    def test_gripper_stall_freeze_press_peak_hold_backs_off_on_decrease(self) -> None:
+        """PRESS is peak-hold, not press-to-force-floor (#20 round 2): advance
+        only while the 2-tick-smoothed pad force is still rising, and back
+        the six frozen targets off by one PRESS_STEP the instant two
+        consecutive ticks show the smoothed force falling -- the round-1
+        acceptance finding (stallfreeze-result.md) that driving past the
+        force's own peak just slides the pads and COLLAPSES the clamp
+        (19.7N plateau -> 4.6N after pressing to the old fixed cap)."""
         backend = _gsf_backend()
         backend._ramp_drive_target = lambda: None
         backend._mirror_gripper_mimic_targets = lambda: None
@@ -2681,21 +2689,70 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._gsf_last_command = backend._drive_command_target  # already in sync (no spurious release)
         backend._gsf_baseline = {i: 0.25 for i in range(6)}
         backend._gsf_travel = 0.0
-        force = {"n": 0.0}
-        backend._gripper_grip_force = lambda: force["n"]
+        # Rises tick-over-tick to a peak, then falls for two consecutive
+        # ticks (smoothed over a trailing 2-tick window): raw 5,10,15,20,18
+        # smooths to 5,7.5,12.5,17.5,19.0 (still rising -- the 2-tick average
+        # keeps climbing even though the raw force dipped at 18), then
+        # 14,10 smooths to 16.0,12.0 -- two straight smoothed decreases.
+        # Peak smoothed value (19.0) is reached at travel 0.010; the
+        # sustained decrease then backs that off by one 0.002 step to 0.008.
+        forces = [5.0, 10.0, 15.0, 20.0, 18.0, 14.0, 10.0]
+        calls = {"i": -1}
+
+        def _force() -> float:
+            calls["i"] += 1
+            return forces[min(calls["i"], len(forces) - 1)]
+
+        backend._gripper_grip_force = _force
 
         ticks = 0
-        while backend._gsf_state == "press" and ticks < 100:
-            force["n"] += 5.0
+        while backend._gsf_state == "press" and ticks < 50:
             backend._gripper_stall_freeze_gate()
             ticks += 1
 
         self.assertEqual(backend._gsf_state, "hold")
-        travel = backend._gsf_travel
-        self.assertGreater(travel, 0.0)
-        self.assertLessEqual(travel, backend._gripper_press_cap)
+        self.assertAlmostEqual(backend._gsf_travel, 0.008, places=6)
         for idx in range(6):
-            self.assertAlmostEqual(float(backend._position_targets[0, idx]), 0.25 + travel, places=6)
+            self.assertAlmostEqual(
+                float(backend._position_targets[0, idx]), 0.25 + 0.008, places=6
+            )
+
+    def test_gripper_stall_freeze_press_backs_off_at_hold_force_target(self) -> None:
+        """Reaching TINKER_SIM_GRIPPER_HOLD_FORCE_N (smoothed) while still
+        rising also stops PRESS and backs off one step, same as a sustained
+        decrease -- the target is a stop condition, not a licence to leave
+        the last advance in place."""
+        backend = _gsf_backend()
+        backend._ramp_drive_target = lambda: None
+        backend._mirror_gripper_mimic_targets = lambda: None
+        backend._gsf_state = "press"
+        backend._gsf_last_command = backend._drive_command_target
+        backend._gsf_baseline = {i: 0.25 for i in range(6)}
+        backend._gsf_travel = 0.0
+        backend._gripper_hold_force_n = 25.0
+        # raw 20,25,25,... smooths to 20, 22.5, then 25.0 -- hits the target
+        # on tick 3 while still rising, one tick after the travel=0.004
+        # advance; back-off restores travel to 0.002.
+        forces = [20.0, 25.0]
+        calls = {"i": -1}
+
+        def _force() -> float:
+            calls["i"] += 1
+            return forces[min(calls["i"], len(forces) - 1)]
+
+        backend._gripper_grip_force = _force
+
+        ticks = 0
+        while backend._gsf_state == "press" and ticks < 50:
+            backend._gripper_stall_freeze_gate()
+            ticks += 1
+
+        self.assertEqual(backend._gsf_state, "hold")
+        self.assertAlmostEqual(backend._gsf_travel, 0.002, places=6)
+        for idx in range(6):
+            self.assertAlmostEqual(
+                float(backend._position_targets[0, idx]), 0.25 + 0.002, places=6
+            )
 
     def test_gripper_stall_freeze_press_cap_stops_travel(self) -> None:
         """With pad force pinned well below the hold-force floor, PRESS must

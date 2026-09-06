@@ -134,6 +134,109 @@ retained through lift -- the two criteria the freeze3.md legs split between
 wraps that chain with `SF_EXIT=`/`SF_CHAIN_DONE` markers for a follow-up GPU
 session to run.
 
+## 2026-09-06 — Task #20 round 2: PRESS is peak-hold, not press-to-force-floor (post-round-1 acceptance)
+
+**Round-1 result** (`$TMP/stallfreeze-result.md`, `task20-decay-probe-findings.md`
+"acceptance round 1"): the bottle leg's PRESS ran unconditionally to the
+fixed `TINKER_SIM_GRIPPER_PRESS_CAP` (0.06 rad) in 0.26s, and the pad-force
+sum COLLAPSED from a 19.7N plateau to 4.6N -- retained on lift (dz +4mm, no
+fall) but tilt 7-8 deg and hold force only 1.7-5N, both outside the accepted
+band. The finding: pressing PAST the plateau's own peak is exactly the
+motion that slides the pads around the object -- the maximum achievable
+static pinch is at the plateau itself (while the PD error is still loaded);
+advancing further only helps if force is still genuinely climbing, and any
+further travel once force starts falling is pure overshoot.
+
+**Fix.** `_gripper_stall_freeze_press_tick` (backend.py) no longer presses
+to a fixed force floor or fixed cap unconditionally. It is now PEAK-HOLD:
+each control tick, the six frozen targets advance by
+`TINKER_SIM_GRIPPER_PRESS_STEP` only while the pad-force sum -- smoothed
+over the trailing two ticks, to filter single-tick contact noise -- is
+still rising (flat counts as rising, so a force that never moves still
+walks the travel cap instead of stalling forever) versus the previous
+tick's smoothed value. The moment two CONSECUTIVE ticks show the smoothed
+force strictly falling, or the smoothed force reaches
+`TINKER_SIM_GRIPPER_HOLD_FORCE_N`, PRESS stops, backs the six targets off
+by one `PRESS_STEP` (restoring exactly the previous tick's targets, since a
+non-rising tick never advances), and transitions to HOLD -- landing one
+increment short of whatever pushed the force past its own peak, instead of
+continuing to drive through it. `TINKER_SIM_GRIPPER_PRESS_CAP`'s default
+dropped from 0.06 to 0.02 rad: it is now a hard safety bound only (entered
+directly, no backoff, since hitting it while still rising is not an
+overshoot signal), not the routine stopping point PRESS used to reach on
+every close. Both exits log the transition with the current smoothed force
+(`pad_force_n`), the peak smoothed force this PRESS ever reached
+(`peak_force_n`), the final `travel`, and a `reason` (`"target"`,
+`"decrease"`, or `"cap"`).
+
+**Tests** (`tests/test_manipulation_runtime.py`): the old
+`test_gripper_stall_freeze_press_advances_to_hold_force` (press-to-force-
+floor) is replaced by
+`test_gripper_stall_freeze_press_peak_hold_backs_off_on_decrease`, which
+feeds a mocked pad-force series that rises then falls (raw 5,10,15,20,18
+smooths to a still-rising 5/7.5/12.5/17.5/19.0, then 14,10 smooths to a
+falling 16.0/12.0) and asserts PRESS stops at travel 0.008 -- one
+`PRESS_STEP` back from the 0.010 peak -- not the old fixed-cap value. This
+test FAILS against 1b502fb (pre-round-2, confirmed by temporarily
+reverting only `backend.py` and rerunning `-k
+test_gripper_stall_freeze_press_peak_hold_backs_off_on_decrease` before
+restoring the fix):
+```
+AssertionError: 0.06 != 0.008 within 6 places (0.052 difference)
+```
+(1b502fb's press-to-force-floor logic ran unconditionally to the fixed cap
+since the mocked force never reaches the 25N hold floor.) A new
+`test_gripper_stall_freeze_press_backs_off_at_hold_force_target` covers the
+other backoff path (reaching `HOLD_FORCE_N` while still rising also backs
+off one step, not just a sustained decrease). `test_gripper_stall_freeze_
+press_cap_stops_travel` (kept, unchanged assertions) still passes: a force
+pinned constant is "still rising" (non-strict) every tick, so it walks the
+cap exactly as before. Full suite: `tests/test_manipulation_runtime.py` 118
+passed, 3 subtests passed, 0 failed (via the pytest-suite-ros-env-
+incantation memory: no `set -u`, a lark-only symlink dir + `/opt/ros/humble/
+local/lib/python3.10/dist-packages` on `PYTHONPATH`,
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`).
+
+**Staged acceptance leg (c) fix.** Round 1's YCB sugar_box leg never
+exercised the fix: it spawned already tipped 94 deg
+(`$TMP/stallfreeze_box_full.log`), aborting before any close. Root-caused
+offline (no GPU) with a standalone `pxr` bbox read of the referenced
+sugar_box asset (`Usd.Stage.Open` + `UsdGeom.BBoxCache`, no Isaac/renderer
+needed): local/world AABB (identity xform) x:[-0.0322,0.0173]
+(0.0495m), y:[-0.0638,0.0304] (0.0942m -- the "0.094m face" across the
+probe's Y closing axis), z:[0.00003,0.1760] (origin at the geometric
+bottom, off-center in x/y). Round 1's `--object-offset 0.0075,0.0167`
+already compensated that off-center origin correctly (matches the measured
+centroid offset to <0.1mm) -- not the bug. Round 1 also kept `--object
+bottle` even though `--object-usda` pointed at the sugar_box, so the
+probe's `if args.object != "bottle": _bxf.AddRotateZOp(...)` guard silently
+skipped the (unused) auto-computed 179 deg yaw; checked whether that
+mattered and it did not (identity already puts local Y, 0.094m, onto world
+Y, the confirmed closing axis) -- but round 2 pins it down explicitly
+(`--object plate` to activate the yaw-apply branch + `--object-yaw-deg 0`)
+instead of relying on an accidental skip. The actual likely cause: the
+probe centers its square support pedestal on the object's raw ORIGIN, not
+its footprint centroid, so covering the asymmetric Y reach (0.0638m one
+side) with `--pedestal 0.14` (half-width 0.07) also reaches 0.07m in X --
+putting the pedestal's near edge just 1.4mm from the finger pivot x
+logged in `staged` (0.4733m), plausibly grazing the open gripper's
+finger/knuckle hardware at spawn and matching the 8.3N of contact force
+`stallfreeze_box_full.log` shows while drive was still ~0 (fully open, no
+close yet). Round 2 right-sizes `--pedestal` to 0.13 (half-width 0.065,
+just covering the 0.0638m reach) for ~6.4mm of pivot clearance instead of
+1.4mm; `--object-offset`/`--tcp-above-top` are unchanged (already verified
+correct). This is a reasoned, offline best-effort fix, not a live-verified
+one -- the real verdict is the next GPU run's leg (c) log.
+
+`$TMP/stallfreeze_chain.sh` is updated in place: `REPO_ROOT` now points at
+this worktree, leg (c)'s args are the placement fix above, its outputs
+renamed to the `stallfreeze2_*` family, and its final markers renamed
+`SF2_EXIT_A/B/C=`, `SF2_EXIT=`, `SF2_CHAIN_DONE` (from `SF_EXIT_A/B/C=`,
+`SF_EXIT=`, `SF_CHAIN_DONE`) so a stale round-1 log can't be mistaken for a
+round-2 result. A new `$TMP/stallfreeze2_launch.sh` (parallel to round 1's
+`stallfreeze_launch.sh`) wraps it into `$TMP/stallfreeze2.log` with those
+SF2 markers for a follow-up GPU session to launch and poll.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported
