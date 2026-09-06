@@ -63,6 +63,7 @@ parser.add_argument("--max-lead", type=float, default=None, help="override backe
 parser.add_argument("--stall-speed", type=float, default=None, help="override backend._gripper_stall_speed")
 parser.add_argument("--drive-effort-limit", type=float, default=None, help="raise the drive_joint effort ceiling (Nm) to sweep the clamp force; URDF default 50. The bench close is capped at this ceiling, so this is the only way to press past 50 Nm")
 parser.add_argument("--follower-effort-limit", type=float, default=None, help="cap the effort ceiling (Nm) of the five gripper mimic/follower joints; backend default 180 (ImplicitActuatorCfg effort_limit_sim for gripper_mimic). #20: the follower cap (180) out-pushing the drive cap (50/--drive-effort-limit) is a suspect for the post-clamp ratchet, so this lets a trial pin the followers at or below the drive ceiling")
+parser.add_argument("--trace-contacts", action="store_true", help="record EVERY contact pair touching the probe object's body (knuckles, palm, table/pedestal -- not just the pads the backend normally monitors), with point/normal, via backend.py's TINKER_SIM_CONTACT_TRACE_BODIES; written into every row under 'trace'. Default off, no cost.")
 parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
 parser.add_argument("--object-usda", default="")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
@@ -132,6 +133,12 @@ manifest = Path(current["manifest"])
 if not manifest.is_absolute():
     manifest = ROOT / manifest
 t0 = time.time()
+if args.trace_contacts:
+    # The probe object always lands at /World/Probe/Bottle regardless of
+    # --object (bottle/knife/plate) -- see the bprim = stage.DefinePrim(...)
+    # below -- so the traced body name is always "Bottle". Must be set before
+    # the backend (and its contact-report subscription) is constructed.
+    os.environ["TINKER_SIM_CONTACT_TRACE_BODIES"] = "Bottle"
 backend = IsaacWholeRobotBackend(
     usd_path=manifest.parent / "robot.usd",
     map_yaml=None,
@@ -840,6 +847,25 @@ if args.descend_from > 0.0:
     emit(event="staged_high", settle_s=st, tcp=stage_tcp, dz=stage_tcp[2] - tcp_p[2], pose=stage_pose)
 
 
+def trace_pairs() -> list[dict[str, object]]:
+    """--trace-contacts: every contact pair touching the probe object's body
+    (knuckles, palm, table/pedestal -- not just the pads the backend normally
+    monitors), with point/normal. Empty (and free) unless --trace-contacts."""
+    if not args.trace_contacts or not hasattr(backend, "contact_trace_pairs"):
+        return []
+    out = []
+    for p in backend.contact_trace_pairs():
+        out.append({
+            "body_a": str(p["body_a"]).split("/")[-1],
+            "body_b": str(p["body_b"]).split("/")[-1],
+            "force": round(float(p["normal_force"]), 3),
+            "n_points": int(p.get("point_count", 0)),
+            "points": [[round(float(v), 5) for v in pt] for pt in p.get("points", [])],
+            "normals": [[round(float(v), 5) for v in n] for n in p.get("normals", [])],
+        })
+    return out
+
+
 def descend(duration_s: float) -> dict[str, object]:
     """Interpolate stage_pose -> arm_pose in joint space, then hold 1 s; report the TCP z reached."""
     n = max(1, int(duration_s / DT))
@@ -929,6 +955,8 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
             "tau": {n: round(v, 3) for n, v in taus.items()},
             "pos": {n: round(g[n][0], 4) for n in FOLLOWERS},
         }
+        if args.trace_contacts:
+            r["trace"] = trace_pairs()
         if bottle_reader is not None:
             b = bottle_reader()
             r["bottle"] = b

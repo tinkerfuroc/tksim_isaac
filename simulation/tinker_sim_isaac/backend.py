@@ -570,6 +570,19 @@ class IsaacWholeRobotBackend:
         self._spawn_attach_watch: dict[str, dict[str, int]] = {}
         self._spawn_attach_step = 0
         self._contact_pairs_by_key: dict[tuple[int, int, int, int], dict[str, object]] = {}
+        # TINKER_SIM_CONTACT_TRACE_BODIES=Bottle,left_inner_knuckle -- when set,
+        # any contact pair where either actor's trailing body/prim name matches
+        # one of these (comma-separated) names is recorded regardless of the
+        # ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES monitored set, with the raw
+        # per-sample contact points kept (not just the force-weighted average)
+        # so a probe can see every pair touching an object, not only the pads.
+        # Unset (default) costs nothing and leaves existing behavior untouched.
+        self._contact_trace_bodies = frozenset(
+            item.strip()
+            for item in os.environ.get("TINKER_SIM_CONTACT_TRACE_BODIES", "").split(",")
+            if item.strip()
+        )
+        self._contact_trace_pairs_by_key: dict[tuple[int, int, int, int], dict[str, object]] = {}
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
         )
@@ -3143,6 +3156,15 @@ class IsaacWholeRobotBackend:
         """Return active PhysX reports with both rigid-body identities."""
         return [dict(pair) for pair in self._contact_pairs_by_key.values()]
 
+    def contact_trace_pairs(self) -> list[dict[str, object]]:
+        """Return every active contact pair touching a TINKER_SIM_CONTACT_TRACE_BODIES
+        body, independent of ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES monitoring.
+        Empty unless the env var is set. Each record carries the same
+        force-weighted "point"/"normal" as contact_pairs(), plus the raw
+        per-sample "points" (up to 4) and "point_count" for the full pair.
+        """
+        return [dict(pair) for pair in self._contact_trace_pairs_by_key.values()]
+
     @staticmethod
     def _contact_vector(value: object) -> list[float]:
         return [float(value[index]) for index in range(3)]  # type: ignore[index]
@@ -3164,6 +3186,7 @@ class IsaacWholeRobotBackend:
             event_type = header.type  # type: ignore[attr-defined]
             if event_type == self._contact_event_lost:
                 self._contact_pairs_by_key.pop(key, None)
+                self._contact_trace_pairs_by_key.pop(key, None)
                 continue
             if event_type not in {
                 self._contact_event_found,
@@ -3171,13 +3194,19 @@ class IsaacWholeRobotBackend:
             }:
                 continue
             actors = tuple(self._contact_path_decoder(path_id) for path_id in actor_ids)
-            if not monitored.intersection(actors):
+            is_monitored = bool(monitored.intersection(actors))
+            is_traced = bool(self._contact_trace_bodies) and any(
+                actor.rsplit("/", 1)[-1] in self._contact_trace_bodies
+                for actor in actors
+            )
+            if not is_monitored and not is_traced:
                 continue
             offset = int(header.contact_data_offset)  # type: ignore[attr-defined]
             count = int(header.num_contact_data)  # type: ignore[attr-defined]
             samples = [contact_data[index] for index in range(offset, offset + count)]  # type: ignore[index]
             if not samples:
                 self._contact_pairs_by_key.pop(key, None)
+                self._contact_trace_pairs_by_key.pop(key, None)
                 continue
             normal_impulses: list[tuple[float, list[float], int]] = []
             for sample_index, sample in enumerate(samples):
@@ -3198,6 +3227,7 @@ class IsaacWholeRobotBackend:
             normal_force = sum(value[0] for value in normal_impulses) / self.dt
             if normal_force <= self.CONTACT_FORCE_THRESHOLD:
                 self._contact_pairs_by_key.pop(key, None)
+                self._contact_trace_pairs_by_key.pop(key, None)
                 continue
             points = [self._contact_vector(sample.position) for sample in samples]
             point = [sum(values) / len(values) for values in zip(*points)]
@@ -3215,13 +3245,29 @@ class IsaacWholeRobotBackend:
                 # largest contribution, with source order as the tie-breaker, is
                 # deterministic and preserves an actual PhysX-reported normal.
                 normal = max(normal_impulses, key=lambda item: (item[0], -item[2]))[1]
-            self._contact_pairs_by_key[key] = {
-                "body_a": actors[0],
-                "body_b": actors[1],
-                "normal_force": normal_force,
-                "point": point,
-                "normal": normal,
-            }
+            if is_monitored:
+                self._contact_pairs_by_key[key] = {
+                    "body_a": actors[0],
+                    "body_b": actors[1],
+                    "normal_force": normal_force,
+                    "point": point,
+                    "normal": normal,
+                }
+            else:
+                self._contact_pairs_by_key.pop(key, None)
+            if is_traced:
+                self._contact_trace_pairs_by_key[key] = {
+                    "body_a": actors[0],
+                    "body_b": actors[1],
+                    "normal_force": normal_force,
+                    "point": point,
+                    "normal": normal,
+                    "points": points[:4],
+                    "normals": [item[1] for item in normal_impulses][:4],
+                    "point_count": len(points),
+                }
+            else:
+                self._contact_trace_pairs_by_key.pop(key, None)
 
     @classmethod
     def is_arm_scenario_collision(
