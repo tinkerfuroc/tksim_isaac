@@ -4,6 +4,75 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #28: contact reporting only sees the arm and the fingers, not the gripper base or the wrist camera
+
+**Why.** A bench round on `agv` pushed the target object with the robot but
+could not tell *who* pushed it: `_on_contact_report_event`
+(`simulation/tinker_sim_isaac/backend.py`) only records a pair when one
+actor's trailing prim name is in `ARM_CONTACT_BODIES` (`link1..link7`) or
+`GRASP_CONTACT_BODIES` (`left_finger`, `right_finger`, `link_tcp`) — a shove
+from the gripper base, the wrist-camera housing, or anything else past
+`link7` was invisible on `contact_pairs()`/`contact_state()`, and there was
+no way to get the raw per-sample contact points (only the force-weighted
+average) to see where on an object it was pushed.
+
+**Fix: two env-gated additions to the same monitored-pair path, no change
+to default behavior.**
+
+- `TINKER_SIM_CONTACT_EXTRA_BODIES` (comma-separated body names, default
+  empty): adds these names to the boot-time monitored set alongside
+  `ARM_CONTACT_BODIES`/`GRASP_CONTACT_BODIES`, so their pairs are recorded
+  by `contact_pairs()` and aggregated by `contact_state()` under their own
+  name key, the same mechanism `GRASP_CONTACT_BODIES` already use.
+  `left_finger`/`right_finger` aggregation is untouched — this only adds new
+  keys. Unset, `self._contact_extra_bodies == ()` and the monitored set is
+  byte-identical to before.
+- `TINKER_SIM_CONTACT_TRACE_BODIES` (comma-separated names, default empty,
+  ported from a local validation branch, commit 045bf77): any pair where
+  either actor's trailing name matches is recorded on a separate
+  `contact_trace_pairs()` accessor regardless of the monitored set, keeping
+  up to 4 raw per-sample points/normals (`points`, `normals`,
+  `point_count`) instead of only the force-weighted average — for pointing
+  a probe at one object and seeing every pair that touches it, with where.
+  This does not add entries to `contact_pairs()`/`contact_state()`.
+
+Both are logged once at boot as a `contact_bodies` JSON line (next to the
+subscribe call, `enable_contacts` branch) so a live run can confirm which
+bodies are covered without reading source: `{"event": "contact_bodies",
+"arm": [...], "grasp": [...], "extra": [...], "trace": [...]}`.
+
+**Resolved body names for the bench.** The robot's link names come straight
+from `integration/model-bundle-r2/simulator_full_urdf/source-tinker-full.urdf`
+(the sim's `/World/Tinker/{name}` prims are 1:1 with this URDF's `<link>`
+names — `ARM_CONTACT_BODIES`/`GRASP_CONTACT_BODIES` are already exact
+matches to `link1..link7`/`left_finger`/`right_finger`/`link_tcp` there).
+Walking the fixed-joint chain past `link7`:
+- Gripper base / palm: `xarm_gripper_base_link` (`link_eef` -> `gripper_fix`
+  (fixed) -> `xarm_gripper_base_link`, line 556).
+- Wrist camera housing / cam-stand: `xarm_camera_link` (`link_eef` ->
+  `xarm_camera_joint` (fixed) -> `xarm_camera_bottom_screw_frame` ->
+  `xarm_camera_link_joint` (fixed) -> `xarm_camera_link`, line 947) — this is
+  the only body in that chain with collision geometry (a 0.02505 x 0.09 x
+  0.025 m box), and it is what the `cam-stand` wrist-camera preset
+  (`head_camera_aim.py`) repositions; `cam-stand` itself is a TF/render
+  preset, not a separate rigid body.
+- "Wrist housing" pushes proper (i.e. on `link7` itself) are already visible
+  today via `ARM_CONTACT_BODIES` and need no new env value.
+
+Recommended bench value:
+`TINKER_SIM_CONTACT_EXTRA_BODIES=xarm_gripper_base_link,xarm_camera_link`.
+
+**Tests.** `tests/test_manipulation_runtime.py`: unset-env parity
+(`test_contact_extra_bodies_unset_matches_default_monitored_set`), extra
+bodies recorded and aggregated like a grasp body without touching
+`left_finger`/`right_finger`
+(`test_contact_extra_bodies_env_records_pair_like_grasp_bodies`), and the
+ported trace-bodies tests
+(`test_contact_report_drops_unmonitored_pair_without_trace_env`,
+`test_contact_report_trace_env_records_unmonitored_pair_with_point_and_normal`).
+Full incantation from `pytest-suite-ros-env-incantation`: 109 passed, 3
+subtests passed.
+
 ## 2026-09-06 — Task #25: bound `controller_reconciler`'s post-success teardown so it cannot wedge the launch chain
 
 **Symptom.** In a live GPSR run (`gpsr_stack_logs/20260905T230818`), the
