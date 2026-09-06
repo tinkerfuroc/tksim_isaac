@@ -30,6 +30,7 @@ from tinker_sim_core.command_mux import (
 )
 from tinker_sim_isaac.backend import (
     IsaacWholeRobotBackend,
+    format_spawn_pose_trace,
     resolve_backend_clock_epoch,
     resolve_clock_epoch,
     resolve_spawn_yaw,
@@ -3121,9 +3122,19 @@ class SpawnPoseCheckTest(unittest.TestCase):
         lines = [
             json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
         ]
-        events = [entry["event"] for entry in lines]
+        # Task #30 also emits a "spawn_pose_trace" (stage "after_settle")
+        # line alongside the check -- filter to the check/mismatch events
+        # this test cares about; the trace line's own shape is covered by
+        # SpawnPoseTraceFormatTest.
+        check_lines = [
+            entry
+            for entry in lines
+            if entry["event"] in ("spawn_pose_check", "spawn_pose_mismatch")
+        ]
+        events = [entry["event"] for entry in check_lines]
         self.assertEqual(events, ["spawn_pose_check"])
-        check = lines[0]
+        self.assertIn("spawn_pose_trace", [entry["event"] for entry in lines])
+        check = check_lines[0]
         self.assertTrue(check["ok"])
         self.assertAlmostEqual(check["dxy_m"], 0.0, places=5)
         # float32 root_quat_w round-trip: exact 0 isn't guaranteed.
@@ -3144,9 +3155,14 @@ class SpawnPoseCheckTest(unittest.TestCase):
         lines = [
             json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
         ]
-        events = [entry["event"] for entry in lines]
+        check_lines = [
+            entry
+            for entry in lines
+            if entry["event"] in ("spawn_pose_check", "spawn_pose_mismatch")
+        ]
+        events = [entry["event"] for entry in check_lines]
         self.assertEqual(events, ["spawn_pose_check", "spawn_pose_mismatch"])
-        check, mismatch = lines
+        check, mismatch = check_lines
         self.assertFalse(check["ok"])
         self.assertAlmostEqual(check["dxy_m"], 1.3237, places=3)
         self.assertAlmostEqual(check["dyaw_deg"], 171.0, places=3)
@@ -3174,8 +3190,13 @@ class SpawnPoseCheckTest(unittest.TestCase):
         lines = [
             json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
         ]
-        self.assertEqual([entry["event"] for entry in lines], ["spawn_pose_check"])
-        check = lines[0]
+        check_lines = [
+            entry
+            for entry in lines
+            if entry["event"] in ("spawn_pose_check", "spawn_pose_mismatch")
+        ]
+        self.assertEqual([entry["event"] for entry in check_lines], ["spawn_pose_check"])
+        check = check_lines[0]
         self.assertTrue(check["ok"])
         self.assertAlmostEqual(abs(check["dyaw_deg"]), 4.7662, places=3)
 
@@ -3192,6 +3213,106 @@ class SpawnPoseCheckTest(unittest.TestCase):
             with contextlib.redirect_stdout(captured):
                 with self.assertRaises(RuntimeError):
                     backend._maybe_check_spawn_pose()
+
+
+class SpawnPoseTraceFormatTest(unittest.TestCase):
+    """Task #30: ``spawn_pose_trace`` boot lines instrumenting the
+    initial-state -> reset -> yaw-write -> rebind -> settle sequence the
+    #30 investigation found under-observed. ``format_spawn_pose_trace`` is
+    the pure formatter (no sim needed); ``_log_spawn_pose_trace`` wires it
+    to a backend double's live root pose and an optional distinct
+    ``base_link`` body -- also no sim needed."""
+
+    def test_format_spawn_pose_trace_shape(self) -> None:
+        payload = format_spawn_pose_trace(
+            "after_reset",
+            1.5,
+            [-2.0, -2.0, 0.0775],
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        self.assertEqual(payload["event"], "spawn_pose_trace")
+        self.assertEqual(payload["stage"], "after_reset")
+        self.assertEqual(payload["t"], 1.5)
+        self.assertEqual(payload["root_pos"], [-2.0, -2.0, 0.0775])
+        self.assertAlmostEqual(payload["root_yaw_deg"], 0.0, places=6)
+        self.assertNotIn("base_link_pos", payload)
+        self.assertNotIn("base_link_yaw_deg", payload)
+        self.assertNotIn("via", payload)
+        self.assertNotIn("reason", payload)
+
+    def test_format_spawn_pose_trace_with_base_link_via_and_reason(self) -> None:
+        payload = format_spawn_pose_trace(
+            "after_rebind:reset_rebind",
+            2.0,
+            [0.0, 0.0, 0.0775],
+            [0.0, 0.0, 1.0, 0.0],  # 180 deg about world Z
+            base_link_pos=[0.1, 0.2, 0.3],
+            base_link_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            via="view",
+            reason="reset_rebind",
+        )
+        self.assertEqual(payload["stage"], "after_rebind:reset_rebind")
+        self.assertAlmostEqual(payload["root_yaw_deg"], 180.0, places=3)
+        self.assertEqual(payload["base_link_pos"], [0.1, 0.2, 0.3])
+        self.assertAlmostEqual(payload["base_link_yaw_deg"], 0.0, places=6)
+        self.assertEqual(payload["via"], "view")
+        self.assertEqual(payload["reason"], "reset_rebind")
+
+    def test_log_spawn_pose_trace_from_backend_double_no_sim(self) -> None:
+        """A backend double (``_backend()``, no live Isaac Sim) with a
+        ``base_link`` body distinct from the articulation root, at a
+        DIFFERENT pose -- exercises "if base_link and the articulation root
+        are different prims, log both" end to end through
+        ``_log_spawn_pose_trace``."""
+        backend = _backend()
+        backend._robot.data.body_names = ("base", "link_tcp", "base_link")
+        backend._robot.data.body_pos_w = torch.cat(
+            [
+                backend._robot.data.body_pos_w,
+                torch.tensor([[[1.0, 2.0, 0.5]]], dtype=torch.float32),
+            ],
+            dim=1,
+        )
+        backend._robot.data.body_quat_w = torch.cat(
+            [
+                backend._robot.data.body_quat_w,
+                torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], dtype=torch.float32),
+            ],
+            dim=1,
+        )
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._log_spawn_pose_trace(
+                "after_reset",
+                root_pos=[-2.0, -2.0, 0.0775],
+                root_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        self.assertEqual(len(lines), 1)
+        payload = lines[0]
+        self.assertEqual(payload["event"], "spawn_pose_trace")
+        self.assertEqual(payload["stage"], "after_reset")
+        self.assertEqual(payload["root_pos"], [-2.0, -2.0, 0.0775])
+        self.assertEqual(payload["base_link_pos"], [1.0, 2.0, 0.5])
+        self.assertNotEqual(payload["base_link_pos"], payload["root_pos"])
+
+    def test_log_spawn_pose_trace_omits_base_link_when_unresolvable(self) -> None:
+        """The stock backend double has no ``base_link`` body name -- the
+        trace must omit the field rather than fail."""
+        backend = _backend()
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._log_spawn_pose_trace(
+                "after_first_step",
+                root_pos=[0.0, 0.0, 0.0775],
+                root_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        payload = json.loads(captured.getvalue().strip())
+        self.assertNotIn("base_link_pos", payload)
 
 
 if __name__ == "__main__":

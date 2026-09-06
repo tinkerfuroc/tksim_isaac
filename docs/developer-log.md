@@ -78,6 +78,143 @@ deg), not the ~355 deg a naive subtraction would give, and is `ok=True`;
 '_maybe_check_spawn_pose'`. Full suite: `tests/test_manipulation_runtime.py`
 113 passed, 3 subtests passed, 0 failed. No GPU boot for this change.
 
+**Follow-up: live matrix on `gpsr-rcw2026-bench` narrows the trigger to Fabric,
+not this repo's spawn-yaw code, and boot instrumentation was added to watch
+the whole spawn path.** A live A/B on the `rcw2026` arena
+(`gpsr-rcw2026-bench`, `--spawn-xy=-2,-2`, commanded yaw 0) across the
+spawn-yaw/Fabric knobs:
+
+| case | `TINKER_SIM_SPAWN_YAW` | via-view | Fabric | landed pose |
+| --- | --- | --- | --- | --- |
+| 1/2 | unset | — | ON (default) | `(-0.69, -2.19, 171°)` -- the original incident, reproduced |
+| 4 | `1.5708` | ON | ON | exact |
+| 6 | `1e-6` | ON | ON | `(-2.607, -2.032, 1.7°)` STATIC, 61 cm off in x |
+| 7 | `1e-6` | OFF | OFF (forced, USD pre-reset write) | exact `(-2.000, -2.000)` |
+| 8 | unset | — | OFF (`TINKER_SIM_USE_FABRIC=0`) | TUMBLES: `(-1.29, -2.17, 165°)` -> `(-0.55, -2.56, 63°)` |
+
+Case 7 confirms the USD-authoritative path (13e4fdf's original fix) is sound
+whenever it actually runs. Case 8 is the decisive new result: forcing Fabric
+off with **no** `TINKER_SIM_SPAWN_YAW` set at all (so none of this repo's
+yaw-write code runs, USD or view) still produces a bad spawn -- worse, a
+*dynamic tumble* rather than a static offset. That rules out every write path
+in `backend.py` as the proximate cause for the yaw-unset failure mode (case
+1/2, the original incident) and points at default `InitialStateCfg`
+placement / Fabric's own root-body ingestion at spawn time being broken in
+this scenario independent of any TINKER_SIM_SPAWN_YAW code. Case 6 (via-view
+ON, Fabric ON, yaw forced tiny-but-nonzero to exercise the view-write path)
+lands statically wrong (61 cm off, not tumbling) -- a different, still
+unexplained failure mode from case 8's dynamic tumble, so "Fabric on" alone
+isn't a single clean explanation either; case 6 needs its own root-cause
+pass. Full analysis, including the ruled-out quaternion/collider/spawn-yaw
+hypotheses that predate this matrix, is in
+`task30-spawn-path-findings.md` (background) and the live matrix above
+(this session).
+
+**Boot instrumentation: `spawn_pose_trace`.** Given the matrix above shows the
+mislocation can already be present very early (case 8's first captured frame
+is off before the ~150-frame settle burst even starts), `_check_spawn_pose`'s
+single post-settle sample cannot show WHERE in the boot sequence the pose
+goes wrong. Added a `{"event": "spawn_pose_trace", "stage": ..., "t":
+sim_time, "root_pos": [x,y,z], "root_yaw_deg": ..., "base_link_pos": [...] if
+resolvable, "via"/"reason" where applicable}` line at each stage of the boot
+path, default-on and cheap (a handful of lines per boot, `backend.py`):
+
+- `"initial_state"` -- the `ArticulationCfg.InitialStateCfg` pos/rot exactly
+  as configured, before the spawner or the articulation object exist
+  (`backend.py`, right before `self._robot = Articulation(robot_cfg)`).
+- `"after_reset"` -- the truth root pose the instant `self._sim.reset()`
+  returns, from `data.root_pos_w`/`root_quat_w`, before
+  `_refresh_robot_handles` can touch it (right after the `reset()` call).
+- `"after_spawn_yaw_write"` -- after whichever spawn-yaw write actually ran,
+  with `"via": "usd"` or `"via": "view"`: the pre-reset USD `xformOp:orient`
+  branch logs the just-authored values (no live tensor view yet); the
+  post-reset `_apply_spawn_yaw_via_view` logs the tensor-view read-back
+  right after `write_root_pose_to_sim_index`. Neither prints when
+  `TINKER_SIM_SPAWN_YAW` is unset (matching case 8/1-2 above: no write of any
+  kind runs on that path -- the trace makes that absence visible instead of
+  silent).
+- `"after_first_step"` -- once, right after the first successful
+  `self._robot.update(self.dt)` following boot, from both `step()` call
+  sites that can reach it (the normal path and the PHYSICS_READY-rebind
+  early-return branch) -- guarded by `_spawn_pose_trace_first_step_logged`
+  so it never re-fires on a later scenario rebind (that gets its own
+  `after_rebind` stage instead).
+- `"after_settle"` -- inside `_check_spawn_pose` itself, alongside the
+  existing `spawn_pose_check` line, from the exact base pose that check
+  already computed.
+- `"after_rebind:<reason>"` -- inside `_refresh_robot_handles`, in the
+  branch that already detects a genuine view-identity change
+  (`self._robot_view_identity is not None`, i.e. not the initial bind).
+  `<reason>` is `reset_rebind` for the scenario's own STOP -> spawn_entity(s)
+  -> PLAY cycle (`reapply_spawn_yaw=True`) or `view_recovery` for
+  `_maybe_recover_simulation_view`'s state-preserving mid-run recovery
+  (`reapply_spawn_yaw=False`). This backend has no handle on which entity
+  triggered a STOP/PLAY cycle -- that lives cross-process, in
+  `ros2_ws/.../scenario_runner.py`'s `/spawn_entity` calls -- so only the
+  reason classification is logged here; entity identity is covered by
+  `scenario_spawn` below.
+
+`base_link` vs the articulation root: `root_pos_w`/`root_quat_w` (used
+everywhere in this file) report the ARTICULATION ROOT's pose
+(`/World/Tinker`), which for a USD-referenced import need not be the same
+prim as the URDF's own `base_link` link (`source-tinker-full.urdf` names
+`base_link` as its actual root `<link>`). New helpers
+`_base_link_body_index`/`_base_link_pose` look up `"base_link"` in
+`data.body_names` and read `body_pos_w`/`body_quat_w` at that index when
+present; `_log_spawn_pose_trace` includes `base_link_pos`/
+`base_link_yaw_deg` whenever that lookup succeeds, so a divergence between
+the two (or its absence) is visible in the trace instead of assumed away.
+Not independently confirmed live in this session (no GPU boot) whether the
+tinker2 USD's `body_names` actually contains a distinct `"base_link"` entry
+separate from body index 0 -- the code degrades to omitting the field if it
+doesn't, by design (`_log_spawn_pose_trace` never raises on a failed
+lookup).
+
+All of the above is formatted by a new pure/stateless `format_spawn_pose_trace`
+function (`backend.py`, next to `resolve_use_fabric`) so the exact JSON shape
+is unit-testable without a live sim.
+
+**Scenario spawn sequence: `scenario_spawn`.** The `/spawn_entity` and
+`/set_simulation_state` simulation_interfaces services are owned by the
+out-of-repo `isaacsim.ros2.sim_control` extension, not by any code in this
+repo -- `backend.py` never sees a spawn request directly, only its
+after-the-fact effect (a view-identity change in `_refresh_robot_handles`,
+see `after_rebind` above). The one place this repo issues those calls is
+`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/scenario_runner.py`'s
+`ScenarioRunner.execute()`, which walks the `ScenarioOperation` tuple
+`tinker_sim_core.orchestration.standard_operations` compiles. Added one
+`{"event": "scenario_spawn", "name": ..., "pose": {"xyz": ...,
+"quaternion_xyzw": ...}, "t": time.monotonic(), "stop_play_cycle": bool}`
+line per `spawn_entity` operation, right after its service response
+confirms the entity name. `stop_play_cycle` is tracked from the boundary
+names on the `set_simulation_state` operations the same loop already walks:
+`True` from the `"SPAWN_READY"` (STOPPED) boundary until the final
+`"PHYSICS_READY"` (PLAYING) boundary -- `False` throughout for the opt-in
+`--spawn-while-playing` mode, which skips that bracket entirely (see
+`orchestration.standard_operations`'s own docstring on why that mode exists).
+This `t` is wall-clock monotonic in the ROS-side runner process, a different
+clock domain from `backend.py`'s sim-time `t` above (the two processes don't
+share a clock) -- correlating a `scenario_spawn` line with a
+`spawn_pose_trace`/`after_rebind` line needs matching by proximity/ordering
+in the combined log, not by comparing `t` values directly.
+
+**Tests.** `tests/test_manipulation_runtime.py::SpawnPoseTraceFormatTest`
+(new): `format_spawn_pose_trace`'s exact JSON shape (fields present/absent
+per optional argument); `_log_spawn_pose_trace` from a backend double (no
+live sim) with a `base_link` body at a pose DIFFERENT from the root,
+confirming both are logged and differ; and the omit-when-unresolvable case
+(the stock backend double's `body_names` has no `"base_link"` entry).
+`SpawnPoseCheckTest`'s existing assertions were updated to filter for
+`spawn_pose_check`/`spawn_pose_mismatch` events specifically (the new
+`after_settle` trace line now also prints during `_maybe_check_spawn_pose`,
+in the same captured-stdout window those tests inspect) -- their pass/fail
+logic is otherwise unchanged. Full suite:
+`tests/test_manipulation_runtime.py` 117 passed, 3 subtests passed, 0
+failed (up from 113 passed pre-change: 4 new `SpawnPoseTraceFormatTest`
+cases). No GPU boot for this change; case 6's static 61 cm offset and case
+8's dynamic tumble both remain open root-cause items the new trace is meant
+to help localize on the next live run.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported
