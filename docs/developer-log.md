@@ -162,6 +162,43 @@ point. A sugar box at 2.0/2.0 held through 15 s with no one-pad dropout
   floor this task considered as a fallback is very likely unnecessary; add
   it only if the bench round finds an open genuinely torque-starved.
 
+**Review fix round (`$TMP/task20-parity-review.md`, REQUEST-CHANGES on
+67cd278).** Two findings, both closed:
+
+1. `_write_gripper_drive_physx_max_force` called `wp.from_torch(...)`,
+   which -- unlike `wp.array(...)` -- does not lazily initialize the Warp
+   runtime (it reads `warp._src.context.runtime.cpu_device` directly and
+   raises `AttributeError` if Warp has not been touched yet in-process,
+   e.g. a gripper command arriving before the fused-actuator physics-step
+   path has run at least once). The bare `except Exception` swallowed that
+   with only a JSON diagnostic, while the caller still latched
+   `_gripper_effort_limit_written = True`, so a later identical-effort
+   command would be dedup-skipped forever without the mapped ceiling ever
+   having reached PhysX. Reproduced exactly as the review predicted: running
+   `test_set_gripper_effort_limit_writes_direct_physx_max_force` ALONE
+   (`-k` that name only) failed `AssertionError: 0 != 1`
+   (`set_dof_max_forces` never called) -- it only passed as part of the full
+   file because an earlier test's Warp use had already initialized the
+   runtime as a side effect. Fixed by building the payload via
+   `wp.array(full_cpu.numpy(), dtype=wp.float32, device="cpu")` (the same
+   self-initializing pattern `set_entity_pose_physics` already uses, #12)
+   plus an explicit `wp.init()` guard, and by moving
+   `_gripper_effort_limit_written = True` to fire only after the direct
+   PhysX write returns successfully -- any exception now logs a
+   `"level": "warning"` JSON line with the error text, leaves the flag
+   False so the next identical command retries, and re-raises under
+   `TINKER_SIM_STRICT_PHYSX_WRITES=1`. The now-isolated-safe test passes
+   alone; two new tests cover the failure-does-not-latch/retry path and the
+   strict re-raise path.
+2. This branch conflicted with the then-open `feat-spawn-pose-assert-30`
+   (PR #18) in `backend.py` (the `GRIPPER_EFFORT_*` constants block sits
+   directly above #30's `_yaw_deg_from_quat_xyzw`/`format_spawn_pose_trace`
+   helpers -- both are pure appends, no real overlap), the test file's
+   import list, and `docs/developer-log.md` (independent same-day entries).
+   Merged `origin/feat-spawn-pose-assert-30`; both features kept intact.
+   Full suite after merge: `tests/test_manipulation_runtime.py` 130 passed,
+   5 subtests passed (117 pre-merge + #30's 13 new).
+
 ## 2026-09-06 — Task #30: boot-time spawn-pose guard (a 171 deg, 1.3 m silent spawn miss)
 
 **Symptom.** A GPSR run observed the robot base at `(-0.69, -2.19)` yaw
