@@ -273,6 +273,28 @@ def resolve_spawn_yaw(value: str | None) -> float:
     return yaw
 
 
+def spawn_root_rot_xyzw(yaw: float) -> tuple[float, float, float, float]:
+    """Pure quaternion (about world Z) for ``ArticulationCfg.InitialStateCfg.rot``.
+
+    Task #30 root cause: the vendored Isaac Lab 3.0.0
+    ``AssetBaseCfg.InitialStateCfg.rot`` (``.deps/IsaacLab/source/isaaclab/
+    isaaclab/assets/asset_base_cfg.py``) documents its ``rot`` field as
+    scalar-last ``(x, y, z, w)``, defaulting to ``(0.0, 0.0, 0.0, 1.0)`` --
+    NOT the scalar-first ``(w, x, y, z)`` order this backend used to build by
+    hand. Supplying ``(cos(yaw/2), 0, 0, sin(yaw/2))`` for that field means a
+    zero (or unset) spawn yaw handed the contract ``(1, 0, 0, 0)``, which
+    Isaac Lab reads as a 180 degree rotation about X -- the robot spawned
+    upside down, and physics ejected it (live trace: after_reset root z 0.30
+    sitting above base_link z 0.25, then a first-step throw to
+    (-0.69, -2.19, 171 deg)). This helper is the single source of the
+    correctly-ordered quaternion; every ``InitialStateCfg.rot``/tensor-view
+    write of a yaw-about-Z heading in this file should go through it (or be
+    explicitly commented as to why it does not).
+    """
+    half = yaw / 2.0
+    return (0.0, 0.0, math.sin(half), math.cos(half))
+
+
 def resolve_spawn_yaw_via_view(value: str | None) -> bool:
     """Parse ``TINKER_SIM_SPAWN_YAW_VIA_VIEW`` (default off / "0").
 
@@ -312,6 +334,60 @@ def resolve_use_fabric(
     elif use_fabric_env == "0":
         use_fabric = False
     return use_fabric
+
+
+def _yaw_deg_from_quat_xyzw(quat_xyzw: Iterable[float]) -> float:
+    qx, qy, qz, qw = (float(value) for value in quat_xyzw)
+    return math.degrees(
+        math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    )
+
+
+def format_spawn_pose_trace(
+    stage: str,
+    t: float,
+    root_pos: Iterable[float],
+    root_quat_xyzw: Iterable[float],
+    *,
+    base_link_pos: Iterable[float] | None = None,
+    base_link_quat_xyzw: Iterable[float] | None = None,
+    via: str | None = None,
+    reason: str | None = None,
+) -> dict[str, object]:
+    """Format one ``spawn_pose_trace`` boot-diagnostic line (task #30).
+
+    Pure/stateless so the exact JSON payload is unit-testable without a live
+    sim: given a stage name, a sim-time sample, and the articulation root's
+    position + ``(x, y, z, w)`` quaternion, returns the dict the boot trace
+    prints (see backend call sites for where each ``stage`` fires --
+    ``"initial_state"``, ``"after_reset"``, ``"after_spawn_yaw_write"``,
+    ``"after_first_step"``, ``"after_settle"``, ``"after_rebind:<reason>"``).
+
+    ``base_link_pos``/``base_link_quat_xyzw`` are included only when the
+    caller could resolve a distinct ``base_link`` body in the articulation
+    view (see ``TinkerIsaacBackend._base_link_pose``) -- for a USD-referenced
+    articulation the root prim need not be the URDF's own ``base_link`` link,
+    and this trace exists to make that divergence (or its absence) visible
+    instead of assumed away. ``via`` records which spawn-yaw write path ran
+    (``"usd"`` or ``"view"``, see ``_apply_spawn_yaw_via_view``); ``reason``
+    records why a rebind fired.
+    """
+    payload: dict[str, object] = {
+        "event": "spawn_pose_trace",
+        "stage": stage,
+        "t": float(t),
+        "root_pos": [float(value) for value in root_pos],
+        "root_yaw_deg": _yaw_deg_from_quat_xyzw(root_quat_xyzw),
+    }
+    if base_link_pos is not None:
+        payload["base_link_pos"] = [float(value) for value in base_link_pos]
+    if base_link_quat_xyzw is not None:
+        payload["base_link_yaw_deg"] = _yaw_deg_from_quat_xyzw(base_link_quat_xyzw)
+    if via is not None:
+        payload["via"] = via
+    if reason is not None:
+        payload["reason"] = reason
+    return payload
 
 
 def resolve_clock_epoch(value: str | None) -> float:
@@ -528,6 +604,11 @@ class IsaacWholeRobotBackend:
         spawn_xy: tuple[float, float] = (0.0, 0.0),
     ) -> None:
         spawn_x, spawn_y = validate_spawn_xy(spawn_xy)
+        # Commanded spawn xy, remembered for the boot-time spawn-pose guard
+        # (_check_spawn_pose, task #30) -- this is the value actually applied
+        # to InitialStateCfg.pos below, not merely the raw --spawn-xy string.
+        self._spawn_x = spawn_x
+        self._spawn_y = spawn_y
         arena_usd, map_yaml = resolve_arena_inputs(arena_artifact, map_yaml)
         self._arena_usd = arena_usd  # dir holds placement.json (support surfaces)
         if arena_artifact is not None and wall_color_fn is not None:
@@ -864,6 +945,20 @@ class IsaacWholeRobotBackend:
                 self._base_hold_resettle_s = max(0.0, float(_resettle))
         except (TypeError, ValueError):
             pass
+        # Boot-time spawn-pose guard (task #30): run _check_spawn_pose exactly
+        # once after the base settles -- the same moment the base-hold latch
+        # fires (TINKER_SIM_FIX_BASE=1, see _maybe_check_spawn_pose) or, with
+        # the base free, once _base_hold_after_sim_s of sim time has elapsed.
+        # Reset on every genuine reset rebind (_refresh_robot_handles) so a
+        # respawn gets its own settle window and its own check, exactly like
+        # _base_hold_settle_from above.
+        self._spawn_pose_checked = False
+        self._spawn_pose_check_settle_from = 0.0
+        # Task #30 trace: log "after_first_step" exactly once per PROCESS
+        # (unlike _spawn_pose_checked above, this is a boot diagnostic, not
+        # re-armed on a scenario reset rebind -- a rebind gets its own
+        # "after_rebind" stage instead, see _refresh_robot_handles).
+        self._spawn_pose_trace_first_step_logged = False
         # Diagnostic (TINKER_SIM_FIX_BASE_DRYRUN=1): run the whole hold -- settle,
         # latch, scene-change detection, logging -- but SKIP the two
         # set_root_transforms writes. If a spawn still lands at the robot pose
@@ -959,22 +1054,27 @@ class IsaacWholeRobotBackend:
                 joint_drive_props=sim_utils.JointDriveBaseCfg(drive_type="force"),
                 articulation_props=articulation_props,
             ),
-            # TINKER_SIM_SPAWN_YAW (radians, world frame): spawn heading. The
-            # spawner drops this rot for a USD-referenced articulation (it is
-            # re-authored on the root xformOp:orient just after construction),
-            # but it is set here too so the intent reads with the pose. A
+            # TINKER_SIM_SPAWN_YAW (radians, world frame): spawn heading.
+            # Task #30: the spawner DOES apply this rot to the articulation
+            # (Articulation.reset() honors init_state) -- the pre-#30 comment
+            # here claiming it "drops" the orientation was wrong/outdated for
+            # the vendored 3.0.0 spawner. It IS true that a USD-referenced
+            # articulation needs the root xformOp:orient re-authored too for
+            # the pose to read correctly pre-reset (below), and that a
             # fixed-root/held base can never be re-aimed after spawn and a
-            # post-bind /set_entity_state root write is a physics no-op, so the
-            # heading must be right from the start.
+            # post-bind /set_entity_state root write is a physics no-op, so
+            # the heading must be right from the start either way.
+            #
+            # rot is scalar-last (x, y, z, w) -- the vendored
+            # InitialStateCfg.rot contract, see spawn_root_rot_xyzw -- NOT
+            # scalar-first (w, x, y, z). Getting this backwards is exactly
+            # #30's root cause: a zero/unset yaw supplied (1, 0, 0, 0) here,
+            # which Isaac Lab reads as a 180 degree roll about X and spawned
+            # the robot upside down.
             init_state=ArticulationCfg.InitialStateCfg(
                 pos=(spawn_x, spawn_y, spawn_z),
-                rot=(
-                    math.cos(resolve_spawn_yaw(
-                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
-                    0.0,
-                    0.0,
-                    math.sin(resolve_spawn_yaw(
-                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
+                rot=spawn_root_rot_xyzw(
+                    resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
                 ),
             ),
             actuators={
@@ -1080,11 +1180,28 @@ class IsaacWholeRobotBackend:
                 ),
             },
         )
+        # Task #30 trace: the InitialStateCfg pos/rot exactly as configured
+        # above (spawn_root_rot_xyzw, scalar-last), before the articulation
+        # itself exists. No live tensor view yet, so t is pinned to 0.0 and
+        # base_link is not attempted.
+        _initial_spawn_yaw = resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
+        self._log_spawn_pose_trace(
+            "initial_state",
+            root_pos=[spawn_x, spawn_y, spawn_z],
+            root_quat_xyzw=list(spawn_root_rot_xyzw(_initial_spawn_yaw)),
+            t=0.0,
+            include_base_link=False,
+        )
         self._robot = Articulation(robot_cfg)
-        # Author the spawn yaw directly on the robot root prim: the spawner
-        # honors InitialStateCfg.pos (xformOp:translate) but drops the
-        # orientation for this USD-referenced articulation (observed: rot
-        # (0.707, 0, 0, 0.707) requested, layer yaw 0 after spawn), and
+        # Author the spawn yaw directly on the robot root prim too. Task #30:
+        # Articulation.reset() DOES apply InitialStateCfg.rot (the previous
+        # version of this comment, claiming the spawner "drops" the
+        # orientation, was wrong/outdated for the vendored 3.0.0 spawner --
+        # that claim was actually observing the (w,x,y,z)-vs-(x,y,z,w) order
+        # bug fixed above, not a dropped write). This direct USD write is
+        # still needed because it is what 13e4fdf's fabric-parity fix
+        # targets (pre-reset xformOp:orient, so a fabric-composed render
+        # already agrees with physics before the first reset), and because
         # post-bind /set_entity_state root writes are physics no-ops.
         #
         # Skipped when TINKER_SIM_SPAWN_YAW_VIA_VIEW=1: the heading is instead
@@ -1103,6 +1220,9 @@ class IsaacWholeRobotBackend:
                 raise RuntimeError("TINKER_SIM_SPAWN_YAW: /World/Tinker not found")
             xformable = UsdGeom.Xformable(robot_prim)
             half = spawn_yaw / 2.0
+            # Gf.Quatd(real, imaginary) is scalar-first by construction --
+            # this is correct for Gf/USD (a different contract from
+            # InitialStateCfg.rot above), do not "fix" this to scalar-last.
             quat = Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half)))
             orient_op = None
             for op in xformable.GetOrderedXformOps():
@@ -1116,6 +1236,20 @@ class IsaacWholeRobotBackend:
             else:
                 orient_op.Set(quat)
             print(json.dumps({"spawn_yaw_rad": spawn_yaw}, sort_keys=True), flush=True)
+            # Task #30 trace: the pose just authored on the USD prim. No
+            # live tensor view yet (sim.reset() has not run), so this
+            # reports the WRITTEN values, not a tensor read-back, and
+            # base_link is not attempted.
+            self._log_spawn_pose_trace(
+                "after_spawn_yaw_write",
+                root_pos=[spawn_x, spawn_y, spawn_z],
+                # xyzw trace convention (see spawn_root_rot_xyzw), not the
+                # Gf.Quatd scalar-first `quat` just authored above.
+                root_quat_xyzw=list(spawn_root_rot_xyzw(spawn_yaw)),
+                t=0.0,
+                include_base_link=False,
+                via="usd",
+            )
         # Ten Warp launches per target push -> two; see _fused_apply_actuator_model.
         if _os.environ.get("TINKER_SIM_STOCK_ACTUATOR_MODEL", "") != "1":
             bind_fused_actuator_model(self._robot)
@@ -1164,6 +1298,27 @@ class IsaacWholeRobotBackend:
         self.gripper_friction_bound = self._apply_gripper_friction_material()
         omni.kit.app.get_app().update()
         self._sim.reset()
+        # Task #30 trace: the truth root pose the moment sim.reset() returns,
+        # before _refresh_robot_handles/_reapply_spawn_yaw_after_rebind can
+        # touch it -- this is the "did InitialStateCfg actually land" sample
+        # the #30 investigation lacked. Best-effort: the articulation's own
+        # is_initialized flag is only set by _refresh_robot_handles below, so
+        # a read failure here is swallowed rather than aborting boot.
+        try:
+            _reset_data = self._robot.data
+            self._log_spawn_pose_trace(
+                "after_reset",
+                root_pos=self._torch_value(_reset_data.root_pos_w)[0]
+                .detach()
+                .cpu()
+                .tolist(),
+                root_quat_xyzw=self._torch_value(_reset_data.root_quat_w)[0]
+                .detach()
+                .cpu()
+                .tolist(),
+            )
+        except Exception:
+            pass
         # UsdFileCfg imports the robot stage metadata, including its short
         # playback range.  Override it only after every USD has been authored.
         # Reaching that range stops PhysX and invalidates tensor views.
@@ -1642,6 +1797,31 @@ class IsaacWholeRobotBackend:
             self._clock_step_origin = count_now - self._clock_elapsed_steps
             self._object_views.clear()
             self._contact_pairs_by_key.clear()
+            # Task #30 trace: a genuine rebind just fired -- either the
+            # scenario's own STOP -> spawn_entity(s) -> PLAY cycle
+            # (reapply_spawn_yaw=True, the interesting case for #30: physics
+            # state was reset to the initial/commanded pose) or
+            # _maybe_recover_simulation_view's state-PRESERVING mid-run view
+            # recovery (reapply_spawn_yaw=False). This backend has no handle
+            # on the triggering entity's name -- that lives cross-process in
+            # scenario_runner.py's /spawn_entity calls (see "scenario_spawn"
+            # there) -- so only the reason classification is logged here.
+            try:
+                _rebind_data = self._robot.data
+                self._log_spawn_pose_trace(
+                    f"after_rebind:{'reset_rebind' if reapply_spawn_yaw else 'view_recovery'}",
+                    root_pos=self._torch_value(_rebind_data.root_pos_w)[0]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    root_quat_xyzw=self._torch_value(_rebind_data.root_quat_w)[0]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    reason="reset_rebind" if reapply_spawn_yaw else "view_recovery",
+                )
+            except Exception:
+                pass
         self.joint_names = tuple(self._robot.data.joint_names)
         self._joint_index = {name: index for index, name in enumerate(self.joint_names)}
         self._wheel_indices = tuple(
@@ -1727,6 +1907,14 @@ class IsaacWholeRobotBackend:
         # (#24 review round 2).
         if reapply_spawn_yaw:
             self._reapply_spawn_yaw_after_rebind()
+            # task #30: a genuine reset rebind (STOP -> spawn -> PLAY) resets
+            # physics state back to the commanded/initial pose, so the
+            # spawn-pose guard must re-arm and measure its own settle window
+            # from THIS rebind, exactly like _base_hold_settle_from above --
+            # simulation_time is monotonic across the rebind (#21), so a
+            # boot-relative deadline would already be satisfied.
+            self._spawn_pose_checked = False
+            self._spawn_pose_check_settle_from = self.simulation_time
         return True
 
     @property
@@ -2282,10 +2470,12 @@ class IsaacWholeRobotBackend:
 
         Root-view quaternions are ``(x, y, z, w)`` (IsaacLab's tensor
         convention -- ``root_quat_w``'s own element order, and
-        ``write_root_pose_to_sim_index``'s docstring), which is NOT the
-        ``(w, x, y, z)`` order ``ArticulationCfg.InitialStateCfg.rot`` and the
-        USD ``xformOp:orient`` path (both above) use -- do not copy the
-        ``Gf.Quatd(cos, 0, 0, sin)`` construction from that code path here.
+        ``write_root_pose_to_sim_index``'s docstring) -- the same scalar-last
+        contract ``ArticulationCfg.InitialStateCfg.rot`` uses (see
+        ``spawn_root_rot_xyzw``; #30 fixed this file's InitialStateCfg.rot to
+        match). It is NOT the scalar-first order the USD ``xformOp:orient``
+        path (above) builds via ``Gf.Quatd`` -- do not copy that
+        ``Gf.Quatd(cos, 0, 0, sin)`` construction here.
 
         Whether this avoids 13e4fdf's spawn-mislocation defect is NOT
         verified -- needs a live GPU A/B (see the validation recipe shipped
@@ -2293,15 +2483,22 @@ class IsaacWholeRobotBackend:
         """
         torch = self._torch
         data = self._robot.data
-        half = spawn_yaw / 2.0
         pos = data.root_pos_w[:1].detach().clone()
         quat = torch.tensor(
-            [[0.0, 0.0, math.sin(half), math.cos(half)]],
+            [list(spawn_root_rot_xyzw(spawn_yaw))],
             dtype=pos.dtype,
             device=pos.device,
         )
         root_pose = torch.cat([pos, quat], dim=-1)
         self._robot.write_root_pose_to_sim_index(root_pose=root_pose)
+        # Task #30 trace: the pose just written through the tensor view.
+        # The view is live here (post sim.reset()), so base_link is attempted.
+        self._log_spawn_pose_trace(
+            "after_spawn_yaw_write",
+            root_pos=pos[0].detach().cpu().tolist(),
+            root_quat_xyzw=quat[0].detach().cpu().tolist(),
+            via="view",
+        )
         # Do NOT seed _base_hold_pose's POSITION here (#26): `pos` above is
         # data.root_pos_w read immediately after self._sim.reset(), before
         # gravity has dropped the mobile-base chassis onto its wheels/
@@ -2469,6 +2666,198 @@ class IsaacWholeRobotBackend:
             return
         self._robot.write_root_pose_to_sim_index(root_pose=self._base_hold_pose)
         self._robot.write_root_velocity_to_sim_index(root_velocity=self._base_hold_vel)
+
+    def _base_link_body_index(self) -> int | None:
+        """Body index of ``base_link`` in the articulation view, if resolvable.
+
+        ``root_pos_w``/``root_quat_w`` (used everywhere else in this file)
+        report the ARTICULATION ROOT's pose. For a USD-referenced import that
+        root prim (``/World/Tinker``) need not be the same prim as the
+        URDF's own ``base_link`` link -- task #30's trace logs both (see
+        ``_base_link_pose``) instead of assuming they coincide.
+        """
+        try:
+            body_names = tuple(getattr(self._robot.data, "body_names", ()))
+        except AttributeError:
+            return None
+        if "base_link" in body_names:
+            return body_names.index("base_link")
+        return None
+
+    def _base_link_pose(self) -> tuple[list[float], list[float]] | None:
+        """``([x, y, z], [x, y, z, w])`` for the ``base_link`` body, or None.
+
+        None both when no distinct ``base_link`` body is resolvable and when
+        the articulation view is not yet live enough to read from (boot
+        stages before the first ``sim.reset()``) -- callers treat both cases
+        identically: omit the ``base_link_pos``/``base_link_quat_xyzw`` trace
+        fields rather than fail the boot over a diagnostic read.
+        """
+        index = self._base_link_body_index()
+        if index is None:
+            return None
+        try:
+            data = self._robot.data
+            pos = self._torch_value(data.body_pos_w)[0, index].detach().cpu().tolist()
+            quat = self._torch_value(data.body_quat_w)[0, index].detach().cpu().tolist()
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+        return [float(value) for value in pos], [float(value) for value in quat]
+
+    def _log_spawn_pose_trace(
+        self,
+        stage: str,
+        *,
+        root_pos: Iterable[float],
+        root_quat_xyzw: Iterable[float],
+        t: float | None = None,
+        include_base_link: bool = True,
+        via: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Print one ``spawn_pose_trace`` line (task #30 boot instrumentation).
+
+        Default-on, cheap (a handful of lines per boot): this only formats
+        and prints already-available values, never reads back a fresh
+        tensor beyond the one optional ``base_link`` lookup, and never
+        raises -- a failure to resolve ``base_link`` (or ``t``, before
+        ``self._clock_step_origin`` exists at the very first call site)
+        degrades to omitting that one field, not aborting boot.
+        """
+        if t is None:
+            try:
+                t = self.simulation_time
+            except AttributeError:
+                t = 0.0
+        base_link_pos = None
+        base_link_quat_xyzw = None
+        if include_base_link:
+            try:
+                resolved = self._base_link_pose()
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                base_link_pos, base_link_quat_xyzw = resolved
+        payload = format_spawn_pose_trace(
+            stage,
+            t,
+            root_pos,
+            root_quat_xyzw,
+            base_link_pos=base_link_pos,
+            base_link_quat_xyzw=base_link_quat_xyzw,
+            via=via,
+            reason=reason,
+        )
+        print(json.dumps(payload, sort_keys=True), flush=True)
+
+    def _maybe_log_first_step_trace(self) -> None:
+        """Log ``spawn_pose_trace`` stage ``after_first_step`` exactly once.
+
+        A boot-only diagnostic sample, taken right after the first
+        successful ``self._robot.update(self.dt)`` following boot (both
+        ``step()`` call sites that reach one call this) -- ``getattr`` with a
+        default keeps this a no-op for test doubles built via
+        ``object.__new__`` that never ran ``__init__`` (same pattern as the
+        other ``getattr`` guards in ``step()``).
+        """
+        if getattr(self, "_spawn_pose_trace_first_step_logged", True):
+            return
+        self._spawn_pose_trace_first_step_logged = True
+        try:
+            data = self._robot.data
+            self._log_spawn_pose_trace(
+                "after_first_step",
+                root_pos=self._torch_value(data.root_pos_w)[0].detach().cpu().tolist(),
+                root_quat_xyzw=self._torch_value(data.root_quat_w)[0]
+                .detach()
+                .cpu()
+                .tolist(),
+            )
+        except Exception:
+            pass
+
+    def _maybe_check_spawn_pose(self) -> None:
+        """Run the boot-time spawn-pose guard exactly once after the base
+        settles (task #30).
+
+        "Settled" means: the same moment the base-hold latch fires
+        (``TINKER_SIM_FIX_BASE=1``, i.e. ``_base_hold_pose`` transitions out
+        of ``None`` in ``_apply_base_hold`` -- this is called right after
+        that in ``step()``), or, with the base free, once
+        ``_base_hold_after_sim_s`` of sim time has elapsed since boot or the
+        last genuine reset rebind (``_refresh_robot_handles`` resets
+        ``_spawn_pose_check_settle_from``/``_spawn_pose_checked`` on those,
+        exactly like ``_base_hold_settle_from``).
+
+        A GPSR run observed the robot base ~1.3 m / ~171 deg off its
+        commanded spawn with nothing in the sim log flagging it (see
+        docs/developer-log.md, 2026-09-06); this makes that mismatch loud at
+        boot instead of silently reaching navigation downstream.
+        """
+        if self._spawn_pose_checked:
+            return
+        if getattr(self, "base_fixed", False):
+            if self._base_hold_pose is None:
+                return
+        else:
+            elapsed = self.simulation_time - self._spawn_pose_check_settle_from
+            if elapsed < self._base_hold_after_sim_s:
+                return
+        self._check_spawn_pose()
+        self._spawn_pose_checked = True
+
+    def _check_spawn_pose(self) -> None:
+        """Compare the truth base pose against the commanded spawn and emit
+        a loud, structured mismatch line (task #30).
+
+        Always prints a ``spawn_pose_check`` line. On a mismatch (position
+        more than 5 cm off, or heading more than 5 deg off, wrap-aware) also
+        prints a ``spawn_pose_mismatch`` line at warning level, and, when
+        ``TINKER_SIM_SPAWN_POSE_ASSERT=strict``, raises to abort the boot.
+        Default (unset, or any other value) is warn-only -- no behaviour
+        change.
+        """
+        base_pose = self._robot_truth_state()["base_pose"]
+        actual_xyz = [float(value) for value in base_pose["xyz"]]
+        qx, qy, qz, qw = (float(value) for value in base_pose["quaternion_xyzw"])
+        actual_yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)
+        )
+        self._log_spawn_pose_trace(
+            "after_settle",
+            root_pos=actual_xyz,
+            root_quat_xyzw=[qx, qy, qz, qw],
+        )
+        commanded_x = float(self._spawn_x)
+        commanded_y = float(self._spawn_y)
+        commanded_yaw = float(self._spawn_yaw)
+        dxy = math.hypot(actual_xyz[0] - commanded_x, actual_xyz[1] - commanded_y)
+        dyaw = math.atan2(
+            math.sin(actual_yaw - commanded_yaw), math.cos(actual_yaw - commanded_yaw)
+        )
+        dyaw_deg = math.degrees(dyaw)
+        ok = dxy <= 0.05 and abs(dyaw_deg) <= 5.0
+        payload = {
+            "event": "spawn_pose_check",
+            "commanded": [commanded_x, commanded_y, commanded_yaw],
+            "actual": [actual_xyz[0], actual_xyz[1], actual_xyz[2], actual_yaw],
+            "dxy_m": dxy,
+            "dyaw_deg": dyaw_deg,
+            "ok": ok,
+        }
+        print(json.dumps(payload, sort_keys=True), flush=True)
+        if ok:
+            return
+        mismatch_payload = dict(payload)
+        mismatch_payload["event"] = "spawn_pose_mismatch"
+        mismatch_payload["level"] = "warning"
+        print(json.dumps(mismatch_payload, sort_keys=True), flush=True)
+        if os.environ.get("TINKER_SIM_SPAWN_POSE_ASSERT") == "strict":
+            raise RuntimeError(
+                "spawn pose mismatch: commanded "
+                f"{payload['commanded']} vs actual {payload['actual']} "
+                f"(dxy={dxy:.3f} m, dyaw={dyaw_deg:.1f} deg)"
+            )
 
     def _scenario_child_signature(self) -> int:
         """Count /World/Scenario children -- a per-step spawn/delete signal for
@@ -2683,6 +3072,7 @@ class IsaacWholeRobotBackend:
             self._sim.step(render=self.render)
             if self._refresh_robot_handles():
                 self._robot.update(self.dt)
+                self._maybe_log_first_step_trace()
             return
         if self._safety_stopped:
             if self._safety_snapshot is None:
@@ -2699,6 +3089,7 @@ class IsaacWholeRobotBackend:
             self._ramp_drive_target()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
+        self._maybe_check_spawn_pose()
         self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
@@ -2758,6 +3149,7 @@ class IsaacWholeRobotBackend:
             if not self._maybe_recover_simulation_view(error):
                 raise
             return
+        self._maybe_log_first_step_trace()
         if _t is not None:
             _sp["robot_update"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()

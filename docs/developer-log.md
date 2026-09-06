@@ -4,6 +4,287 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #30: boot-time spawn-pose guard (a 171 deg, 1.3 m silent spawn miss)
+
+**Symptom.** A GPSR run observed the robot base at `(-0.69, -2.19)` yaw
+`+171 deg` in the sim's own `physics_truth` while the launch command was
+`--spawn-xy=-2,-2` (yaw unset, i.e. commanded 0). Nothing in the sim log
+flagged the ~1.3 m / ~171 deg miss; it only surfaced downstream, in
+navigation.
+
+**Refuted theory: a quaternion-convention bug in `TINKER_SIM_SPAWN_YAW_VIA_VIEW`.**
+The first hypothesis was that PR #9's opt-in `_apply_spawn_yaw_via_view`
+path wrote the root quaternion in the wrong element order. This does not
+hold up: the vendored Isaac Lab 3.0.0 factory
+(`isaaclab_physx/assets/articulation/articulation.py`,
+`isaaclab/assets/articulation/base_articulation.py`) consistently documents
+`(x, y, z, w)` for every `write_root_*_pose_to_sim_*` call, and
+`backend.py`'s `_apply_spawn_yaw_via_view` already writes exactly that
+order -- confirmed live in an earlier probe (commanded yaw=1.5708 read back
+`quaternion_xyzw [0, 0, 0.70711, 0.70711]`, yaw error 0.0000 rad). More
+decisively: **the flag is dead code for this exact failing run.** Its gate,
+identical before and after PR #9,
+is `_spawn_yaw_set = abs(resolve_spawn_yaw(TINKER_SIM_SPAWN_YAW)) > 1e-9`
+(`backend.py:716-718`); with `TINKER_SIM_SPAWN_YAW` unset (as in the failing
+launch), `resolve_spawn_yaw()` returns `0.0`, so `_spawn_yaw_set` is
+`False` and `_apply_spawn_yaw_via_view`/`_reapply_spawn_yaw_after_rebind`
+never run, `via_view` on or off. No yaw-authoring code of any kind (old USD
+`xformOp:orient` path or the new view path) executes when spawn yaw is
+unset. `robot.initial_pose` in the scenario JSON is also never read by this
+repo's sim-side code (`grep -n "initial_pose"` across `scenario.py`,
+`backend.py`, `ros_gateway.py` returns zero hits) -- it is descriptive only.
+The likely actual source (out of scope for a tinker-sim-only fix) is an
+external consumer (nav-sim-fix) re-posing the robot from its own
+scan-to-map fit after reading `/physics_truth`; a ~171 deg heading error
+with no matching geometric feature in this repo's arena/scenario files is
+the classic signature of a front-back symmetric-room AMCL mismatch, not a
+deterministic coordinate-transform bug in this repo.
+
+**Guard, regardless of root cause.** Whoever eventually mis-poses the
+robot, the sim should catch its own spawn being wrong instead of staying
+silent. Added `IsaacWholeRobotBackend._check_spawn_pose`, run exactly once
+per boot and once after any genuine reset rebind (`_refresh_robot_handles`,
+only its `reapply_spawn_yaw=True` callers -- the boot bind and the standard
+scenario STOP -> spawn -> PLAY cycle, not `_maybe_recover_simulation_view`'s
+state-preserving recovery) via a new `_maybe_check_spawn_pose`, called from
+`step()`. "Settled" is the same event the base-hold latch already uses: the
+moment `_apply_base_hold` latches (`TINKER_SIM_FIX_BASE=1`) or, with the
+base free, once `_base_hold_after_sim_s` (2.0s) of sim time has elapsed
+since boot or the rebind -- `_spawn_pose_checked`/
+`_spawn_pose_check_settle_from` are reset in lockstep with
+`_base_hold_settle_from` on every genuine rebind. The check compares
+`truth_state()['robot']['base_pose']` (read via the existing
+`_robot_truth_state`) against the commanded spawn: xy is `self._spawn_x`/
+`self._spawn_y`, the exact validated values `--spawn-xy` already threads
+through `run_sim.py` -> `IsaacWholeRobotBackend.__init__(spawn_xy=...)`
+(newly stored on `self` -- previously only local variables); yaw is
+`self._spawn_yaw` (`resolve_spawn_yaw`, 0 when unset). It always prints one
+`{"event": "spawn_pose_check", "commanded": [x,y,yaw], "actual":
+[x,y,z,yaw], "dxy_m", "dyaw_deg", "ok"}` line (wrap-aware yaw delta via
+`atan2(sin(d), cos(d))`); on a mismatch (`dxy_m > 0.05` or `|dyaw_deg| > 5`,
+wrap-aware) it additionally prints a `spawn_pose_mismatch` line (same
+fields plus `"level": "warning"`), and if `TINKER_SIM_SPAWN_POSE_ASSERT=strict`
+raises `RuntimeError` to abort the boot. Default (unset or any other value)
+is warn-only -- no behaviour change for existing launches.
+
+**Tests** (`tests/test_manipulation_runtime.py::SpawnPoseCheckTest`, backend-double
+pattern): matching pose emits only `spawn_pose_check` with `ok=True`; a pose
+off by 1.3 m / 171 deg (the actual incident numbers) emits both lines with
+`dxy_m≈1.324`, `dyaw_deg≈171.0`, `ok=False`, `level=warning`; a wrap case
+(commanded 3.1 rad, actual -3.1 rad) reports the short way around (~4.77
+deg), not the ~355 deg a naive subtraction would give, and is `ok=True`;
+`TINKER_SIM_SPAWN_POSE_ASSERT=strict` raises. All 4 fail on main first with
+`AttributeError: 'IsaacWholeRobotBackend' object has no attribute
+'_maybe_check_spawn_pose'`. Full suite: `tests/test_manipulation_runtime.py`
+113 passed, 3 subtests passed, 0 failed. No GPU boot for this change.
+
+**Follow-up: live matrix on `gpsr-rcw2026-bench` narrows the trigger to Fabric,
+not this repo's spawn-yaw code, and boot instrumentation was added to watch
+the whole spawn path.** A live A/B on the `rcw2026` arena
+(`gpsr-rcw2026-bench`, `--spawn-xy=-2,-2`, commanded yaw 0) across the
+spawn-yaw/Fabric knobs:
+
+| case | `TINKER_SIM_SPAWN_YAW` | via-view | Fabric | landed pose |
+| --- | --- | --- | --- | --- |
+| 1/2 | unset | — | ON (default) | `(-0.69, -2.19, 171°)` -- the original incident, reproduced |
+| 4 | `1.5708` | ON | ON | exact |
+| 6 | `1e-6` | ON | ON | `(-2.607, -2.032, 1.7°)` STATIC, 61 cm off in x |
+| 7 | `1e-6` | OFF | OFF (forced, USD pre-reset write) | exact `(-2.000, -2.000)` |
+| 8 | unset | — | OFF (`TINKER_SIM_USE_FABRIC=0`) | TUMBLES: `(-1.29, -2.17, 165°)` -> `(-0.55, -2.56, 63°)` |
+
+Case 7 confirms the USD-authoritative path (13e4fdf's original fix) is sound
+whenever it actually runs. Case 8 is the decisive new result: forcing Fabric
+off with **no** `TINKER_SIM_SPAWN_YAW` set at all (so none of this repo's
+yaw-write code runs, USD or view) still produces a bad spawn -- worse, a
+*dynamic tumble* rather than a static offset. That rules out every write path
+in `backend.py` as the proximate cause for the yaw-unset failure mode (case
+1/2, the original incident) and points at default `InitialStateCfg`
+placement / Fabric's own root-body ingestion at spawn time being broken in
+this scenario independent of any TINKER_SIM_SPAWN_YAW code. Case 6 (via-view
+ON, Fabric ON, yaw forced tiny-but-nonzero to exercise the view-write path)
+lands statically wrong (61 cm off, not tumbling) -- a different, still
+unexplained failure mode from case 8's dynamic tumble, so "Fabric on" alone
+isn't a single clean explanation either; case 6 needs its own root-cause
+pass. Full analysis, including the ruled-out quaternion/collider/spawn-yaw
+hypotheses that predate this matrix, is in
+`task30-spawn-path-findings.md` (background) and the live matrix above
+(this session).
+
+**Boot instrumentation: `spawn_pose_trace`.** Given the matrix above shows the
+mislocation can already be present very early (case 8's first captured frame
+is off before the ~150-frame settle burst even starts), `_check_spawn_pose`'s
+single post-settle sample cannot show WHERE in the boot sequence the pose
+goes wrong. Added a `{"event": "spawn_pose_trace", "stage": ..., "t":
+sim_time, "root_pos": [x,y,z], "root_yaw_deg": ..., "base_link_pos": [...] if
+resolvable, "via"/"reason" where applicable}` line at each stage of the boot
+path, default-on and cheap (a handful of lines per boot, `backend.py`):
+
+- `"initial_state"` -- the `ArticulationCfg.InitialStateCfg` pos/rot exactly
+  as configured, before the spawner or the articulation object exist
+  (`backend.py`, right before `self._robot = Articulation(robot_cfg)`).
+- `"after_reset"` -- the truth root pose the instant `self._sim.reset()`
+  returns, from `data.root_pos_w`/`root_quat_w`, before
+  `_refresh_robot_handles` can touch it (right after the `reset()` call).
+- `"after_spawn_yaw_write"` -- after whichever spawn-yaw write actually ran,
+  with `"via": "usd"` or `"via": "view"`: the pre-reset USD `xformOp:orient`
+  branch logs the just-authored values (no live tensor view yet); the
+  post-reset `_apply_spawn_yaw_via_view` logs the tensor-view read-back
+  right after `write_root_pose_to_sim_index`. Neither prints when
+  `TINKER_SIM_SPAWN_YAW` is unset (matching case 8/1-2 above: no write of any
+  kind runs on that path -- the trace makes that absence visible instead of
+  silent).
+- `"after_first_step"` -- once, right after the first successful
+  `self._robot.update(self.dt)` following boot, from both `step()` call
+  sites that can reach it (the normal path and the PHYSICS_READY-rebind
+  early-return branch) -- guarded by `_spawn_pose_trace_first_step_logged`
+  so it never re-fires on a later scenario rebind (that gets its own
+  `after_rebind` stage instead).
+- `"after_settle"` -- inside `_check_spawn_pose` itself, alongside the
+  existing `spawn_pose_check` line, from the exact base pose that check
+  already computed.
+- `"after_rebind:<reason>"` -- inside `_refresh_robot_handles`, in the
+  branch that already detects a genuine view-identity change
+  (`self._robot_view_identity is not None`, i.e. not the initial bind).
+  `<reason>` is `reset_rebind` for the scenario's own STOP -> spawn_entity(s)
+  -> PLAY cycle (`reapply_spawn_yaw=True`) or `view_recovery` for
+  `_maybe_recover_simulation_view`'s state-preserving mid-run recovery
+  (`reapply_spawn_yaw=False`). This backend has no handle on which entity
+  triggered a STOP/PLAY cycle -- that lives cross-process, in
+  `ros2_ws/.../scenario_runner.py`'s `/spawn_entity` calls -- so only the
+  reason classification is logged here; entity identity is covered by
+  `scenario_spawn` below.
+
+`base_link` vs the articulation root: `root_pos_w`/`root_quat_w` (used
+everywhere in this file) report the ARTICULATION ROOT's pose
+(`/World/Tinker`), which for a USD-referenced import need not be the same
+prim as the URDF's own `base_link` link (`source-tinker-full.urdf` names
+`base_link` as its actual root `<link>`). New helpers
+`_base_link_body_index`/`_base_link_pose` look up `"base_link"` in
+`data.body_names` and read `body_pos_w`/`body_quat_w` at that index when
+present; `_log_spawn_pose_trace` includes `base_link_pos`/
+`base_link_yaw_deg` whenever that lookup succeeds, so a divergence between
+the two (or its absence) is visible in the trace instead of assumed away.
+Not independently confirmed live in this session (no GPU boot) whether the
+tinker2 USD's `body_names` actually contains a distinct `"base_link"` entry
+separate from body index 0 -- the code degrades to omitting the field if it
+doesn't, by design (`_log_spawn_pose_trace` never raises on a failed
+lookup).
+
+All of the above is formatted by a new pure/stateless `format_spawn_pose_trace`
+function (`backend.py`, next to `resolve_use_fabric`) so the exact JSON shape
+is unit-testable without a live sim.
+
+**Scenario spawn sequence: `scenario_spawn`.** The `/spawn_entity` and
+`/set_simulation_state` simulation_interfaces services are owned by the
+out-of-repo `isaacsim.ros2.sim_control` extension, not by any code in this
+repo -- `backend.py` never sees a spawn request directly, only its
+after-the-fact effect (a view-identity change in `_refresh_robot_handles`,
+see `after_rebind` above). The one place this repo issues those calls is
+`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/scenario_runner.py`'s
+`ScenarioRunner.execute()`, which walks the `ScenarioOperation` tuple
+`tinker_sim_core.orchestration.standard_operations` compiles. Added one
+`{"event": "scenario_spawn", "name": ..., "pose": {"xyz": ...,
+"quaternion_xyzw": ...}, "t": time.monotonic(), "stop_play_cycle": bool}`
+line per `spawn_entity` operation, right after its service response
+confirms the entity name. `stop_play_cycle` is tracked from the boundary
+names on the `set_simulation_state` operations the same loop already walks:
+`True` from the `"SPAWN_READY"` (STOPPED) boundary until the final
+`"PHYSICS_READY"` (PLAYING) boundary -- `False` throughout for the opt-in
+`--spawn-while-playing` mode, which skips that bracket entirely (see
+`orchestration.standard_operations`'s own docstring on why that mode exists).
+This `t` is wall-clock monotonic in the ROS-side runner process, a different
+clock domain from `backend.py`'s sim-time `t` above (the two processes don't
+share a clock) -- correlating a `scenario_spawn` line with a
+`spawn_pose_trace`/`after_rebind` line needs matching by proximity/ordering
+in the combined log, not by comparing `t` values directly.
+
+**Tests.** `tests/test_manipulation_runtime.py::SpawnPoseTraceFormatTest`
+(new): `format_spawn_pose_trace`'s exact JSON shape (fields present/absent
+per optional argument); `_log_spawn_pose_trace` from a backend double (no
+live sim) with a `base_link` body at a pose DIFFERENT from the root,
+confirming both are logged and differ; and the omit-when-unresolvable case
+(the stock backend double's `body_names` has no `"base_link"` entry).
+`SpawnPoseCheckTest`'s existing assertions were updated to filter for
+`spawn_pose_check`/`spawn_pose_mismatch` events specifically (the new
+`after_settle` trace line now also prints during `_maybe_check_spawn_pose`,
+in the same captured-stdout window those tests inspect) -- their pass/fail
+logic is otherwise unchanged. Full suite:
+`tests/test_manipulation_runtime.py` 117 passed, 3 subtests passed, 0
+failed (up from 113 passed pre-change: 4 new `SpawnPoseTraceFormatTest`
+cases). No GPU boot for this change; case 6's static 61 cm offset and case
+8's dynamic tumble both remain open root-cause items the new trace is meant
+to help localize on the next live run.
+
+**Root cause found: `InitialStateCfg.rot` is scalar-last, backend built it
+scalar-first -- the robot spawned upside down.** The `spawn_pose_trace`
+instrumentation above, followed live, found the actual bug the case
+1/2/6/8 matrix above was chasing without a mechanism. The vendored Isaac Lab
+3.0.0 `AssetBaseCfg.InitialStateCfg` (`.deps/IsaacLab/source/isaaclab/
+isaaclab/assets/asset_base_cfg.py:37-40`) documents its `rot` field as
+scalar-last `(x, y, z, w)`, defaulting to `(0.0, 0.0, 0.0, 1.0)`. `backend.py`
+built that keyword by hand as `(cos(yaw/2), 0, 0, sin(yaw/2))` -- scalar
+FIRST. For the common case, an unset/zero spawn yaw, that expression
+evaluates to `(1.0, 0.0, 0.0, 0.0)`, which under the real scalar-last
+contract is not identity at all: it is a 180 degree rotation about world X.
+`Articulation.reset()` *does* apply `init_state` (the old comment above the
+construction, claiming "the spawner drops this rot" for a USD-referenced
+articulation, was itself wrong/outdated for the vendored 3.0.0 spawner --
+what it was actually observing was this order bug, not a dropped write) --
+so every default-heading boot has been initializing the robot inverted.
+Live trace numbers from the run that caught it: `after_reset` root `z=0.30`
+sitting ABOVE `base_link z=0.25` (impossible right-side-up, trivial upside
+down: the root offset that is normally below `base_link` flips to above it),
+followed by a first-step ejection to `(-0.69, -2.19, 171°)` -- exactly case
+1/2's original incident numbers. Two things masked this for non-zero yaw:
+(a) `TINKER_SIM_SPAWN_YAW=1.5708` supplies `(cos(45°), 0, 0, sin(45°)) =
+(0.707, 0, 0, 0.707)`, which the scalar-last contract reads as a 90 degree
+ROLL about X, not the intended 90 degree yaw about Z -- rescued only because
+the pre-reset USD `xformOp:orient` write (Fabric-off path, correctly
+real-first for `Gf.Quatd`) or `_apply_spawn_yaw_via_view` (already
+correctly scalar-last, post-reset tensor write) overwrite the orientation
+before it matters (matrix cases 4 and 7); (b) case 8 (yaw unset, Fabric
+forced off, neither write path engaged because the `abs(spawn_yaw) > 1e-9`
+guard is false) tumbles instead of landing cleanly -- consistent with an
+upside-down spawn correcting itself dynamically rather than being rescued by
+either write path.
+
+**Fix.** Added a pure `spawn_root_rot_xyzw(yaw) -> (0.0, 0.0, sin(yaw/2),
+cos(yaw/2))` (`backend.py`, next to `resolve_spawn_yaw`) as the single
+source of a correctly-ordered heading-about-Z quaternion, and routed the
+`InitialStateCfg.rot` construction, the `"initial_state"`/
+`"after_spawn_yaw_write"` trace payloads, and `_apply_spawn_yaw_via_view`'s
+tensor-write quaternion through it (all previously duplicated the
+by-hand `sin`/`cos` construction; now there is exactly one place the order
+can go wrong). Left untouched, per the vendored contracts each site
+actually uses: `_apply_spawn_yaw_via_view` (already scalar-last -- its own
+docstring already warned not to copy the `Gf.Quatd` construction into it,
+which turned out to be exactly backwards advice for the other direction:
+the copying had happened into `InitialStateCfg.rot` instead) and the
+pre-reset USD `xformOp:orient` authoring's `Gf.Quatd(cos, 0, 0, sin)` (`Gf`
+quaternions are scalar-first by construction -- this one was already
+correct and must stay real-first, not be "fixed" to scalar-last). Corrected
+the stale "the spawner drops this rot" comment in the same edit.
+
+**Tests** (`tests/test_manipulation_runtime.py`): `SpawnRootRotXyzwTest` --
+`spawn_root_rot_xyzw(0.0) == (0.0, 0.0, 0.0, 1.0)` (the vendored identity
+default) and `spawn_root_rot_xyzw(pi/2) ≈ (0, 0, 0.7071, 0.7071)`, plus an
+explicit regression guard that a zero yaw must NOT reproduce the old
+scalar-first bug's `(1, 0, 0, 0)`. `BackendInitStateRotConstructionTest` --
+extracts the literal `rot=` keyword source off the
+`*.InitialStateCfg(...)` call in `backend.py` via `ast` (no Isaac import
+needed) and `eval`s it for an unset and a `1.5708` `TINKER_SIM_SPAWN_YAW`,
+asserting it equals `spawn_root_rot_xyzw(spawn_yaw)` exactly -- this
+exercises the backend's actual construction, not a hand-reimplementation of
+it in the test. Confirmed both new construction-test cases FAIL against the
+pre-fix (scalar-first) construction:
+`AssertionError: Tuples differ: (1.0, 0.0, 0.0, 0.0) != (0.0, 0.0, 0.0, 1.0)`
+(unset yaw) and the equivalent element-0/2/3 mismatch for yaw `1.5708`. Full
+suite after the fix: `tests/test_manipulation_runtime.py` 122 passed, 3
+subtests passed, 0 failed (up from 117: 5 new cases). No GPU boot for this
+change; PR #18's boot-time `spawn_pose_check` assertion and the
+`spawn_pose_trace` instrumentation above remain in place as the live guard
+that would have caught this immediately had they existed before it did.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported
