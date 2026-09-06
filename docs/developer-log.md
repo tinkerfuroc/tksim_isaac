@@ -2162,3 +2162,73 @@ runs it next, now including a reset-survival check for Finding 1's fix
 from truth and confirm it is still the commanded value, not identity). Do
 not treat this flag as validated, and do not flip any default based on this
 entry alone.
+
+## 2026-09-06: spawn-yaw-via-view + FIX_BASE held the base at its un-settled spawn height (#26)
+
+**Symptom**: with `TINKER_SIM_SPAWN_YAW_VIA_VIEW=1` and `TINKER_SIM_FIX_BASE=1`
+both active, the held base-frame z came out ~0.1954 instead of the ~0.0775
+settled rest height the flag-off (USD-authored-yaw) path produces -- an
+11.8 cm base-frame error, first caught on a bench round ("agu") comparing
+base pose against the flag-off baseline.
+
+**Root cause**: `_apply_spawn_yaw_via_view` (`simulation/tinker_sim_isaac/backend.py`)
+runs once the articulation is bound and `self._sim.reset()` has returned,
+*before the first physics step* -- exactly per its own docstring. The #24
+fix round that added FIX_BASE seeding (see the 2026-09-05 entry above,
+"seeds `_base_hold_pose`/`_base_hold_vel`/`_base_hold_scene_sig` directly")
+took `data.root_pos_w` at that same pre-physics moment and latched it
+straight into `_base_hold_pose`. That is the un-settled spawn height
+(`InitialStateCfg.pos`'s z, ~0.20, minus a small articulation-resolve
+offset) -- the free-base chassis has not yet had gravity drop it onto its
+wheels/casters. Because `_base_hold_pose` was now non-None from step 0,
+`_apply_base_hold`'s own settle-latch (`if self._base_hold_pose is None: if
+self.simulation_time < self._base_hold_after_sim_s: return`, gated on a
+2.0 s wait) never fired -- the branch that would otherwise have captured
+the settled pose was permanently skipped, so the pre-settle height was held
+for the entire run instead. The flag-off path never seeds anything here (it
+is guarded out of `_apply_spawn_yaw_via_view` entirely, which flag-off never
+calls), so it always went through the settle-latch and got the correct
+settled height -- which is exactly why the two paths disagreed.
+
+**Fix**: `_apply_spawn_yaw_via_view` no longer seeds `_base_hold_pose`'s
+position at all. It now only remembers the commanded yaw quaternion in a
+new pending field, `_base_hold_seed_quat`, and (when `base_fixed`) clears
+any already-latched `_base_hold_pose`/`_base_hold_vel` back to `None` --
+necessary on a genuine rebind (STOP -> spawn -> PLAY), since nothing else
+re-drives the settle-latch once `_base_hold_pose` is non-None, and a
+genuine rebind resets the chassis back to its unsettled spawn pose just
+like boot did. `_apply_base_hold`'s existing settle-latch is otherwise
+unchanged -- it still waits for `simulation_time >= _base_hold_after_sim_s`
+-- except that when it fires, it now composes the freshly-read (and by then
+settled) `root_pos_w` with `_base_hold_seed_quat` if one is pending, instead
+of the measured `root_quat_w`, so the commanded yaw still survives into the
+hold exactly as the #24 fix intended. Flag-off behaviour is unchanged
+(`_base_hold_seed_quat` stays `None` for that path, so the latch falls back
+to the measured orientation exactly as before). `_reapply_spawn_yaw_after_rebind`'s
+rebind classification (`reapply_spawn_yaw`, #24 round 2) was not touched --
+it still decides whether this whole method runs at all, independent of what
+it does internally.
+
+**Validation gap that let this ship**: the #24 GPU validation recipe
+(`fabric-on-validation-recipe.md`) did exercise `FIX_BASE=1` and passed its
+"spawn clean, reset survival" checks, but those checks read only
+`robot.base_pose.quaternion_xyzw` -- orientation persistence across a
+rebind -- never `base_pose.xyz`'s z-height against a settled baseline. It
+was checking a different axis of correctness than the one that broke.
+
+Non-GPU coverage (`tests/test_manipulation_runtime.py`,
+`SpawnYawViaViewApplyTest.test_base_hold_latches_settled_height_with_seeded_yaw`,
+new): seeds the yaw with `root_pos_w` z=0.20 (un-settled), mutates the mock's
+`root_pos_w` to z=0.0775 (settled) and advances simulated time past
+`_base_hold_after_sim_s`, then calls `_apply_base_hold` directly and asserts
+the latched hold's z is 0.0775 (not 0.20) *and* its orientation is the
+seeded yaw (not whatever `root_quat_w` happens to read at latch time). This
+test fails against pre-fix `backend.py` (`_base_hold_pose` is not `None`
+immediately after `_apply_spawn_yaw_via_view`, so the settle-latch branch
+never runs). `test_seeds_base_hold_target_when_fix_base_active`,
+`test_does_not_seed_base_hold_when_fix_base_inactive`, and
+`test_reapplies_yaw_on_rebind_when_via_view_active` were updated to assert
+the new contract (yaw seeded into `_base_hold_seed_quat`, `_base_hold_pose`
+left/reset to `None`, not immediately re-latched). Full suite:
+`tests/test_manipulation_runtime.py` 103 passed, 3 subtests passed, 0
+failed. Still no GPU boot for this fix -- same caveat as #24 above.

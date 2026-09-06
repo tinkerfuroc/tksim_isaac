@@ -91,12 +91,16 @@ class _FakeRobot:
         self.target_calls: list[tuple[str, torch.Tensor]] = []
         self.write_count = 0
         self.root_pose_calls: list[torch.Tensor] = []
+        self.root_velocity_calls: list[torch.Tensor] = []
 
     def write_joint_effort_limit_to_sim_index(self, **kwargs: object) -> None:
         self.limit_calls.append(kwargs)
 
     def write_root_pose_to_sim_index(self, **kwargs: object) -> None:
         self.root_pose_calls.append(kwargs["root_pose"].clone())
+
+    def write_root_velocity_to_sim_index(self, **kwargs: object) -> None:
+        self.root_velocity_calls.append(kwargs["root_velocity"].clone())
 
     def write_joint_stiffness_to_sim_index(self, **kwargs: object) -> None:
         self.gain_calls.append(("stiffness", kwargs))
@@ -2585,20 +2589,24 @@ class SpawnYawViaViewApplyTest(unittest.TestCase):
             self.assertAlmostEqual(actual, expected, places=6)
 
     def test_seeds_base_hold_target_when_fix_base_active(self) -> None:
+        """#26: the ORIENTATION is seeded immediately (so it survives a
+        rebind with no durable USD backing), but the POSITION is deferred
+        to _apply_base_hold's own settle-latch -- _base_hold_pose itself
+        must stay None here, not lock in the pre-settle root_pos_w read."""
         backend = _backend()
         backend.base_fixed = True
+        backend._base_hold_pose = "stale-from-a-prior-rebind"
+        backend._base_hold_vel = "stale-vel-from-a-prior-rebind"
         backend._scenario_child_signature = lambda: 7
 
         backend._apply_spawn_yaw_via_view(0.4)
 
-        self.assertIsNotNone(backend._base_hold_pose)
-        self.assertEqual(backend._base_hold_scene_sig, 7)
+        written = backend._robot.root_pose_calls[0]
+        self.assertIsNone(backend._base_hold_pose)
+        self.assertIsNone(backend._base_hold_vel)
+        self.assertIsNotNone(backend._base_hold_seed_quat)
         self.assertEqual(
-            backend._base_hold_pose.tolist(),
-            backend._robot.root_pose_calls[0].tolist(),
-        )
-        self.assertEqual(
-            backend._base_hold_vel.tolist(), [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+            backend._base_hold_seed_quat.tolist(), written[:, 3:].tolist()
         )
 
     def test_does_not_seed_base_hold_when_fix_base_inactive(self) -> None:
@@ -2606,14 +2614,57 @@ class SpawnYawViaViewApplyTest(unittest.TestCase):
         backend.base_fixed = False
         backend._base_hold_pose = None
         backend._base_hold_vel = None
+        backend._base_hold_seed_quat = None
 
         backend._apply_spawn_yaw_via_view(0.4)
 
         self.assertIsNone(backend._base_hold_pose)
         self.assertIsNone(backend._base_hold_vel)
+        self.assertIsNone(backend._base_hold_seed_quat)
         # The write itself still happens -- only the hold-target seeding is
         # gated on FIX_BASE.
         self.assertEqual(len(backend._robot.root_pose_calls), 1)
+
+    def test_base_hold_latches_settled_height_with_seeded_yaw(self) -> None:
+        """#26 regression: the seeded yaw must survive to the LATCHED hold,
+        but the latched POSITION must come from the settled read
+        _apply_base_hold takes once its settle timer elapses, not the
+        pre-settle root_pos_w _apply_spawn_yaw_via_view saw at spawn time."""
+        backend = _backend()
+        backend.base_fixed = True
+        backend._base_hold_pose = None
+        backend._base_hold_vel = None
+        backend._base_hold_seed_quat = None
+        backend._base_hold_scene_sig = None
+        backend._base_hold_skip_until_sim_s = 0.0
+        backend._base_hold_resettle_s = 0.15
+        backend._base_hold_dryrun = False
+        backend._base_hold_after_sim_s = 2.0
+        backend._robot.data.root_pos_w = torch.tensor(
+            [[1.0, 2.0, 0.20]], dtype=torch.float32
+        )
+
+        backend._apply_spawn_yaw_via_view(0.4)
+        self.assertIsNone(backend._base_hold_pose)
+        half = 0.4 / 2.0
+        expected_quat = [0.0, 0.0, math.sin(half), math.cos(half)]
+
+        # Gravity settles the chassis onto its wheels: root_pos_w now reads
+        # the lower, settled rest height.
+        backend._robot.data.root_pos_w = torch.tensor(
+            [[1.0, 2.0, 0.0775]], dtype=torch.float32
+        )
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 241)
+        backend._clock_step_origin = 0
+        backend.physics_dt = 1.0 / 120.0
+
+        backend._apply_base_hold()
+
+        self.assertIsNotNone(backend._base_hold_pose)
+        latched = backend._base_hold_pose[0].tolist()
+        self.assertAlmostEqual(latched[2], 0.0775, places=6)
+        for actual, expected in zip(latched[3:], expected_quat):
+            self.assertAlmostEqual(actual, expected, places=6)
 
 
 class SpawnYawViaViewRebindTest(unittest.TestCase):
@@ -2631,6 +2682,11 @@ class SpawnYawViaViewRebindTest(unittest.TestCase):
     -- see ``SpawnYawViaViewRecoveryRebindTest`` below."""
 
     def test_reapplies_yaw_on_rebind_when_via_view_active(self) -> None:
+        """#26: a rebind must re-seed the pending yaw (so it survives the
+        rebind with no durable USD backing) but must NOT re-latch
+        _base_hold_pose's position from the fresh, pre-settle rebind read
+        -- it clears any stale hold from before the rebind instead, so
+        _apply_base_hold's own settle-latch runs again on a SETTLED read."""
         backend = _backend()
         backend._robot_view_identity = -1  # force _refresh_robot_handles to see a "new" view
         backend._clock_step_origin = 0
@@ -2639,7 +2695,9 @@ class SpawnYawViaViewRebindTest(unittest.TestCase):
         backend._spawn_yaw_via_view = True
         backend._spawn_yaw = math.pi / 2.0
         backend.base_fixed = True
-        backend._scenario_child_signature = lambda: 9
+        # Sentinel stale hold from before the rebind -- must be cleared.
+        backend._base_hold_pose = torch.tensor([[9.0, 9.0, 9.0, 0.0, 0.0, 0.0, 1.0]])
+        backend._base_hold_vel = torch.zeros((1, 6))
 
         self.assertTrue(backend._refresh_robot_handles())
 
@@ -2649,13 +2707,14 @@ class SpawnYawViaViewRebindTest(unittest.TestCase):
         expected_quat = [0.0, 0.0, math.sin(half), math.cos(half)]
         for actual, expected in zip(written_row[3:], expected_quat):
             self.assertAlmostEqual(actual, expected, places=6)
-        # Base-hold target re-seeded too (not left stale from before reset).
-        self.assertIsNotNone(backend._base_hold_pose)
-        self.assertEqual(backend._base_hold_scene_sig, 9)
-        self.assertEqual(
-            backend._base_hold_pose.tolist(),
-            backend._robot.root_pose_calls[0].tolist(),
-        )
+        # The stale hold is cleared, and the yaw is remembered as pending,
+        # rather than being re-latched immediately from the pre-settle
+        # rebind read.
+        self.assertIsNone(backend._base_hold_pose)
+        self.assertIsNone(backend._base_hold_vel)
+        seed_quat_row = backend._base_hold_seed_quat[0].tolist()
+        for actual, expected in zip(seed_quat_row, expected_quat):
+            self.assertAlmostEqual(actual, expected, places=6)
 
     def test_reapplies_yaw_on_every_rebind_not_just_the_first(self) -> None:
         backend = _backend()
