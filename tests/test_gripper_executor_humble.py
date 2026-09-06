@@ -429,14 +429,23 @@ def test_settled_grasp_keeps_clamping_after_success(ros_context) -> None:
         source.destroy_node()
 
 
-def test_fresh_contact_requires_dwell_before_success(ros_context) -> None:
-    # Success is a settled grasp, not first touch: a finger brushing the object
-    # at threshold force has not yet clamped it.  A fresh contact must persist
-    # for stall_dwell_s before it counts, so the grasp does not "succeed" the
-    # instant a pad touches (which would latch a feather-light clamp).
+def test_sustained_contact_does_not_succeed_while_drive_still_advancing(
+    ros_context,
+) -> None:
+    # Hardware parity (#23): the real xArm gripper action returns only once the
+    # drive stalls, reaches its target, or hits its effort limit -- never on
+    # contact alone.  A fresh, sustained contact (well past stall_dwell_s) must
+    # NOT trigger success while the measured position is still advancing toward
+    # the target (a validation round saw the facade return success at 0.162 rad
+    # while the real drive kept closing to 0.569 rad over the next ~5 s).  Once
+    # the drive stops advancing, the SAME contact is allowed to confirm the
+    # stall that the position path would already report.
     node = GripperFacade()
     _clear_safety(node)
-    node.set_parameters([Parameter("stall_dwell_s", Parameter.Type.DOUBLE, 0.3)])
+    stall_dwell = 0.15
+    node.set_parameters(
+        [Parameter("stall_dwell_s", Parameter.Type.DOUBLE, stall_dwell)]
+    )
     source = Node("gripper_executor_contact_dwell_source")
     state_publisher = source.create_publisher(JointState, "/isaac_joint_states", 20)
     contact_publisher = source.create_publisher(
@@ -445,13 +454,14 @@ def test_fresh_contact_requires_dwell_before_success(ros_context) -> None:
     goal = _GoalHandle(target=1.0)
     _run_goal_with_timer(node, goal)
 
-    # Keep the measured position improving toward the target so the contact-free
-    # position-stall path never latches -- only sustained contact can end this
-    # grasp, isolating the contact-dwell behaviour under test.
-    progress = {"p": 0.0}
+    # The measured position keeps improving toward the target for many times
+    # the stall dwell while contact stays sustained above threshold -- this is
+    # the "still closing" / compliant-contact case the fix must not latch on.
+    progress = {"p": 0.0, "advancing": True}
 
     def publish_state() -> None:
-        progress["p"] = min(0.9, progress["p"] + 0.01)
+        if progress["advancing"]:
+            progress["p"] = min(0.9, progress["p"] + 0.01)
         message = JointState()
         message.name = ["drive_joint"]
         message.position = [progress["p"]]
@@ -466,9 +476,15 @@ def test_fresh_contact_requires_dwell_before_success(ros_context) -> None:
     contact_timer = source.create_timer(0.02, publish_contact)
     executor, spin_thread = _spin(node, source)
     try:
-        # First touch must NOT instantly succeed inside the dwell window.
-        assert not goal.finished.wait(0.2)
-        # Sustained contact past the dwell settles into a stalled success.
+        # Sustained contact alone, several dwell periods long, must NOT succeed
+        # while the drive is still advancing (progress keeps climbing toward
+        # 0.9 over ~1.8 s -- far past the 0.15 s dwell).
+        assert not goal.finished.wait(4 * stall_dwell)
+        assert not goal.finished.is_set()
+        # Now let the drive plateau (stop advancing) with contact still held:
+        # the position-stall path fires, and the gated contact_stalled can only
+        # ever confirm that same stall, never precede it.
+        progress["advancing"] = False
         assert goal.finished.wait(3.0)
         assert goal.outcome == "succeeded"
         assert any(feedback.stalled for feedback in goal.feedback)

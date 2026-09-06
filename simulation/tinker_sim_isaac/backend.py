@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -270,6 +271,65 @@ def resolve_spawn_yaw(value: str | None) -> float:
     if not math.isfinite(yaw):
         raise ValueError("TINKER_SIM_SPAWN_YAW must be finite")
     return yaw
+
+
+def resolve_clock_epoch(value: str | None) -> float:
+    """Parse ``TINKER_SIM_CLOCK_EPOCH``: the epoch (seconds) the published
+    ``/clock`` is anchored to, so a fresh sim *process* never publishes a
+    ``/clock`` sample that appears to precede a prior process's last sample.
+    Real ROS time on hardware is wall-clock and never goes backward; this is
+    the parity target for a Isaac Sim restart while long-lived ROS consumers
+    (tf2 buffers with no jump handling, e.g. AnyGrasp) keep running. See
+    ``docs/developer-log.md`` (2026-09-05 entry) and task #21.
+
+    - unset or ``"wall"`` (default): the wall-clock time (``time.time()``)
+      captured once, when this backend/clock origin is first established.
+    - ``"0"``: the legacy zero-based clock -- every pre-existing zero-based
+      test, replay, or offset-alignment assumption keeps its meaning.
+    - any other non-negative numeric string: that epoch in seconds, letting
+      a harness pin a reproducible absolute clock across repeated runs.
+
+    Fails closed on malformed, non-finite, or negative input, mirroring
+    ``resolve_spawn_yaw``. Negative epochs are rejected rather than merely
+    discouraged: ``ros_clock_time`` (``simulation_time + epoch``) would
+    otherwise legitimately read exactly ``0`` -- or briefly go negative --
+    while physics is genuinely advancing, which is indistinguishable from
+    rclpy's own "no /clock sample yet" convention
+    (``evaluate_clock_domain``) and produces an invalid (negative-nanosecond)
+    ``builtin_interfaces/Time`` in ``ros_gateway.py``'s ``_stamp()``.
+    Disallowing negative epochs keeps the invariant ``ros_clock_time >= 0``
+    always, and ``== 0`` reachable only in the legacy ``"0"`` mode (or an
+    explicit ``0``-valued pin, which is the same thing) at true start --
+    exactly the case ``evaluate_clock_domain``'s zero-check is for.
+    """
+    text = "" if value is None else value.strip()
+    if not text or text.lower() == "wall":
+        return time.time()
+    try:
+        epoch = float(text)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"TINKER_SIM_CLOCK_EPOCH must be 'wall', unset, or a number, got {value!r}"
+        )
+    if not math.isfinite(epoch):
+        raise ValueError("TINKER_SIM_CLOCK_EPOCH must be finite")
+    if epoch < 0:
+        raise ValueError(
+            f"TINKER_SIM_CLOCK_EPOCH must be non-negative, got {value!r}"
+        )
+    return epoch
+
+
+def resolve_backend_clock_epoch() -> float:
+    """``__init__``'s actual entry point for ``self._clock_epoch_s``.
+
+    A thin wrapper so a unit test can exercise the real ``TINKER_SIM_CLOCK_EPOCH``
+    env-var name (guarding against e.g. a typo in it inside ``__init__``,
+    which full backend construction -- needing Isaac Sim/PhysX/torch -- can't
+    exercise in this test suite) without going through ``resolve_clock_epoch``
+    a second, redundant, hand-wired way.
+    """
+    return resolve_clock_epoch(os.environ.get("TINKER_SIM_CLOCK_EPOCH"))
 
 
 def _fused_apply_actuator_model(self) -> None:
@@ -964,6 +1024,14 @@ class IsaacWholeRobotBackend:
         # monotonic-clock continuation across STOP -> PLAY resets (see
         # _refresh_robot_handles).
         self._clock_elapsed_steps = 0
+        # Boot epoch (seconds) the *published* clock (ros_clock_time) is
+        # anchored to -- see resolve_clock_epoch and TINKER_SIM_CLOCK_EPOCH.
+        # Captured once per process so a full sim-process restart's first
+        # /clock sample never appears to precede a prior process's last one.
+        # `simulation_time` itself (elapsed sim time since this backend was
+        # constructed) is unchanged and stays the small process-relative
+        # value internal timers/run-duration gating already rely on.
+        self._clock_epoch_s = resolve_backend_clock_epoch()
         import omni.kit.app
 
         # Flush USD/Fabric stage notices before SimulationContext creates the
@@ -1512,6 +1580,24 @@ class IsaacWholeRobotBackend:
         # clock from here instead of jumping backwards (_refresh_robot_handles).
         self._clock_elapsed_steps = steps
         return float(steps) * self.physics_dt
+
+    @property
+    def ros_clock_time(self) -> float:
+        """The value to publish on ``/clock`` (and stamp ROS message headers
+        with): ``simulation_time`` anchored to this process's boot epoch
+        (``TINKER_SIM_CLOCK_EPOCH``, ``resolve_clock_epoch``).
+
+        ``simulation_time`` itself stays a small, process-relative elapsed
+        value (unaffected by the epoch) so internal consumers that already
+        depend on it starting near zero -- run-duration gating in
+        ``validation/run_sim.py``, the base-hold timers, truth-record ``t``
+        fields -- keep their existing meaning. Only the externally published
+        clock needs to be monotonic across a full sim-process restart (task
+        #21): a fresh process's `/clock` must never appear to precede a
+        prior process's last published sample, matching hardware parity
+        (real ROS time is wall-clock and never goes backward).
+        """
+        return self.simulation_time + self._clock_epoch_s
 
     @property
     def physics_frame_index(self) -> int:
@@ -3262,7 +3348,13 @@ class IsaacWholeRobotBackend:
         return {
             "schema_version": self.PHYSICS_TRUTH_SCHEMA_VERSION,
             "frame_index": self.physics_frame_index,
-            "timestamp": self.simulation_time,
+            # Anchored, not elapsed: this feeds /sim/internal/physics_truth,
+            # which truth_evaluator.py restamps onto /sim/truth/* (RobotTruth,
+            # ObjectTruth, ContactTruth, TaskTruth). Every externally
+            # published stamp must share one clock domain with /clock and
+            # ros_gateway.py's own publishes (joint_states, cameras, IMU,
+            # /contact) -- see ros_clock_time and task #21.
+            "timestamp": self.ros_clock_time,
             "scenario": self.scenario,
             "task": self.task,
             "robot": self._robot_truth_state(),

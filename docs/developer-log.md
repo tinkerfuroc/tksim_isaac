@@ -106,6 +106,109 @@ now rather than block on live-repro instrumentation first. `py-spy dump` on
 the next live wedge (see above) remains the confirmation step for the root
 cause.
 
+## 2026-09-05 — /clock re-zero on a full sim-process restart: anchored to a boot epoch (task #21)
+
+**Root cause (findings: `task21-clock-rezero-findings.md`, `.claude/jobs/01ca17b4/tmp/`).**
+`767fb89` (2026-08-27) made `/clock` monotonic across an *in-process*
+`ResetSimulation` STOP -> PLAY (`backend.py` `_refresh_robot_handles`,
+`simulation_time` re-anchors `_clock_step_origin` to the elapsed step count
+observed before the boundary instead of re-zeroing). That fix does not, and
+was never meant to, cover a full Isaac Sim *process* restart: a fresh
+`IsaacWholeRobotBackend` re-initializes `_clock_step_origin = 0` /
+`_clock_elapsed_steps = 0` (backend.py, `__init__`), and `ros_gateway.py`
+stands up a brand-new rclpy node/DDS participant, so the new process's first
+`/clock` samples are near `0.0` again -- a real backward jump relative to
+the prior process's last published sample. Long-lived ROS consumers that
+keep running across the sim restart see it: Python `tf2_ros.Buffer` (used
+by, e.g., AnyGrasp) has no clock-jump handling at all (unlike the C++
+`tf2_ros::Buffer`, which registers `onTimeJump`), so a backward `/clock`
+sample is either cached as stale "old data" and dropped, or produces
+`ExtrapolationException`, until ~10 s of new sim time re-elapses past the
+old cached entries (`tf2::BufferCore`'s 10 s default cache window). This is
+the same class of wedge `767fb89` fixed for the in-process case, one level
+up.
+
+**Fix (option (a) from the findings, chosen over publishing a boot-id for
+consumers to clear their own buffers on): anchor the *published* clock to a
+boot epoch**, so a fresh process's `/clock` never appears to precede a
+prior process's last sample -- matching hardware parity (real ROS time on
+hardware is wall-clock and never goes backward).
+
+- `simulation/tinker_sim_isaac/backend.py`: new `resolve_clock_epoch(value)`
+  parses `TINKER_SIM_CLOCK_EPOCH`: unset/`"wall"` (new default) ->
+  `time.time()` captured once in `__init__`; `"0"` -> the legacy zero-based
+  clock; any other numeric string -> a pinned epoch (seconds), for a
+  harness that wants a reproducible absolute clock. The resolved value is
+  stored once as `self._clock_epoch_s`. A new `ros_clock_time` property
+  returns `self.simulation_time + self._clock_epoch_s` -- this is the value
+  to publish/stamp with. **`simulation_time` itself is unchanged**: it stays
+  the small, process-relative elapsed-steps value that internal consumers
+  already depend on starting near zero (run-duration gating in
+  `validation/run_sim.py`'s `args.duration <= 0.0 or backend.simulation_time
+  < args.duration` loop guards, the base-hold timers, truth-record `t`
+  fields) -- only the externally published clock needed to change. The
+  767fb89 in-process STOP -> PLAY re-anchoring is untouched and composes
+  with the epoch (it still re-anchors `_clock_step_origin`, which
+  `ros_clock_time` builds on through `simulation_time`).
+- `simulation/tinker_sim_isaac/ros_gateway.py`'s `_stamp()` (used for
+  `/clock` and every outgoing ROS message header stamp, including camera
+  frames) now reads `backend.ros_clock_time` (falling back to
+  `backend.simulation_time` for a backend double that predates the
+  property), so every ROS-visible timestamp this gateway produces is
+  consistently epoch-anchored, not just `/clock` itself.
+- `ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/contract_guard.py`'s
+  `evaluate_clock_domain` readiness gate treated `clock_now_ns <= 0` as "sim
+  clock hasn't advanced past zero" -- correct under the old zero-based
+  clock (rclpy's own `TimeSource` convention: "Zero time is a special value
+  that means time is uninitialized"), but under the new wall-clock-anchored
+  default a real running sim's first sample is already a large nonzero
+  epoch value, so the gate no longer needs (or should assume) a genuine
+  zero reading ever occurs in normal operation. `clock_now_ns` is now typed
+  `int | None`: `None` explicitly means "no clock sample received yet" (a
+  caller that tracks this itself, distinct from a raw `Clock.now()` read);
+  the literal `0` case is kept and still treated as not-ready for backward
+  compatibility with any caller that can only observe the numeric value.
+  `joint_state_probe.py`'s call site needed no change -- it passes a raw
+  `Clock.now().nanoseconds` read, which already reads exactly `0` before
+  any `/clock` message has ever arrived (rclpy's own uninitialized-clock
+  convention) and a large epoch value once the new anchored clock is live.
+
+**Grepped for and ruled safe (no change needed), per the findings' "verify
+this" list:** `validation/gripper_close_probe.py --record-s` (a duration
+parameter, `steps = args.record_s / DT`, never touches `simulation_time`);
+`validation/run_sim.py`'s profile-emission `sim_time=getattr(backend,
+"simulation_time", None)` (pure telemetry; unaffected since
+`simulation_time` didn't change); the 2026-08-21 profiling-attribution note
+in this log about `/clock` vs `wall_time` drifting by the bridge attach
+time (predates `767fb89`, describes historical pre-fix behavior, not a live
+assumption). `_sim_receipt_time`/`_sim_age_stale` in `ros_gateway.py` (used
+for same-process command-liveness deltas) were left reading the raw
+`simulation_time`, not `ros_clock_time`: a constant epoch offset cancels
+out of a same-process delta, so this is deliberately unchanged rather than
+switched for consistency's sake.
+
+**Known limitation, not fixed here:** the wall-clock default only
+guarantees the new process's first sample is >= the old process's last one
+when real wall-clock time elapses across the restart at least as fast as
+sim time did within the old process (i.e. the sim was not running many
+times faster than real time right up to the moment of the restart, and the
+restart itself takes nonzero wall time) -- true in practice for an Isaac
+Sim boot (tens of seconds) but not a mathematically airtight guarantee for
+an arbitrarily fast headless sim killed and relaunched in well under a
+second. A stronger guarantee would need cross-process persistence (a state
+file) rather than a wall-clock anchor; deferred as the findings' option (a)
+scoped it as wall-clock-only, matching hardware parity as the acceptance
+bar rather than absolute mathematical monotonicity.
+
+Tests: `tests/test_manipulation_runtime.py` (`resolve_clock_epoch`
+defaults/legacy-zero/numeric/rejects-garbage; `ros_clock_time` adds the
+epoch without perturbing `simulation_time`; two backends constructed
+back-to-back with `time.time` monkeypatched to advance publish
+non-decreasing clocks; the 767fb89 in-process reset still holds with an
+epoch anchored) and `tests/test_integrated_joint_state_contract.py`
+(`evaluate_clock_domain` treats `None` as not-ready and a large epoch value
+as ready, alongside the pre-existing zero/missing-publisher cases).
+
 ## 2026-09-04 — Wrist camera blackout band: the camera was rendered from inside the gripper housing
 
 **Symptom (grasp bench, sensor-rich profile, `TINKER_SIM_WRIST_CAMERA_AIM=tool-forward`).**

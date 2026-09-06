@@ -332,15 +332,21 @@ class GripperFacade(Node):
                     and error > tolerance
                     and now_monotonic - last_progress_at >= stall_dwell
                 )
-                # Success is a SETTLED grasp, not first touch.  A finger that
-                # brushes the object at 1 N has not yet clamped it; declaring
-                # success there returns before the grip is established and (with
-                # the keepalive now holding whatever we latch) would clamp only a
-                # feather-light force.  So a contact must persist for stall_dwell
-                # -- the same dwell the position path uses -- before it counts.
-                # With stall_dwell <= 0 (the isolation-test / contact-only
-                # fallback) this reduces to the original instantaneous contact
-                # stall, since a zero dwell is satisfied immediately.
+                # Success is a DRIVE STALL (or reached_goal), not first touch --
+                # hardware parity with the real xArm gripper action, which only
+                # returns once the drive stalls, reaches its target, or hits its
+                # effort limit.  A fresh contact is not on its own proof of that:
+                # a finger can brush an object, or squish into a compliant one,
+                # while the drive keeps advancing for seconds afterward (a
+                # validation round saw the drive close from 0.162 rad to 0.569
+                # rad -- 19% to 67% of stroke -- after a contact-only success had
+                # already returned).  So contact_stalled is gated by the SAME
+                # non-advancing test as the position path: it can only confirm a
+                # stall that position_stalled would already report on its own,
+                # never trigger one while the drive is still closing.  With
+                # stall_dwell <= 0 (the isolation-test / contact-only fallback)
+                # both dwell checks are satisfied immediately, so this reduces to
+                # the original instantaneous contact stall.
                 if contact_is_fresh and contact >= contact_threshold:
                     if contact_since is None:
                         contact_since = now_monotonic
@@ -350,6 +356,7 @@ class GripperFacade(Node):
                     contact_since is not None
                     and error > tolerance
                     and now_monotonic - contact_since >= stall_dwell
+                    and now_monotonic - last_progress_at >= stall_dwell
                 )
                 feedback = GripperCommand.Feedback()
                 feedback.position = position
