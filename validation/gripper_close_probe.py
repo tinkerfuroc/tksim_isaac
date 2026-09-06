@@ -98,6 +98,46 @@ parser.add_argument("--object-min-torsional-radius", type=float, default=None,
                           "= --object-torsional-radius / 2, matching a rubber-contact-patch profile; "
                           "the pads use 0.01/0.01 i.e. min==max). Ignored unless "
                           "--object-torsional-radius is also set.")
+parser.add_argument("--freeze-at-stall", action="store_true",
+                     help="#20 H-CMD discriminator: during phase B, once contact exists (lf+rf > 1 N) "
+                          "AND the measured drive-joint speed stays below 0.02 rad/s for 0.3 s, freeze "
+                          "the close -- set the drive target and all five follower targets to their "
+                          "MEASURED angles + 0.005 rad and monkeypatch backend._ramp_drive_target / "
+                          "backend._mirror_gripper_mimic_targets to no-ops for the rest of the hold, so "
+                          "nothing keeps advancing the command past the stall. Tests whether the pad "
+                          "creep documented in task20-decay-probe-findings.md is the command's continued "
+                          "advance (H-CMD) rather than a friction-anchor artifact (H-ANCHOR). Emits "
+                          "'freeze_at_stall' with the frozen angles and time (or triggered=False if the "
+                          "stall condition never holds for 0.3 s). Default off (byte-identical close).")
+parser.add_argument("--friction-type", default=None, choices=("patch", "one_directional", "two_directional"),
+                     help="#20 H-ANCHOR discriminator: author physxScene:frictionType on the PhysicsScene "
+                          "prim before the physics parse/play (via TINKER_SIM_PHYSICS_FRICTION_TYPE, read "
+                          "in IsaacWholeRobotBackend.__init__ before self._sim.reset() -- see "
+                          "_apply_physics_scene_friction_type). patch = PhysX default (correlated contact-"
+                          "patch friction anchors, reset every step the contact facet changes -- the "
+                          "suspected zero-friction artifact on a curved convex-hull pinch); one_directional "
+                          "= PhysX's deprecated single-axis model; two_directional = per-contact-point "
+                          "friction with no shared patch anchor. Emits 'scene_friction_type_set' before "
+                          "boot and a post-play 'scene_friction_type_check' USD-attribute readback. "
+                          "Default off (scene keeps PhysX's own default, 'patch').")
+parser.add_argument("--object-approximation", default=None,
+                     choices=("convexHull", "convexDecomposition", "sdf", "none"),
+                     help="#20 H-ANCHOR discriminator: author UsdPhysics.MeshCollisionAPI's "
+                          "physics:approximation on the spawned object's MESH collision prim(s) (same "
+                          "prim discovery as --object-friction), before the physics parse. Different "
+                          "approximations change how PhysX generates the contact manifold, which bears "
+                          "on the same patch-friction-anchor hypothesis as --friction-type. "
+                          "MeshCollisionAPI only affects UsdGeom.Mesh colliders -- the built-in bench "
+                          "objects (bottle: Cylinder, knife: Cube, plate: Cylinder) are ANALYTIC "
+                          "primitives, not meshes, so PhysX ignores this attribute for them; a collider "
+                          "that is not a UsdGeom.Mesh is reported (not authored) via "
+                          "'object_approximation_check' with is_mesh=false, and the flag is otherwise a "
+                          "no-op on the bottle/knife/plate bench objects -- pass --object-usda pointing "
+                          "at a mesh asset to actually exercise it. For 'sdf' also sets "
+                          "physxSDFMeshCollision:sdfResolution=256 on mesh colliders via "
+                          "PhysxSDFMeshCollisionAPI. Emits 'object_approximation_set' before play and "
+                          "'object_approximation_check' (USD readback) after. Default off (object keeps "
+                          "its authored/default approximation).")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
 parser.add_argument("--object-yaw-axis", default="x", choices=("x", "y"), help="which tool axis the object's long axis is aligned to (knife)")
 parser.add_argument("--object-yaw-deg", type=float, default=None, help="absolute world yaw of the object (overrides --object-yaw-axis)")
@@ -176,6 +216,12 @@ if args.pad_friction is not None:
     # fires once from IsaacWholeRobotBackend.__init__(), before self._sim.reset().
     os.environ["TINKER_SIM_GRIPPER_PAD_FRICTION"] = str(float(args.pad_friction))
     emit(event="pad_friction_set", static=float(args.pad_friction), dynamic=float(args.pad_friction))
+if args.friction_type is not None:
+    # Must be set before backend construction: _apply_physics_scene_friction_type()
+    # fires once from IsaacWholeRobotBackend.__init__(), before self._sim.reset()
+    # (PhysxSceneAPI's frictionType is uniform / parse-time-only).
+    os.environ["TINKER_SIM_PHYSICS_FRICTION_TYPE"] = args.friction_type
+    emit(event="scene_friction_type_set", requested=args.friction_type)
 backend = IsaacWholeRobotBackend(
     usd_path=manifest.parent / "robot.usd",
     map_yaml=None,
@@ -204,6 +250,29 @@ if args.pad_friction is not None:
     emit(event="pad_friction_check", static=_pf_static, dynamic=_pf_dynamic,
          bound=int(getattr(backend, "gripper_friction_bound", 0)),
          prim=str(_pf_mat_prim.GetPath()) if _pf_mat_prim.IsValid() else None)
+if args.friction_type is not None:
+    # Post-play readback: self._sim.reset() already ran inside the backend
+    # constructor above, so this confirms what PhysX actually parsed off the
+    # PhysicsScene prim (a USD attribute Get(), same readback_source caveat
+    # as the object-torsional check -- there is no live PhysX-side readback
+    # of frictionType exposed through the tensor API).
+    import omni.usd as _ft_omni_usd
+    from pxr import PhysxSchema as _ft_PhysxSchema
+
+    _ft_scene_path = getattr(backend, "physics_scene_prim_path", None) or "/physicsScene"
+    _ft_stage = _ft_omni_usd.get_context().get_stage()
+    _ft_scene_prim = _ft_stage.GetPrimAtPath(_ft_scene_path)
+    _ft_readback = None
+    _ft_has_api = False
+    if _ft_scene_prim.IsValid():
+        _ft_has_api = _ft_scene_prim.HasAPI(_ft_PhysxSchema.PhysxSceneAPI)
+        if _ft_has_api:
+            _ft_readback = _ft_PhysxSchema.PhysxSceneAPI(_ft_scene_prim).GetFrictionTypeAttr().Get()
+    emit(event="scene_friction_type_check", requested=args.friction_type,
+         resolved=getattr(backend, "physics_scene_friction_type", None),
+         readback=str(_ft_readback) if _ft_readback is not None else None,
+         has_physx_scene_api=_ft_has_api, prim=_ft_scene_path,
+         readback_source="usd_attribute")
 if os.environ.get("PROBE_RELEASE_SAFETY_AT_BOOT", "0") == "1":
     backend.set_safety_stop(False)
 # Spawn-time root orientation (identity in the data's own quaternion
@@ -1041,6 +1110,17 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
     gains = set_follower_gains(cfg["damping"], cfg["stiffness"], cfg.get("drive_stiffness"), cfg.get("drive_damping"))
     if _render["on"]:
         _render["next_drive"] = -1.0  # capture from the first step of this close
+    if args.freeze_at_stall:
+        # Start each close un-frozen: restore whichever ramp/mirror functions
+        # were active before any earlier freeze in this run (stock, or a
+        # --mirror-mode/central monkeypatch) so a freeze from a prior config
+        # in a --configs sweep cannot leak into this one.
+        backend._ramp_drive_target = _ORIG_RAMP_DRIVE_TARGET
+        backend._mirror_gripper_mimic_targets = _ORIG_MIRROR_GRIPPER_MIMIC_TARGETS
+    freeze_run = 0
+    frozen = False
+    freeze_t = None
+    freeze_targets: dict[str, float] | None = None
     command_gripper(args.close_target)
     steps = int(args.record_s / DT)
     peak_force = 0.0
@@ -1070,6 +1150,34 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         lag = target - pad_pos
         lf, rf = pad_forces()
         force = lf + rf
+        if args.freeze_at_stall and not frozen:
+            # H-CMD discriminator (task20-decay-probe-findings.md): once
+            # contact exists and the drive has stopped MOVING (not just the
+            # pads -- the drive is what _ramp_drive_target keeps advancing),
+            # freeze every gripper target at its own measured angle and kill
+            # the ramp/mirror so nothing can push the jaw further round the
+            # object's curvature for the rest of the hold.
+            drive_speed = abs(g["drive_joint"][1])
+            if force > 1.0 and drive_speed < 0.02:
+                freeze_run += 1
+            else:
+                freeze_run = 0
+            if freeze_run >= max(1, int(round(0.3 / DT))):
+                frozen = True
+                freeze_t = t
+                freeze_targets = {}
+                for name, idx in zip(GRIP, GRIP_IDS):
+                    measured = g[name][0]
+                    frozen_value = measured + 0.005
+                    freeze_targets[name] = frozen_value
+                    backend._position_targets[0, idx] = frozen_value
+                backend._ramp_drive_target = lambda: None
+                backend._mirror_gripper_mimic_targets = lambda: None
+                emit(
+                    event="freeze_at_stall", tag=tag, triggered=True, t=round(freeze_t, 4),
+                    frozen_targets={n: round(v, 5) for n, v in freeze_targets.items()},
+                    lf=lf, rf=rf, drive_speed=drive_speed,
+                )
         moving = pad_speed > 0.1
         if moving:
             max_tau_motion = max(max_tau_motion, max_tau)
@@ -1121,6 +1229,8 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         last = r
         maybe_capture(tag, g["drive_joint"][0], force=f"L{lf:.0f}R{rf:.0f}")
         video_tick()
+    if args.freeze_at_stall and not frozen:
+        emit(event="freeze_at_stall", tag=tag, triggered=False)
     tail = int(0.5 / DT)
     metrics: dict[str, object] = {
         "tag": tag, "config": cfg, "gains_after_write": {k: gains.get(k) for k in ("joint_damping", "joint_stiffness", "joint_effort_limits")},
@@ -1133,6 +1243,11 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         "median_tau_motion": float(np.median(taus_motion)) if taus_motion else None,
         "final": {k: last.get(k) for k in ("target", "drive", "pad_pos", "pad_speed", "lag", "lf", "rf", "tau_drive", "tau", "physx_tau", "pos")},
     }
+    if args.freeze_at_stall:
+        metrics["freeze_at_stall"] = {
+            "triggered": frozen, "t": freeze_t,
+            "targets": {n: round(v, 5) for n, v in freeze_targets.items()} if freeze_targets else None,
+        }
     if bottle_rows:
         z0 = bottle_rows[0]["z"]
         xy0 = (bottle_rows[0]["x"], bottle_rows[0]["y"])
@@ -1146,6 +1261,14 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         }
     return metrics
 
+
+# Captured once, after every --mirror-mode/central monkeypatch above has had
+# its chance to run, so --freeze-at-stall restores the RIGHT "unfrozen"
+# baseline at the top of each run_close() call (stock ramp/mirror, or
+# whichever mode this invocation selected) rather than always the class
+# default.
+_ORIG_RAMP_DRIVE_TARGET = backend._ramp_drive_target
+_ORIG_MIRROR_GRIPPER_MIMIC_TARGETS = backend._mirror_gripper_mimic_targets
 
 if "A" in args.phase:
     for cfg in CONFIGS:
@@ -1274,6 +1397,79 @@ if "B" in args.phase:
                 readback_source="usd_attribute",
             )
 
+    def _author_object_approximation(root_prim, approximation: str, tag: str) -> None:
+        for cprim in _collision_prims(root_prim):
+            is_mesh = cprim.IsA(UsdGeom.Mesh)
+            if not is_mesh:
+                # UsdPhysics.MeshCollisionAPI's physics:approximation only
+                # governs how PhysX cooks a UsdGeom.Mesh collider into a
+                # contact shape; the built-in bench objects (bottle/plate:
+                # UsdGeom.Cylinder, knife: UsdGeom.Cube) are ANALYTIC
+                # primitives, so PhysX synthesizes their collision shape
+                # directly and this attribute has no effect. Report and skip
+                # rather than author a schema PhysX will ignore.
+                emit(
+                    event=f"object_approximation_{tag}",
+                    is_mesh=False,
+                    geom_type=cprim.GetTypeName(),
+                    prim=str(cprim.GetPath()),
+                    skipped=True,
+                    reason="collider is not a UsdGeom.Mesh; physics:approximation has no effect on an analytic collider",
+                )
+                continue
+            mesh_api = UsdPhysics.MeshCollisionAPI.Apply(cprim)
+            mesh_api.CreateApproximationAttr(approximation)
+            sdf_resolution = None
+            if approximation == "sdf":
+                try:
+                    from pxr import PhysxSchema
+
+                    sdf_api = PhysxSchema.PhysxSDFMeshCollisionAPI.Apply(cprim)
+                    sdf_api.CreateSdfResolutionAttr(256)
+                    sdf_resolution = 256
+                except ImportError as error:
+                    emit(event=f"object_approximation_{tag}", error=f"PhysxSchema import failed: {error}")
+            emit(
+                event=f"object_approximation_{tag}",
+                is_mesh=True,
+                geom_type=cprim.GetTypeName(),
+                approximation=approximation,
+                sdf_resolution=sdf_resolution,
+                prim=str(cprim.GetPath()),
+                skipped=False,
+            )
+
+    def _check_object_approximation(root_prim, tag: str) -> None:
+        for cprim in _collision_prims(root_prim):
+            is_mesh = cprim.IsA(UsdGeom.Mesh)
+            approx_v = None
+            sdf_resolution_v = None
+            has_mesh_api = cprim.HasAPI(UsdPhysics.MeshCollisionAPI)
+            if has_mesh_api:
+                approx_v = UsdPhysics.MeshCollisionAPI(cprim).GetApproximationAttr().Get()
+            if is_mesh:
+                try:
+                    from pxr import PhysxSchema
+
+                    if cprim.HasAPI(PhysxSchema.PhysxSDFMeshCollisionAPI):
+                        sdf_resolution_v = PhysxSchema.PhysxSDFMeshCollisionAPI(cprim).GetSdfResolutionAttr().Get()
+                except ImportError:
+                    pass
+            emit(
+                event=f"object_approximation_{tag}",
+                is_mesh=is_mesh,
+                geom_type=cprim.GetTypeName(),
+                has_mesh_collision_api=has_mesh_api,
+                approximation=approx_v,
+                sdf_resolution=sdf_resolution_v,
+                prim=str(cprim.GetPath()),
+                # USD-attribute readback, same caveat as _check_object_torsional:
+                # authoritative for what was AUTHORED, not a live PhysX-side
+                # resolution (no tensor/physx-API readback of approximation
+                # is exposed through isaaclab_physx's RigidBodyView).
+                readback_source="usd_attribute",
+            )
+
     # bottle base position
     if grasp and "bottle_rel_base" in grasp:
         rel = grasp["bottle_rel_base"]
@@ -1354,6 +1550,11 @@ if "B" in args.phase:
         # PxShape::setTorsionalPatchRadius refuses while simulation is running,
         # per the plugin's own error strings, so this must land before reset).
         _author_object_torsional(bprim, _radius, _min_radius, "set")
+    if args.object_approximation is not None:
+        # Author before the physics parse, same rationale as --object-friction
+        # above (MeshCollisionAPI is a shape-level schema PhysX reads at parse
+        # time).
+        _author_object_approximation(bprim, args.object_approximation, "set")
     # Spawn 2 cm above the support: a body that never attached to PhysX stays
     # exactly at the authored pose, a live one drops onto the support.
     DROP = 0.02
@@ -1375,6 +1576,11 @@ if "B" in args.phase:
         # parse/reset (USD attribute Get(); see _check_object_torsional's note
         # on why this isn't a live PhysX-side readback).
         _check_object_torsional(bprim, "check")
+    if args.object_approximation is not None:
+        # Post-play readback: confirm the authored attrs survived the physics
+        # parse/reset, or that a non-mesh collider was correctly reported and
+        # skipped.
+        _check_object_approximation(bprim, "check")
     from isaaclab_physx.physics import PhysxManager
 
     view = PhysxManager.get_physics_sim_view().create_rigid_body_view(bottle_path)

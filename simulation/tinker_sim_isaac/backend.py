@@ -1004,6 +1004,8 @@ class IsaacWholeRobotBackend:
         self.arena_friction_bound = self._apply_arena_friction_material()
         self.arena_surface_boxes = self._apply_arena_support_surface_colliders()
         self.gripper_friction_bound = self._apply_gripper_friction_material()
+        self.physics_scene_prim_path: str | None = None
+        self.physics_scene_friction_type = self._apply_physics_scene_friction_type()
         omni.kit.app.get_app().update()
         self._sim.reset()
         # UsdFileCfg imports the robot stage metadata, including its short
@@ -1327,6 +1329,74 @@ class IsaacWholeRobotBackend:
             flush=True,
         )
         return bound
+
+    def _apply_physics_scene_friction_type(self) -> str | None:
+        """#20 H-ANCHOR: override the PhysX scene-wide contact friction model.
+
+        PhysX's default frictionType is "patch" (friction is tracked via
+        correlated anchors persisted across a contact patch). On a curved
+        convex contact -- e.g. a cylindrical bottle pinched by flat pads --
+        the contact facet can change every step, which resets the patch's
+        friction anchors and can leave near-zero *effective* friction even
+        though the bound material's coefficient is high; flat-faced objects
+        keep their anchors and hold. This is one of the two live hypotheses
+        for the pad creep in task20-decay-probe-findings.md ("Torsional-radius
+        hold"): "two_directional" tracks friction per contact point instead
+        of via a shared patch anchor, "one_directional" is PhysX's older
+        (deprecated) single-axis model. TINKER_SIM_PHYSICS_FRICTION_TYPE
+        selects patch|one_directional|two_directional; unset leaves PhysX's
+        own default ("patch") untouched -- no-op, byte-identical behavior.
+
+        Authored on the PhysicsScene prim before self._sim.reset() parses it:
+        PhysxSceneAPI's frictionType is a uniform (parse-time-only) attribute,
+        same rationale as the gripper/arena friction materials above.
+        """
+        env = os.environ.get("TINKER_SIM_PHYSICS_FRICTION_TYPE")
+        if not env or not env.strip():
+            return None
+        token_map = {
+            "patch": "patch",
+            "one_directional": "oneDirectional",
+            "two_directional": "twoDirectional",
+        }
+        token = token_map.get(env.strip())
+        if token is None:
+            raise ValueError(
+                f"unknown TINKER_SIM_PHYSICS_FRICTION_TYPE={env!r}; "
+                f"expected one of {sorted(token_map)}"
+            )
+        try:
+            from pxr import PhysxSchema
+        except ImportError as error:
+            print(
+                json.dumps({"physics_friction_type_error": f"PhysxSchema import failed: {error}"[:160]}, sort_keys=True),
+                flush=True,
+            )
+            return None
+        import omni.usd
+
+        stage = omni.usd.get_context().get_stage()
+        scene_path = getattr(getattr(self._sim, "cfg", None), "physics_prim_path", "/physicsScene")
+        scene_prim = stage.GetPrimAtPath(scene_path)
+        if not scene_prim.IsValid():
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "PhysicsScene":
+                    scene_prim = prim
+                    break
+        if not scene_prim.IsValid():
+            print(
+                json.dumps({"physics_friction_type_error": f"no PhysicsScene prim found (tried {scene_path})"}, sort_keys=True),
+                flush=True,
+            )
+            return None
+        api = PhysxSchema.PhysxSceneAPI.Apply(scene_prim)
+        api.CreateFrictionTypeAttr(token)
+        self.physics_scene_prim_path = str(scene_prim.GetPath())
+        print(
+            json.dumps({"physics_scene_friction_type": token, "physics_scene_prim": self.physics_scene_prim_path}, sort_keys=True),
+            flush=True,
+        )
+        return token
 
     def _apply_stub_link_masses(self, usd_path: Path) -> tuple[str, ...]:
         """Author ``STUB_LINK_MASS_KG`` on the URDF's massless frame links before reset.
