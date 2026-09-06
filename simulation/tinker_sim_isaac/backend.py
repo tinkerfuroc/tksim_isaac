@@ -2210,7 +2210,6 @@ class IsaacWholeRobotBackend:
                 continue
             model_limits[:, local_index] = limit
         self._gripper_effort_limit = limit
-        self._gripper_effort_limit_written = True
         # #20 cap5-analysis: write_joint_effort_limit_to_sim_index (above) and
         # the actuator-model mirror only touch Isaac Lab-side buffers; the
         # probe (validation/gripper_close_probe.py _write_physx_max_forces_
@@ -2220,7 +2219,15 @@ class IsaacWholeRobotBackend:
         # through this same writer alone. Re-assert the mapped limit straight
         # on the PhysX tensor view and author it onto drive_joint's USD
         # DriveAPI so the runtime ceiling this method computes actually binds.
-        physx_max_force = self._write_gripper_drive_physx_max_force(index, limit)
+        #
+        # #20 review: only latch _gripper_effort_limit_written once the direct
+        # PhysX write actually lands. If it raises, the dedup guard above
+        # (L2178-2185) must NOT skip the next identical-effort command --
+        # otherwise a write that silently failed once would never be retried.
+        physx_max_force, physx_write_ok = self._write_gripper_drive_physx_max_force(
+            index, limit
+        )
+        self._gripper_effort_limit_written = physx_write_ok
         print(
             json.dumps(
                 {
@@ -2228,6 +2235,7 @@ class IsaacWholeRobotBackend:
                     "commanded_n": requested,
                     "limit_nm": limit,
                     "physx_max_force": physx_max_force,
+                    "physx_write_ok": physx_write_ok,
                 },
                 sort_keys=True,
             ),
@@ -2236,7 +2244,7 @@ class IsaacWholeRobotBackend:
 
     def _write_gripper_drive_physx_max_force(
         self, index: int, limit: float
-    ) -> list[float]:
+    ) -> tuple[list[float], bool]:
         """Re-assert ``limit`` on drive_joint straight on the PhysX tensor
         view (bypassing the Isaac Lab wrapper) and author it onto the USD
         DriveAPI, then read the effective value back off PhysX.
@@ -2248,33 +2256,66 @@ class IsaacWholeRobotBackend:
         current row, patches only ``index``, and pushes the whole row back --
         using warp arrays for both payload and indices, per the Task #12
         precedent (RigidBodyView tensor-API writes need WARP arrays, not
-        torch, to land). Best-effort: any failure here leaves the Isaac
-        Lab-side write already issued above in place, so it degrades to the
-        pre-#20 behaviour rather than raising.
+        torch, to land).
+
+        Returns ``(physx_max_force_row, ok)``. ``ok`` is False if the direct
+        PhysX write raised (the Isaac Lab-side write already issued above
+        stays in place, so it degrades to the pre-#20 behaviour); the caller
+        must NOT latch ``_gripper_effort_limit_written`` when ``ok`` is
+        False, so the next identical-effort command retries the write rather
+        than silently dedup-skipping forever. Under
+        ``TINKER_SIM_STRICT_PHYSX_WRITES=1`` the exception is re-raised
+        instead of being swallowed, for callers that would rather fail loud.
         """
         root_view = getattr(self._robot, "root_view", None) or getattr(
             self._robot, "root_physx_view", None
         )
         setter = getattr(root_view, "set_dof_max_forces", None) if root_view is not None else None
+        physx_write_ok = True
         if setter is not None:
             try:
                 import warp as wp
+
+                # #20 review: wp.from_torch does NOT lazily initialize the
+                # Warp runtime -- it reads
+                # warp._src.context.runtime.cpu_device directly and raises
+                # AttributeError if Warp hasn't been initialized in-process
+                # yet (e.g. a gripper command issued before the first
+                # physics step, ahead of the fused-actuator path that would
+                # otherwise have self-init'd it). wp.array(...) DOES
+                # self-init, per the Task #12 warp-array fix
+                # (set_entity_pose_physics, above) -- build the payload the
+                # same way here rather than via wp.from_torch, and also
+                # force init explicitly (idempotent) as a second guard.
+                wp.init()
 
                 full = self._robot.data.joint_effort_limits.clone()
                 full[0, index] = float(limit)
                 full_cpu = full.detach().to(
                     device="cpu", dtype=self._torch.float32
                 ).contiguous()
-                forces_wp = wp.from_torch(full_cpu, dtype=wp.float32)
+                forces_wp = wp.array(
+                    full_cpu.numpy(), dtype=wp.float32, device="cpu"
+                )
                 indices_wp = wp.array([0], dtype=wp.int32, device="cpu")
                 setter(forces_wp, indices=indices_wp)
             except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+                physx_write_ok = False
                 print(
-                    json.dumps({"gripper_physx_max_force_write_error": str(error)[:160]}),
+                    json.dumps(
+                        {
+                            "event": "gripper_physx_max_force_write_error",
+                            "level": "warning",
+                            "error": str(error)[:160],
+                        },
+                        sort_keys=True,
+                    ),
                     flush=True,
                 )
+                if os.environ.get("TINKER_SIM_STRICT_PHYSX_WRITES") == "1":
+                    raise
         self._author_gripper_drive_usd_max_force(limit)
-        return self._read_gripper_drive_physx_max_force(index)
+        return self._read_gripper_drive_physx_max_force(index), physx_write_ok
 
     def _read_gripper_drive_physx_max_force(self, index: int) -> list[float]:
         root_view = getattr(self._robot, "root_view", None) or getattr(

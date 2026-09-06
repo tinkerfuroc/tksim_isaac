@@ -976,6 +976,18 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._gripper_effort_full_scale_n = 10.0
         root_view = backend._robot.root_view
 
+        # #20 review: must pass in isolation, not only because an earlier
+        # test in the same process happened to initialize Warp first. In a
+        # real boot Warp is initialized well before any gripper command is
+        # processed (the fused-actuator path touches it every physics
+        # step); pre-warm it here so this test does not depend on suite
+        # ordering, and so Warp's one-time init banner (printed straight to
+        # stdout, not through this module's JSON-line protocol) cannot leak
+        # into the captured output parsed below.
+        import warp as _wp
+
+        _wp.init()
+
         with contextlib.redirect_stdout(io.StringIO()) as captured:
             backend._set_gripper_effort_limit(5.0)
 
@@ -997,6 +1009,87 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(effort_events[0]["commanded_n"], 5.0)
         self.assertAlmostEqual(effort_events[0]["limit_nm"], 1.25)
         self.assertAlmostEqual(effort_events[0]["physx_max_force"][0], 1.25)
+        self.assertTrue(effort_events[0]["physx_write_ok"])
+        self.assertTrue(backend._gripper_effort_limit_written)
+
+    def test_set_gripper_effort_limit_physx_write_failure_does_not_latch_written(
+        self,
+    ) -> None:
+        """#20 review finding 1: if the direct PhysX write
+        (root_view.set_dof_max_forces) raises -- e.g. Warp's runtime not yet
+        initialized in-process -- the failure must be logged (not silently
+        swallowed) and _gripper_effort_limit_written must stay False so a
+        later identical-effort command is NOT dedup-skipped (L2178-2185) but
+        retries the write instead."""
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+        root_view = backend._robot.root_view
+
+        def _raise(forces: object, indices: object = None) -> None:
+            raise RuntimeError("boom: physx view not ready")
+
+        root_view.set_dof_max_forces = _raise
+
+        # Pre-warm Warp so its one-time init banner (real stdout text, not a
+        # JSON line) cannot land inside the captured window below -- see the
+        # matching note on test_set_gripper_effort_limit_writes_direct_physx_max_force.
+        import warp as _wp
+
+        _wp.init()
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._set_gripper_effort_limit(5.0)
+
+        self.assertFalse(getattr(backend, "_gripper_effort_limit_written", False))
+
+        events = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        error_events = [
+            event
+            for event in events
+            if event.get("event") == "gripper_physx_max_force_write_error"
+        ]
+        self.assertEqual(len(error_events), 1)
+        self.assertEqual(error_events[0]["level"], "warning")
+        self.assertIn("boom", error_events[0]["error"])
+
+        effort_events = [
+            event for event in events if event.get("event") == "gripper_effort_limit"
+        ]
+        self.assertEqual(len(effort_events), 1)
+        self.assertFalse(effort_events[0]["physx_write_ok"])
+
+        # Retry: restore a working setter and re-issue the SAME commanded
+        # effort. The dedup guard must not skip it (the write was never
+        # marked as landed), so the direct PhysX write actually fires now.
+        root_view.set_dof_max_forces = _FakeGripperRootView.set_dof_max_forces.__get__(
+            root_view
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            backend._set_gripper_effort_limit(5.0)
+        self.assertEqual(len(root_view.set_dof_max_forces_calls), 1)
+        self.assertTrue(backend._gripper_effort_limit_written)
+
+    def test_set_gripper_effort_limit_strict_physx_writes_reraises(self) -> None:
+        """TINKER_SIM_STRICT_PHYSX_WRITES=1 must surface the PhysX write
+        failure to the caller instead of swallowing it."""
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+        root_view = backend._robot.root_view
+
+        def _raise(forces: object, indices: object = None) -> None:
+            raise RuntimeError("boom: strict mode")
+
+        root_view.set_dof_max_forces = _raise
+
+        with patch.dict(os.environ, {"TINKER_SIM_STRICT_PHYSX_WRITES": "1"}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    backend._set_gripper_effort_limit(5.0)
+        self.assertFalse(getattr(backend, "_gripper_effort_limit_written", False))
 
     def test_gripper_low_effort_pre_open_maps_above_zero(self) -> None:
         """#20 coordinator correction: pre-open commands (5 N from
