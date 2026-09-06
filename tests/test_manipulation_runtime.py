@@ -2557,6 +2557,144 @@ class ManipulationRuntimeTest(unittest.TestCase):
         for index in backend._gripper_mimic_indices:
             self.assertAlmostEqual(float(backend._position_targets[0, index]), 0.43, places=6)
 
+    def test_gripper_mirror_and_ramp_run_once_per_physics_substep(self) -> None:
+        """Task #29: the drive-target ramp and the gripper mimic mirror must
+        be invariant to TINKER_SIM_CONTROL_HZ.
+
+        Before the fix, step() called both once per CONTROL tick, using
+        self.dt (the control-tick interval) as the ramp's slew interval and
+        the mirror's one-step velocity feed-forward -- calibrated only when
+        physics_substeps == 1 (control_hz == physics_hz). At CONTROL_HZ <
+        physics_hz the same stale measured-velocity sample was extrapolated
+        physics_substeps steps ahead and held fixed across all of them
+        instead of being refreshed every solver step, so the follower PD
+        (k=1500/d=55) never settled into the steady overtravel the tightly-
+        coupled case reaches: measured steady clamp force 20.7 N at
+        CONTROL_HZ 120 collapsed to 5.1 N at CONTROL_HZ 30, independent of
+        Fabric/spawn-yaw (see docs/developer-log.md 2026-09-06). The fix
+        reruns both once per PHYSICS substep, in _step_simulation(), always
+        passing physics_dt explicitly.
+        """
+        backend = _backend()
+        backend.physics_hz = 120.0
+        backend.control_hz = 30.0
+        backend.physics_dt = 1.0 / 120.0
+        backend.dt = 1.0 / 30.0
+        backend.physics_substeps = 4
+        backend._drive_joint_index = 0
+        backend._gripper_mimic_indices = (1,)
+        backend._safety_stopped = False
+        backend._slew_wheel_targets = lambda: None  # untouched by this fix; not under test
+
+        mirror_calls: list[float | None] = []
+        ramp_calls: list[float | None] = []
+        original_mirror = backend._mirror_gripper_mimic_targets
+        original_ramp = backend._ramp_drive_target
+        backend._mirror_gripper_mimic_targets = lambda dt=None: (
+            mirror_calls.append(dt),
+            original_mirror(dt),
+        )[-1]
+        backend._ramp_drive_target = lambda dt=None: (
+            ramp_calls.append(dt),
+            original_ramp(dt),
+        )[-1]
+
+        backend.step()
+
+        self.assertEqual(
+            len(mirror_calls), 4,
+            "mirror must run once per physics substep (4) at CONTROL_HZ 30 / physics_hz 120, "
+            f"not once per control tick; got {len(mirror_calls)} call(s)",
+        )
+        self.assertEqual(len(ramp_calls), 4)
+        for dt in mirror_calls + ramp_calls:
+            self.assertAlmostEqual(
+                dt, 1.0 / 120.0, places=9,
+                msg="feed-forward/ramp horizon must be physics_dt (1/120), not control dt (1/30)",
+            )
+
+        # CONTROL_HZ == physics_hz: physics_substeps == 1, so exactly one
+        # call per tick with physics_dt == self.dt -- byte-identical to the
+        # pre-fix per-tick call.
+        backend120 = _backend()
+        backend120._drive_joint_index = 0
+        backend120._gripper_mimic_indices = (1,)
+        backend120._safety_stopped = False
+        backend120._slew_wheel_targets = lambda: None
+        mirror_calls_120: list[float | None] = []
+        ramp_calls_120: list[float | None] = []
+        original_mirror_120 = backend120._mirror_gripper_mimic_targets
+        original_ramp_120 = backend120._ramp_drive_target
+        backend120._mirror_gripper_mimic_targets = lambda dt=None: (
+            mirror_calls_120.append(dt),
+            original_mirror_120(dt),
+        )[-1]
+        backend120._ramp_drive_target = lambda dt=None: (
+            ramp_calls_120.append(dt),
+            original_ramp_120(dt),
+        )[-1]
+
+        backend120.step()
+
+        self.assertEqual(len(mirror_calls_120), 1)
+        self.assertEqual(len(ramp_calls_120), 1)
+        self.assertAlmostEqual(mirror_calls_120[0], 1.0 / 120.0, places=9)
+        self.assertAlmostEqual(ramp_calls_120[0], 1.0 / 120.0, places=9)
+
+    def test_gripper_mirror_feedforward_uses_physics_dt_not_control_dt(self) -> None:
+        """The mirror's one-step velocity feed-forward (q + qdot*dt) must
+        equal measured_vel * physics_dt regardless of TINKER_SIM_CONTROL_HZ.
+
+        Task #29: before the fix the feed-forward multiplied by self.dt (the
+        control tick), so at CONTROL_HZ 30 (physics_hz 120) the horizon was
+        silently 4x too long -- this pins the corrected, control-rate-
+        independent formula directly, for several control_hz values.
+        """
+        names = (
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_finger_joint",
+            "right_inner_knuckle_joint",
+            "joint1",
+        )
+        physics_dt = 1.0 / 120.0
+        for control_hz in (30.0, 60.0, 120.0):
+            with self.subTest(control_hz=control_hz):
+                backend = object.__new__(IsaacWholeRobotBackend)
+                backend._torch = torch
+                # The control tick -- must NOT influence the feed-forward below.
+                backend.dt = 1.0 / control_hz
+                backend._drive_joint_index = 0
+                backend._gripper_mimic_indices = (1, 2, 3, 4, 5)
+                backend._robot = SimpleNamespace(
+                    data=SimpleNamespace(
+                        joint_names=names,
+                        joint_pos=torch.tensor(
+                            [[0.43, 0.6, 0.6, 0.6, 0.6, 0.6, 0.0]], dtype=torch.float32
+                        ),
+                        joint_vel=torch.tensor(
+                            [[1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32
+                        ),
+                    )
+                )
+                backend._position_targets = torch.tensor(
+                    [[0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.0]], dtype=torch.float32
+                )
+                backend._mirror_gripper_mimic_targets(physics_dt)
+                expected = 0.43 + 1.2 * physics_dt  # measured angle + physics-step feed-forward
+                for index in backend._gripper_mimic_indices:
+                    self.assertAlmostEqual(
+                        float(backend._position_targets[0, index]),
+                        expected,
+                        places=6,
+                        msg=(
+                            f"follower {names[index]} feed-forward must use physics_dt "
+                            f"(1/120), not self.dt (1/{control_hz:g})"
+                        ),
+                    )
+
     def test_gripper_lead_clamp_defaults_off_with_measured_mirror(self) -> None:
         """With mimic-correct followers the press is bounded by drive_joint's
         effort limit, and the stall-gated lead clamp self-locks the close into

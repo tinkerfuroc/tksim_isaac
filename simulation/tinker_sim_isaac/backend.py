@@ -1215,16 +1215,114 @@ class IsaacWholeRobotBackend:
             if self._contact_report_subscription is None:
                 raise RuntimeError("manipulation-core requires PhysX contact reporting")
 
-    def _step_simulation(self) -> None:
+    def _step_simulation(self) -> bool:
         """One control step: ``physics_substeps`` solver steps of ``physics_dt``.
 
         Each Isaac Lab ``step()`` is one ``IPhysxSimulation.simulate(dt)`` +
         ``fetch_results()`` at the validated solver dt; Kit is rendered (when
         enabled) only after the last substep.
+
+        Task #29 (gripper clamp force invariant to TINKER_SIM_CONTROL_HZ): the
+        drive-target ramp and the gripper mimic mirror used to run once per
+        CONTROL tick, in step(), using self.dt as both the ramp's slew
+        interval and the mirror's one-step velocity feed-forward. That is
+        only calibrated when physics_substeps == 1 (control_hz == physics_hz):
+        with CONTROL_HZ < physics_hz the same stale measured-velocity sample
+        was extrapolated physics_substeps steps ahead and held fixed across
+        all of them, instead of being refreshed every solver step -- the
+        follower PD (k=1500/d=55) never settled into the steady overtravel
+        the tightly-coupled case reaches (measured: 20.7 N steady pad force
+        at CONTROL_HZ 120 collapsed to 5.1 N at CONTROL_HZ 30; see
+        docs/developer-log.md 2026-09-06). Both now run HERE, once per
+        PHYSICS substep, reading a freshly measured drive angle after every
+        solver step and using physics_dt (not self.dt) as the feed-forward
+        horizon, so the calibration holds regardless of the control rate. At
+        physics_substeps == 1 this loop body runs exactly once with
+        physics_dt == self.dt: byte-identical to the previous per-tick call.
+
+        The arm/base targets are untouched here -- step() sets them once, at
+        the control rate, before calling this method -- but because Isaac
+        Lab's articulation wrapper only exposes a whole-tensor position/
+        velocity target write (no per-joint-index write), re-sending the
+        gripper's freshly mirrored columns means re-sending the unchanged
+        arm/base columns too, every substep. That is up to physics_substeps
+        times the previous per-tick write cost while the gripper is actually
+        moving; accepted as the price of a control-rate-invariant clamp. The
+        existing write gate (self._target_write_gate) still runs every
+        substep and skips the write when nothing (gripper columns included)
+        changed since the last one -- e.g. once the drive has fully stalled
+        and the mirror's feed-forward term goes to zero -- so an idle/settled
+        robot does not pay physics_substeps writes per tick either.
+
+        Returns True if a tensor-view invalidation was recovered mid-substep
+        (mirrors the previous write_data_to_sim / robot.update recovery
+        early-returns in step()); the caller must then abort the rest of
+        step() for this tick, exactly as before.
         """
         last = self.physics_substeps - 1
+        physics_dt = self.physics_dt
+        ramp_gate = not self._safety_stopped
+        effort_writer = getattr(self._robot, "set_joint_effort_target", None)
+        if effort_writer is None and self._safety_stopped:
+            raise RuntimeError(
+                "safety stop requires Isaac Lab set_joint_effort_target"
+            )
+        _sp = self.step_profile
+        _t = _sp["_clock"] if _sp["enabled"] else None
         for index in range(self.physics_substeps):
+            if ramp_gate:
+                self._ramp_drive_target(physics_dt)
+            self._mirror_gripper_mimic_targets(physics_dt)
+            _write_targets = self._target_write_gate.should_write(
+                (self._position_targets, self._velocity_targets, self._effort_targets)
+            )
+            if _write_targets:
+                if _sp["enabled"]:
+                    self._profile_changed_targets()
+                self._robot.set_joint_position_target(self._position_targets)
+                self._robot.set_joint_velocity_target(self._velocity_targets)
+            if _t is not None:
+                _sp["targets"] += _t() - _sp["_mark"]
+                _sp["_mark"] = _t()
+            if _write_targets:
+                if effort_writer is not None:
+                    effort_writer(self._effort_targets)
+                try:
+                    self._robot.write_data_to_sim()
+                except Exception as error:
+                    if self._maybe_recover_simulation_view(error):
+                        return True
+                    raise RuntimeError(
+                        "articulation tensor view failed "
+                        f"(time={self.simulation_time:.6f}, end={self.timeline_end_time:.6f}, "
+                        f"playing={self._timeline.is_playing()}, "
+                        f"initialized={self._robot.is_initialized})"
+                    ) from error
+                self._target_write_gate.note_written(
+                    (
+                        self._position_targets.clone(),
+                        self._velocity_targets.clone(),
+                        self._effort_targets.clone(),
+                    )
+                )
+                self.step_profile["target_writes"] += 1
+            if _t is not None:
+                _sp["write_data"] += _t() - _sp["_mark"]
+                _sp["_mark"] = _t()
             self._sim.step(render=self.render and index == last)
+            if _t is not None:
+                _sp["physx"] += _t() - _sp["_mark"]
+                _sp["_mark"] = _t()
+            try:
+                self._robot.update(physics_dt)
+            except Exception as error:
+                if not self._maybe_recover_simulation_view(error):
+                    raise
+                return True
+            if _t is not None:
+                _sp["robot_update"] += _t() - _sp["_mark"]
+                _sp["_mark"] = _t()
+        return False
 
     def _apply_two_tone_paint(self) -> None:
         """Two-tone the robot so the arm reads apart from the chassis on camera.
@@ -2547,14 +2645,19 @@ class IsaacWholeRobotBackend:
                 continue
         return max(speeds) if speeds else None
 
-    def _ramp_drive_target(self) -> None:
+    def _ramp_drive_target(self, dt: float | None = None) -> None:
         """Slew the drive_joint applied target toward the command and cap its
         lead over the measured pads, so the press is bounded and the jaw reaches
         a clean stall.
 
         _apply_joint_command records the gripper target in _drive_command_target
-        rather than applying it directly; step() calls this each physics step,
-        before the mimic mirror carries the result to the five followers. Two
+        rather than applying it directly; _step_simulation() calls this once per
+        PHYSICS substep (Task #29), before the mimic mirror carries the result
+        to the five followers, passing ``physics_dt`` explicitly so the ramp's
+        integration step matches the solver rather than the (possibly slower)
+        control tick -- see _mirror_gripper_mimic_targets' docstring for why.
+        ``dt`` defaults to ``self.dt`` only for callers (tests, mainly) that
+        still invoke this directly without a physics-substep loop. Two
         limits shape the closing stroke:
 
         1. Slew: advance by at most _gripper_close_slew * dt, so the approach is
@@ -2593,12 +2696,14 @@ class IsaacWholeRobotBackend:
         command = getattr(self, "_drive_command_target", None)
         if drive_index is None or command is None:
             return
+        if dt is None:
+            dt = float(getattr(self, "dt", 0.0))
         current = float(self._position_targets[0, drive_index])
         slew = getattr(self, "_gripper_close_slew", 0.0)
         if slew <= 0.0:
             self._position_targets[0, drive_index] = command
             return
-        max_delta = slew * self.dt
+        max_delta = slew * dt
         target = current + max(-max_delta, min(max_delta, command - current))
         if command > current:  # closing
             lead = getattr(self, "_gripper_max_lead", 0.0)
@@ -2618,7 +2723,7 @@ class IsaacWholeRobotBackend:
                 target = current  # optional hard cap: freeze on raw contact force
         self._position_targets[0, drive_index] = target
 
-    def _mirror_gripper_mimic_targets(self) -> None:
+    def _mirror_gripper_mimic_targets(self, dt: float | None = None) -> None:
         """Couple the five gripper mimic joints to drive_joint's MEASURED angle.
 
         The xArm gripper is a single-DOF mechanism: one motor drives the left
@@ -2652,6 +2757,24 @@ class IsaacWholeRobotBackend:
         control-step lag in steady motion; at stall qdot ~ 0 so the followers
         hold exactly the drive's angle. getattr guards keep step() test doubles
         happy.
+
+        Task #29 (control-rate invariance): ``dt`` is the feed-forward horizon
+        and MUST be the physics-solver step (``physics_dt``), not the control
+        tick (``self.dt``) -- ``_step_simulation()`` now calls this once per
+        PhysX substep with ``physics_dt`` explicitly, so the "one physics step
+        ahead" calibration this comment describes holds regardless of
+        ``TINKER_SIM_CONTROL_HZ``. Previously this ran once per control tick
+        using ``self.dt`` as the feed-forward AND as the hold interval: at
+        ``physics_substeps > 1`` (CONTROL_HZ < physics_hz) a single stale
+        measured-velocity sample was extrapolated ``physics_substeps`` steps
+        ahead and held fixed across all of them, so the follower target
+        overshot the drive's actual (decelerating) motion and snapped back
+        every tick -- measured: steady clamp force 20.7 N at CONTROL_HZ 120
+        collapsed to 5.1 N at CONTROL_HZ 30 (docs/developer-log.md
+        2026-09-06). ``dt`` defaults to ``self.dt`` only for callers (tests,
+        mainly) that still invoke this directly without a physics-substep
+        loop -- at ``physics_substeps == 1`` the two are numerically the same
+        value anyway.
         """
         drive_index = getattr(self, "_drive_joint_index", None)
         mimic_indices = getattr(self, "_gripper_mimic_indices", ())
@@ -2661,13 +2784,13 @@ class IsaacWholeRobotBackend:
         joint_pos = getattr(data, "joint_pos", None)
         if joint_pos is None:
             return
+        if dt is None:
+            dt = float(getattr(self, "dt", 0.0))
         try:
             follower_target = float(self._torch_value(joint_pos)[0, drive_index])
             joint_vel = getattr(data, "joint_vel", None)
             if joint_vel is not None:
-                follower_target += float(self._torch_value(joint_vel)[0, drive_index]) * float(
-                    getattr(self, "dt", 0.0)
-                )
+                follower_target += float(self._torch_value(joint_vel)[0, drive_index]) * float(dt)
         except (IndexError, TypeError, ValueError):
             return
         for index in mimic_indices:
@@ -2696,71 +2819,25 @@ class IsaacWholeRobotBackend:
             self._apply_safety_actuator_hold()
         else:
             self._slew_wheel_targets()
-            self._ramp_drive_target()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
-        self._mirror_gripper_mimic_targets()
+        # The drive-target ramp and the gripper mimic mirror (Task #19/#20)
+        # used to run here, once per control tick.  They now run inside
+        # _step_simulation(), once per PHYSICS substep, so their calibration
+        # (a one-physics-step feed-forward) is invariant to
+        # TINKER_SIM_CONTROL_HZ instead of silently assuming
+        # control_hz == physics_hz (Task #29) -- see that method's docstring.
         # Physics runs at 120 Hz while commands arrive far slower, so most
-        # steps would re-send byte-identical targets. PhysX drive targets
-        # persist until changed and this backend uses implicit (stateless)
-        # actuators with no external wrenches, so skipping an unchanged write
-        # is semantically identical -- and it was 6.8 ms of a 12.2 ms step.
-        _write_targets = self._target_write_gate.should_write(
-            (self._position_targets, self._velocity_targets, self._effort_targets)
-        )
-        effort_writer = getattr(self._robot, "set_joint_effort_target", None)
-        if effort_writer is None and self._safety_stopped:
-            raise RuntimeError(
-                "safety stop requires Isaac Lab set_joint_effort_target"
-            )
-        if _write_targets:
-            if self.step_profile["enabled"]:
-                self._profile_changed_targets()
-            self._robot.set_joint_position_target(self._position_targets)
-            self._robot.set_joint_velocity_target(self._velocity_targets)
+        # substeps would re-send byte-identical targets once the gripper (if
+        # any) has settled. PhysX drive targets persist until changed and
+        # this backend uses implicit (stateless) actuators with no external
+        # wrenches, so skipping an unchanged write is semantically identical
+        # -- and it was 6.8 ms of a 12.2 ms step; _step_simulation() reruns
+        # this same gate every substep.
         _sp = self.step_profile
         _t = _sp["_clock"] if _sp["enabled"] else None
-        if _t is not None:
-            _sp["targets"] += _t() - _sp["_mark"]
-            _sp["_mark"] = _t()
-        if _write_targets:
-            if effort_writer is not None:
-                effort_writer(self._effort_targets)
-            try:
-                self._robot.write_data_to_sim()
-            except Exception as error:
-                if self._maybe_recover_simulation_view(error):
-                    return
-                raise RuntimeError(
-                    "articulation tensor view failed "
-                    f"(time={self.simulation_time:.6f}, end={self.timeline_end_time:.6f}, "
-                    f"playing={self._timeline.is_playing()}, "
-                    f"initialized={self._robot.is_initialized})"
-                ) from error
-            self._target_write_gate.note_written(
-                (
-                    self._position_targets.clone(),
-                    self._velocity_targets.clone(),
-                    self._effort_targets.clone(),
-                )
-            )
-            self.step_profile["target_writes"] += 1
-        if _t is not None:
-            _sp["write_data"] += _t() - _sp["_mark"]
-            _sp["_mark"] = _t()
-        self._step_simulation()
-        if _t is not None:
-            _sp["physx"] += _t() - _sp["_mark"]
-            _sp["_mark"] = _t()
-        try:
-            self._robot.update(self.dt)
-        except Exception as error:
-            if not self._maybe_recover_simulation_view(error):
-                raise
+        if self._step_simulation():
             return
-        if _t is not None:
-            _sp["robot_update"] += _t() - _sp["_mark"]
-            _sp["_mark"] = _t()
         self._refresh_object_views()
         if _t is not None:
             _sp["object_views"] += _t() - _sp["_mark"]

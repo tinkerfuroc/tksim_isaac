@@ -2417,3 +2417,109 @@ pre-#26 behaviour, confirming this round's change doesn't give flag-off a
 settle timer it never had. Full suite:
 `tests/test_manipulation_runtime.py` 105 passed, 3 subtests passed, 0
 failed. Still no GPU boot for either round of this fix.
+
+## 2026-09-06 — Gripper clamp force collapsed at TINKER_SIM_CONTROL_HZ < physics_hz (task #29)
+
+**Symptom**: on the sensor-rich/agw AnyGrasp bench profile (CONTROL_HZ=30),
+per-finger grip force sat at 1-4 N instead of the usual 8-12 N (soup can
+1.22-4.10 N, sugar box 1.00-3.53 N), and both objects popped out of the
+gripper mid-close or mid-lift. The drive itself looked normal (stalled
+cleanly at the effort cap, no runaway), so this looked at first like the
+#17 YCB friction-material republish or the Fabric-ON /
+TINKER_SIM_SPAWN_YAW_VIA_VIEW path (both live in that profile).
+
+**A/B (`$TMP/clamp_ab_chain.sh`, main checkout 2c1b51d, staged 2x2: CONTROL_HZ
+{120,30} x SPAWN_YAW_VIA_VIEW {0,1}, bottle side-grasp probe, steady
+3-5s window)**:
+
+| hz | yaw/fabric | lf_avg | rf_avg | sum_avg | ratio vs 120/0 |
+|---|---|---|---|---|---|
+| 120 | 0 | 12.649 | 8.092 | 20.740 | 1.00x |
+| 120 | 1 | 12.671 | 8.079 | 20.749 | 1.00x |
+| 30  | 0 |  2.955 | 2.168 |  5.123 | 0.25x |
+| 30  | 1 |  2.959 | 2.177 |  5.135 | 0.25x |
+
+CONTROL_HZ 120 -> 30 drops steady pad force by 75% at BOTH fabric/yaw
+settings; SPAWN_YAW_VIA_VIEW / Fabric changes the result by <0.3% at
+either control rate (well inside noise). The YCB-republish and Fabric/
+spawn-yaw suspects were both ruled out; CONTROL_HZ was the lever
+(`$TMP/task29-clamp-force-findings.md`, `$TMP/clamp-ab-result.md`).
+
+**Mechanism**: `backend.py`'s `self.dt = 1.0 / control_hz` is a CONTROL-tick
+interval, not the physics-solver interval (`self.physics_dt = 1.0 /
+physics_hz`). `_mirror_gripper_mimic_targets` couples the five passive
+gripper mimic joints to `drive_joint`'s MEASURED angle (#19/4356f03) plus a
+"one physics step ahead" velocity feed-forward, `q + qdot * dt`; that
+calibration is only exact when `physics_substeps == 1` (`control_hz ==
+physics_hz`). `step()` used to call this (and the drive-target ramp,
+`_ramp_drive_target`) once per CONTROL tick, then `_step_simulation()` ran
+`physics_substeps = physics_hz / control_hz` PhysX solver steps against
+that SAME held target. At CONTROL_HZ 30 / physics_hz 120,
+`physics_substeps == 4`: a single measured-velocity sample taken once at
+the start of a 33 ms window was extrapolated 4 physics steps ahead
+(`self.dt` = 4 x `physics_dt`) and then held FIXED across all 4 solver
+steps, instead of being refreshed every 8.3 ms as it is at CONTROL_HZ 120.
+During the deceleration into contact this over-extrapolated target
+overshoots ahead of where the drive actually ends up, then snaps back to
+the drive's lower actual position at the next control tick -- an
+overshoot-then-relax cycle that never lets the follower PD (k=1500/d=55)
+settle into the same steady overtravel (and therefore clamp force,
+force = stiffness x overtravel) the tightly-coupled 120 Hz case reaches.
+This predicts the same ~4x force loss independent of object identity and
+of Fabric/spawn-yaw state, matching the A/B exactly.
+
+**Fix** (`simulation/tinker_sim_isaac/backend.py`): `_ramp_drive_target`
+and `_mirror_gripper_mimic_targets` now take an explicit `dt` parameter
+(defaulting to `self.dt` only for direct callers, e.g. existing tests, that
+invoke them outside a substep loop). `_step_simulation()` -- previously
+just a bare `for index in range(physics_substeps): self._sim.step(...)`
+loop -- now runs both once per PHYSICS substep, always passing
+`self.physics_dt` explicitly, and does the position/velocity/effort target
+write + `write_data_to_sim()` + `self._robot.update(physics_dt)` for each
+substep too (moved out of `step()`, which previously did this once per
+tick). Arm/base targets are unaffected -- `step()` still computes them once
+per control tick, before calling `_step_simulation()` -- but because Isaac
+Lab's articulation wrapper only exposes a whole-tensor target write (no
+per-joint-index write), refreshing the gripper columns means re-sending the
+unchanged arm/base columns too, up to `physics_substeps` times per tick
+while the gripper is actually moving. The existing `_target_write_gate`
+(byte-identical-target skip) still runs every substep, so an idle/settled
+robot does not pay that extra cost -- only an actively-moving gripper does.
+`_step_simulation()` now returns `bool` (tensor-view-recovery signal) so
+`step()` can still abort the rest of the tick exactly as it did before,
+now through the substep loop instead of around it. At `physics_substeps ==
+1` (`control_hz == physics_hz`) the loop body runs exactly once with
+`physics_dt == self.dt`: byte-identical to the pre-fix per-tick call.
+
+**Tests** (`tests/test_manipulation_runtime.py`):
+`test_gripper_mirror_and_ramp_run_once_per_physics_substep` drives a
+backend double with `physics_hz=120`, `control_hz=30`,
+`physics_substeps=4` through one `step()` call and asserts both
+`_mirror_gripper_mimic_targets` and `_ramp_drive_target` are invoked
+exactly 4 times, each with `dt == 1/120`, then repeats at `control_hz=120`
+(`physics_substeps=1`) and asserts exactly 1 call at `dt == 1/120` (the
+byte-identical path). It fails on main (2c1b51d) with:
+```
+FAILED tests/test_manipulation_runtime.py::ManipulationRuntimeTest::test_gripper_mirror_and_ramp_run_once_per_physics_substep - TypeError: IsaacWholeRobotBackend._ramp_drive_target() takes 1 positional a...
+```
+(`_ramp_drive_target`/`_mirror_gripper_mimic_targets` did not accept a `dt`
+argument pre-fix). `test_gripper_mirror_feedforward_uses_physics_dt_not_control_dt`
+pins the feed-forward formula (`measured_vel * physics_dt`) directly for
+`control_hz` in `{30, 60, 120}`, independent of `self.dt`; it also fails on
+main the same way. Full suite: `tests/test_manipulation_runtime.py` 111
+passed, 6 subtests passed, 0 failed (was 109 passed / 3 subtests before
+this task's two new tests).
+
+**Acceptance (staged, not run)**: `$TMP/clamp_fix_chain.sh` +
+`$TMP/clamp_fix_launch.sh` (copies of the A/B chain/launch scripts,
+`REPO_ROOT` defaulted to this fix's worktree) re-run just the CONTROL_HZ
+axis (120 and 30, `SPAWN_YAW_VIA_VIEW=0`) against the fixed backend, writing
+`clamp_fix_<hz>.jsonl(+.rows.jsonl)/_full.log` and
+`CLAMPFIX_EXIT=`/`CLAMPFIX_CHAIN_DONE` markers to `$TMP/clamp_fix.log`.
+`$TMP/clamp_ab_read.py` now accepts an optional filename-prefix argument
+(default `clamp_ab_`) so `python3 clamp_ab_read.py clamp_fix_` reads the new
+legs with the same steady-window analysis. Pass criterion: CONTROL_HZ 30's
+steady `lf+rf` sum lands within 15% of the CONTROL_HZ 120 leg (~20.7 N);
+CONTROL_HZ 120 itself is unchanged (~20.74 N, since `physics_substeps == 1`
+there is a no-op path). Not run in this task (no GPU boot) -- staged for a
+follow-up GPU validation.
