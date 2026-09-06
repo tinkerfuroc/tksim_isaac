@@ -29,6 +29,7 @@ mirror for A/B (the shipped backend implements measured_ff).
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import os
@@ -109,14 +110,32 @@ parser.add_argument("--freeze-at-stall", action="store_true",
                           "advance (H-CMD) rather than a friction-anchor artifact (H-ANCHOR). Emits "
                           "'freeze_at_stall' with the frozen angles and time (or triggered=False if the "
                           "stall condition never holds for 0.3 s). Default off (byte-identical close).")
-parser.add_argument("--freeze-trigger", default="stall", choices=("stall", "contact"),
+parser.add_argument("--freeze-trigger", default="stall", choices=("stall", "contact", "progress"),
                      help="Only meaningful with --freeze-at-stall. 'stall' (default) = the original "
                           "H-CMD trigger: contact (lf+rf > 1 N) AND measured drive-joint speed < "
                           "0.02 rad/s sustained for 0.3 s. This never armed in practice -- the drive "
                           "creeps continuously (~0.03 rad/s) toward its unreachable target and never "
                           "reads as stalled (see h3-result.md). 'contact' = fires on the first "
                           "genuine clamp: lf+rf > 5 N sustained for 0.3 s, independent of drive "
-                          "speed. Same freeze action either way (see --freeze-lead).")
+                          "speed. This fires too early in practice -- at first light contact "
+                          "(~0.5 s, fingers still moving at ~0.24 rad/s) -- and the clamp force then "
+                          "decays to ~0 (freeze2-result.md). 'progress' = the first genuine clamp "
+                          "PLATEAU: fires when (a) lf+rf > 5 N has been sustained for the last 0.3 s "
+                          "of sim time AND (b) the MEASURED drive-joint angle has advanced less than "
+                          "--freeze-progress-eps rad over that same trailing 0.3 s window (a progress "
+                          "stall, deliberately NOT the instantaneous drive speed used by 'stall', "
+                          "which never reads as stalled while the drive creeps at a near-constant "
+                          "rate -- see task20-decay-probe-findings.md). If the drive keeps creeping "
+                          "faster than --freeze-progress-eps per 0.3 s for the whole hold, this "
+                          "trigger never fires (triggered=False), same as 'stall' not arming. Same "
+                          "freeze action as the other triggers either way (see --freeze-lead).")
+parser.add_argument("--freeze-progress-eps", type=float, default=0.005,
+                     help="Only meaningful with --freeze-at-stall --freeze-trigger progress. Max "
+                          "measured drive-joint advance (rad) allowed over the trailing 0.3 s window "
+                          "for that window to count as a progress stall (clamp plateau). Default "
+                          "0.005 rad / 0.3 s (~0.017 rad/s); the observed creep rate is ~0.03 rad/s "
+                          "(~0.009 rad / 0.3 s), so the default may never fire -- pass a looser value "
+                          "such as 0.012 to see the effect of relaxing the plateau threshold.")
 parser.add_argument("--freeze-lead", type=float, default=0.005,
                      help="Only meaningful with --freeze-at-stall. Amount (rad) added to each "
                           "gripper joint's measured angle to form its frozen target -- 'measured + "
@@ -1135,6 +1154,13 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
     frozen = False
     freeze_t = None
     freeze_targets: dict[str, float] | None = None
+    # 'progress' trigger state: a trailing 0.3 s window of (contact holding,
+    # measured drive angle) so the plateau check can look back at "the last
+    # 0.3 s of sim time" rather than requiring one more 0.3 s ON TOP OF an
+    # already-windowed condition.
+    progress_window = max(1, int(round(0.3 / DT)))
+    progress_contact_run = 0
+    progress_drive_hist: collections.deque[float] = collections.deque(maxlen=progress_window)
     command_gripper(args.close_target)
     steps = int(args.record_s / DT)
     peak_force = 0.0
@@ -1179,16 +1205,46 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
             # unreachable target and never reads as stalled.
             #
             # 'contact' (#20 fix): fires on the first genuine clamp, lf+rf
-            # > 5 N sustained for 0.3 s, independent of drive speed.
+            # > 5 N sustained for 0.3 s, independent of drive speed. Per
+            # freeze2-result.md this fires too early (first light contact,
+            # fingers still moving) and the held clamp force decays to ~0.
+            #
+            # 'progress' (#20 second fix): the drive's own instantaneous
+            # speed never reads as stalled (it creeps at a near-constant
+            # ~0.03 rad/s the whole hold -- see h3-result.md), so instead of
+            # 'stall' this looks for the first genuine clamp PLATEAU: contact
+            # sustained 0.3 s (same as 'contact') AND the measured drive
+            # angle has advanced less than --freeze-progress-eps rad over
+            # that trailing 0.3 s window. progress_drive_hist is a
+            # maxlen=progress_window deque of the measured drive angle
+            # appended every step below, so once it is full its two ends are
+            # exactly 0.3 s apart in sim time.
+            progress_drive_hist.append(g["drive_joint"][0])
+            if force > 5.0:
+                progress_contact_run += 1
+            else:
+                progress_contact_run = 0
+            progress_contact_ok = progress_contact_run >= progress_window
+            progress_plateau_ok = (
+                len(progress_drive_hist) == progress_window
+                and abs(progress_drive_hist[-1] - progress_drive_hist[0]) < args.freeze_progress_eps
+            )
             if args.freeze_trigger == "contact":
                 trigger_hold = force > 5.0
+            elif args.freeze_trigger == "progress":
+                # Both conditions are already evaluated over their own
+                # trailing 0.3 s window, so this is a one-shot fire (no
+                # additional freeze_run sustain needed) -- see progress_run
+                # below.
+                trigger_hold = progress_contact_ok and progress_plateau_ok
             else:
                 trigger_hold = force > 1.0 and drive_speed_now < 0.02
             if trigger_hold:
                 freeze_run += 1
             else:
                 freeze_run = 0
-            if freeze_run >= max(1, int(round(0.3 / DT))):
+            freeze_run_required = 1 if args.freeze_trigger == "progress" else max(1, int(round(0.3 / DT)))
+            if freeze_run >= freeze_run_required:
                 frozen = True
                 freeze_t = t
                 freeze_targets = {}
@@ -1201,9 +1257,15 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
                 backend._mirror_gripper_mimic_targets = lambda: None
                 emit(
                     event="freeze_at_stall", tag=tag, triggered=True, t=round(freeze_t, 4),
-                    trigger=args.freeze_trigger, drive_speed_at_trigger=drive_speed_now,
+                    trigger=args.freeze_trigger, drive_angle_at_trigger=round(g["drive_joint"][0], 5),
+                    drive_speed_at_trigger=drive_speed_now,
                     frozen_targets={n: round(v, 5) for n, v in freeze_targets.items()},
                     lf=lf, rf=rf, drive_speed=drive_speed_now,
+                    progress_window_advance=(
+                        round(progress_drive_hist[-1] - progress_drive_hist[0], 6)
+                        if args.freeze_trigger == "progress" and len(progress_drive_hist) == progress_window
+                        else None
+                    ),
                 )
         moving = pad_speed > 0.1
         if moving:
