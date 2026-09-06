@@ -655,14 +655,33 @@ def evaluate_clock_domain(
     local_use_sim_time: bool,
     remote_use_sim_time: bool | None,
     sim_clock_active: bool,
-    clock_now_ns: int,
+    clock_now_ns: int | None,
 ) -> dict[str, object]:
     """Classify probe/controller clock-domain agreement and sim-clock readiness.
 
     The probe and the controller_manager must agree on ``use_sim_time``; when
     running on the sim clock the probe additionally requires an active ``/clock``
-    that has advanced past zero.  A mismatch is a typed FAIL with a probable
+    that has produced a sample.  A mismatch is a typed FAIL with a probable
     ``use_sim_time`` explanation rather than a bare stale/transport verdict.
+
+    ``clock_now_ns`` is ``None`` when the caller itself knows no ``/clock``
+    sample has been received yet -- the primary "not ready" signal, checked
+    first and independent of the numeric value. When a numeric value *is*
+    given, an exact ``0`` is additionally treated as not-ready, matching
+    rclpy's own ``TimeSource`` convention where a not-yet-set sim clock reads
+    exactly ``0`` ("Zero time is a special value that means time is
+    uninitialized", ``rclpy/time_source.py``) -- this covers a caller that
+    can only observe the numeric value (e.g. a raw ``Clock.now()`` read
+    before any ``/clock`` message has ever arrived) and has no independent
+    way to produce ``None``. This is an exact-zero check, not ``<= 0``: task
+    #21's ``resolve_clock_epoch`` rejects negative ``TINKER_SIM_CLOCK_EPOCH``
+    values specifically so ``ros_clock_time`` (``simulation_time + epoch``)
+    can never be negative and reads exactly ``0`` only in the legacy
+    zero-based clock (``TINKER_SIM_CLOCK_EPOCH=0``) at true start -- the
+    contract the exact-zero branch exists to serve. Under the default
+    wall-clock epoch, a real running sim's first sample is a large nonzero
+    value, never ``0``, so in practice this branch only fires in legacy mode
+    or before any sample has arrived.
     """
     reasons: list[str] = []
     if remote_use_sim_time is None:
@@ -678,7 +697,9 @@ def evaluate_clock_domain(
         reasons.append("probe is not running on the sim clock (use_sim_time=false)")
     elif not sim_clock_active:
         reasons.append("use_sim_time=true but /clock is not published")
-    elif clock_now_ns <= 0:
+    elif clock_now_ns is None:
+        reasons.append("sim clock is active but no clock sample has been received yet")
+    elif clock_now_ns == 0:
         reasons.append("sim clock is active but has not advanced past zero")
     return {
         "ready": not reasons,
