@@ -23,8 +23,8 @@ This note records the state left by the most recent development session in this 
 
 ## Update — 2026-08-18, later session
 
-Steps 1–3 above are done; see the 2026-08-18 README changelog entry for the
-full record. In brief: the arena streaming session ran end to end and is
+Steps 1–3 above are done; see the 2026-08-18 entry in `docs/CHANGELOG.md`
+for the full record. In brief: the arena streaming session ran end to end and is
 left up awaiting a human viewer (the one still-open item); sensor-rich
 head/wrist furniture imagery is in `reports/arena-sensor-rich-2026-08-18/`
 and `reports/arena-arm-camera-2026-08-18/`; AMCL was validated against
@@ -45,7 +45,7 @@ reads until that workspace is restored.
 The arena-findings plan (Tasks 1-14) closed out its code and docs, but the
 live evidence wave it depended on did not pass. What it proved live,
 what it disproved, and what remains open — full detail and evidence paths
-are in the README changelog's 2026-08-21 entry:
+are in `docs/CHANGELOG.md`'s 2026-08-21 entry:
 
 **Proved live** (`reports/arena-fixes-2026-08-19/`): the head pan/tilt
 effort-cap fix converges within tolerance
