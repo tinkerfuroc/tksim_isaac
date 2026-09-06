@@ -1242,8 +1242,18 @@ class IsaacWholeRobotBackend:
             stage, "/World/Tinker/PhysicsMaterials/gripper_friction"
         )
         api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
-        api.CreateStaticFrictionAttr(1.0)
-        api.CreateDynamicFrictionAttr(1.0)
+        # TINKER_SIM_GRIPPER_PAD_FRICTION (#20): single-variable A/B override of
+        # the pad-side static/dynamic friction (default 1.0/1.0). Set before
+        # backend construction -- this fires once, before self._sim.reset().
+        pad_friction_env = os.environ.get("TINKER_SIM_GRIPPER_PAD_FRICTION")
+        pad_friction = 1.0
+        if pad_friction_env and pad_friction_env.strip():
+            try:
+                pad_friction = float(pad_friction_env)
+            except ValueError:
+                pad_friction = 1.0
+        api.CreateStaticFrictionAttr(pad_friction)
+        api.CreateDynamicFrictionAttr(pad_friction)
         api.CreateRestitutionAttr(0.0)
         # Optional compliant contact (TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS):
         # a soft contact spring on the pads cushions the first-contact impulse
@@ -1307,7 +1317,11 @@ class IsaacWholeRobotBackend:
                     )
         print(
             json.dumps(
-                {"gripper_friction_bound": bound, "gripper_torsional_pads": torsional},
+                {
+                    "gripper_friction_bound": bound,
+                    "gripper_torsional_pads": torsional,
+                    "gripper_pad_friction": pad_friction,
+                },
                 sort_keys=True,
             ),
             flush=True,

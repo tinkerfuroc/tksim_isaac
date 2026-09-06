@@ -66,6 +66,21 @@ parser.add_argument("--follower-effort-limit", type=float, default=None, help="c
 parser.add_argument("--trace-contacts", action="store_true", help="record EVERY contact pair touching the probe object's body (knuckles, palm, table/pedestal -- not just the pads the backend normally monitors), with point/normal, via backend.py's TINKER_SIM_CONTACT_TRACE_BODIES; written into every row under 'trace'. Default off, no cost.")
 parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
 parser.add_argument("--object-usda", default="")
+parser.add_argument("--object-friction", type=float, default=None,
+                     help="#20 torsional-friction experiment: author/override the spawned "
+                          "object's bound physics material static AND dynamic friction to this "
+                          "value (binds a new material if the collider has none). Applied right "
+                          "after the object reference is added, before the physics parse; a "
+                          "post-play readback ('object_friction_check') confirms what PhysX "
+                          "actually resolved. Default off (object keeps its authored USDA "
+                          "friction).")
+parser.add_argument("--pad-friction", type=float, default=None,
+                     help="#20 torsional-friction experiment: override the gripper pad material's "
+                          "static AND dynamic friction (backend default 1.0/1.0) via "
+                          "TINKER_SIM_GRIPPER_PAD_FRICTION, set before the backend boots (the "
+                          "material is authored once in _apply_gripper_friction_material() during "
+                          "construction). A post-boot readback ('pad_friction_check') confirms the "
+                          "authored value. Default off (pads keep 1.0/1.0).")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
 parser.add_argument("--object-yaw-axis", default="x", choices=("x", "y"), help="which tool axis the object's long axis is aligned to (knife)")
 parser.add_argument("--object-yaw-deg", type=float, default=None, help="absolute world yaw of the object (overrides --object-yaw-axis)")
@@ -139,6 +154,11 @@ if args.trace_contacts:
     # below -- so the traced body name is always "Bottle". Must be set before
     # the backend (and its contact-report subscription) is constructed.
     os.environ["TINKER_SIM_CONTACT_TRACE_BODIES"] = "Bottle"
+if args.pad_friction is not None:
+    # Must be set before backend construction: _apply_gripper_friction_material()
+    # fires once from IsaacWholeRobotBackend.__init__(), before self._sim.reset().
+    os.environ["TINKER_SIM_GRIPPER_PAD_FRICTION"] = str(float(args.pad_friction))
+    emit(event="pad_friction_set", static=float(args.pad_friction), dynamic=float(args.pad_friction))
 backend = IsaacWholeRobotBackend(
     usd_path=manifest.parent / "robot.usd",
     map_yaml=None,
@@ -153,6 +173,20 @@ backend = IsaacWholeRobotBackend(
     scenario="",
     task="",
 )
+if args.pad_friction is not None:
+    import omni.usd as _omni_usd_pf
+    from pxr import UsdPhysics as _UsdPhysics_pf
+
+    _pf_stage = _omni_usd_pf.get_context().get_stage()
+    _pf_mat_prim = _pf_stage.GetPrimAtPath("/World/Tinker/PhysicsMaterials/gripper_friction")
+    _pf_static = _pf_dynamic = None
+    if _pf_mat_prim.IsValid():
+        _pf_mapi = _UsdPhysics_pf.MaterialAPI(_pf_mat_prim)
+        _pf_static = _pf_mapi.GetStaticFrictionAttr().Get()
+        _pf_dynamic = _pf_mapi.GetDynamicFrictionAttr().Get()
+    emit(event="pad_friction_check", static=_pf_static, dynamic=_pf_dynamic,
+         bound=int(getattr(backend, "gripper_friction_bound", 0)),
+         prim=str(_pf_mat_prim.GetPath()) if _pf_mat_prim.IsValid() else None)
 if os.environ.get("PROBE_RELEASE_SAFETY_AT_BOOT", "0") == "1":
     backend.set_safety_stop(False)
 # Spawn-time root orientation (identity in the data's own quaternion
@@ -1014,9 +1048,70 @@ if "A" in args.phase:
 # ----------------------------------------------------------------- Phase B
 if "B" in args.phase:
     import omni.usd
-    from pxr import Gf, Sdf, UsdGeom, UsdPhysics, UsdShade
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
     stage = omni.usd.get_context().get_stage()
+
+    def _collision_prims(root_prim) -> list:
+        """All descendant prims (root included) carrying UsdPhysics.CollisionAPI."""
+        return [p for p in Usd.PrimRange(root_prim) if p.HasAPI(UsdPhysics.CollisionAPI)]
+
+    def _direct_binding_target(prim) -> str | None:
+        """Path of the material this prim itself (not an ancestor) binds, or None.
+
+        PhysX resolves the physics material from the binding on the collision
+        prim or its NEAREST bound ancestor -- distinguishing the two matters
+        for #20 (is our override landing on the collider itself?).
+        """
+        rel = UsdShade.MaterialBindingAPI(prim).GetDirectBindingRel(materialPurpose="physics")
+        targets = rel.GetTargets()
+        return str(targets[0]) if targets else None
+
+    def _author_object_friction(root_prim, value: float, tag: str) -> None:
+        for cprim in _collision_prims(root_prim):
+            binding_api = UsdShade.MaterialBindingAPI.Apply(cprim)
+            bound_mat, _ = binding_api.ComputeBoundMaterial(materialPurpose="physics")
+            if bound_mat and bound_mat.GetPrim().IsValid():
+                mat_prim = bound_mat.GetPrim()
+                mapi = UsdPhysics.MaterialAPI.Apply(mat_prim)
+            else:
+                new_mat = UsdShade.Material.Define(
+                    stage, cprim.GetPath().AppendChild("FrictionOverrideMat")
+                )
+                mapi = UsdPhysics.MaterialAPI.Apply(new_mat.GetPrim())
+                binding_api.Bind(new_mat, materialPurpose="physics")
+                mat_prim = new_mat.GetPrim()
+            mapi.CreateStaticFrictionAttr(value)
+            mapi.CreateDynamicFrictionAttr(value)
+            emit(
+                event=f"object_friction_{tag}",
+                static=value,
+                dynamic=value,
+                prim=str(cprim.GetPath()),
+                bound_material=str(mat_prim.GetPath()),
+                direct_binding=_direct_binding_target(cprim) == str(mat_prim.GetPath()),
+            )
+
+    def _check_object_friction(root_prim, tag: str) -> None:
+        for cprim in _collision_prims(root_prim):
+            bound_mat, _ = UsdShade.MaterialBindingAPI(cprim).ComputeBoundMaterial(materialPurpose="physics")
+            static_v = dynamic_v = None
+            mat_path = None
+            if bound_mat and bound_mat.GetPrim().IsValid():
+                mat_path = str(bound_mat.GetPrim().GetPath())
+                mapi = UsdPhysics.MaterialAPI(bound_mat.GetPrim())
+                static_v = mapi.GetStaticFrictionAttr().Get()
+                dynamic_v = mapi.GetDynamicFrictionAttr().Get()
+            direct_target = _direct_binding_target(cprim)
+            emit(
+                event=f"object_friction_{tag}",
+                static=static_v,
+                dynamic=dynamic_v,
+                prim=str(cprim.GetPath()),
+                bound_material=mat_path,
+                direct_binding=(direct_target == mat_path) if mat_path else None,
+            )
+
     # bottle base position
     if grasp and "bottle_rel_base" in grasp:
         rel = grasp["bottle_rel_base"]
@@ -1080,6 +1175,11 @@ if "B" in args.phase:
     bottle_path = "/World/Probe/Bottle"
     bprim = stage.DefinePrim(bottle_path, "Xform")
     bprim.GetReferences().AddReference(object_usda)
+    if args.object_friction is not None:
+        # Author before the physics parse (the app.update() loop below triggers
+        # it) so PhysX picks up the override on first parse rather than a
+        # runtime material swap.
+        _author_object_friction(bprim, float(args.object_friction), "set")
     # Spawn 2 cm above the support: a body that never attached to PhysX stays
     # exactly at the authored pose, a live one drops onto the support.
     DROP = 0.02
@@ -1092,6 +1192,10 @@ if "B" in args.phase:
         app.update()
     for _ in range(int(1.5 / DT)):
         backend.step()
+    if args.object_friction is not None:
+        # Post-play readback: confirm what PhysX actually resolved (collider's
+        # own binding vs. an inherited ancestor binding).
+        _check_object_friction(bprim, "check")
     from isaaclab_physx.physics import PhysxManager
 
     view = PhysxManager.get_physics_sim_view().create_rigid_body_view(bottle_path)
