@@ -1832,6 +1832,7 @@ class IsaacWholeRobotBackend:
         # (#24 review round 2).
         if reapply_spawn_yaw:
             self._reapply_spawn_yaw_after_rebind()
+            self._gripper_stall_freeze_reset_after_rebind()
         return True
 
     @property
@@ -2919,27 +2920,78 @@ class IsaacWholeRobotBackend:
         self._gsf_contact_run = 0
         self._gsf_drive_hist.clear()
 
+    def _gripper_stall_freeze_reset_after_rebind(self) -> None:
+        """Reset the #20 stall-freeze state machine on a GENUINE reset rebind.
+
+        Called from ``_refresh_robot_handles`` only when that method's
+        caller declared ``reapply_spawn_yaw=True`` -- the exact same
+        "genuine STOP -> spawn(s) -> PLAY" classification
+        ``_reapply_spawn_yaw_after_rebind`` and the base-hold clear (inside
+        ``_apply_spawn_yaw_via_view``) key off. That rebind resets the
+        articulation's physics state back to its initial/commanded joint
+        state, so any PRESS/HOLD baseline this state machine latched
+        before the reset (measured joint angles from a grasp that may no
+        longer exist) is now stale -- holding it would keep commanding a
+        jaw pose with nothing to do with the fresh joint state the reset
+        just produced. Force the machine back to CLOSING and clear its
+        plateau-detector window and press bookkeeping so the very next
+        ``_gripper_stall_freeze_gate()`` call re-derives targets fresh from
+        whatever ``_drive_command_target`` is live at that time, instead of
+        a mid-grasp STOP -> PLAY leaving frozen targets from before the
+        cycle.
+
+        NOT called for ``_maybe_recover_simulation_view``'s mid-run,
+        state-PRESERVING view recovery (``reapply_spawn_yaw=False``): that
+        recovery can fire while the gripper is genuinely PRESS/HOLDing an
+        object, and physics state (the clamped jaw included) survives it
+        unchanged -- dropping the freeze there would silently release a
+        still-gripped object, mirroring exactly why
+        ``_reapply_spawn_yaw_after_rebind`` itself is skipped on that path.
+
+        No-op (state left untouched, nothing logged) when
+        TINKER_SIM_GRIPPER_STALL_FREEZE is off, matching the "env-off
+        byte-identical" contract ``_gripper_stall_freeze_gate`` documents --
+        the state machine is never reached with the feature disabled, so
+        there is nothing here to reset either.
+        """
+        if not getattr(self, "_gripper_stall_freeze_enabled", True):
+            return
+        self._gsf_state = "closing"
+        self._gsf_baseline = {}
+        self._gsf_travel = 0.0
+        self._gsf_contact_run = 0
+        hist = getattr(self, "_gsf_drive_hist", None)
+        if hist is not None:
+            hist.clear()
+        self._gsf_last_command = None
+        self._gripper_stall_freeze_log(
+            "reset", drive=None, pad_force_n=0.0, travel=0.0, reason="rebind"
+        )
+
     def _gripper_stall_freeze_log(
-        self, state: str, *, drive: float | None, pad_force_n: float, travel: float
+        self,
+        state: str,
+        *,
+        drive: float | None,
+        pad_force_n: float,
+        travel: float,
+        reason: str | None = None,
     ) -> None:
         try:
             t = round(self.simulation_time, 4)
         except Exception:
             t = None
-        print(
-            json.dumps(
-                {
-                    "event": "gripper_stall_freeze",
-                    "state": state,
-                    "t": t,
-                    "drive": drive,
-                    "pad_force_n": pad_force_n,
-                    "travel": travel,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+        payload = {
+            "event": "gripper_stall_freeze",
+            "state": state,
+            "t": t,
+            "drive": drive,
+            "pad_force_n": pad_force_n,
+            "travel": travel,
+        }
+        if reason is not None:
+            payload["reason"] = reason
+        print(json.dumps(payload, sort_keys=True), flush=True)
 
     def step(self) -> None:
         if self.step_profile["enabled"]:

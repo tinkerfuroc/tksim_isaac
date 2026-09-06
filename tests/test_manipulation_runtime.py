@@ -3276,5 +3276,81 @@ class SpawnYawViaViewRecoveryRebindTest(unittest.TestCase):
         self.assertEqual(backend._robot.root_pose_calls, [])
 
 
+class GripperStallFreezeRebindTest(unittest.TestCase):
+    """Follow-up to #20: a genuine scenario reset (STOP -> spawn -> PLAY)
+    recreates the articulation view exactly like a spawn-yaw rebind does,
+    but nothing previously reset the #20 stall-freeze state machine along
+    with it. A mid-grasp cycle that hits this rebind (or a manual
+    ``/sim/reset``) would otherwise leave ``_gsf_state`` latched at
+    PRESS/HOLD with frozen targets baselined against joint angles from
+    BEFORE the reset -- stale relative to the fresh (initial/commanded)
+    joint state the reset just produced. The fix hooks the same
+    ``reapply_spawn_yaw=True`` "genuine rebind" classification
+    ``_reapply_spawn_yaw_after_rebind`` and the base-hold clear use in
+    ``_refresh_robot_handles`` to force the state machine back to CLOSING
+    and clear its dwell/progress windows and press travel."""
+
+    def test_rebind_resets_frozen_hold_state_to_closing(self) -> None:
+        backend = _gsf_backend()
+        # Put the double into HOLD with non-trivial bookkeeping, as if a
+        # grasp had plateaued, pressed, and latched before the reset.
+        backend._gsf_state = "hold"
+        backend._gsf_baseline = {i: 0.25 for i in range(6)}
+        backend._gsf_travel = 0.04
+        backend._gsf_contact_run = 7
+        backend._gsf_drive_hist.extend([0.2, 0.21, 0.22])
+        backend._gsf_last_command = 0.85
+
+        # Force _refresh_robot_handles to see a "new" articulation view --
+        # the same genuine STOP -> spawn -> PLAY rebind signature the
+        # SpawnYawViaView tests above use.
+        backend._robot_view_identity = -1
+
+        self.assertTrue(backend._refresh_robot_handles())
+
+        self.assertEqual(backend._gsf_state, "closing")
+        self.assertEqual(backend._gsf_baseline, {})
+        self.assertEqual(backend._gsf_travel, 0.0)
+        self.assertEqual(backend._gsf_contact_run, 0)
+        self.assertEqual(len(backend._gsf_drive_hist), 0)
+        self.assertIsNone(backend._gsf_last_command)
+
+        # The next step must re-derive targets from whatever command is
+        # live now, not stay wedged -- the CLOSING path (ramp + mirror +
+        # plateau check), not the HOLD no-op, must run.
+        calls: list[str] = []
+        backend._ramp_drive_target = lambda: calls.append("ramp")
+        backend._mirror_gripper_mimic_targets = lambda: calls.append("mirror")
+        backend._gripper_stall_freeze_check_plateau = lambda: calls.append("plateau")
+        backend._drive_command_target = 0.85
+        backend._gripper_stall_freeze_gate()
+        self.assertEqual(calls, ["ramp", "mirror", "plateau"])
+
+    def test_recovery_rebind_leaves_frozen_hold_state_untouched(self) -> None:
+        """The mid-run, state-PRESERVING view recovery
+        (``_maybe_recover_simulation_view``, ``reapply_spawn_yaw=False``)
+        must NOT reset the stall-freeze state -- unlike a genuine scenario
+        reset, physics state (and a genuinely clamped jaw) survives that
+        rebind unchanged, so dropping HOLD there would silently release a
+        still-gripped object."""
+        backend = _gsf_backend()
+        backend._gsf_state = "hold"
+        backend._gsf_baseline = {i: 0.25 for i in range(6)}
+        backend._gsf_travel = 0.04
+        backend._gsf_contact_run = 7
+        backend._gsf_drive_hist.extend([0.2, 0.21, 0.22])
+        backend._gsf_last_command = 0.85
+        backend._robot_view_identity = -1
+
+        self.assertTrue(backend._refresh_robot_handles(reapply_spawn_yaw=False))
+
+        self.assertEqual(backend._gsf_state, "hold")
+        self.assertEqual(backend._gsf_baseline, {i: 0.25 for i in range(6)})
+        self.assertEqual(backend._gsf_travel, 0.04)
+        self.assertEqual(backend._gsf_contact_run, 7)
+        self.assertEqual(list(backend._gsf_drive_hist), [0.2, 0.21, 0.22])
+        self.assertEqual(backend._gsf_last_command, 0.85)
+
+
 if __name__ == "__main__":
     unittest.main()
