@@ -357,6 +357,122 @@ def _read_effective_effort_limits(ids: list[int]) -> list[float]:
     return [float(arr[i]) for i in ids]
 
 
+def _read_physx_max_forces(ids: list[int]) -> list[float]:
+    """Read the follower DOFs' max-force straight off the PhysX tensor view
+    (root_view.get_dof_max_forces / root_physx_view, shape (num_instances,
+    num_joints), env 0) -- the actual buffer write_joint_effort_limit_to_sim_
+    index's set_dof_max_forces call targets (isaaclab_physx articulation.py
+    :1613-1679). data.joint_effort_limits (the other readback in this file)
+    is the Isaac Lab-side mirror of that write and can only prove the write
+    was *issued*; this proves what PhysX itself is holding, independent of
+    any Isaac Lab actuator-model caching (#20 cap5-analysis: bit-identical
+    physics from cap 5 through cap 180 means the two readbacks may diverge
+    even though both currently agree post-write).
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    getter = getattr(root_view, "get_dof_max_forces", None) if root_view is not None else None
+    if getter is None:
+        return [float("nan")] * len(ids)
+    try:
+        forces = getter()
+        arr = forces.numpy() if hasattr(forces, "numpy") else forces
+        arr = np.asarray(arr)
+        return [float(arr[0, i]) for i in ids]
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({"physx_max_force_read_error": str(error)[:160]}), flush=True)
+        return [float("nan")] * len(ids)
+
+
+def _write_physx_max_forces_direct(ids: list[int], limit: float) -> None:
+    """Re-assert the follower cap straight on the PhysX tensor view, bypassing
+    the Isaac Lab wrapper (write_joint_effort_limit_to_sim_index only ever
+    calls this same root_view.set_dof_max_forces once, immediately and on the
+    full joint set -- see articulation.py:1679 -- so this is a redundant,
+    same-call re-assertion, not a different code path; it exists so that if a
+    future change interposes something between the wrapper and the view (or
+    changes the wrapper to defer), the direct write here still lands).
+
+    set_dof_max_forces takes the FULL (num_instances, num_joints) row for the
+    selected env indices, not a sparse per-joint column (the vendored writer
+    clones the whole data._joint_effort_limits buffer, not just the changed
+    columns -- see articulation.py:1679); passing a (1, len(ids))-shaped
+    tensor here would either shape-mismatch or, worse, silently overwrite
+    every OTHER joint's effort limit (arm joints, drive_joint) with `limit`.
+    So this reads the current full row back (already updated for `ids` by the
+    wrapper call that precedes this one), patches it, and pushes the whole
+    row -- and, per the Task #12 precedent (RigidBodyView needs WARP arrays,
+    not torch, for tensor-API writes to actually land), uses warp arrays for
+    both the payload and the indices rather than torch tensors.
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    setter = getattr(root_view, "set_dof_max_forces", None) if root_view is not None else None
+    if setter is None:
+        return
+    try:
+        import warp as wp
+
+        data = backend._robot.data
+        full = backend._torch_value(data.joint_effort_limits).clone()
+        full[0, ids] = float(limit)
+        full_cpu = full.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        forces_wp = wp.from_torch(full_cpu, dtype=wp.float32)
+        indices_wp = wp.array([0], dtype=wp.int32, device="cpu")
+        setter(forces_wp, indices=indices_wp)
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({"physx_max_force_write_error": str(error)[:160]}), flush=True)
+
+
+def _author_usd_follower_max_force(ids: list[int], limit: float) -> None:
+    """Author physics:maxForce on each follower joint's UsdPhysics.DriveAPI
+    directly on the stage, in addition to the runtime tensor-API write.
+
+    The runtime write (write_joint_effort_limit_to_sim_index) only touches
+    the live PhysX simulation buffers; it does not update the USD prim. If
+    anything ever re-parses the stage (a stage reload, or a reset that goes
+    through _initialize_impl/_process_actuators_cfg again -- see articulation
+    .py:3811/4127), the actuator would be rebuilt from whatever the USD prim
+    says, not from this run's runtime override. Authoring the drive attribute
+    now means a re-parse still carries the cap. Best-effort: the follower
+    joints are mimic joints the importer dropped drives for (see the
+    "gripper_mimic" comment in backend.py), so a DriveAPI may not already be
+    applied -- Apply() creates it. Per-joint failures are logged, not fatal.
+    """
+    try:
+        import omni.usd
+        from pxr import Usd, UsdPhysics
+    except ImportError:
+        return
+    id_to_name = {index: name for name, index in JIDX.items()}
+    target_names = {id_to_name[i] for i in ids if i in id_to_name}
+    if not target_names:
+        return
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return
+    robot_prim_path = str(getattr(getattr(backend._robot, "cfg", None), "prim_path", "") or "/World/Tinker")
+    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+    if not robot_prim.IsValid():
+        return
+    authored, errors = [], []
+    for prim in Usd.PrimRange(robot_prim):
+        name = prim.GetName()
+        if name not in target_names:
+            continue
+        for instance in ("angular", "linear"):
+            try:
+                drive = UsdPhysics.DriveAPI.Apply(prim, instance)
+                drive.CreateMaxForceAttr(float(limit))
+                authored.append(f"{name}:{instance}")
+            except Exception as error:  # pragma: no cover - defensive, schema surface
+                errors.append(f"{name}:{instance}:{str(error)[:80]}")
+    print(json.dumps({
+        "event": "follower_usd_drive_authored",
+        "requested": limit,
+        "authored": authored,
+        "errors": errors,
+    }), flush=True)
+
+
 def _patch_actuator_effort_limit_cache(ids: list[int], limit: float) -> None:
     """Mirror the PhysX effort-limit write into the owning ImplicitActuator's
     cached tensors -- the same workaround backend._set_gripper_effort_limit
@@ -396,22 +512,33 @@ def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower
     _set_gripper_effort_limit / _write_safety_effort_limit): PhysX
     write_joint_effort_limit_to_sim_index(limits=..., joint_ids=..., env_ids=...).
     Also patches the owning ImplicitActuator's cached effort_limit/
-    effort_limit_sim tensors in place (see _patch_actuator_effort_limit_cache)
-    and reads the effective limit back for the event -- the raw PhysX write
-    alone was provably ineffective (#20: bit-identical bench rows at cap-50
-    vs cap-180). A no-op unless --follower-effort-limit was passed.
+    effort_limit_sim tensors in place (see _patch_actuator_effort_limit_cache),
+    re-asserts the cap directly on the PhysX tensor view
+    (_write_physx_max_forces_direct) and authors it onto each follower
+    joint's USD DriveAPI (_author_usd_follower_max_force) so a stage re-parse
+    would still carry it, and reads the effective limit back both from Isaac
+    Lab's data.joint_effort_limits and straight from PhysX
+    (get_dof_max_forces) for the event -- #20 evidence (bit-identical 15 s
+    hold physics at cap 5/50/100 vs cap-180, cap5-analysis.md) shows the
+    write reaching the tensor-API buffer is NOT sufficient proof it reaches
+    the solver's actual joint-drive force limit for these mimic joints; the
+    physx_max_force readback is what would catch that gap. A no-op unless
+    --follower-effort-limit was passed.
     """
     if args.follower_effort_limit is None:
         return
     limit = float(args.follower_effort_limit)
     _write_gain("limits", "write_joint_effort_limit_to_sim_index", limit, mimic_ids)
+    _write_physx_max_forces_direct(mimic_ids, limit)
     _patch_actuator_effort_limit_cache(mimic_ids, limit)
+    _author_usd_follower_max_force(mimic_ids, limit)
     if emit_event:
         print(json.dumps({
             "event": event,
             "requested": limit,
             "indices": mimic_ids,
             "effective": _read_effective_effort_limits(mimic_ids),
+            "physx_max_force": _read_physx_max_forces(mimic_ids),
         }), flush=True)
 
 
