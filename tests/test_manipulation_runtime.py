@@ -1696,7 +1696,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_uses_identified_bodies_and_reported_normal(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_persist = "persist"
         backend._contact_event_lost = "lost"
@@ -1739,7 +1739,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_sums_normal_impulses_without_tangential_cancellation(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -1784,7 +1784,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_uses_deterministic_normal_for_degenerate_average(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -1821,6 +1821,91 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(float(pair["normal_force"]), 40.0)
         self.assertEqual(pair["normal"], [0.0, 0.0, 1.0])
 
+    def test_contact_report_force_divides_by_physics_dt_not_control_dt(self) -> None:
+        # Task #29: subscribe_contact_report_events fires once per PhysX
+        # solver SUBSTEP (physics_dt = 1/physics_hz), regardless of
+        # control_hz, so the impulse it delivers is a physics_dt-sized
+        # sample. At control_hz=30 with physics_hz=120 there are
+        # physics_substeps=4 substeps per control tick and self.dt (1/30)
+        # is 4x physics_dt (1/120) -- dividing by self.dt under-reports the
+        # true force by 4x (probe A/B: 20.74 N @120 Hz vs 5.12 N @30 Hz on
+        # an identical drive/pad/tilt trajectory). The formula must divide
+        # by physics_dt, the substep's own integration window, not by the
+        # control-tick dt.
+        backend = _backend()
+        backend.physics_hz = 120.0
+        backend.control_hz = 30.0
+        backend.physics_dt = 1.0 / 120.0
+        backend.dt = 1.0 / 30.0
+        backend.physics_substeps = 4
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/left_finger",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 0.05),
+            position=(0.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pair = backend.contact_pairs()[0]
+        # impulse (0.05) / physics_dt (1/120) == 6.0 N -- the correct value.
+        self.assertAlmostEqual(float(pair["normal_force"]), 6.0)
+        # impulse (0.05) / self.dt (1/30) == 1.5 N -- the pre-fix bug value,
+        # exactly 4x too low. Must NOT be what gets recorded.
+        self.assertNotAlmostEqual(float(pair["normal_force"]), 1.5)
+
+    def test_contact_report_force_at_matched_rates_is_byte_identical_path(self) -> None:
+        # When control_hz == physics_hz, self.dt == self.physics_dt, so the
+        # fixed formula (divide by physics_dt) must reproduce exactly the
+        # same value the old formula (divide by self.dt) gave at 120 Hz --
+        # the fix must not disturb the already-correct 120/120 case.
+        backend = _backend()
+        backend.physics_hz = 120.0
+        backend.control_hz = 120.0
+        backend.physics_dt = 1.0 / 120.0
+        backend.dt = 1.0 / 120.0
+        backend.physics_substeps = 1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/left_finger",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 0.05),
+            position=(0.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pair = backend.contact_pairs()[0]
+        self.assertAlmostEqual(float(pair["normal_force"]), 0.05 * 120.0)
+        self.assertAlmostEqual(float(pair["normal_force"]), 6.0)
+
     def test_contact_report_first_event_logged_exactly_once(self) -> None:
         # #28 observability: a stale contacts-off boot produced a
         # structurally-silent /sim/truth/contacts for a whole bench round
@@ -1828,7 +1913,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # must print a one-line marker exactly once per backend life, not
         # once per contact (see _on_contact_report_event).
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"

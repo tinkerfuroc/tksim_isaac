@@ -2417,3 +2417,110 @@ pre-#26 behaviour, confirming this round's change doesn't give flag-off a
 settle timer it never had. Full suite:
 `tests/test_manipulation_runtime.py` 105 passed, 3 subtests passed, 0
 failed. Still no GPU boot for either round of this fix.
+
+## 2026-09-06: contact-report force divided by the control-tick dt, not the physics dt (#29)
+
+**Symptom**: bench facade `contact_force_n` reads 1.8-3.5 N/finger at
+`TINKER_SIM_CONTROL_HZ=30` (agw run) vs 6-8 N/finger at the 120 Hz default
+(agx run) on grasps that look otherwise identical. A clean A/B probe
+(identical drive/pad/tilt trajectory, only `TINKER_SIM_CONTROL_HZ` changed)
+reproduced it in isolation: 20.74 N at 120 Hz vs 5.12 N at 30 Hz --
+`0.247 ~= 1/4`, and drive angle / pad position tracked within 1-2% of each
+other at every sampled instant across the whole run, so the closure itself
+was not different, only the reported force.
+
+**Root cause**: `_on_contact_report_event` (`backend.py`, formerly line
+3729) computed `normal_force = sum(impulse) / self.dt`. PhysX's
+`subscribe_contact_report_events` callback fires once per solver SUBSTEP,
+i.e. once per `physics_dt` (`1/physics_hz`), independent of `control_hz`.
+`self.dt` is `1/control_hz` (`backend.py:574`), and
+`physics_substeps = physics_hz/control_hz` substeps run per control tick
+(`backend.py:573`, `1218-1227`). At the default `control_hz == physics_hz`
+(120/120), `physics_substeps == 1` and `self.dt == self.physics_dt`, so the
+formula happened to be correct -- masking the bug until `TINKER_SIM_CONTROL_HZ`
+was lowered. At 30 Hz control / 120 Hz physics, `physics_substeps == 4`, so
+every reported force was an impulse from one `physics_dt`-sized window
+divided by a `self.dt` that is 4x too large: exactly the observed
+20.74 N / 5.12 N ratio.
+
+**Consumers of the bug**: everything that reads `contact_pairs()` or
+`contact_state()` inherited the same rate-dependent 4x-at-30Hz
+under-report -- the probe's `lf`/`rf` columns, `/sim/truth/contacts`,
+`/sim/parity/finger_contact`, and (most importantly) the gripper facade's
+`contact_force_n` gate: a force-based stall/success threshold at
+`control_hz < physics_hz` would need up to `physics_substeps`x more real
+force to cross the same nominal threshold than it does at 120 Hz, i.e. it
+silently gets harder to satisfy exactly when control_hz is lowered for RTF.
+
+**PR #16 was a wrong theory, now closed**: commit `75388ee` ("gripper mimic
+mirror runs per physics substep") moved `_ramp_drive_target` /
+`_mirror_gripper_mimic_targets` into the per-substep loop, theorizing the
+follower PD's one-step velocity feed-forward was stale for the extra
+substeps at low `control_hz`. It never touched `_on_contact_report_event`
+or the force formula, and per the task's measurement record it left the
+20.74 N / 5.12 N gap completely unchanged -- confirming the mimic-mirror
+cadence and the contact-force formula are unrelated code paths, and that
+`75388ee`'s theory does not explain this symptom. That commit is not on
+this branch's history; this fix targets the actual formula bug instead.
+
+**Fix**: `normal_force = sum(impulse) / self.physics_dt`. The callback
+receives no per-step `dt`/`current_time` argument (only `contact_headers`,
+`contact_data`), so there is no "actual step dt" to prefer over
+`physics_dt` -- `physics_dt` is exactly the substep's own fixed integration
+window and is the correct, and only available, divisor.
+
+**Audit of other `self.dt` sites in `backend.py`** (grepped every
+`/ self.dt`, `* self.dt`, and `self.dt` near contact/impulse/report/wrench;
+`ros_gateway.py` has no dt-based contact math, it only reads
+`contact_state()`):
+- `backend.py:1180`, `2685`, `2756` (`self._robot.update(self.dt)`): called
+  once per `step()` (one control tick), after `_step_simulation()` has
+  already run all `physics_substeps` PhysX steps for that tick -- the
+  correct elapsed time for that single buffer refresh is the control-tick
+  duration, `self.dt`. No change.
+- `backend.py:2252` (`_slew_wheel_targets`, `WHEEL_VELOCITY_SLEW_RAD_S2 *
+  self.dt`) and `backend.py:2601` (`_ramp_drive_target`, `slew * self.dt`):
+  both are called exactly once per `step()` (`step()`'s single call to
+  `_slew_wheel_targets()`/`_ramp_drive_target()`, not inside the substep
+  loop in `_step_simulation`), so the per-tick slew rate correctly uses the
+  control-tick `self.dt`. No change.
+- `backend.py:2685` region / `_mirror_gripper_mimic_targets`'s one-step
+  velocity feed-forward (`joint_vel * self.dt`): also called once per
+  `step()`, same reasoning -- the feed-forward spans one control tick. No
+  change. (This is the code path `75388ee` theorized about and moved
+  per-substep; that move is not present here and this fix does not
+  reintroduce it -- no live evidence ties it to a real symptom.)
+- `backend.py:754` (`SimulationCfg(dt=self.physics_dt, ...)`),
+  `backend.py:1744` (`simulation_time`, `steps * self.physics_dt`), and
+  `backend.py:2835` (`PhysxManager.update_simulation(get_physics_dt(), ...)`):
+  already used `physics_dt` correctly; left untouched.
+
+**Tests** (`tests/test_manipulation_runtime.py`): added
+`test_contact_report_force_divides_by_physics_dt_not_control_dt` --
+`physics_hz=120`, `control_hz=30` (`physics_dt=1/120`, `dt=1/30`,
+`physics_substeps=4`), one contact event with impulse `0.05`, asserts the
+recorded force is `6.0` (`0.05 * 120`) and explicitly not `1.5`
+(`0.05 * 30`, the pre-fix value). Fails on the pre-fix formula with:
+```
+E       AssertionError: 1.5 != 6.0 within 7 places (4.5 difference)
+```
+Added `test_contact_report_force_at_matched_rates_is_byte_identical_path`
+(`physics_hz == control_hz == 120`, `physics_substeps=1`) asserting the
+120/120 case is unchanged by the fix (`self.dt == self.physics_dt` there,
+so both formulas agree). Updated the four pre-existing contact-report
+tests (`test_contact_report_uses_identified_bodies_and_reported_normal`,
+`..._sums_normal_impulses_without_tangential_cancellation`,
+`..._uses_deterministic_normal_for_degenerate_average`,
+`..._first_event_logged_exactly_once`) to set `backend.physics_dt = 0.1`
+instead of `backend.dt = 0.1`, since the divisor variable changed; their
+expected `normal_force` values are unchanged because they set only one dt
+field and it now maps to the divisor the formula actually uses. Full
+suite: `tests/test_manipulation_runtime.py` 111 passed, 3 subtests passed,
+0 failed (was 109 passed pre-change; +2 new tests).
+
+**Not addressed here**: `$TMP/task29-measurement-check.md`'s bench
+divergence (soup-can/sugar-box drive-angle and squeeze-depth differing
+between 30 Hz and 120 Hz control) is a separate, unconfirmed
+control_hz-dependent effect in the close/stall-detection cadence, not
+reproduced by the clean side-pinch probe and not explained by this
+measurement bug -- it needs its own live investigation.
