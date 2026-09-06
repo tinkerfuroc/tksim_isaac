@@ -1711,3 +1711,175 @@ Next: re-run `s2026-003`, `004`, `005` (old run dirs archived as
 `*.attempt1-no-scene`). Acceptance: 003/004 no longer fail on absent
 objects; 005 passes the `person_found` gate under
 `GPSR_SIM_IDENTITY_RELAXED=1`.
+
+## 2026-08-19 — Vision live-acceptance round-trip: recorded result + real tk26_vision defect
+
+Ran the three-terminal live acceptance check (sim on `--sensor-profile
+sensor-rich` with `--arena-colors`, the Humble vision overlay's `get_image`,
+and `tests/ros_humble/test_vision_get_image_live.py` under
+`TINKER_SIM_VISION_LIVE=1`) end to end on `ROS_DOMAIN_ID=42`. See "Live
+acceptance runbook" under Vision hardware-parity cameras in the README for
+the exact commands.
+
+This was run and recorded (3/3 passed, `ROS_DOMAIN_ID=42`): direct RELIABLE
+subscriptions decode both cameras with `tk26_vision` conventions, and the
+wrist frame carried all six palette hues (45.3% chromatic pixels). Evidence
+is under `reports/vision-roundtrip/` (gitignored, host-local).
+
+**Real defect found in `~/tk25_ws/src/tk26_vision`** (documented here for the
+record; out of scope to patch from this repo): `vision_util`'s `get_image`
+and `get_point_cloud` register `async def` callbacks directly on
+`message_filters`' `ApproximateTimeSynchronizer` (`get_image.py:49,65,77,81`,
+`get_point_cloud.py:43,66,100,104`). Humble's `message_filters` invokes
+callbacks synchronously, so those coroutines are never awaited, the node's
+cached frames never update, and both services always answer "No camera
+data" — on real hardware too, not only in sim. The sim run still proved that
+delivery and stamp-pairing both work: the node's own "coroutine was never
+awaited" `RuntimeWarning`s fired for both cameras. The acceptance test's
+third case probes this service directly and will fail loudly — prompting a
+test upgrade — once the node is fixed upstream.
+
+Status: development-validated with a recorded live round-trip; **not
+release-qualified**.
+
+## 2026-08-17 through 2026-08-20 — RoboCup 2026 arena import: validation evidence and open findings
+
+Validation performed on this branch (development-validated only):
+
+- unit suites are green, with a stable failing/erroring name-set matched
+  against this repo's pre-existing environmental failures (see "Developer
+  verification" in the README);
+- both artifacts hash-verify clean (`verify_asset_artifact(...) == []`) and
+  re-import is a proven byte-identical no-op;
+- visual/collision AABB agreement was spot-verified: within 1.4mm on three
+  YCB objects (cracker box, mug, bowl); arena furniture bounds were checked
+  against the upstream SDF within the configured 0.02m tolerance, with two
+  documented per-model exceptions (`rcw26_door`, `rcw26_sink`) whose upstream
+  SDFs deliberately under-size the collision box (a trimmed door-panel depth
+  and a floor-anchored sink height, both for gripper-reach affordance, not
+  data errors);
+- a headless streaming smoke (`validation/run_sim.py --sensor-profile
+  navigation-parity --profile parity --scenario empty --seed 7 --headless
+  --livestream --arena rcw2026 --duration 45`) ran the full 45 simulated
+  seconds to a clean exit, with only headless-windowing/driver diagnostic
+  warnings in the log and no importer-scratch-path leakage;
+- a live end-to-end `./scripts/launch-arena-streaming --arena rcw2026` run
+  (2026-08-18) reached streaming readiness — ready file written, TCP 49100
+  listening, `viewport_ready: true`, arena `robocup-arena3` with 38
+  colliders loaded — and stayed up awaiting a client;
+- sensor-rich camera imagery of the arena's furniture: head and wrist
+  hardware-parity color/depth frames captured live against `--arena
+  rcw2026` (shelf close-ups plus a base-rotation panorama showing the TV
+  cabinet, trash bin, door, tiled floor, and plant), with per-frame content
+  statistics — `reports/arena-sensor-rich-2026-08-18/`; the wrist camera's
+  mount/intrinsics and arm-following viewpoint were verified separately in
+  `reports/arena-arm-camera-2026-08-18/`;
+- AMCL convergence on the derived map: with the spawn moved to a free cell
+  (`--spawn-xy=-2.0,-2.0`) and the Humble stack pointed at the arena map
+  (`map_yaml:=...`), AMCL locked to physics-truth within 0.07 m after
+  seeding and, over truth-validated gentle-motion runs, contracted to
+  position variance 0.035/0.050 m² (std ~0.2 m) at 0.14 rad yaw error —
+  `reports/arena-amcl-2026-08-18/SUMMARY.md`, which also records two real
+  findings: the default (0, 0) arena spawn sits inside `shelf_02`'s
+  footprint (hence the new `--spawn-xy` override), and sustained in-place
+  skid-steer rotation accumulates wheel-odometry yaw slip that drags the
+  filter (a base-odometry characteristic, not a map defect).
+
+- head pan/tilt effort override: with the backend's `effort_limit_sim`
+  override extended to the `head` actuator group, commanded pan/tilt
+  converged from spawn to within the 0.05 rad tolerance of a (1.0, -0.3)
+  rad target — final (0.9506, -0.2853) rad at sim t=0.317 s — closing the
+  2026-08-18 finding that pan/tilt drives inherited the URDF's 1.0 Nm
+  effort cap. Live-proven:
+  `reports/arena-fixes-2026-08-19/head-tracking.json`;
+- physics interaction (an object resting on arena furniture): the
+  pick-deliver-place `delivery_object` (0.08 m cube), spawned via the
+  standard `spawn_entity` path at its declared z=0.8 pose, fell onto and
+  came to rest statically (zero twist across 387 truth samples) on a 0.5 m
+  board of `rcw26_shelf` —
+  `reports/arena-scenario-spawn-2026-08-19/object-spawn-verification.md`.
+  **Superseded 2026-08-20**: this evidence came from `/get_entity_state`
+  polling, not physics truth; a later run under a profile that reports
+  physics truth found no trace of the object in it at all. See "Scenario-
+  spawned objects may not be physics-simulated" under Known arena
+  limitations below — that finding is SUSPECTED, not confirmed, so treat
+  this bullet as open again rather than either closed or refuted;
+- scenario entity spawning in the arena: `scenario_runner` executed
+  find-and-approach-person and pick-deliver-place against an `--arena
+  rcw2026` sim with every operation accepted; the person capsule and task
+  cube spawn at their exact declared world poses (verified via
+  `/get_entities`/`/get_entity_state` and `expected_objects` truth
+  correlation), and spawned entities are live rigid bodies
+  (`/set_entity_state` round-trips) —
+  `reports/arena-scenario-spawn-2026-08-19/`. Caveats: nothing implements
+  scenario `events` (the person's `actor_path_start` walk never runs), and
+  scenario poses were authored for the procedural world (the arena has no
+  pedestal at the object spawn; the person's declared pose sits in
+  furniture-dense space).
+
+Not yet validated (open):
+
+- textured-frame visual confirmation by a human viewer (the streaming
+  session above is up for exactly this; connect with NVIDIA's client).
+
+Known arena limitations (development findings, 2026-08-18 through 2026-08-20):
+
+- the default robot spawn (0, 0) lies inside `shelf_02`'s physical and
+  rasterized footprint. The launch now fails closed on this instead of
+  spawning into it: `validate_arena_spawn()` exits non-zero and names the
+  nearest free cell in the error (`arena spawn (0.0, 0.0) lacks 0.35 m
+  clearance on the derived map; try --spawn-xy=-0.4,0.4`) — pass the
+  suggested `--spawn-xy` for navigation work (see launch docs above).
+  Live-proven: `reports/arena-fixes-2026-08-19/spawn-fail-closed.log`
+  (exit 1, suggestion printed);
+- under `sensor-rich`, an occupied dev-lidar sensor origin (for example the
+  spawn-in-`shelf_02` case above) used to publish a dense ring at ~0.3 m
+  for every ray. The 2026-08-18 note here misdescribed this as an RTX-lidar
+  self-hit; there is no RTX lidar in this path, and the ring was the
+  occupancy raycast's minimum-range floor being returned when every ray
+  starts inside an occupied cell. An occupied ray origin now publishes an
+  empty cloud instead. Unit-proven only, no live run has targeted this
+  path: `tests/test_ros_gateway.py`
+  (`RosDevelopmentLidarTest.test_development_lidar_empty_when_origin_occupied`);
+- wheel-velocity commands are slew-limited to 60 rad/s² (≈3.1 m/s² linear
+  at the 0.0525 m wheel radius), set deliberately ABOVE Nav2's `acc_lim`
+  (~2.5 m/s²) so planner-shaped velocity profiles pass through unchanged —
+  the bound exists to floor non-planner commanders and stale-target
+  transients, not to shape Nav2 output. Live-proven: after a 30 s in-place
+  rotation, an idle base commanded to coast drifted only 8.0e-05 m in XY
+  over the following 30 s, far inside the 0.1 m bound —
+  `reports/arena-fixes-2026-08-19/coast.json`;
+- sustained in-place skid-steer rotation accumulates wheel-odometry yaw
+  slip (a base-odometry characteristic, not a map defect — see the AMCL
+  validation note above). This is a dead end for IMU fusion: the sim IMU
+  publishes only world-frame angular velocity, marks
+  `orientation_covariance[0] = -1.0` (REP-145 "orientation not provided"),
+  and never populates linear acceleration, so fusing it into an EKF would
+  only duplicate odom's own vyaw rather than correct it.
+
+Found on 2026-08-20, while the live evidence wave was closing out the
+fixes above:
+
+1. **Scenario-spawned objects may not be physics-simulated.** Isaac logs
+   `Physics tensor entity not valid for rigid body /World/Scenario/<id>`
+   and the object was observed holding its exact spawn pose with
+   fabricated zero velocities. This is SUSPECTED, not confirmed: it was
+   seen through a run whose profile could not report objects at all
+   (fixed since, commit `02d1785`), so it may prove to be an artifact of
+   that. This supersedes the 2026-08-19 claim above that the "object
+   rests on furniture" item was closed — that evidence came from
+   `/get_entity_state`, not physics truth. Evidence:
+   `reports/arena-fixes-2026-08-19/object-on-table.json`.
+2. **`ROS_DOMAIN_ID` trap.** `.deployment.env` sets `ROS_DOMAIN_ID=25` and
+   `scripts/launch-humble` defaults to `${ROS_DOMAIN_ID:-25}`, so sourcing
+   `.deployment.env` silently overrides the 42 that live arena runs use.
+   Export 42 AFTER sourcing, in every shell, including the one that runs
+   `launch-humble`. `.deployment.env` must still be sourced — it carries
+   the Isaac EULA acceptance variable.
+3. **`scenario_runner` needs `PYTHONPATH` under a bare `ros2 run`.** It
+   imports `tinker_sim_core` at module level (`scenario_runner.py:22`),
+   so CLI invocations need `PYTHONPATH=$PWD/simulation:$PYTHONPATH`.
+   `actor_path_driver` does NOT need this — it resolves
+   `tinker_sim_core` from `--root` as of commit `bd4b553`.
+
+Status: development-validated only, **not release-qualified**.

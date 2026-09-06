@@ -17,11 +17,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 # The Task 10 integrated-qualification CLI section is documented verbatim in
-# exactly these three tracked files.
+# exactly these three tracked files. The README links to
+# docs/integrated-ompl-qualification.md rather than inlining this content, so
+# that file is the tracked copy in place of README.md.
 DOC_PATHS = {
     "acceptance": ROOT / "docs" / "acceptance.md",
     "manipulation": ROOT / "integration" / "MANIPULATION.md",
-    "readme": ROOT / "README.md",
+    "integrated_ompl_qualification": ROOT / "docs" / "integrated-ompl-qualification.md",
 }
 
 DOC_NAMES = tuple(DOC_PATHS)

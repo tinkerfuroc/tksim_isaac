@@ -262,6 +262,6 @@ user `tinker`. If you must relocate:
 - Portable deployment inputs + source-lock schema: README
   `### Portable deployment inputs`
 - Humble boundary + DDS profiles: README `## ROS 2 Humble boundary`
-- OMPL overlay build: README `## Integrated OMPL qualification CLI`
+- OMPL overlay build: `docs/integrated-ompl-qualification.md`
   (bounded build: `MAKEFLAGS='-j2 -l2' ./scripts/build-humble-overlay`)
 - Environment facts: `deployment.json`, `pyproject.toml`, `.deployment.env`

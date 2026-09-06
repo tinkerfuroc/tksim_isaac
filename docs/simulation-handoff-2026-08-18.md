@@ -45,7 +45,7 @@ reads until that workspace is restored.
 The arena-findings plan (Tasks 1-14) closed out its code and docs, but the
 live evidence wave it depended on did not pass. What it proved live,
 what it disproved, and what remains open — full detail and evidence paths
-are in the README changelog's 2026-08-21 entry:
+are in `docs/CHANGELOG.md`'s 2026-08-21 entry:
 
 **Proved live** (`reports/arena-fixes-2026-08-19/`): the head pan/tilt
 effort-cap fix converges within tolerance
