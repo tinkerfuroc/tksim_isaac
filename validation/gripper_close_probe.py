@@ -62,6 +62,7 @@ parser.add_argument("--mirror-mode", default="target",
 parser.add_argument("--max-lead", type=float, default=None, help="override backend._gripper_max_lead (0 disables the stall-gated lead clamp)")
 parser.add_argument("--stall-speed", type=float, default=None, help="override backend._gripper_stall_speed")
 parser.add_argument("--drive-effort-limit", type=float, default=None, help="raise the drive_joint effort ceiling (Nm) to sweep the clamp force; URDF default 50. The bench close is capped at this ceiling, so this is the only way to press past 50 Nm")
+parser.add_argument("--follower-effort-limit", type=float, default=None, help="cap the effort ceiling (Nm) of the five gripper mimic/follower joints; backend default 180 (ImplicitActuatorCfg effort_limit_sim for gripper_mimic). #20: the follower cap (180) out-pushing the drive cap (50/--drive-effort-limit) is a suspect for the post-clamp ratchet, so this lets a trial pin the followers at or below the drive ceiling")
 parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
 parser.add_argument("--object-usda", default="")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
@@ -339,6 +340,25 @@ def set_follower_gains(damping: float | None, stiffness: float | None,
     return gains_snapshot()
 
 
+def apply_follower_effort_limit(emit_event: bool = False) -> None:
+    """Cap the five follower joints' effort ceiling at --follower-effort-limit.
+
+    Reuses the Isaac Lab writer already used for the drive joint (backend
+    _set_gripper_effort_limit / _write_safety_effort_limit): PhysX
+    write_joint_effort_limit_to_sim_index(limits=..., joint_ids=..., env_ids=...).
+    A no-op unless --follower-effort-limit was passed.
+    """
+    if args.follower_effort_limit is None:
+        return
+    _write_gain("limits", "write_joint_effort_limit_to_sim_index", args.follower_effort_limit, mimic_ids)
+    if emit_event:
+        print(json.dumps({
+            "event": "follower_effort_limit_set",
+            "requested": args.follower_effort_limit,
+            "indices": mimic_ids,
+        }), flush=True)
+
+
 def parse_configs(text: str) -> list[dict[str, float]]:
     """slew:damping:stiffness[:drive_stiffness:drive_damping]"""
     configs = []
@@ -369,6 +389,13 @@ if args.drive_effort_limit is not None:
         "requested": args.drive_effort_limit,
         "gripper_effort_limit": backend.gripper_effort_limit,
     }), flush=True)
+
+if args.follower_effort_limit is not None:
+    # #20: cap the follower (mimic) joints' effort ceiling -- backend default
+    # 180 Nm, vs the drive_joint's 50 (--drive-effort-limit). Same writer as
+    # the drive joint (write_joint_effort_limit_to_sim_index), applied across
+    # the five follower indices instead of just drive_joint.
+    apply_follower_effort_limit(emit_event=True)
 
 if args.mirror_mode == "central":
     set_follower_gains(55.0, 1500.0, drive_stiffness=1500.0, drive_damping=55.0)
@@ -654,6 +681,7 @@ def descend(duration_s: float) -> dict[str, object]:
 # ----------------------------------------------------------------- Phase A
 def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, object]:
     backend._gripper_close_slew = cfg["slew"]
+    apply_follower_effort_limit()  # re-pin before the per-config gains write, so phase-B configs cannot clobber it
     gains = set_follower_gains(cfg["damping"], cfg["stiffness"], cfg.get("drive_stiffness"), cfg.get("drive_damping"))
     if _render["on"]:
         _render["next_drive"] = -1.0  # capture from the first step of this close
@@ -732,7 +760,7 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         video_tick()
     tail = int(0.5 / DT)
     metrics: dict[str, object] = {
-        "tag": tag, "config": cfg, "gains_after_write": {k: gains.get(k) for k in ("joint_damping", "joint_stiffness")},
+        "tag": tag, "config": cfg, "gains_after_write": {k: gains.get(k) for k in ("joint_damping", "joint_stiffness", "joint_effort_limits")},
         "t_reach": t_reach, "stall_t": stall_t,
         "peak_pad_force": peak_force, "peak_pad_force_t": peak_force_t,
         "first_contact_t": first_contact_t, "first_contact_force": first_contact_force, "contact_next_force": contact_next_force,
