@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import json
 import math
 import os
@@ -941,6 +942,110 @@ class IsaacWholeRobotBackend:
                 self._gripper_contact_halt_force = max(0.0, float(_halt))
         except (TypeError, ValueError):
             pass
+        # --- Gripper stall-freeze (#20 parity model; docs/developer-log.md
+        #     2026-09-06). The bounded-lead clamp above stops the drive from
+        #     racing to its unreachable close target, but it is a quasi-static
+        #     approximation: while the pads are still slowly creeping around a
+        #     curved object's contact patch, the target keeps dragging the
+        #     whole six-joint mimic linkage forward, walking the pinch
+        #     circumferentially off the object until the grasp slips on lift
+        #     (freeze2/freeze3-result.md, task20-decay-probe-findings.md).
+        #     Every material/friction/gain lever was falsified as the cause
+        #     (h3-result.md); the mechanism is the COMMAND still advancing.
+        #     The real xArm gripper's motor pushes toward its target until its
+        #     own current/force limit stalls it, then HOLDS -- it does not
+        #     keep commanding motion past that limit. This state machine
+        #     restores that parity in the drive/mimic path:
+        #       CLOSING -> _ramp_drive_target + _mirror_gripper_mimic_targets
+        #         run exactly as before (#19 measured-angle mimic).
+        #       PLATEAU -> detected once the pad-force sum (contact_state()'s
+        #         left_finger + right_finger, i.e. _gripper_grip_force(), the
+        #         SAME quantity the facade reads) is sustained above
+        #         TINKER_SIM_GRIPPER_STALL_CONTACT_N for
+        #         TINKER_SIM_GRIPPER_STALL_DWELL_S seconds of sim time AND the
+        #         measured drive angle has advanced less than
+        #         TINKER_SIM_GRIPPER_STALL_EPS rad over that same trailing
+        #         window, while the commanded target is still ahead of the
+        #         measured angle (i.e. the ramp is still trying to close
+        #         further but the object is what is stopping it).
+        #       PRESS -> the six targets (drive_joint + the five mimic
+        #         followers) freeze at their OWN measured angles, then are
+        #         advanced together by TINKER_SIM_GRIPPER_PRESS_STEP rad per
+        #         control tick while the pad-force sum stays below
+        #         TINKER_SIM_GRIPPER_HOLD_FORCE_N, up to a total extra travel
+        #         of TINKER_SIM_GRIPPER_PRESS_CAP rad. This is a bounded
+        #         closed-loop nudge, not a one-shot static lead: freeze3-
+        #         result.md #4 found a static lead relaxes to near-zero force
+        #         as the compliant multi-link mimic linkage settles onto it
+        #         (k1500 followers converge to within 1e-4 rad of the frozen
+        #         target), so it must keep nudging while under the target
+        #         force the way the real motor's current limit would.
+        #       HOLD -> targets frozen; the ramp and mirror do not run. This
+        #         is what command_target_state() echoes to the facade while
+        #         holding (it reads _position_targets directly).
+        #       RELEASE -> any new drive_joint command (an opening command, or
+        #         another close) while in PLATEAU/PRESS/HOLD exits back to
+        #         CLOSING immediately (no dwell), so a fresh close or an open
+        #         is never blocked by a stale freeze.
+        #     Gate: TINKER_SIM_GRIPPER_STALL_FREEZE (default "1"); "0"
+        #     reproduces pre-#20 behaviour exactly -- step() calls
+        #     _ramp_drive_target + _mirror_gripper_mimic_targets
+        #     unconditionally, no state machine, no logging.
+        self._gripper_stall_freeze_enabled = _os.environ.get(
+            "TINKER_SIM_GRIPPER_STALL_FREEZE", "1"
+        ).strip() not in ("0", "false", "False", "")
+        self._gripper_stall_contact_n = 5.0
+        try:
+            _v = _os.environ.get("TINKER_SIM_GRIPPER_STALL_CONTACT_N")
+            if _v is not None and _v.strip():
+                self._gripper_stall_contact_n = max(0.0, float(_v))
+        except (TypeError, ValueError):
+            pass
+        self._gripper_stall_dwell_s = 0.3
+        try:
+            _v = _os.environ.get("TINKER_SIM_GRIPPER_STALL_DWELL_S")
+            if _v is not None and _v.strip():
+                self._gripper_stall_dwell_s = max(0.0, float(_v))
+        except (TypeError, ValueError):
+            pass
+        self._gripper_stall_eps = 0.012
+        try:
+            _v = _os.environ.get("TINKER_SIM_GRIPPER_STALL_EPS")
+            if _v is not None and _v.strip():
+                self._gripper_stall_eps = max(0.0, float(_v))
+        except (TypeError, ValueError):
+            pass
+        self._gripper_press_step = 0.002
+        try:
+            _v = _os.environ.get("TINKER_SIM_GRIPPER_PRESS_STEP")
+            if _v is not None and _v.strip():
+                self._gripper_press_step = max(0.0, float(_v))
+        except (TypeError, ValueError):
+            pass
+        self._gripper_hold_force_n = 25.0
+        try:
+            _v = _os.environ.get("TINKER_SIM_GRIPPER_HOLD_FORCE_N")
+            if _v is not None and _v.strip():
+                self._gripper_hold_force_n = max(0.0, float(_v))
+        except (TypeError, ValueError):
+            pass
+        self._gripper_press_cap = 0.06
+        try:
+            _v = _os.environ.get("TINKER_SIM_GRIPPER_PRESS_CAP")
+            if _v is not None and _v.strip():
+                self._gripper_press_cap = max(0.0, float(_v))
+        except (TypeError, ValueError):
+            pass
+        # State machine bookkeeping. Re-armed on every RELEASE (see
+        # _gripper_stall_freeze_step) so a new close always starts CLOSING.
+        self._gsf_state = "closing"
+        self._gsf_contact_run = 0
+        self._gsf_drive_hist: "collections.deque[float]" = collections.deque(
+            maxlen=max(1, int(round(self._gripper_stall_dwell_s / max(self.dt, 1e-9))))
+        )
+        self._gsf_baseline: dict[int, float] = {}
+        self._gsf_travel = 0.0
+        self._gsf_last_command: float | None = None
         articulation_props = None
         if solver_position is not None or solver_velocity is not None:
             articulation_props = sim_utils.ArticulationRootPropertiesCfg(
@@ -2673,6 +2778,169 @@ class IsaacWholeRobotBackend:
         for index in mimic_indices:
             self._position_targets[0, index] = follower_target
 
+    def _gripper_stall_freeze_gate(self) -> None:
+        """Dispatch each control tick to either the plain ramp+mirror path or
+        the #20 stall-freeze state machine (see __init__ for the full model).
+
+        Called from step() in place of the unconditional
+        ``_ramp_drive_target() ... _mirror_gripper_mimic_targets()`` pair.
+        With the feature off, or before articulation setup has populated
+        ``_drive_joint_index`` (bare test doubles), this calls exactly that
+        pair and returns -- the env-off byte-identical requirement holds
+        trivially because the state machine below is never reached.
+        """
+        drive_index = getattr(self, "_drive_joint_index", None)
+        if drive_index is None or not getattr(self, "_gripper_stall_freeze_enabled", True):
+            self._ramp_drive_target()
+            self._mirror_gripper_mimic_targets()
+            return
+        command = getattr(self, "_drive_command_target", None)
+        state = getattr(self, "_gsf_state", "closing")
+        if state != "closing" and command is not None and command != getattr(self, "_gsf_last_command", None):
+            # RELEASE: any new drive_joint command (an opening command, or
+            # another close) while PRESS/HOLD exits back to CLOSING
+            # immediately -- no dwell -- so a fresh close or an open is never
+            # blocked by a stale freeze.
+            self._gripper_stall_freeze_release()
+            state = "closing"
+        self._gsf_last_command = command
+        if state == "press":
+            self._gripper_stall_freeze_press_tick()
+            return
+        if state == "hold":
+            # Targets are frozen; nothing writes them while held.
+            return
+        # CLOSING (default): unchanged #19 ramp + measured-angle mimic, plus
+        # the plateau detector that can arm PRESS below.
+        self._ramp_drive_target()
+        self._mirror_gripper_mimic_targets()
+        self._gripper_stall_freeze_check_plateau()
+
+    def _gripper_stall_freeze_check_plateau(self) -> None:
+        """CLOSING-state plateau detector.
+
+        Appends this tick's measured drive angle to a trailing
+        TINKER_SIM_GRIPPER_STALL_DWELL_S window and tracks how many
+        consecutive ticks the pad-force sum (_gripper_grip_force(), the same
+        quantity the facade reads) has stayed above
+        TINKER_SIM_GRIPPER_STALL_CONTACT_N. Once that window is full, the
+        force has been sustained for its whole length, the drive angle
+        advanced less than TINKER_SIM_GRIPPER_STALL_EPS rad end-to-end across
+        it, AND the commanded target is still ahead of the measured angle
+        (the ramp is still trying to close further but the object is what is
+        stopping it), transitions CLOSING -> PRESS.
+        """
+        drive_index = self._drive_joint_index
+        command = getattr(self, "_drive_command_target", None)
+        if command is None:
+            return
+        try:
+            measured_drive = float(self._torch_value(self._robot.data.joint_pos)[0, drive_index])
+        except (IndexError, TypeError, ValueError, AttributeError):
+            return
+        force = self._gripper_grip_force()
+        hist = self._gsf_drive_hist
+        hist.append(measured_drive)
+        if force > self._gripper_stall_contact_n:
+            self._gsf_contact_run += 1
+        else:
+            self._gsf_contact_run = 0
+        window = hist.maxlen or 1
+        plateau = (
+            self._gsf_contact_run >= window
+            and len(hist) == window
+            and abs(hist[-1] - hist[0]) < self._gripper_stall_eps
+            and command > measured_drive
+        )
+        if not plateau:
+            return
+        self._gripper_stall_freeze_log("plateau", drive=measured_drive, pad_force_n=force, travel=0.0)
+        # PRESS baseline: the six targets freeze at their OWN measured angles
+        # (drive_joint + the five mimic followers), not the stale commanded
+        # target -- a blocked follower's measured angle is what the linkage
+        # actually reached, exactly like the CLOSING mirror above.
+        indices = (drive_index,) + tuple(getattr(self, "_gripper_mimic_indices", ()))
+        joint_pos = self._torch_value(self._robot.data.joint_pos)
+        baseline: dict[int, float] = {}
+        for idx in indices:
+            try:
+                value = float(joint_pos[0, idx])
+            except (IndexError, TypeError, ValueError):
+                value = measured_drive
+            baseline[idx] = value
+            self._position_targets[0, idx] = value
+        self._gsf_baseline = baseline
+        self._gsf_travel = 0.0
+        self._gsf_state = "press"
+        self._gripper_stall_freeze_log("press", drive=measured_drive, pad_force_n=force, travel=0.0)
+
+    def _gripper_stall_freeze_press_tick(self) -> None:
+        """PRESS-state per-tick advance.
+
+        Nudges the six frozen targets together by
+        TINKER_SIM_GRIPPER_PRESS_STEP rad while the pad-force sum stays below
+        TINKER_SIM_GRIPPER_HOLD_FORCE_N, up to a total extra travel of
+        TINKER_SIM_GRIPPER_PRESS_CAP rad -- a bounded closed-loop nudge (not
+        a one-shot static lead, which freeze3-result.md #4 found relaxes to
+        near-zero force as the compliant mimic linkage settles onto it).
+        Transitions PRESS -> HOLD once either bound is reached.
+        """
+        force = self._gripper_grip_force()
+        cap = self._gripper_press_cap
+        if force < self._gripper_hold_force_n and self._gsf_travel < cap:
+            self._gsf_travel = min(cap, self._gsf_travel + self._gripper_press_step)
+            for idx, base in self._gsf_baseline.items():
+                self._position_targets[0, idx] = base + self._gsf_travel
+            return
+        self._gsf_state = "hold"
+        drive_index = getattr(self, "_drive_joint_index", None)
+        drive_value = self._gsf_baseline.get(drive_index) if drive_index is not None else None
+        if drive_value is not None:
+            drive_value = drive_value + self._gsf_travel
+        self._gripper_stall_freeze_log("hold", drive=drive_value, pad_force_n=force, travel=self._gsf_travel)
+
+    def _gripper_stall_freeze_release(self) -> None:
+        """Exit PRESS/HOLD back to CLOSING (see _gripper_stall_freeze_gate).
+
+        Logs the transition, then clears the plateau detector and press
+        bookkeeping so the fresh close (or open) that triggered this starts
+        CLOSING clean -- no leftover history from the freeze being released.
+        """
+        force = self._gripper_grip_force()
+        drive_index = getattr(self, "_drive_joint_index", None)
+        try:
+            drive_value = float(self._torch_value(self._robot.data.joint_pos)[0, drive_index])
+        except (IndexError, TypeError, ValueError, AttributeError):
+            drive_value = None
+        self._gripper_stall_freeze_log("release", drive=drive_value, pad_force_n=force, travel=self._gsf_travel)
+        self._gsf_state = "closing"
+        self._gsf_baseline = {}
+        self._gsf_travel = 0.0
+        self._gsf_contact_run = 0
+        self._gsf_drive_hist.clear()
+
+    def _gripper_stall_freeze_log(
+        self, state: str, *, drive: float | None, pad_force_n: float, travel: float
+    ) -> None:
+        try:
+            t = round(self.simulation_time, 4)
+        except Exception:
+            t = None
+        print(
+            json.dumps(
+                {
+                    "event": "gripper_stall_freeze",
+                    "state": state,
+                    "t": t,
+                    "drive": drive,
+                    "pad_force_n": pad_force_n,
+                    "travel": travel,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     def step(self) -> None:
         if self.step_profile["enabled"]:
             self.step_profile["_mark"] = self.step_profile["_clock"]()
@@ -2696,10 +2964,15 @@ class IsaacWholeRobotBackend:
             self._apply_safety_actuator_hold()
         else:
             self._slew_wheel_targets()
-            self._ramp_drive_target()
+            self._gripper_stall_freeze_gate()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
-        self._mirror_gripper_mimic_targets()
+        if self._safety_stopped:
+            # Safety stop bypasses the ramp/state-machine entirely (above);
+            # the mimic mirror still runs so the followers track whatever
+            # measured drive angle the latched snapshot holds, unchanged from
+            # before this feature existed.
+            self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
         # persist until changed and this backend uses implicit (stateless)

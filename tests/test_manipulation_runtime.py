@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import collections
 import contextlib
 import io
 import json
@@ -197,6 +198,48 @@ def _backend() -> IsaacWholeRobotBackend:
     backend.chassis_ballast_mass_kg = 0.0
     backend._object_views = {}
     backend._refresh_object_views = lambda: None
+    return backend
+
+
+def _gsf_backend(control_hz: float = 120.0) -> IsaacWholeRobotBackend:
+    """A gripper backend double sized for the #20 stall-freeze state machine:
+    6 joints (drive_joint + 5 mimic followers), independently settable
+    measured joint_pos/joint_vel, and every TINKER_SIM_GRIPPER_* knob at its
+    documented default. Tests drive the state machine directly via
+    _gripper_stall_freeze_gate() (and, for isolated PRESS/HOLD checks, by
+    seeding _gsf_state/_gsf_baseline/_gsf_travel and calling it again), the
+    same monkeypatch-the-ramp-and-mirror approach validation/
+    gripper_close_probe.py uses to hold the rest of the pipeline still while
+    exercising one piece of it.
+    """
+    backend = _backend()
+    n = 6
+    backend.dt = 1.0 / control_hz
+    backend.physics_dt = 1.0 / control_hz
+    backend._drive_joint_index = 0
+    backend._gripper_mimic_indices = (1, 2, 3, 4, 5)
+    backend._gripper_finger_indices = (1, 3)
+    backend._robot.data.joint_pos = torch.zeros((1, n), dtype=torch.float32)
+    backend._robot.data.joint_vel = torch.zeros((1, n), dtype=torch.float32)
+    backend._position_targets = torch.zeros((1, n), dtype=torch.float32)
+    backend._velocity_targets = torch.zeros((1, n), dtype=torch.float32)
+    backend._effort_targets = torch.zeros((1, n), dtype=torch.float32)
+    backend._drive_command_target = 0.85
+    backend._gripper_stall_freeze_enabled = True
+    backend._gripper_stall_contact_n = 5.0
+    backend._gripper_stall_dwell_s = 0.3
+    backend._gripper_stall_eps = 0.012
+    backend._gripper_press_step = 0.002
+    backend._gripper_hold_force_n = 25.0
+    backend._gripper_press_cap = 0.06
+    backend._gsf_state = "closing"
+    backend._gsf_contact_run = 0
+    window = max(1, int(round(backend._gripper_stall_dwell_s / backend.dt)))
+    backend._gsf_drive_hist = collections.deque(maxlen=window)
+    backend._gsf_baseline = {}
+    backend._gsf_travel = 0.0
+    backend._gsf_last_command = None
+    backend._gripper_grip_force = lambda: 0.0
     return backend
 
 
@@ -2566,6 +2609,168 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertRegex(backend_source, r"self\._gripper_max_lead = 0\.0\s*\n")
         self.assertNotRegex(backend_source, r"self\._gripper_max_lead = 0\.015")
         self.assertIn("TINKER_SIM_GRIPPER_MAX_LEAD_RAD", backend_source)
+
+    # -- #20 gripper stall-freeze state machine -----------------------------
+    # Parity model (docs/developer-log.md 2026-09-06, task20-decay-probe-
+    # findings.md, freeze2/freeze3-result.md): the object's post-clamp creep
+    # is the close command still advancing toward an unreachable target;
+    # freezing all six gripper targets on the clamp plateau arrests it, and a
+    # bounded closed-loop press toward a force floor (rather than a one-shot
+    # static lead, which relaxes to near-zero force as the compliant mimic
+    # linkage settles onto it) restores real pad force before holding.
+
+    def test_gripper_stall_freeze_disabled_calls_ramp_and_mirror_only(self) -> None:
+        """TINKER_SIM_GRIPPER_STALL_FREEZE=0 must be byte-identical to
+        pre-#20 behaviour: step() calls the ramp and mirror unconditionally,
+        the plateau detector never runs, and the state machine never leaves
+        CLOSING."""
+        backend = _gsf_backend()
+        backend._gripper_stall_freeze_enabled = False
+        calls: list[str] = []
+        backend._ramp_drive_target = lambda: calls.append("ramp")
+        backend._mirror_gripper_mimic_targets = lambda: calls.append("mirror")
+        backend._gripper_stall_freeze_check_plateau = lambda: calls.append("plateau")
+        backend._gripper_stall_freeze_gate()
+        self.assertEqual(calls, ["ramp", "mirror"])
+        self.assertEqual(backend._gsf_state, "closing")
+
+    def test_gripper_stall_freeze_plateau_needs_dwell_eps_and_contact(self) -> None:
+        """The plateau trigger requires ALL THREE of: pad-force sum sustained
+        above the contact threshold, measured drive angle advanced less than
+        eps, and both true over the SAME trailing dwell window -- not either
+        alone."""
+        backend = _gsf_backend()
+        backend._ramp_drive_target = lambda: None
+        backend._mirror_gripper_mimic_targets = lambda: None
+        window = backend._gsf_drive_hist.maxlen
+        assert window is not None
+
+        # 1) Sustained low force (below TINKER_SIM_GRIPPER_STALL_CONTACT_N)
+        #    with a flat drive never plateaus -- there is no real clamp yet.
+        backend._gripper_grip_force = lambda: 1.0
+        for _ in range(window + 5):
+            backend._gripper_stall_freeze_gate()
+        self.assertEqual(backend._gsf_state, "closing")
+
+        # 2) Sustained contact force but the drive is still creeping faster
+        #    than eps per window -- no genuine plateau yet either.
+        backend._gripper_grip_force = lambda: 12.0
+        backend._gsf_contact_run = 0
+        backend._gsf_drive_hist.clear()
+        for i in range(window + 5):
+            backend._robot.data.joint_pos[0, 0] = 0.01 * i
+            backend._gripper_stall_freeze_gate()
+        self.assertEqual(backend._gsf_state, "closing")
+
+        # 3) Sustained contact force AND a flat drive over one full dwell
+        #    window -> plateaus into PRESS.
+        backend._gsf_contact_run = 0
+        backend._gsf_drive_hist.clear()
+        for _ in range(window):
+            backend._gripper_stall_freeze_gate()
+        self.assertEqual(backend._gsf_state, "press")
+
+    def test_gripper_stall_freeze_press_advances_to_hold_force(self) -> None:
+        """PRESS nudges all six frozen targets together by the press step
+        while pad force stays below the hold-force floor, and stops (HOLD)
+        the moment the (mocked) force reaches it."""
+        backend = _gsf_backend()
+        backend._ramp_drive_target = lambda: None
+        backend._mirror_gripper_mimic_targets = lambda: None
+        backend._gsf_state = "press"
+        backend._gsf_last_command = backend._drive_command_target  # already in sync (no spurious release)
+        backend._gsf_baseline = {i: 0.25 for i in range(6)}
+        backend._gsf_travel = 0.0
+        force = {"n": 0.0}
+        backend._gripper_grip_force = lambda: force["n"]
+
+        ticks = 0
+        while backend._gsf_state == "press" and ticks < 100:
+            force["n"] += 5.0
+            backend._gripper_stall_freeze_gate()
+            ticks += 1
+
+        self.assertEqual(backend._gsf_state, "hold")
+        travel = backend._gsf_travel
+        self.assertGreater(travel, 0.0)
+        self.assertLessEqual(travel, backend._gripper_press_cap)
+        for idx in range(6):
+            self.assertAlmostEqual(float(backend._position_targets[0, idx]), 0.25 + travel, places=6)
+
+    def test_gripper_stall_freeze_press_cap_stops_travel(self) -> None:
+        """With pad force pinned well below the hold-force floor, PRESS must
+        still stop -- at TINKER_SIM_GRIPPER_PRESS_CAP total extra travel --
+        rather than nudging forever."""
+        backend = _gsf_backend()
+        backend._ramp_drive_target = lambda: None
+        backend._mirror_gripper_mimic_targets = lambda: None
+        backend._gsf_state = "press"
+        backend._gsf_last_command = backend._drive_command_target  # already in sync (no spurious release)
+        backend._gsf_baseline = {i: 0.25 for i in range(6)}
+        backend._gsf_travel = 0.0
+        backend._gripper_grip_force = lambda: 2.0
+
+        ticks = 0
+        while backend._gsf_state == "press" and ticks < 1000:
+            backend._gripper_stall_freeze_gate()
+            ticks += 1
+
+        self.assertEqual(backend._gsf_state, "hold")
+        self.assertAlmostEqual(backend._gsf_travel, backend._gripper_press_cap, places=6)
+        for idx in range(6):
+            self.assertAlmostEqual(
+                float(backend._position_targets[0, idx]), 0.25 + backend._gripper_press_cap, places=6
+            )
+
+    def test_gripper_stall_freeze_release_on_new_command(self) -> None:
+        """An opening command (a new drive target below the held angle) must
+        exit HOLD back to CLOSING immediately -- no dwell -- and clear the
+        press/plateau bookkeeping so the next close starts clean. Repeating
+        the SAME held command must NOT release."""
+        backend = _gsf_backend()
+        backend._ramp_drive_target = lambda: None
+        backend._mirror_gripper_mimic_targets = lambda: None
+        backend._gsf_state = "hold"
+        backend._gsf_baseline = {i: 0.25 for i in range(6)}
+        backend._gsf_travel = 0.01
+        backend._gsf_last_command = 0.85
+        backend._drive_command_target = 0.85
+        backend._gripper_grip_force = lambda: 20.0
+        for idx in range(6):
+            backend._position_targets[0, idx] = 0.26
+        backend._robot.data.joint_pos[0, 0] = 0.26
+
+        # Same commanded target repeated -> stays held.
+        backend._gripper_stall_freeze_gate()
+        self.assertEqual(backend._gsf_state, "hold")
+
+        # A new, lower (opening) command -> release back to CLOSING.
+        backend._drive_command_target = 0.0
+        backend._gripper_stall_freeze_gate()
+        self.assertEqual(backend._gsf_state, "closing")
+        self.assertEqual(backend._gsf_travel, 0.0)
+        self.assertEqual(backend._gsf_baseline, {})
+
+    def test_gripper_stall_freeze_hold_echoes_frozen_targets(self) -> None:
+        """While HOLD is active, command_target_state() (what the facade
+        reads back as the applied joint targets) must echo the frozen/pressed
+        values, not the original close command."""
+        backend = _gsf_backend()
+        backend.joint_names = tuple(f"joint{i}" for i in range(6))
+        backend._gsf_state = "hold"
+        backend._gsf_last_command = backend._drive_command_target  # already in sync (no spurious release)
+        backend._gsf_baseline = {i: 0.3 for i in range(6)}
+        backend._gsf_travel = 0.01
+        for idx in range(6):
+            backend._position_targets[0, idx] = 0.31
+        # HOLD writes nothing further; the gate must be a no-op here.
+        backend._gripper_stall_freeze_gate()
+        state = backend.command_target_state()
+        for value in state["joint_positions"]:
+            self.assertAlmostEqual(float(value), 0.31, places=6)
+        # The original close command (0.85, from _gsf_backend) is nowhere in
+        # the echoed targets -- they reflect only the frozen press.
+        self.assertNotIn(0.85, [round(float(v), 2) for v in state["joint_positions"]])
 
     def test_set_entity_pose_physics_writes_transform_and_velocity(self) -> None:
         """A physics-effective park write pushes the world pose + zeroed twist

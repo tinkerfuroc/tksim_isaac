@@ -4,6 +4,136 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #20: gripper stall-freeze with force-floor press (post-clamp creep / retention)
+
+**Mechanism.** #20's grasp-force investigation (`task20-decay-probe-findings.md`,
+`task20-lever-findings.md`) chased followers' stiffness/damping, drive-effort
+caps, contact-friction material, PhysX friction-anchor type (patch vs
+two-directional), and convex-hull-vs-SDF contact generation as candidate
+causes of a slow post-clamp creep that rolls or squeezes an object out of
+the jaw before lift. Every one of those levers was falsified with an H3
+probe chain (`$TMP/h3-result.md`): friction type and contact-generation
+changes left the trajectory identical or worse. The actual mechanism is the
+close COMMAND: `_ramp_drive_target`'s bounded-lead clamp stops the drive
+from racing to its unreachable fully-closed target only quasi-statically --
+while the pads are still slowly creeping around a curved object's contact
+patch, the unreachable target keeps dragging the whole six-joint mimic
+linkage (drive_joint + the five `_gripper_mimic_indices` followers) forward,
+walking the pinch circumferentially off the object over several seconds
+until the grasp slips on lift. A contact-triggered freeze (`freeze2-
+result.md`: all six targets frozen the instant pad force exceeds 5N) fully
+arrested the creep (drive flat, tilt <1 deg for 15s, world separation
+pinned) -- confirming the command-advance hypothesis (H-CMD) -- but fired
+too early, before real squeeze built, and clamp force decayed to ~0N by 2s:
+retained tilt/geometry, but the bottle was left on the table on lift.
+
+**Freeze evidence.** A plateau-gated retry (`freeze3-result.md`: freeze on
+sustained contact force AND negligible drive-angle progress over a trailing
+0.3s window, not first light contact) fired later, in real contact, and all
+three parameter legs tried (progress eps 0.005/0.012, lead 0.02/0.04) held
+flat and were RETAINED ON LIFT (tilt 0.5-6 deg, dz 0.3-3.8mm) -- the first
+retained lift of the whole investigation. But a one-shot static lead offset
+relaxed to a near-zero (0-3N) sustained force in every leg: the k=1500
+position-PD followers converge to within 1e-4 rad of the frozen target
+(the compliant multi-link mimic linkage absorbs essentially all of the
+commanded lead), so retention there was geometric (the creep stopped, so
+the object simply wasn't pushed off), not force-held. freeze3-result.md #4's
+proposed fix -- a bounded closed-loop nudge that keeps advancing the frozen
+target in small steps while force stays below a floor, instead of one
+static offset -- is what's implemented below.
+
+**Parity model.** The real xArm gripper's motor pushes toward its
+commanded target until its own current/force limit stalls it, then HOLDS --
+it does not keep commanding motion past that limit the way an open-loop sim
+ramp does. `simulation/tinker_sim_isaac/backend.py` now implements that
+hold-at-stall behaviour as a small state machine wrapping the drive
+ramp/mimic path (new `_gripper_stall_freeze_gate`, called from `step()` in
+place of the previous unconditional `_ramp_drive_target()` +
+`_mirror_gripper_mimic_targets()` pair; both env-config and the state fields
+are initialized once in `__init__` next to the existing gripper-close-shaping
+block):
+
+- **CLOSING** (default): unchanged -- `_ramp_drive_target` slews/clamps the
+  drive target and `_mirror_gripper_mimic_targets` mirrors the MEASURED
+  drive angle into the five followers (#19 semantics, untouched). A new
+  `_gripper_stall_freeze_check_plateau` runs alongside it each tick,
+  appending the measured drive angle to a trailing
+  `TINKER_SIM_GRIPPER_STALL_DWELL_S`-second deque and counting consecutive
+  ticks where the pad-force sum (`_gripper_grip_force()` -- the same
+  `contact_state()` left_finger + right_finger quantity the facade reads on
+  `/sim/parity/finger_contact`) exceeds `TINKER_SIM_GRIPPER_STALL_CONTACT_N`.
+- **PLATEAU -> PRESS**: once that window is full, the force has been
+  sustained for its entire length, the measured drive angle advanced less
+  than `TINKER_SIM_GRIPPER_STALL_EPS` rad end-to-end across it, AND the
+  commanded target is still ahead of the measured angle (the ramp is still
+  trying to close further but the object is what's stopping it), the six
+  targets (drive_joint + the five mimic followers) freeze at their OWN
+  measured angles (not the stale far-away command) and the state becomes
+  PRESS. A `"plateau"` transition is logged, immediately followed by a
+  `"press"` transition at the same tick.
+- **PRESS**: `_gripper_stall_freeze_press_tick` advances all six frozen
+  targets together by `TINKER_SIM_GRIPPER_PRESS_STEP` rad per control tick
+  while the pad-force sum stays below `TINKER_SIM_GRIPPER_HOLD_FORCE_N`, up
+  to `TINKER_SIM_GRIPPER_PRESS_CAP` rad of total extra travel -- the bounded
+  closed-loop nudge freeze3-result.md #4 called for, in place of a one-shot
+  static lead.
+- **HOLD**: once the force floor or the travel cap is reached, targets
+  freeze for good (a `"hold"` transition is logged); nothing in the ramp or
+  mirror writes them again. `command_target_state()` reads `_position_targets`
+  directly, so the facade's target echo is the frozen/pressed value for free
+  -- no separate echo path was needed.
+- **RELEASE**: any new `drive_joint` position command while PRESS/HOLD is
+  active -- an opening command, or another close to a different target --
+  exits back to CLOSING immediately (no dwell), logs a `"release"`
+  transition, and clears the plateau/press bookkeeping so the next close
+  starts clean. Repeating the identical held command does not release.
+
+Each transition logs one JSON line:
+`{"event": "gripper_stall_freeze", "state": "plateau|press|hold|release",
+"t": <sim_time>, "drive": ..., "pad_force_n": ..., "travel": ...}`.
+
+**Env knobs** (all optional, defaults match the accepted freeze3-result.md
+config): `TINKER_SIM_GRIPPER_STALL_FREEZE` (default `"1"`; `"0"` reproduces
+pre-#20 behaviour exactly -- `_gripper_stall_freeze_gate`'s first check calls
+`_ramp_drive_target()` + `_mirror_gripper_mimic_targets()` unconditionally
+and returns before the state machine is ever reached), `TINKER_SIM_GRIPPER_
+STALL_CONTACT_N` (5.0 N), `TINKER_SIM_GRIPPER_STALL_DWELL_S` (0.3 s sim),
+`TINKER_SIM_GRIPPER_STALL_EPS` (0.012 rad), `TINKER_SIM_GRIPPER_PRESS_STEP`
+(0.002 rad/tick), `TINKER_SIM_GRIPPER_HOLD_FORCE_N` (25.0 N),
+`TINKER_SIM_GRIPPER_PRESS_CAP` (0.06 rad total).
+
+**Tests** (`tests/test_manipulation_runtime.py`, backend-double pattern, new
+`_gsf_backend()` helper building a 6-joint drive+mimic double): six new
+cases -- flag off calls ramp+mirror only, no state machine, no plateau
+check; plateau requires dwell+eps+contact together (neither alone fires
+it); PRESS advances the step until the force mock reaches the hold floor,
+then holds; the press cap stops travel even when force never rises; an
+opening command releases HOLD back to CLOSING (and an identical repeated
+command does not); and the drive-target echo during HOLD reflects the
+frozen/pressed value, not the original close command. All six fail against
+main (`2c1b51d`) with, e.g.:
+```
+AttributeError: 'IsaacWholeRobotBackend' object has no attribute '_gripper_stall_freeze_gate'. Did you mean: '_gripper_stall_freeze_enabled'?
+```
+(confirmed by temporarily reverting only `backend.py` and rerunning `-k
+gripper_stall_freeze`, then restoring). Full suite:
+`tests/test_manipulation_runtime.py` 115 passed, 3 subtests passed, 0
+failed (109 passed pre-existing + 6 new).
+
+**Acceptance plan** (staged, not run from this worktree -- no GPU/sim
+launch here): `$TMP/stallfreeze_chain.sh` re-runs main's
+`validation/gripper_close_probe.py` bottle side-pinch close
+(`--pose side --object bottle --tcp-above-top 0.095 --record-s 15 --phase B
+--lift --mirror-mode target`, control cfg damping/stiffness/drive-stiffness
+1.5:55:1500) with the flag on vs off, plus a third leg with the flag on for
+a YCB sugar_box, to confirm on the actual probe pipeline (not just the unit
+tests) that PRESS restores real hold force (target 15-30N sustained, per
+freeze3-result.md's "next change") while keeping tilt <5 deg and the object
+retained through lift -- the two criteria the freeze3.md legs split between
+(geometric retention without sustained force). `$TMP/stallfreeze_launch.sh`
+wraps that chain with `SF_EXIT=`/`SF_CHAIN_DONE` markers for a follow-up GPU
+session to run.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported
