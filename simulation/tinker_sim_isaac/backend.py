@@ -828,8 +828,23 @@ class IsaacWholeRobotBackend:
         self.base_fixed = _os.environ.get("TINKER_SIM_FIX_BASE") == "1"
         self._base_hold_pose = None  # latched [1,7] pos+quat(xyzw) tensor
         self._base_hold_vel = None   # zeros [1,6]
+        # TINKER_SIM_SPAWN_YAW_VIA_VIEW's commanded yaw, pending composition
+        # onto whatever SETTLED position _apply_base_hold's own latch below
+        # captures (#26) -- see _apply_spawn_yaw_via_view for why this must
+        # not be folded into _base_hold_pose directly.
+        self._base_hold_seed_quat = None  # pending [1,4] quat(xyzw) tensor
         # Let the free base drop-settle onto its wheels before latching.
         self._base_hold_after_sim_s = 2.0
+        # #26 round 2: when the via-view path clears _base_hold_pose (boot,
+        # or a genuine mid-run rebind), the settle window below must be
+        # measured from THIS clear, not from process boot -- simulation_time
+        # is deliberately kept MONOTONIC across a STOP->spawn->PLAY rebind
+        # (#21, _clock_step_origin re-anchoring), so a boot-relative deadline
+        # is already satisfied by the time a mid-run reset happens and
+        # _apply_base_hold would re-latch on its very next call, at the
+        # pre-settle respawn height. 0.0 at construction keeps boot behavior
+        # (deadline measured from t=0) unchanged.
+        self._base_hold_settle_from = 0.0
         # A mid-play /spawn_entity (or delete) rebuilds the shared physics
         # view; a root write issued across that rebuild aliases onto the
         # freshly inserted body, teleporting the spawned object to the robot's
@@ -2256,19 +2271,38 @@ class IsaacWholeRobotBackend:
         )
         root_pose = torch.cat([pos, quat], dim=-1)
         self._robot.write_root_pose_to_sim_index(root_pose=root_pose)
-        # Seed the base-hold target directly, rather than relying on
-        # _apply_base_hold's own settle-latch (which only fires at
-        # self.simulation_time >= self._base_hold_after_sim_s): if
-        # TINKER_SIM_FIX_BASE is also active, this guarantees the hold uses
-        # the yawed pose from the first held step, instead of snapping back
-        # to whatever the base drifted to before the settle timer latches.
+        # Do NOT seed _base_hold_pose's POSITION here (#26): `pos` above is
+        # data.root_pos_w read immediately after self._sim.reset(), before
+        # gravity has dropped the mobile-base chassis onto its wheels/
+        # casters. Seeding _base_hold_pose directly with it used to make
+        # _apply_base_hold's `if self._base_hold_pose is None:` settle
+        # check permanently False from step 0, latching the un-settled
+        # spawn height (~0.1954) for the whole run instead of the settled
+        # rest height (~0.0775) the flag-off path produces.
+        #
+        # Instead, only remember the commanded yaw quaternion here, and let
+        # _apply_base_hold's own settle-latch capture the SETTLED position
+        # once it fires, composing it with this seeded yaw instead of the
+        # measured orientation at that time. If TINKER_SIM_FIX_BASE is also
+        # active, also clear any hold already latched from a prior rebind
+        # so that settle-latch runs again -- nothing else re-drives it
+        # while _base_hold_pose stays non-None, and a genuine rebind
+        # (STOP -> spawn -> PLAY) resets the chassis back to its unsettled
+        # spawn pose just like boot did.
         if getattr(self, "base_fixed", False):
-            zero_vel = torch.zeros(
-                (1, 6), dtype=root_pose.dtype, device=root_pose.device
-            )
-            self._base_hold_pose = root_pose.clone()
-            self._base_hold_vel = zero_vel
-            self._base_hold_scene_sig = self._scenario_child_signature()
+            self._base_hold_seed_quat = quat.clone()
+            self._base_hold_pose = None
+            self._base_hold_vel = None
+            # #26 round 2: this clear can happen at boot OR at a genuine
+            # mid-run rebind (_reapply_spawn_yaw_after_rebind runs on every
+            # STOP->spawn->PLAY cycle). Either way the chassis has just been
+            # dropped back to its unsettled spawn pose and needs a fresh
+            # settle window measured from NOW, not from process boot --
+            # simulation_time never resets (#21), so a boot-relative deadline
+            # would already be satisfied on a mid-run reset and
+            # _apply_base_hold would re-latch on its very next call at the
+            # pre-settle height.
+            self._base_hold_settle_from = self.simulation_time
 
     def _reapply_spawn_yaw_after_rebind(self) -> None:
         """Re-apply TINKER_SIM_SPAWN_YAW_VIA_VIEW's yaw after a GENUINE reset rebind.
@@ -2320,11 +2354,36 @@ class IsaacWholeRobotBackend:
         """
         data = self._robot.data
         if self._base_hold_pose is None:
-            if self.simulation_time < self._base_hold_after_sim_s:
+            seed_quat = self._base_hold_seed_quat
+            # #26 round 2: when the via-view path owns the hold (seed_quat
+            # set), the settle deadline is measured from the LAST CLEAR --
+            # boot or a genuine mid-run rebind, see _apply_spawn_yaw_via_view
+            # -- not from process boot, because simulation_time is monotonic
+            # across a rebind (#21) and a boot-relative deadline would
+            # already be satisfied by the time a mid-run reset happens.
+            # Flag-off never clears _base_hold_pose on rebind (no seed_quat),
+            # so it keeps the original boot-relative check unchanged.
+            if seed_quat is not None:
+                if (
+                    self.simulation_time - self._base_hold_settle_from
+                    < self._base_hold_after_sim_s
+                ):
+                    return
+            elif self.simulation_time < self._base_hold_after_sim_s:
                 return
+            # #26: prefer TINKER_SIM_SPAWN_YAW_VIA_VIEW's pending seeded yaw
+            # (_apply_spawn_yaw_via_view) over the measured orientation --
+            # the commanded yaw has no durable USD backing under that flag
+            # and must survive into the hold -- but always take the
+            # POSITION fresh here, now that the settle wait above has
+            # actually elapsed, not whatever root_pos_w read at spawn time.
+            quat = (
+                seed_quat.detach().clone()
+                if seed_quat is not None
+                else data.root_quat_w[:1].detach().clone()
+            )
             self._base_hold_pose = self._torch.cat(
-                [data.root_pos_w[:1].detach().clone(),
-                 data.root_quat_w[:1].detach().clone()],
+                [data.root_pos_w[:1].detach().clone(), quat],
                 dim=-1,
             )
             self._base_hold_vel = self._torch.zeros(
