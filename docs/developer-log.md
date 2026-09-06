@@ -215,6 +215,76 @@ cases). No GPU boot for this change; case 6's static 61 cm offset and case
 8's dynamic tumble both remain open root-cause items the new trace is meant
 to help localize on the next live run.
 
+**Root cause found: `InitialStateCfg.rot` is scalar-last, backend built it
+scalar-first -- the robot spawned upside down.** The `spawn_pose_trace`
+instrumentation above, followed live, found the actual bug the case
+1/2/6/8 matrix above was chasing without a mechanism. The vendored Isaac Lab
+3.0.0 `AssetBaseCfg.InitialStateCfg` (`.deps/IsaacLab/source/isaaclab/
+isaaclab/assets/asset_base_cfg.py:37-40`) documents its `rot` field as
+scalar-last `(x, y, z, w)`, defaulting to `(0.0, 0.0, 0.0, 1.0)`. `backend.py`
+built that keyword by hand as `(cos(yaw/2), 0, 0, sin(yaw/2))` -- scalar
+FIRST. For the common case, an unset/zero spawn yaw, that expression
+evaluates to `(1.0, 0.0, 0.0, 0.0)`, which under the real scalar-last
+contract is not identity at all: it is a 180 degree rotation about world X.
+`Articulation.reset()` *does* apply `init_state` (the old comment above the
+construction, claiming "the spawner drops this rot" for a USD-referenced
+articulation, was itself wrong/outdated for the vendored 3.0.0 spawner --
+what it was actually observing was this order bug, not a dropped write) --
+so every default-heading boot has been initializing the robot inverted.
+Live trace numbers from the run that caught it: `after_reset` root `z=0.30`
+sitting ABOVE `base_link z=0.25` (impossible right-side-up, trivial upside
+down: the root offset that is normally below `base_link` flips to above it),
+followed by a first-step ejection to `(-0.69, -2.19, 171°)` -- exactly case
+1/2's original incident numbers. Two things masked this for non-zero yaw:
+(a) `TINKER_SIM_SPAWN_YAW=1.5708` supplies `(cos(45°), 0, 0, sin(45°)) =
+(0.707, 0, 0, 0.707)`, which the scalar-last contract reads as a 90 degree
+ROLL about X, not the intended 90 degree yaw about Z -- rescued only because
+the pre-reset USD `xformOp:orient` write (Fabric-off path, correctly
+real-first for `Gf.Quatd`) or `_apply_spawn_yaw_via_view` (already
+correctly scalar-last, post-reset tensor write) overwrite the orientation
+before it matters (matrix cases 4 and 7); (b) case 8 (yaw unset, Fabric
+forced off, neither write path engaged because the `abs(spawn_yaw) > 1e-9`
+guard is false) tumbles instead of landing cleanly -- consistent with an
+upside-down spawn correcting itself dynamically rather than being rescued by
+either write path.
+
+**Fix.** Added a pure `spawn_root_rot_xyzw(yaw) -> (0.0, 0.0, sin(yaw/2),
+cos(yaw/2))` (`backend.py`, next to `resolve_spawn_yaw`) as the single
+source of a correctly-ordered heading-about-Z quaternion, and routed the
+`InitialStateCfg.rot` construction, the `"initial_state"`/
+`"after_spawn_yaw_write"` trace payloads, and `_apply_spawn_yaw_via_view`'s
+tensor-write quaternion through it (all previously duplicated the
+by-hand `sin`/`cos` construction; now there is exactly one place the order
+can go wrong). Left untouched, per the vendored contracts each site
+actually uses: `_apply_spawn_yaw_via_view` (already scalar-last -- its own
+docstring already warned not to copy the `Gf.Quatd` construction into it,
+which turned out to be exactly backwards advice for the other direction:
+the copying had happened into `InitialStateCfg.rot` instead) and the
+pre-reset USD `xformOp:orient` authoring's `Gf.Quatd(cos, 0, 0, sin)` (`Gf`
+quaternions are scalar-first by construction -- this one was already
+correct and must stay real-first, not be "fixed" to scalar-last). Corrected
+the stale "the spawner drops this rot" comment in the same edit.
+
+**Tests** (`tests/test_manipulation_runtime.py`): `SpawnRootRotXyzwTest` --
+`spawn_root_rot_xyzw(0.0) == (0.0, 0.0, 0.0, 1.0)` (the vendored identity
+default) and `spawn_root_rot_xyzw(pi/2) ≈ (0, 0, 0.7071, 0.7071)`, plus an
+explicit regression guard that a zero yaw must NOT reproduce the old
+scalar-first bug's `(1, 0, 0, 0)`. `BackendInitStateRotConstructionTest` --
+extracts the literal `rot=` keyword source off the
+`*.InitialStateCfg(...)` call in `backend.py` via `ast` (no Isaac import
+needed) and `eval`s it for an unset and a `1.5708` `TINKER_SIM_SPAWN_YAW`,
+asserting it equals `spawn_root_rot_xyzw(spawn_yaw)` exactly -- this
+exercises the backend's actual construction, not a hand-reimplementation of
+it in the test. Confirmed both new construction-test cases FAIL against the
+pre-fix (scalar-first) construction:
+`AssertionError: Tuples differ: (1.0, 0.0, 0.0, 0.0) != (0.0, 0.0, 0.0, 1.0)`
+(unset yaw) and the equivalent element-0/2/3 mismatch for yaw `1.5708`. Full
+suite after the fix: `tests/test_manipulation_runtime.py` 122 passed, 3
+subtests passed, 0 failed (up from 117: 5 new cases). No GPU boot for this
+change; PR #18's boot-time `spawn_pose_check` assertion and the
+`spawn_pose_trace` instrumentation above remain in place as the live guard
+that would have caught this immediately had they existed before it did.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported

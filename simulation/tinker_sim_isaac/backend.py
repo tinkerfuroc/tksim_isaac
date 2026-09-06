@@ -273,6 +273,28 @@ def resolve_spawn_yaw(value: str | None) -> float:
     return yaw
 
 
+def spawn_root_rot_xyzw(yaw: float) -> tuple[float, float, float, float]:
+    """Pure quaternion (about world Z) for ``ArticulationCfg.InitialStateCfg.rot``.
+
+    Task #30 root cause: the vendored Isaac Lab 3.0.0
+    ``AssetBaseCfg.InitialStateCfg.rot`` (``.deps/IsaacLab/source/isaaclab/
+    isaaclab/assets/asset_base_cfg.py``) documents its ``rot`` field as
+    scalar-last ``(x, y, z, w)``, defaulting to ``(0.0, 0.0, 0.0, 1.0)`` --
+    NOT the scalar-first ``(w, x, y, z)`` order this backend used to build by
+    hand. Supplying ``(cos(yaw/2), 0, 0, sin(yaw/2))`` for that field means a
+    zero (or unset) spawn yaw handed the contract ``(1, 0, 0, 0)``, which
+    Isaac Lab reads as a 180 degree rotation about X -- the robot spawned
+    upside down, and physics ejected it (live trace: after_reset root z 0.30
+    sitting above base_link z 0.25, then a first-step throw to
+    (-0.69, -2.19, 171 deg)). This helper is the single source of the
+    correctly-ordered quaternion; every ``InitialStateCfg.rot``/tensor-view
+    write of a yaw-about-Z heading in this file should go through it (or be
+    explicitly commented as to why it does not).
+    """
+    half = yaw / 2.0
+    return (0.0, 0.0, math.sin(half), math.cos(half))
+
+
 def resolve_spawn_yaw_via_view(value: str | None) -> bool:
     """Parse ``TINKER_SIM_SPAWN_YAW_VIA_VIEW`` (default off / "0").
 
@@ -1032,22 +1054,27 @@ class IsaacWholeRobotBackend:
                 joint_drive_props=sim_utils.JointDriveBaseCfg(drive_type="force"),
                 articulation_props=articulation_props,
             ),
-            # TINKER_SIM_SPAWN_YAW (radians, world frame): spawn heading. The
-            # spawner drops this rot for a USD-referenced articulation (it is
-            # re-authored on the root xformOp:orient just after construction),
-            # but it is set here too so the intent reads with the pose. A
+            # TINKER_SIM_SPAWN_YAW (radians, world frame): spawn heading.
+            # Task #30: the spawner DOES apply this rot to the articulation
+            # (Articulation.reset() honors init_state) -- the pre-#30 comment
+            # here claiming it "drops" the orientation was wrong/outdated for
+            # the vendored 3.0.0 spawner. It IS true that a USD-referenced
+            # articulation needs the root xformOp:orient re-authored too for
+            # the pose to read correctly pre-reset (below), and that a
             # fixed-root/held base can never be re-aimed after spawn and a
-            # post-bind /set_entity_state root write is a physics no-op, so the
-            # heading must be right from the start.
+            # post-bind /set_entity_state root write is a physics no-op, so
+            # the heading must be right from the start either way.
+            #
+            # rot is scalar-last (x, y, z, w) -- the vendored
+            # InitialStateCfg.rot contract, see spawn_root_rot_xyzw -- NOT
+            # scalar-first (w, x, y, z). Getting this backwards is exactly
+            # #30's root cause: a zero/unset yaw supplied (1, 0, 0, 0) here,
+            # which Isaac Lab reads as a 180 degree roll about X and spawned
+            # the robot upside down.
             init_state=ArticulationCfg.InitialStateCfg(
                 pos=(spawn_x, spawn_y, spawn_z),
-                rot=(
-                    math.cos(resolve_spawn_yaw(
-                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
-                    0.0,
-                    0.0,
-                    math.sin(resolve_spawn_yaw(
-                        _os.environ.get("TINKER_SIM_SPAWN_YAW")) / 2.0),
+                rot=spawn_root_rot_xyzw(
+                    resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
                 ),
             ),
             actuators={
@@ -1154,28 +1181,27 @@ class IsaacWholeRobotBackend:
             },
         )
         # Task #30 trace: the InitialStateCfg pos/rot exactly as configured
-        # above, before the spawner (which the surrounding comments document
-        # as dropping the orientation half of this for a USD-referenced
-        # articulation) or the articulation itself exist. No live tensor
-        # view yet, so t is pinned to 0.0 and base_link is not attempted.
+        # above (spawn_root_rot_xyzw, scalar-last), before the articulation
+        # itself exists. No live tensor view yet, so t is pinned to 0.0 and
+        # base_link is not attempted.
         _initial_spawn_yaw = resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
         self._log_spawn_pose_trace(
             "initial_state",
             root_pos=[spawn_x, spawn_y, spawn_z],
-            root_quat_xyzw=[
-                0.0,
-                0.0,
-                math.sin(_initial_spawn_yaw / 2.0),
-                math.cos(_initial_spawn_yaw / 2.0),
-            ],
+            root_quat_xyzw=list(spawn_root_rot_xyzw(_initial_spawn_yaw)),
             t=0.0,
             include_base_link=False,
         )
         self._robot = Articulation(robot_cfg)
-        # Author the spawn yaw directly on the robot root prim: the spawner
-        # honors InitialStateCfg.pos (xformOp:translate) but drops the
-        # orientation for this USD-referenced articulation (observed: rot
-        # (0.707, 0, 0, 0.707) requested, layer yaw 0 after spawn), and
+        # Author the spawn yaw directly on the robot root prim too. Task #30:
+        # Articulation.reset() DOES apply InitialStateCfg.rot (the previous
+        # version of this comment, claiming the spawner "drops" the
+        # orientation, was wrong/outdated for the vendored 3.0.0 spawner --
+        # that claim was actually observing the (w,x,y,z)-vs-(x,y,z,w) order
+        # bug fixed above, not a dropped write). This direct USD write is
+        # still needed because it is what 13e4fdf's fabric-parity fix
+        # targets (pre-reset xformOp:orient, so a fabric-composed render
+        # already agrees with physics before the first reset), and because
         # post-bind /set_entity_state root writes are physics no-ops.
         #
         # Skipped when TINKER_SIM_SPAWN_YAW_VIA_VIEW=1: the heading is instead
@@ -1194,6 +1220,9 @@ class IsaacWholeRobotBackend:
                 raise RuntimeError("TINKER_SIM_SPAWN_YAW: /World/Tinker not found")
             xformable = UsdGeom.Xformable(robot_prim)
             half = spawn_yaw / 2.0
+            # Gf.Quatd(real, imaginary) is scalar-first by construction --
+            # this is correct for Gf/USD (a different contract from
+            # InitialStateCfg.rot above), do not "fix" this to scalar-last.
             quat = Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half)))
             orient_op = None
             for op in xformable.GetOrderedXformOps():
@@ -1214,12 +1243,9 @@ class IsaacWholeRobotBackend:
             self._log_spawn_pose_trace(
                 "after_spawn_yaw_write",
                 root_pos=[spawn_x, spawn_y, spawn_z],
-                root_quat_xyzw=[
-                    0.0,
-                    0.0,
-                    math.sin(half),
-                    math.cos(half),
-                ],
+                # xyzw trace convention (see spawn_root_rot_xyzw), not the
+                # Gf.Quatd scalar-first `quat` just authored above.
+                root_quat_xyzw=list(spawn_root_rot_xyzw(spawn_yaw)),
                 t=0.0,
                 include_base_link=False,
                 via="usd",
@@ -2444,10 +2470,12 @@ class IsaacWholeRobotBackend:
 
         Root-view quaternions are ``(x, y, z, w)`` (IsaacLab's tensor
         convention -- ``root_quat_w``'s own element order, and
-        ``write_root_pose_to_sim_index``'s docstring), which is NOT the
-        ``(w, x, y, z)`` order ``ArticulationCfg.InitialStateCfg.rot`` and the
-        USD ``xformOp:orient`` path (both above) use -- do not copy the
-        ``Gf.Quatd(cos, 0, 0, sin)`` construction from that code path here.
+        ``write_root_pose_to_sim_index``'s docstring) -- the same scalar-last
+        contract ``ArticulationCfg.InitialStateCfg.rot`` uses (see
+        ``spawn_root_rot_xyzw``; #30 fixed this file's InitialStateCfg.rot to
+        match). It is NOT the scalar-first order the USD ``xformOp:orient``
+        path (above) builds via ``Gf.Quatd`` -- do not copy that
+        ``Gf.Quatd(cos, 0, 0, sin)`` construction here.
 
         Whether this avoids 13e4fdf's spawn-mislocation defect is NOT
         verified -- needs a live GPU A/B (see the validation recipe shipped
@@ -2455,10 +2483,9 @@ class IsaacWholeRobotBackend:
         """
         torch = self._torch
         data = self._robot.data
-        half = spawn_yaw / 2.0
         pos = data.root_pos_w[:1].detach().clone()
         quat = torch.tensor(
-            [[0.0, 0.0, math.sin(half), math.cos(half)]],
+            [list(spawn_root_rot_xyzw(spawn_yaw))],
             dtype=pos.dtype,
             device=pos.device,
         )

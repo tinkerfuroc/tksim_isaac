@@ -36,6 +36,7 @@ from tinker_sim_isaac.backend import (
     resolve_spawn_yaw,
     resolve_spawn_yaw_via_view,
     resolve_use_fabric,
+    spawn_root_rot_xyzw,
 )
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
@@ -262,6 +263,30 @@ def _spawn_usd_file_cfg_source(backend_source: str) -> str:
             ):
                 continue
             return ast.get_source_segment(backend_source, value) or ""
+    return ""
+
+
+def _init_state_rot_source(backend_source: str) -> str:
+    """Return the source text of the ``rot=`` keyword the backend passes to
+    ``ArticulationCfg.InitialStateCfg(...)``.
+
+    Task #30: the vendored Isaac Lab ``InitialStateCfg.rot`` contract is
+    scalar-last (x, y, z, w). This extracts exactly the expression the
+    backend builds for that keyword (without importing Isaac) so a test can
+    eval it and assert it matches ``spawn_root_rot_xyzw`` byte for byte,
+    instead of duplicating the construction by hand and risking the same
+    order mistake in the test itself.
+    """
+    tree = ast.parse(backend_source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "InitialStateCfg"):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "rot":
+                return ast.get_source_segment(backend_source, keyword.value) or ""
     return ""
 
 
@@ -2688,6 +2713,80 @@ class UseFabricDerivationTest(unittest.TestCase):
 
         via_view_on = spawn_yaw_set and resolve_spawn_yaw_via_view("1")
         self.assertFalse(spawn_yaw_set and not via_view_on)  # USD path skipped
+
+
+class SpawnRootRotXyzwTest(unittest.TestCase):
+    """#30 root cause: ``ArticulationCfg.InitialStateCfg.rot`` is scalar-last
+    (x, y, z, w) in the vendored Isaac Lab 3.0.0 (``asset_base_cfg.py``
+    defaults it to ``(0.0, 0.0, 0.0, 1.0)``), not the scalar-first
+    (w, x, y, z) order the backend used to build by hand. A zero/unset spawn
+    yaw therefore used to hand Isaac Lab ``(1, 0, 0, 0)`` -- a 180 degree
+    roll about X -- and the robot spawned upside down."""
+
+    def test_zero_yaw_matches_vendored_default_identity(self) -> None:
+        self.assertEqual(spawn_root_rot_xyzw(0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def test_quarter_turn_yaw_is_scalar_last(self) -> None:
+        qx, qy, qz, qw = spawn_root_rot_xyzw(math.pi / 2.0)
+        self.assertAlmostEqual(qx, 0.0, places=6)
+        self.assertAlmostEqual(qy, 0.0, places=6)
+        self.assertAlmostEqual(qz, 0.7071067811865476, places=6)
+        self.assertAlmostEqual(qw, 0.7071067811865476, places=6)
+
+    def test_never_matches_the_old_scalar_first_bug_at_zero_yaw(self) -> None:
+        """Regression guard: the pre-#30 construction ``(cos(0), 0, 0, sin(0))``
+        produced ``(1, 0, 0, 0)`` for a zero yaw -- a 180 degree rotation
+        about X under the scalar-last contract. The fixed helper must not
+        reproduce that."""
+        self.assertNotEqual(spawn_root_rot_xyzw(0.0), (1.0, 0.0, 0.0, 0.0))
+
+
+class BackendInitStateRotConstructionTest(unittest.TestCase):
+    """Construction test (#30): the exact ``rot=`` expression the backend
+    passes to ``ArticulationCfg.InitialStateCfg`` -- extracted from source so
+    this cannot pass by the test independently re-deriving the same order
+    bug -- must equal ``spawn_root_rot_xyzw(spawn_yaw)`` for both an unset
+    and a non-zero ``TINKER_SIM_SPAWN_YAW``.
+
+    On b6af3ce (pre-fix) the backend built this keyword as
+    ``(math.cos(yaw/2), 0.0, 0.0, math.sin(yaw/2))`` -- scalar-first -- so
+    for yaw unset (0.0) this evaluates to ``(1.0, 0.0, 0.0, 0.0)``, which
+    fails the ``(0.0, 0.0, 0.0, 1.0)`` expectation below.
+    """
+
+    def _eval_rot(self, spawn_yaw_env: str | None) -> tuple:
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        rot_source = _init_state_rot_source(backend_source)
+        self.assertTrue(
+            rot_source,
+            "no rot= keyword found on an *.InitialStateCfg(...) call in backend.py",
+        )
+        fake_os = SimpleNamespace(environ=SimpleNamespace(get=lambda *a, **k: spawn_yaw_env))
+        namespace = {
+            "math": math,
+            "spawn_root_rot_xyzw": spawn_root_rot_xyzw,
+            "resolve_spawn_yaw": resolve_spawn_yaw,
+            "_os": fake_os,
+        }
+        return eval(compile(rot_source, "<rot-source>", "eval"), namespace)
+
+    def test_unset_spawn_yaw_matches_helper(self) -> None:
+        rot = self._eval_rot(None)
+        expected = spawn_root_rot_xyzw(resolve_spawn_yaw(None))
+        self.assertEqual(tuple(rot), expected)
+        self.assertEqual(tuple(rot), (0.0, 0.0, 0.0, 1.0))
+
+    def test_nonzero_spawn_yaw_matches_helper(self) -> None:
+        rot = self._eval_rot("1.5708")
+        expected = spawn_root_rot_xyzw(resolve_spawn_yaw("1.5708"))
+        self.assertEqual(tuple(rot), expected)
+        qx, qy, qz, qw = rot
+        self.assertAlmostEqual(qx, 0.0, places=4)
+        self.assertAlmostEqual(qy, 0.0, places=4)
+        self.assertAlmostEqual(qz, 0.7071, places=4)
+        self.assertAlmostEqual(qw, 0.7071, places=4)
 
 
 class SpawnYawViaViewApplyTest(unittest.TestCase):
