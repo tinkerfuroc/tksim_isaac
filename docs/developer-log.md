@@ -4,6 +4,72 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
+
+**Symptom.** Bench round `agv`: a close goal reported
+`Gripper close ok: position=0.013920 effort=9.992524 stalled=1
+reached_goal=0` only ~0.45s wall after the goal started -- 4% of the drive's
+stroke, no contact -- and `pick_and_place` immediately attached the object
+and lifted; the arm lifted air. Bench RTF at the time was ~0.27.
+
+**Root cause.** `gripper_facade.py`'s `_execute` runs with
+`use_sim_time=True` and already uses `self.get_clock().now()` correctly for
+`simulation_timeout`, but the no-progress stall dwell
+(`stall_dwell_s`, default 0.3s) was timed with the free function
+`time.monotonic()` -- WALL seconds -- via `last_progress_at`/`now_monotonic`
+(and, since #23, `contact_stalled` inherits the same dwell). At RTF 0.27,
+0.3s of WALL time is only ~0.08s of SIM time, well under the ~0.2s of SIM
+actuation latency the drive needs before it even starts moving, so the
+dwell fired before the drive had any chance to make progress -- confirmed
+against the bench trace's timestamps and the truth-drive samples in
+`/home/tinker/.claude/jobs/01ca17b4/tmp/task27-facade-false-stall-findings.md`.
+`start_wall` and the 30s wall watchdog are correctly wall-clock (they bound
+a mux/keepalive contract measured in wall seconds) and were left alone.
+
+**Fix.** `last_progress_at` and the per-iteration `now_sim` (formerly
+`now_monotonic`) now read `self.get_clock().now().nanoseconds * 1e-9`, the
+same sim clock `simulation_timeout` already used; `contact_since` (and
+therefore `contact_stalled`) now derives from the same `now_sim`, so both
+stall paths share one clock. No parameter values changed.
+
+**Observability.** The facade had zero log lines. Added
+`_log_execute_outcome`, called once at every terminal `_execute` exit
+(`aborted_safety_stop`, `canceled`, `reached_goal`/`stalled`, `timeout_sim`/
+`timeout_wall`) with position, effort, stalled, reached_goal, and elapsed
+sim/wall seconds -- what previously took cross-referencing the client's own
+log line against the truth evaluator is now a single grep on
+`tinker_sim_gripper_facade`.
+
+**Test.** `tests/test_gripper_executor_humble.py::
+test_position_stall_dwell_uses_sim_clock_not_wall_clock_at_low_rtf` drives a
+synthetic `/clock` feed at RTF ~0.27 alongside `/isaac_joint_states` samples
+that stay parked for 0.2s SIM, ramp for 0.15s SIM, then genuinely plateau.
+On main it failed with:
+`AssertionError: goal finished before the drive could have genuinely
+stalled in SIM time -- the stall dwell is still running on WALL time`
+(`assert not True`, at the 1.4s-wall checkpoint where sim time has only
+reached ~0.38s). Getting this test running for real also surfaced an
+unrelated test-harness trap worth recording: the file's existing
+`_run_goal_with_timer` helper drives `_execute()` from a
+`node.create_timer()` callback with no explicit `callback_group`, which
+defaults to the node's default `MutuallyExclusiveCallbackGroup` -- the same
+group rclpy's internal `TimeSource` uses for its own `/clock` subscription.
+`_execute()`'s while-loop then monopolizes that group for the whole goal,
+silently freezing `self.get_clock().now()` until the goal ends (reproduced
+in isolation before diagnosing it). The real `ActionServer` doesn't have
+this problem -- `execute_callback` runs in its own explicit
+`ReentrantCallbackGroup` -- so the new test drives `_execute()` from a plain
+background thread instead, matching that disjointness. Full targeted run:
+`tests/test_gripper_executor_humble.py` 12 passed;
+`tests/test_manipulation_runtime.py -k "facade or gripper"` 11 passed; full
+`test_manipulation_runtime.py` 102 passed, 3 subtests passed, 0 failed.
+
+**Remaining margin (follow-up, not fixed here).** The dwell (0.3s SIM) and
+the observed actuation latency (~0.2s SIM) are close enough that a slower
+actuation response, or a lower stall_epsilon combined with sensor noise,
+could still trip a false-ish stall inside that 0.1s SIM margin. Not
+reproduced live; flagged for whoever next tunes `stall_dwell_s` or
+actuation timing.
 ## 2026-09-06 — Task #28: contact-report enablement was invisible in the sim log
 
 **Symptom.** A whole bench round (`agv`) came back with `/sim/truth/contacts`
