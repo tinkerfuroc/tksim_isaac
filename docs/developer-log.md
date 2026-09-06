@@ -1727,6 +1727,54 @@ test double. These cannot and do not exercise a real PhysX root view,
 fabric's sibling-spawn ingestion, the actual PHYSICS_READY dispatch timing,
 or whether the hypothesis above actually holds.
 
+**Fix round 2 (same day, re-review `/home/tinker/.claude/jobs/01ca17b4/tmp/task24-yawview-review-r1.md`,
+new finding -- CONFIRMED)**: fix round 1 closed Finding 1 correctly but
+introduced a regression: `_reapply_spawn_yaw_after_rebind` ran on *every*
+view-identity change `_refresh_robot_handles` detected, with no distinction
+between a genuine reset (physics state reset to the initial pose anyway --
+safe to reapply) and `_maybe_recover_simulation_view`'s mid-run,
+state-PRESERVING view recovery (reachable any time via
+`_heal_detached_scenario_bodies`, budgeted 5 uses/boot, whose own docstring
+says it deliberately skips `force_load_physics_from_usd` specifically so
+bodies keep their live/settled pose across the recovery). A nav-profile
+robot (`FIX_BASE=0`) that had driven/turned to a live heading would get that
+heading silently snapped back to the stale `TINKER_SIM_SPAWN_YAW` boot value
+on the next such recovery; with `FIX_BASE=1` the base-hold reseed made the
+wrong heading persistent rather than a one-off glitch. The review's point:
+"is this a reset" cannot be inferred from the measured pose (a driven
+robot's live heading is indistinguishable from a stale one by pose alone),
+so the classification has to be explicit.
+
+Fixed by giving `_refresh_robot_handles` an explicit
+`reapply_spawn_yaw: bool = True` keyword, decided by the CALLER, never
+inferred: the two genuine-reset callers (`__init__`'s boot bind and
+`step()`'s PHYSICS_READY rebind branch) take the default and are unchanged;
+`_maybe_recover_simulation_view`'s call now explicitly passes
+`reapply_spawn_yaw=False`, so that recovery path never writes a root pose
+and never touches `_spawn_yaw` or an existing base-hold target -- matching
+what the USD-authoring path already does today (no code re-authors
+`xformOp:orient` outside boot, so a state-preserving recovery already left a
+flag-off robot's live heading alone; this makes the flag-on view-write path
+behave the same way).
+
+Non-GPU coverage added (`tests/test_manipulation_runtime.py`,
+`SpawnYawViaViewRebindTest.test_boot_bind_reapplies_yaw` +
+`SpawnYawViaViewRecoveryRebindTest`): boot (`_robot_view_identity=None`)
+reapplies; a genuine-reset rebind (default `reapply_spawn_yaw=True`)
+reapplies (already covered in round 1); a recovery-classified rebind
+(`reapply_spawn_yaw=False`) issues no root-pose write at all and leaves a
+pre-set `_spawn_yaw` and a driven, pre-latched `_base_hold_pose`/
+`_base_hold_vel`/`_base_hold_scene_sig` completely byte-identical to what
+they were before the call, while still performing the rest of the rebind
+(joint index caches, clock re-anchoring, view-identity bookkeeping) exactly
+as before. Full suite: 87 passed, 3 subtests passed, 0 failed.
+
+This is a unit-tested invariant only -- no GPU harness in this repo can
+currently trigger `_maybe_recover_simulation_view` on demand (it fires from
+a caught tensor-view exception, not a controllable command), so there is no
+live check analogous to the reset-survival one below for this path; see the
+validation recipe's note on this.
+
 **Not done here**: any GPU boot. The validation recipe --
 `/home/tinker/.claude/jobs/01ca17b4/tmp/fabric-on-validation-recipe.md` --
 lays out the exact A/B (spawn-yaw truth-pose comparison against 13e4fdf's

@@ -1086,7 +1086,10 @@ class IsaacWholeRobotBackend:
             raise RuntimeError("Tinker articulation did not initialize after simulation reset")
         # _refresh_robot_handles applies TINKER_SIM_SPAWN_YAW_VIA_VIEW's yaw
         # (via _reapply_spawn_yaw_after_rebind) on this initial bind, and
-        # again on every later rebind -- see that method's docstring.
+        # again on the standard scenario reset's rebind -- both default
+        # reapply_spawn_yaw=True (a genuine reset). Mid-run state-preserving
+        # recovery (_maybe_recover_simulation_view) explicitly opts out --
+        # see both methods' docstrings.
         self._robot.update(self.dt)
         self._safety_snapshot = self._robot.data.joint_pos.clone()
         if enable_contacts:
@@ -1483,8 +1486,23 @@ class IsaacWholeRobotBackend:
             sphere.CreatePurposeAttr(UsdGeom.Tokens.guide)
             UsdPhysics.CollisionAPI.Apply(sphere.GetPrim())
 
-    def _refresh_robot_handles(self) -> bool:
-        """Refresh tensors after a standard stop/reset/play lifecycle."""
+    def _refresh_robot_handles(self, *, reapply_spawn_yaw: bool = True) -> bool:
+        """Refresh tensors after a standard stop/reset/play lifecycle.
+
+        ``reapply_spawn_yaw`` is an explicit, caller-declared classification
+        of WHY this rebind is happening -- never inferred from the measured
+        pose (a driven/turned robot's live heading is indistinguishable from
+        a stale one by pose alone). Default True matches the two genuine
+        "physics state is reset to the initial pose anyway" callers: the
+        initial boot bind, and ``step()``'s PHYSICS_READY rebind branch
+        after a standard scenario STOP -> spawn -> PLAY cycle. The one
+        state-PRESERVING rebind caller, ``_maybe_recover_simulation_view``,
+        passes ``reapply_spawn_yaw=False`` explicitly -- see that method's
+        docstring and ``_reapply_spawn_yaw_after_rebind``'s for why (#24
+        review round 2: applying it there snapped a driven robot's live
+        heading back to the stale boot-commanded yaw on every mid-run view
+        recovery).
+        """
         if not self._robot.is_initialized or self._robot.root_view is None:
             return False
         identity = id(self._robot.root_view)
@@ -1588,8 +1606,13 @@ class IsaacWholeRobotBackend:
         # write through) and before returning to the caller, which may step
         # physics immediately after -- see _reapply_spawn_yaw_after_rebind's
         # docstring (#24 review Finding 1: a rebind with this skipped
-        # silently reverts the robot to identity yaw).
-        self._reapply_spawn_yaw_after_rebind()
+        # silently reverts the robot to identity yaw). Gated on the explicit
+        # reapply_spawn_yaw classification, NOT inferred here -- a
+        # state-preserving recovery rebind (reapply_spawn_yaw=False) must
+        # leave the robot's live pose and any base-hold target untouched
+        # (#24 review round 2).
+        if reapply_spawn_yaw:
+            self._reapply_spawn_yaw_after_rebind()
         return True
 
     @property
@@ -2162,24 +2185,37 @@ class IsaacWholeRobotBackend:
             self._base_hold_scene_sig = self._scenario_child_signature()
 
     def _reapply_spawn_yaw_after_rebind(self) -> None:
-        """Re-apply TINKER_SIM_SPAWN_YAW_VIA_VIEW's yaw on every rebind.
+        """Re-apply TINKER_SIM_SPAWN_YAW_VIA_VIEW's yaw after a GENUINE reset rebind.
 
-        Called from ``_refresh_robot_handles`` whenever it detects a new
-        articulation root-view identity -- which includes the very first
-        bind at boot, and every later one. #24 review Finding 1: with the
-        flag on, the pre-reset USD ``xformOp:orient`` authoring is
-        deliberately skipped, so the commanded yaw has NO durable USD
-        backing -- it lives only in the transient PhysX/warp root-view
-        tensor buffer ``_apply_spawn_yaw_via_view`` writes. The standard
-        scenario boot sequence (reset -> STOP -> spawn_entity(s) -> PLAY)
-        recreates that view on PHYSICS_READY (see the STOP -> PLAY comment
-        just above in ``_refresh_robot_handles``), and so does
-        ``_maybe_recover_simulation_view``'s manual view recreation; without
-        this, the robot silently reverts to the USD/InitialStateCfg-composed
-        identity orientation immediately after exactly the spawn sequence
-        this flag exists to make cheap. Position is re-read fresh from the
-        (new) view each time, not held at the original boot position, so
-        this is correct even if the base has moved/settled since boot.
+        Called from ``_refresh_robot_handles`` only when that method's
+        caller explicitly declared ``reapply_spawn_yaw=True`` (the default)
+        -- the initial boot bind, and ``step()``'s PHYSICS_READY rebind
+        branch after a standard scenario STOP -> spawn_entity(s) -> PLAY
+        cycle, both of which reset physics state to the initial/commanded
+        pose anyway. #24 review Finding 1: with the flag on, the pre-reset
+        USD ``xformOp:orient`` authoring is deliberately skipped, so the
+        commanded yaw has NO durable USD backing -- it lives only in the
+        transient PhysX/warp root-view tensor buffer
+        ``_apply_spawn_yaw_via_view`` writes, and a genuine reset's view
+        recreation would otherwise silently revert the robot to the
+        USD/InitialStateCfg-composed identity orientation immediately after
+        exactly the spawn sequence this flag exists to make cheap. Position
+        is re-read fresh from the (new) view each time, not held at the
+        original boot position, so this is correct even if the base has
+        moved/settled since boot.
+
+        NOT called for ``_maybe_recover_simulation_view``'s mid-run,
+        state-PRESERVING view recovery (it passes
+        ``reapply_spawn_yaw=False``) -- #24 review round 2: that recovery
+        can fire long after boot, on a robot that has since driven/turned
+        to a live heading with nothing to do with the boot-commanded
+        ``TINKER_SIM_SPAWN_YAW``; applying this there would silently snap
+        that live heading back to the stale boot value (and, under
+        ``TINKER_SIM_FIX_BASE=1``, make the mis-orientation persistent via
+        the base-hold reseed below). Whether to reapply is decided by the
+        caller's explicit classification of the rebind, never inferred from
+        the measured pose.
+
         No-op unless TINKER_SIM_SPAWN_YAW_VIA_VIEW is active.
         """
         if not getattr(self, "_spawn_yaw_via_view", False):
@@ -2699,12 +2735,19 @@ class IsaacWholeRobotBackend:
         # Deliver any deferred PHYSICS_READY work and rebind the articulation
         # before the next target write; a write against the old view raises
         # "articulation tensor view failed".
+        #
+        # reapply_spawn_yaw=False: this recovery is explicitly
+        # state-PRESERVING (it skips force_load_physics_from_usd precisely
+        # so bodies keep their live/settled pose, per this method's own
+        # docstring above) -- it must not overwrite a driven robot's live
+        # heading with the stale TINKER_SIM_SPAWN_YAW boot value, nor
+        # re-seed the base-hold target from it (#24 review round 2).
         try:
             import omni.kit.app
 
             for _ in range(2):
                 omni.kit.app.get_app().update()
-            self._refresh_robot_handles()
+            self._refresh_robot_handles(reapply_spawn_yaw=False)
         except Exception:
             pass
         self._target_write_gate.force_next()

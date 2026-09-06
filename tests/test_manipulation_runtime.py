@@ -2388,7 +2388,14 @@ class SpawnYawViaViewRebindTest(unittest.TestCase):
     PLAY) recreates the articulation root view, which ``_refresh_robot_handles``
     detects as a new view identity. The yaw must be re-applied on that
     rebind too, not just at the initial boot bind, or the flag's own target
-    use case (spawn objects, then reset) silently reverts to identity yaw."""
+    use case (spawn objects, then reset) silently reverts to identity yaw.
+
+    Round 2: whether a rebind reapplies is the caller's EXPLICIT
+    ``reapply_spawn_yaw`` classification (default True == boot / genuine
+    scenario reset), never inferred from pose. ``_maybe_recover_simulation_view``'s
+    mid-run, state-preserving rebind passes ``reapply_spawn_yaw=False`` and
+    must leave the root pose and any base-hold target completely untouched
+    -- see ``SpawnYawViaViewRecoveryRebindTest`` below."""
 
     def test_reapplies_yaw_on_rebind_when_via_view_active(self) -> None:
         backend = _backend()
@@ -2470,6 +2477,91 @@ class SpawnYawViaViewRebindTest(unittest.TestCase):
         # (set by _backend()), so this call must take the early "no rebind
         # happened" path and not touch the root-pose writer at all.
         self.assertTrue(backend._refresh_robot_handles())
+        self.assertEqual(backend._robot.root_pose_calls, [])
+
+    def test_boot_bind_reapplies_yaw(self) -> None:
+        """The very first bind (``_robot_view_identity`` starts ``None``,
+        as it does in ``__init__``) is also a ``reapply_spawn_yaw=True``
+        (default) rebind, and must apply the yaw exactly like the boot path
+        in ``IsaacWholeRobotBackend.__init__`` relies on."""
+        backend = _backend()
+        backend._robot_view_identity = None
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 0)
+        backend._object_views = {}
+        backend._spawn_yaw_via_view = True
+        backend._spawn_yaw = 1.5708
+        backend.base_fixed = False
+
+        self.assertTrue(backend._refresh_robot_handles())
+
+        self.assertEqual(len(backend._robot.root_pose_calls), 1)
+        written_row = backend._robot.root_pose_calls[0][0].tolist()
+        half = backend._spawn_yaw / 2.0
+        expected_quat = [0.0, 0.0, math.sin(half), math.cos(half)]
+        for actual, expected in zip(written_row[3:], expected_quat):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+
+class SpawnYawViaViewRecoveryRebindTest(unittest.TestCase):
+    """#24 review round 2 (CONFIRMED regression in fix round 1):
+    ``_maybe_recover_simulation_view``'s mid-run, state-PRESERVING view
+    recovery calls ``_refresh_robot_handles(reapply_spawn_yaw=False)``. That
+    rebind must NOT write a root pose, must NOT touch ``_spawn_yaw`` (frozen
+    at boot), and must NOT touch any existing base-hold target -- a driven
+    robot's live heading (and its base-hold lock, if FIX_BASE=1) must
+    survive a mid-run recovery unchanged, exactly as the state-preserving
+    USD-authoring path already does today (no code anywhere re-authors
+    xformOp:orient outside boot)."""
+
+    def test_recovery_rebind_issues_no_write_when_via_view_active(self) -> None:
+        backend = _backend()
+        backend._robot_view_identity = -1  # force a "new view" rebind
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 100)
+        backend._object_views = {}
+        backend._spawn_yaw_via_view = True
+        backend._spawn_yaw = 1.5708  # frozen boot value
+        backend.base_fixed = True
+        # Sentinel base-hold state as if the robot had driven/turned and the
+        # hold had long since latched a live (non-boot) pose.
+        driven_pose = torch.tensor([[3.0, 4.0, 0.4, 0.0, 0.0, 0.9995, 0.0316]])
+        driven_vel = torch.zeros((1, 6))
+        backend._base_hold_pose = driven_pose.clone()
+        backend._base_hold_vel = driven_vel.clone()
+        backend._base_hold_scene_sig = 123
+
+        self.assertTrue(
+            backend._refresh_robot_handles(reapply_spawn_yaw=False)
+        )
+
+        self.assertEqual(backend._robot.root_pose_calls, [])
+        self.assertEqual(backend._spawn_yaw, 1.5708)
+        self.assertEqual(backend._base_hold_pose.tolist(), driven_pose.tolist())
+        self.assertEqual(backend._base_hold_vel.tolist(), driven_vel.tolist())
+        self.assertEqual(backend._base_hold_scene_sig, 123)
+
+    def test_recovery_rebind_still_rebuilds_other_handles(self) -> None:
+        """reapply_spawn_yaw=False must only skip the yaw reapply -- the
+        rest of the rebind (joint index caches, clock re-anchoring, view
+        identity bookkeeping) is unrelated and must still run, exactly as
+        the pre-existing test_reset_reacquires_object_views expects for the
+        default case."""
+        backend = _backend()
+        backend._robot_view_identity = -1
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 42)
+        backend._object_views = {"delivery_object": object()}
+        backend._spawn_yaw_via_view = True
+        backend._spawn_yaw = 1.5708
+
+        self.assertTrue(
+            backend._refresh_robot_handles(reapply_spawn_yaw=False)
+        )
+
+        self.assertEqual(backend._object_views, {})
+        self.assertEqual(backend._contact_pairs_by_key, {})
+        self.assertEqual(backend._clock_step_origin, 42)
         self.assertEqual(backend._robot.root_pose_calls, [])
 
 
