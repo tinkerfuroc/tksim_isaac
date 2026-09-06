@@ -463,9 +463,14 @@ def _write_physx_max_forces_direct(ids: list[int], limit: float) -> None:
         print(json.dumps({"physx_max_force_write_error": str(error)[:160]}), flush=True)
 
 
-def _author_usd_follower_max_force(ids: list[int], limit: float) -> None:
-    """Author physics:maxForce on each follower joint's UsdPhysics.DriveAPI
+def _author_usd_max_force(ids: list[int], limit: float, event: str = "follower_usd_drive_authored") -> None:
+    """Author physics:maxForce on each targeted joint's UsdPhysics.DriveAPI
     directly on the stage, in addition to the runtime tensor-API write.
+
+    Generic over `ids` -- used for both the five follower/mimic joints
+    (default `event`) and, for #20's drive-cap parity, the single drive_joint
+    (pass `event="drive_usd_drive_authored"`); the prim-name resolution and
+    DriveAPI application are identical either way.
 
     The runtime write (write_joint_effort_limit_to_sim_index) only touches
     the live PhysX simulation buffers; it does not update the USD prim. If
@@ -476,7 +481,9 @@ def _author_usd_follower_max_force(ids: list[int], limit: float) -> None:
     now means a re-parse still carries the cap. Best-effort: the follower
     joints are mimic joints the importer dropped drives for (see the
     "gripper_mimic" comment in backend.py), so a DriveAPI may not already be
-    applied -- Apply() creates it. Per-joint failures are logged, not fatal.
+    applied -- Apply() creates it (drive_joint already has one; Apply() on an
+    existing DriveAPI is a no-op re-bind). Per-joint failures are logged, not
+    fatal.
     """
     try:
         import omni.usd
@@ -507,7 +514,7 @@ def _author_usd_follower_max_force(ids: list[int], limit: float) -> None:
             except Exception as error:  # pragma: no cover - defensive, schema surface
                 errors.append(f"{name}:{instance}:{str(error)[:80]}")
     print(json.dumps({
-        "event": "follower_usd_drive_authored",
+        "event": event,
         "requested": limit,
         "authored": authored,
         "errors": errors,
@@ -556,7 +563,7 @@ def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower
     effort_limit_sim tensors in place (see _patch_actuator_effort_limit_cache),
     re-asserts the cap directly on the PhysX tensor view
     (_write_physx_max_forces_direct) and authors it onto each follower
-    joint's USD DriveAPI (_author_usd_follower_max_force) so a stage re-parse
+    joint's USD DriveAPI (_author_usd_max_force) so a stage re-parse
     would still carry it, and reads the effective limit back both from Isaac
     Lab's data.joint_effort_limits and straight from PhysX
     (get_dof_max_forces) for the event -- #20 evidence (bit-identical 15 s
@@ -572,7 +579,7 @@ def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower
     _write_gain("limits", "write_joint_effort_limit_to_sim_index", limit, mimic_ids)
     _write_physx_max_forces_direct(mimic_ids, limit)
     _patch_actuator_effort_limit_cache(mimic_ids, limit)
-    _author_usd_follower_max_force(mimic_ids, limit)
+    _author_usd_max_force(mimic_ids, limit)
     if emit_event:
         print(json.dumps({
             "event": event,
@@ -580,6 +587,48 @@ def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower
             "indices": mimic_ids,
             "effective": _read_effective_effort_limits(mimic_ids),
             "physx_max_force": _read_physx_max_forces(mimic_ids),
+        }), flush=True)
+
+
+def apply_drive_effort_limit(emit_event: bool = False, event: str = "drive_effort_limit_set") -> None:
+    """Cap drive_joint's effort ceiling at --drive-effort-limit through the
+    SAME direct PhysX path as apply_follower_effort_limit above (#20 round 2).
+
+    The pre-existing path (backend._set_gripper_effort_limit) only issues the
+    Isaac Lab tensor-API write (write_joint_effort_limit_to_sim_index) and
+    patches the owning ImplicitActuator's `effort_limit` cache -- the SAME
+    writer that #20's cap5-analysis proved was a PhysX no-op for the follower
+    joints (bit-identical 15 s hold physics from cap 5 through cap 180). There
+    is no a-priori reason drive_joint's actuator would be exempt from that
+    gap, so this re-asserts the cap straight on the PhysX tensor view
+    (_write_physx_max_forces_direct), patches BOTH `effort_limit` and
+    `effort_limit_sim` on the actuator model (_patch_actuator_effort_limit_
+    cache -- _set_gripper_effort_limit only touches `effort_limit`), and
+    authors physics:maxForce onto drive_joint's own USD DriveAPI
+    (_author_usd_max_force) so a stage re-parse still carries it. Reads the
+    effective limit back both from Isaac Lab's data.joint_effort_limits and
+    straight from PhysX (get_dof_max_forces) for the event, exactly like
+    apply_follower_effort_limit. A no-op unless --drive-effort-limit was
+    passed.
+    """
+    if args.drive_effort_limit is None:
+        return
+    limit = float(args.drive_effort_limit)
+    ids = [drive_id]
+    backend._default_gripper_effort_limit = limit
+    backend._gripper_effort_limit_written = False
+    backend._set_gripper_effort_limit(limit)
+    _write_physx_max_forces_direct(ids, limit)
+    _patch_actuator_effort_limit_cache(ids, limit)
+    _author_usd_max_force(ids, limit, event="drive_usd_drive_authored")
+    if emit_event:
+        print(json.dumps({
+            "event": event,
+            "requested": limit,
+            "indices": ids,
+            "gripper_effort_limit": backend.gripper_effort_limit,
+            "effective": _read_effective_effort_limits(ids),
+            "physx_max_force": _read_physx_max_forces(ids),
         }), flush=True)
 
 
@@ -601,18 +650,12 @@ def parse_configs(text: str) -> list[dict[str, float]]:
 CONFIGS = parse_configs(args.configs)
 
 if args.drive_effort_limit is not None:
-    # Raise the drive_joint effort ceiling so the close can press past the URDF
-    # 50 Nm cap (reuses the backend's own effort-limit writer + actuator-model
-    # sync). This is the #20 sweep: quantify the clamp-normal force each object
-    # geometry reaches as the drive ceiling rises.
-    backend._default_gripper_effort_limit = float(args.drive_effort_limit)
-    backend._gripper_effort_limit_written = False
-    backend._set_gripper_effort_limit(float(args.drive_effort_limit))
-    print(json.dumps({
-        "event": "drive_effort_limit_set",
-        "requested": args.drive_effort_limit,
-        "gripper_effort_limit": backend.gripper_effort_limit,
-    }), flush=True)
+    # Raise (or, for the #20 round-2 sweep, lower) the drive_joint effort
+    # ceiling through the same direct PhysX max-force write + USD DriveAPI
+    # authoring + readback path as the follower cap (apply_drive_effort_limit)
+    # -- this is the #20 sweep: quantify the clamp-normal force / creep
+    # behaviour each object geometry reaches as the drive ceiling changes.
+    apply_drive_effort_limit(emit_event=True)
 
 if args.follower_effort_limit is not None:
     # #20: cap the follower (mimic) joints' effort ceiling -- backend default
@@ -925,10 +968,12 @@ def descend(duration_s: float) -> dict[str, object]:
 def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, object]:
     backend._gripper_close_slew = cfg["slew"]
     # Re-pin (and re-emit a readback) before the per-config gains write, so a
-    # phase-B config that clobbers the follower cap -- or an actuator re-init
-    # that restores the ImplicitActuatorCfg default -- shows up in the log
-    # instead of silently reverting (see apply_follower_effort_limit).
+    # phase-B config that clobbers the follower/drive cap -- or an actuator
+    # re-init that restores the ImplicitActuatorCfg default -- shows up in the
+    # log instead of silently reverting (see apply_follower_effort_limit /
+    # apply_drive_effort_limit).
     apply_follower_effort_limit(emit_event=True, event="follower_effort_limit_check")
+    apply_drive_effort_limit(emit_event=True, event="drive_effort_limit_check")
     gains = set_follower_gains(cfg["damping"], cfg["stiffness"], cfg.get("drive_stiffness"), cfg.get("drive_damping"))
     if _render["on"]:
         _render["next_drive"] = -1.0  # capture from the first step of this close
