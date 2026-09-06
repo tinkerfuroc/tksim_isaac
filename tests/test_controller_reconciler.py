@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 
 import pytest
 import tinker_sim_bridge.controller_reconciler as reconciler
@@ -128,6 +129,7 @@ def test_actual_load_failure_is_strict() -> None:
 
 
 def test_main_removes_ros_args_but_keeps_application_args(monkeypatch) -> None:
+    monkeypatch.delenv(reconciler.TEARDOWN_TIMEOUT_ENV_VAR, raising=False)
     captured = {}
     monkeypatch.setattr(
         reconciler,
@@ -165,6 +167,7 @@ def test_main_removes_ros_args_but_keeps_application_args(monkeypatch) -> None:
         "ready_parameter": None,
         "ready_value": True,
         "ready_timeout": 15.0,
+        "teardown_timeout_s": reconciler.DEFAULT_TEARDOWN_TIMEOUT_S,
     }
 
 
@@ -239,3 +242,115 @@ def test_remote_parameter_fails_closed_after_bounded_discovery_timeout() -> None
             parameter_factory=lambda name, value: (name, value),
             request_factory=lambda parameters: parameters,
         )
+
+
+class _RecordingLogger:
+    def __init__(self):
+        self.infos: list[str] = []
+        self.errors: list[str] = []
+
+    def info(self, message: str) -> None:
+        self.infos.append(message)
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
+
+
+def test_bounded_teardown_returns_normally_when_teardown_is_prompt() -> None:
+    calls: list[int] = []
+    logger = _RecordingLogger()
+
+    def prompt_teardown() -> None:
+        calls.append(1)
+
+    completed = reconciler.bounded_teardown(
+        prompt_teardown,
+        1.0,
+        logger=logger,
+        exit_code=0,
+        exit_fn=lambda code: pytest.fail(
+            f"exit_fn must not be called on a prompt teardown (got code={code})"
+        ),
+    )
+
+    assert completed is True
+    assert calls == [1]
+    assert logger.errors == []
+    assert any("starting teardown" in message for message in logger.infos)
+    assert any("teardown completed" in message for message in logger.infos)
+
+
+def test_bounded_teardown_forces_exit_when_teardown_hangs() -> None:
+    forced: list[int] = []
+    started = threading.Event()
+    release = threading.Event()
+    logger = _RecordingLogger()
+
+    def hanging_teardown() -> None:
+        started.set()
+        # Never sets `release`; blocks forever (this thread is a daemon, so
+        # it is abandoned -- not joined -- once the test process exits).
+        release.wait()
+
+    completed = reconciler.bounded_teardown(
+        hanging_teardown,
+        0.05,
+        logger=logger,
+        exit_code=0,
+        exit_fn=lambda code: forced.append(code),
+    )
+
+    assert started.wait(timeout=1.0), "teardown thread never started"
+    assert completed is False
+    assert forced == [0]
+    assert len(logger.errors) == 1
+    assert (
+        "controller_reconciler: teardown did not complete within"
+        in logger.errors[0]
+    )
+    assert "after success; forcing exit (rc=0)" in logger.errors[0]
+
+
+def test_bounded_teardown_preserves_nonzero_exit_code_on_timeout() -> None:
+    forced: list[int] = []
+    release = threading.Event()
+    logger = _RecordingLogger()
+
+    reconciler.bounded_teardown(
+        release.wait,
+        0.05,
+        logger=logger,
+        exit_code=1,
+        exit_fn=lambda code: forced.append(code),
+    )
+
+    assert forced == [1]
+    assert "after failure; forcing exit (rc=1)" in logger.errors[0]
+
+
+def test_teardown_timeout_default_reads_env_var(monkeypatch) -> None:
+    monkeypatch.setenv(reconciler.TEARDOWN_TIMEOUT_ENV_VAR, "12.5")
+
+    assert reconciler._teardown_timeout_default() == 12.5
+
+
+def test_teardown_timeout_default_falls_back_when_env_var_is_invalid(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(reconciler.TEARDOWN_TIMEOUT_ENV_VAR, "not-a-number")
+
+    assert (
+        reconciler._teardown_timeout_default()
+        == reconciler.DEFAULT_TEARDOWN_TIMEOUT_S
+    )
+
+
+def test_teardown_timeout_default_falls_back_when_env_var_is_unset(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(reconciler.TEARDOWN_TIMEOUT_ENV_VAR, raising=False)
+
+    assert (
+        reconciler._teardown_timeout_default()
+        == reconciler.DEFAULT_TEARDOWN_TIMEOUT_S
+    )
