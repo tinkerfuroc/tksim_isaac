@@ -39,6 +39,13 @@ def _bool(value: str) -> bool:
 def _process_exit_actions(event, label: str, success_actions):
     """Gate launch progression on a successful process exit."""
     if event.returncode == 0:
+        if success_actions:
+            # Readiness marker (task #25): makes the next chained stage's
+            # start observable in the log even when its own first log line
+            # is delayed, so a future wedge here is self-documenting.
+            launch.logging.get_logger("tinker_sim.manipulation_launch").info(
+                f"{label} succeeded; starting next stage"
+            )
         return success_actions
     launch.logging.get_logger("tinker_sim.manipulation_launch").error(
         f"{label} exited with return code {event.returncode}; shutting down"

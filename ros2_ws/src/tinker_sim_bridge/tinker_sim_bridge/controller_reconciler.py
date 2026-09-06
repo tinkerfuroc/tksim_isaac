@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
+
+# Task #25: node.destroy_node()/rclpy.shutdown() were observed to hang
+# indefinitely (SIGINT-immune, no traceback) after a successful
+# reconciliation during a live GPSR run, wedging the OnProcessExit launch
+# chain that loads xarm7_traj_controller. bounded_teardown() below caps that
+# call so a wedge there can no longer stall the whole robot.
+DEFAULT_TEARDOWN_TIMEOUT_S = 5.0
+TEARDOWN_TIMEOUT_ENV_VAR = "TINKER_RECONCILER_TEARDOWN_TIMEOUT_S"
 
 
 class ReconciliationError(RuntimeError):
@@ -20,6 +30,77 @@ def _parse_bool(value: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
+
+
+def _teardown_timeout_default() -> float:
+    """Resolve the default --teardown-timeout-s from TEARDOWN_TIMEOUT_ENV_VAR.
+
+    Falls back to DEFAULT_TEARDOWN_TIMEOUT_S when the env var is unset,
+    blank, or not a valid float, so a malformed env var cannot make the
+    reconciler fail to start.
+    """
+    raw = os.environ.get(TEARDOWN_TIMEOUT_ENV_VAR)
+    if raw is None or not raw.strip():
+        return DEFAULT_TEARDOWN_TIMEOUT_S
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_TEARDOWN_TIMEOUT_S
+
+
+def bounded_teardown(
+    teardown: Callable[[], None],
+    timeout_s: float,
+    *,
+    logger=None,
+    exit_code: int = 0,
+    exit_fn: Callable[[int], None] = os._exit,
+) -> bool:
+    """Run *teardown* in a daemon thread, bounded by *timeout_s* seconds.
+
+    node.destroy_node()/rclpy.shutdown() have been observed (task #25) to
+    hang indefinitely -- SIGINT-immune, no traceback -- under heavy DDS
+    discovery load right after a successful reconciliation, which wedges
+    every launch file chained on this process's exit. This keeps that call
+    from stalling the process forever: if *teardown* has not finished within
+    *timeout_s*, this logs one clear line, flushes stdout/stderr, and
+    force-exits the process via *exit_fn* (os._exit by default, which does
+    not run atexit/finally handlers or return) instead of waiting on it.
+
+    Returns True if *teardown* completed within the bound (the normal path
+    today). A timeout never returns: *exit_fn* is expected to terminate the
+    process; it is only injectable so tests can observe the call instead of
+    actually exiting.
+    """
+
+    def _log_info(message: str) -> None:
+        if logger is not None:
+            logger.info(message)
+        else:
+            print(message)
+
+    def _log_error(message: str) -> None:
+        if logger is not None:
+            logger.error(message)
+        else:
+            print(message, file=sys.stderr)
+
+    _log_info(f"controller_reconciler: starting teardown (bound {timeout_s:g}s)")
+    thread = threading.Thread(target=teardown, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        outcome = "success" if exit_code == 0 else "failure"
+        _log_error(
+            "controller_reconciler: teardown did not complete within "
+            f"{timeout_s:g}s after {outcome}; forcing exit (rc={exit_code})"
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        exit_fn(exit_code)
+        return False
+    _log_info("controller_reconciler: teardown completed")
+    return True
 
 
 @dataclass(frozen=True)
@@ -278,6 +359,17 @@ def _parse_args(argv: list[str] | None = None):
     parser.add_argument("--ready-parameter")
     parser.add_argument("--ready-value", type=_parse_bool, default=True)
     parser.add_argument("--ready-timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--teardown-timeout-s",
+        type=float,
+        default=_teardown_timeout_default(),
+        help=(
+            "Bound, in seconds, on node.destroy_node()/rclpy.shutdown() "
+            "after reconciliation finishes; the process force-exits if this "
+            f"is exceeded (default {DEFAULT_TEARDOWN_TIMEOUT_S:g}, "
+            f"overridable via {TEARDOWN_TIMEOUT_ENV_VAR})."
+        ),
+    )
 
     raw_argv = list(sys.argv) if argv is None else ["controller_reconciler", *argv]
     application_argv = _remove_ros_args(raw_argv)[1:]
@@ -300,6 +392,7 @@ def _run(args) -> int:
 
     rclpy.init()
     node = rclpy.create_node("tinker_controller_reconciler")
+    rc = 1
     try:
         api = RosControllerManagerApi(node, args.controller_manager, args.service_timeout)
         for name in args.controllers:
@@ -318,13 +411,29 @@ def _run(args) -> int:
             node.get_logger().info(
                 f"set {args.ready_node}.{args.ready_parameter}={args.ready_value}"
             )
-        return 0
+        rc = 0
+        return rc
     except (ReconciliationError, ValueError) as exc:
         node.get_logger().error(str(exc))
-        return 1
+        rc = 1
+        return rc
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # Same teardown that ran here unconditionally before task #25, now
+        # bounded: on success (rc=0) a timeout force-exits 0 (the reconciled
+        # controller is already proven active; do not fail the launch chain
+        # over a teardown-only hang) and logs it clearly. The same bound
+        # applies on the failure path (rc=1) and preserves that non-zero
+        # code, since this is the single teardown for both branches.
+        def _teardown() -> None:
+            node.destroy_node()
+            rclpy.shutdown()
+
+        bounded_teardown(
+            _teardown,
+            args.teardown_timeout_s,
+            logger=node.get_logger(),
+            exit_code=rc,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
