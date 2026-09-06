@@ -497,6 +497,137 @@ def test_sustained_contact_does_not_succeed_while_drive_still_advancing(
         source.destroy_node()
 
 
+class _RecordingGoalHandle(_GoalHandle):
+    """A _GoalHandle that timestamps each feedback publish against a shared,
+    externally-driven simulated-clock reading, so the test can tell whether a
+    stall/success was reported before or after a given amount of SIM progress
+    -- independent of how much WALL time has actually elapsed."""
+
+    def __init__(self, target: float, sim_time_ref: dict, sim_time_lock: threading.Lock) -> None:
+        super().__init__(target)
+        self._sim_time_ref = sim_time_ref
+        self._sim_time_lock = sim_time_lock
+        self.feedback_log: list[tuple[float, object]] = []
+
+    def publish_feedback(self, feedback) -> None:
+        with self._sim_time_lock:
+            sim_t = self._sim_time_ref["sim_t"]
+        self.feedback_log.append((sim_t, feedback))
+        super().publish_feedback(feedback)
+
+
+def test_position_stall_dwell_uses_sim_clock_not_wall_clock_at_low_rtf(
+    ros_context,
+) -> None:
+    # Task #27: bench round agv saw the close goal report stalled=1 at 4% of
+    # stroke with no contact, at bench RTF ~0.27 -- the arm then lifted air.
+    # Root cause: the stall dwell (stall_dwell_s=0.3) was measured with
+    # time.monotonic() (WALL seconds) even though the node runs with
+    # use_sim_time=True. At RTF 0.27, 0.3s of WALL time is only ~0.08s of SIM
+    # time -- far less than the ~0.2s SIM actuation latency before the drive
+    # even starts moving -- so the dwell fires before the drive has had any
+    # chance to make progress.
+    #
+    # This test drives a synthetic /clock feed at RTF ~0.27 (sim advances
+    # ~0.27s of sim time per second of wall time) alongside /isaac_joint_states
+    # samples where the drive stays parked at 0.0 for the first 0.2s of SIM
+    # time, then genuinely advances for 0.15s of SIM time before genuinely
+    # plateauing (a real stall). It asserts the facade does not report
+    # stalled/succeeded before the drive could have made SIM-time progress,
+    # but does report the genuine stall once 0.3s of SIM time has passed with
+    # no further progress.
+    from rosgraph_msgs.msg import Clock
+
+    node = GripperFacade()
+    node.set_parameters([Parameter("use_sim_time", Parameter.Type.BOOL, True)])
+    _clear_safety(node)
+    source = Node("gripper_executor_sim_clock_source")
+    clock_publisher = source.create_publisher(Clock, "/clock", 1)
+    joint_publisher = source.create_publisher(JointState, "/isaac_joint_states", 20)
+    safety_qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    safety_publisher = source.create_publisher(
+        Bool, "/sim/hardware/safety_stop", safety_qos
+    )
+
+    sim_time_lock = threading.Lock()
+    sim_time = {"sim_t": 0.0}
+    goal = _RecordingGoalHandle(1.0, sim_time, sim_time_lock)
+    # NOT _run_goal_with_timer: that helper drives _execute() from a
+    # node.create_timer() callback with no explicit callback_group, which
+    # defaults to the node's DEFAULT MutuallyExclusiveCallbackGroup -- the
+    # SAME group rclpy's internal TimeSource creates its own /clock
+    # subscription in. _execute()'s while-loop then occupies that group for
+    # the whole goal, starving the /clock callback and freezing sim time
+    # (reproduced in isolation: node.get_clock().now() stalls for the entire
+    # goal, then jumps once it finishes). The real ActionServer does not have
+    # this problem -- it runs execute_callback in its own explicit
+    # ReentrantCallbackGroup, disjoint from the default group. A plain
+    # background thread reproduces that disjointness for this test.
+    threading.Thread(target=lambda: node._execute(goal), daemon=True).start()
+
+    wall_dt = 0.05
+    sim_dt = wall_dt * 0.27  # matches the bench's ~0.27 RTF (round agv)
+
+    def tick() -> None:
+        # Wall-clock safety heartbeat (safety_timeout_s defaults to 1.0s WALL,
+        # independent of the sim-clock bug under test): keep it fed on every
+        # tick, faster than 1.0s, or the goal aborts on a safety timeout
+        # before the stall-dwell behavior under test ever gets exercised.
+        clear = Bool()
+        clear.data = False
+        safety_publisher.publish(clear)
+        with sim_time_lock:
+            sim_time["sim_t"] += sim_dt
+            t = sim_time["sim_t"]
+        clock_message = Clock()
+        clock_message.clock.sec = int(t)
+        clock_message.clock.nanosec = int((t - int(t)) * 1.0e9)
+        clock_publisher.publish(clock_message)
+        if t < 0.2:
+            position = 0.0  # parked: actuation latency, drive hasn't moved yet
+        elif t < 0.35:
+            position = (t - 0.2) / 0.15 * 0.05  # genuine progress
+        else:
+            position = 0.05  # genuine plateau -> genuine stall after 0.3s SIM
+        message = JointState()
+        message.name = ["drive_joint"]
+        message.position = [position]
+        joint_publisher.publish(message)
+
+    clock_timer = source.create_timer(wall_dt, tick)
+    executor, spin_thread = _spin(node, source)
+    try:
+        # At wall=1.4s, sim_t ~= 0.38s: the drive has genuinely started moving
+        # (past the 0.2s SIM latency) but has not yet been stalled for a
+        # genuine 0.3s of SIM time (plateau starts at sim_t=0.35, so the
+        # genuine stall cannot fire before sim_t=0.65, ~2.4s wall). On main,
+        # the WALL-clock dwell fires within ~0.3-0.5s wall -- long before this
+        # check -- so this assertion fails on main.
+        time.sleep(1.4)
+        assert not goal.finished.is_set(), (
+            "goal finished before the drive could have genuinely stalled in "
+            "SIM time -- the stall dwell is still running on WALL time"
+        )
+        assert not any(feedback.stalled for _, feedback in goal.feedback_log), (
+            "position_stalled fired before 0.3s of SIM no-progress time had "
+            "elapsed"
+        )
+        assert goal.finished.wait(4.0)
+        assert goal.outcome == "succeeded"
+        assert any(feedback.stalled for _, feedback in goal.feedback_log)
+        assert not any(feedback.reached_goal for _, feedback in goal.feedback_log)
+    finally:
+        clock_timer.cancel()
+        executor.shutdown()
+        spin_thread.join(timeout=2.0)
+        node.destroy_node()
+        source.destroy_node()
+
+
 def test_finger_parked_short_of_target_stalls_without_contact(ros_context) -> None:
     # A close that stops advancing toward its target while still short of it --
     # with no contact telemetry at all -- is a physical stall and must report a
