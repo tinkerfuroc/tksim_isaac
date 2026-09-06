@@ -1711,3 +1711,180 @@ Next: re-run `s2026-003`, `004`, `005` (old run dirs archived as
 `*.attempt1-no-scene`). Acceptance: 003/004 no longer fail on absent
 objects; 005 passes the `person_found` gate under
 `GPSR_SIM_IDENTITY_RELAXED=1`.
+
+## 2026-09-05: fabric-off cost + opt-in spawn-yaw-via-view (#24, unvalidated)
+
+Profiling flagged `TINKER_SIM_USE_FABRIC=0` (forced off by 13e4fdf whenever
+`TINKER_SIM_SPAWN_YAW` is non-zero) as the single largest non-physics RTF
+cost found: `updateToUsd` -- PhysX writing every rigid body's transform back
+to USD every step, plus the Hydra scene-notice resync that write triggers --
+profiles at roughly 1.1 s of wall per simulated second. 13e4fdf's own root
+cause for forcing fabric off is narrower than that cost: `omni.physx.fabric`
+resolves a *newly-spawned sibling body's* initial world transform against
+the robot root's non-identity yaw when fabric is authoritative (i.e. when
+`use_fabric=True` sets `/physics/updateToUsd=False`), so a scenario object
+spawned after a yawed robot boot lands rotated by `-robot_yaw` about the
+robot's origin in physics, even though USD/`get_entity_state` read back the
+commanded pose correctly. Fabric-off makes USD authoritative for that
+ingestion and removes the leak, at the `updateToUsd` cost above. A full
+dependency audit (`/home/tinker/.claude/jobs/01ca17b4/tmp/fabric-off-dependencies.md`)
+found this SPAWN_YAW mislocation is the *only* reason fabric is off anywhere
+in this repo -- every other fabric-off-adjacent fix (arena/gripper/YCB
+friction materials, #12's `set_entity_pose_physics`, `_apply_base_hold`) is
+either a tensor-view write that is already fabric-independent by
+construction, or a USD-authoring compensation for a second-order defect
+(mesh colliders not inheriting the PhysicsScene default material under
+`updateToUsd`) that is harmless under fabric-on.
+
+**Hypothesis** (untested beyond static reading + CPU unit tests): the
+pre-reset USD `xformOp:orient` write that authors the spawn yaw is not
+itself required to be a USD write -- `_apply_base_hold` and #12's
+`set_entity_pose_physics` already write the robot's root pose through the
+Isaac Lab / PhysX tensor view (`write_root_pose_to_sim_index` /
+`create_rigid_body_view(...).set_transforms`), which is fabric-independent.
+If the spawn yaw is instead written through that same view, *after*
+`sim.reset()` binds the articulation, fabric would not need to be forced
+off at all for the SPAWN_YAW path. This is a **candidate fix, not a proven
+one**: 13e4fdf's own diagnosis was that the defect's trigger is the robot
+root carrying a non-identity yaw *in physics* at the moment a sibling body
+spawns -- a condition switching the write mechanism does not obviously
+change, since the robot root ends up at the same yawed pose in physics
+either way, just via a different write path. It needs a live GPU A/B, not
+more source reading.
+
+**Shipped, default-off, current behaviour unchanged when unset**:
+`TINKER_SIM_SPAWN_YAW_VIA_VIEW=1` (`simulation/tinker_sim_isaac/backend.py`).
+When set and `TINKER_SIM_SPAWN_YAW` is non-zero: `use_fabric` stays as
+`resolve_use_fabric` would otherwise compute it (normally `True`, i.e. NOT
+forced off), the pre-reset USD orient authoring is skipped entirely, and
+once the articulation is bound and reset, `_apply_spawn_yaw_via_view` writes
+the commanded yaw as a root-view quaternion (`(x, y, z, w)` order -- NOT the
+`(w, x, y, z)` order `InitialStateCfg.rot` and the USD `xformOp:orient` path
+use; this tripped up the initial reading of the vendored IsaacLab source and
+is called out explicitly in both the code and its tests) before the first
+physics step, and seeds `_base_hold_pose`/`_base_hold_vel`/
+`_base_hold_scene_sig` directly so `TINKER_SIM_FIX_BASE=1`, if also active,
+holds the yawed pose immediately rather than only picking it up once its own
+2 s settle-latch fires. A `{"event":"spawn_yaw","via":"view"|"usd",
+"use_fabric":...}` boot-log line records which path ran, alongside the
+pre-existing `{"use_fabric":...,"spawn_yaw_set":...}` line, so a live boot's
+stdout says unambiguously which path it took.
+
+**Fix round 1 (same day, code review `/home/tinker/.claude/jobs/01ca17b4/tmp/task24-yawview-review.md`, Finding 1 -- CONFIRMED)**:
+the first cut of this flag only applied the yaw once, at the initial boot
+bind (right after `sim.reset()`). Every standard scenario boot performs
+reset -> STOP -> `spawn_entity`(s) -> PLAY (`simulation_interfaces`'
+`/reset_simulation` + `/set_simulation_state`, the default
+`spawn_while_playing=False` flow -- see `simulation/README.md` and
+`simulation/tinker_sim_core/orchestration.py`), and Isaac Lab recreates the
+articulation root view on that PLAY/PHYSICS_READY transition
+(`_refresh_robot_handles` already detects and handles the new view identity
+for every other piece of cached state). Since the pre-reset USD
+`xformOp:orient` authoring is deliberately skipped under this flag, the
+commanded yaw had no durable USD backing -- it lived only in the transient
+root-view tensor buffer -- so that reset/rebind silently snapped the robot
+back to the USD/`InitialStateCfg`-composed identity orientation, *right
+after the spawn sequence this flag exists to make cheap*. With
+`TINKER_SIM_FIX_BASE=0` (the nav-profile default) nothing ever re-applied
+the yaw for the rest of the run; with `FIX_BASE=1`, `_apply_base_hold`'s
+Python-cached target happened to survive and re-fix it, but only after one
+physics step at identity yaw.
+
+Fixed by moving the reapply into `_refresh_robot_handles` itself, via a new
+`_reapply_spawn_yaw_after_rebind` helper: it runs on every genuine view-identity
+change that method detects (the initial boot bind included, so the explicit
+call the first cut made in `__init__` right after `sim.reset()` is now
+redundant and was removed), covering all three call sites that can rebind
+the articulation view -- `__init__`'s boot path, `step()`'s re-entrant
+PHYSICS_READY rebind branch, and `_maybe_recover_simulation_view`'s manual
+view recreation -- from one place instead of three. It re-reads the
+*current* root position from the freshly (re)bound view rather than
+replaying a cached boot-time position, so it stays correct even if the base
+moved before the reset. Confirmed safe to call before any explicit
+`Articulation.update(dt)`: IsaacLab's `root_link_pose_w` is a
+timestamp-checked proxy that re-fetches from the physics view on every
+access regardless of `.update()` (`.deps/IsaacLab/.../articulation_data.py:616-630`),
+so there is no stale-buffer window. The one unavoidable residual from the
+review (not fixed, and not fixable without changing Isaac's own
+PHYSICS_READY dispatch order): `step()`'s rebind branch must still run one
+`_sim.step()` at whatever orientation the just-recreated view reports
+*before* it can call `_refresh_robot_handles()` again successfully -- so a
+single physics step at the pre-reapply orientation is unavoidable on every
+reset, same as it always was for every other piece of state that branch
+re-synchronizes.
+
+Non-GPU coverage (`tests/test_manipulation_runtime.py`,
+`UseFabricDerivationTest` + `SpawnYawViaViewApplyTest` +
+`SpawnYawViaViewRebindTest`): the `use_fabric` derivation truth table (yaw
+set + flag off -> False, unchanged; yaw set + flag on -> True; no yaw ->
+True regardless of flag; `TINKER_SIM_USE_FABRIC` override still wins over
+the new flag), the view-write itself (issues the root-pose write exactly
+once, position taken from the articulation's already-resolved `root_pos_w`,
+quaternion matching a pure yaw in `(x, y, z, w)` order, and the base-hold
+seeding only firing when `base_fixed` is set), and the rebind-durability
+fix (`_refresh_robot_handles` reapplies the yaw and re-seeds the base-hold
+target on a forced view-identity change, does so again on a second,
+independent rebind, does nothing when the view identity is unchanged, and
+does nothing at all when the flag is off or unset) -- all against a backend
+test double. These cannot and do not exercise a real PhysX root view,
+fabric's sibling-spawn ingestion, the actual PHYSICS_READY dispatch timing,
+or whether the hypothesis above actually holds.
+
+**Fix round 2 (same day, re-review `/home/tinker/.claude/jobs/01ca17b4/tmp/task24-yawview-review-r1.md`,
+new finding -- CONFIRMED)**: fix round 1 closed Finding 1 correctly but
+introduced a regression: `_reapply_spawn_yaw_after_rebind` ran on *every*
+view-identity change `_refresh_robot_handles` detected, with no distinction
+between a genuine reset (physics state reset to the initial pose anyway --
+safe to reapply) and `_maybe_recover_simulation_view`'s mid-run,
+state-PRESERVING view recovery (reachable any time via
+`_heal_detached_scenario_bodies`, budgeted 5 uses/boot, whose own docstring
+says it deliberately skips `force_load_physics_from_usd` specifically so
+bodies keep their live/settled pose across the recovery). A nav-profile
+robot (`FIX_BASE=0`) that had driven/turned to a live heading would get that
+heading silently snapped back to the stale `TINKER_SIM_SPAWN_YAW` boot value
+on the next such recovery; with `FIX_BASE=1` the base-hold reseed made the
+wrong heading persistent rather than a one-off glitch. The review's point:
+"is this a reset" cannot be inferred from the measured pose (a driven
+robot's live heading is indistinguishable from a stale one by pose alone),
+so the classification has to be explicit.
+
+Fixed by giving `_refresh_robot_handles` an explicit
+`reapply_spawn_yaw: bool = True` keyword, decided by the CALLER, never
+inferred: the two genuine-reset callers (`__init__`'s boot bind and
+`step()`'s PHYSICS_READY rebind branch) take the default and are unchanged;
+`_maybe_recover_simulation_view`'s call now explicitly passes
+`reapply_spawn_yaw=False`, so that recovery path never writes a root pose
+and never touches `_spawn_yaw` or an existing base-hold target -- matching
+what the USD-authoring path already does today (no code re-authors
+`xformOp:orient` outside boot, so a state-preserving recovery already left a
+flag-off robot's live heading alone; this makes the flag-on view-write path
+behave the same way).
+
+Non-GPU coverage added (`tests/test_manipulation_runtime.py`,
+`SpawnYawViaViewRebindTest.test_boot_bind_reapplies_yaw` +
+`SpawnYawViaViewRecoveryRebindTest`): boot (`_robot_view_identity=None`)
+reapplies; a genuine-reset rebind (default `reapply_spawn_yaw=True`)
+reapplies (already covered in round 1); a recovery-classified rebind
+(`reapply_spawn_yaw=False`) issues no root-pose write at all and leaves a
+pre-set `_spawn_yaw` and a driven, pre-latched `_base_hold_pose`/
+`_base_hold_vel`/`_base_hold_scene_sig` completely byte-identical to what
+they were before the call, while still performing the rest of the rebind
+(joint index caches, clock re-anchoring, view-identity bookkeeping) exactly
+as before. Full suite: 87 passed, 3 subtests passed, 0 failed.
+
+This is a unit-tested invariant only -- no GPU harness in this repo can
+currently trigger `_maybe_recover_simulation_view` on demand (it fires from
+a caught tensor-view exception, not a controllable command), so there is no
+live check analogous to the reset-survival one below for this path; see the
+validation recipe's note on this.
+
+**Not done here**: any GPU boot. The validation recipe --
+`/home/tinker/.claude/jobs/01ca17b4/tmp/fabric-on-validation-recipe.md` --
+lays out the exact A/B (spawn-yaw truth-pose comparison against 13e4fdf's
+repro shape, robot root yaw from `/sim/internal/physics_truth`, and
+`TINKER_SIM_PROFILE=1`'s `step_profile.kit_pump`/RTF numbers) for whoever
+runs it next, now including a reset-survival check for Finding 1's fix
+(spawn through the standard reset cycle, then re-read the robot's base yaw
+from truth and confirm it is still the commanded value, not identity). Do
+not treat this flag as validated, and do not flip any default based on this
+entry alone.
