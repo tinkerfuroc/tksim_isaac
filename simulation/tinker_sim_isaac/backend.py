@@ -528,6 +528,11 @@ class IsaacWholeRobotBackend:
         spawn_xy: tuple[float, float] = (0.0, 0.0),
     ) -> None:
         spawn_x, spawn_y = validate_spawn_xy(spawn_xy)
+        # Commanded spawn xy, remembered for the boot-time spawn-pose guard
+        # (_check_spawn_pose, task #30) -- this is the value actually applied
+        # to InitialStateCfg.pos below, not merely the raw --spawn-xy string.
+        self._spawn_x = spawn_x
+        self._spawn_y = spawn_y
         arena_usd, map_yaml = resolve_arena_inputs(arena_artifact, map_yaml)
         self._arena_usd = arena_usd  # dir holds placement.json (support surfaces)
         if arena_artifact is not None and wall_color_fn is not None:
@@ -864,6 +869,15 @@ class IsaacWholeRobotBackend:
                 self._base_hold_resettle_s = max(0.0, float(_resettle))
         except (TypeError, ValueError):
             pass
+        # Boot-time spawn-pose guard (task #30): run _check_spawn_pose exactly
+        # once after the base settles -- the same moment the base-hold latch
+        # fires (TINKER_SIM_FIX_BASE=1, see _maybe_check_spawn_pose) or, with
+        # the base free, once _base_hold_after_sim_s of sim time has elapsed.
+        # Reset on every genuine reset rebind (_refresh_robot_handles) so a
+        # respawn gets its own settle window and its own check, exactly like
+        # _base_hold_settle_from above.
+        self._spawn_pose_checked = False
+        self._spawn_pose_check_settle_from = 0.0
         # Diagnostic (TINKER_SIM_FIX_BASE_DRYRUN=1): run the whole hold -- settle,
         # latch, scene-change detection, logging -- but SKIP the two
         # set_root_transforms writes. If a spawn still lands at the robot pose
@@ -1727,6 +1741,14 @@ class IsaacWholeRobotBackend:
         # (#24 review round 2).
         if reapply_spawn_yaw:
             self._reapply_spawn_yaw_after_rebind()
+            # task #30: a genuine reset rebind (STOP -> spawn -> PLAY) resets
+            # physics state back to the commanded/initial pose, so the
+            # spawn-pose guard must re-arm and measure its own settle window
+            # from THIS rebind, exactly like _base_hold_settle_from above --
+            # simulation_time is monotonic across the rebind (#21), so a
+            # boot-relative deadline would already be satisfied.
+            self._spawn_pose_checked = False
+            self._spawn_pose_check_settle_from = self.simulation_time
         return True
 
     @property
@@ -2470,6 +2492,84 @@ class IsaacWholeRobotBackend:
         self._robot.write_root_pose_to_sim_index(root_pose=self._base_hold_pose)
         self._robot.write_root_velocity_to_sim_index(root_velocity=self._base_hold_vel)
 
+    def _maybe_check_spawn_pose(self) -> None:
+        """Run the boot-time spawn-pose guard exactly once after the base
+        settles (task #30).
+
+        "Settled" means: the same moment the base-hold latch fires
+        (``TINKER_SIM_FIX_BASE=1``, i.e. ``_base_hold_pose`` transitions out
+        of ``None`` in ``_apply_base_hold`` -- this is called right after
+        that in ``step()``), or, with the base free, once
+        ``_base_hold_after_sim_s`` of sim time has elapsed since boot or the
+        last genuine reset rebind (``_refresh_robot_handles`` resets
+        ``_spawn_pose_check_settle_from``/``_spawn_pose_checked`` on those,
+        exactly like ``_base_hold_settle_from``).
+
+        A GPSR run observed the robot base ~1.3 m / ~171 deg off its
+        commanded spawn with nothing in the sim log flagging it (see
+        docs/developer-log.md, 2026-09-06); this makes that mismatch loud at
+        boot instead of silently reaching navigation downstream.
+        """
+        if self._spawn_pose_checked:
+            return
+        if getattr(self, "base_fixed", False):
+            if self._base_hold_pose is None:
+                return
+        else:
+            elapsed = self.simulation_time - self._spawn_pose_check_settle_from
+            if elapsed < self._base_hold_after_sim_s:
+                return
+        self._check_spawn_pose()
+        self._spawn_pose_checked = True
+
+    def _check_spawn_pose(self) -> None:
+        """Compare the truth base pose against the commanded spawn and emit
+        a loud, structured mismatch line (task #30).
+
+        Always prints a ``spawn_pose_check`` line. On a mismatch (position
+        more than 5 cm off, or heading more than 5 deg off, wrap-aware) also
+        prints a ``spawn_pose_mismatch`` line at warning level, and, when
+        ``TINKER_SIM_SPAWN_POSE_ASSERT=strict``, raises to abort the boot.
+        Default (unset, or any other value) is warn-only -- no behaviour
+        change.
+        """
+        base_pose = self._robot_truth_state()["base_pose"]
+        actual_xyz = [float(value) for value in base_pose["xyz"]]
+        qx, qy, qz, qw = (float(value) for value in base_pose["quaternion_xyzw"])
+        actual_yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)
+        )
+        commanded_x = float(self._spawn_x)
+        commanded_y = float(self._spawn_y)
+        commanded_yaw = float(self._spawn_yaw)
+        dxy = math.hypot(actual_xyz[0] - commanded_x, actual_xyz[1] - commanded_y)
+        dyaw = math.atan2(
+            math.sin(actual_yaw - commanded_yaw), math.cos(actual_yaw - commanded_yaw)
+        )
+        dyaw_deg = math.degrees(dyaw)
+        ok = dxy <= 0.05 and abs(dyaw_deg) <= 5.0
+        payload = {
+            "event": "spawn_pose_check",
+            "commanded": [commanded_x, commanded_y, commanded_yaw],
+            "actual": [actual_xyz[0], actual_xyz[1], actual_xyz[2], actual_yaw],
+            "dxy_m": dxy,
+            "dyaw_deg": dyaw_deg,
+            "ok": ok,
+        }
+        print(json.dumps(payload, sort_keys=True), flush=True)
+        if ok:
+            return
+        mismatch_payload = dict(payload)
+        mismatch_payload["event"] = "spawn_pose_mismatch"
+        mismatch_payload["level"] = "warning"
+        print(json.dumps(mismatch_payload, sort_keys=True), flush=True)
+        if os.environ.get("TINKER_SIM_SPAWN_POSE_ASSERT") == "strict":
+            raise RuntimeError(
+                "spawn pose mismatch: commanded "
+                f"{payload['commanded']} vs actual {payload['actual']} "
+                f"(dxy={dxy:.3f} m, dyaw={dyaw_deg:.1f} deg)"
+            )
+
     def _scenario_child_signature(self) -> int:
         """Count /World/Scenario children -- a per-step spawn/delete signal for
         the base hold. Cheap (one stage child listing) and only called while
@@ -2699,6 +2799,7 @@ class IsaacWholeRobotBackend:
             self._ramp_drive_target()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
+        self._maybe_check_spawn_pose()
         self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets

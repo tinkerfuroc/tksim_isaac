@@ -197,6 +197,12 @@ def _backend() -> IsaacWholeRobotBackend:
     backend.chassis_ballast_mass_kg = 0.0
     backend._object_views = {}
     backend._refresh_object_views = lambda: None
+    backend._spawn_x = 0.0
+    backend._spawn_y = 0.0
+    backend._spawn_yaw = 0.0
+    backend._spawn_pose_checked = False
+    backend._spawn_pose_check_settle_from = 0.0
+    backend._base_hold_after_sim_s = 2.0
     return backend
 
 
@@ -3069,6 +3075,123 @@ class SpawnYawViaViewRecoveryRebindTest(unittest.TestCase):
         self.assertEqual(backend._contact_pairs_by_key, {})
         self.assertEqual(backend._clock_step_origin, 42)
         self.assertEqual(backend._robot.root_pose_calls, [])
+
+
+def _set_root_pose(backend: IsaacWholeRobotBackend, xyz, yaw: float) -> None:
+    half = yaw / 2.0
+    backend._robot.data.root_pos_w = torch.tensor([list(xyz)], dtype=torch.float32)
+    backend._robot.data.root_quat_w = torch.tensor(
+        [[0.0, 0.0, math.sin(half), math.cos(half)]], dtype=torch.float32
+    )
+
+
+def _free_base_settled(backend: IsaacWholeRobotBackend) -> None:
+    """Arm the free-base (TINKER_SIM_FIX_BASE off) settle gate so the very
+    next ``_maybe_check_spawn_pose`` call fires: 2.0s of sim time elapsed
+    since boot/the last rebind, matching ``_base_hold_after_sim_s``."""
+    backend.base_fixed = False
+    backend._base_hold_after_sim_s = 2.0
+    backend._spawn_pose_check_settle_from = 0.0
+    backend._clock_step_origin = 0
+    backend._clock_elapsed_steps = 0
+    backend._sim = SimpleNamespace(get_physics_step_count=lambda: 240)
+    backend._spawn_pose_checked = False
+
+
+class SpawnPoseCheckTest(unittest.TestCase):
+    """Task #30: a GPSR run observed the robot base at (-0.69, -2.19) yaw
+    +171 deg in the sim's own physics_truth while the launch commanded
+    --spawn-xy=-2,-2 (yaw unset = 0) -- nothing in the sim log flagged it.
+    ``_check_spawn_pose`` compares the truth base pose against the
+    commanded spawn once the base settles and makes a mismatch loud."""
+
+    def test_matching_pose_is_ok_with_no_mismatch_line(self) -> None:
+        backend = _backend()
+        backend._spawn_x = 1.0
+        backend._spawn_y = 2.0
+        backend._spawn_yaw = 0.5
+        _set_root_pose(backend, (1.0, 2.0, 0.0775), 0.5)
+        _free_base_settled(backend)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._maybe_check_spawn_pose()
+
+        self.assertTrue(backend._spawn_pose_checked)
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        events = [entry["event"] for entry in lines]
+        self.assertEqual(events, ["spawn_pose_check"])
+        check = lines[0]
+        self.assertTrue(check["ok"])
+        self.assertAlmostEqual(check["dxy_m"], 0.0, places=5)
+        # float32 root_quat_w round-trip: exact 0 isn't guaranteed.
+        self.assertAlmostEqual(check["dyaw_deg"], 0.0, places=3)
+
+    def test_pose_off_by_1_3m_171deg_emits_mismatch(self) -> None:
+        backend = _backend()
+        backend._spawn_x = -2.0
+        backend._spawn_y = -2.0
+        backend._spawn_yaw = 0.0
+        _set_root_pose(backend, (-0.69, -2.19, 0.0775), math.radians(171))
+        _free_base_settled(backend)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._maybe_check_spawn_pose()
+
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        events = [entry["event"] for entry in lines]
+        self.assertEqual(events, ["spawn_pose_check", "spawn_pose_mismatch"])
+        check, mismatch = lines
+        self.assertFalse(check["ok"])
+        self.assertAlmostEqual(check["dxy_m"], 1.3237, places=3)
+        self.assertAlmostEqual(check["dyaw_deg"], 171.0, places=3)
+        self.assertEqual(mismatch["commanded"], [-2.0, -2.0, 0.0])
+        self.assertAlmostEqual(mismatch["dxy_m"], 1.3237, places=3)
+        self.assertAlmostEqual(mismatch["dyaw_deg"], 171.0, places=3)
+        self.assertFalse(mismatch["ok"])
+        self.assertEqual(mismatch.get("level"), "warning")
+
+    def test_yaw_wrap_reports_small_delta(self) -> None:
+        """Commanded 3.1 rad, actual -3.1 rad -- these are ~4.8 deg apart
+        going the short way around the circle, not the ~355 deg a naive
+        (unwrapped) subtraction would report."""
+        backend = _backend()
+        backend._spawn_x = 0.0
+        backend._spawn_y = 0.0
+        backend._spawn_yaw = 3.1
+        _set_root_pose(backend, (0.0, 0.0, 0.0775), -3.1)
+        _free_base_settled(backend)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            backend._maybe_check_spawn_pose()
+
+        lines = [
+            json.loads(line) for line in captured.getvalue().splitlines() if line.strip()
+        ]
+        self.assertEqual([entry["event"] for entry in lines], ["spawn_pose_check"])
+        check = lines[0]
+        self.assertTrue(check["ok"])
+        self.assertAlmostEqual(abs(check["dyaw_deg"]), 4.7662, places=3)
+
+    def test_strict_mode_raises_on_mismatch(self) -> None:
+        backend = _backend()
+        backend._spawn_x = -2.0
+        backend._spawn_y = -2.0
+        backend._spawn_yaw = 0.0
+        _set_root_pose(backend, (-0.69, -2.19, 0.0775), math.radians(171))
+        _free_base_settled(backend)
+
+        with patch.dict(os.environ, {"TINKER_SIM_SPAWN_POSE_ASSERT": "strict"}):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                with self.assertRaises(RuntimeError):
+                    backend._maybe_check_spawn_pose()
 
 
 if __name__ == "__main__":
