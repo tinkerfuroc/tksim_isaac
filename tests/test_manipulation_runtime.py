@@ -1753,6 +1753,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             impulse=(0.0, 0.0, 5.0),
             position=(0.1, 0.2, 0.3),
             normal=(0.0, 0.0, 1.0),
+            separation=-0.0005,
         )
         backend._on_contact_report_event([header], [sample])
 
@@ -1774,6 +1775,20 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(len(traced[0]["normals"]), 1)
         for actual, expected in zip(traced[0]["normals"][0], [0.0, 0.0, 1.0]):
             self.assertAlmostEqual(float(actual), expected)
+        # Task #20: per-point impulse vector, separation, and normal/
+        # tangential impulse decomposition (fn/ft), plus dt for force
+        # conversion. The impulse here is purely along +Z, same as the
+        # normal, so fn == the impulse magnitude and ft == 0.
+        self.assertEqual(len(traced[0]["impulses"]), 1)
+        for actual, expected in zip(traced[0]["impulses"][0], [0.0, 0.0, 5.0]):
+            self.assertAlmostEqual(float(actual), expected)
+        self.assertEqual(len(traced[0]["separations"]), 1)
+        self.assertAlmostEqual(float(traced[0]["separations"][0]), -0.0005)
+        self.assertEqual(len(traced[0]["fn"]), 1)
+        self.assertAlmostEqual(float(traced[0]["fn"][0]), 5.0)
+        self.assertEqual(len(traced[0]["ft"]), 1)
+        self.assertAlmostEqual(float(traced[0]["ft"][0]), 0.0)
+        self.assertAlmostEqual(float(traced[0]["dt"]), 0.1)
 
         # a lost event clears the traced pair the same way it clears the
         # monitored one.

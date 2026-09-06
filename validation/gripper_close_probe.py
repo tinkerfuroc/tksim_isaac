@@ -271,6 +271,7 @@ names, _, _, _ = backend.joint_state()
 JIDX = {n: i for i, n in enumerate(names)}
 mimic_ids = list(backend._gripper_mimic_indices)
 drive_id = backend._drive_joint_index
+GRIP_IDS = [JIDX[n] for n in GRIP]
 DT = backend.dt
 
 
@@ -421,6 +422,41 @@ def _read_physx_max_forces(ids: list[int]) -> list[float]:
         return [float(arr[0, i]) for i in ids]
     except Exception as error:  # pragma: no cover - defensive, PhysX API surface
         print(json.dumps({"physx_max_force_read_error": str(error)[:160]}), flush=True)
+        return [float("nan")] * len(ids)
+
+
+def _read_physx_joint_forces(ids: list[int]) -> list[float]:
+    """Read the PhysX-measured joint force/torque actually delivered by the
+    solver for the given DOF indices -- distinct from ``joint_state()``'s
+    ``tau`` (Isaac Lab's ``data.applied_torque``, the actuator MODEL's
+    post-clip command that gets set INTO the sim, per
+    isaaclab/assets/articulation/base_articulation_data.py:198-205 -- a
+    Python-side estimate of what was asked for, not what PhysX produced).
+
+    Uses ``root_view.get_dof_projected_joint_forces()``
+    (omni.physics.tensors ArticulationView, see api.py:1991-2020 in this
+    Isaac Lab/PhysX build): "projects the link's incoming joint force[s] in
+    the motion direction", i.e. the actual constraint-solver output along
+    each joint's motion axis -- the solver-measured force/torque, not a
+    command. ``get_dof_actuation_forces`` (api.py:1963) was the other
+    available getter but reads back the actuation-model's force input to the
+    solver (the same class of quantity as ``applied_torque``, just at the
+    tensor-API layer) rather than what the solver's joint constraint actually
+    carried, so it doesn't answer #20's question. ``get_measured_joint_forces``
+    does not exist on this build (grepped omni.physics.tensors/api.py and the
+    isaaclab_physx articulation sources -- absent).
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    getter = getattr(root_view, "get_dof_projected_joint_forces", None) if root_view is not None else None
+    if getter is None:
+        return [float("nan")] * len(ids)
+    try:
+        forces = getter()
+        arr = forces.numpy() if hasattr(forces, "numpy") else forces
+        arr = np.asarray(arr)
+        return [float(arr[0, i]) for i in ids]
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({"physx_joint_force_read_error": str(error)[:160]}), flush=True)
         return [float("nan")] * len(ids)
 
 
@@ -927,7 +963,13 @@ if args.descend_from > 0.0:
 def trace_pairs() -> list[dict[str, object]]:
     """--trace-contacts: every contact pair touching the probe object's body
     (knuckles, palm, table/pedestal -- not just the pads the backend normally
-    monitors), with point/normal. Empty (and free) unless --trace-contacts."""
+    monitors), with point/normal. Empty (and free) unless --trace-contacts.
+
+    Also carries the per-point impulse vectors, separations, and normal/
+    tangential impulse decomposition (fn/ft, N.s) plus the physics dt used,
+    straight from backend.contact_trace_pairs() -- Task #20's "what does the
+    solver actually apply at this contact" instrumentation.
+    """
     if not args.trace_contacts or not hasattr(backend, "contact_trace_pairs"):
         return []
     out = []
@@ -939,6 +981,11 @@ def trace_pairs() -> list[dict[str, object]]:
             "n_points": int(p.get("point_count", 0)),
             "points": [[round(float(v), 5) for v in pt] for pt in p.get("points", [])],
             "normals": [[round(float(v), 5) for v in n] for n in p.get("normals", [])],
+            "impulses": [[round(float(v), 6) for v in imp] for imp in p.get("impulses", [])],
+            "separations": [round(float(v), 6) for v in p.get("separations", [])],
+            "fn": [round(float(v), 6) for v in p.get("fn", [])],
+            "ft": [round(float(v), 6) for v in p.get("ft", [])],
+            "dt": float(p["dt"]) if p.get("dt") is not None else None,
         })
     return out
 
@@ -1027,11 +1074,16 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
                 stall_t = t
         else:
             stall_run = 0
+        physx_taus = _read_physx_joint_forces(GRIP_IDS)
         r = {
             "tag": tag, "k": k, "t": round(t, 4), "target": target, "drive": g["drive_joint"][0],
             "pad_pos": pad_pos, "pad_speed": pad_speed, "lag": lag, "lf": lf, "rf": rf,
             "tau_drive": round(g["drive_joint"][2], 3),
             "tau": {n: round(v, 3) for n, v in taus.items()},
+            # PhysX solver-measured joint force/torque (get_dof_projected_joint_forces),
+            # alongside the pre-existing tau/tau_drive (Isaac Lab's applied_torque,
+            # the actuator model's commanded value) -- see _read_physx_joint_forces.
+            "physx_tau": {n: round(v, 3) for n, v in zip(GRIP, physx_taus)},
             "pos": {n: round(g[n][0], 4) for n in FOLLOWERS},
         }
         if args.trace_contacts:
@@ -1062,7 +1114,7 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         "median_lag_motion": float(np.median(lags_motion)) if lags_motion else None,
         "median_speed_motion": float(np.median(speeds_motion)) if speeds_motion else None,
         "median_tau_motion": float(np.median(taus_motion)) if taus_motion else None,
-        "final": {k: last.get(k) for k in ("target", "drive", "pad_pos", "pad_speed", "lag", "lf", "rf", "tau_drive", "tau", "pos")},
+        "final": {k: last.get(k) for k in ("target", "drive", "pad_pos", "pad_speed", "lag", "lf", "rf", "tau_drive", "tau", "physx_tau", "pos")},
     }
     if bottle_rows:
         z0 = bottle_rows[0]["z"]

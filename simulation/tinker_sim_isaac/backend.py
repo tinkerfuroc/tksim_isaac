@@ -3176,6 +3176,13 @@ class IsaacWholeRobotBackend:
         Empty unless the env var is set. Each record carries the same
         force-weighted "point"/"normal" as contact_pairs(), plus the raw
         per-sample "points" (up to 4) and "point_count" for the full pair.
+        Also carries, per traced point (same up-to-4 truncation): "impulses"
+        (raw contact_data impulse vectors, N.s), "separations" (contact_data
+        separation), and "fn"/"ft" -- the impulse decomposed into its normal
+        (dot with the per-point unit normal) and tangential (residual)
+        magnitude, both still in N.s. "dt" carries the physics step used so
+        impulse -> force conversion (force = impulse / dt) is possible
+        downstream.
         """
         return [dict(pair) for pair in self._contact_trace_pairs_by_key.values()]
 
@@ -3270,6 +3277,39 @@ class IsaacWholeRobotBackend:
             else:
                 self._contact_pairs_by_key.pop(key, None)
             if is_traced:
+                # Task #20: per-point impulse vectors + separation, decomposed
+                # into normal/tangential components (fn/ft, in N.s -- ``dt``
+                # is carried alongside so the analyst can convert to force).
+                # Computed only on this (already gated, default-off) branch so
+                # tracing off costs nothing extra.
+                impulses = [self._contact_vector(sample.impulse) for sample in samples]
+                separations = [float(sample.separation) for sample in samples]
+                per_point_fn: list[float] = []
+                per_point_ft: list[float] = []
+                for sample in samples:
+                    impulse_vec = self._contact_vector(sample.impulse)
+                    reported_normal = self._contact_vector(sample.normal)
+                    normal_length = math.sqrt(
+                        sum(value * value for value in reported_normal)
+                    )
+                    if not math.isfinite(normal_length) or normal_length <= 0.0:
+                        per_point_fn.append(float("nan"))
+                        per_point_ft.append(float("nan"))
+                        continue
+                    unit_normal = [value / normal_length for value in reported_normal]
+                    fn = sum(
+                        impulse_value * normal_value
+                        for impulse_value, normal_value in zip(impulse_vec, unit_normal)
+                    )
+                    if not math.isfinite(fn):
+                        per_point_fn.append(float("nan"))
+                        per_point_ft.append(float("nan"))
+                        continue
+                    tangential_sq = max(
+                        0.0, sum(value * value for value in impulse_vec) - fn * fn
+                    )
+                    per_point_fn.append(fn)
+                    per_point_ft.append(math.sqrt(tangential_sq))
                 self._contact_trace_pairs_by_key[key] = {
                     "body_a": actors[0],
                     "body_b": actors[1],
@@ -3279,6 +3319,11 @@ class IsaacWholeRobotBackend:
                     "points": points[:4],
                     "normals": [item[1] for item in normal_impulses][:4],
                     "point_count": len(points),
+                    "impulses": impulses[:4],
+                    "separations": separations[:4],
+                    "fn": per_point_fn[:4],
+                    "ft": per_point_ft[:4],
+                    "dt": self.dt,
                 }
             else:
                 self._contact_trace_pairs_by_key.pop(key, None)
