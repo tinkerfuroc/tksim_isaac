@@ -272,6 +272,47 @@ def resolve_spawn_yaw(value: str | None) -> float:
     return yaw
 
 
+def resolve_spawn_yaw_via_view(value: str | None) -> bool:
+    """Parse ``TINKER_SIM_SPAWN_YAW_VIA_VIEW`` (default off / "0").
+
+    "1" or "true" (case-insensitive) enables it; anything else, including
+    unset, is False. When enabled *and* ``TINKER_SIM_SPAWN_YAW`` is non-zero,
+    the spawn heading is written through the articulation root physics view
+    after ``sim.reset()`` (the same fabric-independent tensor-view path
+    ``_apply_base_hold`` and ``set_entity_pose_physics`` already use) instead
+    of the pre-reset USD ``xformOp:orient`` authoring that 13e4fdf's fabric
+    workaround exists to route around -- so ``use_fabric`` no longer needs to
+    be forced off for a non-zero spawn yaw. Opt-in and unvalidated live; see
+    docs/developer-log.md (2026-09-05).
+    """
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "true")
+
+
+def resolve_use_fabric(
+    spawn_yaw_env: str | None,
+    via_view_env: str | None,
+    use_fabric_env: str | None,
+) -> bool:
+    """Pure derivation of ``SimulationCfg(use_fabric=...)``.
+
+    Default True; forced False only when ``TINKER_SIM_SPAWN_YAW`` is
+    non-zero AND ``TINKER_SIM_SPAWN_YAW_VIA_VIEW`` is not enabled (the
+    historical 13e4fdf behaviour: the pre-reset USD orient write is the only
+    known-safe path under fabric-on). ``TINKER_SIM_USE_FABRIC=0``/``1``
+    overrides either way, exactly as before.
+    """
+    spawn_yaw_set = abs(resolve_spawn_yaw(spawn_yaw_env)) > 1.0e-9
+    via_view = spawn_yaw_set and resolve_spawn_yaw_via_view(via_view_env)
+    use_fabric = not (spawn_yaw_set and not via_view)
+    if use_fabric_env == "1":
+        use_fabric = True
+    elif use_fabric_env == "0":
+        use_fabric = False
+    return use_fabric
+
+
 def _fused_apply_actuator_model(self) -> None:
     """Replacement for ``Articulation._apply_actuator_model`` that launches once.
 
@@ -592,15 +633,34 @@ class IsaacWholeRobotBackend:
         # nav/arena runs); auto-off only when SPAWN_YAW is set (the sole
         # trigger, itself opt-in); TINKER_SIM_USE_FABRIC=0/1 forces either way
         # (e.g. to A/B the RTF cost).
+        #
+        # TINKER_SIM_SPAWN_YAW_VIA_VIEW=1 (default off): opt-in, unvalidated
+        # candidate to keep fabric ON even under SPAWN_YAW. updateToUsd (the
+        # fabric-off path above) profiles at ~1.1s of wall per simulated
+        # second -- the largest non-physics RTF cost found (2026-09-05) -- and
+        # the only reason it exists is SPAWN_YAW's pre-reset USD orient write.
+        # When set, that USD authoring is skipped and the heading is instead
+        # written post-reset through the root physics view (see
+        # _apply_spawn_yaw_via_view), the same fabric-independent tensor path
+        # _apply_base_hold and set_entity_pose_physics already use. Whether
+        # this actually avoids 13e4fdf's spawn-mislocation defect is NOT
+        # verified here -- that defect was diagnosed as fabric's C++ ingestion
+        # reacting to the robot root's non-identity orientation *in physics*
+        # at spawn time, which this change does not avoid, only how that
+        # orientation gets there. Needs a live GPU A/B before trusting it; see
+        # the validation recipe this change ships alongside.
         _spawn_yaw_set = (
             abs(resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))) > 1.0e-9
         )
-        _use_fabric = not _spawn_yaw_set
-        _use_fabric_env = _os.environ.get("TINKER_SIM_USE_FABRIC")
-        if _use_fabric_env == "1":
-            _use_fabric = True
-        elif _use_fabric_env == "0":
-            _use_fabric = False
+        _spawn_yaw_via_view = _spawn_yaw_set and resolve_spawn_yaw_via_view(
+            _os.environ.get("TINKER_SIM_SPAWN_YAW_VIA_VIEW")
+        )
+        self._spawn_yaw_via_view = _spawn_yaw_via_view
+        _use_fabric = resolve_use_fabric(
+            _os.environ.get("TINKER_SIM_SPAWN_YAW"),
+            _os.environ.get("TINKER_SIM_SPAWN_YAW_VIA_VIEW"),
+            _os.environ.get("TINKER_SIM_USE_FABRIC"),
+        )
         print(
             json.dumps(
                 {"use_fabric": _use_fabric, "spawn_yaw_set": _spawn_yaw_set},
@@ -608,6 +668,23 @@ class IsaacWholeRobotBackend:
             ),
             flush=True,
         )
+        if _spawn_yaw_set:
+            # Boot marker so a live GPU run can tell, without reading source,
+            # which spawn-yaw authoring path ran and what fabric state it ran
+            # under -- "usd" is the 13e4fdf default (fabric forced off);
+            # "view" is this change's candidate (fabric left as computed
+            # above, normally on).
+            print(
+                json.dumps(
+                    {
+                        "event": "spawn_yaw",
+                        "via": "view" if _spawn_yaw_via_view else "usd",
+                        "use_fabric": _use_fabric,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         self._sim = SimulationContext(
             SimulationCfg(
                 dt=self.physics_dt,
@@ -930,8 +1007,15 @@ class IsaacWholeRobotBackend:
         # orientation for this USD-referenced articulation (observed: rot
         # (0.707, 0, 0, 0.707) requested, layer yaw 0 after spawn), and
         # post-bind /set_entity_state root writes are physics no-ops.
+        #
+        # Skipped when TINKER_SIM_SPAWN_YAW_VIA_VIEW=1: the heading is instead
+        # written post-reset through the root physics view once the
+        # articulation is bound (_apply_spawn_yaw_via_view, called below
+        # after self._sim.reset()) so this pre-reset USD write -- the trigger
+        # 13e4fdf found for fabric's spawn-mislocation leak -- never happens.
         spawn_yaw = resolve_spawn_yaw(_os.environ.get("TINKER_SIM_SPAWN_YAW"))
-        if abs(spawn_yaw) > 1.0e-9:
+        self._spawn_yaw = spawn_yaw
+        if abs(spawn_yaw) > 1.0e-9 and not self._spawn_yaw_via_view:
             from pxr import Gf, UsdGeom
             import omni.usd
             stage = omni.usd.get_context().get_stage()
@@ -1001,6 +1085,11 @@ class IsaacWholeRobotBackend:
         if not self._refresh_robot_handles():
             raise RuntimeError("Tinker articulation did not initialize after simulation reset")
         self._robot.update(self.dt)
+        if self._spawn_yaw_via_view:
+            # After bind/reset, before the first physics step: write the
+            # commanded heading through the root physics view instead of the
+            # (skipped, above) pre-reset USD orient authoring.
+            self._apply_spawn_yaw_via_view(self._spawn_yaw)
         self._safety_snapshot = self._robot.data.joint_pos.clone()
         if enable_contacts:
             self._contact_report_subscription = (
@@ -2014,6 +2103,59 @@ class IsaacWholeRobotBackend:
         self._velocity_targets[0, wheel_index] = updated
         for index, value in zip(self._wheel_indices, updated.tolist()):
             self._applied_wheel_velocities[index] = value
+
+    def _apply_spawn_yaw_via_view(self, spawn_yaw: float) -> None:
+        """Write TINKER_SIM_SPAWN_YAW's heading through the root physics view.
+
+        Opt-in alternative (TINKER_SIM_SPAWN_YAW_VIA_VIEW=1) to the pre-reset
+        USD ``xformOp:orient`` authoring 13e4fdf introduced: runs once, after
+        the articulation is bound and ``self._sim.reset()`` has run (so
+        ``write_root_pose_to_sim_index`` has a live root view to target) and
+        before the first physics step. Position is left exactly as the
+        articulation resolved it (``InitialStateCfg.pos``, which the spawner
+        does honor -- only the orientation is the part that gets dropped);
+        only the quaternion is overwritten, to the commanded yaw about world
+        Z. This is the same fabric-independent tensor-view write
+        ``_apply_base_hold`` and ``set_entity_pose_physics`` use (see
+        ``write_root_pose_to_sim_index`` / ``write_root_link_pose_to_sim_index``
+        in the vendored IsaacLab), which is why ``use_fabric`` no longer needs
+        to be forced off for this path (see ``resolve_use_fabric``).
+
+        Root-view quaternions are ``(x, y, z, w)`` (IsaacLab's tensor
+        convention -- ``root_quat_w``'s own element order, and
+        ``write_root_pose_to_sim_index``'s docstring), which is NOT the
+        ``(w, x, y, z)`` order ``ArticulationCfg.InitialStateCfg.rot`` and the
+        USD ``xformOp:orient`` path (both above) use -- do not copy the
+        ``Gf.Quatd(cos, 0, 0, sin)`` construction from that code path here.
+
+        Whether this avoids 13e4fdf's spawn-mislocation defect is NOT
+        verified -- needs a live GPU A/B (see the validation recipe shipped
+        alongside this change).
+        """
+        torch = self._torch
+        data = self._robot.data
+        half = spawn_yaw / 2.0
+        pos = data.root_pos_w[:1].detach().clone()
+        quat = torch.tensor(
+            [[0.0, 0.0, math.sin(half), math.cos(half)]],
+            dtype=pos.dtype,
+            device=pos.device,
+        )
+        root_pose = torch.cat([pos, quat], dim=-1)
+        self._robot.write_root_pose_to_sim_index(root_pose=root_pose)
+        # Seed the base-hold target directly, rather than relying on
+        # _apply_base_hold's own settle-latch (which only fires at
+        # self.simulation_time >= self._base_hold_after_sim_s): if
+        # TINKER_SIM_FIX_BASE is also active, this guarantees the hold uses
+        # the yawed pose from the first held step, instead of snapping back
+        # to whatever the base drifted to before the settle timer latches.
+        if getattr(self, "base_fixed", False):
+            zero_vel = torch.zeros(
+                (1, 6), dtype=root_pose.dtype, device=root_pose.device
+            )
+            self._base_hold_pose = root_pose.clone()
+            self._base_hold_vel = zero_vel
+            self._base_hold_scene_sig = self._scenario_child_signature()
 
     def _apply_base_hold(self) -> None:
         """Kinematic braked-base hold (TINKER_SIM_FIX_BASE=1).

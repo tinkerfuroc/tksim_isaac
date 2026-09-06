@@ -1608,3 +1608,81 @@ Next: re-run `s2026-003`, `004`, `005` (old run dirs archived as
 `*.attempt1-no-scene`). Acceptance: 003/004 no longer fail on absent
 objects; 005 passes the `person_found` gate under
 `GPSR_SIM_IDENTITY_RELAXED=1`.
+
+## 2026-09-05: fabric-off cost + opt-in spawn-yaw-via-view (#24, unvalidated)
+
+Profiling flagged `TINKER_SIM_USE_FABRIC=0` (forced off by 13e4fdf whenever
+`TINKER_SIM_SPAWN_YAW` is non-zero) as the single largest non-physics RTF
+cost found: `updateToUsd` -- PhysX writing every rigid body's transform back
+to USD every step, plus the Hydra scene-notice resync that write triggers --
+profiles at roughly 1.1 s of wall per simulated second. 13e4fdf's own root
+cause for forcing fabric off is narrower than that cost: `omni.physx.fabric`
+resolves a *newly-spawned sibling body's* initial world transform against
+the robot root's non-identity yaw when fabric is authoritative (i.e. when
+`use_fabric=True` sets `/physics/updateToUsd=False`), so a scenario object
+spawned after a yawed robot boot lands rotated by `-robot_yaw` about the
+robot's origin in physics, even though USD/`get_entity_state` read back the
+commanded pose correctly. Fabric-off makes USD authoritative for that
+ingestion and removes the leak, at the `updateToUsd` cost above. A full
+dependency audit (`/home/tinker/.claude/jobs/01ca17b4/tmp/fabric-off-dependencies.md`)
+found this SPAWN_YAW mislocation is the *only* reason fabric is off anywhere
+in this repo -- every other fabric-off-adjacent fix (arena/gripper/YCB
+friction materials, #12's `set_entity_pose_physics`, `_apply_base_hold`) is
+either a tensor-view write that is already fabric-independent by
+construction, or a USD-authoring compensation for a second-order defect
+(mesh colliders not inheriting the PhysicsScene default material under
+`updateToUsd`) that is harmless under fabric-on.
+
+**Hypothesis** (untested beyond static reading + CPU unit tests): the
+pre-reset USD `xformOp:orient` write that authors the spawn yaw is not
+itself required to be a USD write -- `_apply_base_hold` and #12's
+`set_entity_pose_physics` already write the robot's root pose through the
+Isaac Lab / PhysX tensor view (`write_root_pose_to_sim_index` /
+`create_rigid_body_view(...).set_transforms`), which is fabric-independent.
+If the spawn yaw is instead written through that same view, *after*
+`sim.reset()` binds the articulation, fabric would not need to be forced
+off at all for the SPAWN_YAW path. This is a **candidate fix, not a proven
+one**: 13e4fdf's own diagnosis was that the defect's trigger is the robot
+root carrying a non-identity yaw *in physics* at the moment a sibling body
+spawns -- a condition switching the write mechanism does not obviously
+change, since the robot root ends up at the same yawed pose in physics
+either way, just via a different write path. It needs a live GPU A/B, not
+more source reading.
+
+**Shipped, default-off, current behaviour unchanged when unset**:
+`TINKER_SIM_SPAWN_YAW_VIA_VIEW=1` (`simulation/tinker_sim_isaac/backend.py`).
+When set and `TINKER_SIM_SPAWN_YAW` is non-zero: `use_fabric` stays as
+`resolve_use_fabric` would otherwise compute it (normally `True`, i.e. NOT
+forced off), the pre-reset USD orient authoring is skipped entirely, and
+once the articulation is bound and reset, `_apply_spawn_yaw_via_view` writes
+the commanded yaw as a root-view quaternion (`(x, y, z, w)` order -- NOT the
+`(w, x, y, z)` order `InitialStateCfg.rot` and the USD `xformOp:orient` path
+use; this tripped up the initial reading of the vendored IsaacLab source and
+is called out explicitly in both the code and its tests) before the first
+physics step, and seeds `_base_hold_pose`/`_base_hold_vel`/
+`_base_hold_scene_sig` directly so `TINKER_SIM_FIX_BASE=1`, if also active,
+holds the yawed pose immediately rather than only picking it up once its own
+2 s settle-latch fires. A `{"event":"spawn_yaw","via":"view"|"usd",
+"use_fabric":...}` boot-log line records which path ran, alongside the
+pre-existing `{"use_fabric":...,"spawn_yaw_set":...}` line, so a live boot's
+stdout says unambiguously which path it took.
+
+Non-GPU coverage (`tests/test_manipulation_runtime.py`,
+`UseFabricDerivationTest` + `SpawnYawViaViewApplyTest`): the `use_fabric`
+derivation truth table (yaw set + flag off -> False, unchanged; yaw set +
+flag on -> True; no yaw -> True regardless of flag; `TINKER_SIM_USE_FABRIC`
+override still wins over the new flag) and the view-write itself (issues the
+root-pose write exactly once, position taken from the articulation's
+already-resolved `root_pos_w`, quaternion matching a pure yaw in
+`(x, y, z, w)` order, and the base-hold seeding only firing when
+`base_fixed` is set) on a backend test double. These cannot and do not
+exercise a real PhysX root view, fabric's sibling-spawn ingestion, or
+whether the hypothesis above actually holds.
+
+**Not done here**: any GPU boot. The validation recipe --
+`/home/tinker/.claude/jobs/01ca17b4/tmp/fabric-on-validation-recipe.md` --
+lays out the exact A/B (spawn-yaw truth-pose comparison against 13e4fdf's
+repro shape, robot root yaw from `/sim/internal/physics_truth`, and
+`TINKER_SIM_PROFILE=1`'s `step_profile.kit_pump`/RTF numbers) for whoever
+runs it next. Do not treat this flag as validated, and do not flip any
+default based on this entry alone.

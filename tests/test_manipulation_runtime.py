@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import queue
 import re
@@ -25,7 +26,12 @@ from tinker_sim_core.command_mux import (
     encode_command_frame,
     encode_snapshot_packet,
 )
-from tinker_sim_isaac.backend import IsaacWholeRobotBackend
+from tinker_sim_isaac.backend import (
+    IsaacWholeRobotBackend,
+    resolve_spawn_yaw,
+    resolve_spawn_yaw_via_view,
+    resolve_use_fabric,
+)
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
 from manipulation_qualification import QualificationManifest, QualificationRunner
@@ -82,9 +88,13 @@ class _FakeRobot:
         self.gain_calls: list[tuple[str, dict[str, object]]] = []
         self.target_calls: list[tuple[str, torch.Tensor]] = []
         self.write_count = 0
+        self.root_pose_calls: list[torch.Tensor] = []
 
     def write_joint_effort_limit_to_sim_index(self, **kwargs: object) -> None:
         self.limit_calls.append(kwargs)
+
+    def write_root_pose_to_sim_index(self, **kwargs: object) -> None:
+        self.root_pose_calls.append(kwargs["root_pose"].clone())
 
     def write_joint_stiffness_to_sim_index(self, **kwargs: object) -> None:
         self.gain_calls.append(("stiffness", kwargs))
@@ -2261,6 +2271,116 @@ class ManipulationRuntimeTest(unittest.TestCase):
                 "/World/Scenario/missing", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]
             )
         )
+
+
+class UseFabricDerivationTest(unittest.TestCase):
+    """TINKER_SIM_SPAWN_YAW_VIA_VIEW=1 lets use_fabric stay True even under a
+    non-zero TINKER_SIM_SPAWN_YAW (#24); off (default) reproduces 13e4fdf's
+    force-fabric-off behaviour byte for byte."""
+
+    def test_via_view_flag_parsing(self) -> None:
+        self.assertFalse(resolve_spawn_yaw_via_view(None))
+        self.assertFalse(resolve_spawn_yaw_via_view(""))
+        self.assertFalse(resolve_spawn_yaw_via_view("0"))
+        self.assertFalse(resolve_spawn_yaw_via_view("false"))
+        self.assertFalse(resolve_spawn_yaw_via_view("no"))
+        self.assertTrue(resolve_spawn_yaw_via_view("1"))
+        self.assertTrue(resolve_spawn_yaw_via_view("true"))
+        self.assertTrue(resolve_spawn_yaw_via_view("True"))
+        self.assertTrue(resolve_spawn_yaw_via_view(" 1 "))
+
+    def test_yaw_set_flag_off_fabric_false(self) -> None:
+        # Current/default behaviour (13e4fdf): unchanged.
+        self.assertFalse(resolve_use_fabric("1.5708", None, None))
+        self.assertFalse(resolve_use_fabric("1.5708", "0", None))
+
+    def test_yaw_set_flag_on_fabric_true(self) -> None:
+        self.assertTrue(resolve_use_fabric("1.5708", "1", None))
+        self.assertTrue(resolve_use_fabric("1.5708", "true", None))
+
+    def test_no_yaw_fabric_true_regardless_of_flag(self) -> None:
+        self.assertTrue(resolve_use_fabric(None, None, None))
+        self.assertTrue(resolve_use_fabric("0.0", None, None))
+        self.assertTrue(resolve_use_fabric("0.0", "1", None))
+
+    def test_use_fabric_env_override_still_wins(self) -> None:
+        self.assertTrue(resolve_use_fabric("1.5708", None, "1"))
+        self.assertFalse(resolve_use_fabric(None, None, "0"))
+        # Override wins even over the new flag.
+        self.assertFalse(resolve_use_fabric("1.5708", "1", "0"))
+
+    def test_usd_authoring_guard_matches_derivation(self) -> None:
+        """Mirrors backend.__init__'s USD-authoring guard,
+        ``abs(spawn_yaw) > 1e-9 and not self._spawn_yaw_via_view``: verifies
+        the pre-reset USD xformOp:orient path still runs, unmodified, when
+        the flag is off, and is skipped only when it is on."""
+        spawn_yaw = resolve_spawn_yaw("1.5708")
+        spawn_yaw_set = abs(spawn_yaw) > 1.0e-9
+        self.assertTrue(spawn_yaw_set)
+
+        via_view_off = spawn_yaw_set and resolve_spawn_yaw_via_view(None)
+        self.assertTrue(spawn_yaw_set and not via_view_off)  # USD path runs
+
+        via_view_on = spawn_yaw_set and resolve_spawn_yaw_via_view("1")
+        self.assertFalse(spawn_yaw_set and not via_view_on)  # USD path skipped
+
+
+class SpawnYawViaViewApplyTest(unittest.TestCase):
+    """``IsaacWholeRobotBackend._apply_spawn_yaw_via_view`` (#24): writes the
+    commanded yaw through the root-view writer post-reset, position
+    untouched, and seeds the base-hold target when FIX_BASE is active."""
+
+    def test_writes_yaw_quaternion_once_position_unchanged(self) -> None:
+        backend = _backend()
+        backend.base_fixed = False
+        spawn_yaw = math.pi / 2.0
+
+        backend._apply_spawn_yaw_via_view(spawn_yaw)
+
+        self.assertEqual(len(backend._robot.root_pose_calls), 1)
+        written = backend._robot.root_pose_calls[0]
+        self.assertEqual(tuple(written.shape), (1, 7))
+        written_row = written[0].tolist()
+        original_pos = backend._robot.data.root_pos_w[0].tolist()
+        for actual, expected in zip(written_row[:3], original_pos):
+            self.assertAlmostEqual(actual, expected, places=6)
+        # Root-view quaternions are (x, y, z, w) -- NOT the (w, x, y, z) order
+        # InitialStateCfg.rot / the USD xformOp:orient path use.
+        half = spawn_yaw / 2.0
+        expected_quat = [0.0, 0.0, math.sin(half), math.cos(half)]
+        for actual, expected in zip(written_row[3:], expected_quat):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_seeds_base_hold_target_when_fix_base_active(self) -> None:
+        backend = _backend()
+        backend.base_fixed = True
+        backend._scenario_child_signature = lambda: 7
+
+        backend._apply_spawn_yaw_via_view(0.4)
+
+        self.assertIsNotNone(backend._base_hold_pose)
+        self.assertEqual(backend._base_hold_scene_sig, 7)
+        self.assertEqual(
+            backend._base_hold_pose.tolist(),
+            backend._robot.root_pose_calls[0].tolist(),
+        )
+        self.assertEqual(
+            backend._base_hold_vel.tolist(), [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+        )
+
+    def test_does_not_seed_base_hold_when_fix_base_inactive(self) -> None:
+        backend = _backend()
+        backend.base_fixed = False
+        backend._base_hold_pose = None
+        backend._base_hold_vel = None
+
+        backend._apply_spawn_yaw_via_view(0.4)
+
+        self.assertIsNone(backend._base_hold_pose)
+        self.assertIsNone(backend._base_hold_vel)
+        # The write itself still happens -- only the hold-target seeding is
+        # gated on FIX_BASE.
+        self.assertEqual(len(backend._robot.root_pose_calls), 1)
 
 
 if __name__ == "__main__":
