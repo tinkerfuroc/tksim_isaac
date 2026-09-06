@@ -599,6 +599,38 @@ def test_clock_domain_rejects_missing_clock_publisher() -> None:
     assert any("/clock" in reason for reason in result["reasons"])
 
 
+def test_clock_domain_rejects_no_sample_received_yet() -> None:
+    # Task #21: the readiness gate must distinguish "no clock sample
+    # received" (None) from "value is zero" -- an epoch-anchored /clock
+    # (TINKER_SIM_CLOCK_EPOCH default wall-clock) never legitimately
+    # publishes exactly 0, so None is the only way a caller that knows it
+    # has never received a sample can express that.
+    result = evaluate_clock_domain(
+        local_use_sim_time=True,
+        remote_use_sim_time=True,
+        sim_clock_active=True,
+        clock_now_ns=None,
+    )
+    assert result["ready"] is False
+    assert any(
+        "no clock sample has been received yet" in reason
+        for reason in result["reasons"]
+    )
+
+
+def test_clock_domain_ready_for_large_boot_epoch_value() -> None:
+    # A valid large epoch value (e.g. a wall-clock TINKER_SIM_CLOCK_EPOCH
+    # anchor, ~1.7e18 ns for a 2026 wall-clock second count) is ready, same
+    # as any other nonzero sample.
+    result = evaluate_clock_domain(
+        local_use_sim_time=True,
+        remote_use_sim_time=True,
+        sim_clock_active=True,
+        clock_now_ns=1_798_000_000_000_000_000,
+    )
+    assert result["ready"] is True, result["reasons"]
+
+
 # ---------------------------------------------------------------------------
 # evaluate_probe_verdict (fail-closed aggregation seam)
 # ---------------------------------------------------------------------------

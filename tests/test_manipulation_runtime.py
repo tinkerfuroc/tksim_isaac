@@ -25,7 +25,7 @@ from tinker_sim_core.command_mux import (
     encode_command_frame,
     encode_snapshot_packet,
 )
-from tinker_sim_isaac.backend import IsaacWholeRobotBackend
+from tinker_sim_isaac.backend import IsaacWholeRobotBackend, resolve_clock_epoch
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
 from manipulation_qualification import QualificationManifest, QualificationRunner
@@ -162,6 +162,7 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
     backend._clock_elapsed_steps = 0
+    backend._clock_epoch_s = 0.0
     backend._sim = SimpleNamespace(
         get_physics_step_count=lambda: 0,
         step=lambda render=False: None,
@@ -1553,6 +1554,94 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(backend._object_views, {})
         self.assertEqual(backend._contact_pairs_by_key, {})
         self.assertEqual(backend._clock_step_origin, 42)
+
+    # -- Task #21: /clock boot-epoch anchoring (TINKER_SIM_CLOCK_EPOCH) -----
+
+    def test_resolve_clock_epoch_defaults_to_wall_clock(self) -> None:
+        with patch("time.time", return_value=1_798_000_000.0):
+            self.assertEqual(resolve_clock_epoch(None), 1_798_000_000.0)
+            self.assertEqual(resolve_clock_epoch(""), 1_798_000_000.0)
+            self.assertEqual(resolve_clock_epoch("wall"), 1_798_000_000.0)
+            self.assertEqual(resolve_clock_epoch("WALL"), 1_798_000_000.0)
+
+    def test_resolve_clock_epoch_zero_is_legacy_zero_based(self) -> None:
+        self.assertEqual(resolve_clock_epoch("0"), 0.0)
+
+    def test_resolve_clock_epoch_numeric_pins_value(self) -> None:
+        self.assertEqual(resolve_clock_epoch("12345.5"), 12345.5)
+
+    def test_resolve_clock_epoch_rejects_non_numeric(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_clock_epoch("not-a-number")
+
+    def test_resolve_clock_epoch_rejects_non_finite(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_clock_epoch("nan")
+
+    def test_ros_clock_time_adds_epoch_without_changing_simulation_time(self) -> None:
+        backend = _backend()
+        backend._clock_epoch_s = 1_000.0
+        backend.physics_dt = 1.0 / 120.0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 60)
+
+        self.assertAlmostEqual(backend.simulation_time, 0.5)
+        self.assertAlmostEqual(backend.ros_clock_time, 1_000.5)
+        # simulation_time itself is untouched by the epoch: internal timers
+        # (run-duration gating, base-hold, truth "t" fields) that already
+        # depend on it starting near zero keep their existing meaning.
+        self.assertAlmostEqual(backend.simulation_time, 0.5)
+
+    def test_clock_epoch_zero_reproduces_legacy_zero_based_sequence(self) -> None:
+        backend = _backend()
+        backend._clock_epoch_s = resolve_clock_epoch("0")
+        backend.physics_dt = 1.0 / 120.0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 12)
+
+        self.assertAlmostEqual(backend.ros_clock_time, backend.simulation_time)
+        self.assertAlmostEqual(backend.ros_clock_time, 0.1)
+
+    def test_reset_monotonic_clock_holds_with_epoch_in_place(self) -> None:
+        # The 767fb89 in-process STOP -> PLAY monotonic-clock fix must keep
+        # working once an epoch is anchored on top of it.
+        backend = _backend()
+        backend._clock_epoch_s = 500.0
+        backend.physics_dt = 1.0 / 120.0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 100)
+        last_clock_before_reset = backend.ros_clock_time
+        self.assertAlmostEqual(last_clock_before_reset, 500.0 + 100 / 120.0)
+
+        # Standard ResetSimulation: the articulation view identity changes and
+        # the physics step counter can reset to a small number.
+        backend._robot_view_identity = -1
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 3)
+        backend._object_views = {"delivery_object": object()}
+
+        self.assertTrue(backend._refresh_robot_handles())
+        first_clock_after_reset = backend.ros_clock_time
+        self.assertGreaterEqual(first_clock_after_reset, last_clock_before_reset)
+
+    def test_two_backends_back_to_back_publish_nondecreasing_clock(self) -> None:
+        # Simulate a full sim-process restart (task #21): two independently
+        # constructed backends, each anchoring its published clock to the
+        # wall-clock time observed when its own clock origin is established.
+        with patch("time.time", return_value=1_000.0):
+            backend1 = _backend()
+            backend1._clock_epoch_s = resolve_clock_epoch(None)
+        backend1.physics_dt = 1.0 / 120.0
+        backend1._sim = SimpleNamespace(get_physics_step_count=lambda: 6_000)  # 50s
+        last_clock_backend1 = backend1.ros_clock_time
+        self.assertAlmostEqual(last_clock_backend1, 1_050.0)
+
+        # Wall-clock time elapses across the restart -- a real Isaac Sim boot
+        # takes far longer than any sim time accumulated above.
+        with patch("time.time", return_value=1_100.0):
+            backend2 = _backend()
+            backend2._clock_epoch_s = resolve_clock_epoch(None)
+        backend2.physics_dt = 1.0 / 120.0
+        backend2._sim = SimpleNamespace(get_physics_step_count=lambda: 0)
+        first_clock_backend2 = backend2.ros_clock_time
+
+        self.assertGreaterEqual(first_clock_backend2, last_clock_backend1)
 
     def test_contact_report_uses_identified_bodies_and_reported_normal(self) -> None:
         backend = _backend()

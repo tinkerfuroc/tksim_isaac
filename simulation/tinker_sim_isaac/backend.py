@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -270,6 +271,39 @@ def resolve_spawn_yaw(value: str | None) -> float:
     if not math.isfinite(yaw):
         raise ValueError("TINKER_SIM_SPAWN_YAW must be finite")
     return yaw
+
+
+def resolve_clock_epoch(value: str | None) -> float:
+    """Parse ``TINKER_SIM_CLOCK_EPOCH``: the epoch (seconds) the published
+    ``/clock`` is anchored to, so a fresh sim *process* never publishes a
+    ``/clock`` sample that appears to precede a prior process's last sample.
+    Real ROS time on hardware is wall-clock and never goes backward; this is
+    the parity target for a Isaac Sim restart while long-lived ROS consumers
+    (tf2 buffers with no jump handling, e.g. AnyGrasp) keep running. See
+    ``docs/developer-log.md`` (2026-09-05 entry) and task #21.
+
+    - unset or ``"wall"`` (default): the wall-clock time (``time.time()``)
+      captured once, when this backend/clock origin is first established.
+    - ``"0"``: the legacy zero-based clock -- every pre-existing zero-based
+      test, replay, or offset-alignment assumption keeps its meaning.
+    - any other numeric string: that epoch in seconds, letting a harness pin
+      a reproducible absolute clock across repeated runs.
+
+    Fails closed on malformed or non-finite input, mirroring
+    ``resolve_spawn_yaw``.
+    """
+    text = "" if value is None else value.strip()
+    if not text or text.lower() == "wall":
+        return time.time()
+    try:
+        epoch = float(text)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"TINKER_SIM_CLOCK_EPOCH must be 'wall', unset, or a number, got {value!r}"
+        )
+    if not math.isfinite(epoch):
+        raise ValueError("TINKER_SIM_CLOCK_EPOCH must be finite")
+    return epoch
 
 
 def _fused_apply_actuator_model(self) -> None:
@@ -964,6 +998,14 @@ class IsaacWholeRobotBackend:
         # monotonic-clock continuation across STOP -> PLAY resets (see
         # _refresh_robot_handles).
         self._clock_elapsed_steps = 0
+        # Boot epoch (seconds) the *published* clock (ros_clock_time) is
+        # anchored to -- see resolve_clock_epoch and TINKER_SIM_CLOCK_EPOCH.
+        # Captured once per process so a full sim-process restart's first
+        # /clock sample never appears to precede a prior process's last one.
+        # `simulation_time` itself (elapsed sim time since this backend was
+        # constructed) is unchanged and stays the small process-relative
+        # value internal timers/run-duration gating already rely on.
+        self._clock_epoch_s = resolve_clock_epoch(_os.environ.get("TINKER_SIM_CLOCK_EPOCH"))
         import omni.kit.app
 
         # Flush USD/Fabric stage notices before SimulationContext creates the
@@ -1512,6 +1554,24 @@ class IsaacWholeRobotBackend:
         # clock from here instead of jumping backwards (_refresh_robot_handles).
         self._clock_elapsed_steps = steps
         return float(steps) * self.physics_dt
+
+    @property
+    def ros_clock_time(self) -> float:
+        """The value to publish on ``/clock`` (and stamp ROS message headers
+        with): ``simulation_time`` anchored to this process's boot epoch
+        (``TINKER_SIM_CLOCK_EPOCH``, ``resolve_clock_epoch``).
+
+        ``simulation_time`` itself stays a small, process-relative elapsed
+        value (unaffected by the epoch) so internal consumers that already
+        depend on it starting near zero -- run-duration gating in
+        ``validation/run_sim.py``, the base-hold timers, truth-record ``t``
+        fields -- keep their existing meaning. Only the externally published
+        clock needs to be monotonic across a full sim-process restart (task
+        #21): a fresh process's `/clock` must never appear to precede a
+        prior process's last published sample, matching hardware parity
+        (real ROS time is wall-clock and never goes backward).
+        """
+        return self.simulation_time + self._clock_epoch_s
 
     @property
     def physics_frame_index(self) -> int:
