@@ -348,6 +348,97 @@ instead (`task20-decay-probe-findings.md`'s "Live datapoint" entries).
 `SF3_CHAIN_DONE` markers in `$TMP/stallfreeze3.log` for a follow-up GPU
 session to run; `REPO_ROOT` defaults to this worktree.
 
+## 2026-09-06 — Task #20 review response: physics-dt plateau force, main's exact step() order when disabled, PR #16 closed
+
+**Context.** `fix-gripper-stall-freeze-20` (tip `b1fc2f6`, round 3 above) got
+a REQUEST-CHANGES review (`$TMP/task20-review.md`) with four findings. This
+round addresses findings 2 and 3; finding 1 and finding 4 are handled as
+below.
+
+**Finding 1 (architectural collision with `fix-gripper-mirror-control-rate-
+29` / PR #16) is now moot: PR #16 is CLOSED and will not merge.** It would
+have moved `_ramp_drive_target`/`_mirror_gripper_mimic_targets` into
+`_step_simulation()`, called once per physics substep, which would have
+given the stall-freeze gate (a once-per-control-tick hook) no place to
+suppress those calls during HOLD -- silently reproducing the creep this
+whole feature exists to fix. With #16 dropped, that collision cannot occur;
+no code change was needed for this finding, only this note.
+
+**Finding 2 -- plateau force scale was wrong at `control_hz < physics_hz`
+(the recommended production config).** `_gripper_grip_force()` (the
+PLATEAU detector's pad-force read, also what the facade's
+`/sim/parity/finger_contact` reads) sums `contact_state()` entries built by
+`_on_contact_report_event`, which computed `normal_force = sum(impulse) /
+self.dt` -- the control-tick period. PhysX's `subscribe_contact_report_
+events` callback fires once per solver SUBSTEP (`physics_dt =
+1/physics_hz`), independent of `control_hz`; at the recommended
+`TINKER_SIM_CONTROL_HZ=30` / physics 120 Hz config, `physics_substeps=4` and
+`self.dt` (1/30) is 4x `physics_dt` (1/120), so the reported force -- and
+therefore the plateau's `STALL_CONTACT_N` gate -- was under-counted 4x
+(`fix-contact-force-physics-dt-29`'s own A/B probe: 20.74N at 120 Hz control
+vs a wrong 5.12N at 30 Hz, identical trajectory). Fixed by the same one-line
+change as that branch's commit 2ec9639 (not yet on `main`): divide by
+`self.physics_dt` instead, with a comment cross-referencing #29/#17 so a
+future merge with that branch is a no-op here. `_gripper_grip_force()`
+itself needed no change -- it only sums `contact_state()`, so fixing the
+root (`_on_contact_report_event`) fixes it for free.
+
+**Finding 3 -- the disabled path (`TINKER_SIM_GRIPPER_STALL_FREEZE=0`) was
+not byte-identical to main's `step()` call order.** On `b1fc2f6`,
+`_gripper_stall_freeze_gate()` called `_ramp_drive_target()` then
+`_mirror_gripper_mimic_targets()` itself and returned, *before* `step()`'s
+`if getattr(self, "base_fixed", False): self._apply_base_hold()` line --
+main's order was ramp, apply_base_hold, mirror. Functionally inert today
+(`_apply_base_hold()` only writes root pose/velocity, never touches
+`_position_targets`), but a literal contract violation the existing
+byte-identity test didn't catch (it exercised only the gate in isolation).
+Fixed by having `_gripper_stall_freeze_gate()` return a `bool` -- True when
+the caller must still run `_mirror_gripper_mimic_targets()` itself (the
+feature disabled, or CLOSING with no plateau this tick), False when
+PRESS/HOLD (or a same-tick PLATEAU freeze) already froze the six targets and
+mirroring would overwrite that freeze with the drive's live measured angle.
+`step()` now calls the mirror itself, after `_apply_base_hold()`, exactly
+reproducing main's order in the disabled case. `_gripper_stall_freeze_check_
+plateau()` reads the physically measured `joint_pos` (not `_position_
+targets`), so deferring the CLOSING-state mirror call past it is
+behaviourally identical there too.
+
+**Tests** (`tests/test_manipulation_runtime.py`): four pre-existing contact-
+report tests (`test_contact_report_uses_identified_bodies_and_reported_
+normal`, `..._sums_normal_impulses_without_tangential_cancellation`,
+`..._uses_deterministic_normal_for_degenerate_average`,
+`..._first_event_logged_exactly_once`) switch their `backend.dt = 0.1` setup
+to `backend.physics_dt = 0.1` -- same rename #17 makes, kept aligned so a
+future merge is textually trivial. New: `test_contact_report_force_divides_
+by_physics_dt_not_control_dt` and `test_contact_report_force_at_matched_
+rates_is_byte_identical_path` (identical to #17's own tests, same names) plus
+`test_gripper_grip_force_matches_across_control_hz_for_same_impulse`, which
+drives `_on_contact_report_event` then `_gripper_grip_force()` directly at
+control_hz 120 vs 30 (physics_hz 120 fixed) for the same impulse and asserts
+the two grip forces are equal. **Fails on `b1fc2f6`:**
+```
+AssertionError: 1.5 != 6.0 within 7 places (4.5 difference)
+```
+`test_gripper_stall_freeze_disabled_calls_ramp_and_mirror_only` is updated
+for the gate's new `bool` return (asserts `True` and `calls == ["ramp"]`,
+mirror no longer called from inside the gate). New:
+`test_gripper_stall_freeze_disabled_step_matches_main_call_order` drives a
+full `step()` double (not the gate in isolation) with `base_fixed=True` and
+asserts `calls == ["slew", "ramp", "apply_base_hold", "mirror"]`. **Fails on
+`b1fc2f6`:**
+```
+AssertionError: Lists differ: ['slew', 'ramp', 'mirror', 'apply_base_hold'] != ['slew', 'ramp', 'apply_base_hold', 'mirror']
+```
+`test_rebind_resets_frozen_hold_state_to_closing` updated for the same
+return-value contract change (`calls == ["ramp", "plateau"]`, gate returns
+`True`). Full suite: `tests/test_manipulation_runtime.py` 125 passed, 3
+subtests passed, 0 failed (via the pytest-suite-ros-env-incantation memory).
+
+**Finding 4 (HOLD never re-checks contact loss) stays a documented open
+item**, per the review's own framing: it matches the literal RELEASE-on-new-
+command contract as specified, and is already tracked in
+`task20-decay-probe-findings.md`.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported

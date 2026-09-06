@@ -1753,7 +1753,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_uses_identified_bodies_and_reported_normal(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_persist = "persist"
         backend._contact_event_lost = "lost"
@@ -1796,7 +1796,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_sums_normal_impulses_without_tangential_cancellation(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -1841,7 +1841,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_uses_deterministic_normal_for_degenerate_average(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -1878,6 +1878,144 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(float(pair["normal_force"]), 40.0)
         self.assertEqual(pair["normal"], [0.0, 0.0, 1.0])
 
+    def test_contact_report_force_divides_by_physics_dt_not_control_dt(self) -> None:
+        # Task #29: subscribe_contact_report_events fires once per PhysX
+        # solver SUBSTEP (physics_dt = 1/physics_hz), regardless of
+        # control_hz, so the impulse it delivers is a physics_dt-sized
+        # sample. At control_hz=30 with physics_hz=120 there are
+        # physics_substeps=4 substeps per control tick and self.dt (1/30)
+        # is 4x physics_dt (1/120) -- dividing by self.dt under-reports the
+        # true force by 4x (probe A/B: 20.74 N @120 Hz vs 5.12 N @30 Hz on
+        # an identical drive/pad/tilt trajectory). The formula must divide
+        # by physics_dt, the substep's own integration window, not by the
+        # control-tick dt. Aligned with fix-contact-force-physics-dt-29
+        # (2ec9639) -- #20 review finding 2.
+        backend = _backend()
+        backend.physics_hz = 120.0
+        backend.control_hz = 30.0
+        backend.physics_dt = 1.0 / 120.0
+        backend.dt = 1.0 / 30.0
+        backend.physics_substeps = 4
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/left_finger",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 0.05),
+            position=(0.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pair = backend.contact_pairs()[0]
+        # impulse (0.05) / physics_dt (1/120) == 6.0 N -- the correct value.
+        self.assertAlmostEqual(float(pair["normal_force"]), 6.0)
+        # impulse (0.05) / self.dt (1/30) == 1.5 N -- the pre-fix bug value,
+        # exactly 4x too low. Must NOT be what gets recorded.
+        self.assertNotAlmostEqual(float(pair["normal_force"]), 1.5)
+
+    def test_contact_report_force_at_matched_rates_is_byte_identical_path(self) -> None:
+        # When control_hz == physics_hz, self.dt == self.physics_dt, so the
+        # fixed formula (divide by physics_dt) must reproduce exactly the
+        # same value the old formula (divide by self.dt) gave at 120 Hz --
+        # the fix must not disturb the already-correct 120/120 case.
+        backend = _backend()
+        backend.physics_hz = 120.0
+        backend.control_hz = 120.0
+        backend.physics_dt = 1.0 / 120.0
+        backend.dt = 1.0 / 120.0
+        backend.physics_substeps = 1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/left_finger",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 0.05),
+            position=(0.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pair = backend.contact_pairs()[0]
+        self.assertAlmostEqual(float(pair["normal_force"]), 0.05 * 120.0)
+        self.assertAlmostEqual(float(pair["normal_force"]), 6.0)
+
+    def test_gripper_grip_force_matches_across_control_hz_for_same_impulse(self) -> None:
+        """#20 review finding 2: _gripper_grip_force() -- the PLATEAU
+        detector's pad-force read -- sums contact_state() entries built
+        from _on_contact_report_event's normal_force, which the physics_dt
+        fix above (aligned with fix-contact-force-physics-dt-29, 2ec9639)
+        scales by physics_dt, not the control-tick dt. The plateau force
+        for the SAME physical impulse must therefore be identical whether
+        control_hz is 120 (dt == physics_dt) or 30 (physics_substeps=4,
+        dt == 4*physics_dt) -- the plateau's STALL_CONTACT_N gate must not
+        silently move with the control rate. Fails on b1fc2f6, which
+        divided by self.dt: control_hz=30 reports 1/4 of the control_hz=120
+        force for the identical impulse."""
+
+        def _grip_force(control_hz: float, physics_hz: float) -> float:
+            backend = _backend()
+            backend.physics_hz = physics_hz
+            backend.control_hz = control_hz
+            backend.physics_dt = 1.0 / physics_hz
+            backend.dt = 1.0 / control_hz
+            backend.physics_substeps = max(1, round(physics_hz / control_hz))
+            backend._contact_event_found = "found"
+            backend._contact_event_lost = "lost"
+            backend._contact_event_persist = "persist"
+            backend._contact_path_decoder = {
+                1: "/World/Tinker/left_finger",
+                2: "/World/Scenario/delivery_object",
+            }.__getitem__
+            header = SimpleNamespace(
+                actor0=1,
+                actor1=2,
+                collider0=11,
+                collider1=22,
+                type="found",
+                contact_data_offset=0,
+                num_contact_data=1,
+            )
+            sample = SimpleNamespace(
+                impulse=(0.0, 0.0, 0.05),
+                position=(0.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+            )
+            backend._on_contact_report_event([header], [sample])
+            return backend._gripper_grip_force()
+
+        force_120 = _grip_force(120.0, 120.0)
+        force_30 = _grip_force(30.0, 120.0)
+        self.assertAlmostEqual(force_120, 6.0)
+        self.assertAlmostEqual(force_30, force_120)
+        # The pre-fix bug value (impulse / self.dt at 1/30) would be 1.5 N
+        # -- 4x too low. Must NOT be what _gripper_grip_force() returns.
+        self.assertNotAlmostEqual(force_30, 1.5)
+
     def test_contact_report_first_event_logged_exactly_once(self) -> None:
         # #28 observability: a stale contacts-off boot produced a
         # structurally-silent /sim/truth/contacts for a whole bench round
@@ -1885,7 +2023,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # must print a one-line marker exactly once per backend life, not
         # once per contact (see _on_contact_report_event).
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -2637,15 +2775,48 @@ class ManipulationRuntimeTest(unittest.TestCase):
         """TINKER_SIM_GRIPPER_STALL_FREEZE=0 must be byte-identical to
         pre-#20 behaviour: step() calls the ramp and mirror unconditionally,
         the plateau detector never runs, and the state machine never leaves
-        CLOSING."""
+        CLOSING.
+
+        The gate itself only runs the ramp and returns True (mirror must
+        still run) -- it defers the mirror call to step(), which runs it
+        AFTER _apply_base_hold() to reproduce main's exact order (#20
+        review finding 3; see test_gripper_stall_freeze_disabled_step_
+        matches_main_call_order below for the full step() version of this
+        contract)."""
         backend = _gsf_backend()
         backend._gripper_stall_freeze_enabled = False
         calls: list[str] = []
         backend._ramp_drive_target = lambda: calls.append("ramp")
         backend._mirror_gripper_mimic_targets = lambda: calls.append("mirror")
         backend._gripper_stall_freeze_check_plateau = lambda: calls.append("plateau")
-        backend._gripper_stall_freeze_gate()
-        self.assertEqual(calls, ["ramp", "mirror"])
+        self.assertTrue(backend._gripper_stall_freeze_gate())
+        self.assertEqual(calls, ["ramp"])
+        self.assertEqual(backend._gsf_state, "closing")
+
+    def test_gripper_stall_freeze_disabled_step_matches_main_call_order(self) -> None:
+        """#20 review finding 3: with TINKER_SIM_GRIPPER_STALL_FREEZE=0 the
+        full step() call sequence must be BYTE-IDENTICAL to main's order --
+        _ramp_drive_target(), then (if base_fixed) _apply_base_hold(), then
+        _mirror_gripper_mimic_targets() -- not ramp+mirror before
+        apply_base_hold, which is what step() did on b1fc2f6 (the gate
+        called the mirror itself, before step()'s own
+        ``if getattr(self, "base_fixed", False): self._apply_base_hold()``
+        line). Exercises the real step(), not
+        _gripper_stall_freeze_gate() in isolation, so a reordering at
+        either level is caught. Fails on b1fc2f6:
+        AssertionError: Lists differ: ['slew', 'ramp', 'mirror', 'apply_base_hold'] != ['slew', 'ramp', 'apply_base_hold', 'mirror']
+        """
+        backend = _gsf_backend()
+        backend._gripper_stall_freeze_enabled = False
+        backend.base_fixed = True
+        calls: list[str] = []
+        backend._slew_wheel_targets = lambda: calls.append("slew")
+        backend._ramp_drive_target = lambda: calls.append("ramp")
+        backend._apply_base_hold = lambda: calls.append("apply_base_hold")
+        backend._mirror_gripper_mimic_targets = lambda: calls.append("mirror")
+        backend._gripper_stall_freeze_check_plateau = lambda: calls.append("plateau")
+        backend.step()
+        self.assertEqual(calls, ["slew", "ramp", "apply_base_hold", "mirror"])
         self.assertEqual(backend._gsf_state, "closing")
 
     def test_gripper_stall_freeze_plateau_needs_dwell_eps_and_contact(self) -> None:
@@ -3505,15 +3676,18 @@ class GripperStallFreezeRebindTest(unittest.TestCase):
         self.assertIsNone(backend._gsf_last_command)
 
         # The next step must re-derive targets from whatever command is
-        # live now, not stay wedged -- the CLOSING path (ramp + mirror +
-        # plateau check), not the HOLD no-op, must run.
+        # live now, not stay wedged -- the CLOSING path (ramp + plateau
+        # check), not the HOLD no-op, must run. The gate itself no longer
+        # calls the mirror (#20 review finding 3 -- see
+        # _gripper_stall_freeze_gate's docstring); it returns True so
+        # step() runs the mirror after _apply_base_hold() instead.
         calls: list[str] = []
         backend._ramp_drive_target = lambda: calls.append("ramp")
         backend._mirror_gripper_mimic_targets = lambda: calls.append("mirror")
         backend._gripper_stall_freeze_check_plateau = lambda: calls.append("plateau")
         backend._drive_command_target = 0.85
-        backend._gripper_stall_freeze_gate()
-        self.assertEqual(calls, ["ramp", "mirror", "plateau"])
+        self.assertTrue(backend._gripper_stall_freeze_gate())
+        self.assertEqual(calls, ["ramp", "plateau"])
 
     def test_recovery_rebind_leaves_frozen_hold_state_untouched(self) -> None:
         """The mid-run, state-PRESERVING view recovery

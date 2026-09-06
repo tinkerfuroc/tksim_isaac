@@ -2848,22 +2848,33 @@ class IsaacWholeRobotBackend:
         for index in mimic_indices:
             self._position_targets[0, index] = follower_target
 
-    def _gripper_stall_freeze_gate(self) -> None:
-        """Dispatch each control tick to either the plain ramp+mirror path or
-        the #20 stall-freeze state machine (see __init__ for the full model).
+    def _gripper_stall_freeze_gate(self) -> bool:
+        """Dispatch each control tick to either the plain ramp path or the
+        #20 stall-freeze state machine (see __init__ for the full model).
 
         Called from step() in place of the unconditional
         ``_ramp_drive_target() ... _mirror_gripper_mimic_targets()`` pair.
-        With the feature off, or before articulation setup has populated
-        ``_drive_joint_index`` (bare test doubles), this calls exactly that
-        pair and returns -- the env-off byte-identical requirement holds
-        trivially because the state machine below is never reached.
+        Returns True when the caller must still run
+        ``_mirror_gripper_mimic_targets()`` itself -- the feature disabled,
+        or CLOSING with no plateau this tick -- and False when the mimic
+        followers must NOT be touched because PRESS/HOLD already froze
+        them (running the mirror afterward would overwrite the freeze with
+        the drive's live measured angle).
+
+        Deferring the mirror call to the caller (rather than calling it
+        here) lets step() run it in the exact position main did --
+        ``_ramp_drive_target()``, then (if base_fixed) ``_apply_base_hold()``,
+        then ``_mirror_gripper_mimic_targets()`` -- instead of before
+        ``_apply_base_hold()``. #20 review finding 3: with the feature off
+        (or before articulation setup has populated ``_drive_joint_index``,
+        bare test doubles) this calls only ``_ramp_drive_target()`` and
+        returns True, so step() reproduces main's call order byte-for-byte;
+        the state machine below is never reached in that case.
         """
         drive_index = getattr(self, "_drive_joint_index", None)
         if drive_index is None or not getattr(self, "_gripper_stall_freeze_enabled", True):
             self._ramp_drive_target()
-            self._mirror_gripper_mimic_targets()
-            return
+            return True
         command = getattr(self, "_drive_command_target", None)
         state = getattr(self, "_gsf_state", "closing")
         if state != "closing" and command is not None and command != getattr(self, "_gsf_last_command", None):
@@ -2876,15 +2887,21 @@ class IsaacWholeRobotBackend:
         self._gsf_last_command = command
         if state == "press":
             self._gripper_stall_freeze_press_tick()
-            return
+            return False
         if state == "hold":
             # Targets are frozen; nothing writes them while held.
-            return
-        # CLOSING (default): unchanged #19 ramp + measured-angle mimic, plus
-        # the plateau detector that can arm PRESS below.
+            return False
+        # CLOSING (default): unchanged #19 ramp, plus the plateau detector
+        # that can arm PRESS/HOLD below. The measured-angle mimic mirror is
+        # deferred to the caller (see docstring) so it still runs after
+        # _apply_base_hold(); check_plateau reads the physically measured
+        # joint_pos, not _position_targets, so mirroring before or after it
+        # is behaviourally identical -- UNLESS this tick's plateau just
+        # froze the six targets (state left "closing"), in which case the
+        # caller must skip the mirror this tick.
         self._ramp_drive_target()
-        self._mirror_gripper_mimic_targets()
         self._gripper_stall_freeze_check_plateau()
+        return self._gsf_state == "closing"
 
     def _gripper_stall_freeze_check_plateau(self) -> None:
         """CLOSING-state plateau detector.
@@ -3251,6 +3268,7 @@ class IsaacWholeRobotBackend:
             if self._refresh_robot_handles():
                 self._robot.update(self.dt)
             return
+        _run_mirror = False
         if self._safety_stopped:
             if self._safety_snapshot is None:
                 self._safety_snapshot = self._robot.data.joint_pos.clone()
@@ -3263,7 +3281,16 @@ class IsaacWholeRobotBackend:
             self._apply_safety_actuator_hold()
         else:
             self._slew_wheel_targets()
-            self._gripper_stall_freeze_gate()
+            # _gripper_stall_freeze_gate() runs _ramp_drive_target() (and,
+            # when enabled, the #20 plateau/press/hold state machine)
+            # itself, but returns without calling
+            # _mirror_gripper_mimic_targets() -- see its docstring. That
+            # call is made below, AFTER _apply_base_hold(), so the disabled
+            # (TINKER_SIM_GRIPPER_STALL_FREEZE=0) path reproduces main's
+            # exact call order: ramp, apply_base_hold, mirror (#20 review
+            # finding 3). PRESS/HOLD ticks and a same-tick PLATEAU freeze
+            # return False and must not be mirrored over.
+            _run_mirror = self._gripper_stall_freeze_gate()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
         if self._safety_stopped:
@@ -3271,6 +3298,8 @@ class IsaacWholeRobotBackend:
             # the mimic mirror still runs so the followers track whatever
             # measured drive angle the latched snapshot holds, unchanged from
             # before this feature existed.
+            self._mirror_gripper_mimic_targets()
+        elif _run_mirror:
             self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
@@ -4298,7 +4327,24 @@ class IsaacWholeRobotBackend:
                     continue
                 normal_impulses.append((abs(projected_impulse), normal, sample_index))
 
-            normal_force = sum(value[0] for value in normal_impulses) / self.dt
+            # subscribe_contact_report_events fires this callback once per
+            # PhysX solver SUBSTEP (physics_dt = 1/physics_hz), independent
+            # of control_hz: with physics_substeps = physics_hz/control_hz
+            # substeps per control tick, self.dt (1/control_hz) is
+            # physics_substeps times too large whenever control_hz <
+            # physics_hz. The callback receives no per-step dt/current_time
+            # argument (only contact_headers, contact_data), so the impulse
+            # -- itself accumulated over exactly one physics_dt -- must be
+            # converted to a force with physics_dt, not the control-tick
+            # self.dt (Task #29; confirmed by A/B probe: 20.74 N at 120 Hz
+            # vs a wrong 5.12 N at 30 Hz for an identical trajectory).
+            # _gripper_grip_force() (the #20 stall-freeze PLATEAU detector's
+            # pad-force read) consumes this same contact_state()/
+            # contact_pairs() value, so this fix also corrects the plateau
+            # force at control_hz < physics_hz configs (#20 review finding
+            # 2); aligned with fix-contact-force-physics-dt-29 (2ec9639) so
+            # a future merge with that branch is a no-op here.
+            normal_force = sum(value[0] for value in normal_impulses) / self.physics_dt
             if normal_force <= self.CONTACT_FORCE_THRESHOLD:
                 self._contact_pairs_by_key.pop(key, None)
                 continue
