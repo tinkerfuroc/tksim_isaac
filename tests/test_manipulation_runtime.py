@@ -1934,6 +1934,91 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertIn("/sim/internal/physics_truth", source)
         self.assertNotIn("self.truth_pub", source)
 
+    def test_finger_contact_wrench_publishes_every_tick_not_at_status_cadence(self) -> None:
+        """Bug #22: /sim/parity/finger_contact was nested inside the 2 Hz
+        _status_stride heartbeat block, so it read all-zero across most of a
+        grasp trial even while /sim/internal/physics_truth (unconditional,
+        every tick) carried real contact force. The wrench must publish on
+        every control tick, independent of the status cadence."""
+        from builtin_interfaces.msg import Time
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import WrenchStamped
+
+        class _ContactBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {
+                    "left_finger": {"force": 3.5},
+                    "right_finger": {"force": 2.5},
+                }
+
+            def physics_truth_frame(self, token):
+                return {}
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _ContactBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway._camera_rig = None
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        # Large strides so state/imu/status only fire on tick 0 (0 % N == 0
+        # for any N); every subsequent tick must skip the status heartbeat.
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(
+            len(gateway.status_pub.messages), 1,
+            "status heartbeat should only fire on tick 0 with a huge stride",
+        )
+        self.assertEqual(
+            len(gateway.contact_pub.messages), 3,
+            "finger_contact wrench must publish every tick, not gated on "
+            "_status_stride like the status heartbeat",
+        )
+        forces = [msg.wrench.force.z for msg in gateway.contact_pub.messages]
+        self.assertTrue(all(abs(force - 6.0) < 1e-6 for force in forces))
+
     def test_gateway_publishes_raw_truth_without_persisting_physics_truth(self) -> None:
         source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
             encoding="utf-8"

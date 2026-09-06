@@ -1216,18 +1216,22 @@ class RosStandardGateway:
             message = self._String()
             message.data = json.dumps(status, sort_keys=True)
             self.status_pub.publish(message)
-            contacts = self.backend.contact_state()
-            force = sum(
-                float(item["force"])
-                for name, item in contacts.items()
-                if name in {"left_finger", "right_finger"}
-            )
-            contact = self._WrenchStamped()
-            contact.header.stamp = stamp
-            contact.header.frame_id = "link_tcp"
-            contact.wrench.force.z = float(force)
-            self.contact_pub.publish(contact)
         _lap("status")
+        # Published every tick (not gated on _status_stride): a 2 Hz sample
+        # misses transient/marginal grasp contact and reads zero for most of
+        # a trial, while /sim/internal/physics_truth below (also unconditional)
+        # carries the real force. Keep this at the same cadence as that block.
+        contacts = self.backend.contact_state()
+        force = sum(
+            float(item["force"])
+            for name, item in contacts.items()
+            if name in {"left_finger", "right_finger"}
+        )
+        contact = self._WrenchStamped()
+        contact.header.stamp = stamp
+        contact.header.frame_id = "link_tcp"
+        contact.wrench.force.z = float(force)
+        self.contact_pub.publish(contact)
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {
