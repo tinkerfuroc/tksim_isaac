@@ -4,6 +4,63 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #28: contact-report enablement was invisible in the sim log
+
+**Symptom.** A whole bench round (`agv`) came back with `/sim/truth/contacts`
+publishing nothing, `/sim/parity/finger_contact` flat zero on every axis for
+its entire ~6100-sample force trace, and every physics-truth frame's
+`contacts` field an empty list — a structurally-silent contact pipeline with
+no error, no exception, and nothing distinguishing it in the sim's stdout
+from a genuinely contact-free round.
+
+**Diagnosis.** Not a regression in the round's own code path. PhysX contact
+reporting is decided exactly once, at `IsaacWholeRobotBackend.__init__`
+(`simulation/tinker_sim_isaac/backend.py`), from the `enable_contacts`
+constructor argument — which the sensor-rich launch path derives from
+`TINKER_SIM_SENSOR_RICH_CONTACTS` (`validation/run_sim.py`). There is no
+later re-check: if that boot's environment lacked the flag, the
+`subscribe_contact_report_events` call is skipped entirely and
+`_on_contact_report_event` (the sole writer of the backend's contact-pairs
+dict, which both `/sim/parity/finger_contact` and physics-truth's `contacts`
+list read from) never fires for the rest of that process's life — no matter
+what changes afterward in the launched task stack. Round `agv`'s bringup
+(`restart_c_by_pid.sh`) explicitly restarts only the task-stack terminal
+("Isaac + control plane stay up"), so whatever `TINKER_SIM_SENSOR_RICH_CONTACTS`
+value the *already-running* Isaac Sim process booted with is the one that
+silently governs contacts for every subsequent round until Isaac itself is
+restarted — and nothing in the log said which value that was.
+
+**Fix (observability only, no behavior change).** Two new one-line JSON
+diagnostics in `backend.py`, alongside the existing `wheel_collider` /
+`solver_iterations` boot lines:
+- At `__init__`, right where `enable_contacts` is consumed:
+  `{"event": "contact_report", "enabled": <bool>, "source":
+  "TINKER_SIM_SENSOR_RICH_CONTACTS" | "constructor:enable_contacts",
+  "monitored_bodies": <count>}` — printed unconditionally, so a stale
+  contacts-off boot is visible in sim stdout without an `/proc/<pid>/environ`
+  read or a live force probe. `source` names the env gate when it was set,
+  falling back to naming the constructor argument for callers
+  (`manipulation-core`, probes) that pass `enable_contacts` explicitly.
+- In `_on_contact_report_event`, the first time a pair actually gets
+  recorded (not merely reported and filtered out): `{"event":
+  "contact_report_first_event", "simulation_time": <t>, "pair": [body_a,
+  body_b]}`, gated by a one-shot bool so it never repeats per-contact.
+
+**Operational rule.** For any round that depends on contacts, restart Isaac
+Sim itself — a task-stack-only restart keeps the prior process's
+`enable_contacts` decision no matter what the next launch wrapper exports.
+Before trusting a per-round env override, check the *running* process's own
+environment (`cat /proc/<pid>/environ | tr '\0' '\n' | grep
+TINKER_SIM_SENSOR_RICH_CONTACTS`), or now, simply read the `contact_report`
+boot line the backend already prints.
+
+Non-GPU coverage added (`tests/test_manipulation_runtime.py`,
+`test_contact_report_first_event_logged_exactly_once`): two recorded contact
+events (found, then persist) against a backend test double produce exactly
+one `contact_report_first_event` line, carrying the expected body-pair and a
+`simulation_time` field. Full suite: 103 passed, 3 subtests passed, 0
+failed.
+
 ## 2026-09-06 — Task #25: bound `controller_reconciler`'s post-success teardown so it cannot wedge the launch chain
 
 **Symptom.** In a live GPSR run (`gpsr_stack_logs/20260905T230818`), the
