@@ -29,9 +29,14 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
 )
 from tinker_sim_isaac.backend import (
+    GRIPPER_EFFORT_CEILING_NM,
+    GRIPPER_EFFORT_FULL_SCALE_N,
     IsaacWholeRobotBackend,
+    gripper_effort_limit_nm,
     resolve_backend_clock_epoch,
     resolve_clock_epoch,
+    resolve_gripper_effort_ceiling_nm,
+    resolve_gripper_effort_full_scale_n,
     resolve_spawn_yaw,
     resolve_spawn_yaw_via_view,
     resolve_use_fabric,
@@ -42,13 +47,33 @@ from manipulation_qualification import QualificationManifest, QualificationRunne
 from run_sim import _content_addressed_tinker_usd, _expected_scenario_objects
 
 
+class _FakeGripperRootView:
+    """Minimal double for the PhysX ArticulationView's max-force tensor API
+    (root_view.set_dof_max_forces / get_dof_max_forces), #20's direct-write
+    path. Holds one (1, num_joints) row, mirroring the real tensor-API shape.
+    """
+
+    def __init__(self, num_joints: int, initial: list[float]) -> None:
+        self._row = list(initial)
+        assert len(self._row) == num_joints
+        self.set_dof_max_forces_calls: list[dict[str, object]] = []
+
+    def set_dof_max_forces(self, forces: object, indices: object = None) -> None:
+        arr = forces.numpy() if hasattr(forces, "numpy") else forces
+        self._row = [float(value) for value in arr[0]]
+        self.set_dof_max_forces_calls.append({"forces": arr, "indices": indices})
+
+    def get_dof_max_forces(self) -> list[list[float]]:
+        return [list(self._row)]
+
+
 class _FakeRobot:
     device = "cpu"
     num_base_dofs = 2
 
     def __init__(self) -> None:
         self.is_initialized = True
-        self.root_view = object()
+        self.root_view = _FakeGripperRootView(2, [12.0, 30.0])
         self.data = SimpleNamespace(
             joint_names=("drive_joint", "joint1"),
             joint_pos=torch.tensor([[0.25, -0.4]], dtype=torch.float32),
@@ -174,6 +199,11 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._pending_snapshot_index = 0
     backend._pending_snapshot_commands = []
     backend._default_gripper_effort_limit = 12.0
+    # Equal to the ceiling above so gripper_effort_limit_nm degenerates to the
+    # pre-#20 min(requested, ceiling) behaviour these existing fixtures were
+    # written against; #20-specific tests override this to exercise the real
+    # proportional map (ceiling != full scale).
+    backend._gripper_effort_full_scale_n = 12.0
     backend._gripper_effort_limit = 12.0
     backend._expected_objects = {}
     backend._contact_pairs_by_key = {}
@@ -765,6 +795,224 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # A zero request that restores the default is also a no-op when repeated.
         backend._set_gripper_effort_limit(0.0)
         self.assertEqual(len(backend._robot.limit_calls), writes + 1)
+
+    def test_gripper_effort_limit_nm_mapping_monotone_and_capped(self) -> None:
+        """#20: GripperCommand.max_effort (N) -> drive_joint ceiling (N*m).
+
+        Real commanded values from the manipulation stack: grasp close and
+        pre-open both send native_gripper_max_effort = 10 N (full scale, maps
+        to the whole ceiling); grasp_benchmark's pre-open sends 5 N (half
+        scale); the bridge's own reopen sends 50 N (over-range, saturates at
+        the ceiling rather than over-shooting it). 0/None/negative all mean
+        "no explicit request", which resolves to the ceiling, matching the
+        pre-#20 default behaviour (not zero authority).
+        """
+        ceiling, full_scale = 2.5, 10.0
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(10.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(5.0, ceiling, full_scale), 1.25
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(50.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(0.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(None, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(-5.0, ceiling, full_scale), 2.5
+        )
+        self.assertAlmostEqual(
+            gripper_effort_limit_nm(float("nan"), ceiling, full_scale), 2.5
+        )
+        # Monotone over the reachable [0, full_scale] range.
+        samples = [0.0, 1.0, 2.5, 5.0, 7.5, 10.0]
+        mapped = [gripper_effort_limit_nm(value, ceiling, full_scale) for value in samples[1:]]
+        self.assertEqual(mapped, sorted(mapped))
+
+    def test_gripper_effort_ceiling_and_full_scale_env_overrides(self) -> None:
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm(None), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm(""), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(resolve_gripper_effort_ceiling_nm("3.0"), 3.0)
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm("not-a-number"), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(
+            resolve_gripper_effort_ceiling_nm("-1.0"), GRIPPER_EFFORT_CEILING_NM
+        )
+        self.assertEqual(
+            resolve_gripper_effort_full_scale_n(None), GRIPPER_EFFORT_FULL_SCALE_N
+        )
+        self.assertEqual(resolve_gripper_effort_full_scale_n("25"), 25.0)
+        self.assertEqual(
+            resolve_gripper_effort_full_scale_n("0"), GRIPPER_EFFORT_FULL_SCALE_N
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "TINKER_SIM_GRIPPER_EFFORT_CEILING_NM": "1.75",
+                "TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N": "20",
+            },
+        ):
+            backend = IsaacWholeRobotBackend.__new__(IsaacWholeRobotBackend)
+            backend._default_gripper_effort_limit = resolve_gripper_effort_ceiling_nm(
+                os.environ.get("TINKER_SIM_GRIPPER_EFFORT_CEILING_NM")
+            )
+            backend._gripper_effort_full_scale_n = resolve_gripper_effort_full_scale_n(
+                os.environ.get("TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N")
+            )
+        self.assertEqual(backend._default_gripper_effort_limit, 1.75)
+        self.assertEqual(backend._gripper_effort_full_scale_n, 20.0)
+
+    def test_gripper_joint_effort_limits_are_hardware_scale_in_config(self) -> None:
+        """RED config contract (#20): the 'gripper' (drive_joint) and
+        'gripper_mimic' (five followers) ImplicitActuatorCfg groups must both
+        set effort_limit_sim to the 2.5 N*m hardware-parity ceiling. Prior to
+        this fix, 'gripper' set no effort_limit_sim at all (runtime-only via
+        _set_gripper_effort_limit, default 80) and 'gripper_mimic' set 180 --
+        both far above the bracket threshold ($TMP/hwcap-result.md,
+        hwcap2-result.md) where the PD stalls at the clamp instead of tipping
+        the grasped object along the finger arc.
+
+        This must FAIL on main (2c1b51d): 'gripper' has no effort_limit_sim
+        keyword at all (AssertionError: gripper ImplicitActuatorCfg has no
+        effort_limit_sim -- runtime-only default 80, not hardware-scale) and
+        'gripper_mimic' resolves to 180.0, not 2.5.
+        """
+        backend_source = (
+            ROOT / "simulation/tinker_sim_isaac/backend.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(backend_source)
+
+        actuators: ast.Dict | None = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "ArticulationCfg":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "actuators" and isinstance(keyword.value, ast.Dict):
+                    actuators = keyword.value
+        self.assertIsNotNone(
+            actuators, "backend ArticulationCfg.actuators must be a dict literal"
+        )
+        assert actuators is not None
+
+        groups: dict[str, ast.Call] = {}
+        for key, value in zip(actuators.keys, actuators.values):
+            if isinstance(key, ast.Constant):
+                groups[str(key.value)] = value
+
+        for group_name in ("gripper", "gripper_mimic"):
+            self.assertIn(
+                group_name, groups, f"backend must define a '{group_name}' actuator group"
+            )
+            call = groups[group_name]
+            self.assertIsInstance(call, ast.Call)
+            effort_limit_sim = None
+            effort_limit = None
+            for kw in call.keywords:
+                if kw.arg == "effort_limit_sim":
+                    effort_limit_sim = kw.value
+                if kw.arg == "effort_limit":
+                    effort_limit = kw.value
+            self.assertIsNotNone(
+                effort_limit_sim,
+                f"'{group_name}' ImplicitActuatorCfg has no effort_limit_sim -- "
+                "must be 2.5 Nm hardware-parity ceiling",
+            )
+            value = ast.literal_eval(effort_limit_sim)
+            self.assertEqual(
+                float(value),
+                2.5,
+                f"'{group_name}' effort_limit_sim must equal the 2.5 Nm hardware "
+                f"torque ceiling (#20 bracket), got {value}",
+            )
+            if effort_limit is not None:
+                # If effort_limit is also set (not currently the case), it must
+                # agree with effort_limit_sim rather than silently diverge.
+                self.assertEqual(float(ast.literal_eval(effort_limit)), 2.5)
+
+    def test_set_gripper_effort_limit_maps_commanded_effort_proportionally(self) -> None:
+        """The runtime path (production ceiling/full-scale, not the 1:1 test
+        fixture default) must apply gripper_effort_limit_nm, not pass the
+        commanded N through as N*m."""
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+
+        backend._set_gripper_effort_limit(10.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 2.5)
+
+        backend._set_gripper_effort_limit(5.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 1.25)
+
+        backend._set_gripper_effort_limit(50.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 2.5)
+
+        backend._set_gripper_effort_limit(0.0)
+        self.assertAlmostEqual(backend.gripper_effort_limit, 2.5)
+
+    def test_set_gripper_effort_limit_writes_direct_physx_max_force(self) -> None:
+        """#20: write_joint_effort_limit_to_sim_index alone was proven (probe
+        cap5-analysis) not to guarantee the cap reaches the PhysX solver for
+        these mimic-coupled joints. _set_gripper_effort_limit must also push
+        the mapped limit straight onto the PhysX tensor view
+        (root_view.set_dof_max_forces) so the runtime ceiling actually binds,
+        and the readback (root_view.get_dof_max_forces) must reflect it.
+        """
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+        root_view = backend._robot.root_view
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._set_gripper_effort_limit(5.0)
+
+        self.assertEqual(len(root_view.set_dof_max_forces_calls), 1)
+        drive_index = backend._joint_index["drive_joint"]
+        written = root_view.set_dof_max_forces_calls[0]["forces"]
+        self.assertAlmostEqual(float(written[0][drive_index]), 1.25)
+        self.assertAlmostEqual(
+            float(root_view.get_dof_max_forces()[0][drive_index]), 1.25
+        )
+
+        events = [
+            json.loads(line)
+            for line in captured.getvalue().splitlines()
+            if line.strip()
+        ]
+        effort_events = [event for event in events if event.get("event") == "gripper_effort_limit"]
+        self.assertEqual(len(effort_events), 1)
+        self.assertAlmostEqual(effort_events[0]["commanded_n"], 5.0)
+        self.assertAlmostEqual(effort_events[0]["limit_nm"], 1.25)
+        self.assertAlmostEqual(effort_events[0]["physx_max_force"][0], 1.25)
+
+    def test_gripper_low_effort_pre_open_maps_above_zero(self) -> None:
+        """#20 coordinator correction: pre-open commands (5 N from
+        grasp_benchmark, 10 N native default elsewhere) must map to a
+        strictly positive joint ceiling -- enough authority to open the
+        gripper in free air, unlike a hypothetical zero-effort mapping. Live
+        free-air-open timing is validated by the bench round (staged
+        acceptance: $TMP/effortcap_chain.sh); this is the unit-level floor
+        the coordinator asked for as a fallback since this worktree cannot
+        launch the sim.
+        """
+        ceiling, full_scale = GRIPPER_EFFORT_CEILING_NM, GRIPPER_EFFORT_FULL_SCALE_N
+        for pre_open_n in (5.0, 10.0):
+            with self.subTest(pre_open_n=pre_open_n):
+                mapped = gripper_effort_limit_nm(pre_open_n, ceiling, full_scale)
+                self.assertGreater(mapped, 0.0)
 
     def test_position_only_command_clears_affected_velocity_target(self) -> None:
         backend = _backend()

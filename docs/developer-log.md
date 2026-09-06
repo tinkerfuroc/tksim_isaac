@@ -4,6 +4,164 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
+
+**The whole #20 chain, in brief.** The gripper's "creep" (an object tipping
+along the finger arc and eventually escaping the jaw under a sustained
+close) was chased through a long series of levers, each measured and
+falsified in turn: object/pad friction magnitude and type, torsional
+friction radius, contact/collision approximation (SDF vs convex hull),
+follower stiffness/damping, follower effort-limit cap alone (5 through 180,
+bit-identical 15 s hold physics -- proof `write_joint_effort_limit_to_sim_
+index` alone does not guarantee a cap reaches the PhysX solver for these
+mimic-coupled joints), drive-cap alone, mirror-mode (target vs measured),
+and a stall-triggered position freeze (PR #19, `fix-gripper-stall-freeze-20`)
+that arrested the creep in isolated bench legs but could not hold a
+sustained clamp FORCE once the object had already yielded the freeze's lead
+tolerance -- the bench acceptance round (`agy`) lost both a sugar box (force
+relaxed 16 -> 1.8 N in 0.6 s once frozen) and a soup can (crept faster than
+the freeze could arm, 0.08 rad/s). The actual mechanism, confirmed by a
+freeze-all-six-targets-at-contact trace, is that the creep is the PD's
+*continued advance* toward an unreachable close target -- the followers'
+mimic control mirrors drive_joint's target every step, so as long as the
+drive keeps asking to close further, the followers keep pushing the object
+along the arc even after contact, regardless of any friction/material lever.
+That reframes the freeze fix (PR #19) as a symptom patch, now superseded.
+
+**The lever that actually holds: torque authority, not position.** A
+real xArm gripper is position-controlled but torque-LIMITED -- it stalls at
+its own clamp torque instead of continuing to overhaul the servo target
+through the object. The sim's effort limits were nowhere near hardware
+scale (drive 50 N*m, followers 180 N*m -- the follower cap's own comment
+sized it only to keep drive_joint's 0 lower limit enforceable, not for
+grip-force parity). A hardware-scale torque-cap bracket
+(`validation/gripper_close_probe.py --drive-effort-limit`/
+`--follower-effort-limit`, ported straight PhysX tensor-API write +
+readback since the Isaac Lab writer alone was proven insufficient;
+`$TMP/hwcap-result.md`, `$TMP/hwcap2-result.md`) swept drive+follower caps
+together on a 15 s bottle side-pinch hold + lift:
+
+| cap (N*m) | drive advance | tilt @15s | pad force (N) | lift |
+|---|---|---|---|---|
+| 1.5/1.5 | holds (-0.014 rad) | ~1° | 7-10 | retained |
+| 2.0/2.0 | holds (-0.017 rad) | ~1° | 10-14 | retained (borderline tilt) |
+| 2.5/2.5 | holds (flat, target never approached) | ~0.01° | 11-18 | retained (best) |
+| 3.0/3.0 | creeps (+0.10 rad) | 16° | 18-23 | dropped |
+| 50/180 (control) | runs away (+0.57 rad) | 55° | 0 | lost before lift |
+
+2.5 N*m is the highest cap that holds; the threshold sits between 2.5 and
+3.0. Raising the follower cap independently of the drive cap (2.0 drive /
+5.0 follower) gave no force benefit -- follower `physx_tau` stayed well
+under even the 2.5 cap, confirming the drive cap alone sets the stall
+point. A sugar box at 2.0/2.0 held through 15 s with no one-pad dropout
+(the uncapped control lost it at 11.6 s).
+
+**Fix.** `simulation/tinker_sim_isaac/backend.py`:
+- `GRIPPER_EFFORT_CEILING_NM = 2.5` (module constant, env-overridable via
+  `TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`) replaces the old
+  `DEFAULT_GRIPPER_EFFORT_LIMIT = 80.0`. The "gripper" (drive_joint) and
+  "gripper_mimic" (five followers) `ImplicitActuatorCfg` groups both set
+  `effort_limit_sim=2.5` (kept as literal float, not a name reference, so
+  the AST-based config test can read it via `ast.literal_eval` -- matches
+  the module constant by construction/comment). The old "180 keeps
+  drive_joint's limit enforceable" comment on the follower cap is replaced
+  with the bracket's finding: that reasoning solved the wrong problem.
+- **Mapping.** `GripperCommand.max_effort` (N, hardware fingertip
+  convention) is no longer applied 1:1 as N*m on drive_joint. It is mapped
+  proportionally onto the hardware ceiling: `gripper_effort_limit_nm(n,
+  ceiling, full_scale) = ceiling * clamp(n / full_scale, 0, 1)`, with `n`
+  <=0/unset/non-finite resolving to the full ceiling (today's default
+  behaviour, not zero authority). `GRIPPER_EFFORT_FULL_SCALE_N = 10.0`
+  (also env-overridable, `TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N`) -- traced
+  the real commands the manipulation stack sends: `gripper_facade.py`'s
+  `_execute` forwards `request.command.max_effort` unmodified into
+  `JointState.effort` (no substitution, confirmed by reading the code, not
+  assuming from a log line -- see "facade forwarding" below), and
+  `command_gateway.py`'s `_owned_command` projection is a pure passthrough
+  too. `pick_and_place`'s grasp close and pre-open both send
+  `native_gripper_max_effort` = 10 N (no launch override), so 10 N is "full
+  commanded grip" hardware-side; `grasp_benchmark`'s pre-open sends 5 N; the
+  bridge's own reopen sends 50 N (over-range, saturates at the ceiling).
+  Mapped values: 10 N -> 2.5 N*m (ceiling), 5 N -> 1.25 N*m, 50 N -> 2.5
+  N*m (clamped), 0/None -> 2.5 N*m.
+- **Facade forwarding, verified not to need a change.** Re-read
+  `gripper_facade.py` end to end for this task: `_execute` sets
+  `max_effort = requested_effort` (the goal's own `max_effort`, no
+  substitution to 50 anywhere) and publishes it verbatim as
+  `command.effort = [max_effort]`. The "effort=50" seen in some bench logs
+  is a *different* number -- `result.effort`/`feedback.effort` echo
+  `self._effort`, which is populated from `joint_state()`'s
+  `data.applied_torque` (the real, measured PD torque), not the commanded
+  value -- so a stall reported "at 50" was the drive genuinely saturating at
+  whatever ceiling `_set_gripper_effort_limit` last wrote, not proof the
+  facade substituted 50 for the request. No bridge-side fix was needed;
+  this is a verification finding, not a behavior change.
+- **Runtime write reaches the solver.** `_set_gripper_effort_limit` still
+  calls `write_joint_effort_limit_to_sim_index` (Isaac Lab buffer) and
+  mirrors the mapped limit into the owning `ImplicitActuator`'s cached
+  `effort_limit` tensor (issue #128 workaround, unchanged), but now also
+  calls a new `_write_gripper_drive_physx_max_force`, ported from
+  `validation/gripper_close_probe.py`'s `_write_physx_max_forces_direct` /
+  `_author_usd_max_force` (the same direct PhysX tensor-view write +
+  USD DriveAPI `maxForce` author the probe used to prove the Isaac Lab
+  writer alone was insufficient for the follower joints in `cap5-analysis`).
+  It clones the current full `joint_effort_limits` row, patches only
+  drive_joint's column, and pushes the whole row back via
+  `root_view.set_dof_max_forces` using warp arrays for both payload and
+  indices (Task #12 precedent: RigidBodyView tensor-API writes need WARP
+  arrays, not torch, to land), then reads it back
+  (`get_dof_max_forces`) for the log line. Followers stay config-only at
+  2.5 -- no runtime write targets them, matching the bracket recommendation
+  (raising the follower cap independently gave no benefit). Every effective
+  write now logs `{"event": "gripper_effort_limit", "commanded_n": ...,
+  "limit_nm": ..., "physx_max_force": [...]}`.
+- Tests: `tests/test_manipulation_runtime.py` gained
+  `test_gripper_effort_limit_nm_mapping_monotone_and_capped`,
+  `test_gripper_effort_ceiling_and_full_scale_env_overrides`,
+  `test_gripper_joint_effort_limits_are_hardware_scale_in_config` (AST/eval
+  config contract, fails on main: `gripper` has no `effort_limit_sim` at
+  all and `gripper_mimic` resolves to 180.0, not 2.5),
+  `test_set_gripper_effort_limit_maps_commanded_effort_proportionally`,
+  `test_set_gripper_effort_limit_writes_direct_physx_max_force` (asserts
+  the direct PhysX setter is called with the mapped value, via a new
+  `_FakeGripperRootView` double), and
+  `test_gripper_low_effort_pre_open_maps_above_zero`. Full suite: 115
+  passed, 5 subtests passed (was 109 passed, 3 subtests on main).
+
+**Open items.**
+- **Pad force is still below hardware.** The bracket's best-holding cap
+  (2.5 N*m) produces 11-18 N of pad force; the physical gripper's clamp is
+  ~30 N. Pushing the cap higher (3.0 N*m) reliably creeps and drops the
+  object in this contact model before that force is reachable -- the sim
+  tips objects before it can match the hardware's clamp force. This is an
+  open gap in the contact model, not something this fix resolves.
+- **2.5 N*m needs pinning to a live hardware measurement.** The 2.5 N*m
+  ceiling and the bracket data behind it (`$TMP/hwcap-result.md`,
+  `hwcap2-result.md`) are simulation-only; the ceiling should be re-pinned
+  to the user's measured hardware clamp force at commanded `max_effort` =
+  10 N (native full scale) once that measurement is available. Both the
+  ceiling and full-scale constants are env-overridable
+  (`TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`,
+  `TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N`) specifically so that
+  recalibration doesn't need a code change.
+- **Low-effort OPEN commands are unverified live.** A 5 N pre-open
+  (`grasp_benchmark`) maps to 1.25 N*m, and 10 N (the native default used
+  elsewhere) maps to the full 2.5 N*m ceiling -- both comfortably above the
+  bracket's own 1.5 N*m leg, which held a grasped bottle, so opening in
+  free air (much lower resistance than holding an object) should not be
+  torque-starved. This worktree cannot launch the sim to confirm it
+  directly; `test_gripper_low_effort_pre_open_maps_above_zero` is the
+  unit-level floor (mapped limit for both real pre-open values is strictly
+  positive), and the staged acceptance
+  (`$TMP/effortcap_chain.sh`/`$TMP/effortcap_launch.sh`) exercises the
+  mapped ceiling on a live close+hold+lift; a live free-air-open timing
+  check is left to the bench round. No `TINKER_SIM_GRIPPER_OPEN_MIN_NM`
+  floor was added -- with the corrected `GRIPPER_EFFORT_FULL_SCALE_N` =
+  10.0 (not 50.0), the real low-effort commands map to 1.25-2.5 N*m, not
+  the 0.25-0.5 N*m an assumed 50 N full scale would have produced, so the
+  floor this task considered as a fallback is very likely unnecessary; add
+  it only if the bench round finds an open genuinely torque-starved.
+
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
 **Symptom.** Bench round `agv`: a close goal reported
