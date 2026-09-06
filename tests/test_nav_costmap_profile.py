@@ -61,6 +61,13 @@ SLAM_PROFILE = {
                 "rolling_window": True,
                 "width": 5,
                 "height": 5,
+                "plugins": ["voxel_layer", "inflation_layer"],
+                "voxel_layer": {
+                    "plugin": "nav2_costmap_2d::VoxelLayer",
+                    "observation_sources": "scan",
+                    "scan": {"topic": "/scan", "data_type": "LaserScan"},
+                },
+                "inflation_layer": {"plugin": "nav2_costmap_2d::InflationLayer"},
             }
         }
     },
@@ -85,7 +92,25 @@ class PriorMapOverlayTest(unittest.TestCase):
         """StaticLayer sizes the master grid to the arena map."""
         self.assertEqual(
             _global(self.result)["plugins"],
-            ["static_layer", "obstacle_layer", "inflation_layer"],
+            ["static_layer", "inflation_layer"],
+        )
+
+    def test_global_costmap_drops_the_obstacle_layer(self):
+        """The sim lidar raycasts the same PGM the static layer loads.
+
+        The obstacle layer can add nothing to the global map; projected with
+        the AMCL/EKF estimate instead of the true pose it only draws
+        displaced wall copies whose inscribed rings disconnected the planner
+        for single ticks (run 20260906T041154: 42 refusal streaks, median
+        0 s, 67 % during plain driving).
+        """
+        section = _global(self.result)
+        self.assertNotIn("obstacle_layer", section)
+        self.assertNotIn("obstacle_layer", section["plugins"])
+        self.assertEqual(section["plugins"][-1], "inflation_layer")
+        self.assertEqual(
+            section["inflation_layer"]["plugin"],
+            "nav2_costmap_2d::InflationLayer",
         )
 
     def test_static_layer_is_declared(self):
@@ -99,7 +124,12 @@ class PriorMapOverlayTest(unittest.TestCase):
         self.assertTrue(_global(self.result)["track_unknown_space"])
 
     def test_local_costmap_is_untouched(self):
-        """The odom-frame rolling window is correct and stays as it is."""
+        """The odom-frame rolling window is correct and stays as it is.
+
+        In particular its ``/scan`` source survives: the local costmap is
+        the controller's only reactive layer, and it lives in ``odom`` so
+        AMCL corrections never offset its marks (unlike the global map).
+        """
         self.assertEqual(
             self.result["local_costmap"], SLAM_PROFILE["local_costmap"]
         )
@@ -159,13 +189,16 @@ class UpstreamParamsTest(unittest.TestCase):
         section = _global(result)
         self.assertFalse(section["rolling_window"])
         self.assertTrue(section["track_unknown_space"])
-        self.assertEqual(section["plugins"][0], "static_layer")
-        # The obstacle layer's scan source must survive the plugin-list swap.
-        self.assertIn("obstacle_layer", section)
-        self.assertEqual(
-            section["obstacle_layer"]["plugin"],
-            "nav2_costmap_2d::ObstacleLayer",
-        )
+        self.assertEqual(section["plugins"], ["static_layer", "inflation_layer"])
+        # The global map is static-only in simulation (see
+        # nav_params_overlay.py); the upstream obstacle block is dropped
+        # from the copy rather than left as an unreferenced parameter set.
+        self.assertNotIn("obstacle_layer", section)
+        # The local costmap's live scan source is carried through untouched.
+        local = result["local_costmap"]["local_costmap"]["ros__parameters"]
+        upstream_local = self.params["local_costmap"]["local_costmap"]["ros__parameters"]
+        self.assertEqual(local["voxel_layer"], upstream_local["voxel_layer"])
+        self.assertIn("voxel_layer", local["plugins"])
 
     def test_inflation_forms_a_doorway_cost_bowl(self):
         # Doorway fix round 3 (Nav2 tuning guide): inflation must exceed
