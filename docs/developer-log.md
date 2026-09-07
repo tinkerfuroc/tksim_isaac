@@ -4,6 +4,63 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-07 — Task #41: pan_tilt facade keepalive timer thrashed stale_hold at low RTF
+
+**Symptom.** A bench round logged 2835 `stale_hold`/`stale_hold_cleared`
+pairs (~1.18 Hz cycle, ~0.85s period) from the mux's pan_tilt
+`CommandSource` -- harmless that round because the mux's stale-hold
+substitute happened to match what the facade was already sending (head
+idle), but the churn is a symptom of a real mechanism: a real
+`/pan_tilt_controller/cmd` sweep in progress could get clamped mid-motion
+to a stale measured position.
+
+**Root cause.** `pan_tilt_facade.py`'s `_hold_target` republish timer
+(`self.create_timer(0.2, self._hold_target)`) had no explicit `clock=`
+argument, so it ran on the node's default clock -- `ROS_TIME` under the
+bridge's `use_sim_time=True` launch, i.e. paced in SIM seconds. The
+consumer, `CommandGateway`'s pan_tilt `CommandSource` (0.5s timeout,
+`command_gateway.py:99-101`), judges staleness in the mux against
+`time.monotonic()` -- WALL seconds (same clock the gateway's own 150 Hz
+publish timer and `_enforce_safety_deadline` are explicitly pinned to via
+`Clock(clock_type=ClockType.STEADY_TIME)`, `command_gateway.py:135-139`).
+At RTF < 0.4 a 0.2 sim-s republish costs more than 0.5 wall-s to land, so
+every tick arrived after the deadline -- continuous churn. This is the same
+family as Task #27 (facade dwell on the wall clock while the node runs sim
+time) but the inverse direction: there the *deadline* logic ran on the
+wrong clock, here the *keepalive* logic does.
+
+**Fix.** `pan_tilt_facade.py`'s hold timer now passes
+`clock=Clock(clock_type=ClockType.STEADY_TIME)`, mirroring
+`command_gateway.py`'s own 150 Hz timer and `gripper_facade.py`'s 20 Hz
+keepalive (`gripper_facade.py` was already correct here, confirmed by
+reading it, not assumed). Header timestamps inside `_hold_target` still use
+`self.get_clock().now()`, which stays sim time -- only the timer's own tick
+cadence changed. Swept the rest of the bridge for the identical defect
+(a keepalive/republish timer on a `use_sim_time` node feeding a
+wall-clock-gated `CommandSource`): `base_facade.py` and `xarm_facade.py`
+were already `STEADY_TIME`; `command_gateway.py`'s own 150 Hz tick and
+`gripper_facade.py`'s two timers were already `STEADY_TIME`. `pan_tilt`
+was the only one still on the node's default clock.
+
+**Test.** `tests/test_pan_tilt_facade_keepalive.py` (new):
+`test_hold_timer_created_with_steady_clock` patches `Node.create_timer`
+with a recording double and asserts the `_hold_target` timer's `clock=`
+kwarg has `clock_type == ClockType.STEADY_TIME`;
+`test_hold_republish_cadence_is_wall_clock_bounded_at_low_rtf` drives a
+synthetic `/clock` feed at RTF ~0.25 (`use_sim_time=True`) and asserts the
+wall-clock gap between consecutive `/sim/controller/pan_tilt_commands`
+publishes stays <= 0.35s. Pre-fix, both fail: the first with
+`AssertionError: _hold_target timer must pass an explicit clock=`, the
+second with only 3 republishes in 3 wall-s (~0.85s gaps, matching the
+bench's 2835-pair measurement); post-fix, both pass with ~15 republishes in
+3 wall-s. Full targeted run (python3.10, ROS-sourced,
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`): `test_pan_tilt_facade_keepalive.py`,
+`test_head_tf.py`, `test_head_initial_pose.py`,
+`test_command_gateway_keepalive.py`, `test_gateway_simtime_deadlines.py`,
+`test_xarm_safety_heartbeat.py`, `test_gripper_executor_humble.py` together:
+47 passed. `tests/test_manipulation_runtime.py` (uv/lark-shim incantation):
+132 passed, 3 subtests passed, unaffected.
+
 ## 2026-09-07 — Task #39: `/spawn_entity` advertised ~100s before it can be served
 
 **Symptom.** A `/spawn_entity` (or sibling `simulation_interfaces`) call made
