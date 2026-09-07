@@ -818,6 +818,18 @@ class IsaacWholeRobotBackend:
     # Bodies the #35 TCP/pad parity publisher needs resolved by name in
     # data.body_names; see parity_tcp_frame().
     PARITY_TCP_BODIES = ("link_tcp", "left_finger", "right_finger")
+    # The six gripper joints the #33 PhysX-torque parity publisher needs
+    # resolved by name in joint_names; see parity_gripper_torque(). Order is
+    # the published JointState.name order (drive first, then the five mimic
+    # followers) -- not necessarily the articulation's own DOF ordering.
+    PARITY_GRIPPER_JOINTS = (
+        "drive_joint",
+        "left_finger_joint",
+        "left_inner_knuckle_joint",
+        "right_outer_knuckle_joint",
+        "right_inner_knuckle_joint",
+        "right_finger_joint",
+    )
 
     def __init__(
         self,
@@ -1036,6 +1048,14 @@ class IsaacWholeRobotBackend:
         # right_finger, so the "unresolved" diagnostic (see there) logs once
         # per backend life instead of once per publish tick.
         self._parity_tcp_bodies_missing_logged = False
+        # Set once parity_gripper_torque() cannot resolve the six gripper
+        # joints / the PhysX view's projected-forces call, or once that call
+        # raises -- see there. Two flags: the joints/view are a static
+        # property of the articulation (checked once is enough), while a
+        # read error could in principle recur with a different message, but
+        # the fail-soft contract is still "log once, then skip silently".
+        self._parity_gripper_torque_unresolved_logged = False
+        self._parity_gripper_torque_error_logged = False
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
         )
@@ -2174,6 +2194,15 @@ class IsaacWholeRobotBackend:
             self._joint_index[name]
             for name in ("left_finger_joint", "right_finger_joint")
             if name in self._joint_index
+        )
+        # #33: the six PARITY_GRIPPER_JOINTS DOF indices, resolved once here
+        # (rebuilt only when the articulation view changes, same lifetime as
+        # _gripper_mimic_indices above) rather than re-looked-up per publish
+        # tick in parity_gripper_torque(). A name missing from this
+        # articulation (e.g. a gripper-less rig) lands as None so the reader
+        # can fail soft instead of raising a KeyError.
+        self._parity_gripper_joint_indices = tuple(
+            self._joint_index.get(name) for name in self.PARITY_GRIPPER_JOINTS
         )
         self._safety_nominal_stiffness = self._read_joint_gain_values(
             "joint_stiffness",
@@ -4813,6 +4842,102 @@ class IsaacWholeRobotBackend:
                 tuple(midpoint_base),
             ),
         }
+
+    def parity_gripper_torque(
+        self,
+    ) -> tuple[tuple[str, ...], list[float], list[float], list[float]] | None:
+        """PhysX-MEASURED joint torque for the six gripper joints, next to
+        ``joint_state()``'s Python actuator echo.
+
+        ``joint_state()``'s ``effort`` column is ``data.applied_torque`` --
+        the Isaac Lab actuator MODEL's post-clip command
+        (``clamp(k*error - d*velocity)``) that gets SET INTO the sim, not
+        what PhysX actually delivered. This reads exactly the call the grasp
+        bench's ``physx_tau`` rows use
+        (``validation/gripper_close_probe.py``'s ``_read_physx_joint_forces``):
+        ``root_view.get_dof_projected_joint_forces()`` -- "projects the
+        link's incoming joint force[s] in the motion direction", i.e. the
+        constraint solver's actual output along each joint's motion axis --
+        so a bench recording of both topics agrees by construction with the
+        probe's own numbers.
+
+        Position/velocity come from the same ``data.joint_pos``/
+        ``data.joint_vel`` tensors as ``joint_state()``; only the torque
+        column differs (PhysX view vs. Isaac Lab actuator echo). Gripper
+        joint indices are resolved once at bind time
+        (``_parity_gripper_joint_indices``, alongside
+        ``_gripper_mimic_indices``), not re-looked-up per tick.
+
+        Fails soft: returns ``None`` (logged once) if any of
+        ``PARITY_GRIPPER_JOINTS`` is missing from this articulation, if the
+        PhysX view exposes no ``get_dof_projected_joint_forces`` (e.g. a
+        gripper-less rig or a stub/test double), or if that call raises --
+        the caller (``ros_gateway.publish()``) must skip that tick's publish,
+        not raise.
+        """
+        indices = getattr(self, "_parity_gripper_joint_indices", None)
+        if indices is None or any(index is None for index in indices):
+            if not self._parity_gripper_torque_unresolved_logged:
+                self._parity_gripper_torque_unresolved_logged = True
+                missing = [
+                    name
+                    for name, index in zip(self.PARITY_GRIPPER_JOINTS, indices or ())
+                    if index is None
+                ]
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_torque_joints_unresolved",
+                            "missing": missing,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        getter = (
+            getattr(root_view, "get_dof_projected_joint_forces", None)
+            if root_view is not None
+            else None
+        )
+        if getter is None:
+            if not self._parity_gripper_torque_unresolved_logged:
+                self._parity_gripper_torque_unresolved_logged = True
+                print(
+                    json.dumps({"event": "parity_gripper_torque_view_unavailable"}),
+                    flush=True,
+                )
+            return None
+
+        try:
+            forces = getter()
+            arr = forces.numpy() if hasattr(forces, "numpy") else forces
+            physx_tau = [float(arr[0][index]) for index in indices]
+        except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+            if not self._parity_gripper_torque_error_logged:
+                self._parity_gripper_torque_error_logged = True
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_torque_read_error",
+                            "error": str(error)[:160],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        data = self._robot.data
+        joint_pos = self._torch_value(data.joint_pos)[0]
+        joint_vel = self._torch_value(data.joint_vel)[0]
+        pos = [float(joint_pos[index]) for index in indices]
+        vel = [float(joint_vel[index]) for index in indices]
+        return self.PARITY_GRIPPER_JOINTS, pos, vel, physx_tau
 
     def body_pose_world(
         self, name: str

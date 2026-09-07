@@ -238,6 +238,8 @@ def _backend() -> IsaacWholeRobotBackend:
     )
     backend._contact_report_first_event_logged = False
     backend._parity_tcp_bodies_missing_logged = False
+    backend._parity_gripper_torque_unresolved_logged = False
+    backend._parity_gripper_torque_error_logged = False
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
     backend._clock_elapsed_steps = 0
@@ -1990,6 +1992,97 @@ class ManipulationRuntimeTest(unittest.TestCase):
             sorted(payload["missing"]), ["left_finger", "right_finger"]
         )
 
+    def test_parity_gripper_torque_returns_six_joints_from_physx_projected_forces(
+        self,
+    ) -> None:
+        """#33: parity_gripper_torque() must return the six
+        PARITY_GRIPPER_JOINTS in order, with position/velocity from the same
+        joint_pos/joint_vel tensors joint_state() reads, but torque from
+        root_view.get_dof_projected_joint_forces() at the resolved DOF
+        indices -- deliberately DIFFERENT here from data.applied_torque (the
+        Isaac Lab actuator model's post-clip COMMAND echo) so a test that
+        accidentally reads the wrong tensor fails loudly. The joint order is
+        scrambled (and includes a non-gripper joint) to prove the indices
+        are resolved by name, not assumed contiguous."""
+        backend = _backend()
+        joint_names = (
+            "joint1",
+            "right_finger_joint",
+            "drive_joint",
+            "right_inner_knuckle_joint",
+            "left_finger_joint",
+            "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint",
+        )
+        backend.joint_names = joint_names
+        backend._joint_index = {name: index for index, name in enumerate(joint_names)}
+        backend._parity_gripper_joint_indices = tuple(
+            backend._joint_index[name] for name in backend.PARITY_GRIPPER_JOINTS
+        )
+        backend._robot.data.joint_pos = torch.tensor(
+            [[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]], dtype=torch.float32
+        )
+        backend._robot.data.joint_vel = torch.tensor(
+            [[20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0]], dtype=torch.float32
+        )
+        physx_row = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
+        backend._robot.root_view = SimpleNamespace(
+            get_dof_projected_joint_forces=lambda: [physx_row]
+        )
+
+        result = backend.parity_gripper_torque()
+
+        self.assertIsNotNone(result)
+        names, positions, velocities, physx_tau = result
+        self.assertEqual(names, backend.PARITY_GRIPPER_JOINTS)
+        for name, pos, vel, tau in zip(names, positions, velocities, physx_tau):
+            index = joint_names.index(name)
+            self.assertAlmostEqual(pos, 10.0 + index, places=6)
+            self.assertAlmostEqual(vel, 20.0 + index, places=6)
+            self.assertAlmostEqual(tau, 100.0 + index, places=6)
+
+    def test_parity_gripper_torque_fails_soft_and_logs_once_when_view_raises(
+        self,
+    ) -> None:
+        """#33: root_view.get_dof_projected_joint_forces() raising (a real
+        PhysX API surface -- e.g. queried before the first physics step)
+        must not propagate; log once and return None so the gateway skips
+        that tick's publish, the same fail-soft contract as
+        parity_tcp_frame()."""
+        backend = _backend()
+        joint_names = (
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_inner_knuckle_joint",
+            "right_finger_joint",
+        )
+        backend.joint_names = joint_names
+        backend._joint_index = {name: index for index, name in enumerate(joint_names)}
+        backend._parity_gripper_joint_indices = tuple(
+            backend._joint_index[name] for name in backend.PARITY_GRIPPER_JOINTS
+        )
+
+        def _raise():
+            raise RuntimeError("physx view not ready")
+
+        backend._robot.root_view = SimpleNamespace(
+            get_dof_projected_joint_forces=_raise
+        )
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            first = backend.parity_gripper_torque()
+            second = backend.parity_gripper_torque()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the read-error diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "parity_gripper_torque_read_error")
+
     def test_usd_camera_pose_to_ros_optical_identity_looks_down_world_minus_z(
         self,
     ) -> None:
@@ -2223,6 +2316,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def parity_tcp_frame(self):
                 return None  # keep this test focused on the camera block
 
+            def parity_gripper_torque(self):
+                return None  # keep this test focused on the camera block
+
             def body_pose_world(self, name):
                 assert name == "xarm_camera_link"
                 # Arbitrary tensor-style body pose; the fake camera rig
@@ -2378,6 +2474,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
                 return {}
 
             def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
                 return None
 
             def body_pose_world(self, name):
@@ -3502,6 +3601,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
                     ),
                 }
 
+            def parity_gripper_torque(self):
+                return None  # keep this test focused on the TCP/pad block
+
         class _RecordingPublisher:
             def __init__(self) -> None:
                 self.messages: list[object] = []
@@ -3600,6 +3702,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
                 self.calls = getattr(self, "calls", 0) + 1
                 return None  # unresolved this tick
 
+            def parity_gripper_torque(self):
+                return None  # keep this test focused on the TCP/pad block
+
         class _RecordingPublisher:
             def __init__(self) -> None:
                 self.messages: list[object] = []
@@ -3655,6 +3760,222 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(len(unresolved_gateway.tcp_pose_pub.messages), 0)
         self.assertEqual(len(unresolved_gateway.tcp_pose_base_pub.messages), 0)
         self.assertEqual(len(unresolved_gateway.pad_points_pub.messages), 0)
+        self.assertEqual(unresolved_backend.calls, 1)
+
+    def test_gateway_registers_gripper_physx_tau_publisher_gated_by_env(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'JointState, "/sim/parity/gripper_physx_tau", reliable', source
+        )
+        self.assertIn("self.backend.parity_gripper_torque()", source)
+        self.assertIn(
+            'os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"', source
+        )
+
+    def test_gripper_physx_tau_publisher_emits_every_tick_with_sim_stamp(
+        self,
+    ) -> None:
+        """#33: /sim/parity/gripper_physx_tau publishes at the same cadence
+        as the other parity topics (unconditional, every publish() tick, not
+        gated on the status-heartbeat stride), stamped with the same sim
+        clock the /clock and /isaac_joint_states publishes use this tick,
+        with name/position/velocity/effort taken straight from
+        backend.parity_gripper_torque()."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        gripper_names = (
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_inner_knuckle_joint",
+            "right_finger_joint",
+        )
+        gripper_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        gripper_velocities = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+        gripper_physx_tau = [2.0, 2.1, 2.2, 2.3, 2.4, 2.5]
+
+        class _GripperTorqueBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
+                return (
+                    gripper_names,
+                    list(gripper_positions),
+                    list(gripper_velocities),
+                    list(gripper_physx_tau),
+                )
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _GripperTorqueBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway._PoseStamped = PoseStamped
+        gateway._PolygonStamped = PolygonStamped
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway.tcp_pose_pub = _RecordingPublisher()
+        gateway.tcp_pose_base_pub = _RecordingPublisher()
+        gateway.pad_points_pub = _RecordingPublisher()
+        gateway.gripper_physx_tau_pub = _RecordingPublisher()
+        gateway._parity_tcp_enabled = True
+        gateway._camera_rig = None
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(len(gateway.gripper_physx_tau_pub.messages), 3)
+        message = gateway.gripper_physx_tau_pub.messages[0]
+        self.assertEqual(list(message.name), list(gripper_names))
+        for actual, expected in zip(message.position, gripper_positions):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(message.velocity, gripper_velocities):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(message.effort, gripper_physx_tau):
+            self.assertAlmostEqual(actual, expected, places=6)
+        self.assertEqual(message.header.stamp, gateway.clock_pub.messages[0].clock)
+
+    def test_gripper_physx_tau_publisher_skips_when_env_disabled_or_unresolved(
+        self,
+    ) -> None:
+        """TINKER_SIM_PARITY_TCP=0 must fully disable this topic too (no
+        parity_gripper_torque() calls at all); a resolvable-but-currently-
+        unresolved backend (#33's fail-soft contract, returns None) must
+        skip publishing without raising."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        class _NoOpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
+                self.calls = getattr(self, "calls", 0) + 1
+                return None  # unresolved this tick
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        def _new_gateway(backend, *, parity_tcp_enabled: bool) -> RosStandardGateway:
+            gateway = object.__new__(RosStandardGateway)
+            gateway.backend = backend
+            gateway._Clock = Clock
+            gateway._JointState = JointState
+            gateway._Imu = Imu
+            gateway._String = String
+            gateway._WrenchStamped = WrenchStamped
+            gateway._PoseStamped = PoseStamped
+            gateway._PolygonStamped = PolygonStamped
+            gateway.clock_pub = _RecordingPublisher()
+            gateway.joint_pub = _RecordingPublisher()
+            gateway.imu_pub = _RecordingPublisher()
+            gateway.status_pub = _RecordingPublisher()
+            gateway.contact_pub = _RecordingPublisher()
+            gateway.physics_truth_pub = _RecordingPublisher()
+            gateway.cloud_pub = _RecordingPublisher()
+            gateway.tcp_pose_pub = _RecordingPublisher()
+            gateway.tcp_pose_base_pub = _RecordingPublisher()
+            gateway.pad_points_pub = _RecordingPublisher()
+            gateway.gripper_physx_tau_pub = _RecordingPublisher()
+            gateway._parity_tcp_enabled = parity_tcp_enabled
+            gateway._camera_rig = None
+            gateway._cloud_publish_enabled = lambda: False
+            gateway._last_command_error = None
+            gateway._command_stream_lost = False
+            gateway._command_epoch = 0
+            gateway._last_logical_snapshot_id = -1
+            gateway.development_lidar = False
+            gateway._publish_profile_enabled = False
+            gateway._state_stride = 1_000_000
+            gateway._imu_stride = 1_000_000
+            gateway._status_stride = 1_000_000
+            gateway._tick = 0
+            return gateway
+
+        disabled_backend = _NoOpBackend()
+        disabled_gateway = _new_gateway(disabled_backend, parity_tcp_enabled=False)
+        disabled_gateway.publish()
+        self.assertEqual(len(disabled_gateway.gripper_physx_tau_pub.messages), 0)
+        self.assertEqual(getattr(disabled_backend, "calls", 0), 0)
+
+        unresolved_backend = _NoOpBackend()
+        unresolved_gateway = _new_gateway(unresolved_backend, parity_tcp_enabled=True)
+        unresolved_gateway.publish()
+        self.assertEqual(len(unresolved_gateway.gripper_physx_tau_pub.messages), 0)
         self.assertEqual(unresolved_backend.calls, 1)
 
     def test_gateway_publishes_raw_truth_without_persisting_physics_truth(self) -> None:

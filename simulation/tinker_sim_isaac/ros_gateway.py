@@ -221,6 +221,7 @@ class RosStandardGateway:
         self.pad_points_pub = None
         self.wrist_camera_pose_pub = None
         self.wrist_camera_pose_base_pub = None
+        self.gripper_physx_tau_pub = None
         if self._parity_tcp_enabled:
             self.tcp_pose_pub = self.node.create_publisher(
                 PoseStamped, "/sim/parity/tcp_pose", reliable
@@ -245,6 +246,16 @@ class RosStandardGateway:
             )
             self.wrist_camera_pose_base_pub = self.node.create_publisher(
                 PoseStamped, "/sim/parity/wrist_camera_pose_base", reliable
+            )
+            # Task #33: same env gate as the rest of this block -- the
+            # grasp bench needs the PhysX-MEASURED joint torque of the six
+            # gripper joints next to /isaac_joint_states' effort field
+            # (the Python actuator model's echo of its own command, not
+            # what PhysX actually delivered) to diagnose real clamp force.
+            # Fail-soft on backend.parity_gripper_torque() returning None --
+            # see publish().
+            self.gripper_physx_tau_pub = self.node.create_publisher(
+                JointState, "/sim/parity/gripper_physx_tau", reliable
             )
         self._camera_rig = camera_rig
         self.camera_skipped_frames = 0
@@ -1399,6 +1410,21 @@ class RosStandardGateway:
                         camera_pose_base.pose.orientation.w,
                     ) = quaternion_base
                     self.wrist_camera_pose_base_pub.publish(camera_pose_base)
+            # Task #33: same gate/cadence as the TCP parity block above
+            # (unconditional, every physics-truth tick). Fails soft:
+            # backend.parity_gripper_torque() returns None (and logs once)
+            # if any gripper joint or the PhysX view's projected-forces call
+            # is unresolved this tick.
+            gripper_physx_tau = self.backend.parity_gripper_torque()
+            if gripper_physx_tau is not None:
+                names, positions, velocities, physx_tau = gripper_physx_tau
+                gripper_message = self._JointState()
+                gripper_message.header.stamp = stamp
+                gripper_message.name = list(names)
+                gripper_message.position = positions
+                gripper_message.velocity = velocities
+                gripper_message.effort = physx_tau
+                self.gripper_physx_tau_pub.publish(gripper_message)
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {

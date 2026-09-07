@@ -230,6 +230,73 @@ passed, 1 subtests passed). No GPU boot for this diagnostic-only change;
 the live bench recording against `updateToUsd=False` fabric-on is the
 follow-up that actually validates the fix tracks the arm during motion.
 
+### Task #33 addendum — PhysX-measured gripper joint torque parity publisher
+
+**Purpose.** The #20 chain above needed the gripper joints' PhysX-MEASURED
+torque to diagnose real clamp force, but `/isaac_joint_states`' `effort`
+field is `data.applied_torque` -- the Isaac Lab actuator MODEL's own
+post-clip COMMAND (`clamp(k*error - d*velocity)`) set INTO the sim, not
+what the PhysX solver actually delivered (this is the same distinction
+`validation/gripper_close_probe.py`'s `_read_physx_joint_forces()` draws
+between its `tau`/`tau_drive` rows and its `physx_tau` row). Same idea as
+#35/#36's parity topics, same env gate (`TINKER_SIM_PARITY_TCP`), same
+unconditional every-`publish()`-tick cadence: publish the six gripper
+joints' (`drive_joint`, `left_finger_joint`, `left_inner_knuckle_joint`,
+`right_outer_knuckle_joint`, `right_inner_knuckle_joint`,
+`right_finger_joint`) measured PhysX torque next to the existing
+actuator-echo topic, so a bench recording of both agrees by construction
+with the probe's own numbers.
+
+- `/sim/parity/gripper_physx_tau` (`sensor_msgs/JointState`): `name` is the
+  six gripper joints in that fixed order; `position`/`velocity` are the
+  same `data.joint_pos`/`data.joint_vel` tensors `joint_state()` reads;
+  `effort` is the PhysX-measured torque (see read path below), not the
+  actuator echo.
+
+**Read path.** `backend.py` gains a `PARITY_GRIPPER_JOINTS` class constant
+(the six names, in publish order) and
+`IsaacWholeRobotBackend.parity_gripper_torque()`. The six joints' DOF
+indices are resolved once, at bind time, into
+`self._parity_gripper_joint_indices` (alongside the existing
+`_gripper_mimic_indices`/`_drive_joint_index` resolution), not re-looked-up
+per publish tick. The torque itself is exactly the probe's read:
+`root_view.get_dof_projected_joint_forces()` (`root_view`/`root_physx_view`,
+whichever the articulation exposes) -- "projects the link's incoming joint
+force[s] in the motion direction", i.e. the constraint solver's actual
+output along each joint's motion axis, as opposed to
+`get_dof_max_forces()`/`data.joint_effort_limits` (the CEILING, not the
+delivered value) used by the #20 effort-limit read/write paths. Fails soft,
+matching `parity_tcp_frame()`: any of the six joints missing from
+`joint_names`, the view lacking `get_dof_projected_joint_forces`, or that
+call raising, each log once (`parity_gripper_torque_joints_unresolved`/
+`_view_unavailable`/`_read_error`, via two latches --
+`_parity_gripper_torque_unresolved_logged` for the two static/joint-
+resolution cases, `_parity_gripper_torque_error_logged` for a read
+exception) and return `None`; the gateway skips publishing that tick
+without raising.
+
+**Tests** (`tests/test_manipulation_runtime.py`): the helper against a
+scrambled (non-contiguous, includes a non-gripper joint) joint order with a
+fake `root_view.get_dof_projected_joint_forces()` row DELIBERATELY
+different from `data.applied_torque`, proving indices are resolved by name
+and the torque column is the PhysX view's, not the actuator echo;
+`parity_gripper_torque()`'s fail-soft/log-once contract when the view call
+raises; the gateway's publisher registration/topic/env-gate source
+strings; a `publish()` runtime test asserting the topic fires every tick
+with `name`/`position`/`velocity`/`effort` taken straight from the backend
+call and `header.stamp` matching that tick's `/clock` sample; and the
+disabled/unresolved skip contract (no publish calls, no raise) --
+mirroring the #35/#36 gateway test shape throughout. The four pre-existing
+fake backends in this file that already define `parity_tcp_frame()` and
+run with `_parity_tcp_enabled = True` needed a `parity_gripper_torque()`
+returning `None` added alongside, since `publish()` now calls it
+unconditionally in that same gated block. Full suite:
+`tests/test_manipulation_runtime.py` 157 passed, 5 subtests passed, 0
+failed (152 passed before this task's 5 new tests). No GPU boot for this
+diagnostic-only change; a live bench recording of both `effort` fields side
+by side against the probe's own `physx_tau` is the follow-up that confirms
+they agree outside the unit-test fakes.
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping
