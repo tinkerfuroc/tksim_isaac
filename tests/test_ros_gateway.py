@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import queue
 import sys
 import time
@@ -636,3 +637,111 @@ class MainThreadIntakeTest(unittest.TestCase):
         gateway = _gateway()
         gateway._safety_active = False
         gateway.spin_once()  # no _intake_subscriptions: nothing to take
+
+
+class _StatusPublisher:
+    def __init__(self) -> None:
+        self.messages: list[object] = []
+
+    def publish(self, message: object) -> None:
+        self.messages.append(message)
+
+
+class _StatusBackend:
+    """Minimal backend double covering everything publish() touches."""
+
+    dt = 0.02
+    physics_device = "cpu"
+    safety_stopped = False
+    simulation_time = 0.0
+    TRUTH_TOKEN = object()
+
+    def joint_state(self):
+        return ((), [], [], [])
+
+    def root_state(self):
+        return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+    def contact_state(self):
+        return {}
+
+    def physics_truth_frame(self, token):
+        return {}
+
+
+def _status_gateway(simulation_time: float = 0.0) -> RosStandardGateway:
+    from geometry_msgs.msg import WrenchStamped
+    from rosgraph_msgs.msg import Clock
+    from sensor_msgs.msg import Imu, JointState
+    from std_msgs.msg import String
+
+    gateway = object.__new__(RosStandardGateway)
+    gateway.backend = _StatusBackend()
+    gateway.backend.simulation_time = simulation_time
+    gateway._Clock = Clock
+    gateway._JointState = JointState
+    gateway._Imu = Imu
+    gateway._String = String
+    gateway._WrenchStamped = WrenchStamped
+    gateway.clock_pub = _StatusPublisher()
+    gateway.joint_pub = _StatusPublisher()
+    gateway.imu_pub = _StatusPublisher()
+    gateway.status_pub = _StatusPublisher()
+    gateway.contact_pub = _StatusPublisher()
+    gateway.physics_truth_pub = _StatusPublisher()
+    gateway.cloud_pub = _StatusPublisher()
+    gateway._camera_rig = None
+    gateway._cloud_publish_enabled = lambda: False
+    gateway._last_command_error = None
+    gateway._command_stream_lost = False
+    gateway._command_epoch = 0
+    gateway._last_logical_snapshot_id = -1
+    gateway.development_lidar = False
+    gateway._publish_profile_enabled = False
+    # Large strides so only the status heartbeat's own gate (_status_stride
+    # == 1 below) matters for this test's assertions.
+    gateway._state_stride = 1_000_000
+    gateway._imu_stride = 1_000_000
+    gateway._status_stride = 1
+    gateway._tick = 0
+    gateway._services_ready = False
+    gateway._services_ready_since = None
+    return gateway
+
+
+class ServicesReadyStatusTest(unittest.TestCase):
+    """Task #39: ``/sim/status/isaac`` must carry ``services_ready`` so a
+    client (``tools/gpsr_spawn.py``) can gate its first ``/spawn_entity``
+    call on the main loop actually pumping Kit regularly, not just
+    ``wait_for_service()`` -- which returns true the instant
+    ``isaacsim.ros2.sim_control`` is enabled, long before backend/camera
+    warm-up finishes and the extension can serve a request promptly.
+    """
+
+    def test_services_ready_false_before_mark_services_ready(self) -> None:
+        gateway = _status_gateway()
+
+        gateway.publish()
+
+        status = json.loads(gateway.status_pub.messages[-1].data)
+        self.assertFalse(status["services_ready"])
+        self.assertIsNone(status["services_ready_since"])
+
+    def test_services_ready_true_after_mark_services_ready(self) -> None:
+        gateway = _status_gateway(simulation_time=12.5)
+
+        gateway.mark_services_ready()
+        gateway.publish()
+
+        status = json.loads(gateway.status_pub.messages[-1].data)
+        self.assertTrue(status["services_ready"])
+        self.assertEqual(status["services_ready_since"], 12.5)
+
+    def test_mark_services_ready_records_the_timestamp_once(self) -> None:
+        gateway = _status_gateway(simulation_time=1.0)
+
+        gateway.mark_services_ready()
+        gateway.backend.simulation_time = 99.0
+        gateway.mark_services_ready()  # idempotent: must not move the mark
+
+        self.assertEqual(gateway._services_ready_since, 1.0)

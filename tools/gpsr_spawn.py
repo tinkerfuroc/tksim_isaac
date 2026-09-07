@@ -20,9 +20,10 @@ import json
 import math
 import os
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Any, Callable, Optional, Protocol, Sequence
 
 # The bench invokes this file as a standalone script from another repo
 # (`python3 /abs/path/tools/gpsr_spawn.py ...`), with no PYTHONPATH help --
@@ -53,6 +54,17 @@ DEFAULT_BASE_SCENARIO = REPO_ROOT / "simulation" / "scenarios" / "gpsr-rcw2026-b
 
 
 SPAWN_TIMEOUT_S = 120.0
+
+# Task #39: /spawn_entity's advertise-early/serve-late gap. wait_for_service()
+# on the standard simulation_interfaces services returns true the instant the
+# sim's isaacsim.ros2.sim_control extension is enabled -- which can happen
+# well before the sim's backend/camera-rig warm-up finishes, i.e. well before
+# Kit is being pumped regularly enough to actually serve a request. A first
+# call that lands in that window can queue past both SPAWN_TIMEOUT_S and, at
+# the DDS layer, the point where the response can even be correlated back to
+# this client ("failed to send response (timeout)"). 300s covers the
+# sensor-rich profile's worst observed warm-up (~100s) several times over.
+SERVICES_READY_TIMEOUT_S = 300.0
 
 
 class ServiceUnavailable(RuntimeError):
@@ -486,22 +498,86 @@ def _resolve_asset_uri(asset_uri: str) -> str:
     return str(path.resolve())
 
 
+def _wait_for_services_ready(
+    node: Any,
+    spin_once: Callable[[Any, float], None],
+    string_msg_type: type,
+    *,
+    timeout_s: float = SERVICES_READY_TIMEOUT_S,
+    now: Callable[[], float] = time.monotonic,
+) -> None:
+    """Block until `/sim/status/isaac` reports `services_ready: true` (Task
+    #39), with its own bounded wait -- separate from, and ahead of,
+    `SPAWN_TIMEOUT_S`'s per-call budget.
+
+    `wait_for_service()` alone only proves `isaacsim.ros2.sim_control` has
+    been enabled, not that a request arriving right now would be served
+    promptly: the sim can be deep inside backend/camera-rig warm-up (up to
+    ~100s, few if any Kit pumps in between) with the service already
+    advertised. A first `/spawn_entity` call in that window can be lost at
+    the ROS middleware layer well before this module's own 120s budget
+    would have complained. `node`/`spin_once`/`string_msg_type` are
+    injected (rather than imported here) so this is testable without rclpy.
+    """
+    ready = {"value": False}
+
+    def _on_status(msg: Any) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if payload.get("services_ready"):
+            ready["value"] = True
+
+    subscription = node.create_subscription(
+        string_msg_type, "/sim/status/isaac", _on_status, 10
+    )
+    print(
+        f"[gpsr_spawn] waiting up to {timeout_s:.0f}s for /sim/status/isaac "
+        "services_ready before starting the spawn budget",
+        flush=True,
+    )
+    deadline = now() + timeout_s
+    try:
+        while not ready["value"] and now() < deadline:
+            spin_once(node, 0.5)
+    finally:
+        node.destroy_subscription(subscription)
+    if not ready["value"]:
+        raise ServiceUnavailable(
+            f"/sim/status/isaac never reported services_ready after "
+            f"{timeout_s:.0f}s -- the sim may still be in backend/camera "
+            "warm-up, or /sim/status/isaac is not being published at all"
+        )
+    print("[gpsr_spawn] /sim/status/isaac services_ready=true", flush=True)
+
+
 def _make_ros_service_client() -> "ServiceClient":
     """The only place this module imports rclpy -- constructed lazily so
     `plan`/`emit-scenario` (and every test) never need ROS on the path.
-    Waits for BOTH `/spawn_entity` and `/delete_entity` (10s each) before
-    returning, raising `ServiceUnavailable` naming whichever service never
-    came up -- a client this module hands to `apply_plan`/`clear_manifest`
-    should never be able to hit a service that was never actually there.
+    Waits for `/sim/status/isaac` services_ready (Task #39, bounded by
+    `SERVICES_READY_TIMEOUT_S`) and then for BOTH `/spawn_entity` and
+    `/delete_entity` (10s each, secondary check) before returning, raising
+    `ServiceUnavailable` naming whichever readiness signal never came up --
+    a client this module hands to `apply_plan`/`clear_manifest` should
+    never be able to hit a service that was never actually there, or was
+    advertised too early to serve a prompt request.
     """
     import rclpy
     from geometry_msgs.msg import PoseStamped
     from rclpy.node import Node
+    from std_msgs.msg import String
     from simulation_interfaces.msg import Result
     from simulation_interfaces.srv import DeleteEntity, SpawnEntity
 
     rclpy.init(args=None)
     node = Node("gpsr_spawn_client")
+    try:
+        _wait_for_services_ready(node, rclpy.spin_once, String)
+    except ServiceUnavailable:
+        node.destroy_node()
+        rclpy.shutdown()
+        raise
     spawn_client = node.create_client(SpawnEntity, "/spawn_entity")
     delete_client = node.create_client(DeleteEntity, "/delete_entity")
     for service_name, ros_client in (

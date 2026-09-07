@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 
 
 STREAM_SIGNAL_PORT = 49100
@@ -833,6 +834,40 @@ def _install_set_entity_state_physics(backend_holder: dict) -> None:
     )
 
 
+def _enable_sim_control_services(app: Any, gateway: Any | None = None) -> None:
+    """Advertise ``isaacsim.ros2.sim_control``'s ROS services (``/spawn_entity``,
+    ``/set_entity_state``, ``/delete_entity``, ``/set_simulation_state``,
+    ``/load_world``, ``/reset_simulation``) and flip the gateway's
+    ``services_ready`` flag once they are.
+
+    Task #39: call this ONLY once every long-running boot step before it
+    (backend construction, camera-rig warm-up, gateway construction) has
+    finished -- i.e. right where the boot-config JSON prints today, just
+    before the main loop starts pumping ``app.update()``/
+    ``gateway.spin_once()`` on every tick.
+
+    ``enable_extension`` registers the services synchronously, but Kit only
+    *serves* them from its own asyncio loop, which nothing pumps regularly
+    until the main loop starts. Backend construction
+    (``IsaacWholeRobotBackend.__init__``) and camera warm-up
+    (``CameraRig.initialize``) together can run for a couple of minutes with
+    only a handful of incidental ``app.update()`` calls in between; a
+    request that reaches the extension in that window queues past both the
+    caller's own timeout budget and, at the DDS layer, the point at which a
+    response can even be correlated back to it -- ``rmw_fastrtps_shared_cpp``'s
+    "failed to send response (timeout): client will not receive response".
+    Advertising the services this late instead of at process start closes
+    that window: ``wait_for_service()`` no longer returns true before a
+    request can actually be served promptly.
+    """
+    from isaacsim.core.utils.extensions import enable_extension
+
+    enable_extension("isaacsim.ros2.sim_control")
+    app.update()
+    if gateway is not None:
+        gateway.mark_services_ready()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -975,11 +1010,16 @@ def main() -> int:
         # once it is constructed further below.
         set_entity_state_backend_holder: dict = {"backend": None}
         if args.ros:
-            from isaacsim.core.utils.extensions import enable_extension
-
+            # Only the monkeypatch goes in this early -- it must run before
+            # the extension's own on_startup captures the unpatched bound
+            # method (see _install_set_entity_state_physics's docstring).
+            # Enabling isaacsim.ros2.sim_control itself is deferred to just
+            # before each profile's main loop starts (Task #39,
+            # _enable_sim_control_services): enabling it here, before the
+            # backend/camera-rig/gateway below exist, advertises
+            # /spawn_entity et al. long before anything pumps Kit's asyncio
+            # loop regularly enough to serve them.
             _install_set_entity_state_physics(set_entity_state_backend_holder)
-            enable_extension("isaacsim.ros2.sim_control")
-            app.update()
         if args.sensor_profile == "navigation-parity":
             root = Path(__file__).resolve().parents[1]
             sys.path.insert(0, str(root / "simulation"))
@@ -1043,6 +1083,10 @@ def main() -> int:
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
                 )
+                # Task #39: backend (and the streaming viewport, above) are
+                # fully constructed -- safe to advertise sim_control's
+                # services now, right before this branch's main loop starts.
+                _enable_sim_control_services(app, gateway)
             stream_update_stride = 1
             stream_physics_frames = 0
             if args.livestream:
@@ -1321,6 +1365,11 @@ def main() -> int:
                 camera_rig=camera_rig,
                 camera_pointcloud=args.camera_pointcloud,
             )
+            # Task #39: backend and camera_rig warm-up (the ~90s window with
+            # almost no app.update() calls) are both fully behind us here --
+            # safe to advertise sim_control's services now, right before the
+            # boot-config print and the main loop below.
+            _enable_sim_control_services(app, gateway)
             camera_hz = _resolve_camera_hz(
                 robot_min_camera_hz,
                 os.environ.get("TINKER_SIM_CAMERA_HZ"),
@@ -1535,6 +1584,12 @@ def main() -> int:
                     backend=backend,
                     event_pump=gateway.spin_once if gateway is not None else None,
                 )
+            if args.ros:
+                # Task #39: backend (and, under --qualification, the visual
+                # capture warm-up above) are fully constructed -- safe to
+                # advertise sim_control's services now, right before the
+                # boot-config print and the main loop below.
+                _enable_sim_control_services(app, gateway)
             print(
                 json.dumps(
                     {
@@ -1609,6 +1664,12 @@ def main() -> int:
             world = World(stage_units_in_meters=1.0, backend="torch", device="cpu")
             world.scene.add_default_ground_plane()
             world.reset()
+            if args.ros:
+                # No RosStandardGateway exists on this profile (Task #39
+                # readiness has nothing to flip), but the extension itself
+                # still only needs enabling once world construction (fast,
+                # here) is done.
+                _enable_sim_control_services(app)
             print(
                 json.dumps(
                     {
