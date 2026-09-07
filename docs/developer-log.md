@@ -3074,3 +3074,82 @@ between 30 Hz and 120 Hz control) is a separate, unconfirmed
 control_hz-dependent effect in the close/stall-detection cadence, not
 reproduced by the clean side-pinch probe and not explained by this
 measurement bug -- it needs its own live investigation.
+
+## 2026-09-07 — TINKER_SIM_TRACK_OBJECTS log flood: blind per-tick PhysX queries of absent prims (#38)
+
+**Symptom**: `_log_tracked_objects` (opt-in via `TINKER_SIM_TRACK_OBJECTS`,
+built for the 2026-08-31 vanishing-spawn investigation) fires at its own
+~4 Hz cadence and, on every fire, calls
+`IPhysx.get_rigidbody_transformation(path)` for *every* path in
+`_tracked_object_paths` -- parsed blind from the env var with no existence
+check. A bench round logged 1424 bursts of the underlying carb/omni.physx
+ERROR line ("did not locate any object" / "Error executing
+getRigidBodyTransformation") because two of the tracked paths were spawned
+late (or already removed) and every tick before/after that queried them
+anyway. The Python side already handled the failure gracefully (`ret_val`
+check, try/except), but that C++-level ERROR log line is emitted from
+inside the PhysX call itself, before it ever returns to Python, so no
+amount of Python-side error handling suppresses it.
+
+**Cause**: unlike `_iter_spawned_bodies` (the "good pattern": re-derives
+its candidate list from `/World/Scenario`'s stage children, filtered by
+`RigidBodyAPI`, once per `_object_discovery_interval`, so it structurally
+cannot blind-query a path for more than one interval), `_log_tracked_objects`
+never re-derives or memoizes presence at all -- it queries the same static,
+env-parsed path list forever, for the whole backend lifetime, regardless of
+whether the prim ever existed or has since been removed.
+
+**Fix**: added `_resolve_tracked_objects()`, mirroring `_iter_spawned_bodies`'s
+discipline: at the `_object_discovery_interval` cadence (driven from
+`step()`, same as `_refresh_object_views`/`_heal_detached_scenario_bodies`),
+check each tracked path against the live stage
+(`stage.GetPrimAtPath(path).IsValid()` + `HasAPI(UsdPhysics.RigidBodyAPI)`)
+and maintain a `_tracked_object_resolved` set. `_log_tracked_objects` now
+only calls `get_rigidbody_transformation` for paths in that set -- an
+unresolved path is skipped every tick, not queried-then-caught. Logging is
+transition-based (mirroring the single-shot guard pattern used elsewhere,
+e.g. `_contact_report_first_event_logged`): "resolved" once when a path
+first becomes present, "missing" once when a previously-present path
+disappears, "unresolved" once for a path that has never resolved --
+instead of a per-tick state print. Two in-repo code paths that confirm a
+tracked prim's rigid body just went live get an immediate `force=True`
+re-check instead of waiting out the discovery interval:
+`_heal_detached_scenario_bodies` (when a watched spawn transitions to
+attached) and `set_entity_pose_physics` (when a park view is first
+resolved for a prim path). Output format for paths that do resolve is
+unchanged.
+
+**Tests** (`tests/test_manipulation_runtime.py`, net-new -- no prior test
+covered `TINKER_SIM_TRACK_OBJECTS`/`_log_tracked_objects` at all): a fake
+`omni.usd`/`pxr` stage stub (`_fake_omni_usd_and_pxr`) whose `GetPrimAtPath`
+re-checks a live, test-mutable `present_paths` set, plus a fake
+`omni.physx` module whose `get_rigidbody_transformation` asserts if called
+with a path outside an allowed set.
+- `test_log_tracked_objects_never_queries_unresolved_paths`: two present +
+  two absent paths, several ticks -- zero PhysX queries reach the absent
+  paths, present paths are queried every tick as before, and each absent
+  path logs exactly one "unresolved" line (not once per tick).
+- `test_tracked_object_resolves_on_spawn_without_waiting_for_interval`: a
+  path absent at first (`_object_discovery_interval=1000`, so a plain tick
+  would not naturally refresh) becomes present, and a forced re-check
+  (`force=True`, the spawn/park hook path) resolves it immediately -- one
+  "resolved" log line, and the very next `_log_tracked_objects()` call
+  queries it.
+- `test_tracked_object_stops_querying_after_despawn`: a present, queried
+  path disappears; the next `_resolve_tracked_objects()` call notices,
+  logs exactly one "missing" line, and no further PhysX query reaches that
+  path afterward (repeat ticks do not re-log "missing").
+
+Fail-first check: with the pre-fix `backend.py` (no
+`_resolve_tracked_objects`), all three new tests fail with
+`AttributeError: 'IsaacWholeRobotBackend' object has no attribute
+'_resolve_tracked_objects'`. Full suite (ROS-sourced, lark-shim on
+PYTHONPATH, `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`):
+`tests/test_manipulation_runtime.py` **132 passed, 3 subtests passed** (129
+baseline + 3 new).
+
+**Not addressed here**: the design doc for this task also traced a related
+"Physics tensor entity not valid ... velocities set to zero" warning to the
+vendored `isaacsim.ros2.sim_control` extension's `/get_entity_state` handler
+-- an out-of-tree call site this repo does not own and has no fix point
+for; left open.

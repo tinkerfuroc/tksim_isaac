@@ -733,6 +733,16 @@ class IsaacWholeRobotBackend:
         )
         self._tracked_object_views: dict[str, Any] = {}
         self._tracked_object_step = 0
+        # Resolved-path registry for the tracked set (Task #38): a tracked
+        # path is queried through PhysX only once it is confirmed present on
+        # the stage with RigidBodyAPI -- see _resolve_tracked_objects. Blind
+        # per-tick queries of an absent/removed prim both fail softly in
+        # Python AND emit a carb/omni.physx ERROR log line from inside the
+        # C++ call, which floods the log forever for any not-yet-spawned or
+        # already-deleted tracked path.
+        self._tracked_object_resolved: set[str] = set()
+        self._tracked_object_unresolved_logged: set[str] = set()
+        self._tracked_object_resolve_step = 0
         # Self-healing watchdog for the mid-play spawn attach race: about 1
         # in 3 /spawn_entity spawns onto a playing timeline never enters
         # PhysX (prim created and acked, RigidBodyAPI authored, but no
@@ -3211,6 +3221,7 @@ class IsaacWholeRobotBackend:
         # getattr defaults: test doubles construct via object.__new__ and
         # call step() without running __init__.
         if getattr(self, "_tracked_object_paths", ()):
+            self._resolve_tracked_objects()
             self._log_tracked_objects()
         if getattr(self, "_heal_detached_spawns", False):
             self._heal_detached_scenario_bodies()
@@ -3455,6 +3466,11 @@ class IsaacWholeRobotBackend:
                         flush=True,
                     )
                 state["healed"] = 1
+                # A newly-attached spawn may be a tracked path (Task #38):
+                # resolve it now rather than waiting out the next discovery
+                # interval, so _log_tracked_objects can query it on the very
+                # next tick it fires.
+                self._resolve_tracked_objects(force=True)
                 continue
             state["attempts"] += 1
             if state["attempts"] >= 3:
@@ -3486,6 +3502,94 @@ class IsaacWholeRobotBackend:
                     flush=True,
                 )
 
+    def _resolve_tracked_objects(self, *, force: bool = False) -> None:
+        """Refresh which TINKER_SIM_TRACK_OBJECTS paths currently resolve to
+        a live stage prim carrying RigidBodyAPI (Task #38).
+
+        Mirrors the "good pattern" ``_iter_spawned_bodies`` already uses for
+        scenario children: re-derive presence from the stage instead of
+        blind-querying PhysX forever. Runs at the same cadence
+        (``_object_discovery_interval``) so steady-state cost is one
+        ``GetPrimAtPath``/``HasAPI`` check per tracked path per interval, not
+        per tick. ``force=True`` lets a spawn-attach or park code path ask
+        for an immediate re-check instead of waiting out the interval, so a
+        freshly (re)spawned tracked prim is picked up without delay.
+
+        Logs a transition, not a state: "resolved" the first tick a path is
+        seen present, "missing" the first tick a previously-present path is
+        gone, "unresolved" once for a path that has never resolved at all --
+        mirroring the single-shot guard pattern used elsewhere (e.g.
+        ``_parity_tcp_bodies_missing_logged``, ``_contact_report_first_event_logged``).
+        """
+        paths = getattr(self, "_tracked_object_paths", ())
+        if not paths:
+            return
+        step = getattr(self, "_tracked_object_resolve_step", 0) + 1
+        self._tracked_object_resolve_step = step
+        interval = max(1, int(getattr(self, "_object_discovery_interval", 1)))
+        if not force and step != 1 and step % interval:
+            return
+        try:
+            import omni.usd
+            from pxr import UsdPhysics
+
+            stage = omni.usd.get_context().get_stage()
+        except (AttributeError, ImportError, RuntimeError):
+            return
+        resolved = getattr(self, "_tracked_object_resolved", None)
+        if resolved is None:
+            resolved = set()
+            self._tracked_object_resolved = resolved
+        unresolved_logged = getattr(self, "_tracked_object_unresolved_logged", None)
+        if unresolved_logged is None:
+            unresolved_logged = set()
+            self._tracked_object_unresolved_logged = unresolved_logged
+        for path in paths:
+            prim = stage.GetPrimAtPath(path)
+            present = bool(prim.IsValid()) and prim.HasAPI(UsdPhysics.RigidBodyAPI)
+            was_present = path in resolved
+            if present and not was_present:
+                resolved.add(path)
+                unresolved_logged.discard(path)
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": "resolved",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            elif not present and was_present:
+                resolved.discard(path)
+                unresolved_logged.add(path)
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": "missing",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            elif not present and path not in unresolved_logged:
+                unresolved_logged.add(path)
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": "unresolved",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
     def _log_tracked_objects(self) -> None:
         """Print tracked rigid-body world poses (TINKER_SIM_TRACK_OBJECTS).
 
@@ -3495,6 +3599,12 @@ class IsaacWholeRobotBackend:
         views have no release API) on a deleted prim invalidates the shared
         SimulationView and kills the boot. See
         ``_heal_detached_scenario_bodies``.
+
+        Only queries paths ``_resolve_tracked_objects`` has confirmed
+        present (Task #38): PhysX's ``get_rigidbody_transformation`` on an
+        absent prim both fails softly here AND emits its own carb/omni.physx
+        ERROR log line from inside the C++ call, so blind-querying an
+        absent/removed path every tick floods the log forever.
         """
         self._tracked_object_step += 1
         interval = max(1, int(0.25 * self.control_hz))
@@ -3506,7 +3616,10 @@ class IsaacWholeRobotBackend:
             physx = get_physx_interface()
         except (AttributeError, ImportError, RuntimeError):
             return
+        resolved = getattr(self, "_tracked_object_resolved", ())
         for path in self._tracked_object_paths:
+            if path not in resolved:
+                continue
             try:
                 result = physx.get_rigidbody_transformation(path)
             except (AttributeError, RuntimeError, TypeError) as error:
@@ -3939,6 +4052,10 @@ class IsaacWholeRobotBackend:
             if not count:
                 return False
             self._park_views[prim_path] = view
+            # A parked prim's rigid body just confirmed live; if it is a
+            # tracked path (Task #38), resolve it immediately instead of
+            # waiting out the next discovery interval.
+            self._resolve_tracked_objects(force=True)
         # The PhysxManager SimulationView uses the WARP frontend, whose
         # set_transforms/set_velocities require WARP arrays: they call
         # wp.types.type_ctype(tensor.dtype), which rejects a torch tensor's
