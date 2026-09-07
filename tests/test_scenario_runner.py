@@ -33,6 +33,9 @@ class _StrictLogger:
     def warning(self, message: str) -> None:
         self._warnings.append(message)
 
+    def info(self, message: str) -> None:
+        del message
+
 
 class _Runner:
     _initial_reset = scenario_runner.ScenarioRunner._initial_reset
@@ -229,6 +232,24 @@ class _FakeResultsNode:
     def __init__(self, *args, **kwargs) -> None:
         del args, kwargs
 
+    def create_subscription(self, msg_type, topic, callback, depth):
+        # Task #39: main() gates the first service call on
+        # _wait_for_services_ready() before execute() runs. Deliver an
+        # already-ready sample synchronously so these pre-#39 report-shape
+        # tests (which don't care about the readiness gate) never block.
+        del depth
+        assert topic == "/sim/status/isaac"
+        message = msg_type()
+        message.data = json.dumps({"services_ready": True})
+        callback(message)
+        return object()
+
+    def destroy_subscription(self, subscription) -> None:
+        del subscription
+
+    def get_logger(self):
+        return _StrictLogger([])
+
     def execute(self, operations):
         del operations
         return [
@@ -246,13 +267,12 @@ class _FakeResultsNode:
 
 
 def _patch_rclpy_and_runner(monkeypatch):
-    import rclpy
-
     monkeypatch.setattr(scenario_runner.rclpy, "init", lambda args=None: None)
     monkeypatch.setattr(scenario_runner.rclpy, "ok", lambda: False)
     monkeypatch.setattr(
         scenario_runner.rclpy.utilities, "remove_ros_args", lambda args: args
     )
+    monkeypatch.setattr(scenario_runner.rclpy, "spin_once", lambda *a, **k: None)
     monkeypatch.setattr(scenario_runner, "ScenarioRunner", _FakeResultsNode)
 
 
@@ -303,3 +323,127 @@ def test_legacy_path_with_report_writes_atomic_previous_shape(capsys, monkeypatc
     # No canonical compact report keys leak into the legacy payload.
     assert "report_revision" not in written
     assert "integrated" not in written
+
+
+class _WaitStatusMessage:
+    def __init__(self, data: str) -> None:
+        self.data = data
+
+
+class _WaitStatusNode:
+    """Minimal stand-in for the rclpy Node `_wait_for_services_ready` needs
+    (mirrors `tests/test_gpsr_spawn_cli.py`'s `_FakeStatusNode` -- the
+    function itself is a duplicate of `tools/gpsr_spawn.py`'s, per the
+    docstring in `scenario_runner._wait_for_services_ready`)."""
+
+    def __init__(self) -> None:
+        self._callback = None
+        self.destroyed_subscriptions: list[object] = []
+        self.warnings: list[str] = []
+
+    def create_subscription(self, msg_type, topic, callback, depth):
+        del msg_type, depth
+        assert topic == "/sim/status/isaac"
+        self._callback = callback
+        return object()
+
+    def destroy_subscription(self, subscription) -> None:
+        self.destroyed_subscriptions.append(subscription)
+
+    def deliver(self, services_ready: bool) -> None:
+        self._callback(_WaitStatusMessage(json.dumps({"services_ready": services_ready})))
+
+    def get_logger(self):
+        return _StrictLogger(self.warnings)
+
+
+class _WaitFakeClock:
+    """Deterministic monotonic-like clock: advances by `step` every call."""
+
+    def __init__(self, step: float = 1.0) -> None:
+        self._t = 0.0
+        self._step = step
+
+    def __call__(self) -> float:
+        self._t += self._step
+        return self._t
+
+
+def test_scenario_runner_wait_for_services_ready_waits_then_proceeds_on_true() -> None:
+    """Task #39 review finding 2: the first standard service call must be
+    gated on /sim/status/isaac's services_ready, not just on
+    ScenarioRunner.call()'s own wait_for_service loop."""
+    node = _WaitStatusNode()
+    deliveries = iter([False, False, True])
+
+    def spin_once(n, timeout_sec):
+        del timeout_sec
+        n.deliver(next(deliveries))
+
+    scenario_runner._wait_for_services_ready(
+        node, spin_once, _WaitStatusMessage, now=_WaitFakeClock(step=1.0)
+    )
+
+    with pytest.raises(StopIteration):
+        next(deliveries)
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+
+
+def test_scenario_runner_wait_for_services_ready_times_out_when_never_ready() -> None:
+    node = _WaitStatusNode()
+
+    def spin_once(n, timeout_sec):
+        del timeout_sec
+        n.deliver(False)
+
+    with pytest.raises(RuntimeError, match="services_ready"):
+        scenario_runner._wait_for_services_ready(
+            node,
+            spin_once,
+            _WaitStatusMessage,
+            timeout_s=5.0,
+            now=_WaitFakeClock(step=2.0),
+        )
+    assert node.destroyed_subscriptions, "subscription must still be cleaned up on timeout"
+
+
+def test_scenario_runner_wait_for_services_ready_falls_back_when_status_never_publishes() -> None:
+    """Task #39 review finding 3 applies here too: an older sim (or one
+    whose /sim/status/isaac has not come up yet) must fall back to the
+    existing per-call wait_for_service budget, not block the full 300s."""
+    node = _WaitStatusNode()
+
+    def spin_once(n, timeout_sec):
+        del n, timeout_sec  # nothing ever delivered
+
+    scenario_runner._wait_for_services_ready(
+        node,
+        spin_once,
+        _WaitStatusMessage,
+        timeout_s=300.0,
+        grace_s=3.0,
+        now=_WaitFakeClock(step=1.0),
+    )
+
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+    assert any("did not publish" in message for message in node.warnings)
+
+
+def test_scenario_runner_wait_for_services_ready_falls_back_when_field_missing() -> None:
+    node = _WaitStatusNode()
+
+    def spin_once(n, timeout_sec):
+        del timeout_sec
+        n._callback(_WaitStatusMessage(json.dumps({"physics_device": "cpu"})))
+
+    scenario_runner._wait_for_services_ready(
+        node,
+        spin_once,
+        _WaitStatusMessage,
+        timeout_s=300.0,
+        grace_s=10.0,
+        now=_WaitFakeClock(step=1.0),
+    )
+
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+    assert any("no 'services_ready' field" in message for message in node.warnings)

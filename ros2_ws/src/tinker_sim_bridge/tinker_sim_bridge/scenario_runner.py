@@ -18,6 +18,7 @@ from simulation_interfaces.srv import (
     SetSimulationState,
     SpawnEntity,
 )
+from std_msgs.msg import String
 
 from tinker_sim_core.orchestration import standard_operations
 from tinker_sim_core.scenario import load_named_scenario
@@ -140,6 +141,113 @@ def build_scenario_report(
         provider_manifest_sha256=provider_manifest_sha256,
         final_simulation_state=FINAL_SIMULATION_STATE,
     )
+
+
+# Task #39 review finding 2: `ScenarioRunner.call()`'s per-call --timeout
+# (default 20.0s, see main()'s --timeout argument) times both the
+# wait_for_service discovery and the response wait for every standard
+# service call. isaacsim.ros2.sim_control's services can be advertised
+# (wait_for_service() true) well before the sim's backend/camera-rig
+# warm-up finishes -- up to ~100s on the sensor-rich profile GPSR uses
+# (see docs/developer-log.md Task #39) -- so a scenario_runner invoked
+# right after that profile's launch (gpsr.launch.py never raises
+# --timeout past its 20s default) can lose its first load_world/
+# reset_spawned/spawn_entity call to that gap. Gate the very first
+# service call on the same /sim/status/isaac services_ready signal
+# tools/gpsr_spawn.py uses, ahead of (not instead of) the existing
+# per-call --timeout budget.
+SERVICES_READY_TIMEOUT_S = 300.0
+
+# How long to wait for /sim/status/isaac to publish at all (or to carry a
+# services_ready field) before concluding this is an older sim binary that
+# never will, and falling back to the pre-#39 wait_for_service-only path
+# (ScenarioRunner.call()'s own discovery loop) rather than burning the
+# whole SERVICES_READY_TIMEOUT_S on a signal that will never arrive.
+SERVICES_READY_GRACE_S = 10.0
+
+
+def _wait_for_services_ready(
+    node,
+    spin_once,
+    string_msg_type: type,
+    *,
+    timeout_s: float = SERVICES_READY_TIMEOUT_S,
+    grace_s: float = SERVICES_READY_GRACE_S,
+    now=time.monotonic,
+) -> None:
+    """Block until `/sim/status/isaac` reports `services_ready: true` (Task
+    #39), ahead of the first standard service call `ScenarioRunner.call()`
+    makes.
+
+    Duplicated (not imported) from `tools/gpsr_spawn.py`'s function of the
+    same name: that module lives in the top-level repo tree and is invoked
+    as a standalone script with no package install step, while this one is
+    part of the `tinker_sim_bridge` ament_python package built by colcon --
+    a cross-package import would tie the bridge's build to the top-level
+    `tools/` tree, which is not installed anywhere colcon looks. Keep the
+    two in sync by hand if the readiness contract changes.
+
+    Falls back to a no-op -- relying on `ScenarioRunner.call()`'s own
+    `wait_for_service` loop, i.e. the pre-#39 behavior -- if
+    `/sim/status/isaac` never publishes within `grace_s`, or its payload
+    never carries a `services_ready` field at all; both are signs of an
+    older sim binary rather than one that is genuinely still warming up.
+    Once a sample carrying the field is seen (`services_ready: false`
+    included), commits to the full `timeout_s` bounded wait and raises
+    `RuntimeError` on timeout.
+    """
+    ready = {"value": False}
+    status = {"seen": False, "has_field": False}
+
+    def _on_status(msg) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        status["seen"] = True
+        if "services_ready" in payload:
+            status["has_field"] = True
+            if payload.get("services_ready"):
+                ready["value"] = True
+
+    subscription = node.create_subscription(
+        string_msg_type, "/sim/status/isaac", _on_status, 10
+    )
+    try:
+        grace_deadline = now() + grace_s
+        while not status["seen"] and now() < grace_deadline:
+            spin_once(node, 0.5)
+        if not status["seen"]:
+            node.get_logger().warning(
+                f"/sim/status/isaac did not publish within {grace_s:.0f}s -- "
+                "falling back to the per-call wait_for_service readiness "
+                "check (older sim, or status topic not up yet)"
+            )
+            return
+        if not status["has_field"]:
+            node.get_logger().warning(
+                "/sim/status/isaac has no 'services_ready' field -- "
+                "falling back to the per-call wait_for_service readiness "
+                "check (older sim)"
+            )
+            return
+        if not ready["value"]:
+            node.get_logger().info(
+                f"/sim/status/isaac seen, services_ready=false -- waiting "
+                f"up to {timeout_s:.0f}s more before the first service call"
+            )
+            deadline = now() + timeout_s
+            while not ready["value"] and now() < deadline:
+                spin_once(node, 0.5)
+            if not ready["value"]:
+                raise RuntimeError(
+                    f"/sim/status/isaac never reported services_ready after "
+                    f"{timeout_s:.0f}s -- the sim may still be in backend/"
+                    "camera warm-up"
+                )
+        node.get_logger().info("/sim/status/isaac services_ready=true")
+    finally:
+        node.destroy_subscription(subscription)
 
 
 class _RetryableServiceError(RuntimeError):
@@ -481,6 +589,9 @@ def main(argv: list[str] | None = None) -> None:
         reset_retry_delay_s=arguments.reset_retry_delay,
     )
     try:
+        # Task #39: gate the first standard service call on services_ready,
+        # ahead of ScenarioRunner.call()'s per-call --timeout budget.
+        _wait_for_services_ready(node, rclpy.spin_once, String)
         results = node.execute(operations)
         if integrated is None:
             # Legacy non-overlay path: restore the byte/schema-compatible report

@@ -68,6 +68,59 @@ first; `wait_for_service()` alone is necessary but not sufficient -- it only
 proves the extension is enabled, not that Kit is being pumped regularly
 enough to serve a request promptly.
 
+### Review round (2026-09-07): test-double regression, scenario_runner gap, absent-status fallback
+
+Three findings from review against the fix above, all addressed:
+
+1. **`RosStandardGateway.publish()` read `self._services_ready` directly**,
+   which broke `tests/test_manipulation_runtime.py`'s
+   `test_finger_contact_wrench_publishes_every_tick_not_at_status_cadence`
+   -- its gateway double is built via `object.__new__(RosStandardGateway)`
+   (skips `__init__`, so `_services_ready`/`_services_ready_since` never
+   get set) and exercises `publish()`'s status block. Fixed with
+   `getattr(self, "_services_ready", False)` (and the `_since` sibling) so
+   any double built this way degrades to "not ready" instead of raising;
+   also added the two attributes directly to that test's double for
+   belt-and-suspenders. `tests/test_manipulation_runtime.py`: 129 passed, 0
+   failed (was 128 passed, 1 failed).
+
+2. **`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/scenario_runner.py`
+   had no `services_ready` gate at all.** Its `ScenarioRunner.call()` bounds
+   both the `wait_for_service` discovery and the response wait to a single
+   `--timeout` (default 20.0s; `gpsr.launch.py` never raises it), with no
+   retry beyond the very first `/reset_simulation`. Moving the sim's
+   `_enable_sim_control_services` call point later (this same task) makes
+   the ~100s warm-up gap it exists to describe worse for this client, not
+   better. Added a duplicate of `tools/gpsr_spawn.py`'s
+   `_wait_for_services_ready` (same fallback behavior as finding 3 below)
+   directly in `scenario_runner.py` -- not imported, since
+   `tinker_sim_bridge` is a separate `ament_python` package built by
+   colcon and the top-level `tools/` tree is not installed anywhere colcon
+   looks; a cross-package import would tie the bridge's build to a tree
+   outside it. Wired into `main()` right after `ScenarioRunner`
+   construction, ahead of `node.execute(operations)`. `tests/
+   test_scenario_runner.py`: 14 passed (10 pre-existing + 4 new), run under
+   `python3.10` (this file `pytest.importorskip`s real `rclpy`, whose
+   Humble-built C extension does not load under the repo's Python 3.12 uv
+   venv).
+
+3. **`tools/gpsr_spawn.py`'s `_wait_for_services_ready` had no fallback for
+   an older sim / absent `/sim/status/isaac`.** If the topic never
+   published at all, or published without a `services_ready` key (a
+   pre-#39 sim binary), the function spun for the full
+   `SERVICES_READY_TIMEOUT_S` (300s) and then raised, turning what used to
+   be a ~20-30s `wait_for_service`-only success into a 300s failure.
+   Added `SERVICES_READY_GRACE_S = 10.0`: the function now waits only that
+   long for *any* status sample; if none arrives, or the first one that
+   does has no `services_ready` key, it logs a warning and returns
+   immediately, leaving the caller's own `wait_for_service` checks (the
+   pre-#39 path) to run unmodified. Once a sample carrying the key is seen
+   -- `services_ready: false` included -- it commits to the full bounded
+   wait exactly as before. Same fallback duplicated into
+   `scenario_runner.py`'s copy (finding 2). `tests/test_gpsr_spawn_cli.py`:
+   34 passed (31 pre-existing + 3 new, including the false-then-true
+   commit-after-grace case).
+
 **Tests.** `tests/test_run_sim_services_readiness.py` (new): unit tests on
 `_enable_sim_control_services` itself (fakes for `enable_extension`/the
 app/gateway, asserting the enable -> `app.update` -> `mark_services_ready`

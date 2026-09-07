@@ -2508,6 +2508,8 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway._imu_stride = 1_000_000
         gateway._status_stride = 1_000_000
         gateway._tick = 0
+        gateway._services_ready = False
+        gateway._services_ready_since = None
 
         for _ in range(3):
             gateway.publish()

@@ -66,6 +66,13 @@ SPAWN_TIMEOUT_S = 120.0
 # sensor-rich profile's worst observed warm-up (~100s) several times over.
 SERVICES_READY_TIMEOUT_S = 300.0
 
+# Task #39 review: how long to wait for /sim/status/isaac to publish at all
+# (or to carry a services_ready field) before concluding this is an older
+# sim binary that never will, and falling back to the pre-#39
+# wait_for_service-only path rather than burning the whole
+# SERVICES_READY_TIMEOUT_S on a signal that will never arrive.
+SERVICES_READY_GRACE_S = 10.0
+
 
 class ServiceUnavailable(RuntimeError):
     """Raised by the real ROS service client (see `_make_ros_service_client`)
@@ -504,6 +511,7 @@ def _wait_for_services_ready(
     string_msg_type: type,
     *,
     timeout_s: float = SERVICES_READY_TIMEOUT_S,
+    grace_s: float = SERVICES_READY_GRACE_S,
     now: Callable[[], float] = time.monotonic,
 ) -> None:
     """Block until `/sim/status/isaac` reports `services_ready: true` (Task
@@ -518,38 +526,81 @@ def _wait_for_services_ready(
     the ROS middleware layer well before this module's own 120s budget
     would have complained. `node`/`spin_once`/`string_msg_type` are
     injected (rather than imported here) so this is testable without rclpy.
+
+    Task #39 review: an older sim binary (pre-#39) never publishes a
+    `services_ready` field at all -- either `/sim/status/isaac` never comes
+    up (topic entirely absent from this build), or it comes up without the
+    key. Burning the whole `timeout_s` (300s default) on a signal that will
+    never arrive would turn what used to be a ~20-30s
+    `wait_for_service`-only success into a 300s failure. So this first
+    waits only `grace_s` for *any* status sample; if none arrives, or the
+    first one that does has no `services_ready` key, it logs a warning and
+    returns immediately, leaving the caller to fall back to its own
+    `wait_for_service` check (the pre-#39 behavior). Once a sample with the
+    key is seen -- `services_ready: false` included -- this commits to the
+    full bounded wait and raises on timeout, same as before.
     """
     ready = {"value": False}
+    status = {"seen": False, "has_field": False}
 
     def _on_status(msg: Any) -> None:
         try:
             payload = json.loads(msg.data)
         except (TypeError, ValueError):
             return
-        if payload.get("services_ready"):
-            ready["value"] = True
+        status["seen"] = True
+        if "services_ready" in payload:
+            status["has_field"] = True
+            if payload.get("services_ready"):
+                ready["value"] = True
 
     subscription = node.create_subscription(
         string_msg_type, "/sim/status/isaac", _on_status, 10
     )
     print(
-        f"[gpsr_spawn] waiting up to {timeout_s:.0f}s for /sim/status/isaac "
-        "services_ready before starting the spawn budget",
+        f"[gpsr_spawn] waiting up to {grace_s:.0f}s for /sim/status/isaac "
+        "before gating on services_ready",
         flush=True,
     )
-    deadline = now() + timeout_s
     try:
-        while not ready["value"] and now() < deadline:
+        grace_deadline = now() + grace_s
+        while not status["seen"] and now() < grace_deadline:
             spin_once(node, 0.5)
+        if not status["seen"]:
+            print(
+                f"[gpsr_spawn] WARNING: /sim/status/isaac did not publish "
+                f"within {grace_s:.0f}s -- falling back to wait_for_service-"
+                "only readiness (older sim, or status topic not up yet)",
+                flush=True,
+            )
+            return
+        if not status["has_field"]:
+            print(
+                "[gpsr_spawn] WARNING: /sim/status/isaac has no "
+                "'services_ready' field -- falling back to "
+                "wait_for_service-only readiness (older sim)",
+                flush=True,
+            )
+            return
+        if not ready["value"]:
+            print(
+                f"[gpsr_spawn] /sim/status/isaac seen, services_ready=false "
+                f"-- waiting up to {timeout_s:.0f}s more before the spawn "
+                "budget starts",
+                flush=True,
+            )
+            deadline = now() + timeout_s
+            while not ready["value"] and now() < deadline:
+                spin_once(node, 0.5)
+            if not ready["value"]:
+                raise ServiceUnavailable(
+                    f"/sim/status/isaac never reported services_ready after "
+                    f"{timeout_s:.0f}s -- the sim may still be in backend/"
+                    "camera warm-up"
+                )
+        print("[gpsr_spawn] /sim/status/isaac services_ready=true", flush=True)
     finally:
         node.destroy_subscription(subscription)
-    if not ready["value"]:
-        raise ServiceUnavailable(
-            f"/sim/status/isaac never reported services_ready after "
-            f"{timeout_s:.0f}s -- the sim may still be in backend/camera "
-            "warm-up, or /sim/status/isaac is not being published at all"
-        )
-    print("[gpsr_spawn] /sim/status/isaac services_ready=true", flush=True)
 
 
 def _make_ros_service_client() -> "ServiceClient":

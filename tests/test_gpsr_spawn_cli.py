@@ -721,3 +721,73 @@ def test_wait_for_services_ready_ignores_status_samples_that_stay_false():
             timeout_s=3.0,
             now=_FakeClock(step=1.0),
         )
+
+
+def test_wait_for_services_ready_falls_back_when_status_never_publishes(capsys):
+    """Task #39 review finding 3: an older sim binary (or one whose
+    /sim/status/isaac has not come up yet) never publishes at all --
+    burning the full 300s timeout on that would turn a pre-#39 ~20-30s
+    wait_for_service success into a 300s failure. Must return (not raise)
+    after only the short grace period, leaving the caller to fall back to
+    its own wait_for_service check."""
+    node = _FakeStatusNode()
+
+    def spin_once(n, timeout_sec):
+        pass  # nothing ever delivered
+
+    _wait_for_services_ready(
+        node,
+        spin_once,
+        _FakeStatusMessage,
+        timeout_s=300.0,
+        grace_s=3.0,
+        now=_FakeClock(step=1.0),
+    )
+
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+    assert "did not publish" in capsys.readouterr().out
+
+
+def test_wait_for_services_ready_falls_back_when_field_missing(capsys):
+    """Task #39 review finding 3: an older sim's /sim/status/isaac payload
+    (or any schema without the services_ready key) must fall back rather
+    than being treated as services_ready=false and waited out."""
+    node = _FakeStatusNode()
+
+    def spin_once(n, timeout_sec):
+        node._callback(_FakeStatusMessage(json.dumps({"physics_device": "cpu"})))
+
+    _wait_for_services_ready(
+        node,
+        spin_once,
+        _FakeStatusMessage,
+        timeout_s=300.0,
+        grace_s=10.0,
+        now=_FakeClock(step=1.0),
+    )
+
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+    assert "no 'services_ready' field" in capsys.readouterr().out
+
+
+def test_wait_for_services_ready_false_then_true_still_proceeds_with_grace():
+    """The grace period only guards the *first* sample; once a sample with
+    the services_ready key is seen (even false), the wait commits to the
+    full bounded loop exactly as before finding 3's fallback was added."""
+    node = _FakeStatusNode()
+    deliveries = iter([False, False, True])
+
+    def spin_once(n, timeout_sec):
+        n.deliver(next(deliveries))
+
+    _wait_for_services_ready(
+        node,
+        spin_once,
+        _FakeStatusMessage,
+        timeout_s=30.0,
+        grace_s=10.0,
+        now=_FakeClock(step=1.0),
+    )
+
+    with pytest.raises(StopIteration):
+        next(deliveries)

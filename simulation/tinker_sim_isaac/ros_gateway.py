@@ -1226,8 +1226,12 @@ class RosStandardGateway:
                 # mark_services_ready(). Clients (e.g. tools/gpsr_spawn.py)
                 # should gate their first call on this, not just
                 # wait_for_service(), which returns true far earlier.
-                "services_ready": self._services_ready,
-                "services_ready_since": self._services_ready_since,
+                # getattr(..., default) rather than a direct attribute read:
+                # test doubles built via object.__new__(RosStandardGateway)
+                # (skipping __init__) exercise this publish() path without
+                # ever going through the constructor that sets these.
+                "services_ready": getattr(self, "_services_ready", False),
+                "services_ready_since": getattr(self, "_services_ready_since", None),
             }
             if self._camera_rig is not None:
                 status["camera_skipped_frames"] = self.camera_skipped_frames
