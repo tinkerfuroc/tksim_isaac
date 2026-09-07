@@ -446,25 +446,53 @@ gateway's job, see below). An engage appends
 just latched); a release appends `drive_applied=<_position_targets[0,
 drive_index]> drive_measured=<joint_pos[0, drive_index]>` (both equal
 immediately after a release, since the fresh hold target IS the measured
-joint position at that instant -- expected, not a bug).
+joint position at that instant -- expected, not a bug). The whole body is
+wrapped `try/except Exception: return` (review round 2, `2a305cb`): this
+path is reached from `_adopt_command_epoch`/`_enter_command_stream_lost`
+deep inside `spin_once()`'s unguarded loop, so a `print` `BrokenPipeError`
+or a stale-view `RuntimeError` from a log-only read must never kill the sim
+process. **`reason="init"` never actually appears in a log**: the backend
+boots with `_safety_stopped=True` (`IsaacWholeRobotBackend.__init__`), so
+the constructor's `set_safety_stop(True, reason="init")` hits the
+repeated-identical-sample early return before reaching the print -- the
+first visible transition on a live log is always `state=released
+reason=sample_false` (the gateway's first genuine clear sample).
 
-A second line, `applied_targets_reset source=<reason> drive_before=<...>
-drive_after=<...> measured=<...> sim_t=<...>`, fires at every place that
-replaces the whole `_position_targets` tensor (not an element-wise command
-write): `set_safety_stop`'s engage (snapshot clone) and release (fresh
-`joint_pos.clone()` hold target), and `step()`'s per-tick
-`_position_targets.copy_(_safety_snapshot)` reassertion while stopped --
-the last one guarded by a `_safety_hold_reassert_logged` flag (armed
-`False` on every engage) so it fires once, on the first tick after the
-engage, not once per physics tick for the whole duration of the stop.
-Rate-limited to `APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW` (5) lines per
-`APPLIED_TARGETS_RESET_LOG_WINDOW_S` (1.0 s), mirroring the existing
-`gripper_command_target` limiter. The ros_gateway paths that only call
-`backend.set_safety_stop(...)` (baseline preflight/commit,
-`_adopt_command_epoch`, `_enter_command_stream_lost`, its recovery) don't
-duplicate this line themselves -- the backend is the single source of truth
-for every wholesale `_position_targets` replace, and every one of those
-gateway paths already routes through `set_safety_stop`.
+A second line, `applied_targets_reset source=<...> drive_before=<...>
+drive_after=<...> measured=<...> sim_t=<...> dropped=<n>`, fires at the
+FOUR places that replace the whole `_position_targets` tensor (not an
+element-wise command write): `set_safety_stop`'s engage (snapshot clone)
+and release (fresh `joint_pos.clone()` hold target); `step()`'s per-tick
+`_position_targets.copy_(_safety_snapshot)` reassertion while stopped
+(guarded by a `_safety_hold_reassert_logged` flag, armed `False` on every
+engage, so it fires once on the first tick after the engage, not once per
+physics tick for the whole duration of the stop); and
+`_refresh_robot_handles`' `_position_targets = joint_pos.clone()` reseed on
+every root-view identity change (review round 2 addition -- this one has
+NO safety stop involved at all, the exact re-origination shape #33's
+stale-hold/gripper-target chain is hunting; `source=refresh_robot_handles:
+reset_rebind` for a genuine STOP -> spawn -> PLAY reset or
+`:view_recovery` for `_maybe_recover_simulation_view`'s state-preserving
+rebind, same `reapply_spawn_yaw` classification `_log_spawn_pose_trace`
+already uses; `drive_before` is `n/a` on the very first boot bind, when
+`_position_targets` doesn't exist yet). Every argument these four sites
+pass is computed through `_safety_drive_scalar`/a new `_robot_joint_pos()`
+getattr-chain helper (review round 2: NEVER a bare `self._robot.data.
+joint_pos` attribute chain, which can raise before `_log_applied_targets_
+reset`'s own try is even entered) and each call site is additionally
+wrapped in its own local `try/except`, so nothing this line reads can
+propagate. Rate-limited to `APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW` (5)
+lines per `APPLIED_TARGETS_RESET_LOG_WINDOW_S` (1.0 s) IN TOTAL -- one
+shared window across all four sources, not five per source (the original
+comment claimed "per source"; the implementation was always a single
+counter, and review round 2 fixed the comment instead of the behaviour);
+a suppressed line increments a counter that the next line to get through
+reports as `dropped=<n>`, so nothing suppressed is unaccounted for. The
+ros_gateway paths that only *call* `backend.set_safety_stop(...)` (baseline
+preflight/commit, `_adopt_command_epoch`, `_enter_command_stream_lost`, its
+recovery) don't duplicate this line themselves -- the backend is the single
+source of truth for every wholesale `_position_targets` replace, and every
+one of those gateway paths already routes through `set_safety_stop`.
 
 **`ros_gateway.py`**: every one of the ~10 `backend.set_safety_stop(...)`
 call sites now passes a distinct `reason=`: `"init"` (constructor),
@@ -492,7 +520,17 @@ always gets one line regardless of the window so a recovery is never
 silently swallowed by it; a source that has never gone stale stays silent.
 Both callers (`_enforce_command_deadline`, `_enforce_safety_deadline`) pass
 `source="command_stream"` / `"safety_heartbeat"` and their own already-
-computed wall age.
+computed wall age. **Reading `stale=` on this line**: both callers only
+reach `_sim_age_stale` AFTER their own wall-clock check already failed
+(`now - last >= timeout`) -- the sample is already wall-stale by
+construction whenever this line is emitted at all. `stale=` is therefore
+the SIM-time verdict on top of that: `stale=True` means stale in BOTH
+clocks (a genuinely dead publisher, or the sim genuinely outpacing it) and
+the deadline actually fires; `stale=False` means wall-stale-but-sim-fresh
+-- the stepping loop itself stalled (an RTX render stride, a loaded box)
+while a healthy sample sat queued in DDS -- and the deadline is deliberately
+NOT applied. It is never evidence of a fully healthy sample; it only
+distinguishes "the loop stalled" from "the publisher died."
 
 **Tests.** `tests/test_manipulation_runtime.py`: engage-then-release prints
 both lines with the expected reason/state/drive fields; a repeated identical
@@ -502,7 +540,10 @@ raising; a release's `applied_targets_reset` reports the pre-replace
 `_position_targets` value (the "ramp" value) as `drive_before` and the
 joint_pos-derived fresh target as `drive_after`/`measured`; `step()`'s
 per-tick reassertion logs exactly once across three consecutive ticks while
-stopped. `tests/test_ros_gateway.py`: a fake backend recording
+stopped; review round 2 added a rebind test (`_robot_view_identity` forced
+to a new value, no safety stop involved) asserting
+`source=refresh_robot_handles:reset_rebind` with the pre-rebind value as
+`drive_before`. `tests/test_ros_gateway.py`: a fake backend recording
 `(active, reason)` pairs confirms a direct sample carries `"sample_true"`,
 `_enforce_safety_deadline` under a fake-clock timeout carries
 `"safety_stale"`, and `_adopt_command_epoch` carries `"command_epoch_retired"`
@@ -511,10 +552,13 @@ confirms the stale line is rate-limited to one per second, a stale->fresh
 transition always logs, and a never-stale source stays silent. Full suite
 under the repo's ROS-env pytest incantation (`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
 + lark-shim `PYTHONPATH`, sourced `/opt/ros/humble/setup.bash` without
-`set -u`, `uv run --frozen --no-sync`):
-`tests/test_manipulation_runtime.py` 164 passed / 5 subtests passed (157
-baseline + 7 new); `tests/test_ros_gateway.py` 27 passed (21 baseline + 6
-new). No GPU boot for this diagnostic-only change.
+`set -u`, `uv run --frozen --no-sync`), review round 2 (`2a305cb` review
+fixes, this commit):
+`tests/test_manipulation_runtime.py` 165 passed / 5 subtests passed (157
+baseline + 8 new, +1 over the first round's 164/7); `tests/test_ros_gateway.py`
+27 passed (21 baseline + 6 new, unchanged this round);
+`tests/test_gateway_simtime_deadlines.py` 7 passed, unaffected. No GPU boot
+for this diagnostic-only change.
 
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 

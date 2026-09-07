@@ -377,10 +377,12 @@ GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW = 5
 GRIPPER_COMMAND_TARGET_LOG_WINDOW_S = 1.0
 
 # Observability only (#33): cap on how many applied_targets_reset lines
-# _log_applied_targets_reset prints per source within
+# _log_applied_targets_reset prints in TOTAL (across every source -- engage,
+# release, step()'s reassert, _refresh_robot_handles) within
 # APPLIED_TARGETS_RESET_LOG_WINDOW_S. A safety engage/release pair or a
 # rapid stop/clear flap should be fully visible; a pathological flap must
-# still be capped so it cannot spam the log.
+# still be capped so it cannot spam the log. Suppressed lines are still
+# counted; the next line to get through reports how many were dropped.
 APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW = 5
 APPLIED_TARGETS_RESET_LOG_WINDOW_S = 1.0
 
@@ -2234,8 +2236,33 @@ class IsaacWholeRobotBackend:
         )
         self._safety_gains_applied = False
         self._velocity_targets = self._torch.zeros_like(self._robot.data.joint_vel)
+        # Observability only (#33): this reseed is a wholesale
+        # `_position_targets` replace with NO safety stop involved -- the
+        # same re-origination shape #33's stale-hold/gripper-target chain
+        # is hunting, so it gets the same `applied_targets_reset` line as
+        # the safety engage/release/reassert sites. `drive_before` reads
+        # whatever was in `_position_targets` before this call (`None` --
+        # renders "n/a" -- on the very first bind, when the attribute
+        # doesn't exist yet); `source` distinguishes a genuine STOP->PLAY
+        # reset rebind from a state-preserving mid-run view recovery, same
+        # tag `_log_spawn_pose_trace` above already uses for the same
+        # `reapply_spawn_yaw` classification.
+        _reset_drive_index = getattr(self, "_drive_joint_index", None)
+        _reset_drive_before = self._safety_drive_scalar(
+            getattr(self, "_position_targets", None), _reset_drive_index
+        )
         self._position_targets = self._robot.data.joint_pos.clone()
         self._effort_targets = self._torch.zeros_like(self._robot.data.joint_vel)
+        try:
+            self._log_applied_targets_reset(
+                "refresh_robot_handles:"
+                + ("reset_rebind" if reapply_spawn_yaw else "view_recovery"),
+                _reset_drive_before,
+                self._safety_drive_scalar(self._position_targets, _reset_drive_index),
+                self._safety_drive_scalar(self._robot_joint_pos(), _reset_drive_index),
+            )
+        except Exception:
+            pass
         # Cached once here (only rebuilt when the articulation view changes,
         # not per physics step) so the vectorised wheel slew in step() never
         # pays for a fresh tensor allocation on the hot path.
@@ -2353,7 +2380,9 @@ class IsaacWholeRobotBackend:
         self._target_write_gate.force_next()
         drive_index = getattr(self, "_drive_joint_index", None)
         if active:
-            drive_before = self._safety_drive_scalar(self._position_targets, drive_index)
+            drive_before = self._safety_drive_scalar(
+                getattr(self, "_position_targets", None), drive_index
+            )
             self._pending_snapshot_id = None
             self._pending_snapshot_commands.clear()
             self._command_snapshot_id = None
@@ -2368,14 +2397,19 @@ class IsaacWholeRobotBackend:
             }
             self._safety_hold_reassert_logged = False
             self._log_safety_stop_transition(True, reason, drive_index)
-            self._log_applied_targets_reset(
-                reason or "unspecified",
-                drive_before,
-                self._safety_drive_scalar(self._position_targets, drive_index),
-                self._safety_drive_scalar(self._robot.data.joint_pos, drive_index),
-            )
+            try:
+                self._log_applied_targets_reset(
+                    reason or "unspecified",
+                    drive_before,
+                    self._safety_drive_scalar(self._position_targets, drive_index),
+                    self._safety_drive_scalar(self._robot_joint_pos(), drive_index),
+                )
+            except Exception:
+                pass
             return
-        drive_before = self._safety_drive_scalar(self._position_targets, drive_index)
+        drive_before = self._safety_drive_scalar(
+            getattr(self, "_position_targets", None), drive_index
+        )
         self._restore_safety_actuator_gains()
         self._safety_stopped = False
         # Clearing a stop creates a fresh hold target. It must not restore the
@@ -2385,12 +2419,31 @@ class IsaacWholeRobotBackend:
         self._effort_targets.zero_()
         self._safety_snapshot = None
         self._log_safety_stop_transition(False, reason, drive_index)
-        self._log_applied_targets_reset(
-            reason or "unspecified",
-            drive_before,
-            self._safety_drive_scalar(self._position_targets, drive_index),
-            self._safety_drive_scalar(self._robot.data.joint_pos, drive_index),
-        )
+        try:
+            self._log_applied_targets_reset(
+                reason or "unspecified",
+                drive_before,
+                self._safety_drive_scalar(self._position_targets, drive_index),
+                self._safety_drive_scalar(self._robot_joint_pos(), drive_index),
+            )
+        except Exception:
+            pass
+
+    def _robot_joint_pos(self) -> Any:
+        """``self._robot.data.joint_pos``, via getattr chains only.
+
+        Observability call sites (#33) use this instead of the direct
+        attribute chain so a mid-teardown/invalidated robot handle degrades
+        a log line's "measured" field to "n/a" instead of raising an
+        AttributeError out of an observability call in set_safety_stop/
+        step(). Never raises: a broken handle here returns ``None``.
+        """
+        try:
+            data = getattr(self, "_robot", None)
+            data = getattr(data, "data", None)
+            return getattr(data, "joint_pos", None)
+        except Exception:
+            return None
 
     @staticmethod
     def _safety_drive_scalar(tensor: Any, drive_index: int | None) -> float | None:
@@ -2399,12 +2452,15 @@ class IsaacWholeRobotBackend:
         Observability only (#33): returns ``None`` (renders "n/a" via
         ``format_duration``) instead of raising on a missing index, an
         untensor-like value, or a test double that doesn't shape like one.
+        Catches any ``Exception`` (not just the obvious index/type/value
+        trio) -- this is called from inside guarded log helpers whose whole
+        point is to never propagate.
         """
         if drive_index is None or tensor is None:
             return None
         try:
             return float(tensor[0, drive_index])
-        except (IndexError, TypeError, ValueError):
+        except Exception:
             return None
 
     def _log_safety_stop_transition(
@@ -2415,34 +2471,42 @@ class IsaacWholeRobotBackend:
         actually flips -- a repeated identical sample already returned
         before reaching here. The backend has no wall clock of its own
         (that is the gateway's job), so ``wall_age_s`` is always unknown
-        from here. Must never raise: a log line cannot be the reason a
-        safety transition fails.
+        from here. The entire body is guarded: ``set_safety_stop`` is
+        reached from ``_adopt_command_epoch``/``_enter_command_stream_lost``
+        deep inside spin_once()'s unguarded loop, so a log line here (a
+        BrokenPipeError from ``print``, or a RuntimeError from an
+        invalidated PhysX view read) must never be the reason the sim
+        process dies -- it must never raise.
         """
-        reason_text = reason if reason else "unspecified"
         try:
-            sim_t = format_duration(self.simulation_time)
+            reason_text = reason if reason else "unspecified"
+            try:
+                sim_t = format_duration(self.simulation_time)
+            except Exception:
+                sim_t = "n/a"
+            line = (
+                f"sim_safety_stop state={'engaged' if active else 'released'} "
+                f"reason={reason_text} sim_t={sim_t} wall_age_s={format_duration(None)}"
+            )
+            if active:
+                snapshot = self._safety_drive_scalar(
+                    getattr(self, "_safety_snapshot", None), drive_index
+                )
+                line += f" drive_snapshot={format_duration(snapshot)}"
+            else:
+                applied = self._safety_drive_scalar(
+                    getattr(self, "_position_targets", None), drive_index
+                )
+                measured = self._safety_drive_scalar(
+                    self._robot_joint_pos(), drive_index
+                )
+                line += (
+                    f" drive_applied={format_duration(applied)} "
+                    f"drive_measured={format_duration(measured)}"
+                )
+            print(line, flush=True)
         except Exception:
-            sim_t = "n/a"
-        line = (
-            f"sim_safety_stop state={'engaged' if active else 'released'} "
-            f"reason={reason_text} sim_t={sim_t} wall_age_s={format_duration(None)}"
-        )
-        if active:
-            snapshot = self._safety_drive_scalar(
-                getattr(self, "_safety_snapshot", None), drive_index
-            )
-            line += f" drive_snapshot={format_duration(snapshot)}"
-        else:
-            applied = self._safety_drive_scalar(self._position_targets, drive_index)
-            data = getattr(self._robot, "data", None)
-            measured = self._safety_drive_scalar(
-                getattr(data, "joint_pos", None), drive_index
-            )
-            line += (
-                f" drive_applied={format_duration(applied)} "
-                f"drive_measured={format_duration(measured)}"
-            )
-        print(line, flush=True)
+            return
 
     def _log_applied_targets_reset(
         self,
@@ -2454,12 +2518,16 @@ class IsaacWholeRobotBackend:
         """Announce a wholesale ``_position_targets`` replace/copy (not an
         element-wise command write) -- observability only, #33: safety
         engage (snapshot clone), safety release (fresh joint_pos-derived
-        hold target), and step()'s per-tick reassertion while stopped
-        (caller passes a distinct ``source`` and rate-limits that one to
-        once per engage rather than calling this per tick). Rate-limited to
-        APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW lines per
-        APPLIED_TARGETS_RESET_LOG_WINDOW_S so a rapid stop/clear flap cannot
-        spam the log; must never raise.
+        hold target), step()'s per-tick reassertion while stopped (caller
+        rate-limits that one to once per engage itself, via
+        ``_safety_hold_reassert_logged``, rather than calling this per
+        tick), and ``_refresh_robot_handles``' per-rebind reseed. Rate-
+        limited to APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW lines per
+        APPLIED_TARGETS_RESET_LOG_WINDOW_S IN TOTAL (one shared window
+        across every source, not one per source) so a rapid stop/clear flap
+        cannot spam the log; a suppressed line still increments a counter,
+        reported as ``dropped=<n>`` on the next line that gets through, so
+        nothing suppressed goes unaccounted for. Must never raise.
         """
         try:
             now = time.monotonic()
@@ -2472,14 +2540,20 @@ class IsaacWholeRobotBackend:
                 if now - stamp < APPLIED_TARGETS_RESET_LOG_WINDOW_S
             ]
             if len(state) >= APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW:
+                self._applied_targets_reset_dropped = (
+                    getattr(self, "_applied_targets_reset_dropped", 0) + 1
+                )
                 return
             state.append(now)
+            dropped = getattr(self, "_applied_targets_reset_dropped", 0)
+            self._applied_targets_reset_dropped = 0
             print(
                 f"applied_targets_reset source={source} "
                 f"drive_before={format_duration(drive_before)} "
                 f"drive_after={format_duration(drive_after)} "
                 f"measured={format_duration(measured)} "
-                f"sim_t={format_duration(self.simulation_time)}",
+                f"sim_t={format_duration(self.simulation_time)} "
+                f"dropped={dropped}",
                 flush=True,
             )
         except Exception:
@@ -3769,12 +3843,18 @@ class IsaacWholeRobotBackend:
             # tick while stopped, so only the first tick after an engage
             # (set_safety_stop(True) arms this flag) is logged -- a per-tick
             # line would spam the log for the whole duration of the stop.
+            # `drive_before` is computed lazily (only when this tick will
+            # actually log) and every read here is getattr-guarded so a
+            # broken/mid-teardown handle degrades a field to "n/a" instead
+            # of raising out of step()'s unguarded caller.
             reassert_logged = getattr(self, "_safety_hold_reassert_logged", True)
             drive_index = getattr(self, "_drive_joint_index", None)
             drive_before = (
                 None
                 if reassert_logged
-                else self._safety_drive_scalar(self._position_targets, drive_index)
+                else self._safety_drive_scalar(
+                    getattr(self, "_position_targets", None), drive_index
+                )
             )
             # Reassert the latched target and retire any buffer mutation that
             # could have arrived after the command epoch was stopped.  These
@@ -3785,15 +3865,19 @@ class IsaacWholeRobotBackend:
             self._apply_safety_actuator_hold()
             if not reassert_logged:
                 self._safety_hold_reassert_logged = True
-                data = getattr(self._robot, "data", None)
-                self._log_applied_targets_reset(
-                    "step_safety_reassert",
-                    drive_before,
-                    self._safety_drive_scalar(self._position_targets, drive_index),
-                    self._safety_drive_scalar(
-                        getattr(data, "joint_pos", None), drive_index
-                    ),
-                )
+                try:
+                    self._log_applied_targets_reset(
+                        "step_safety_reassert",
+                        drive_before,
+                        self._safety_drive_scalar(
+                            getattr(self, "_position_targets", None), drive_index
+                        ),
+                        self._safety_drive_scalar(
+                            self._robot_joint_pos(), drive_index
+                        ),
+                    )
+                except Exception:
+                    pass
         else:
             self._slew_wheel_targets()
             self._ramp_drive_target()

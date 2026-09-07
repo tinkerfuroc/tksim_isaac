@@ -1375,6 +1375,38 @@ class ManipulationRuntimeTest(unittest.TestCase):
         ]
         self.assertEqual(len(lines), 1)
 
+    def test_refresh_robot_handles_rebind_logs_applied_targets_reset(self) -> None:
+        """``_refresh_robot_handles`` re-seeds ``_position_targets`` on every
+        root-view identity change with NO safety stop involved -- the same
+        re-origination shape the safety-stop lines cover. A genuine rebind
+        (``reapply_spawn_yaw=True``, the default) must log
+        ``source=refresh_robot_handles:reset_rebind`` with the pre-rebind
+        value as ``drive_before``.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._position_targets = torch.tensor([[0.42, -1.0]], dtype=torch.float32)
+        backend._robot_view_identity = -1  # force a "new view" rebind
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 42)
+        backend._object_views = {}
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            self.assertTrue(backend._refresh_robot_handles())
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("applied_targets_reset ")
+            and "source=refresh_robot_handles:reset_rebind" in line
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("drive_before=0.420", lines[0])
+        # The reseed is joint_pos.clone(); joint_pos[0, 0] is 0.25 in
+        # _FakeRobot's fixture.
+        self.assertIn("drive_after=0.250", lines[0])
+        self.assertIn("measured=0.250", lines[0])
+
     def test_snapshot_boundary_preserves_active_mixed_base_and_arm_packets(self) -> None:
         backend = _backend()
         backend.begin_command_snapshot(0)
