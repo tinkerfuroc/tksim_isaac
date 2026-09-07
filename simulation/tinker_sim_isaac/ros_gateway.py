@@ -114,7 +114,12 @@ class RosStandardGateway:
             qos_profile_sensor_data,
         )
         from rclpy.signals import SignalHandlerOptions
-        from geometry_msgs.msg import WrenchStamped
+        from geometry_msgs.msg import (
+            Point32,
+            PolygonStamped,
+            PoseStamped,
+            WrenchStamped,
+        )
         from rosgraph_msgs.msg import Clock
         from sensor_msgs.msg import Imu, JointState, PointCloud2, PointField
         from std_msgs.msg import Bool, String
@@ -172,6 +177,9 @@ class RosStandardGateway:
         self._Bool = Bool
         self._String = String
         self._WrenchStamped = WrenchStamped
+        self._PoseStamped = PoseStamped
+        self._PolygonStamped = PolygonStamped
+        self._Point32 = Point32
         self.clock_pub = self.node.create_publisher(Clock, "/clock", reliable)
         self.joint_pub = self.node.create_publisher(
             JointState, "/isaac_joint_states", reliable
@@ -199,6 +207,27 @@ class RosStandardGateway:
         self.contact_pub = self.node.create_publisher(
             WrenchStamped, "/sim/parity/finger_contact", reliable
         )
+        # Task #35: backend-only TCP/pad-inner-face parity diagnostic, so the
+        # grasp bench can diff the sim's PHYSICAL tool-centre-point and pad
+        # faces against the ROS TF link_tcp in one recording. Default on;
+        # TINKER_SIM_PARITY_TCP=0 disables (e.g. a bench that only cares
+        # about /sim/parity/finger_contact).
+        self._parity_tcp_enabled = (
+            os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"
+        )
+        self.tcp_pose_pub = None
+        self.tcp_pose_base_pub = None
+        self.pad_points_pub = None
+        if self._parity_tcp_enabled:
+            self.tcp_pose_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/tcp_pose", reliable
+            )
+            self.tcp_pose_base_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/tcp_pose_base", reliable
+            )
+            self.pad_points_pub = self.node.create_publisher(
+                PolygonStamped, "/sim/parity/pad_points", reliable
+            )
         self._camera_rig = camera_rig
         self.camera_skipped_frames = 0
         self._camera_streams: list[dict[str, Any]] = []
@@ -1232,6 +1261,56 @@ class RosStandardGateway:
         contact.header.frame_id = "link_tcp"
         contact.wrench.force.z = float(force)
         self.contact_pub.publish(contact)
+        # Task #35: same cadence as physics_truth below (unconditional, every
+        # tick) -- a stride-gated sample would miss the transient tool-centre
+        # motion a grasp bench needs to diff against TF link_tcp. Fails soft:
+        # backend.parity_tcp_frame() returns None (and logs once) if
+        # link_tcp/left_finger/right_finger cannot be resolved this tick.
+        if self._parity_tcp_enabled:
+            parity_tcp = self.backend.parity_tcp_frame()
+            if parity_tcp is not None:
+                tcp_world = parity_tcp["tcp_pose_world"]
+                tcp_pose = self._PoseStamped()
+                tcp_pose.header.stamp = stamp
+                tcp_pose.header.frame_id = "world"
+                (
+                    tcp_pose.pose.position.x,
+                    tcp_pose.pose.position.y,
+                    tcp_pose.pose.position.z,
+                ) = tcp_world["xyz"]
+                (
+                    tcp_pose.pose.orientation.x,
+                    tcp_pose.pose.orientation.y,
+                    tcp_pose.pose.orientation.z,
+                    tcp_pose.pose.orientation.w,
+                ) = tcp_world["quaternion_xyzw"]
+                self.tcp_pose_pub.publish(tcp_pose)
+
+                tcp_base = parity_tcp["tcp_pose_base"]
+                tcp_pose_base = self._PoseStamped()
+                tcp_pose_base.header.stamp = stamp
+                tcp_pose_base.header.frame_id = "base_link"
+                (
+                    tcp_pose_base.pose.position.x,
+                    tcp_pose_base.pose.position.y,
+                    tcp_pose_base.pose.position.z,
+                ) = tcp_base["xyz"]
+                (
+                    tcp_pose_base.pose.orientation.x,
+                    tcp_pose_base.pose.orientation.y,
+                    tcp_pose_base.pose.orientation.z,
+                    tcp_pose_base.pose.orientation.w,
+                ) = tcp_base["quaternion_xyzw"]
+                self.tcp_pose_base_pub.publish(tcp_pose_base)
+
+                pad_points = self._PolygonStamped()
+                pad_points.header.stamp = stamp
+                pad_points.header.frame_id = "base_link"
+                pad_points.polygon.points = [
+                    self._Point32(x=float(x), y=float(y), z=float(z))
+                    for (x, y, z) in parity_tcp["pad_points_base"]
+                ]
+                self.pad_points_pub.publish(pad_points)
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {

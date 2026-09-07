@@ -648,6 +648,141 @@ def bind_fused_actuator_model(robot: Any) -> None:
     robot._apply_actuator_model = types.MethodType(_fused_apply_actuator_model, robot)
 
 
+# --- Task #35: TCP/pad-inner-face parity geometry ---------------------------
+# Provenance: a live ``pxr`` readback of the shipped robot USD (see
+# $TMP/task31-jaw-opening-findings.md for the original probe, re-verified
+# 2026-09-06 against artifacts/robot/tinker2/*/robot.usd). For both
+# /tinker_full/{left,right}_finger, ``UsdGeom.BBoxCache.ComputeLocalBound``
+# on the finger's own ``collisions`` prim (i.e. relative to the finger
+# link's own origin, before that link's world transform is applied) gives:
+#   X (width, both):        -16.0 / +16.0 mm
+#   Y (closing axis) left:  -26.0 / +5.9 mm     right: -5.9 / +26.0 mm
+#   Z (reach axis, both):    -5.9 / +61.0 mm
+# The two collision meshes are mirror images of one another (their link
+# frames share the same orientation -- both fingers rotate about local X
+# only, confirmed via ComputeLocalToWorldTransform); each pad's INNER face
+# (the surface that actually meets a grasped object) is the extreme 26.0 mm
+# from the link origin -- local Y = -0.026 on the left finger, +0.026 on
+# the right -- at the pad's mid-reach height.
+PAD_INNER_INSET_M = 0.026
+PAD_MID_REACH_M = (-0.0059 + 0.0610) / 2.0
+# Fixed offsets in each finger LINK's OWN FRAME from the link origin to the
+# centre of its inner face. Rotate by that link's current body_quat_w (the
+# same tensor the physics-truth tcp_pose read already uses) to place the
+# point in world space -- this is correct through the whole open/close
+# range because it is a point painted on the rigid pad, not a world-frame
+# constant; the closing motion is captured entirely by body_quat_w.
+LEFT_FINGER_PAD_LOCAL_OFFSET = (0.0, -PAD_INNER_INSET_M, PAD_MID_REACH_M)
+RIGHT_FINGER_PAD_LOCAL_OFFSET = (0.0, PAD_INNER_INSET_M, PAD_MID_REACH_M)
+
+
+def rotate_vector_xyzw(
+    quaternion_xyzw: Iterable[float], vector: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    """Rotate *vector* by the unit quaternion *quaternion_xyzw* (x, y, z, w).
+
+    Scalar-last, matching every other quaternion in this module
+    (``_quaternion_xyzw_from_physx``, ``root_state``, ``spawn_root_rot_xyzw``).
+    """
+    x, y, z, w = (float(value) for value in quaternion_xyzw)
+    vx, vy, vz = vector
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return (
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    )
+
+
+def _conjugate_xyzw(
+    quaternion_xyzw: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    x, y, z, w = quaternion_xyzw
+    return (-x, -y, -z, w)
+
+
+def _quaternion_multiply_xyzw(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Hamilton product ``a (x) b``, both scalar-last."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def finger_inner_face_world(
+    position: tuple[float, float, float],
+    quaternion_xyzw: tuple[float, float, float, float],
+    local_offset: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """World-frame centre of a finger pad's inner face.
+
+    *local_offset* is fixed in the finger link's own frame (see
+    ``LEFT_FINGER_PAD_LOCAL_OFFSET`` / ``RIGHT_FINGER_PAD_LOCAL_OFFSET``
+    above); rotating it by *quaternion_xyzw* -- that link's own current
+    ``body_quat_w`` -- places it correctly in world space at any joint
+    angle.
+    """
+    rotated = rotate_vector_xyzw(quaternion_xyzw, local_offset)
+    return (
+        position[0] + rotated[0],
+        position[1] + rotated[1],
+        position[2] + rotated[2],
+    )
+
+
+def pad_points_world(
+    left_finger_pose: tuple[
+        tuple[float, float, float], tuple[float, float, float, float]
+    ],
+    right_finger_pose: tuple[
+        tuple[float, float, float], tuple[float, float, float, float]
+    ],
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    """Left inner-face, right inner-face, and their midpoint -- world frame."""
+    left_position, left_quaternion = left_finger_pose
+    right_position, right_quaternion = right_finger_pose
+    left_point = finger_inner_face_world(
+        left_position, left_quaternion, LEFT_FINGER_PAD_LOCAL_OFFSET
+    )
+    right_point = finger_inner_face_world(
+        right_position, right_quaternion, RIGHT_FINGER_PAD_LOCAL_OFFSET
+    )
+    midpoint = tuple((a + b) / 2.0 for a, b in zip(left_point, right_point))
+    return left_point, right_point, midpoint
+
+
+def pose_in_frame(
+    frame_position: tuple[float, float, float],
+    frame_quaternion_xyzw: tuple[float, float, float, float],
+    world_position: tuple[float, float, float],
+    world_quaternion_xyzw: tuple[float, float, float, float] | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float] | None]:
+    """Express *world_position* (and optionally an orientation) in *frame*'s
+    own frame (e.g. base_link), given the frame's own world pose.
+    """
+    inverse = _conjugate_xyzw(frame_quaternion_xyzw)
+    relative = tuple(w - f for w, f in zip(world_position, frame_position))
+    local_position = rotate_vector_xyzw(inverse, relative)
+    local_quaternion = (
+        _quaternion_multiply_xyzw(inverse, world_quaternion_xyzw)
+        if world_quaternion_xyzw is not None
+        else None
+    )
+    return local_position, local_quaternion
+
+
 class IsaacWholeRobotBackend:
     """CPU-PhysX articulation controlled only by standard JointState commands."""
 
@@ -680,6 +815,9 @@ class IsaacWholeRobotBackend:
     CONTACT_FORCE_THRESHOLD = 1.0
     ARM_CONTACT_BODIES = tuple(f"link{index}" for index in range(1, 8))
     GRASP_CONTACT_BODIES = ("left_finger", "right_finger", "link_tcp")
+    # Bodies the #35 TCP/pad parity publisher needs resolved by name in
+    # data.body_names; see parity_tcp_frame().
+    PARITY_TCP_BODIES = ("link_tcp", "left_finger", "right_finger")
 
     def __init__(
         self,
@@ -860,6 +998,10 @@ class IsaacWholeRobotBackend:
         # "contact_report_first_event" diagnostic (see there) fires exactly
         # once per backend life instead of once per contact.
         self._contact_report_first_event_logged = False
+        # Set once parity_tcp_frame() fails to resolve link_tcp/left_finger/
+        # right_finger, so the "unresolved" diagnostic (see there) logs once
+        # per backend life instead of once per publish tick.
+        self._parity_tcp_bodies_missing_logged = False
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
         )
@@ -4474,6 +4616,86 @@ class IsaacWholeRobotBackend:
             "joint_positions": positions,
             "joint_velocities": velocities,
             "joint_efforts": efforts,
+        }
+
+    def parity_tcp_frame(self) -> Mapping[str, object] | None:
+        """World + base_link-relative TCP and pad-inner-face geometry.
+
+        Task #35 diagnostic: lets the grasp bench diff the sim's PHYSICAL
+        tool-centre-point and pad faces against the ROS TF ``link_tcp`` in
+        one recording. Reads the same ``body_pos_w``/``body_quat_w`` tensors
+        as ``_robot_truth_state`` (view-free through the articulation data,
+        not a separate PhysX query) and the pad-geometry constants above.
+
+        Fails soft: returns ``None`` if ``link_tcp`` or either finger link
+        is not in ``data.body_names`` (logged once, not per tick).
+        """
+        data = self._robot.data
+        body_names = tuple(getattr(data, "body_names", ()))
+        missing = [name for name in self.PARITY_TCP_BODIES if name not in body_names]
+        if missing:
+            if not self._parity_tcp_bodies_missing_logged:
+                self._parity_tcp_bodies_missing_logged = True
+                print(
+                    json.dumps(
+                        {"event": "parity_tcp_bodies_unresolved", "missing": missing},
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        def _body_pose(
+            name: str,
+        ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+            index = body_names.index(name)
+            position = tuple(
+                float(value)
+                for value in self._torch_value(data.body_pos_w)[0, index]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            quaternion = tuple(
+                float(value)
+                for value in self._torch_value(data.body_quat_w)[0, index]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            return position, quaternion
+
+        tcp_position, tcp_quaternion = _body_pose("link_tcp")
+        left_pose = _body_pose("left_finger")
+        right_pose = _body_pose("right_finger")
+        base_position = tuple(
+            float(value)
+            for value in self._torch_value(data.root_pos_w)[0].detach().cpu().tolist()
+        )
+        base_quaternion = tuple(
+            float(value)
+            for value in self._torch_value(data.root_quat_w)[0].detach().cpu().tolist()
+        )
+
+        tcp_position_base, tcp_quaternion_base = pose_in_frame(
+            base_position, base_quaternion, tcp_position, tcp_quaternion
+        )
+        left_point, right_point, midpoint = pad_points_world(left_pose, right_pose)
+        left_point_base, _ = pose_in_frame(base_position, base_quaternion, left_point)
+        right_point_base, _ = pose_in_frame(base_position, base_quaternion, right_point)
+        midpoint_base, _ = pose_in_frame(base_position, base_quaternion, midpoint)
+
+        return {
+            "tcp_pose_world": {"xyz": tcp_position, "quaternion_xyzw": tcp_quaternion},
+            "tcp_pose_base": {
+                "xyz": tuple(tcp_position_base),
+                "quaternion_xyzw": tuple(tcp_quaternion_base),
+            },
+            "pad_points_base": (
+                tuple(left_point_base),
+                tuple(right_point_base),
+                tuple(midpoint_base),
+            ),
         }
 
     def truth_state(self, evaluator_token: object) -> Mapping[str, object]:

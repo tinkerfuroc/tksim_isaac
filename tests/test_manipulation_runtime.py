@@ -210,6 +210,7 @@ def _backend() -> IsaacWholeRobotBackend:
     backend._expected_objects = {}
     backend._contact_pairs_by_key = {}
     backend._contact_report_first_event_logged = False
+    backend._parity_tcp_bodies_missing_logged = False
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
     backend._clock_elapsed_steps = 0
@@ -1886,6 +1887,82 @@ class ManipulationRuntimeTest(unittest.TestCase):
         for actual, expected in zip(robot["tcp_pose"]["quaternion_xyzw"], [0.4, 0.3, 0.2, 0.1]):
             self.assertAlmostEqual(float(actual), expected)
 
+    def test_parity_tcp_frame_publishes_world_and_base_link_geometry(self) -> None:
+        """Task #35 end to end through the backend method: link_tcp world
+        pose, its base_link-relative pose, and the pad inner-face/midpoint
+        points expressed in base_link -- all read from the same body_pos_w/
+        body_quat_w tensors as _robot_truth_state (no separate PhysX query).
+        """
+        backend = _backend()
+        backend._robot.data.body_names = (
+            "base", "link_tcp", "left_finger", "right_finger",
+        )
+        backend._robot.data.body_pos_w = torch.cat(
+            [
+                backend._robot.data.body_pos_w,
+                torch.tensor(
+                    [[[5.0, 4.9295, 0.5], [5.0, 5.0705, 0.5]]], dtype=torch.float32
+                ),
+            ],
+            dim=1,
+        )
+        backend._robot.data.body_quat_w = torch.cat(
+            [
+                backend._robot.data.body_quat_w,
+                torch.tensor(
+                    [[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]], dtype=torch.float32
+                ),
+            ],
+            dim=1,
+        )
+        # link_tcp itself: overwrite the shared fixture's [1,2,3] entry with a
+        # pose offset from a non-trivial root, so tcp_pose_base is a real
+        # translation, not a no-op.
+        backend._robot.data.body_pos_w[0, 1] = torch.tensor([5.5, 5.0, 1.0])
+        backend._robot.data.body_quat_w[0, 1] = torch.tensor([0.0, 0.0, 0.0, 1.0])
+        backend._robot.data.root_pos_w = torch.tensor([[5.0, 5.0, 0.5]], dtype=torch.float32)
+        backend._robot.data.root_quat_w = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
+
+        frame = backend.parity_tcp_frame()
+
+        self.assertIsNotNone(frame)
+        for actual, expected in zip(frame["tcp_pose_world"]["xyz"], (5.5, 5.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(frame["tcp_pose_base"]["xyz"], (0.5, 0.0, 0.5)):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(
+            frame["tcp_pose_base"]["quaternion_xyzw"], (0.0, 0.0, 0.0, 1.0)
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+        left_point, right_point, midpoint = frame["pad_points_base"]
+        for actual, expected in zip(left_point, (0.0, -0.0445, -0.02755)):
+            self.assertAlmostEqual(actual, expected, places=5)
+        for actual, expected in zip(right_point, (0.0, 0.0445, -0.02755)):
+            self.assertAlmostEqual(actual, expected, places=5)
+        for actual, expected in zip(midpoint, (0.0, 0.0, -0.02755)):
+            self.assertAlmostEqual(actual, expected, places=5)
+
+    def test_parity_tcp_frame_fails_soft_and_logs_once_when_unresolved(self) -> None:
+        """link_tcp/left_finger/right_finger absent from body_names (e.g. a
+        gripper-less articulation) must not raise -- just log once and let
+        the gateway skip publishing that tick."""
+        backend = _backend()  # body_names is only ("base", "link_tcp")
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            first = backend.parity_tcp_frame()
+            second = backend.parity_tcp_frame()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the unresolved-bodies diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "parity_tcp_bodies_unresolved")
+        self.assertEqual(
+            sorted(payload["missing"]), ["left_finger", "right_finger"]
+        )
+
     def test_command_target_truth_exposes_active_physx_targets(self) -> None:
         backend = _backend()
 
@@ -2397,6 +2474,105 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertIsNone(_BE._quaternion_xyzw_from_physx(None))
         self.assertIsNone(_BE._quaternion_xyzw_from_physx((1.0, 2.0)))
 
+    def test_pad_points_world_mirrors_toward_centreline_at_rest_orientation(
+        self,
+    ) -> None:
+        """Task #35 pad-inner-face math. Both finger links share one static
+        rest orientation -- a 180 deg rotation about local X, xyzw (1,0,0,0)
+        -- confirmed live via pxr on the shipped robot USD (see
+        docs/developer-log.md 2026-09-06, Task #35): rotating each finger's
+        fixed LEFT/RIGHT_FINGER_PAD_LOCAL_OFFSET by that orientation is what
+        turns the local mesh offset into "toward the jaw centreline" in
+        world space. Fingers at +/-0.0705 m (matching the live pxr readback
+        of the finger link origins) with the 26 mm inset must land the inner
+        faces at +/-0.0445 m and their midpoint at 0 along the closing axis.
+        """
+        from tinker_sim_isaac import backend as backend_module
+
+        rest_quaternion = (1.0, 0.0, 0.0, 0.0)
+        left_pose = ((0.0, -0.0705, 0.0), rest_quaternion)
+        right_pose = ((0.0, 0.0705, 0.0), rest_quaternion)
+
+        left_point, right_point, midpoint = backend_module.pad_points_world(
+            left_pose, right_pose
+        )
+
+        self.assertAlmostEqual(left_point[1], -0.0445, places=6)
+        self.assertAlmostEqual(right_point[1], 0.0445, places=6)
+        self.assertAlmostEqual(midpoint[1], 0.0, places=6)
+        self.assertAlmostEqual(
+            left_point[2], -backend_module.PAD_MID_REACH_M, places=6
+        )
+        self.assertAlmostEqual(
+            right_point[2], -backend_module.PAD_MID_REACH_M, places=6
+        )
+
+    def test_pad_points_world_rotates_consistently_under_an_additional_yaw(
+        self,
+    ) -> None:
+        """Composing an extra 90 deg yaw onto the rest orientation must
+        rotate both inner-face points (and their midpoint) the same way a
+        single rigid transform would -- i.e. the closing-axis separation
+        the two inner faces started with (before the yaw) reappears, after
+        the yaw, along the axis the yaw rotated the closing axis onto."""
+        from tinker_sim_isaac import backend as backend_module
+
+        rest_quaternion = (1.0, 0.0, 0.0, 0.0)
+        yaw_90_z = (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0))
+        combined = backend_module._quaternion_multiply_xyzw(yaw_90_z, rest_quaternion)
+
+        left_pose = (
+            backend_module.rotate_vector_xyzw(yaw_90_z, (0.0, -0.0705, 0.0)),
+            combined,
+        )
+        right_pose = (
+            backend_module.rotate_vector_xyzw(yaw_90_z, (0.0, 0.0705, 0.0)),
+            combined,
+        )
+
+        left_point, right_point, midpoint = backend_module.pad_points_world(
+            left_pose, right_pose
+        )
+
+        # The un-yawed case put the +/-0.0445 m separation on Y (see the
+        # test above); a 90 deg yaw about Z carries that separation onto X,
+        # not Y, and leaves Z untouched.
+        self.assertAlmostEqual(left_point[0], 0.0445, places=6)
+        self.assertAlmostEqual(right_point[0], -0.0445, places=6)
+        self.assertAlmostEqual(left_point[1], 0.0, places=6)
+        self.assertAlmostEqual(right_point[1], 0.0, places=6)
+        self.assertAlmostEqual(midpoint[0], 0.0, places=6)
+        self.assertAlmostEqual(
+            left_point[2], -backend_module.PAD_MID_REACH_M, places=6
+        )
+
+    def test_pose_in_frame_expresses_a_world_pose_relative_to_a_yawed_root(
+        self,
+    ) -> None:
+        """Task #35 base_link transform math, checked against a known root
+        pose: a root translated by (1, 2, 0) and yawed 90 deg about Z, and a
+        world point one metre along world +X from the root -- expressed in
+        the root's own frame that point must be one metre along the root's
+        LOCAL -Y (since +X world is -Y in a frame yawed +90 deg about Z)."""
+        from tinker_sim_isaac import backend as backend_module
+
+        root_position = (1.0, 2.0, 0.0)
+        root_quaternion = (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0))
+        world_position = (2.0, 2.0, 0.0)  # root_position + 1 m along world +X
+        world_quaternion = root_quaternion  # co-oriented with the root itself
+
+        local_position, local_quaternion = backend_module.pose_in_frame(
+            root_position, root_quaternion, world_position, world_quaternion
+        )
+
+        self.assertAlmostEqual(local_position[0], 0.0, places=6)
+        self.assertAlmostEqual(local_position[1], -1.0, places=6)
+        self.assertAlmostEqual(local_position[2], 0.0, places=6)
+        # Co-oriented with the frame itself -> the relative orientation is
+        # the identity quaternion.
+        for actual, expected in zip(local_quaternion, (0.0, 0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=6)
+
     def test_manipulation_profile_and_artifact_are_strict(self) -> None:
         profile = json.loads(
             (ROOT / "simulation/profiles/manipulation-core.json").read_text(encoding="utf-8")
@@ -2503,6 +2679,8 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway._last_logical_snapshot_id = -1
         gateway.development_lidar = False
         gateway._publish_profile_enabled = False
+        # Unrelated to this test (#22); off so publish() skips the #35 block.
+        gateway._parity_tcp_enabled = False
         # Large strides so state/imu/status only fire on tick 0 (0 % N == 0
         # for any N); every subsequent tick must skip the status heartbeat.
         gateway._state_stride = 1_000_000
@@ -2524,6 +2702,227 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         forces = [msg.wrench.force.z for msg in gateway.contact_pub.messages]
         self.assertTrue(all(abs(force - 6.0) < 1e-6 for force in forces))
+
+    def test_gateway_registers_parity_tcp_publishers_gated_by_env(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('PoseStamped, "/sim/parity/tcp_pose", reliable', source)
+        self.assertIn(
+            'PoseStamped, "/sim/parity/tcp_pose_base", reliable', source
+        )
+        self.assertIn(
+            'PolygonStamped, "/sim/parity/pad_points", reliable', source
+        )
+        self.assertIn('tcp_pose.header.frame_id = "world"', source)
+        self.assertIn('tcp_pose_base.header.frame_id = "base_link"', source)
+        self.assertIn('pad_points.header.frame_id = "base_link"', source)
+        self.assertIn(
+            'os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"', source
+        )
+
+    def test_parity_tcp_publishers_emit_world_base_and_pad_points_every_tick(
+        self,
+    ) -> None:
+        """Task #35: the three parity topics publish at the same cadence as
+        /sim/internal/physics_truth (unconditional, every tick), independent
+        of the status heartbeat stride -- same contract as #22's finger
+        contact wrench above."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import Point32, PolygonStamped, PoseStamped, WrenchStamped
+
+        class _ParityTcpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return {
+                    "tcp_pose_world": {
+                        "xyz": (0.5, 0.0, 0.6),
+                        "quaternion_xyzw": (0.0, 0.0, 0.0, 1.0),
+                    },
+                    "tcp_pose_base": {
+                        "xyz": (0.1, 0.0, 0.2),
+                        "quaternion_xyzw": (0.0, 0.0, 0.0, 1.0),
+                    },
+                    "pad_points_base": (
+                        (0.1, -0.0445, 0.15),
+                        (0.1, 0.0445, 0.15),
+                        (0.1, 0.0, 0.15),
+                    ),
+                }
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _ParityTcpBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway._PoseStamped = PoseStamped
+        gateway._PolygonStamped = PolygonStamped
+        gateway._Point32 = Point32
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway.tcp_pose_pub = _RecordingPublisher()
+        gateway.tcp_pose_base_pub = _RecordingPublisher()
+        gateway.pad_points_pub = _RecordingPublisher()
+        gateway._parity_tcp_enabled = True
+        gateway._camera_rig = None
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(len(gateway.tcp_pose_pub.messages), 3)
+        self.assertEqual(len(gateway.tcp_pose_base_pub.messages), 3)
+        self.assertEqual(len(gateway.pad_points_pub.messages), 3)
+
+        tcp_pose = gateway.tcp_pose_pub.messages[0]
+        self.assertEqual(tcp_pose.header.frame_id, "world")
+        self.assertAlmostEqual(tcp_pose.pose.position.x, 0.5, places=6)
+        self.assertAlmostEqual(tcp_pose.pose.orientation.w, 1.0, places=6)
+
+        tcp_pose_base = gateway.tcp_pose_base_pub.messages[0]
+        self.assertEqual(tcp_pose_base.header.frame_id, "base_link")
+        self.assertAlmostEqual(tcp_pose_base.pose.position.z, 0.2, places=6)
+
+        pad_points = gateway.pad_points_pub.messages[0]
+        self.assertEqual(pad_points.header.frame_id, "base_link")
+        self.assertEqual(len(pad_points.polygon.points), 3)
+        self.assertAlmostEqual(pad_points.polygon.points[0].y, -0.0445, places=5)
+        self.assertAlmostEqual(pad_points.polygon.points[1].y, 0.0445, places=5)
+        self.assertAlmostEqual(pad_points.polygon.points[2].y, 0.0, places=5)
+
+    def test_parity_tcp_publishers_skip_publish_when_env_disabled_or_unresolved(
+        self,
+    ) -> None:
+        """TINKER_SIM_PARITY_TCP=0 must fully disable the block (no publish
+        calls at all); a resolvable-but-currently-unresolved backend (##35's
+        fail-soft contract) must skip publishing without raising."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        class _NoOpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                self.calls = getattr(self, "calls", 0) + 1
+                return None  # unresolved this tick
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        def _new_gateway(backend, *, parity_tcp_enabled: bool) -> RosStandardGateway:
+            gateway = object.__new__(RosStandardGateway)
+            gateway.backend = backend
+            gateway._Clock = Clock
+            gateway._JointState = JointState
+            gateway._Imu = Imu
+            gateway._String = String
+            gateway._WrenchStamped = WrenchStamped
+            gateway._PoseStamped = PoseStamped
+            gateway._PolygonStamped = PolygonStamped
+            gateway.clock_pub = _RecordingPublisher()
+            gateway.joint_pub = _RecordingPublisher()
+            gateway.imu_pub = _RecordingPublisher()
+            gateway.status_pub = _RecordingPublisher()
+            gateway.contact_pub = _RecordingPublisher()
+            gateway.physics_truth_pub = _RecordingPublisher()
+            gateway.cloud_pub = _RecordingPublisher()
+            gateway.tcp_pose_pub = _RecordingPublisher()
+            gateway.tcp_pose_base_pub = _RecordingPublisher()
+            gateway.pad_points_pub = _RecordingPublisher()
+            gateway._parity_tcp_enabled = parity_tcp_enabled
+            gateway._camera_rig = None
+            gateway._cloud_publish_enabled = lambda: False
+            gateway._last_command_error = None
+            gateway._command_stream_lost = False
+            gateway._command_epoch = 0
+            gateway._last_logical_snapshot_id = -1
+            gateway.development_lidar = False
+            gateway._publish_profile_enabled = False
+            gateway._state_stride = 1_000_000
+            gateway._imu_stride = 1_000_000
+            gateway._status_stride = 1_000_000
+            gateway._tick = 0
+            return gateway
+
+        disabled_backend = _NoOpBackend()
+        disabled_gateway = _new_gateway(disabled_backend, parity_tcp_enabled=False)
+        disabled_gateway.publish()
+        self.assertEqual(len(disabled_gateway.tcp_pose_pub.messages), 0)
+        self.assertEqual(len(disabled_gateway.pad_points_pub.messages), 0)
+        self.assertEqual(getattr(disabled_backend, "calls", 0), 0)
+
+        unresolved_backend = _NoOpBackend()
+        unresolved_gateway = _new_gateway(unresolved_backend, parity_tcp_enabled=True)
+        unresolved_gateway.publish()
+        self.assertEqual(len(unresolved_gateway.tcp_pose_pub.messages), 0)
+        self.assertEqual(len(unresolved_gateway.tcp_pose_base_pub.messages), 0)
+        self.assertEqual(len(unresolved_gateway.pad_points_pub.messages), 0)
+        self.assertEqual(unresolved_backend.calls, 1)
 
     def test_gateway_publishes_raw_truth_without_persisting_physics_truth(self) -> None:
         source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(

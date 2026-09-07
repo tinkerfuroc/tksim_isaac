@@ -4,6 +4,89 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-06 — Task #35: backend-only TCP/pad parity publisher
+
+**Purpose.** A diagnostic for the grasp bench: the left pad's inner face was
+observed meeting a can 29-30 mm from TF `link_tcp` at drive 0, while the USD
+puts the pad faces at +-44.5 mm about the sim's `link_tcp` prim -- all URDFs
+agree statically, so if the discrepancy is real it is runtime-only. To let a
+bench diff the sim's PHYSICAL tool-centre-point and pad faces against the ROS
+TF `link_tcp` in one recording, `ros_gateway.py` now publishes, every
+`publish()` tick (same unconditional cadence as `/sim/internal/physics_truth`
+and the #22 `/sim/parity/finger_contact` wrench), gated by
+`TINKER_SIM_PARITY_TCP` (default `"1"`, `"0"` disables):
+
+- `/sim/parity/tcp_pose` (`geometry_msgs/PoseStamped`, frame `world`): the
+  articulation's `link_tcp` body world pose.
+- `/sim/parity/tcp_pose_base` (`PoseStamped`, frame `base_link`): the same
+  pose expressed in the robot root frame.
+- `/sim/parity/pad_points` (`geometry_msgs/PolygonStamped`, frame
+  `base_link`): `[left inner-face centre, right inner-face centre,
+  midpoint]`.
+
+**Read path.** `backend.py` gains `IsaacWholeRobotBackend.parity_tcp_frame()`,
+which resolves `link_tcp`/`left_finger`/`right_finger` in
+`data.body_names` and reads their world pose from the same
+`body_pos_w`/`body_quat_w` tensors `_robot_truth_state()` already uses for
+`tcp_pose` (view-free through the articulation data -- no separate PhysX
+query; `IPhysx.get_rigidbody_transformation` is for non-articulated rigid
+bodies, e.g. spawned objects via `_iter_spawned_bodies`, not articulation
+links). Fails soft: if any of the three bodies is missing, it logs
+`{"event": "parity_tcp_bodies_unresolved", "missing": [...]}` once (a
+`_parity_tcp_bodies_missing_logged` latch, mirroring
+`_contact_report_first_event_logged`) and returns `None`; the gateway then
+skips publishing that tick without raising.
+
+**Pad-inner-face constants and their provenance.** A live `pxr` probe of the
+shipped robot USD (`artifacts/robot/tinker2/*/robot.usd`, re-verifying
+`$TMP/task31-jaw-opening-findings.md`) gave, via
+`UsdGeom.BBoxCache.ComputeLocalBound` on each finger's own `collisions` prim
+(i.e. relative to that finger LINK's own origin, before its world transform):
+
+```
+              X (width)        Y (closing axis)      Z (reach axis)
+left_finger   -16.0/+16.0 mm   -26.0/+5.9 mm         -5.9/+61.0 mm
+right_finger  -16.0/+16.0 mm   -5.9/+26.0 mm         -5.9/+61.0 mm
+```
+
+Both finger links share one static rest orientation (confirmed via
+`ComputeLocalToWorldTransform` on both prims: a ~180 deg rotation about
+local X, matching that both `left_finger_joint`/`right_finger_joint` are
+revolute about local X) -- the two collision meshes are mirror images of
+one another, not the link frames. Each pad's INNER face (the surface that
+meets a grasped object) is therefore the extreme 26.0 mm from the link
+origin: local Y = -0.026 on the left finger, +0.026 on the right, both at
+the reach-axis midpoint `PAD_MID_REACH_M = (-0.0059 + 0.0610) / 2 ~=
+0.02755`. `backend.py` module-level constants `PAD_INNER_INSET_M`,
+`PAD_MID_REACH_M`, `LEFT_FINGER_PAD_LOCAL_OFFSET`,
+`RIGHT_FINGER_PAD_LOCAL_OFFSET` carry this exact derivation in a comment.
+`finger_inner_face_world()` rotates the fixed link-local offset by that
+link's CURRENT `body_quat_w` before adding it to the link's world position
+-- correct through the whole open/close range because it is a point
+painted on the rigid pad, not a world-frame constant; a live pxr check of
+the rest pose confirmed the mirrored +-0.0445 m inner-face separation this
+produces (from finger origins at +-0.0705 m) against the shipped USD.
+`pose_in_frame()` (quaternion conjugate + Hamilton product, both
+scalar-last like every other quaternion in this module) expresses a world
+pose in an arbitrary frame's own frame, used both for `tcp_pose_base` and
+for expressing the pad points in `base_link`.
+
+**Tests** (`tests/test_manipulation_runtime.py`): pure pad-inner-face/
+midpoint math against the rest orientation and under an added yaw (verifies
+the mirrored separation "rotates with" the closing axis rather than staying
+pinned to world Y); `pose_in_frame` against a known yawed root pose;
+`IsaacWholeRobotBackend.parity_tcp_frame()` end to end (world + base_link
+poses, pad points) and its fail-soft/log-once contract when
+`left_finger`/`right_finger` are absent from `body_names`; the gateway's
+publisher registration/topic/frame_id/env-gate strings; and a `publish()`
+runtime test (mirroring the #22 finger-contact-wrench test) asserting all
+three topics fire every tick and that `TINKER_SIM_PARITY_TCP=0` (or an
+unresolved frame) fully skips publishing without raising. Full suite:
+`tests/test_manipulation_runtime.py` 138 passed, 5 subtests passed, 0
+failed. No GPU boot for this diagnostic-only change; a bench recording
+against the live TF `link_tcp` is the follow-up that actually answers the
+29-30 mm question this publisher exists for.
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping
