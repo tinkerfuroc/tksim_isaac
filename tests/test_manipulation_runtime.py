@@ -1257,6 +1257,124 @@ class ManipulationRuntimeTest(unittest.TestCase):
             )
         self.assertEqual(captured.getvalue().strip(), "")
 
+    def test_safety_stop_transition_logs_engage_then_release(self) -> None:
+        """#33 observability: every real ``_safety_stopped`` flip announces
+        state/reason/drive-snapshot on engage and applied/measured on
+        release, through the caller-provided ``reason``.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(True, reason="sample_true")
+            backend.set_safety_stop(False, reason="sample_false")
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("sim_safety_stop ")
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("state=engaged", lines[0])
+        self.assertIn("reason=sample_true", lines[0])
+        self.assertIn("wall_age_s=n/a", lines[0])
+        # joint_pos[0, 0] (the drive DOF) is 0.25 in _FakeRobot's fixture --
+        # the snapshot latched by the engage.
+        self.assertIn("drive_snapshot=0.250", lines[0])
+        self.assertIn("state=released", lines[1])
+        self.assertIn("reason=sample_false", lines[1])
+        self.assertIn("drive_applied=0.250", lines[1])
+        self.assertIn("drive_measured=0.250", lines[1])
+
+    def test_safety_stop_repeated_sample_logs_nothing(self) -> None:
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend.set_safety_stop(True, reason="sample_true")
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(True, reason="sample_true")
+
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_safety_stop_transition_safe_when_drive_index_unresolved(self) -> None:
+        """Boot-time safety: a fresh backend has no ``_drive_joint_index``
+        yet and starts with ``_safety_snapshot`` unset (``_backend()``'s
+        default). Both transitions must still log, degrading the drive
+        fields to "n/a" instead of raising.
+        """
+        backend = _backend()
+        self.assertIsNone(backend._safety_snapshot)
+        self.assertFalse(hasattr(backend, "_drive_joint_index"))
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(True)
+            backend.set_safety_stop(False)
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("sim_safety_stop ")
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("reason=unspecified", lines[0])
+        self.assertIn("drive_snapshot=n/a", lines[0])
+        self.assertIn("drive_applied=n/a", lines[1])
+        self.assertIn("drive_measured=n/a", lines[1])
+
+    def test_safety_release_logs_applied_targets_reset_with_ramp_value_and_measured(
+        self,
+    ) -> None:
+        """A release's ``applied_targets_reset`` line reports the value that
+        was sitting in ``_position_targets`` before the replace (the
+        gripper's frozen-hold/ramp value) as ``drive_before``, and the
+        fresh joint_pos-derived hold target -- identical to the measured
+        state -- as ``drive_after``.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._safety_stopped = True
+        backend._safety_snapshot = backend._robot.data.joint_pos.clone()
+        # A value distinct from joint_pos[0, 0] (0.25), standing in for
+        # whatever the drive's ramp/hold target was before this release.
+        backend._position_targets = torch.tensor([[0.62, -0.4]], dtype=torch.float32)
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(False, reason="sample_false")
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("applied_targets_reset ")
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("source=sample_false", lines[0])
+        self.assertIn("drive_before=0.620", lines[0])
+        self.assertIn("drive_after=0.250", lines[0])
+        self.assertIn("measured=0.250", lines[0])
+
+    def test_step_safety_reassert_logs_once_per_engage_not_per_tick(self) -> None:
+        """step()'s per-tick ``_position_targets.copy_(_safety_snapshot)``
+        reassertion runs every physics step while stopped; its
+        ``applied_targets_reset`` line must fire once (on the first tick
+        after the engage) and stay silent on every following tick.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend.set_safety_stop(True)
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.step()
+            backend.step()
+            backend.step()
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("applied_targets_reset ")
+            and "source=step_safety_reassert" in line
+        ]
+        self.assertEqual(len(lines), 1)
+
     def test_snapshot_boundary_preserves_active_mixed_base_and_arm_packets(self) -> None:
         backend = _backend()
         backend.begin_command_snapshot(0)
@@ -1399,7 +1517,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def begin_command_snapshot(self, snapshot: int) -> None:
                 pass
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.events.append(("stop", active))
                 self.safety_stopped = active
                 if not active:
@@ -1455,7 +1573,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def begin_command_snapshot(self, snapshot: int) -> None:
                 self.events.append(("snapshot", snapshot))
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.safety_stopped = active
                 self.events.append(("stop", active))
 
@@ -1511,7 +1629,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.stops: list[bool] = []
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.stops.append(active)
 
         backend = _Backend()
@@ -1534,7 +1652,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         class _Backend:
             safety_stopped = False
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.safety_stopped = active
 
         gateway = object.__new__(RosStandardGateway)
@@ -1563,7 +1681,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.stops: list[bool] = []
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.stops.append(active)
                 self.safety_stopped = active
 
@@ -1591,7 +1709,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         class _Backend:
             safety_stopped = False
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.safety_stopped = active
 
         backend = _Backend()

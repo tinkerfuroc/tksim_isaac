@@ -18,6 +18,7 @@ from tinker_sim_core.command_mux import (
     decode_command_frame,
     decode_snapshot_packet,
 )
+from tinker_sim_core.observability import format_duration
 from tinker_sim_isaac.backend import pose_in_frame
 from tinker_sim_isaac.camera_rig import (
     camera_info_fields,
@@ -141,7 +142,7 @@ class RosStandardGateway:
         self._safety_active = True
         self._safety_timeout_s = SAFETY_HEARTBEAT_TIMEOUT_S
         self._safety_last_sample_at: float | None = None
-        self.backend.set_safety_stop(True)
+        self.backend.set_safety_stop(True, reason="init")
         # Isaac does not mint or increment epochs.  The gateway owns the
         # session/generation token and Isaac adopts only a fresh session's
         # first snapshot after a safety-clear sample.
@@ -455,7 +456,13 @@ class RosStandardGateway:
             if node is not None:
                 node.get_logger().error(f"rejected safety-stop message: {error}")
 
-    def _apply_safety_stop(self, active: bool) -> None:
+    def _apply_safety_stop(self, active: bool, *, reason: str | None = None) -> None:
+        # Observability only (#33): the caller may name the trigger
+        # explicitly (e.g. the heartbeat-timeout path passes "safety_stale");
+        # otherwise this is a direct application of an /sim/hardware/safety_stop
+        # sample, so the default just says which value it carried.
+        if reason is None:
+            reason = "sample_true" if active else "sample_false"
         if not getattr(self, "_session_protocol_enabled", False):
             if active == self._safety_active:
                 return
@@ -463,7 +470,7 @@ class RosStandardGateway:
             self._command_epoch += 1
             if active:
                 self._last_snapshot_id = -1
-            self.backend.set_safety_stop(active)
+            self.backend.set_safety_stop(active, reason=reason)
             return
         if active:
             self._baseline_resync_until = None
@@ -481,14 +488,14 @@ class RosStandardGateway:
             )
             self._retire_command_epoch()
             self._last_snapshot_id = -1
-            self.backend.set_safety_stop(True)
+            self.backend.set_safety_stop(True, reason=reason)
             return
         self._safety_active = False
         self._arm_baseline_resynchronization()
         # A clear sample alone never releases the actuator hold.  A valid,
         # post-boundary command must arrive as well.
         if not getattr(self, "_command_stream_lost", False):
-            self.backend.set_safety_stop(False)
+            self.backend.set_safety_stop(False, reason=reason)
 
     def _retire_command_epoch(
         self, *, retire: bool = True, reset_snapshot: bool = True
@@ -573,7 +580,7 @@ class RosStandardGateway:
             # staging and restores the physical hold target.  This is the
             # rollback boundary for a backend without a stopped-state command
             # transaction API.
-            self.backend.set_safety_stop(True)
+            self.backend.set_safety_stop(True, reason="command_baseline_rejected")
             # set_safety_stop early-returns when the stop is already active,
             # so it cannot be relied on to drop staging on the abort path.
             self._discard_backend_snapshot_staging()
@@ -621,7 +628,7 @@ class RosStandardGateway:
             # The backend must be stopped throughout preflight.  begin_* may
             # stage packet ordering internally, so reset that staging before
             # the real commit pass below.
-            self.backend.set_safety_stop(True)
+            self.backend.set_safety_stop(True, reason="command_baseline_preflight")
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
                 self._validate_staged_command(staged_command)
@@ -638,7 +645,7 @@ class RosStandardGateway:
             # physics step can interleave with this single gateway turn, and
             # every failure path below restores the physical stop before the
             # command stream can be considered accepted.
-            self.backend.set_safety_stop(False)
+            self.backend.set_safety_stop(False, reason="command_baseline_commit")
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
                 _cj_t0 = time.perf_counter()
@@ -683,7 +690,10 @@ class RosStandardGateway:
                 else:
                     sessions.add(known_session)
                 self._retired_command_sessions = sessions
-        self.backend.set_safety_stop(True)
+        self.backend.set_safety_stop(
+            True,
+            reason="session_reset" if new_session else "command_epoch_retired",
+        )
         self._command_stream_lost = True
         self._command_loss_at = getattr(
             self, "_last_safety_clear_at", received_at
@@ -719,7 +729,7 @@ class RosStandardGateway:
         self._retire_command_epoch(retire=False, reset_snapshot=False)
         self._snapshot_baseline_pending = True
         self._snapshot_recovery_floor = self._last_logical_snapshot_id
-        self.backend.set_safety_stop(True)
+        self.backend.set_safety_stop(True, reason="command_stream_lost")
         self._last_command_error = "command stream expired"
 
     def _sim_receipt_time(self) -> float | None:
@@ -730,7 +740,14 @@ class RosStandardGateway:
         except (AttributeError, TypeError, ValueError):
             return None
 
-    def _sim_age_stale(self, received_sim_at: object, timeout: float) -> bool:
+    def _sim_age_stale(
+        self,
+        received_sim_at: object,
+        timeout: float,
+        *,
+        source: str = "unspecified",
+        wall_age: float | None = None,
+    ) -> bool:
         """Whether a receipt is also stale measured in *simulation* time.
 
         The heartbeat/command publishers run on wall clock in separate
@@ -748,13 +765,64 @@ class RosStandardGateway:
         expiry until stepping resumes is safe by construction.  Receipts
         with no simulation stamp (older tests, exotic backends) keep the
         wall-only behavior.
+
+        ``source`` and ``wall_age`` are observability only (#33): they name
+        the caller and its already-computed wall-clock age for the
+        ``sim_safety_stale`` log line; they never affect the return value.
         """
-        if received_sim_at is None:
-            return True
-        sim_now = self._sim_receipt_time()
-        if sim_now is None:
-            return True
-        return sim_now - float(received_sim_at) >= timeout
+        sim_age: float | None = None
+        if received_sim_at is not None:
+            sim_now = self._sim_receipt_time()
+            if sim_now is not None:
+                sim_age = sim_now - float(received_sim_at)
+        stale = sim_age is None or sim_age >= timeout
+        self._log_sim_age_stale(source, wall_age, sim_age, timeout, stale)
+        return stale
+
+    def _log_sim_age_stale(
+        self,
+        source: str,
+        wall_age: float | None,
+        sim_age: float | None,
+        timeout: float,
+        stale: bool,
+    ) -> None:
+        """Observability only (#33): announce a stale-receipt evaluation.
+
+        Rate-limited to at most one line per second per ``source`` while
+        ``stale`` stays ``True`` (the deadline checks run every spin, and a
+        genuinely dead publisher would otherwise print every spin for as
+        long as it stays dead). A stale -> fresh transition always gets one
+        line regardless of the window, so a recovery is never silently
+        swallowed; a loop that has never been stale for this source stays
+        silent. Must never raise: a log line cannot be the reason the
+        gateway loses its safety hold.
+        """
+        try:
+            node = getattr(self, "node", None)
+            get_logger = getattr(node, "get_logger", None)
+            if get_logger is None:
+                return
+            state = self._stale_log_state = getattr(self, "_stale_log_state", {})
+            entry = state.setdefault(source, {"was_stale": False, "last_log_at": None})
+            now = time.monotonic()
+            if stale:
+                last_log_at = entry["last_log_at"]
+                if last_log_at is not None and now - float(last_log_at) < 1.0:
+                    entry["was_stale"] = True
+                    return
+            elif not entry["was_stale"]:
+                return
+            get_logger().info(
+                f"sim_safety_stale source={source} "
+                f"wall_age_s={format_duration(wall_age)} "
+                f"sim_age_s={format_duration(sim_age)} "
+                f"timeout_s={format_duration(timeout)} stale={stale}"
+            )
+            entry["last_log_at"] = now
+            entry["was_stale"] = stale
+        except Exception:
+            return
 
     def _enforce_command_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -767,7 +835,10 @@ class RosStandardGateway:
         if last is None or now - last < timeout:
             return
         if not self._sim_age_stale(
-            getattr(self, "_last_command_received_sim_at", None), timeout
+            getattr(self, "_last_command_received_sim_at", None),
+            timeout,
+            source="command_stream",
+            wall_age=now - last,
         ):
             return
         self._enter_command_stream_lost(now)
@@ -781,13 +852,16 @@ class RosStandardGateway:
         if last is not None and now - last < timeout:
             return
         if last is not None and not self._sim_age_stale(
-            getattr(self, "_safety_last_sample_sim_at", None), timeout
+            getattr(self, "_safety_last_sample_sim_at", None),
+            timeout,
+            source="safety_heartbeat",
+            wall_age=None if last is None else now - last,
         ):
             return
         if self._safety_active:
             return
         try:
-            self._apply_safety_stop(True)
+            self._apply_safety_stop(True, reason="safety_stale")
             self._last_command_error = "safety heartbeat expired"
         except Exception as error:
             self._last_command_error = str(error)
@@ -1113,7 +1187,9 @@ class RosStandardGateway:
                 for staged_command, staged_snapshot, _ in packets_to_apply:
                     begin_snapshot(staged_snapshot)
                     if self._command_stream_lost:
-                        self.backend.set_safety_stop(False)
+                        self.backend.set_safety_stop(
+                            False, reason="command_stream_recovered"
+                        )
                         self._command_stream_lost = False
                     _cj_t0 = time.perf_counter()
                     accepted = self.backend.command_joints(staged_command)

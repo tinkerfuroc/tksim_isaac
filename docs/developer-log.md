@@ -419,6 +419,103 @@ diagnostic-only change; a live bench recording of both `effort` fields side
 by side against the probe's own `physx_tau` is the follow-up that confirms
 they agree outside the unit-test fakes.
 
+### Task #33 follow-up — sim-side safety-stop transitions, their trigger, and the drive-target snapshot
+
+**Purpose.** The chain above covers the mux and the bridge nodes; the sim
+process itself (`simulation/tinker_sim_isaac/backend.py`,
+`simulation/tinker_sim_isaac/ros_gateway.py`) had no equivalent -- a
+`_safety_stopped` flip on a live bench log was invisible, and there was no
+way to tell which of the gateway's ~10 `backend.set_safety_stop(...)` call
+sites (init, a direct sample, the heartbeat-timeout re-arm, a rejected
+command baseline, the two-phase baseline preflight/commit, an epoch/session
+adoption, a lost command stream, its recovery) triggered a given transition.
+Observability only, same contract as the addendum above: reuses
+`format_duration()` (`tinker_sim_core/observability.py`) and the
+never-raise pattern, no packet/target/publish value changes.
+
+**`backend.py`**: `set_safety_stop(active, reason=None)` gained an optional,
+caller-named `reason` kwarg (default `None` -> renders `"unspecified"`; no
+call site is required to pass it, so this is not a behaviour change). On
+every *real* `_safety_stopped` flip (the existing repeated-identical-sample
+early return is unchanged and still logs nothing) it prints
+`sim_safety_stop state=engaged|released reason=<reason> sim_t=<simulation_time>
+wall_age_s=n/a` -- `wall_age_s` is always `n/a` from here because the
+backend has no wall clock of its own, only `simulation_time` (that's the
+gateway's job, see below). An engage appends
+`drive_snapshot=<_safety_snapshot[0, drive_index]>` (the frozen hold target
+just latched); a release appends `drive_applied=<_position_targets[0,
+drive_index]> drive_measured=<joint_pos[0, drive_index]>` (both equal
+immediately after a release, since the fresh hold target IS the measured
+joint position at that instant -- expected, not a bug).
+
+A second line, `applied_targets_reset source=<reason> drive_before=<...>
+drive_after=<...> measured=<...> sim_t=<...>`, fires at every place that
+replaces the whole `_position_targets` tensor (not an element-wise command
+write): `set_safety_stop`'s engage (snapshot clone) and release (fresh
+`joint_pos.clone()` hold target), and `step()`'s per-tick
+`_position_targets.copy_(_safety_snapshot)` reassertion while stopped --
+the last one guarded by a `_safety_hold_reassert_logged` flag (armed
+`False` on every engage) so it fires once, on the first tick after the
+engage, not once per physics tick for the whole duration of the stop.
+Rate-limited to `APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW` (5) lines per
+`APPLIED_TARGETS_RESET_LOG_WINDOW_S` (1.0 s), mirroring the existing
+`gripper_command_target` limiter. The ros_gateway paths that only call
+`backend.set_safety_stop(...)` (baseline preflight/commit,
+`_adopt_command_epoch`, `_enter_command_stream_lost`, its recovery) don't
+duplicate this line themselves -- the backend is the single source of truth
+for every wholesale `_position_targets` replace, and every one of those
+gateway paths already routes through `set_safety_stop`.
+
+**`ros_gateway.py`**: every one of the ~10 `backend.set_safety_stop(...)`
+call sites now passes a distinct `reason=`: `"init"` (constructor),
+`"sample_true"`/`"sample_false"` (a direct `/sim/hardware/safety_stop`
+sample, both in `_apply_safety_stop`'s non-session-protocol branch and its
+default when no caller overrides it), `"safety_stale"`
+(`_enforce_safety_deadline`'s heartbeat-timeout re-arm, passed explicitly
+into `_apply_safety_stop`), `"command_baseline_rejected"`
+(`_reject_staged_baseline`), `"command_baseline_preflight"` /
+`"command_baseline_commit"` (`_commit_staged_baseline`'s two-phase stop/
+clear), `"session_reset"` / `"command_epoch_retired"`
+(`_adopt_command_epoch`, keyed off its existing `new_session` bool),
+`"command_stream_lost"` (`_enter_command_stream_lost`), and
+`"command_stream_recovered"` (the snapshot-apply loop's mid-stream clear).
+
+The staleness evaluation (`_sim_age_stale`) gained `source`/`wall_age`
+kwargs (both observability only, default `"unspecified"`/`None`, no return-
+value change -- refactored to compute `sim_age` once instead of three early
+returns, same boolean result) and now logs through
+`self.node.get_logger().info(...)`: `sim_safety_stale source=<source>
+wall_age_s=<...> sim_age_s=<...> timeout_s=<...> stale=<bool>`. Rate-limited
+to at most one line per second per `source` while `stale=True` stays true
+(the deadline checks run every spin); a `stale=True -> False` transition
+always gets one line regardless of the window so a recovery is never
+silently swallowed by it; a source that has never gone stale stays silent.
+Both callers (`_enforce_command_deadline`, `_enforce_safety_deadline`) pass
+`source="command_stream"` / `"safety_heartbeat"` and their own already-
+computed wall age.
+
+**Tests.** `tests/test_manipulation_runtime.py`: engage-then-release prints
+both lines with the expected reason/state/drive fields; a repeated identical
+sample logs nothing; a fresh backend (no `_drive_joint_index` yet,
+`_safety_snapshot is None`) degrades every drive field to `n/a` without
+raising; a release's `applied_targets_reset` reports the pre-replace
+`_position_targets` value (the "ramp" value) as `drive_before` and the
+joint_pos-derived fresh target as `drive_after`/`measured`; `step()`'s
+per-tick reassertion logs exactly once across three consecutive ticks while
+stopped. `tests/test_ros_gateway.py`: a fake backend recording
+`(active, reason)` pairs confirms a direct sample carries `"sample_true"`,
+`_enforce_safety_deadline` under a fake-clock timeout carries
+`"safety_stale"`, and `_adopt_command_epoch` carries `"command_epoch_retired"`
+or `"session_reset"` depending on `new_session`; a fake `node.get_logger()`
+confirms the stale line is rate-limited to one per second, a stale->fresh
+transition always logs, and a never-stale source stays silent. Full suite
+under the repo's ROS-env pytest incantation (`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
++ lark-shim `PYTHONPATH`, sourced `/opt/ros/humble/setup.bash` without
+`set -u`, `uv run --frozen --no-sync`):
+`tests/test_manipulation_runtime.py` 164 passed / 5 subtests passed (157
+baseline + 7 new); `tests/test_ros_gateway.py` 27 passed (21 baseline + 6
+new). No GPU boot for this diagnostic-only change.
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping

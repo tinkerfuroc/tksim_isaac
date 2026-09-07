@@ -29,7 +29,7 @@ class _SnapshotBackend:
         self.begin_calls: list[int] = []
         self._contact_pairs: list[dict[str, str]] = []
 
-    def set_safety_stop(self, active: bool) -> None:
+    def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
         self.safety_stopped = bool(active)
         if active:
             self.pending.clear()
@@ -91,7 +91,7 @@ class _FaultInjectingBackend(_SnapshotBackend):
         self.command_count = 0
         self.committed_command_count = 0
 
-    def set_safety_stop(self, active: bool) -> None:
+    def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
         self.stop_calls.append(bool(active))
         if not active and self.clear_error:
             raise RuntimeError("injected safety clear failure")
@@ -636,3 +636,132 @@ class MainThreadIntakeTest(unittest.TestCase):
         gateway = _gateway()
         gateway._safety_active = False
         gateway.spin_once()  # no _intake_subscriptions: nothing to take
+
+
+class _ReasonRecordingBackend(_SnapshotBackend):
+    """Records every ``set_safety_stop`` call's ``(active, reason)`` pair
+    (#33 observability)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reasons: list[tuple[bool, str | None]] = []
+
+    def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
+        self.reasons.append((bool(active), reason))
+        super().set_safety_stop(active)
+
+
+class _RecordingLogger:
+    def __init__(self) -> None:
+        self.info_lines: list[str] = []
+        self.error_lines: list[str] = []
+
+    def info(self, message: str) -> None:
+        self.info_lines.append(message)
+
+    def error(self, message: str) -> None:
+        self.error_lines.append(message)
+
+
+class SafetyStopReasonObservabilityTest(unittest.TestCase):
+    """#33: every ``backend.set_safety_stop`` call site names its trigger."""
+
+    def test_sample_true_carries_the_sample_reason(self) -> None:
+        backend = _ReasonRecordingBackend()
+        gateway = _gateway(backend)
+        gateway._safety_active = False
+
+        gateway._safety_stop(SimpleNamespace(data=True))
+        gateway.spin_once()
+
+        self.assertIn((True, "sample_true"), backend.reasons)
+
+    def test_heartbeat_timeout_carries_the_safety_stale_reason(self) -> None:
+        backend = _ReasonRecordingBackend()
+        gateway = _gateway(backend)
+        gateway._safety_active = False
+        gateway._safety_timeout_s = 1.0
+        gateway._safety_last_sample_at = 10.0
+        gateway._safety_last_sample_sim_at = None
+
+        # A fake clock well beyond the heartbeat timeout in both wall and
+        # (absent, so treated as stale) simulation time.
+        gateway._enforce_safety_deadline(now=20.0)
+
+        self.assertIn((True, "safety_stale"), backend.reasons)
+
+    def test_adopt_command_epoch_names_session_reset_or_epoch_retirement(self) -> None:
+        backend = _ReasonRecordingBackend()
+        gateway = _gateway(backend)
+        gateway._known_command_session = 5
+        gateway._known_command_generation = 1
+        gateway._command_epoch = encode_command_epoch(5, 1)
+
+        # Same session, next generation: an epoch retirement, not a reset.
+        gateway._adopt_command_epoch(
+            encode_command_epoch(5, 2), received_at=1.0, new_session=False
+        )
+        self.assertIn((True, "command_epoch_retired"), backend.reasons)
+
+        # A new session id: a session reset.
+        gateway._adopt_command_epoch(
+            encode_command_epoch(6, 1), received_at=2.0, new_session=True
+        )
+        self.assertIn((True, "session_reset"), backend.reasons)
+
+
+class SimSafetyStaleLoggingTest(unittest.TestCase):
+    """#33: the staleness evaluation logs ``sim_safety_stale``, rate-limited."""
+
+    def test_stale_true_logs_at_most_once_per_second(self) -> None:
+        gateway = _gateway()
+        logger = _RecordingLogger()
+        gateway.node = SimpleNamespace(get_logger=lambda: logger)
+
+        # The stub backend carries no `simulation_time`, so `_sim_receipt_time()`
+        # returns None and every evaluation is unconditionally stale.
+        self.assertTrue(
+            gateway._sim_age_stale(1.0, 0.5, source="test_source", wall_age=2.0)
+        )
+        self.assertTrue(
+            gateway._sim_age_stale(1.0, 0.5, source="test_source", wall_age=2.0)
+        )
+
+        self.assertEqual(len(logger.info_lines), 1)
+        self.assertIn("sim_safety_stale source=test_source", logger.info_lines[0])
+        self.assertIn("wall_age_s=2.000", logger.info_lines[0])
+        self.assertIn("stale=True", logger.info_lines[0])
+
+    def test_stale_to_fresh_transition_always_logs_one_line(self) -> None:
+        gateway = _gateway()
+        logger = _RecordingLogger()
+        gateway.node = SimpleNamespace(get_logger=lambda: logger)
+
+        self.assertTrue(
+            gateway._sim_age_stale(None, 0.5, source="src", wall_age=1.0)
+        )
+        self.assertEqual(len(logger.info_lines), 1)
+
+        gateway.backend = SimpleNamespace(simulation_time=10.0)
+        self.assertFalse(
+            gateway._sim_age_stale(9.9, 0.5, source="src", wall_age=0.05)
+        )
+        self.assertEqual(len(logger.info_lines), 2)
+        self.assertIn("stale=False", logger.info_lines[1])
+
+        # Already fresh: a second fresh evaluation must not log again.
+        self.assertFalse(
+            gateway._sim_age_stale(9.95, 0.5, source="src", wall_age=0.05)
+        )
+        self.assertEqual(len(logger.info_lines), 2)
+
+    def test_never_stale_source_stays_silent(self) -> None:
+        gateway = _gateway()
+        logger = _RecordingLogger()
+        gateway.node = SimpleNamespace(get_logger=lambda: logger)
+        gateway.backend = SimpleNamespace(simulation_time=10.0)
+
+        self.assertFalse(
+            gateway._sim_age_stale(9.9, 0.5, source="src", wall_age=0.05)
+        )
+        self.assertEqual(logger.info_lines, [])

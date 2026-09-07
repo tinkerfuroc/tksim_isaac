@@ -36,7 +36,7 @@ class _Backend:
         self.stops: list[bool] = []
         self.safety_stopped = False
 
-    def set_safety_stop(self, active: bool) -> None:
+    def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
         self.stops.append(active)
         self.safety_stopped = active
 
