@@ -560,6 +560,110 @@ baseline + 8 new, +1 over the first round's 164/7); `tests/test_ros_gateway.py`
 `tests/test_gateway_simtime_deadlines.py` 7 passed, unaffected. No GPU boot
 for this diagnostic-only change.
 
+### Task #33 follow-up — gripper per-tick target parity publisher (bench round ahh)
+
+**Context, not a fix.** Bench round ahh showed a mid-close stall with
+`drive_joint` sitting at 0.341 rad while Isaac Lab's `data.applied_torque`
+echo stayed pinned at +2.5 -- consistent with either PhysX's own drive
+target already sitting near the measured position, or its stiffness/damping
+gains reading near zero, but nothing on the live bench had ever recorded
+the PhysX-side per-tick drive target to tell those two apart. Observability
+only -- no fix, no behaviour change.
+
+**New:** `/sim/parity/gripper_targets` (`sensor_msgs/JointState`, same
+reliable QoS and `TINKER_SIM_PARITY_TCP` env gate as the sibling parity
+topics, unconditional every `publish()` tick). For `drive_joint`,
+`left_finger_joint`, and `right_outer_knuckle_joint`
+(`PARITY_GRIPPER_TARGET_JOINTS` -- the drive, the pad readback #20's
+bounded-lead clamp already uses, and a mimic follower on the opposite side
+of the linkage), publishes nine `"<joint>/<field>"` names in `position`:
+`py_target` (`backend._position_targets`, Python's own commanded target),
+`lab_target` (`data.joint_pos_target`, Isaac Lab's actuator-model input
+buffer), `physx_target` (`root_view.get_dof_position_targets()`, the PhysX
+solver's own drive target -- the layer that had never been recorded),
+`physx_k`/`physx_d`/`physx_max_force`/`physx_max_vel` (the live PhysX
+gains/limits driving that target), `measured` (`data.joint_pos`), and
+`lab_applied_effort` (`data.applied_torque`). Plus `articulation/
+target_write` (1 if `step()`'s `TargetWriteGate` actually pushed changed
+targets to PhysX that tick, else 0 -- a repeated identical-target tick
+skips the write entirely, see `step()`'s `_write_targets` gate) and, if
+cheaply resolvable, `articulation/is_sleeping` (`get_physx_simulation_
+interface().is_sleeping(stage_id, prim_id)` on the articulation root,
+ids resolved once per `_refresh_robot_handles` rebind, never per tick --
+unverified against a live Kit process in this round, so a resolution
+failure at any point just omits the field entirely rather than publishing
+a placeholder).
+
+**Backend:** `IsaacWholeRobotBackend.parity_gripper_targets()` mirrors
+`validation/gripper_close_probe.py`'s existing `--arm-stream-hz` readback
+rows exactly (same `_read_physx_dof_param`/`_read_physx_position_targets`/
+`_read_lab_position_targets` sources, same one-call-per-parameter batching
+across all three joints via a new `_parity_read_dof_param` static helper --
+five PhysX view calls total per tick, not fifteen). Same two-flag fail-soft
+shape as `parity_gripper_torque`: any of the three joints unresolved, the
+PhysX view unavailable, or any read in the batch raising all return `None`
+(logged once), unlike the probe's own per-field NaN degradation -- this
+mirrors the OTHER parity publishers in this file (one bad read drops the
+whole tick) rather than mixing real and NaN values in one message. The
+gateway wraps its own publish call in a second try/except (log once, not
+per tick) so a message-construction failure on that side can't interrupt
+the `physics_truth` publish immediately after it either.
+
+**Per-tick cost (not measured on a live bench this round -- no GPU/Kit run
+in scope):** five small `(1, num_dofs)` PhysX tensor/array reads (one per
+parameter, batched across all three joints) plus four already-in-memory
+tensor slices (`_position_targets`/`joint_pos`/`joint_pos_target`/
+`applied_torque`) and one already-resolved `is_sleeping` call -- the same
+order of magnitude as the existing `parity_gripper_torque` publisher next
+to it (one PhysX view call), roughly 5x that call count. Expected to be a
+small fraction of the ~24 ms/physics-step budget measured for the
+sensor-rich profile (`sim-rtf-sensor-rich-baseline.md`); a live bench
+recording that confirms this is the follow-up.
+
+**Also this round (both fixed while reading the surrounding code, still
+observability only):**
+- `step_profile_snapshot()`'s `changed_targets` used to keep only the
+  top-8 most-changed `"<label>:<joint>"` keys by count. A low-traffic key
+  like `pos:drive_joint` (the gripper closes far less often than the arm
+  moves or the base drives) silently fell off that list whenever 8+ other
+  joints changed more in the same window -- exactly the blind spot the
+  mid-close stall investigation ran into. The key space is bounded by
+  construction (at most 3 labels x `num_joints`, reset every snapshot
+  call, never user-input-driven), so the cap is simply removed rather than
+  raised to an arbitrary larger number.
+- `_mirror_gripper_mimic_targets()`'s docstring claimed "robot.usd dropped
+  every `<mimic>`" as the reason the coupling is restored in software.
+  Measured 2026-09-07: the live stage DOES carry a `PhysxMimicJointAPI:
+  rotX` (gearing -1) on all five followers, but it creates no live PhysX
+  constraint at all (freezing the five followers at 0 does not stop
+  `drive_joint` from closing; driving the followers independently does not
+  move `drive_joint` either) -- the operational conclusion (the coupling
+  must be restored in software regardless) is unchanged, only the reason
+  given was wrong. A second, near-identical claim in the `ImplicitActuatorCfg`
+  comment block earlier in `__init__` (`backend.py` ~1508-1511: "the
+  URDF->USD import dropped every `<mimic>`... no drive and no coupling")
+  makes the same now-inaccurate claim and was left untouched -- out of this
+  round's scope (only the one flagged location was in the brief), noted
+  here for a follow-up pass.
+
+**Tests** (`tests/test_manipulation_runtime.py`): the readback against a
+scrambled (non-contiguous, includes a non-target joint) joint order with
+tracked PhysX getter stubs, proving indices resolve by name and every
+`get_dof_*` call fires exactly once (batched, not once per joint); a
+double lacking a PhysX view returns `None`; the gateway publishes the
+backend's `(names, values)` straight through with the tick's sim stamp;
+the gateway skips cleanly (no publish, no raise) when
+`TINKER_SIM_PARITY_TCP=0`, when the backend returns `None`, and when the
+backend's `parity_gripper_targets()` raises -- the last case logging
+exactly once across two ticks while `physics_truth` keeps publishing
+every tick regardless; and `step_profile_snapshot()` with 9 other joints
+changing every round and `drive_joint` changing once, proving all 10 keys
+(not 8) come through. Full suite under the same ROS-env pytest incantation
+as the round above: `tests/test_manipulation_runtime.py` 171 passed / 5
+subtests passed (165 baseline + 6 new); `tests/test_ros_gateway.py` /
+`tests/test_gateway_simtime_deadlines.py` unaffected (27 / 7 passed). No
+GPU boot for this diagnostic-only change.
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping

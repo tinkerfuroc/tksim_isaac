@@ -223,6 +223,7 @@ class RosStandardGateway:
         self.wrist_camera_pose_pub = None
         self.wrist_camera_pose_base_pub = None
         self.gripper_physx_tau_pub = None
+        self.gripper_targets_pub = None
         if self._parity_tcp_enabled:
             self.tcp_pose_pub = self.node.create_publisher(
                 PoseStamped, "/sim/parity/tcp_pose", reliable
@@ -257,6 +258,18 @@ class RosStandardGateway:
             # see publish().
             self.gripper_physx_tau_pub = self.node.create_publisher(
                 JointState, "/sim/parity/gripper_physx_tau", reliable
+            )
+            # Task #33 follow-up (bench round ahh): a mid-close stall showed
+            # drive_joint sitting at 0.341 rad with Isaac Lab's effort echo
+            # pinned +2.5 while PhysX behaved as if its own drive target
+            # already equalled the measured position (or its gains were
+            # ~0) -- the per-tick PhysX target had never been recorded on a
+            # live bench. Same env gate/cadence as the rest of this block.
+            # Fail-soft on backend.parity_gripper_targets() returning None,
+            # or on any exception while building/publishing this message --
+            # see publish().
+            self.gripper_targets_pub = self.node.create_publisher(
+                JointState, "/sim/parity/gripper_targets", reliable
             )
         self._camera_rig = camera_rig
         self.camera_skipped_frames = 0
@@ -1501,6 +1514,31 @@ class RosStandardGateway:
                 gripper_message.velocity = velocities
                 gripper_message.effort = physx_tau
                 self.gripper_physx_tau_pub.publish(gripper_message)
+            # Task #33 follow-up (bench round ahh): same gate/cadence as the
+            # parity block above. backend.parity_gripper_targets() already
+            # fails soft (returns None, logs once, backend-side) if the
+            # target joints or a PhysX/Lab read is unresolved; this try
+            # additionally guards message construction/publish itself so a
+            # failure THERE can't propagate into the physics_truth publish
+            # below it either -- logged once, not per tick.
+            try:
+                gripper_targets = self.backend.parity_gripper_targets()
+                if gripper_targets is not None:
+                    names, values = gripper_targets
+                    targets_message = self._JointState()
+                    targets_message.header.stamp = stamp
+                    targets_message.name = list(names)
+                    targets_message.position = list(values)
+                    self.gripper_targets_pub.publish(targets_message)
+            except Exception as error:
+                if not getattr(self, "_gripper_targets_publish_error_logged", False):
+                    self._gripper_targets_publish_error_logged = True
+                    node = getattr(self, "node", None)
+                    get_logger = getattr(node, "get_logger", None)
+                    if get_logger is not None:
+                        get_logger().error(
+                            f"gripper_targets publish failed: {error}"
+                        )
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {

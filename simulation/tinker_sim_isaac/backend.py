@@ -848,6 +848,36 @@ class IsaacWholeRobotBackend:
         "right_inner_knuckle_joint",
         "right_finger_joint",
     )
+    # #33 follow-up (bench round ahh): the three joints whose PER-LAYER
+    # position target (Python's own _position_targets, Isaac Lab's
+    # data.joint_pos_target, and PhysX's own get_dof_position_targets) the
+    # mid-close stall investigation needs side by side -- see
+    # parity_gripper_targets(). drive_joint is the master; left_finger_joint
+    # is the pad readback #20's bounded-lead clamp already reads;
+    # right_outer_knuckle_joint is a mimic follower on the OPPOSITE side of
+    # the linkage from left_finger_joint.
+    PARITY_GRIPPER_TARGET_JOINTS = (
+        "drive_joint",
+        "left_finger_joint",
+        "right_outer_knuckle_joint",
+    )
+    # Published as "<joint>/<field>" names, values in JointState.position --
+    # see parity_gripper_targets(). Mirrors validation/gripper_close_probe.py's
+    # #33 readback rows exactly (py_target/lab_target/physx_target/physx_k/
+    # physx_d/physx_max_force/physx_max_vel already exist there as CSV
+    # columns; measured/lab_applied_effort are the pre-existing joint_state()
+    # fields, added here so one topic carries the whole per-tick picture).
+    PARITY_GRIPPER_TARGET_FIELDS = (
+        "py_target",
+        "lab_target",
+        "physx_target",
+        "physx_k",
+        "physx_d",
+        "physx_max_force",
+        "physx_max_vel",
+        "measured",
+        "lab_applied_effort",
+    )
 
     def __init__(
         self,
@@ -1074,6 +1104,24 @@ class IsaacWholeRobotBackend:
         # the fail-soft contract is still "log once, then skip silently".
         self._parity_gripper_torque_unresolved_logged = False
         self._parity_gripper_torque_error_logged = False
+        # Same two-flag shape as parity_gripper_torque above, for
+        # parity_gripper_targets() (#33 bench round ahh follow-up).
+        self._parity_gripper_targets_unresolved_logged = False
+        self._parity_gripper_targets_error_logged = False
+        # Best-effort articulation-root (stage_id, prim_id) for
+        # get_physx_simulation_interface().is_sleeping(), resolved once per
+        # rebind by _refresh_robot_handles; None if unresolved/unavailable,
+        # in which case parity_gripper_targets() simply omits the
+        # "articulation/is_sleeping" name/value pair rather than raising or
+        # publishing a placeholder.
+        self._articulation_sleep_ids: tuple[int, int] | None = None
+        # Set by step() every tick (observability only, #33): whether that
+        # tick actually pushed changed drive targets to PhysX (the
+        # TargetWriteGate's should_write() result), so
+        # parity_gripper_targets() can publish "articulation/target_write"
+        # without step() itself needing any new bookkeeping beyond this one
+        # assignment.
+        self._last_target_write = False
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
         )
@@ -2222,6 +2270,17 @@ class IsaacWholeRobotBackend:
         self._parity_gripper_joint_indices = tuple(
             self._joint_index.get(name) for name in self.PARITY_GRIPPER_JOINTS
         )
+        # #33 follow-up: the three PARITY_GRIPPER_TARGET_JOINTS DOF indices,
+        # same resolve-once-per-rebind shape as the six above.
+        self._parity_gripper_target_indices = tuple(
+            self._joint_index.get(name) for name in self.PARITY_GRIPPER_TARGET_JOINTS
+        )
+        # Best-effort, resolved once per rebind (cheap: one stage/prim
+        # lookup, not a per-tick cost) -- see _articulation_is_sleeping().
+        # Any failure (no live Kit/USD stage, unavailable API, wrong prim
+        # path) leaves this None and parity_gripper_targets() simply omits
+        # the field, per its "if cheaply available, else omit" contract.
+        self._articulation_sleep_ids = self._resolve_articulation_sleep_ids()
         self._safety_nominal_stiffness = self._read_joint_gain_values(
             "joint_stiffness",
             self.NOMINAL_ARM_STIFFNESS,
@@ -3778,8 +3837,15 @@ class IsaacWholeRobotBackend:
         parallel. The URDF expresses this as ``<mimic joint="drive_joint"
         multiplier="1">`` on all five follower joints (the finger joints on -x
         axes, which the importer baked as 180 deg frame flips, so a uniform +1
-        mirror is kinematically right). robot.usd dropped every <mimic>, so the
-        coupling is restored here in software.
+        mirror is kinematically right). robot.usd does carry a
+        ``PhysxMimicJointAPI:rotX`` (gearing -1) on all five followers, but it
+        creates NO live PhysX constraint -- corrected 2026-09-07, the prior
+        "robot.usd dropped every <mimic>" claim here was never actually
+        measured: freezing the five followers at 0 does not stop drive_joint
+        from closing, and driving the followers independently does not move
+        drive_joint either. Whatever the schema authors, the linkage is
+        unconstrained in PhysX, so the coupling is restored here in software
+        regardless.
 
         URDF mimic semantics are ``q_follower = multiplier * q_drive`` -- the
         driving joint's ACTUAL angle. Mirroring drive_joint's commanded TARGET
@@ -3893,6 +3959,11 @@ class IsaacWholeRobotBackend:
         _write_targets = self._target_write_gate.should_write(
             (self._position_targets, self._velocity_targets, self._effort_targets)
         )
+        # Observability only (#33): published as "articulation/target_write"
+        # by parity_gripper_targets() -- whether THIS tick actually pushed
+        # changed drive targets to PhysX, or the write gate skipped an
+        # unchanged repeat.
+        self._last_target_write = bool(_write_targets)
         effort_writer = getattr(self._robot, "set_joint_effort_target", None)
         if effort_writer is None and self._safety_stopped:
             raise RuntimeError(
@@ -4330,8 +4401,17 @@ class IsaacWholeRobotBackend:
         # were byte-identical re-sends the write gate skipped.
         out["target_writes"] = sp["target_writes"]
         if sp.get("changed_targets"):
+            # #33 follow-up: this used to cap at the top-8 most-changed
+            # keys, which silently dropped a low-traffic joint like
+            # pos:drive_joint whenever 8+ other joints (arm + wheels) moved
+            # more often in the same window -- exactly the visibility the
+            # mid-close stall investigation needed and didn't have. The key
+            # space here is bounded by construction (at most 3 labels *
+            # num_joints distinct keys, reset every snapshot call, never
+            # user-input-driven), so there is no unbounded-growth risk in
+            # publishing all of it.
             out["changed_targets"] = dict(
-                sorted(sp["changed_targets"].items(), key=lambda kv: -kv[1])[:8]
+                sorted(sp["changed_targets"].items(), key=lambda kv: -kv[1])
             )
             sp["changed_targets"] = {}
         # PhysX solver steps per control step (1 unless TINKER_SIM_CONTROL_HZ
@@ -5225,6 +5305,229 @@ class IsaacWholeRobotBackend:
         pos = [float(joint_pos[index]) for index in indices]
         vel = [float(joint_vel[index]) for index in indices]
         return self.PARITY_GRIPPER_JOINTS, pos, vel, physx_tau
+
+    def _resolve_articulation_sleep_ids(self) -> tuple[int, int] | None:
+        """Best-effort ``(stage_id, prim_id)`` for the articulation root,
+        for ``get_physx_simulation_interface().is_sleeping(stage_id,
+        prim_id)`` -- #33 bench round ahh follow-up (``articulation/
+        is_sleeping`` in ``parity_gripper_targets()``). Called once per
+        ``_refresh_robot_handles`` rebind, never per tick: a stage/prim
+        lookup is not something the hot path should pay for, and the ids
+        this resolves don't change between rebinds anyway.
+
+        No Kit/USD stage is available in a headless unit-test construction
+        (``omni.usd``/``pxr`` fail to import there, matching every other
+        lazy-pxr-import method in this class), and even on a live bench the
+        exact PhysX API surface for this is unverified -- this is
+        explicitly a "cheap if available" diagnostic per the task, not a
+        contract anything depends on. Any failure at all returns ``None``;
+        the caller then simply omits the field rather than publishing a
+        placeholder.
+        """
+        try:
+            import omni.usd
+            from pxr import PhysicsSchemaTools
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return None
+            robot_prim_path = str(
+                getattr(getattr(self._robot, "cfg", None), "prim_path", "")
+                or "/World/Tinker"
+            )
+            robot_prim = stage.GetPrimAtPath(robot_prim_path)
+            if not robot_prim.IsValid():
+                return None
+            stage_id = omni.usd.get_context().get_stage_id()
+            prim_id = PhysicsSchemaTools.sdfPathToInt(robot_prim.GetPath())
+            return int(stage_id), int(prim_id)
+        except Exception:
+            return None
+
+    def _articulation_is_sleeping(self) -> bool | None:
+        """Per-tick ``is_sleeping`` read using the ids cached by
+        ``_resolve_articulation_sleep_ids`` -- ``None`` (never published,
+        per the "if cheaply available, else omit" contract) if the ids
+        never resolved or the read itself fails.
+        """
+        ids = getattr(self, "_articulation_sleep_ids", None)
+        if ids is None:
+            return None
+        try:
+            from omni.physx import get_physx_simulation_interface
+
+            return bool(get_physx_simulation_interface().is_sleeping(ids[0], ids[1]))
+        except Exception:
+            return None
+
+    def parity_gripper_targets(self) -> tuple[list[str], list[float]] | None:
+        """Per-tick, per-LAYER position-target readback for the three
+        ``PARITY_GRIPPER_TARGET_JOINTS`` -- #33 bench round ahh follow-up: a
+        mid-close stall showed ``drive_joint`` sitting at 0.341 rad with
+        Isaac Lab's effort echo pinned at +2.5 while PhysX behaved as
+        though its own drive target already equalled the measured position
+        (or its gains were ~0), and the PhysX-side per-tick target had
+        never actually been recorded on a live bench. This publishes, for
+        each of the three joints, Python's own commanded target
+        (``_position_targets``, ``py_target``), Isaac Lab's actuator-model
+        input buffer (``data.joint_pos_target``, ``lab_target``), and the
+        PhysX solver's own drive target (``root_view.
+        get_dof_position_targets()``, ``physx_target``) side by side, plus
+        the live PhysX gains/limits driving that target
+        (``physx_k``/``physx_d``/``physx_max_force``/``physx_max_vel``) and
+        the measured position/Lab-applied-effort those targets are
+        supposedly tracking toward -- exactly the row
+        ``validation/gripper_close_probe.py``'s ``--arm-stream-hz`` CSV
+        already computes in-process, published live instead of only
+        available from a probe run.
+
+        Fails soft, same two-flag shape as ``parity_gripper_torque``:
+        returns ``None`` (logged once) if any of ``PARITY_GRIPPER_TARGET_
+        JOINTS`` is unresolved, the PhysX view is unavailable, or ANY read
+        in the batch raises -- the caller must skip that tick's publish,
+        not raise. Unlike ``validation/gripper_close_probe.py``'s per-field
+        NaN degradation (a CSV column must never go missing), this mirrors
+        the OTHER parity publishers in this file: one bad read drops the
+        whole tick rather than mixing real and NaN values in one message.
+        """
+        indices = getattr(self, "_parity_gripper_target_indices", None)
+        if indices is None or any(index is None for index in indices):
+            if not self._parity_gripper_targets_unresolved_logged:
+                self._parity_gripper_targets_unresolved_logged = True
+                missing = [
+                    name
+                    for name, index in zip(
+                        self.PARITY_GRIPPER_TARGET_JOINTS, indices or ()
+                    )
+                    if index is None
+                ]
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_targets_joints_unresolved",
+                            "missing": missing,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        if root_view is None:
+            if not self._parity_gripper_targets_unresolved_logged:
+                self._parity_gripper_targets_unresolved_logged = True
+                print(
+                    json.dumps({"event": "parity_gripper_targets_view_unavailable"}),
+                    flush=True,
+                )
+            return None
+
+        try:
+            # One PhysX view call per parameter (batched across all three
+            # joints), not one call per joint -- five getter calls total,
+            # each a single small (1, num_dofs) CPU tensor/array read.
+            physx_target = self._parity_read_dof_param(
+                root_view, "get_dof_position_targets", indices
+            )
+            physx_k = self._parity_read_dof_param(
+                root_view, "get_dof_stiffnesses", indices
+            )
+            physx_d = self._parity_read_dof_param(
+                root_view, "get_dof_dampings", indices
+            )
+            physx_max_force = self._parity_read_dof_param(
+                root_view, "get_dof_max_forces", indices
+            )
+            physx_max_vel = self._parity_read_dof_param(
+                root_view, "get_dof_max_velocities", indices
+            )
+            data = self._robot.data
+            joint_pos = self._torch_value(data.joint_pos)[0]
+            py_targets = self._torch_value(self._position_targets)[0]
+            lab_target_tensor = getattr(data, "joint_pos_target", None)
+            lab_targets = (
+                self._torch_value(lab_target_tensor)[0]
+                if lab_target_tensor is not None
+                else None
+            )
+            applied_torque_tensor = getattr(data, "applied_torque", None)
+            applied_torque = (
+                self._torch_value(applied_torque_tensor)[0]
+                if applied_torque_tensor is not None
+                else None
+            )
+            names: list[str] = []
+            values: list[float] = []
+            for row, joint_name in enumerate(self.PARITY_GRIPPER_TARGET_JOINTS):
+                index = indices[row]
+                row_values = {
+                    "py_target": float(py_targets[index]),
+                    "lab_target": (
+                        float(lab_targets[index])
+                        if lab_targets is not None
+                        else float("nan")
+                    ),
+                    "physx_target": physx_target[row],
+                    "physx_k": physx_k[row],
+                    "physx_d": physx_d[row],
+                    "physx_max_force": physx_max_force[row],
+                    "physx_max_vel": physx_max_vel[row],
+                    "measured": float(joint_pos[index]),
+                    "lab_applied_effort": (
+                        float(applied_torque[index])
+                        if applied_torque is not None
+                        else float("nan")
+                    ),
+                }
+                for field in self.PARITY_GRIPPER_TARGET_FIELDS:
+                    names.append(f"{joint_name}/{field}")
+                    values.append(row_values[field])
+        except Exception as error:  # pragma: no cover - defensive, PhysX/Lab API surface
+            if not self._parity_gripper_targets_error_logged:
+                self._parity_gripper_targets_error_logged = True
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_targets_read_error",
+                            "error": str(error)[:160],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        names.append("articulation/target_write")
+        values.append(1.0 if getattr(self, "_last_target_write", False) else 0.0)
+        sleeping = self._articulation_is_sleeping()
+        if sleeping is not None:
+            names.append("articulation/is_sleeping")
+            values.append(1.0 if sleeping else 0.0)
+        return names, values
+
+    @staticmethod
+    def _parity_read_dof_param(
+        root_view: Any, getter_name: str, indices: tuple[int, ...]
+    ) -> list[float]:
+        """One PhysX tensor-view call for the named per-DOF parameter
+        (``get_dof_position_targets``/``get_dof_stiffnesses``/
+        ``get_dof_dampings``/``get_dof_max_forces``/
+        ``get_dof_max_velocities``, shape ``(num_instances, num_dofs)``, env
+        0), then extract every requested index from that one read -- same
+        shape as ``validation/gripper_close_probe.py``'s
+        ``_read_physx_dof_param``. Raises (the caller's batch try/except
+        catches it) rather than degrading per-field, matching
+        ``parity_gripper_targets()``'s whole-tick fail-soft contract.
+        """
+        getter = getattr(root_view, getter_name, None)
+        if getter is None:
+            raise AttributeError(f"{getter_name} unavailable on this PhysX view")
+        raw = getter()
+        arr = raw.numpy() if hasattr(raw, "numpy") else raw
+        return [float(arr[0][index]) for index in indices]
 
     def body_pose_world(
         self, name: str
