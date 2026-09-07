@@ -671,7 +671,41 @@ class IsaacWholeRobotBackend:
         self._spawn_attach_watch: dict[str, dict[str, int]] = {}
         self._spawn_attach_step = 0
         self._contact_pairs_by_key: dict[tuple[int, int, int, int], dict[str, object]] = {}
-        # Set once _on_contact_report_event records its first pair, so the
+        # TINKER_SIM_CONTACT_TRACE_BODIES=Bottle,left_inner_knuckle -- when set,
+        # any contact pair where either actor's trailing body/prim name matches
+        # one of these (comma-separated) names is recorded regardless of the
+        # ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES monitored set, with the raw
+        # per-sample contact points kept (not just the force-weighted average)
+        # so a probe can see every pair touching an object, not only the pads.
+        # Entries may be a bare leaf name or a full prim path -- matching
+        # compares leaves on both sides (see _contact_name_matches), so
+        # "bench_sugar_box_100_anygrasp_agw_a1" matches an actor of
+        # "/World/Scenario/bench_sugar_box_100_anygrasp_agw_a1" and a fully
+        # qualified entry still matches by its own leaf. Unset (default)
+        # costs nothing and leaves existing behavior untouched.
+        self._contact_trace_bodies = frozenset(
+            item.strip()
+            for item in os.environ.get("TINKER_SIM_CONTACT_TRACE_BODIES", "").split(",")
+            if item.strip()
+        )
+        self._contact_trace_pairs_by_key: dict[tuple[int, int, int, int], dict[str, object]] = {}
+        # TINKER_SIM_CONTACT_EXTRA_BODIES=xarm_gripper_base_link,xarm_camera_link
+        # -- when set, these body names are added to the monitored set
+        # alongside ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES, so pushes on
+        # bodies the bench cares about (gripper base/palm, wrist camera
+        # housing) are recorded and aggregated by contact_pairs()/
+        # contact_state() the same way GRASP_CONTACT_BODIES are -- lf/rf
+        # aggregation semantics for left_finger/right_finger are untouched.
+        # Same leaf-or-full-path matching as _contact_trace_bodies (see
+        # _contact_name_matches). Unset (default) is byte-identical to the
+        # pre-existing monitored set.
+        self._contact_extra_bodies = tuple(
+            item.strip()
+            for item in os.environ.get("TINKER_SIM_CONTACT_EXTRA_BODIES", "").split(",")
+            if item.strip()
+        )
+        # Set once _on_contact_report_event records its first *monitored*
+        # pair (ARM/GRASP/EXTRA -- a trace-only pair does not count), so the
         # "contact_report_first_event" diagnostic (see there) fires exactly
         # once per backend life instead of once per contact.
         self._contact_report_first_event_logged = False
@@ -1214,6 +1248,23 @@ class IsaacWholeRobotBackend:
             )
             if self._contact_report_subscription is None:
                 raise RuntimeError("manipulation-core requires PhysX contact reporting")
+            # Boot marker: the resolved monitored/traced body sets, so a live
+            # run can confirm TINKER_SIM_CONTACT_EXTRA_BODIES /
+            # TINKER_SIM_CONTACT_TRACE_BODIES took effect without reading
+            # source or env dumps.
+            print(
+                json.dumps(
+                    {
+                        "event": "contact_bodies",
+                        "arm": list(self.ARM_CONTACT_BODIES),
+                        "grasp": list(self.GRASP_CONTACT_BODIES),
+                        "extra": list(self._contact_extra_bodies),
+                        "trace": sorted(self._contact_trace_bodies),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     def _step_simulation(self) -> None:
         """One control step: ``physics_substeps`` solver steps of ``physics_dt``.
@@ -3655,7 +3706,9 @@ class IsaacWholeRobotBackend:
     def contact_state(self) -> dict[str, dict[str, float | bool]]:
         state: dict[str, dict[str, float | bool]] = {
             name: {"in_contact": False, "force": 0.0}
-            for name in self.ARM_CONTACT_BODIES + self.GRASP_CONTACT_BODIES
+            for name in self.ARM_CONTACT_BODIES
+            + self.GRASP_CONTACT_BODIES
+            + self._contact_extra_bodies
         }
         for pair in self.contact_pairs():
             force = float(pair["normal_force"])
@@ -3674,9 +3727,39 @@ class IsaacWholeRobotBackend:
         """Return active PhysX reports with both rigid-body identities."""
         return [dict(pair) for pair in self._contact_pairs_by_key.values()]
 
+    def contact_trace_pairs(self) -> list[dict[str, object]]:
+        """Return every active contact pair touching a TINKER_SIM_CONTACT_TRACE_BODIES
+        body, independent of ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES monitoring.
+        Empty unless the env var is set. Each record carries the same
+        force-weighted "point"/"normal" as contact_pairs(), plus the raw
+        per-sample "points" (up to 4) and "point_count" for the full pair.
+        """
+        return [dict(pair) for pair in self._contact_trace_pairs_by_key.values()]
+
     @staticmethod
     def _contact_vector(value: object) -> list[float]:
         return [float(value[index]) for index in range(3)]  # type: ignore[index]
+
+    @staticmethod
+    def _contact_name_matches(actor_path: str, names: Iterable[str]) -> bool:
+        """True if ``actor_path`` matches any of ``names`` by leaf or full path.
+
+        ``names`` entries (TINKER_SIM_CONTACT_TRACE_BODIES /
+        TINKER_SIM_CONTACT_EXTRA_BODIES) may be a bare leaf body/prim name
+        (e.g. "xarm_gripper_base_link") or a full prim path (e.g.
+        "/World/Scenario/bench_sugar_box_100_anygrasp_agw_a1"); a spawned
+        entity's rigid body IS its prim, so the bench's own full paths must
+        match too. Matching compares leaves on both sides, so a bare entry
+        matches any actor ending in that leaf, and a full-path entry still
+        matches by falling back to its own leaf.
+        """
+        actor_leaf = actor_path.rsplit("/", 1)[-1]
+        for name in names:
+            if name == actor_path or name == actor_leaf:
+                return True
+            if name.rsplit("/", 1)[-1] == actor_leaf:
+                return True
+        return False
 
     def _on_contact_report_event(
         self, contact_headers: Iterable[object], contact_data: object
@@ -3695,6 +3778,7 @@ class IsaacWholeRobotBackend:
             event_type = header.type  # type: ignore[attr-defined]
             if event_type == self._contact_event_lost:
                 self._contact_pairs_by_key.pop(key, None)
+                self._contact_trace_pairs_by_key.pop(key, None)
                 continue
             if event_type not in {
                 self._contact_event_found,
@@ -3702,13 +3786,22 @@ class IsaacWholeRobotBackend:
             }:
                 continue
             actors = tuple(self._contact_path_decoder(path_id) for path_id in actor_ids)
-            if not monitored.intersection(actors):
+            is_monitored = bool(monitored.intersection(actors)) or any(
+                self._contact_name_matches(actor, self._contact_extra_bodies)
+                for actor in actors
+            )
+            is_traced = bool(self._contact_trace_bodies) and any(
+                self._contact_name_matches(actor, self._contact_trace_bodies)
+                for actor in actors
+            )
+            if not is_monitored and not is_traced:
                 continue
             offset = int(header.contact_data_offset)  # type: ignore[attr-defined]
             count = int(header.num_contact_data)  # type: ignore[attr-defined]
             samples = [contact_data[index] for index in range(offset, offset + count)]  # type: ignore[index]
             if not samples:
                 self._contact_pairs_by_key.pop(key, None)
+                self._contact_trace_pairs_by_key.pop(key, None)
                 continue
             normal_impulses: list[tuple[float, list[float], int]] = []
             for sample_index, sample in enumerate(samples):
@@ -3729,6 +3822,7 @@ class IsaacWholeRobotBackend:
             normal_force = sum(value[0] for value in normal_impulses) / self.dt
             if normal_force <= self.CONTACT_FORCE_THRESHOLD:
                 self._contact_pairs_by_key.pop(key, None)
+                self._contact_trace_pairs_by_key.pop(key, None)
                 continue
             points = [self._contact_vector(sample.position) for sample in samples]
             point = [sum(values) / len(values) for values in zip(*points)]
@@ -3746,26 +3840,48 @@ class IsaacWholeRobotBackend:
                 # largest contribution, with source order as the tie-breaker, is
                 # deterministic and preserves an actual PhysX-reported normal.
                 normal = max(normal_impulses, key=lambda item: (item[0], -item[2]))[1]
-            self._contact_pairs_by_key[key] = {
-                "body_a": actors[0],
-                "body_b": actors[1],
-                "normal_force": normal_force,
-                "point": point,
-                "normal": normal,
-            }
-            if not self._contact_report_first_event_logged:
-                self._contact_report_first_event_logged = True
-                print(
-                    json.dumps(
-                        {
-                            "event": "contact_report_first_event",
-                            "simulation_time": self.simulation_time,
-                            "pair": [actors[0], actors[1]],
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
+            if is_monitored:
+                self._contact_pairs_by_key[key] = {
+                    "body_a": actors[0],
+                    "body_b": actors[1],
+                    "normal_force": normal_force,
+                    "point": point,
+                    "normal": normal,
+                }
+                # Trace-only pairs (matched via TINKER_SIM_CONTACT_TRACE_BODIES
+                # alone, is_traced but not is_monitored) deliberately do NOT
+                # count as the first monitored event -- this diagnostic marks
+                # when the bench's own ARM/GRASP/EXTRA contact set first sees
+                # contact, independent of whatever extra bodies a probe is
+                # also tracing.
+                if not self._contact_report_first_event_logged:
+                    self._contact_report_first_event_logged = True
+                    print(
+                        json.dumps(
+                            {
+                                "event": "contact_report_first_event",
+                                "simulation_time": self.simulation_time,
+                                "pair": [actors[0], actors[1]],
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+            else:
+                self._contact_pairs_by_key.pop(key, None)
+            if is_traced:
+                self._contact_trace_pairs_by_key[key] = {
+                    "body_a": actors[0],
+                    "body_b": actors[1],
+                    "normal_force": normal_force,
+                    "point": point,
+                    "normal": normal,
+                    "points": points[:4],
+                    "normals": [item[1] for item in normal_impulses][:4],
+                    "point_count": len(points),
+                }
+            else:
+                self._contact_trace_pairs_by_key.pop(key, None)
 
     @classmethod
     def is_arm_scenario_collision(
