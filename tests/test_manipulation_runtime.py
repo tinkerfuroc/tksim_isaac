@@ -11,6 +11,7 @@ import re
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -152,6 +153,36 @@ class _FakeRigidView:
 
     def get_velocities(self) -> _ArrayValue:
         return self._velocities
+
+
+def _fake_omni_usd_and_pxr(present_paths: set[str]) -> dict[str, object]:
+    """Return a ``sys.modules`` overlay (for ``patch.dict``) stubbing
+    ``omni.usd``/``pxr`` for ``_resolve_tracked_objects`` (Task #38).
+
+    ``present_paths`` is a live set the test mutates in place to simulate a
+    spawn/despawn between calls -- ``GetPrimAtPath`` always re-checks
+    membership rather than snapshotting it once.
+    """
+    pxr = types.ModuleType("pxr")
+    pxr.UsdPhysics = SimpleNamespace(RigidBodyAPI="RigidBodyAPI")
+
+    class _Prim:
+        def __init__(self, path: str) -> None:
+            self._path = path
+
+        def IsValid(self) -> bool:
+            return self._path in present_paths
+
+        def HasAPI(self, api: object) -> bool:
+            return api == "RigidBodyAPI" and self._path in present_paths
+
+    stage = SimpleNamespace(GetPrimAtPath=lambda path: _Prim(path))
+    omni = types.ModuleType("omni")
+    omni.__path__ = []
+    omni_usd = types.ModuleType("omni.usd")
+    omni_usd.get_context = lambda: SimpleNamespace(get_stage=lambda: stage)
+    omni.usd = omni_usd
+    return {"pxr": pxr, "omni": omni, "omni.usd": omni_usd}
 
 
 def _backend() -> IsaacWholeRobotBackend:
@@ -2379,6 +2410,151 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(objects[0]["prim_path"], "/World/Scenario/delivery_object")
         self.assertNotEqual(objects[0]["pose"]["xyz"], [9.0, 9.0, 9.0])
+
+    def _tracked_backend(self, paths: tuple[str, ...]) -> IsaacWholeRobotBackend:
+        backend = _backend()
+        backend._tracked_object_paths = paths
+        backend._tracked_object_step = 0
+        backend._tracked_object_resolve_step = 0
+        backend._tracked_object_resolved = set()
+        backend._tracked_object_unresolved_logged = set()
+        return backend
+
+    @staticmethod
+    def _fake_physx_module(allowed: set[str], calls: list[str]):
+        class _Physx:
+            def get_rigidbody_transformation(self, path: str) -> dict:
+                assert path in allowed, f"blind PhysX query of unresolved path {path}"
+                calls.append(path)
+                return {
+                    "ret_val": True,
+                    "position": (1.0, 2.0, 3.0),
+                    "rotation": (0.0, 0.0, 0.0, 1.0),
+                }
+
+        physx = types.ModuleType("omni.physx")
+        physx.get_physx_interface = lambda: _Physx()
+        return physx
+
+    def test_log_tracked_objects_never_queries_unresolved_paths(self) -> None:
+        # Task #38: an absent/never-spawned tracked path must never reach a
+        # blind PhysX query -- get_rigidbody_transformation on a nonexistent
+        # prim fails softly in Python but also emits a carb/omni.physx ERROR
+        # log line from inside the C++ call, so blind-querying it every tick
+        # floods the log forever. Two present + two absent paths, several
+        # ticks: absent paths are never queried, and each logs "unresolved"
+        # exactly once (not once per tick).
+        backend = self._tracked_backend(
+            (
+                "/World/Scenario/present_a",
+                "/World/Scenario/present_b",
+                "/World/Scenario/absent_a",
+                "/World/Scenario/absent_b",
+            )
+        )
+        backend._object_discovery_interval = 1
+        backend.control_hz = 4.0  # _log_tracked_objects interval = 1 tick
+
+        present = {"/World/Scenario/present_a", "/World/Scenario/present_b"}
+        overlay = _fake_omni_usd_and_pxr(present)
+        calls: list[str] = []
+        overlay["omni.physx"] = self._fake_physx_module(present, calls)
+
+        with patch.dict(sys.modules, overlay):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                for _ in range(6):
+                    backend._resolve_tracked_objects()
+                    backend._log_tracked_objects()
+
+        # Zero queries reached the absent paths; the present ones were
+        # queried normally (once per tick).
+        self.assertTrue(calls)
+        self.assertTrue(all(path in present for path in calls))
+        self.assertEqual(calls.count("/World/Scenario/present_a"), 6)
+        self.assertEqual(calls.count("/World/Scenario/present_b"), 6)
+
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
+        unresolved = [line for line in lines if line.get("state") == "unresolved"]
+        self.assertEqual(
+            sorted(line["tracked_object"] for line in unresolved),
+            ["/World/Scenario/absent_a", "/World/Scenario/absent_b"],
+        )
+
+    def test_tracked_object_resolves_on_spawn_without_waiting_for_interval(self) -> None:
+        # A tracked path that appears mid-run (spawn) must be picked up by
+        # the very next tick, not up to one discovery interval later --
+        # exercised here via the force=True path a spawn/park hook uses
+        # (_heal_detached_scenario_bodies / set_entity_pose_physics).
+        backend = self._tracked_backend(("/World/Scenario/late_spawn",))
+        backend._object_discovery_interval = 1000  # would not naturally refresh
+        backend.control_hz = 4.0
+
+        present: set[str] = set()
+        overlay = _fake_omni_usd_and_pxr(present)
+
+        with patch.dict(sys.modules, overlay):
+            with contextlib.redirect_stdout(io.StringIO()):
+                backend._resolve_tracked_objects()  # first call always runs
+            self.assertNotIn("/World/Scenario/late_spawn", backend._tracked_object_resolved)
+
+            present.add("/World/Scenario/late_spawn")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                backend._resolve_tracked_objects(force=True)
+            self.assertIn("/World/Scenario/late_spawn", backend._tracked_object_resolved)
+            lines = [
+                json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()
+            ]
+            resolved_lines = [line for line in lines if line.get("state") == "resolved"]
+            self.assertEqual(len(resolved_lines), 1)
+
+            calls: list[str] = []
+            with patch.dict(
+                sys.modules, {"omni.physx": self._fake_physx_module(present, calls)}
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    backend._log_tracked_objects()
+            self.assertEqual(calls, ["/World/Scenario/late_spawn"])
+
+    def test_tracked_object_stops_querying_after_despawn(self) -> None:
+        # A tracked path that disappears (despawn) must stop being queried
+        # after the next discovery refresh, and log the transition exactly
+        # once -- not every tick thereafter.
+        backend = self._tracked_backend(("/World/Scenario/gone_soon",))
+        backend._object_discovery_interval = 1
+        backend.control_hz = 4.0
+
+        present = {"/World/Scenario/gone_soon"}
+        overlay = _fake_omni_usd_and_pxr(present)
+        calls: list[str] = []
+        overlay["omni.physx"] = self._fake_physx_module(present, calls)
+
+        with patch.dict(sys.modules, overlay):
+            with contextlib.redirect_stdout(io.StringIO()):
+                backend._resolve_tracked_objects()
+                backend._log_tracked_objects()
+            self.assertEqual(calls, ["/World/Scenario/gone_soon"])
+
+            present.discard("/World/Scenario/gone_soon")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                backend._resolve_tracked_objects()
+                backend._log_tracked_objects()
+            lines = [
+                json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()
+            ]
+            missing = [line for line in lines if line.get("state") == "missing"]
+            self.assertEqual(len(missing), 1)
+            # No further PhysX query after the despawn is noticed.
+            self.assertEqual(calls, ["/World/Scenario/gone_soon"])
+
+            stdout2 = io.StringIO()
+            with contextlib.redirect_stdout(stdout2):
+                backend._resolve_tracked_objects()
+                backend._log_tracked_objects()
+            self.assertNotIn('"missing"', stdout2.getvalue())
+            self.assertEqual(calls, ["/World/Scenario/gone_soon"])
 
     def test_quaternion_xyzw_from_physx_maps_scalar_last(self) -> None:
         from tinker_sim_isaac.backend import IsaacWholeRobotBackend as _BE
