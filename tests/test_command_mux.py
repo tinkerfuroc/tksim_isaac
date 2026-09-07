@@ -356,6 +356,44 @@ class JointCommandMuxStopLoggingTest(unittest.TestCase):
         self.assertEqual(len(released), 1)
         self.assertIn("held=left:0.4000 right:-0.2000", released[0])
 
+    def test_release_without_a_prior_engage_is_a_silent_no_op(self) -> None:
+        """#33: stop(False) on a mux that was never engaged (safety_stop
+        already False) must not raise and must not log a "released" line --
+        there was nothing held to report releasing.
+        """
+        self.mux.stop(False)  # no prior stop(True)
+        self.assertFalse(self.mux.safety_stop)
+
+
+class JointCommandMuxStaleHoldClearedNoneToleranceTest(unittest.TestCase):
+    """#33: stale_hold_cleared must degrade to stale_for_s=n/a rather than
+    raising or fabricating a zero-length hold if the paired _stale_since
+    bookkeeping is ever missing when a fresh command arrives.
+    """
+
+    LOGGER_NAME = "tinker_sim_core.command_mux"
+
+    def test_missing_stale_since_degrades_to_n_a(self) -> None:
+        mux = JointCommandMux(
+            {"gripper": CommandSource(frozenset({"drive_joint"}), 0.5)}
+        )
+        mux.accept(
+            "gripper", JointCommand(("drive_joint",), positions=(0.83,)), 1.0
+        )
+        mux.observe_positions(("drive_joint",), (0.83,))
+        mux.compose(1.6)  # times out -> populates _stale_position_holds
+        # Simulate the bookkeeping gap this test exists to guard: the hold
+        # is present but its start time is not.
+        mux._stale_since.pop("gripper", None)
+
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            mux.accept(
+                "gripper", JointCommand(("drive_joint",), positions=(0.2,)), 3.0
+            )
+        cleared = [m for m in captured.output if "stale_hold_cleared" in m]
+        self.assertEqual(len(cleared), 1)
+        self.assertIn("stale_for_s=n/a", cleared[0])
+
 
 if __name__ == "__main__":
     unittest.main()

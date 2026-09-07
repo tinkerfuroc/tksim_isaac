@@ -119,6 +119,61 @@ def test_source_expiry_and_recovery_flip_publish_with_a_fake_clock() -> None:
         assert published[-1] == "safety_stop_published value=False reason=none"
 
 
+def test_first_heartbeat_ever_transition_does_not_raise() -> None:
+    """#33: a source that starts already-expired (requires_stop() True at
+    the very first _log_source_transitions call, before _source_stop_state
+    has any prior value for it) and then recovers on its first-ever sample
+    must not raise formatting an age from a tracker whose received_at was
+    still None moments earlier.
+    """
+    with patch("tinker_sim_bridge.safety_supervisor.time.monotonic", lambda: 0.0):
+        logger = _LogRecorder()
+        supervisor = _supervisor(logger)
+
+        # Before any sample, requires_stop() is True (received_at is None)
+        # and _source_stop_state has no prior entry: the transition guard
+        # must not crash formatting that unset state, and (by design) does
+        # not log a line since there is nothing to compare against yet.
+        supervisor._refresh_desired_stop()
+        assert [m for m in logger.info_lines if m.startswith("safety_source")] == []
+        assert supervisor._source_stop_state["collision"] is True
+
+        # The first-ever heartbeat now flips it: state=recovered, and the
+        # age is computed from a receive time that only just stopped being
+        # None -- this must render a real duration, not raise or print nan.
+        supervisor._source_trackers["collision"].update(False, 0.0)
+        supervisor._refresh_desired_stop()
+        recovered = [m for m in logger.info_lines if "recovered" in m]
+        assert recovered == [
+            "safety_source source=collision state=recovered age_s=0.000 deadline_s=1.000"
+        ]
+
+
+def test_transition_with_no_received_at_recorded_does_not_raise() -> None:
+    """#33 defensive path: _log_source_transitions must not raise even if a
+    tracker somehow flips to "expired" with received_at still None (e.g. a
+    future caller mutating tracker state directly, bypassing update()).
+    requires_stop() forces True whenever received_at is None, so this is the
+    only state ``current`` can take there -- but the age formatting must
+    still degrade rather than assume a start time exists.
+    """
+    with patch("tinker_sim_bridge.safety_supervisor.time.monotonic", lambda: 0.0):
+        logger = _LogRecorder()
+        supervisor = _supervisor(logger)
+        tracker = supervisor._source_trackers["collision"]
+
+        supervisor._source_stop_state["collision"] = False  # seed a "previous"
+        tracker.value = False
+        tracker.received_at = None  # deliberately decoupled from value
+
+        supervisor._log_source_transitions()
+
+        expired = [m for m in logger.info_lines if "expired" in m]
+        assert expired == [
+            "safety_source source=collision state=expired age_s=n/a deadline_s=1.000"
+        ]
+
+
 def test_unchanged_publish_is_not_logged_again() -> None:
     with patch("tinker_sim_bridge.safety_supervisor.time.monotonic", lambda: 5.0):
         logger = _LogRecorder()

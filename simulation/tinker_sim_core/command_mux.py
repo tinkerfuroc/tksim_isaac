@@ -6,6 +6,8 @@ import secrets
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from tinker_sim_core.observability import format_duration
+
 # The mux is a plain library (no ROS dependency), so it logs through the
 # standard `logging` module rather than an rclpy node logger. A consumer that
 # wants these lines in its own log (e.g. the command gateway node) attaches a
@@ -256,13 +258,21 @@ class JointCommandMux:
         was_stale = self._stale_position_holds.pop(source, None) is not None
         if was_stale:
             # Observability only: report how long the source was held before
-            # this fresh command replaced the hold.
-            stale_since = self._stale_since.pop(source, steady_time)
+            # this fresh command replaced the hold. ``_stale_since`` is set
+            # in lockstep with ``_stale_position_holds`` above, so it is
+            # normally present; the ``None`` default only guards a caller
+            # that reaches ``was_stale`` through some other path (e.g. a
+            # test double), so the line degrades to "n/a" instead of
+            # reporting a fabricated zero-length hold.
+            stale_since = self._stale_since.pop(source, None)
             self._stale_hold_last_logged.pop(source, None)
+            stale_for_s = (
+                None if stale_since is None else steady_time - stale_since
+            )
             logger.info(
-                "stale_hold_cleared source=%s stale_for_s=%.3f",
+                "stale_hold_cleared source=%s stale_for_s=%s",
                 source,
-                steady_time - stale_since,
+                format_duration(stale_for_s),
             )
         self._latest[source] = (steady_time, command)
 

@@ -117,6 +117,92 @@ def test_explicit_active_sample_logs_armed_reason_sample_without_gap() -> None:
         assert armed == ["safety_gate armed reason=sample"]
 
 
+def _boot_armed_gateway(logger: _LogRecorder) -> CommandGateway:
+    """A gateway double in the exact state __init__ leaves it in before any
+    /sim/hardware/safety_stop sample has ever arrived: armed, with no arm
+    time recorded (``_safety_armed_at`` exists and is ``None``, it is not
+    simply unset).
+    """
+    gateway = object.__new__(CommandGateway)
+    gateway._mux = JointCommandMux(
+        {"gripper": CommandSource(frozenset({"drive_joint"}), 0.5)}
+    )
+    gateway._rejected = {}
+    gateway._rejected_log_state = {}
+    gateway._safety_active = True
+    gateway._safety_armed_at = None
+    gateway._safety_timeout_s = 1.0
+    gateway._safety_last_sample_at = None
+    gateway._command_epoch = 0
+    gateway._snapshot_id = 0
+    gateway._last_published_commands = None
+    gateway.get_logger = lambda: logger
+    return gateway
+
+
+def test_boot_armed_first_sample_clears_without_a_prior_arm_time() -> None:
+    """Live crash reproduction: the gateway boots ARMED with armed_at=None
+    (see __init__). The bench crash was the first False sample on
+    /sim/hardware/safety_stop raising TypeError out of `now - armed_at`
+    inside `_safety_stop`, killing the node. This must instead clear the
+    gate, log one line with gap_s=n/a, and raise nothing.
+    """
+    with patch("tinker_sim_bridge.command_gateway.time.monotonic", lambda: 10.0):
+        logger = _LogRecorder()
+        gateway = _boot_armed_gateway(logger)
+
+        gateway._safety_stop(SimpleNamespace(data=False))
+
+        assert gateway._safety_active is False
+        cleared = [m for m in logger.info_lines if m.startswith("safety_gate cleared")]
+        assert cleared == ["safety_gate cleared reason=sample gap_s=n/a"]
+
+
+def test_boot_armed_then_armed_then_cleared_has_a_numeric_gap() -> None:
+    clock = {"t": 10.0}
+    with patch("tinker_sim_bridge.command_gateway.time.monotonic", lambda: clock["t"]):
+        logger = _LogRecorder()
+        gateway = _boot_armed_gateway(logger)
+
+        # The first sample clears the boot-armed gate (no crash, gap_s=n/a).
+        gateway._safety_stop(SimpleNamespace(data=False))
+        assert gateway._safety_active is False
+
+        # A True sample arms it again, with a real armed_at recorded.
+        clock["t"] += 0.3
+        gateway._safety_stop(SimpleNamespace(data=True))
+        assert gateway._safety_active is True
+        armed = [m for m in logger.info_lines if m.startswith("safety_gate armed")]
+        assert armed == ["safety_gate armed reason=sample"]
+
+        # A second False sample now has a real duration to report.
+        clock["t"] += 0.75
+        gateway._safety_stop(SimpleNamespace(data=False))
+        cleared = [m for m in logger.info_lines if m.startswith("safety_gate cleared")]
+        assert cleared == [
+            "safety_gate cleared reason=sample gap_s=n/a",
+            "safety_gate cleared reason=sample gap_s=0.750",
+        ]
+
+
+def test_timeout_rearm_with_no_prior_sample_ever_does_not_raise() -> None:
+    """A gateway that boots CLEAR (safety already discovered false once, but
+    then loses the heartbeat before this deadline check runs even once) must
+    still re-arm on timeout without a start time to compute a gap from.
+    """
+    with patch("tinker_sim_bridge.command_gateway.time.monotonic", lambda: 50.0):
+        logger = _LogRecorder()
+        gateway = _boot_armed_gateway(logger)
+        gateway._safety_active = False
+        gateway._safety_last_sample_at = None
+
+        gateway._enforce_safety_deadline()
+
+        assert gateway._safety_active is True
+        armed = [m for m in logger.info_lines if m.startswith("safety_gate armed")]
+        assert armed == ["safety_gate armed reason=timeout gap_s=n/a"]
+
+
 def test_command_rejected_rate_limit_reopens_after_the_window() -> None:
     clock = {"t": 0.0}
 

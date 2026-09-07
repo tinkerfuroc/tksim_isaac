@@ -11,6 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
 
+from tinker_sim_core.observability import format_duration
 from tinker_sim_core.safety_gating import effective_stop
 
 
@@ -156,17 +157,23 @@ class SafetySupervisor(Node):
             current = tracker.requires_stop(now)
             previous = self._source_stop_state.get(name)
             if previous is not None and previous != current:
+                # ``received_at`` is only ``None`` before this source's very
+                # first sample ever, which cannot itself flip requires_stop()
+                # from a prior state -- but the "recovered" transition after
+                # a heartbeat that landed while this tracker was still fresh
+                # from an even earlier sample degrades the same way, so this
+                # never assumes a start time exists.
                 age = (
                     now - tracker.received_at
                     if tracker.received_at is not None
-                    else float("nan")
+                    else None
                 )
                 self.get_logger().info(
-                    "safety_source source=%s state=%s age_s=%.3f deadline_s=%.3f"
+                    "safety_source source=%s state=%s age_s=%s deadline_s=%.3f"
                     % (
                         name,
                         "expired" if current else "recovered",
-                        age,
+                        format_duration(age),
                         tracker.deadline_s,
                     )
                 )

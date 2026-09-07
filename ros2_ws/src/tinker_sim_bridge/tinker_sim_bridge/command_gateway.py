@@ -23,6 +23,7 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
     new_command_session,
 )
+from tinker_sim_core.observability import format_duration
 
 # #33: the mux's stale-hold observability lines are plain logging.getLogger
 # records (it has no ROS handle of its own -- see command_mux.py). rclpy's
@@ -173,15 +174,29 @@ class CommandGateway(Node):
             clock=Clock(clock_type=ClockType.STEADY_TIME),
         )
 
+    # Distinguishes "this transition has no gap concept" (omit the field
+    # entirely -- the fresh-sample "armed" line) from "the gap is unknown
+    # because there was no prior start time" (render the field as "n/a" --
+    # a boot-armed gateway clearing on its first sample, or a timeout
+    # re-arm that has never seen a sample). ``None`` is a legitimate value
+    # for the latter, so it cannot double as the "omit" default.
+    _NO_GAP = object()
+
     def _log_safety_gate(
-        self, state: str, reason: str, gap_s: float | None = None
+        self, state: str, reason: str, gap_s: float | None = _NO_GAP
     ) -> None:
-        """Observability only (#33): announce every _safety_active transition."""
-        if gap_s is None:
+        """Observability only (#33): announce every _safety_active transition.
+
+        ``gap_s`` may be a finite duration, ``None`` (a start time was never
+        recorded -- logs as ``gap_s=n/a``), or omitted entirely (no gap
+        field at all). This must never raise: a log line is not allowed to
+        be the reason the gateway exits.
+        """
+        if gap_s is self._NO_GAP:
             self.get_logger().info(f"safety_gate {state} reason={reason}")
         else:
             self.get_logger().info(
-                f"safety_gate {state} reason={reason} gap_s={gap_s:.3f}"
+                f"safety_gate {state} reason={reason} gap_s={format_duration(gap_s)}"
             )
 
     def _log_command_rejected(self, source: str, reason: str) -> None:
@@ -307,8 +322,14 @@ class CommandGateway(Node):
             self._safety_armed_at = now
             self._log_safety_gate("armed", "sample")
         else:
-            armed_at = getattr(self, "_safety_armed_at", now)
-            self._log_safety_gate("cleared", "sample", now - armed_at)
+            # The gateway boots ARMED (see __init__) with no arm time
+            # recorded, so the very first sample can clear the gate before
+            # anything ever set ``_safety_armed_at``. ``getattr`` alone does
+            # not catch that: the attribute exists and is ``None``, not
+            # missing, so the default there never applies.
+            armed_at = getattr(self, "_safety_armed_at", None)
+            gap_s = None if armed_at is None else now - armed_at
+            self._log_safety_gate("cleared", "sample", gap_s)
         self._safety_active = active
         if hasattr(self, "_command_session_id"):
             self._advance_command_epoch()
@@ -333,7 +354,7 @@ class CommandGateway(Node):
         self._safety_active = True
         self._safety_armed_at = now
         self._log_safety_gate(
-            "armed", "timeout", now - last if last is not None else float("nan")
+            "armed", "timeout", now - last if last is not None else None
         )
         self._advance_command_epoch()
         self._mux.stop(True)
