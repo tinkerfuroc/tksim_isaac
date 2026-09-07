@@ -63,6 +63,7 @@ parser.add_argument("--mirror-mode", default="target",
 parser.add_argument("--max-lead", type=float, default=None, help="override backend._gripper_max_lead (0 disables the stall-gated lead clamp)")
 parser.add_argument("--stall-speed", type=float, default=None, help="override backend._gripper_stall_speed")
 parser.add_argument("--drive-effort-limit", type=float, default=None, help="raise the drive_joint effort ceiling (Nm) to sweep the clamp force; URDF default 50. The bench close is capped at this ceiling, so this is the only way to press past 50 Nm")
+parser.add_argument("--arm-stream-hz", type=float, default=0.0, help="inject synthetic JTC-style arm HOLD packets (names joint1..7, positions = the CURRENT measured arm joint angles, velocities = zeros, no gripper joints) into backend.command_joints() at this many packets per second of SIM time, immediately before each backend.step() call during phase B's close (and its --descend-from descent, if any). Mirrors the live stack's ordering: validation/run_sim.py's main loop calls gateway.spin_once() (which applies queued /isaac_joint_commands via backend.command_joints()) immediately before backend.step() every tick; this probe calls backend.step() directly with no ROS spin inside it, so injecting right before step() is the equivalent point. 0 = off (default; no extra joint traffic, rows unchanged apart from the new PhysX/Lab/Python target readback fields)")
 parser.add_argument("--follower-effort-limit", type=float, default=None, help="cap the effort ceiling (Nm) of the five gripper mimic/follower joints; backend default 180 (ImplicitActuatorCfg effort_limit_sim for gripper_mimic). #20: the follower cap (180) out-pushing the drive cap (50/--drive-effort-limit) is a suspect for the post-clamp ratchet, so this lets a trial pin the followers at or below the drive ceiling")
 parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
 parser.add_argument("--object-usda", default="")
@@ -118,6 +119,7 @@ sys.path.insert(0, str(ROOT))
 from tinker_sim_core.command_mux import JointCommand  # noqa: E402
 from tinker_sim_isaac.backend import IsaacWholeRobotBackend  # noqa: E402
 from validation.arm_joints_parse import parse_arm_joints_deg  # noqa: E402
+from validation.arm_stream_packet import build_arm_hold_packet  # noqa: E402
 
 OUT = Path(args.out)
 OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -243,6 +245,60 @@ mimic_ids = list(backend._gripper_mimic_indices)
 drive_id = backend._drive_joint_index
 GRIP_IDS = [JIDX[n] for n in GRIP]
 DT = backend.dt
+
+
+class ArmStreamInjector:
+    """--arm-stream-hz: inject synthetic JTC-style arm HOLD packets into
+    backend.command_joints() -- the same backend entry point the live
+    gateway's spin_once() calls for a queued /isaac_joint_commands message
+    (RosStandardGateway._joint_command builds a JointCommand from a
+    JointState via command_from_sequences and hands it straight to
+    backend.command_joints; see ros_gateway.py) -- at ``hz`` packets/sec of
+    SIM time. ``.tick()`` is called once per backend.step() call from the
+    phase-B close/descent loops, immediately before that step() -- mirroring
+    validation/run_sim.py's main loop, where gateway.spin_once() runs
+    directly before backend.step() every tick.
+
+    Fractional accumulation: per_tick = hz * dt is usually not an integer
+    (e.g. hz=200 at dt=1/120 -> 1.667/tick); the fractional remainder
+    carries across ticks so the long-run packet rate matches ``hz`` exactly
+    rather than rounding down every tick.
+    """
+
+    def __init__(self, hz: float, dt: float) -> None:
+        self.hz = float(hz)
+        self.per_tick = self.hz * dt
+        self._acc = 0.0
+        self.sent = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.hz > 0.0
+
+    def tick(self) -> None:
+        if not self.enabled:
+            return
+        self._acc += self.per_tick
+        n = int(self._acc)
+        self._acc -= n
+        for _ in range(n):
+            _, pos_now, _, _ = backend.joint_state()
+            positions = [float(pos_now[JIDX[j]]) for j in ARM]
+            names, hold_positions, velocities = build_arm_hold_packet(positions)
+            backend.command_joints(
+                JointCommand(names=names, positions=hold_positions, velocities=velocities)
+            )
+        self.sent += n
+
+
+ARM_STREAM = ArmStreamInjector(args.arm_stream_hz, DT)
+if ARM_STREAM.enabled:
+    emit(
+        event="arm_stream",
+        hz=ARM_STREAM.hz,
+        packets_per_tick=ARM_STREAM.per_tick,
+        names=list(ARM),
+    )
 
 
 def gains_snapshot() -> dict[str, object]:
@@ -491,6 +547,105 @@ def _read_physx_joint_forces(ids: list[int]) -> list[float]:
     except Exception as error:  # pragma: no cover - defensive, PhysX API surface
         print(json.dumps({"physx_joint_force_read_error": str(error)[:160]}), flush=True)
         return [float("nan")] * len(ids)
+
+
+def _read_physx_position_targets(ids: list[int]) -> list[float]:
+    """Read the PhysX-side per-DOF position target straight off the runtime
+    tensor view (root_view.get_dof_position_targets(), shape (num_instances,
+    num_dofs), env 0) -- what the implicit drive is actually tracking, one
+    layer below both Isaac Lab's data.joint_pos_target (the pre-write
+    Isaac Lab buffer -- see _read_lab_position_targets) and this backend's
+    own _position_targets (the Python-side JointCommand mirror
+    _apply_joint_command writes into). #33's physx_target/lab_target/
+    py_target row fields let a row show whether an --arm-stream-hz packet
+    actually displaced the drive at every layer, or stalled at one of them.
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    getter = getattr(root_view, "get_dof_position_targets", None) if root_view is not None else None
+    if getter is None:
+        return [float("nan")] * len(ids)
+    try:
+        arr = _as_numpy(getter())
+        return [float(arr[0, i]) for i in ids]
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({"physx_position_target_read_error": str(error)[:160]}), flush=True)
+        return [float("nan")] * len(ids)
+
+
+def _read_lab_position_targets(ids: list[int]) -> list[float | None]:
+    """Read Isaac Lab's data.joint_pos_target -- the buffer the fused
+    actuator step (_apply_actuator_model, see the docstring near line 570)
+    reads every step to compute the actuator model's control action -- for
+    the given DOF indices; None per index if the build's Articulation.data
+    does not expose the attribute (older Isaac Lab trees), rather than
+    raising.
+    """
+    data = backend._robot.data
+    val = getattr(data, "joint_pos_target", None)
+    if val is None:
+        return [None] * len(ids)
+    try:
+        arr = backend._torch_value(val)[0].detach().cpu().tolist()
+        return [float(arr[i]) for i in ids]
+    except Exception as error:  # pragma: no cover - defensive, Isaac Lab API surface
+        print(json.dumps({"lab_position_target_read_error": str(error)[:160]}), flush=True)
+        return [None] * len(ids)
+
+
+def _round_or_none(value: float | None, ndigits: int = 4) -> float | None:
+    return None if value is None else round(value, ndigits)
+
+
+def _read_physx_dof_param(getter_name: str, ids: list[int]) -> list[float]:
+    """Generic PhysX tensor-view per-DOF gain/limit readback -- root_view's
+    get_dof_stiffnesses / get_dof_dampings / get_dof_max_forces /
+    get_dof_max_velocities, shape (num_instances, num_dofs), env 0 -- for
+    the given DOF indices. Same soft-fail shape as the other PhysX readback
+    helpers in this file (nan per index, plus a one-line stderr-style event,
+    if the view or the named getter is missing on this build): a diagnostic
+    readback must never be the reason a --arm-stream-hz trial aborts.
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    getter = getattr(root_view, getter_name, None) if root_view is not None else None
+    if getter is None:
+        return [float("nan")] * len(ids)
+    try:
+        arr = _as_numpy(getter())
+        return [float(arr[0, i]) for i in ids]
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({f"{getter_name}_read_error": str(error)[:160]}), flush=True)
+        return [float("nan")] * len(ids)
+
+
+def _read_lab_actuator_gains(names: list[str]) -> tuple[dict[str, float | None], dict[str, float | None]]:
+    """Isaac Lab's own view of stiffness/damping for the given joint names --
+    ActuatorBase.stiffness/.damping tensors (isaaclab/actuators/actuator_base.py),
+    indexed by the owning actuator's LOCAL joint index -- same lookup
+    _patch_actuator_effort_limit_cache uses for effort_limit/effort_limit_sim.
+    None per name if no actuator owns it or the tensor read fails, rather
+    than raising: this is a readback for a human to eyeball against the
+    PhysX-side get_dof_stiffnesses/get_dof_dampings values (#33: whether
+    PhysX's drive parameters drift from Python's during a close under
+    --arm-stream-hz), not something the probe's control path depends on.
+    """
+    k_out: dict[str, float | None] = {n: None for n in names}
+    d_out: dict[str, float | None] = {n: None for n in names}
+    wanted = set(names)
+    for actuator in getattr(backend._robot, "actuators", {}).values():
+        joint_names = getattr(actuator, "joint_names", None)
+        if joint_names is None:
+            continue
+        for local_index, name in enumerate(joint_names):
+            if name not in wanted:
+                continue
+            for attr, out in (("stiffness", k_out), ("damping", d_out)):
+                tensor = getattr(actuator, attr, None)
+                if isinstance(tensor, torch.Tensor):
+                    try:
+                        out[name] = float(tensor[0, local_index])
+                    except (IndexError, ValueError):
+                        pass
+    return k_out, d_out
 
 
 def _write_physx_max_forces_direct(ids: list[int], limit: float) -> None:
@@ -988,9 +1143,11 @@ def descend(duration_s: float) -> dict[str, object]:
     for k in range(1, n + 1):
         a = k / n
         command_arm({j: stage_pose[j] + a * (arm_pose[j] - stage_pose[j]) for j in ARM})
+        ARM_STREAM.tick()
         backend.step()
         video_tick()
     for _ in range(int(1.0 / DT)):
+        ARM_STREAM.tick()
         backend.step()
         video_tick()
     tcp_now, _ = body_pose("link_tcp")
@@ -1033,6 +1190,8 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
     last: dict[str, object] = {}
     bottle_rows: list[dict[str, float]] = []
     for k in range(steps):
+        if tag == "B":
+            ARM_STREAM.tick()
         backend.step()
         t = k * DT
         g = read_gripper()
@@ -1066,6 +1225,24 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         else:
             stall_run = 0
         physx_taus = _read_physx_joint_forces(GRIP_IDS)
+        # #33 --arm-stream-hz readback: the drive target at every layer a
+        # command can stall at (PhysX's own drive, Isaac Lab's actuator-model
+        # input buffer, this backend's Python-side JointCommand mirror), plus
+        # the PhysX-side and Isaac-Lab-side gains (k/d/max_force/max_vel) --
+        # same set for left_finger_joint (a follower) so a row can show
+        # whether an injected hold packet (which only ever names arm joints)
+        # still perturbs the gripper's own targets/gains indirectly, or
+        # leaves them untouched, and whether PhysX's drive parameters drift
+        # from Python's during a close.
+        _lf_id = JIDX["left_finger_joint"]
+        _grip_target_ids = [drive_id, _lf_id]
+        _physx_targets = _read_physx_position_targets(_grip_target_ids)
+        _lab_targets = _read_lab_position_targets(_grip_target_ids)
+        _physx_k = _read_physx_dof_param("get_dof_stiffnesses", _grip_target_ids)
+        _physx_d = _read_physx_dof_param("get_dof_dampings", _grip_target_ids)
+        _physx_max_force = _read_physx_dof_param("get_dof_max_forces", _grip_target_ids)
+        _physx_max_vel = _read_physx_dof_param("get_dof_max_velocities", _grip_target_ids)
+        _lab_k, _lab_d = _read_lab_actuator_gains(["drive_joint", "left_finger_joint"])
         r = {
             "tag": tag, "k": k, "t": round(t, 4), "target": target, "drive": g["drive_joint"][0],
             "pad_pos": pad_pos, "pad_speed": pad_speed, "lag": lag, "lf": lf, "rf": rf,
@@ -1075,6 +1252,24 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
             # alongside the pre-existing tau/tau_drive (Isaac Lab's applied_torque,
             # the actuator model's commanded value) -- see _read_physx_joint_forces.
             "physx_tau": {n: round(v, 3) for n, v in zip(GRIP, physx_taus)},
+            "physx_target": round(_physx_targets[0], 4),
+            "py_target": round(float(backend._position_targets[0, drive_id]), 4),
+            "lab_target": _round_or_none(_lab_targets[0]),
+            "physx_k": round(_physx_k[0], 3),
+            "physx_d": round(_physx_d[0], 3),
+            "physx_max_force": round(_physx_max_force[0], 3),
+            "physx_max_vel": round(_physx_max_vel[0], 3),
+            "lab_k": _round_or_none(_lab_k["drive_joint"], 3),
+            "lab_d": _round_or_none(_lab_d["drive_joint"], 3),
+            "physx_target_left_finger": round(_physx_targets[1], 4),
+            "py_target_left_finger": round(float(backend._position_targets[0, _lf_id]), 4),
+            "lab_target_left_finger": _round_or_none(_lab_targets[1]),
+            "physx_k_left_finger": round(_physx_k[1], 3),
+            "physx_d_left_finger": round(_physx_d[1], 3),
+            "physx_max_force_left_finger": round(_physx_max_force[1], 3),
+            "physx_max_vel_left_finger": round(_physx_max_vel[1], 3),
+            "lab_k_left_finger": _round_or_none(_lab_k["left_finger_joint"], 3),
+            "lab_d_left_finger": _round_or_none(_lab_d["left_finger_joint"], 3),
             "pos": {n: round(g[n][0], 4) for n in FOLLOWERS},
         }
         if bottle_reader is not None:
