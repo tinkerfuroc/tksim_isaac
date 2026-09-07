@@ -18,6 +18,7 @@ from tinker_sim_core.command_mux import (
     decode_command_frame,
     decode_snapshot_packet,
 )
+from tinker_sim_isaac.backend import pose_in_frame
 from tinker_sim_isaac.camera_rig import (
     camera_info_fields,
     depth_to_16uc1_mm,
@@ -218,6 +219,8 @@ class RosStandardGateway:
         self.tcp_pose_pub = None
         self.tcp_pose_base_pub = None
         self.pad_points_pub = None
+        self.wrist_camera_pose_pub = None
+        self.wrist_camera_pose_base_pub = None
         if self._parity_tcp_enabled:
             self.tcp_pose_pub = self.node.create_publisher(
                 PoseStamped, "/sim/parity/tcp_pose", reliable
@@ -227,6 +230,21 @@ class RosStandardGateway:
             )
             self.pad_points_pub = self.node.create_publisher(
                 PolygonStamped, "/sim/parity/pad_points", reliable
+            )
+            # Task #36: same env gate as the TCP/pad parity above -- the
+            # grasp bench's ~15 mm constant base-x perception bias (two
+            # objects) is suspected to be a wrist-camera extrinsic mismatch,
+            # and this lets the bench diff the sim's ACTUAL rendered wrist
+            # colour optical-frame pose against the ROS TF
+            # xarm_camera_color_optical_frame/_aimed in one recording.
+            # Publishing itself is additionally fail-soft on self._camera_rig
+            # (None with cameras off, or a name/prim not yet resolved) --
+            # see publish().
+            self.wrist_camera_pose_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/wrist_camera_pose", reliable
+            )
+            self.wrist_camera_pose_base_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/wrist_camera_pose_base", reliable
             )
         self._camera_rig = camera_rig
         self.camera_skipped_frames = 0
@@ -1311,6 +1329,67 @@ class RosStandardGateway:
                     for (x, y, z) in parity_tcp["pad_points_base"]
                 ]
                 self.pad_points_pub.publish(pad_points)
+            # Task #36: same gate/cadence as the TCP parity block above.
+            # Fails soft: self._camera_rig is None with cameras off, and
+            # camera_optical_pose_world() returns None (logged once) until
+            # the wrist camera's render prim is resolved.
+            if self._camera_rig is not None:
+                wrist_camera_pose = self._camera_rig.camera_optical_pose_world(
+                    "wrist_camera"
+                )
+                if wrist_camera_pose is not None:
+                    position, quaternion_wxyz = wrist_camera_pose
+                    quaternion_xyzw = (
+                        quaternion_wxyz[1],
+                        quaternion_wxyz[2],
+                        quaternion_wxyz[3],
+                        quaternion_wxyz[0],
+                    )
+                    camera_pose = self._PoseStamped()
+                    camera_pose.header.stamp = stamp
+                    camera_pose.header.frame_id = "world"
+                    (
+                        camera_pose.pose.position.x,
+                        camera_pose.pose.position.y,
+                        camera_pose.pose.position.z,
+                    ) = position
+                    (
+                        camera_pose.pose.orientation.x,
+                        camera_pose.pose.orientation.y,
+                        camera_pose.pose.orientation.z,
+                        camera_pose.pose.orientation.w,
+                    ) = quaternion_xyzw
+                    self.wrist_camera_pose_pub.publish(camera_pose)
+
+                    root = self.backend.root_state()
+                    root_quaternion_wxyz = root["quaternion_wxyz"]
+                    root_quaternion_xyzw = (
+                        root_quaternion_wxyz[1],
+                        root_quaternion_wxyz[2],
+                        root_quaternion_wxyz[3],
+                        root_quaternion_wxyz[0],
+                    )
+                    position_base, quaternion_base = pose_in_frame(
+                        root["position"],
+                        root_quaternion_xyzw,
+                        position,
+                        quaternion_xyzw,
+                    )
+                    camera_pose_base = self._PoseStamped()
+                    camera_pose_base.header.stamp = stamp
+                    camera_pose_base.header.frame_id = "base_link"
+                    (
+                        camera_pose_base.pose.position.x,
+                        camera_pose_base.pose.position.y,
+                        camera_pose_base.pose.position.z,
+                    ) = position_base
+                    (
+                        camera_pose_base.pose.orientation.x,
+                        camera_pose_base.pose.orientation.y,
+                        camera_pose_base.pose.orientation.z,
+                        camera_pose_base.pose.orientation.w,
+                    ) = quaternion_base
+                    self.wrist_camera_pose_base_pub.publish(camera_pose_base)
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {

@@ -127,6 +127,54 @@ def _rotate_by_quaternion(
     )
 
 
+def _quaternion_multiply_wxyz(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Hamilton product ``a (x) b``, both scalar-first (w, x, y, z) -- this
+    module's own quaternion convention (``mount_rotation_wxyz`` etc), unlike
+    ``backend._quaternion_multiply_xyzw``'s scalar-last one."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def usd_camera_pose_to_ros_optical(
+    position: tuple[float, float, float],
+    quaternion_wxyz: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Convert a rendered USD camera's world pose to the ROS optical frame.
+
+    Task #36 (grasp bench, constant ~15 mm base-x perception bias, two
+    objects, suspected wrist-camera extrinsic): the bench needs the sim's
+    ACTUAL rendered wrist-camera pose, expressed in the ROS optical
+    convention (+Z forward, +Y down), to diff against the ROS TF frames
+    ``xarm_camera_color_optical_frame``/``_aimed`` in one recording.
+
+    *position*/*quaternion_wxyz* are the render camera prim's own
+    ``ComputeLocalToWorldTransform`` (the exact transform the renderer
+    reads) -- native USD camera convention, looks down -Z with +Y up. This
+    is a pure relabelling of that SAME prim's axes about its OWN current
+    local X, not a re-derivation of the un-corrected mount frame: it stays
+    correct even when a ``TINKER_SIM_WRIST_CAMERA_AIM`` preset
+    (tool-forward/cam-stand) has rotated the render camera away from the
+    raw URDF chain, because whatever the prim actually renders from is what
+    gets relabelled.
+
+    Composes ``quaternion_wxyz (x) OPTICAL_TO_USD_CAMERA_WXYZ`` -- a
+    Hamilton product with the flip on the RIGHT, i.e. applied about the
+    camera's own current local X (not a fixed world axis); the same
+    constant used the other way in ``initialize()`` to place the render
+    camera into the optical mount's convention converts back just as well,
+    since a 180 deg rotation is its own inverse.
+    """
+    return position, _quaternion_multiply_wxyz(quaternion_wxyz, OPTICAL_TO_USD_CAMERA_WXYZ)
+
+
 def camera_xform_ops(
     spec: CameraStreamSpec,
 ) -> tuple[tuple[str, tuple[float, ...]], ...]:
@@ -582,6 +630,17 @@ class CameraRig:
             raise ValueError("camera rig requires at least one camera spec")
         self.specs = tuple(specs)
         self._sensors: dict[str, Any] = {}
+        #: Task #36: each spec's actual render-camera prim path (set by
+        #: ``initialize()``), so ``camera_optical_pose_world()`` can read the
+        #: SAME prim's live ``ComputeLocalToWorldTransform`` the renderer
+        #: itself uses -- no separate mount-prim search or duplicated
+        #: correction-preset logic.
+        self._camera_prim_paths: dict[str, str] = {}
+        #: Camera names ``camera_optical_pose_world()`` has already logged an
+        #: "unresolved prim" diagnostic for, so it fires once per backend
+        #: life rather than once per publish tick (matches
+        #: ``IsaacWholeRobotBackend._parity_tcp_bodies_missing_logged``).
+        self._optical_pose_missing_logged: set[str] = set()
         #: Per-camera (rgb, depth) pinned host wp.array buffers, sized to the
         #: exact post-conversion shape (depth is post metres->16UC1-mm, done
         #: on the GPU; see ``capture()``). Reused every ``capture()`` call so
@@ -745,6 +804,7 @@ class CameraRig:
                     )
                 mount_path = mounts[0].GetPath().pathString
             camera_path = f"{mount_path}/rtx_camera"
+            self._camera_prim_paths[spec.name] = camera_path
             camera = RtxCamera(camera_path, tick_rate=float(spec.tick_rate_hz))
             prim = stage.GetPrimAtPath(camera_path)
             usd_camera = UsdGeom.Camera(prim)
@@ -958,3 +1018,69 @@ class CameraRig:
         if sync_device is not None:
             wp.synchronize_stream(sync_device)
         return frames
+
+    def camera_optical_pose_world(
+        self, name: str
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """World pose of *name*'s render camera, in the ROS optical convention.
+
+        Task #36 diagnostic: lets the grasp bench diff the sim's ACTUAL
+        rendered wrist-camera pose against the ROS TF
+        ``xarm_camera_color_optical_frame``/``_aimed`` in one recording, in
+        the debugging of a constant ~15 mm base-x perception bias. Reads the
+        SAME ``rtx_camera`` prim's live ``ComputeLocalToWorldTransform`` the
+        renderer itself uses (not the mount prim, and not a recomputation
+        from the spec's static ``mount_rotation_wxyz`` -- this is the actual
+        current pose, including whatever the arm's forward kinematics and
+        any ``TINKER_SIM_WRIST_CAMERA_AIM`` preset put it at this tick), then
+        converts via ``usd_camera_pose_to_ros_optical``.
+
+        Fails soft: returns ``None`` (logged once per camera name) if
+        ``initialize()`` has not run for *name* or its prim is no longer
+        valid -- callers should skip publishing that tick, not raise.
+        """
+        path = self._camera_prim_paths.get(name)
+        if path is None:
+            if name not in self._optical_pose_missing_logged:
+                self._optical_pose_missing_logged.add(name)
+                print(
+                    json.dumps(
+                        {"event": "camera_optical_pose_unresolved", "camera": name},
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+        import omni.usd
+        from pxr import Usd, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            if name not in self._optical_pose_missing_logged:
+                self._optical_pose_missing_logged.add(name)
+                print(
+                    json.dumps(
+                        {
+                            "event": "camera_optical_pose_unresolved",
+                            "camera": name,
+                            "prim_path": path,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+        matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+        translation = matrix.ExtractTranslation()
+        rotation = matrix.ExtractRotationQuat().GetNormalized()
+        position = (float(translation[0]), float(translation[1]), float(translation[2]))
+        render_quaternion_wxyz = (
+            float(rotation.GetReal()),
+            float(rotation.GetImaginary()[0]),
+            float(rotation.GetImaginary()[1]),
+            float(rotation.GetImaginary()[2]),
+        )
+        return usd_camera_pose_to_ros_optical(position, render_quaternion_wxyz)

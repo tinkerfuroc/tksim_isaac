@@ -21,6 +21,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 sys.path.insert(0, str(ROOT / "validation"))
+CAMERA_CONTRACT = ROOT / "simulation/sensors/hardware-parity.json"
 
 from tinker_sim_core.command_mux import (
     JointCommand,
@@ -42,6 +43,12 @@ from tinker_sim_isaac.backend import (
     resolve_spawn_yaw_via_view,
     resolve_use_fabric,
     spawn_root_rot_xyzw,
+)
+from tinker_sim_isaac.camera_rig import (
+    CameraRig,
+    _rotate_by_quaternion,
+    load_camera_specs,
+    usd_camera_pose_to_ros_optical,
 )
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
@@ -1981,6 +1988,338 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(
             sorted(payload["missing"]), ["left_finger", "right_finger"]
         )
+
+    def test_usd_camera_pose_to_ros_optical_identity_looks_down_world_minus_z(
+        self,
+    ) -> None:
+        """Task #36 worked example: a USD camera at the origin with no local
+        rotation looks down -Z with +Y up (native convention). Converting to
+        ROS optical must publish a frame whose +Z (forward) points along
+        world -Z and whose +Y (down) points along world -Y."""
+        position, quaternion_wxyz = usd_camera_pose_to_ros_optical(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)
+        )
+        self.assertEqual(position, (0.0, 0.0, 0.0))
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        for actual, expected in zip(forward, (0.0, 0.0, -1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(down, (0.0, -1.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_usd_camera_pose_to_ros_optical_composes_about_the_cameras_own_axis(
+        self,
+    ) -> None:
+        """A camera yawed 90 deg about world Z: the flip must compose about
+        the camera's OWN current local X (Hamilton product on the RIGHT),
+        landing optical 'down' at world +X here -- a left-multiply ordering
+        bug would instead land it at world -X. (The forward axis alone does
+        not discriminate the two orders: it sits on the yaw's own rotation
+        axis either way, unchanged by the bug.)"""
+        half = math.pi / 4.0
+        yaw90_wxyz = (math.cos(half), 0.0, 0.0, math.sin(half))
+        _position, quaternion_wxyz = usd_camera_pose_to_ros_optical(
+            (0.0, 0.0, 0.0), yaw90_wxyz
+        )
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        for actual, expected in zip(down, (1.0, 0.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(forward, (0.0, 0.0, -1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_camera_optical_pose_world_fails_soft_and_logs_once_before_initialize(
+        self,
+    ) -> None:
+        """Task #36: camera_optical_pose_world() must not raise if
+        initialize() has not run for the named camera (no Kit/pxr yet) --
+        log once and let the gateway skip publishing that tick, the same
+        fail-soft contract as parity_tcp_frame()."""
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            first = rig.camera_optical_pose_world("wrist_camera")
+            second = rig.camera_optical_pose_world("wrist_camera")
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the unresolved-camera diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "camera_optical_pose_unresolved")
+        self.assertEqual(payload["camera"], "wrist_camera")
+
+    def test_gateway_registers_wrist_camera_pose_publishers_gated_by_env(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'PoseStamped, "/sim/parity/wrist_camera_pose", reliable', source
+        )
+        self.assertIn(
+            'PoseStamped, "/sim/parity/wrist_camera_pose_base", reliable', source
+        )
+        self.assertIn('camera_pose.header.frame_id = "world"', source)
+        self.assertIn('camera_pose_base.header.frame_id = "base_link"', source)
+        # Same env gate as the rest of #35/#36's parity block -- no separate
+        # flag for the camera topics.
+        self.assertIn(
+            'os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"', source
+        )
+
+    def test_wrist_camera_pose_publishers_emit_world_and_base_every_tick(self) -> None:
+        """Task #36 end to end through the gateway: the wrist camera's world
+        pose (as CameraRig.camera_optical_pose_world reports it) and its
+        base_link-relative pose (via the same pose_in_frame() the #35 TCP
+        parity block reuses), published every publish() tick alongside the
+        TCP topics."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import Point32, PolygonStamped, PoseStamped, WrenchStamped
+
+        class _ParityCameraBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                # Root yawed 180 deg about Z, at (1, 2, 0.5) -- a non-trivial
+                # frame so the base_link transform actually exercises
+                # pose_in_frame's rotation, not just a translation.
+                return {
+                    "position": (1.0, 2.0, 0.5),
+                    "quaternion_wxyz": (0.0, 0.0, 0.0, 1.0),
+                    "angular_velocity_world": (0.0, 0.0, 0.0),
+                }
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None  # keep this test focused on the camera block
+
+        class _FakeWristCameraRig:
+            def __init__(self, pose) -> None:
+                self._pose = pose
+                self.calls = 0
+
+            def camera_optical_pose_world(self, name):
+                self.calls += 1
+                assert name == "wrist_camera"
+                return self._pose
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _ParityCameraBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway._PoseStamped = PoseStamped
+        gateway._PolygonStamped = PolygonStamped
+        gateway._Point32 = Point32
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway.tcp_pose_pub = _RecordingPublisher()
+        gateway.tcp_pose_base_pub = _RecordingPublisher()
+        gateway.pad_points_pub = _RecordingPublisher()
+        gateway.wrist_camera_pose_pub = _RecordingPublisher()
+        gateway.wrist_camera_pose_base_pub = _RecordingPublisher()
+        gateway._parity_tcp_enabled = True
+        # Camera at (2, 2, 0.5) with an identity optical orientation in
+        # world -- one metre along the root's own +X, at the same height.
+        camera_rig = _FakeWristCameraRig(((2.0, 2.0, 0.5), (1.0, 0.0, 0.0, 0.0)))
+        gateway._camera_rig = camera_rig
+        gateway.camera_skipped_frames = 0
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(camera_rig.calls, 3)
+        self.assertEqual(len(gateway.wrist_camera_pose_pub.messages), 3)
+        self.assertEqual(len(gateway.wrist_camera_pose_base_pub.messages), 3)
+
+        world_pose = gateway.wrist_camera_pose_pub.messages[0]
+        self.assertEqual(world_pose.header.frame_id, "world")
+        for actual, expected in zip(
+            (world_pose.pose.position.x, world_pose.pose.position.y, world_pose.pose.position.z),
+            (2.0, 2.0, 0.5),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(
+            (
+                world_pose.pose.orientation.x,
+                world_pose.pose.orientation.y,
+                world_pose.pose.orientation.z,
+                world_pose.pose.orientation.w,
+            ),
+            (0.0, 0.0, 0.0, 1.0),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+        # Hand-derived via backend.pose_in_frame: relative = (1, 0, 0) in
+        # world, rotated by the 180-deg-about-Z root's inverse -> (-1, 0, 0);
+        # the orientation likewise composes to another 180-about-Z, (0, 0,
+        # -1, 0) scalar-last.
+        base_pose = gateway.wrist_camera_pose_base_pub.messages[0]
+        self.assertEqual(base_pose.header.frame_id, "base_link")
+        for actual, expected in zip(
+            (base_pose.pose.position.x, base_pose.pose.position.y, base_pose.pose.position.z),
+            (-1.0, 0.0, 0.0),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(
+            (
+                base_pose.pose.orientation.x,
+                base_pose.pose.orientation.y,
+                base_pose.pose.orientation.z,
+                base_pose.pose.orientation.w,
+            ),
+            (0.0, 0.0, -1.0, 0.0),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_wrist_camera_pose_publishers_skip_when_env_disabled_or_camera_unresolved(
+        self,
+    ) -> None:
+        """TINKER_SIM_PARITY_TCP=0 must fully disable the camera topics too
+        (no camera_optical_pose_world() calls at all); a resolvable-but-
+        currently-unresolved camera rig (fail-soft, returns None) must skip
+        publishing without raising."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        class _NoOpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {
+                    "position": (0.0, 0.0, 0.0),
+                    "quaternion_wxyz": (1.0, 0.0, 0.0, 0.0),
+                    "angular_velocity_world": (0.0, 0.0, 0.0),
+                }
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+        class _UnresolvedCameraRig:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def camera_optical_pose_world(self, name):
+                self.calls += 1
+                return None  # unresolved this tick
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        def _new_gateway(*, parity_tcp_enabled: bool, camera_rig) -> RosStandardGateway:
+            gateway = object.__new__(RosStandardGateway)
+            gateway.backend = _NoOpBackend()
+            gateway._Clock = Clock
+            gateway._JointState = JointState
+            gateway._Imu = Imu
+            gateway._String = String
+            gateway._WrenchStamped = WrenchStamped
+            gateway._PoseStamped = PoseStamped
+            gateway._PolygonStamped = PolygonStamped
+            gateway.clock_pub = _RecordingPublisher()
+            gateway.joint_pub = _RecordingPublisher()
+            gateway.imu_pub = _RecordingPublisher()
+            gateway.status_pub = _RecordingPublisher()
+            gateway.contact_pub = _RecordingPublisher()
+            gateway.physics_truth_pub = _RecordingPublisher()
+            gateway.cloud_pub = _RecordingPublisher()
+            gateway.tcp_pose_pub = _RecordingPublisher()
+            gateway.tcp_pose_base_pub = _RecordingPublisher()
+            gateway.pad_points_pub = _RecordingPublisher()
+            gateway.wrist_camera_pose_pub = _RecordingPublisher()
+            gateway.wrist_camera_pose_base_pub = _RecordingPublisher()
+            gateway._parity_tcp_enabled = parity_tcp_enabled
+            gateway._camera_rig = camera_rig
+            gateway.camera_skipped_frames = 0
+            gateway._cloud_publish_enabled = lambda: False
+            gateway._last_command_error = None
+            gateway._command_stream_lost = False
+            gateway._command_epoch = 0
+            gateway._last_logical_snapshot_id = -1
+            gateway.development_lidar = False
+            gateway._publish_profile_enabled = False
+            gateway._state_stride = 1_000_000
+            gateway._imu_stride = 1_000_000
+            gateway._status_stride = 1_000_000
+            gateway._tick = 0
+            return gateway
+
+        disabled_rig = _UnresolvedCameraRig()
+        disabled_gateway = _new_gateway(parity_tcp_enabled=False, camera_rig=disabled_rig)
+        disabled_gateway.publish()
+        self.assertEqual(len(disabled_gateway.wrist_camera_pose_pub.messages), 0)
+        self.assertEqual(len(disabled_gateway.wrist_camera_pose_base_pub.messages), 0)
+        self.assertEqual(disabled_rig.calls, 0)
+
+        unresolved_rig = _UnresolvedCameraRig()
+        unresolved_gateway = _new_gateway(parity_tcp_enabled=True, camera_rig=unresolved_rig)
+        unresolved_gateway.publish()
+        self.assertEqual(len(unresolved_gateway.wrist_camera_pose_pub.messages), 0)
+        self.assertEqual(len(unresolved_gateway.wrist_camera_pose_base_pub.messages), 0)
+        self.assertEqual(unresolved_rig.calls, 1)
+
+        no_camera_gateway = _new_gateway(parity_tcp_enabled=True, camera_rig=None)
+        no_camera_gateway.publish()  # must not raise with no camera rig at all
+        self.assertEqual(len(no_camera_gateway.wrist_camera_pose_pub.messages), 0)
 
     def test_command_target_truth_exposes_active_physx_targets(self) -> None:
         backend = _backend()

@@ -87,6 +87,75 @@ failed. No GPU boot for this diagnostic-only change; a bench recording
 against the live TF `link_tcp` is the follow-up that actually answers the
 29-30 mm question this publisher exists for.
 
+### Task #36 addendum — wrist colour camera optical-frame parity publisher
+
+**Purpose.** The grasp bench sees a constant ~15 mm perception bias along
+base X on two different objects and suspects the wrist camera extrinsic.
+Same idea as #35's TCP/pad topics, same env gate (`TINKER_SIM_PARITY_TCP`),
+same unconditional every-`publish()`-tick cadence: publish the sim's
+ACTUAL rendered wrist colour camera pose so the bench can diff it against
+the ROS TF frames `xarm_camera_color_optical_frame`/`_aimed` in one
+recording.
+
+- `/sim/parity/wrist_camera_pose` (`PoseStamped`, frame `world`): the wrist
+  colour camera's ROS OPTICAL frame (x right, y down, z forward) pose in
+  world.
+- `/sim/parity/wrist_camera_pose_base` (`PoseStamped`, frame `base_link`):
+  the same pose expressed in the robot root frame, via `backend.py`'s
+  existing `pose_in_frame()` (reused as-is, no new backend method).
+
+**Read path and convention.** `camera_rig.py` gains
+`CameraRig.camera_optical_pose_world(name)`: it looks up the SAME
+`rtx_camera` prim path `initialize()` created for that spec (cached in
+`self._camera_prim_paths`, set at `camera_path = f"{mount_path}/rtx_camera"`
+-- no separate mount-prim search or re-derivation of the un-corrected mount
+frame), reads its live `UsdGeom.Xformable(prim).ComputeLocalToWorldTransform`
+(the exact transform the renderer itself uses, at whatever pose the arm's
+forward kinematics and any `TINKER_SIM_WRIST_CAMERA_AIM` preset put it at
+this tick), and converts native USD camera convention (looks down -Z, +Y
+up) to ROS optical (+Z forward, +Y down) via the new pure function
+`usd_camera_pose_to_ros_optical()`. That conversion is exactly
+`quaternion_wxyz (x) OPTICAL_TO_USD_CAMERA_WXYZ` -- the SAME module
+constant `initialize()` already uses to go optical->usd for the `orient`
+xform op (the current, Task #15-fixed value, `(0, 1, 0, 0)`, 180 deg about
+X; the nearby code comment describing a `(0, 0, 1, 0)` "y-flip variant" for
+this artifact is pre-#15/stale and was NOT used here), composed on the
+RIGHT (Hamilton product) so the flip is about the camera's OWN current
+local X, not a fixed world axis -- verified by a 90 deg-world-Z-yaw test
+that a left-multiply ordering bug would fail (forward alone does not
+discriminate the two orders, since it sits on the yaw's own rotation axis
+either way; only a cross-axis vector like optical "down" does). Fails
+soft, matching `parity_tcp_frame()`: if `initialize()` has not resolved
+that camera's prim (or the prim later becomes invalid), it logs
+`{"event": "camera_optical_pose_unresolved", "camera": ...}` once (a
+`_optical_pose_missing_logged` latch) and returns `None`; the gateway skips
+publishing that tick.
+
+`ros_gateway.py`'s `publish()` reuses `pose_in_frame()` directly (imported
+from `backend.py`) with `self.backend.root_state()`'s position/
+`quaternion_wxyz` (converted to xyzw by reordering) as the frame -- no new
+backend method needed, since a camera pose is not a backend/articulation
+concept the way TCP/pad points are.
+
+**Tests** (`tests/test_manipulation_runtime.py`): the pure
+`usd_camera_pose_to_ros_optical()` conversion at identity (camera at the
+origin looking down world -Z with +Y up must publish optical +Z along
+world -Z and +Y along world -Y) and under a 90 deg world-Z yaw (the
+order-discriminating case above); `CameraRig.camera_optical_pose_world()`'s
+fail-soft/log-once contract before `initialize()` has run (no Kit/pxr
+needed for this path); the gateway's publisher registration/topic/
+frame_id/env-gate source strings; a `publish()` runtime test with a fake
+camera rig and a non-trivial (180 deg-about-Z) root pose, asserting both
+topics fire every tick with hand-derived-via-`pose_in_frame` world and
+base_link values; and the disabled/unresolved/no-camera-rig skip contract
+(no publish calls, no raise). Full suite: `tests/test_manipulation_runtime.py`
+149 passed, 5 subtests passed, 0 failed (143 passed before this task's 6
+new tests); `tests/test_camera_rig.py` and the other camera test files
+unaffected (119 passed, 1 subtests passed). No GPU boot for this
+diagnostic-only change; the bench recording against the live TF frames is
+the follow-up that actually answers the 15 mm bias question this publisher
+exists for.
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping
