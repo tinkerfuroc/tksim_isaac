@@ -2476,7 +2476,19 @@ class ManipulationRuntimeTest(unittest.TestCase):
         actually carries ``UsdPhysics.RigidBodyAPI`` at resolve time may be
         resolved; a real in-memory USD stage (this venv's bare ``pxr`` has
         no ``PhysicsSchemaTools``, so that one call is faked) proves both
-        directions: resolved with the API applied, omitted without it."""
+        directions: resolved with the API applied, omitted without it.
+
+        Round 3 fix: the "omitted" half must ALSO patch
+        ``pxr.PhysicsSchemaTools`` (the method imports it unconditionally,
+        before the ``HasAPI`` check) -- without that patch this venv's real
+        ``pxr`` lacking ``PhysicsSchemaTools`` raises ``ImportError``
+        first, and the method's outer ``except Exception: return None``
+        masks that as a "None" that looks like the HasAPI gate fired but
+        actually never ran (the reviewer proved the old test still passed
+        with the gate deleted). Tracking whether the fake ``sdfPathToInt``
+        was actually CALLED distinguishes the two: the resolved branch must
+        call it once, the omitted branch must never reach it.
+        """
         from pxr import Usd, UsdPhysics
 
         backend = _backend()
@@ -2491,7 +2503,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         fake_usd = ModuleType("omni.usd")
         fake_usd.get_context = lambda: fake_context
-        fake_schema_tools = SimpleNamespace(sdfPathToInt=lambda path: 987)
+        resolved_sdf_calls: list[object] = []
+        fake_schema_tools = SimpleNamespace(
+            sdfPathToInt=lambda path: resolved_sdf_calls.append(path) or 987
+        )
 
         with patch.dict(sys.modules, {"omni.usd": fake_usd}):
             with patch("omni.usd", fake_usd, create=True):
@@ -2499,9 +2514,13 @@ class ManipulationRuntimeTest(unittest.TestCase):
                     resolved = backend._resolve_articulation_sleep_ids()
 
         self.assertEqual(resolved, (12345, 987))
+        self.assertEqual(len(resolved_sdf_calls), 1)
 
-        # Without RigidBodyAPI on base_link, the same stage/context must
-        # omit (return None) instead of resolving a bad prim id.
+        # Without RigidBodyAPI on base_link, the same stage/context (and the
+        # SAME PhysicsSchemaTools patch, so an ImportError can't masquerade
+        # as the HasAPI gate) must omit (return None) WITHOUT ever calling
+        # sdfPathToInt -- proving the gate itself, not an import failure,
+        # is what produced the None.
         bare_stage = Usd.Stage.CreateInMemory()
         bare_stage.DefinePrim("/World/Tinker", "Xform")
         bare_stage.DefinePrim("/World/Tinker/base_link", "Xform")  # no API
@@ -2510,12 +2529,18 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         fake_usd2 = ModuleType("omni.usd")
         fake_usd2.get_context = lambda: fake_context2
+        omitted_sdf_calls: list[object] = []
+        fake_schema_tools2 = SimpleNamespace(
+            sdfPathToInt=lambda path: omitted_sdf_calls.append(path) or 987
+        )
 
         with patch.dict(sys.modules, {"omni.usd": fake_usd2}):
             with patch("omni.usd", fake_usd2, create=True):
-                omitted = backend._resolve_articulation_sleep_ids()
+                with patch("pxr.PhysicsSchemaTools", fake_schema_tools2, create=True):
+                    omitted = backend._resolve_articulation_sleep_ids()
 
         self.assertIsNone(omitted)
+        self.assertEqual(len(omitted_sdf_calls), 0)
 
     def test_articulation_is_sleeping_self_check_disables_on_non_bool_return(
         self,
