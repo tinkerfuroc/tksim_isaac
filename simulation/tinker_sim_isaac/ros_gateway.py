@@ -308,6 +308,16 @@ class RosStandardGateway:
         self._spin_profile = {
             "events": 0, "commands": 0, "safety": 0, "command_joints_s": 0.0, "n": 0,
         }
+        # Task #39: isaacsim.ros2.sim_control's services (/spawn_entity et
+        # al) can be advertised well before the caller can actually pump Kit
+        # regularly enough to serve them (backend/camera warm-up). False here
+        # and flipped by mark_services_ready() at the one point run_sim.py's
+        # main() knows that warm-up is over and its main loop is about to
+        # start -- see validation/run_sim.py's _enable_sim_control_services.
+        # A client should treat this as the readiness gate ahead of any
+        # /spawn_entity-family call, not wait_for_service() alone.
+        self._services_ready = False
+        self._services_ready_since: float | None = None
 
     def _spin_executor(self) -> None:
         from rclpy.executors import ExternalShutdownException
@@ -1210,6 +1220,18 @@ class RosStandardGateway:
                 "last_command_error": self._last_command_error,
                 "development_lidar": self.development_lidar,
                 "safety_stop": bool(self.backend.safety_stopped),
+                # Task #39: whether isaacsim.ros2.sim_control's services
+                # (/spawn_entity et al) are being advertised at a point where
+                # they can actually be served promptly -- see
+                # mark_services_ready(). Clients (e.g. tools/gpsr_spawn.py)
+                # should gate their first call on this, not just
+                # wait_for_service(), which returns true far earlier.
+                # getattr(..., default) rather than a direct attribute read:
+                # test doubles built via object.__new__(RosStandardGateway)
+                # (skipping __init__) exercise this publish() path without
+                # ever going through the constructor that sets these.
+                "services_ready": getattr(self, "_services_ready", False),
+                "services_ready_since": getattr(self, "_services_ready_since", None),
             }
             if self._camera_rig is not None:
                 status["camera_skipped_frames"] = self.camera_skipped_frames
@@ -1396,6 +1418,21 @@ class RosStandardGateway:
             # once shutdown began, but a live-context failure is real.
             if self.node.context.ok():
                 raise
+
+    def mark_services_ready(self) -> None:
+        """Record that isaacsim.ros2.sim_control's services are being
+        advertised at a point where the main loop is about to start pumping
+        Kit regularly -- i.e. requests can now actually be served promptly.
+
+        Called exactly once, by ``run_sim.py``'s ``_enable_sim_control_services``
+        (Task #39), right where the boot-config JSON prints today. Idempotent
+        and safe to call more than once; the timestamp is only recorded on
+        the first call.
+        """
+        if self._services_ready:
+            return
+        self._services_ready = True
+        self._services_ready_since = self.backend.simulation_time
 
     def _cloud_publish_enabled(self) -> bool:
         """Whether the development lidar cloud should publish on this tick.

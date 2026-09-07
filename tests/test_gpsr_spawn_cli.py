@@ -19,6 +19,7 @@ from tools.gpsr_spawn import (  # noqa: E402
     emit_scenario,
     main,
 )
+from tools.gpsr_spawn import _wait_for_services_ready  # noqa: E402
 
 PLACEMENTS = json.loads((ROOT / "simulation" / "scenarios" / "rcw2026-placements.json").read_text())
 BASE_SCENARIO = json.loads((ROOT / "simulation" / "scenarios" / "gpsr-rcw2026-bench.json").read_text())
@@ -622,3 +623,171 @@ def test_cli_runs_as_a_standalone_script_with_no_pythonpath(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert out.is_file()
+
+
+class _FakeStatusMessage:
+    def __init__(self, data: str) -> None:
+        self.data = data
+
+
+class _FakeStatusNode:
+    """Minimal stand-in for the rclpy Node `_wait_for_services_ready` needs:
+    `create_subscription` captures the callback, `destroy_subscription` just
+    records it happened."""
+
+    def __init__(self) -> None:
+        self._callback = None
+        self.destroyed_subscriptions = []
+
+    def create_subscription(self, msg_type, topic, callback, depth):
+        assert topic == "/sim/status/isaac"
+        self._callback = callback
+        return object()
+
+    def destroy_subscription(self, subscription) -> None:
+        self.destroyed_subscriptions.append(subscription)
+
+    def deliver(self, services_ready: bool) -> None:
+        self._callback(_FakeStatusMessage(json.dumps({"services_ready": services_ready})))
+
+
+class _FakeClock:
+    """Deterministic monotonic-like clock: advances by `step` every call, so
+    a test can predict exactly when the deadline in `_wait_for_services_ready`
+    is crossed without depending on wall time."""
+
+    def __init__(self, step: float = 1.0) -> None:
+        self._t = 0.0
+        self._step = step
+
+    def __call__(self) -> float:
+        self._t += self._step
+        return self._t
+
+
+def test_wait_for_services_ready_waits_through_false_samples_then_proceeds_on_true():
+    """Task #39: the sim's isaacsim.ros2.sim_control services can be
+    advertised (wait_for_service() true) long before they can actually be
+    served -- gpsr_spawn's client must gate its first call on
+    /sim/status/isaac's services_ready, not on wait_for_service() alone."""
+    node = _FakeStatusNode()
+    deliveries = iter([False, False, True])
+
+    def spin_once(n, *, timeout_sec=None):
+        assert n is node
+        n.deliver(next(deliveries))
+
+    # Should not raise, and must have spun exactly 3 times (2 false samples,
+    # then the true one that ends the wait).
+    _wait_for_services_ready(
+        node, spin_once, _FakeStatusMessage, now=_FakeClock(step=1.0)
+    )
+    with pytest.raises(StopIteration):
+        next(deliveries)
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+
+
+def test_wait_for_services_ready_bounded_wait_times_out_when_never_ready():
+    node = _FakeStatusNode()
+    spins = []
+
+    def spin_once(n, *, timeout_sec=None):
+        spins.append(timeout_sec)
+        n.deliver(False)
+
+    with pytest.raises(ServiceUnavailable, match="services_ready"):
+        _wait_for_services_ready(
+            node,
+            spin_once,
+            _FakeStatusMessage,
+            timeout_s=5.0,
+            now=_FakeClock(step=2.0),
+        )
+    assert spins, "must have spun at least once before giving up"
+    assert node.destroyed_subscriptions, "subscription must still be cleaned up on timeout"
+
+
+def test_wait_for_services_ready_ignores_status_samples_that_stay_false():
+    node = _FakeStatusNode()
+
+    def spin_once(n, *, timeout_sec=None):
+        n.deliver(False)
+
+    with pytest.raises(ServiceUnavailable):
+        _wait_for_services_ready(
+            node,
+            spin_once,
+            _FakeStatusMessage,
+            timeout_s=3.0,
+            now=_FakeClock(step=1.0),
+        )
+
+
+def test_wait_for_services_ready_falls_back_when_status_never_publishes(capsys):
+    """Task #39 review finding 3: an older sim binary (or one whose
+    /sim/status/isaac has not come up yet) never publishes at all --
+    burning the full 300s timeout on that would turn a pre-#39 ~20-30s
+    wait_for_service success into a 300s failure. Must return (not raise)
+    after only the short grace period, leaving the caller to fall back to
+    its own wait_for_service check."""
+    node = _FakeStatusNode()
+
+    def spin_once(n, *, timeout_sec=None):
+        pass  # nothing ever delivered
+
+    _wait_for_services_ready(
+        node,
+        spin_once,
+        _FakeStatusMessage,
+        timeout_s=300.0,
+        grace_s=3.0,
+        now=_FakeClock(step=1.0),
+    )
+
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+    assert "did not publish" in capsys.readouterr().out
+
+
+def test_wait_for_services_ready_falls_back_when_field_missing(capsys):
+    """Task #39 review finding 3: an older sim's /sim/status/isaac payload
+    (or any schema without the services_ready key) must fall back rather
+    than being treated as services_ready=false and waited out."""
+    node = _FakeStatusNode()
+
+    def spin_once(n, *, timeout_sec=None):
+        node._callback(_FakeStatusMessage(json.dumps({"physics_device": "cpu"})))
+
+    _wait_for_services_ready(
+        node,
+        spin_once,
+        _FakeStatusMessage,
+        timeout_s=300.0,
+        grace_s=10.0,
+        now=_FakeClock(step=1.0),
+    )
+
+    assert node.destroyed_subscriptions, "subscription must be cleaned up"
+    assert "no 'services_ready' field" in capsys.readouterr().out
+
+
+def test_wait_for_services_ready_false_then_true_still_proceeds_with_grace():
+    """The grace period only guards the *first* sample; once a sample with
+    the services_ready key is seen (even false), the wait commits to the
+    full bounded loop exactly as before finding 3's fallback was added."""
+    node = _FakeStatusNode()
+    deliveries = iter([False, False, True])
+
+    def spin_once(n, *, timeout_sec=None):
+        n.deliver(next(deliveries))
+
+    _wait_for_services_ready(
+        node,
+        spin_once,
+        _FakeStatusMessage,
+        timeout_s=30.0,
+        grace_s=10.0,
+        now=_FakeClock(step=1.0),
+    )
+
+    with pytest.raises(StopIteration):
+        next(deliveries)

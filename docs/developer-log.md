@@ -4,6 +4,195 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-07 — Task #39: `/spawn_entity` advertised ~100s before it can be served
+
+**Symptom.** A `/spawn_entity` (or sibling `simulation_interfaces`) call made
+right after `wait_for_service()` returned true could still fail with
+rclpy/`rmw_fastrtps_shared_cpp`'s "failed to send response (timeout): client
+will not receive response" -- a middleware-level failure, not the caller's
+own timeout budget expiring. In one dataset (`01-sim.log`) the extension
+came up at wall 18.9s, then a 93s gap with nothing else logged, then the
+failed-response warning at wall 117.7s; `scenario_runner`'s own six
+boot-time spawns all round-tripped cleanly before that gap, ruling them out
+as the failing call and pointing at a later, separate client (the GPSR
+overlay's `tools/gpsr_spawn.py`, own budget `SPAWN_TIMEOUT_S = 120`).
+
+**Root cause.** `validation/run_sim.py` called
+`enable_extension("isaacsim.ros2.sim_control")` immediately after
+`SimulationApp` construction, before the sensor profile branches ran at
+all -- i.e. before the backend, camera rig, or `RosStandardGateway` existed.
+`enable_extension` registers the extension's ROS services (`/spawn_entity`,
+`/set_entity_state`, `/delete_entity`, `/set_simulation_state`,
+`/load_world`, `/reset_simulation`) synchronously, but Kit only *serves*
+them from its own asyncio loop, which nothing pumps regularly until each
+profile's main loop starts. Backend construction
+(`IsaacWholeRobotBackend.__init__`) has no `app.update()` call at all, and
+camera warm-up (`CameraRig.initialize`, sensor-rich only) has only a
+handful; together they can run for a couple of minutes on a cold shader
+cache. A request that reaches the extension in that window queues past both
+the caller's own timeout budget and, at the DDS layer, the point at which a
+response can even be correlated back to it. `wait_for_service()` -- the only
+readiness signal any client checked -- returns true the instant the
+extension is enabled, long before any of this warm-up is done, so it
+actively misleads a client into thinking a prompt response is possible.
+
+**Fix.** `_enable_sim_control_services(app, gateway=None)` (`run_sim.py`)
+now does the enable + one `app.update()`, and is called once per sensor
+profile branch, at the same point the boot-config JSON prints today -- i.e.
+after backend construction, camera-rig warm-up (sensor-rich), and gateway
+construction are all behind it, right before that branch's main loop starts.
+The pre-enable `_install_set_entity_state_physics` monkeypatch (Task #12/#20)
+stays at the old early call site: it only patches a class method and does
+not itself need the extension enabled or any long-running object to exist
+yet, and must run before `enable_extension`'s `on_startup` captures the
+unpatched bound method.
+
+`RosStandardGateway` (`ros_gateway.py`) gained `services_ready` /
+`services_ready_since` on `/sim/status/isaac` (a JSON string message):
+`False`/`None` at gateway construction, flipped by the new
+`mark_services_ready()` method (idempotent, timestamped with
+`backend.simulation_time`) at the same call site as the extension enable.
+
+`tools/gpsr_spawn.py`'s `_make_ros_service_client` now calls
+`_wait_for_services_ready` (its own bounded wait, default
+`SERVICES_READY_TIMEOUT_S = 300s`, logged) before the existing
+`wait_for_service` 10s checks on `/spawn_entity`/`/delete_entity`, which
+remain as a secondary check. A not-ready sim now fails fast and
+diagnosably ("`/sim/status/isaac` never reported services_ready after
+300s") instead of racing `SPAWN_TIMEOUT_S` and surfacing as an opaque DDS
+timeout.
+
+**How a client should gate a first `/spawn_entity`-family call going
+forward:** wait for `/sim/status/isaac`'s `services_ready` to be `true`
+first; `wait_for_service()` alone is necessary but not sufficient -- it only
+proves the extension is enabled, not that Kit is being pumped regularly
+enough to serve a request promptly.
+
+### Review round (2026-09-07): test-double regression, scenario_runner gap, absent-status fallback
+
+Three findings from review against the fix above, all addressed:
+
+1. **`RosStandardGateway.publish()` read `self._services_ready` directly**,
+   which broke `tests/test_manipulation_runtime.py`'s
+   `test_finger_contact_wrench_publishes_every_tick_not_at_status_cadence`
+   -- its gateway double is built via `object.__new__(RosStandardGateway)`
+   (skips `__init__`, so `_services_ready`/`_services_ready_since` never
+   get set) and exercises `publish()`'s status block. Fixed with
+   `getattr(self, "_services_ready", False)` (and the `_since` sibling) so
+   any double built this way degrades to "not ready" instead of raising;
+   also added the two attributes directly to that test's double for
+   belt-and-suspenders. `tests/test_manipulation_runtime.py`: 129 passed, 0
+   failed (was 128 passed, 1 failed).
+
+2. **`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/scenario_runner.py`
+   had no `services_ready` gate at all.** Its `ScenarioRunner.call()` bounds
+   both the `wait_for_service` discovery and the response wait to a single
+   `--timeout` (default 20.0s; `gpsr.launch.py` never raises it), with no
+   retry beyond the very first `/reset_simulation`. Moving the sim's
+   `_enable_sim_control_services` call point later (this same task) makes
+   the ~100s warm-up gap it exists to describe worse for this client, not
+   better. Added a duplicate of `tools/gpsr_spawn.py`'s
+   `_wait_for_services_ready` (same fallback behavior as finding 3 below)
+   directly in `scenario_runner.py` -- not imported, since
+   `tinker_sim_bridge` is a separate `ament_python` package built by
+   colcon and the top-level `tools/` tree is not installed anywhere colcon
+   looks; a cross-package import would tie the bridge's build to a tree
+   outside it. Wired into `main()` right after `ScenarioRunner`
+   construction, ahead of `node.execute(operations)`. `tests/
+   test_scenario_runner.py`: 14 passed (10 pre-existing + 4 new), run under
+   `python3.10` (this file `pytest.importorskip`s real `rclpy`, whose
+   Humble-built C extension does not load under the repo's Python 3.12 uv
+   venv).
+
+3. **`tools/gpsr_spawn.py`'s `_wait_for_services_ready` had no fallback for
+   an older sim / absent `/sim/status/isaac`.** If the topic never
+   published at all, or published without a `services_ready` key (a
+   pre-#39 sim binary), the function spun for the full
+   `SERVICES_READY_TIMEOUT_S` (300s) and then raised, turning what used to
+   be a ~20-30s `wait_for_service`-only success into a 300s failure.
+   Added `SERVICES_READY_GRACE_S = 10.0`: the function now waits only that
+   long for *any* status sample; if none arrives, or the first one that
+   does has no `services_ready` key, it logs a warning and returns
+   immediately, leaving the caller's own `wait_for_service` checks (the
+   pre-#39 path) to run unmodified. Once a sample carrying the key is seen
+   -- `services_ready: false` included -- it commits to the full bounded
+   wait exactly as before. Same fallback duplicated into
+   `scenario_runner.py`'s copy (finding 2). `tests/test_gpsr_spawn_cli.py`:
+   34 passed (31 pre-existing + 3 new, including the false-then-true
+   commit-after-grace case).
+
+**Tests.** `tests/test_run_sim_services_readiness.py` (new): unit tests on
+`_enable_sim_control_services` itself (fakes for `enable_extension`/the
+app/gateway, asserting the enable -> `app.update` -> `mark_services_ready`
+order, and that a missing gateway is tolerated); source-order regression
+tests per sensor-profile branch of `main()` (`inspect.getsource`, same
+pattern as the existing structural tests in
+`test_manipulation_gate_executor.py`) asserting backend construction, (on
+sensor-rich) camera-rig warm-up, and gateway construction all precede the
+`_enable_sim_control_services(...)` call in that branch's source, plus a
+regression that the old early call site carries no `enable_extension(`
+call. `tests/test_ros_gateway.py`: `/sim/status/isaac` carries
+`services_ready: false`/`services_ready_since: null` before
+`mark_services_ready()`, `true`/the recorded `backend.simulation_time`
+after, and a second call does not move the timestamp.
+`tests/test_gpsr_spawn_cli.py`: `_wait_for_services_ready` spins through
+false samples and returns once a true sample arrives, cleans up its
+subscription either way, and raises `ServiceUnavailable` once its own
+bounded timeout elapses without ever seeing `services_ready: true` (fake
+`/sim/status/isaac` node + injectable clock, no rclpy needed). Full
+targeted run:
+`tests/test_run_sim_services_readiness.py tests/test_ros_gateway.py
+tests/test_gpsr_spawn_cli.py tests/test_set_entity_state_physics.py
+tests/test_run_sim_arena_cli.py tests/test_run_sim_arena_wiring.py` --
+83 passed. No GPU boot for this change (deferred: live confirmation that
+the moved call site actually closes the wall-clock gap end to end).
+
+### Second review round (2026-09-07): `spin_once`'s timeout is keyword-only
+
+**Finding.** Both `_wait_for_services_ready` implementations
+(`tools/gpsr_spawn.py`, `ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/
+scenario_runner.py`) called `spin_once(node, 0.5)` -- a positional
+`timeout_sec`. Real `rclpy.spin_once`'s signature is `spin_once(node, *,
+executor=None, timeout_sec=None)`: `timeout_sec` is keyword-only. Against
+real rclpy this raises `TypeError: spin_once() takes 1 positional argument
+but 2 were given` on the very first loop iteration -- including the
+"already ready" fast path this whole task exists to preserve. Every unit
+test passed anyway because each test double's fake `spin_once(n,
+timeout_sec)` accepts the positional call fine; the mismatch only fires
+against the real function, which no test in the suite exercised for this
+call site.
+
+**Fix.** Both call sites now call `spin_once(node, timeout_sec=0.5)`.
+Grepped the whole branch for other `rclpy.spin_once`/
+`spin_until_future_complete` calls: every other call site in the repo
+already uses the keyword form (`tools/gpsr_spawn.py`'s own
+`spin_until_future_complete` calls, `scenario_runner.py`'s
+`ScenarioRunner.call()`, `controller_reconciler.py`,
+`ompl_plan_smoke.py`, etc.) -- these two were the only positional
+holdouts. Also checked the two helpers' other injected-rclpy-shaped calls
+(`node.create_subscription(msg_type, topic, callback, qos_profile)`,
+`node.destroy_subscription(subscription)`) against real
+`rclpy.node.Node`'s signatures (`inspect.signature` under `python3.10`)
+-- both match; no `*` before the arguments these helpers pass.
+
+**Test-double hardening.** Every fake `spin_once` in
+`tests/test_gpsr_spawn_cli.py` and `tests/test_scenario_runner.py` is now
+declared `def spin_once(n, *, timeout_sec=None)` (was `def spin_once(n,
+timeout_sec)`), so a future regression back to the positional call form
+raises `TypeError` inside the test itself instead of silently passing.
+Verified directly: reverting either production call site back to
+`spin_once(node, 0.5)` against the now-keyword-only doubles fails 6/34
+(`test_gpsr_spawn_cli.py`) and 4/14 (`test_scenario_runner.py`) with
+exactly that `TypeError`; restoring the keyword-argument call makes both
+files pass again (34 passed; 14 passed).
+
+`tests/test_scenario_runner.py` needs real `rclpy`/`simulation_interfaces`
+(`pytest.importorskip`s them) and does not load under the repo's Python
+3.12 uv venv; run under `python3.10` with `PYTHONPATH` carrying
+`.ros-vendor/humble/opt/ros/humble/local/lib/python3.10/dist-packages`
+(carries `simulation_interfaces`) plus the `ros2_ws/src/tinker_sim_bridge`
+and `simulation` source trees.
+
 ## 2026-09-06 — Task #30: boot-time spawn-pose guard (a 171 deg, 1.3 m silent spawn miss)
 
 **Symptom.** A GPSR run observed the robot base at `(-0.69, -2.19)` yaw
