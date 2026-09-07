@@ -256,6 +256,17 @@ class ScenarioRunner(Node):
 
     def execute(self, operations) -> list[dict[str, object]]:
         results = []
+        # Task #30 trace: whether the entity about to be spawned is going
+        # through the standard reset_spawned -> set_simulation_state(STOPPED,
+        # "SPAWN_READY") -> spawn_entity(s) -> set_simulation_state(PLAYING,
+        # "PHYSICS_READY") bracket (backend.py's own comments call this the
+        # "STOP -> spawn_entity -> PLAY cycle") or the opt-in
+        # --spawn-while-playing mode, which skips that bracket entirely (see
+        # tinker_sim_core.orchestration.standard_operations). Tracked from
+        # the boundary names on the compiled set_simulation_state operations
+        # this loop already walks -- true from "SPAWN_READY" (STOPPED) until
+        # the final "PHYSICS_READY" (PLAYING).
+        stop_play_cycle = False
         for index, operation in enumerate(operations):
             if operation.kind == "load_world":
                 request = LoadWorld.Request()
@@ -295,6 +306,22 @@ class ScenarioRunner(Node):
                     raise RuntimeError(
                         f"spawned entity path changed from {expected_name} to {actual_name}"
                     )
+                print(
+                    json.dumps(
+                        {
+                            "event": "scenario_spawn",
+                            "name": expected_name,
+                            "pose": {
+                                "xyz": [float(value) for value in xyz],
+                                "quaternion_xyzw": [float(value) for value in xyzw],
+                            },
+                            "t": time.monotonic(),
+                            "stop_play_cycle": stop_play_cycle,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             elif operation.kind == "set_simulation_state":
                 request = SetSimulationState.Request()
                 state = int(operation.payload["state"])
@@ -306,6 +333,11 @@ class ScenarioRunner(Node):
                     raise RuntimeError(f"unsupported scenario simulation state: {state}")
                 request.state = SimulationState(state=state)
                 self._call_state(request)
+                boundary = str(operation.payload.get("boundary", ""))
+                if boundary == "SPAWN_READY":
+                    stop_play_cycle = True
+                elif boundary == "PHYSICS_READY":
+                    stop_play_cycle = False
             else:
                 raise RuntimeError(f"unsupported standard operation: {operation.kind}")
             result = {"operation": operation.kind, "accepted": True}
