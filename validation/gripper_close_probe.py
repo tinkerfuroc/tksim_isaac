@@ -62,6 +62,7 @@ parser.add_argument("--mirror-mode", default="target",
 parser.add_argument("--max-lead", type=float, default=None, help="override backend._gripper_max_lead (0 disables the stall-gated lead clamp)")
 parser.add_argument("--stall-speed", type=float, default=None, help="override backend._gripper_stall_speed")
 parser.add_argument("--drive-effort-limit", type=float, default=None, help="raise the drive_joint effort ceiling (Nm) to sweep the clamp force; URDF default 50. The bench close is capped at this ceiling, so this is the only way to press past 50 Nm")
+parser.add_argument("--follower-effort-limit", type=float, default=None, help="cap the effort ceiling (Nm) of the five gripper mimic/follower joints; backend default 180 (ImplicitActuatorCfg effort_limit_sim for gripper_mimic). #20: the follower cap (180) out-pushing the drive cap (50/--drive-effort-limit) is a suspect for the post-clamp ratchet, so this lets a trial pin the followers at or below the drive ceiling")
 parser.add_argument("--object", default="bottle", choices=("bottle", "knife", "plate"))
 parser.add_argument("--object-usda", default="")
 parser.add_argument("--tcp-above-top", type=float, default=None, help="pedestal top = tcp_z - this (bottle 0.095 CoM-height side grasp; knife 0.02 top-down)")
@@ -69,6 +70,14 @@ parser.add_argument("--object-yaw-axis", default="x", choices=("x", "y"), help="
 parser.add_argument("--object-yaw-deg", type=float, default=None, help="absolute world yaw of the object (overrides --object-yaw-axis)")
 parser.add_argument("--object-offset", default="0,0", help="dx,dy (base/world frame) of the object ORIGIN from the TCP xy; e.g. plate near-rim pinch = 0.10,0")
 parser.add_argument("--pedestal", type=float, default=0.10, help="static pedestal side length (m); must cover the object footprint")
+parser.add_argument("--no-object", action="store_true",
+                     help="phase B: skip spawning the object entirely -- stage/descend/close with nothing "
+                          "between the pads (a free close from a staged pose, since --descend-from only runs "
+                          "in the phase-B loop). The pedestal is still authored (its placement doesn't depend "
+                          "on the object mesh existing). Object-dependent events (object, bottle_placed, "
+                          "the after_spawn sanity check) are skipped and object-dependent metrics (bottle_pre, "
+                          "phaseB's lift bottle_dz/tilt/slide) come back null instead of describing an object "
+                          "that was never there.")
 # Top-down family with a real descent (the bench's pick: pregrasp above, then
 # down onto the object, then close). --tcp-xz solves the planar IK for the
 # grasp TCP; --descend-from stages the arm that much higher, spawns the object
@@ -229,6 +238,7 @@ names, _, _, _ = backend.joint_state()
 JIDX = {n: i for i, n in enumerate(names)}
 mimic_ids = list(backend._gripper_mimic_indices)
 drive_id = backend._drive_joint_index
+GRIP_IDS = [JIDX[n] for n in GRIP]
 DT = backend.dt
 
 
@@ -260,6 +270,76 @@ emit(
     compliant_env=os.environ.get("TINKER_SIM_GRIPPER_COMPLIANT_STIFFNESS"),
     gains=gains_snapshot(),
 )
+
+
+def _as_numpy(value: object) -> np.ndarray:
+    """Warp arrays (the tensor-API return type on this build, per the Task
+    #12 precedent -- RigidBodyView reads/writes are Warp, not torch) and
+    torch tensors both expose .numpy(); plain numpy/lists pass through."""
+    return np.asarray(value.numpy() if hasattr(value, "numpy") else value)
+
+
+def emit_link_masses() -> None:
+    """Per-body mass (and inertia tensor, if the view exposes it) straight off
+    the runtime PhysX articulation view -- root_view.get_masses(), shape
+    (1, n_bodies) -- indexed by backend._robot.body_names (Isaac Lab's
+    Articulation.body_names is root_view.shared_metatype.link_names, so the
+    ordering already lines up 1:1 with the tensor columns; no JIDX-style
+    name->index remap needed). This is what PhysX is actually integrating for
+    every articulation body (arm links, gripper base, the six gripper links,
+    the camera link) -- not a USD-authored guess -- so a missing/zeroed
+    catalog mass (the #17 YCB gap) or an unexpectedly heavy link shows up in
+    every probe run without a dedicated flag. No dynamics estimate here
+    (nothing fancy): just the masses, for a human to eyeball against gravity
+    torque by hand.
+    """
+    try:
+        root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+        if root_view is None:
+            raise RuntimeError("backend._robot exposes neither root_view nor root_physx_view")
+        bnames = list(backend._robot.body_names)
+        masses_arr = _as_numpy(root_view.get_masses())
+        payload: dict[str, object] = {"masses": {name: float(masses_arr[0, i]) for i, name in enumerate(bnames)}}
+        get_inertias = getattr(root_view, "get_inertias", None)
+        if get_inertias is not None:
+            inertias_arr = _as_numpy(get_inertias())
+            payload["inertias"] = {name: [float(v) for v in inertias_arr[0, i]] for i, name in enumerate(bnames)}
+        emit(event="link_masses", **payload)
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        emit(event="link_masses", error=str(error)[:200])
+
+
+def emit_dof_limits(tag: str | None = None) -> None:
+    """Per-joint effort/velocity ceiling straight off the runtime PhysX
+    articulation view -- root_view.get_dof_max_forces() / get_dof_max_velocities(),
+    shape (1, n_dofs) -- indexed by backend._robot.joint_names (same
+    shared_metatype ordering guarantee as body_names above). Emitted once at
+    boot (to compare against the config-authored joint_effort_limits) and
+    again right after the phase-B close command is issued, because the
+    drive/follower caps can be rewritten per-command by the backend's effort
+    mapping on newer trees (on this probe tree the direct-PhysX-write flags,
+    apply_follower_effort_limit / apply_drive_effort_limit, set them).
+    """
+    try:
+        root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+        if root_view is None:
+            raise RuntimeError("backend._robot exposes neither root_view nor root_physx_view")
+        jnames = list(backend._robot.joint_names)
+        forces_arr = _as_numpy(root_view.get_dof_max_forces())
+        payload: dict[str, object] = {"max_force": {name: float(forces_arr[0, i]) for i, name in enumerate(jnames)}}
+        get_dof_max_velocities = getattr(root_view, "get_dof_max_velocities", None)
+        if get_dof_max_velocities is not None:
+            vel_arr = _as_numpy(get_dof_max_velocities())
+            payload["max_velocity"] = {name: float(vel_arr[0, i]) for i, name in enumerate(jnames)}
+        if tag is not None:
+            payload["tag"] = tag
+        emit(event="dof_limits", **payload)
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        emit(event="dof_limits", tag=tag, error=str(error)[:200])
+
+
+emit_link_masses()
+emit_dof_limits(tag="boot")
 
 
 # ------------------------------------------------------------------ helpers
@@ -339,6 +419,216 @@ def set_follower_gains(damping: float | None, stiffness: float | None,
     return gains_snapshot()
 
 
+def _read_effective_effort_limits(ids: list[int]) -> list[float]:
+    """Read back the effective effort limit for `ids` the same way backend
+    does (gains_snapshot/_read_joint_gain_values): data.joint_effort_limits,
+    env 0. This is the buffer write_joint_effort_limit_to_sim_index populates
+    directly, so it reflects the PhysX-side write immediately; reading it
+    again at the top of each phase-B config is what makes a later clobber
+    (e.g. an actuator re-init restoring the ImplicitActuatorCfg default)
+    visible in the log instead of silently reverting.
+    """
+    data = backend._robot.data
+    limits = getattr(data, "joint_effort_limits", None)
+    if limits is None:
+        return [float("nan")] * len(ids)
+    arr = backend._torch_value(limits)[0].detach().cpu().tolist()
+    return [float(arr[i]) for i in ids]
+
+
+def _read_physx_max_forces(ids: list[int]) -> list[float]:
+    """Read the follower DOFs' max-force straight off the PhysX tensor view
+    (root_view.get_dof_max_forces / root_physx_view, shape (num_instances,
+    num_joints), env 0) -- the actual buffer write_joint_effort_limit_to_sim_
+    index's set_dof_max_forces call targets (isaaclab_physx articulation.py
+    :1613-1679). data.joint_effort_limits (the other readback in this file)
+    is the Isaac Lab-side mirror of that write and can only prove the write
+    was *issued*; this proves what PhysX itself is holding, independent of
+    any Isaac Lab actuator-model caching (#20 cap5-analysis: bit-identical
+    physics from cap 5 through cap 180 means the two readbacks may diverge
+    even though both currently agree post-write).
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    getter = getattr(root_view, "get_dof_max_forces", None) if root_view is not None else None
+    if getter is None:
+        return [float("nan")] * len(ids)
+    try:
+        forces = getter()
+        arr = forces.numpy() if hasattr(forces, "numpy") else forces
+        arr = np.asarray(arr)
+        return [float(arr[0, i]) for i in ids]
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({"physx_max_force_read_error": str(error)[:160]}), flush=True)
+        return [float("nan")] * len(ids)
+
+
+def _read_physx_joint_forces(ids: list[int]) -> list[float]:
+    """Read the PhysX-measured joint force/torque actually delivered by the
+    solver for the given DOF indices -- distinct from ``joint_state()``'s
+    ``tau`` (Isaac Lab's ``data.applied_torque``, the actuator MODEL's
+    post-clip command that gets set INTO the sim, per
+    isaaclab/assets/articulation/base_articulation_data.py:198-205 -- a
+    Python-side estimate of what was asked for, not what PhysX produced).
+
+    Uses ``root_view.get_dof_projected_joint_forces()``
+    (omni.physics.tensors ArticulationView): "projects the link's incoming
+    joint force[s] in the motion direction", i.e. the actual constraint-
+    solver output along each joint's motion axis -- the solver-measured
+    force/torque, not a command.
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    getter = getattr(root_view, "get_dof_projected_joint_forces", None) if root_view is not None else None
+    if getter is None:
+        return [float("nan")] * len(ids)
+    try:
+        forces = getter()
+        arr = forces.numpy() if hasattr(forces, "numpy") else forces
+        arr = np.asarray(arr)
+        return [float(arr[0, i]) for i in ids]
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({"physx_joint_force_read_error": str(error)[:160]}), flush=True)
+        return [float("nan")] * len(ids)
+
+
+def _write_physx_max_forces_direct(ids: list[int], limit: float) -> None:
+    """Re-assert the follower cap straight on the PhysX tensor view, bypassing
+    the Isaac Lab wrapper (write_joint_effort_limit_to_sim_index only ever
+    calls this same root_view.set_dof_max_forces once, immediately and on the
+    full joint set), so this is a redundant, same-call re-assertion, not a
+    different code path.
+
+    set_dof_max_forces takes the FULL (num_instances, num_joints) row for the
+    selected env indices, not a sparse per-joint column, so this reads the
+    current full row back (already updated for `ids` by the wrapper call that
+    precedes this one), patches it, and pushes the whole row -- and, per the
+    Task #12 precedent (RigidBodyView needs WARP arrays, not torch, for
+    tensor-API writes to actually land), uses warp arrays for both the
+    payload and the indices rather than torch tensors.
+    """
+    root_view = getattr(backend._robot, "root_view", None) or getattr(backend._robot, "root_physx_view", None)
+    setter = getattr(root_view, "set_dof_max_forces", None) if root_view is not None else None
+    if setter is None:
+        return
+    try:
+        import warp as wp
+
+        data = backend._robot.data
+        full = backend._torch_value(data.joint_effort_limits).clone()
+        full[0, ids] = float(limit)
+        full_cpu = full.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        forces_wp = wp.from_torch(full_cpu, dtype=wp.float32)
+        indices_wp = wp.array([0], dtype=wp.int32, device="cpu")
+        setter(forces_wp, indices=indices_wp)
+    except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+        print(json.dumps({"physx_max_force_write_error": str(error)[:160]}), flush=True)
+
+
+def _author_usd_max_force(ids: list[int], limit: float, event: str = "follower_usd_drive_authored") -> None:
+    """Author physics:maxForce on each targeted joint's UsdPhysics.DriveAPI
+    directly on the stage, in addition to the runtime tensor-API write, so a
+    stage re-parse (a reset that rebuilds the actuator from the USD prim)
+    still carries the cap. Best-effort: the follower joints are mimic joints
+    the importer dropped drives for, so a DriveAPI may not already be applied
+    -- Apply() creates it. Per-joint failures are logged, not fatal.
+    """
+    try:
+        import omni.usd
+        from pxr import Usd, UsdPhysics
+    except ImportError:
+        return
+    id_to_name = {index: name for name, index in JIDX.items()}
+    target_names = {id_to_name[i] for i in ids if i in id_to_name}
+    if not target_names:
+        return
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return
+    robot_prim_path = str(getattr(getattr(backend._robot, "cfg", None), "prim_path", "") or "/World/Tinker")
+    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+    if not robot_prim.IsValid():
+        return
+    authored, errors = [], []
+    for prim in Usd.PrimRange(robot_prim):
+        name = prim.GetName()
+        if name not in target_names:
+            continue
+        for instance in ("angular", "linear"):
+            try:
+                drive = UsdPhysics.DriveAPI.Apply(prim, instance)
+                drive.CreateMaxForceAttr(float(limit))
+                authored.append(f"{name}:{instance}")
+            except Exception as error:  # pragma: no cover - defensive, schema surface
+                errors.append(f"{name}:{instance}:{str(error)[:80]}")
+    print(json.dumps({
+        "event": event,
+        "requested": limit,
+        "authored": authored,
+        "errors": errors,
+    }), flush=True)
+
+
+def _patch_actuator_effort_limit_cache(ids: list[int], limit: float) -> None:
+    """Mirror the PhysX effort-limit write into the owning ImplicitActuator's
+    cached tensors -- the same workaround backend._set_gripper_effort_limit
+    applies for drive_joint (Isaac Lab issue #128: write_joint_effort_limit_to_
+    sim_index only updates the simulator buffer, not the actuator model).
+    Patches both `effort_limit` (read every step by _clip_effort) and
+    `effort_limit_sim` (read at actuator (re)construction) since ActuatorBase
+    keeps them as separate tensors.
+    """
+    id_to_name = {index: name for name, index in JIDX.items()}
+    target_names = {id_to_name[i] for i in ids if i in id_to_name}
+    if not target_names:
+        return
+    for actuator in getattr(backend._robot, "actuators", {}).values():
+        names = getattr(actuator, "joint_names", None)
+        if names is None:
+            continue
+        for local_index, name in enumerate(names):
+            if name not in target_names:
+                continue
+            for attr in ("effort_limit", "effort_limit_sim"):
+                tensor = getattr(actuator, attr, None)
+                if isinstance(tensor, torch.Tensor):
+                    tensor[:, local_index] = limit
+
+
+def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower_effort_limit_set") -> None:
+    """Cap the five follower joints' effort ceiling at --follower-effort-limit.
+
+    Reuses the Isaac Lab writer already used for the drive joint (backend
+    _set_gripper_effort_limit / _write_safety_effort_limit): PhysX
+    write_joint_effort_limit_to_sim_index(limits=..., joint_ids=..., env_ids=...).
+    Also patches the owning ImplicitActuator's cached effort_limit/
+    effort_limit_sim tensors in place, re-asserts the cap directly on the
+    PhysX tensor view (_write_physx_max_forces_direct) and authors it onto
+    each follower joint's USD DriveAPI (_author_usd_max_force) so a stage
+    re-parse would still carry it, and reads the effective limit back both
+    from Isaac Lab's data.joint_effort_limits and straight from PhysX
+    (get_dof_max_forces) for the event -- #20 evidence (bit-identical hold
+    physics at cap 5/50/100 vs cap-180) shows the write reaching the
+    tensor-API buffer is NOT sufficient proof it reaches the solver's actual
+    joint-drive force limit for these mimic joints; the physx_max_force
+    readback is what would catch that gap. A no-op unless
+    --follower-effort-limit was passed.
+    """
+    if args.follower_effort_limit is None:
+        return
+    limit = float(args.follower_effort_limit)
+    _write_gain("limits", "write_joint_effort_limit_to_sim_index", limit, mimic_ids)
+    _write_physx_max_forces_direct(mimic_ids, limit)
+    _patch_actuator_effort_limit_cache(mimic_ids, limit)
+    _author_usd_max_force(mimic_ids, limit)
+    if emit_event:
+        print(json.dumps({
+            "event": event,
+            "requested": limit,
+            "indices": mimic_ids,
+            "effective": _read_effective_effort_limits(mimic_ids),
+            "physx_max_force": _read_physx_max_forces(mimic_ids),
+        }), flush=True)
+
+
 def parse_configs(text: str) -> list[dict[str, float]]:
     """slew:damping:stiffness[:drive_stiffness:drive_damping]"""
     configs = []
@@ -369,6 +659,13 @@ if args.drive_effort_limit is not None:
         "requested": args.drive_effort_limit,
         "gripper_effort_limit": backend.gripper_effort_limit,
     }), flush=True)
+
+if args.follower_effort_limit is not None:
+    # #20: cap the follower (mimic) joints' effort ceiling -- backend default
+    # 180 Nm, vs the drive_joint's 50 (--drive-effort-limit). Same writer as
+    # the drive joint (write_joint_effort_limit_to_sim_index), applied across
+    # the five follower indices instead of just drive_joint.
+    apply_follower_effort_limit(emit_event=True)
 
 if args.mirror_mode == "central":
     set_follower_gains(55.0, 1500.0, drive_stiffness=1500.0, drive_damping=55.0)
@@ -658,6 +955,12 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
     if _render["on"]:
         _render["next_drive"] = -1.0  # capture from the first step of this close
     command_gripper(args.close_target)
+    if tag == "B":
+        # The drive/follower effort caps can be rewritten per command on some
+        # trees (see emit_dof_limits' docstring); re-read them right after
+        # this phase-B close command lands so a per-command clobber shows up
+        # here rather than only in the boot-time snapshot.
+        emit_dof_limits(tag="phaseB_after_close_command")
     steps = int(args.record_s / DT)
     peak_force = 0.0
     peak_force_t = None
@@ -707,11 +1010,16 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
                 stall_t = t
         else:
             stall_run = 0
+        physx_taus = _read_physx_joint_forces(GRIP_IDS)
         r = {
             "tag": tag, "k": k, "t": round(t, 4), "target": target, "drive": g["drive_joint"][0],
             "pad_pos": pad_pos, "pad_speed": pad_speed, "lag": lag, "lf": lf, "rf": rf,
             "tau_drive": round(g["drive_joint"][2], 3),
             "tau": {n: round(v, 3) for n, v in taus.items()},
+            # PhysX solver-measured joint force/torque (get_dof_projected_joint_forces),
+            # alongside the pre-existing tau/tau_drive (Isaac Lab's applied_torque,
+            # the actuator model's commanded value) -- see _read_physx_joint_forces.
+            "physx_tau": {n: round(v, 3) for n, v in zip(GRIP, physx_taus)},
             "pos": {n: round(g[n][0], 4) for n in FOLLOWERS},
         }
         if bottle_reader is not None:
@@ -740,7 +1048,7 @@ def run_close(tag: str, cfg: dict[str, float], bottle_reader=None) -> dict[str, 
         "median_lag_motion": float(np.median(lags_motion)) if lags_motion else None,
         "median_speed_motion": float(np.median(speeds_motion)) if speeds_motion else None,
         "median_tau_motion": float(np.median(taus_motion)) if taus_motion else None,
-        "final": {k: last.get(k) for k in ("target", "drive", "pad_pos", "pad_speed", "lag", "lf", "rf", "tau_drive", "tau", "pos")},
+        "final": {k: last.get(k) for k in ("target", "drive", "pad_pos", "pad_speed", "lag", "lf", "rf", "tau_drive", "tau", "physx_tau", "pos")},
     }
     if bottle_rows:
         z0 = bottle_rows[0]["z"]
@@ -834,44 +1142,6 @@ if "B" in args.phase:
     rf_now, _ = body_pose("right_finger")
     emit(event="support", pedestal=PED, top=support_top, finger_z=[lf_now[2], rf_now[2]], clearance=min(lf_now[2], rf_now[2]) - support_top,
          root=backend.root_state() if hasattr(backend, "root_state") else None)
-    bottle_path = "/World/Probe/Bottle"
-    bprim = stage.DefinePrim(bottle_path, "Xform")
-    bprim.GetReferences().AddReference(object_usda)
-    # Spawn 2 cm above the support: a body that never attached to PhysX stays
-    # exactly at the authored pose, a live one drops onto the support.
-    DROP = 0.02
-    _bxf = UsdGeom.Xformable(bprim)
-    _bxf.AddTranslateOp().Set(Gf.Vec3d(bottle_base[0], bottle_base[1], bottle_base[2] + DROP))
-    if args.object != "bottle":
-        _bxf.AddRotateZOp().Set(float(object_yaw_deg))
-    emit(event="object", kind=args.object, usda=object_usda, yaw_deg=object_yaw_deg, tool_x=tool_x, tool_y=tool_y)
-    for _ in range(5):
-        app.update()
-    for _ in range(int(1.5 / DT)):
-        backend.step()
-    from isaaclab_physx.physics import PhysxManager
-
-    view = PhysxManager.get_physics_sim_view().create_rigid_body_view(bottle_path)
-
-    def bottle_state() -> dict[str, float]:
-        tf = view.get_transforms()
-        arr = tf.numpy() if hasattr(tf, "numpy") else tf
-        arr = np.asarray(arr).reshape(-1, 7)[0]
-        x, y, z, qx, qy, qz, qw = (float(v) for v in arr)
-        # body z axis in world = R * (0,0,1)
-        zx = 2 * (qx * qz + qw * qy)
-        zy = 2 * (qy * qz - qw * qx)
-        zz = 1 - 2 * (qx * qx + qy * qy)
-        tilt = math.degrees(math.acos(max(-1.0, min(1.0, zz))))
-        return {"x": x, "y": y, "z": z, "tilt_deg": tilt, "zx": zx, "zy": zy}
-
-    initial = view.get_transforms()
-    init_arr = np.array(initial.numpy() if hasattr(initial, "numpy") else initial).reshape(-1, 7).copy()
-    b0 = bottle_state()
-    dropped = (bottle_base[2] + DROP) - b0["z"]
-    emit(event="bottle_placed", source=source, bottle_base=bottle_base, support_top=support_top, settled=b0,
-         dropped_m=dropped, attached=bool(dropped > 0.005),
-         dist_to_pad_mid_xy=math.hypot(b0["x"] - pad_mid[0], b0["y"] - pad_mid[1]), pad_mid=pad_mid)
     def articulation_sane(tag: str) -> bool:
         g = read_gripper()
         pairs = backend.contact_pairs()
@@ -882,28 +1152,88 @@ if "B" in args.phase:
         emit(event="sanity", tag=tag, ok=ok, drive=drive, max_gripper_speed=vmax, contact_pairs=odd[:12])
         return ok
 
-    if dropped < 0.005 or b0["z"] < bottle_base[2] - 0.05 or not articulation_sane("after_spawn"):
-        emit(event="abort", reason="bottle not resting on support, or articulation disturbed by the spawn")
-        _out.close()
-        _rows.close()
-        app.close()
-        sys.exit(2)
+    if args.no_object:
+        # Free close: nothing spawned between the pads. bottle_state() and
+        # reset_bottle() become no-ops (null pose / no-op reset) so the
+        # shared phase-B loop below (descend/run_close/lift) can keep calling
+        # them unconditionally instead of branching at every call site; every
+        # object-dependent event (object, bottle_placed, the after_spawn
+        # sanity check) is skipped and object-dependent metrics come back
+        # null instead of describing an object that was never there.
+        NULL_OBJECT_STATE = {"x": None, "y": None, "z": None, "tilt_deg": None, "zx": None, "zy": None}
 
-    def reset_bottle() -> None:
-        tf = view.get_transforms()
-        arr = tf.numpy() if hasattr(tf, "numpy") else tf
-        np.asarray(arr).reshape(-1, 7)[0, :] = init_arr[0, :]
-        vel = view.get_velocities()
-        varr = vel.numpy() if hasattr(vel, "numpy") else vel
-        np.asarray(varr).reshape(-1, 6)[0, :] = 0.0
-        if hasattr(tf, "numpy"):
-            import warp as wp
+        def bottle_state() -> dict[str, float]:
+            return dict(NULL_OBJECT_STATE)
 
-            indices = wp.array([0], dtype=wp.uint32, device=str(tf.device))
-        else:
-            indices = torch.arange(1, device=tf.device, dtype=torch.int32)
-        view.set_transforms(tf, indices)
-        view.set_velocities(vel, indices)
+        def reset_bottle() -> None:
+            return None
+
+        emit(event="object", kind=None, skipped=True, reason="--no-object")
+    else:
+        bottle_path = "/World/Probe/Bottle"
+        bprim = stage.DefinePrim(bottle_path, "Xform")
+        bprim.GetReferences().AddReference(object_usda)
+        # Spawn 2 cm above the support: a body that never attached to PhysX stays
+        # exactly at the authored pose, a live one drops onto the support.
+        DROP = 0.02
+        _bxf = UsdGeom.Xformable(bprim)
+        _bxf.AddTranslateOp().Set(Gf.Vec3d(bottle_base[0], bottle_base[1], bottle_base[2] + DROP))
+        if args.object != "bottle":
+            _bxf.AddRotateZOp().Set(float(object_yaw_deg))
+        emit(event="object", kind=args.object, usda=object_usda, yaw_deg=object_yaw_deg, tool_x=tool_x, tool_y=tool_y)
+
+    for _ in range(5):
+        app.update()
+    for _ in range(int(1.5 / DT)):
+        backend.step()
+
+    if not args.no_object:
+        from isaaclab_physx.physics import PhysxManager
+
+        view = PhysxManager.get_physics_sim_view().create_rigid_body_view(bottle_path)
+
+        def bottle_state() -> dict[str, float]:
+            tf = view.get_transforms()
+            arr = tf.numpy() if hasattr(tf, "numpy") else tf
+            arr = np.asarray(arr).reshape(-1, 7)[0]
+            x, y, z, qx, qy, qz, qw = (float(v) for v in arr)
+            # body z axis in world = R * (0,0,1)
+            zx = 2 * (qx * qz + qw * qy)
+            zy = 2 * (qy * qz - qw * qx)
+            zz = 1 - 2 * (qx * qx + qy * qy)
+            tilt = math.degrees(math.acos(max(-1.0, min(1.0, zz))))
+            return {"x": x, "y": y, "z": z, "tilt_deg": tilt, "zx": zx, "zy": zy}
+
+        initial = view.get_transforms()
+        init_arr = np.array(initial.numpy() if hasattr(initial, "numpy") else initial).reshape(-1, 7).copy()
+        b0 = bottle_state()
+        dropped = (bottle_base[2] + DROP) - b0["z"]
+        emit(event="bottle_placed", source=source, bottle_base=bottle_base, support_top=support_top, settled=b0,
+             dropped_m=dropped, attached=bool(dropped > 0.005),
+             dist_to_pad_mid_xy=math.hypot(b0["x"] - pad_mid[0], b0["y"] - pad_mid[1]), pad_mid=pad_mid)
+
+        if dropped < 0.005 or b0["z"] < bottle_base[2] - 0.05 or not articulation_sane("after_spawn"):
+            emit(event="abort", reason="bottle not resting on support, or articulation disturbed by the spawn")
+            _out.close()
+            _rows.close()
+            app.close()
+            sys.exit(2)
+
+        def reset_bottle() -> None:
+            tf = view.get_transforms()
+            arr = tf.numpy() if hasattr(tf, "numpy") else tf
+            np.asarray(arr).reshape(-1, 7)[0, :] = init_arr[0, :]
+            vel = view.get_velocities()
+            varr = vel.numpy() if hasattr(vel, "numpy") else vel
+            np.asarray(varr).reshape(-1, 6)[0, :] = 0.0
+            if hasattr(tf, "numpy"):
+                import warp as wp
+
+                indices = wp.array([0], dtype=wp.uint32, device=str(tf.device))
+            else:
+                indices = torch.arange(1, device=tf.device, dtype=torch.int32)
+            view.set_transforms(tf, indices)
+            view.set_velocities(vel, indices)
 
     for cfg in CONFIGS:
         wait_gripper_open()
@@ -918,7 +1248,7 @@ if "B" in args.phase:
             d = descend(args.descend_s)
             d["object_after_descent"] = bottle_state()
             emit(event="descent", **d)
-        m = run_close("B", cfg, bottle_reader=bottle_state)
+        m = run_close("B", cfg, bottle_reader=None if args.no_object else bottle_state)
         m["bottle_pre"] = pre
         if args.lift:
             if ik_family:
@@ -934,8 +1264,9 @@ if "B" in args.phase:
             _slide = {"max": 0.0, "arm_v": 0.0}
 
             def _track_lift() -> None:
-                b = bottle_state()
-                _slide["max"] = max(_slide["max"], math.hypot(b["x"] - _ls_xy[0], b["y"] - _ls_xy[1]))
+                if not args.no_object:
+                    b = bottle_state()
+                    _slide["max"] = max(_slide["max"], math.hypot(b["x"] - _ls_xy[0], b["y"] - _ls_xy[1]))
                 _, _, v, _ = backend.joint_state()
                 _slide["arm_v"] = max(_slide["arm_v"], max(abs(float(v[JIDX[j]])) for j in ARM))
 
@@ -963,13 +1294,18 @@ if "B" in args.phase:
             tcp_after, _ = body_pose("link_tcp")
             bl = bottle_state()
             lf, rf = pad_forces()
-            m["lift"] = {"tcp_dz": tcp_after[2] - tcp_p[2], "bottle_dz": bl["z"] - pre["z"], "bottle_tilt": bl["tilt_deg"], "hold_force": lf + rf,
+            m["lift"] = {"tcp_dz": tcp_after[2] - tcp_p[2],
+                         "bottle_dz": None if args.no_object else bl["z"] - pre["z"],
+                         "bottle_tilt": bl["tilt_deg"], "hold_force": lf + rf,
                          "slide_xy_max": _slide["max"],
-                         "slide_xy_end": math.hypot(bl["x"] - _ls_xy[0], bl["y"] - _ls_xy[1]),
+                         "slide_xy_end": None if args.no_object else math.hypot(bl["x"] - _ls_xy[0], bl["y"] - _ls_xy[1]),
                          "peak_arm_joint_speed": _slide["arm_v"],
                          "obj_at_lift_start": obj_ls,
                          "tcp_after": tcp_after, "object_after": bl}
-            capture_frame("LIFT", 0.0, force=f"dz{bl['z']-pre['z']:+.02f}_tilt{bl['tilt_deg']:.0f}")
+            capture_frame(
+                "LIFT", 0.0,
+                force="dz?_tilt?" if args.no_object else f"dz{bl['z']-pre['z']:+.02f}_tilt{bl['tilt_deg']:.0f}",
+            )
             # release BEFORE returning: a closed jaw descending onto an object
             # left on the pedestal jams the drive past its limit (probe6)
             wait_gripper_open()
