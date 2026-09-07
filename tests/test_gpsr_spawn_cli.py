@@ -673,7 +673,7 @@ def test_wait_for_services_ready_waits_through_false_samples_then_proceeds_on_tr
     node = _FakeStatusNode()
     deliveries = iter([False, False, True])
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         assert n is node
         n.deliver(next(deliveries))
 
@@ -691,7 +691,7 @@ def test_wait_for_services_ready_bounded_wait_times_out_when_never_ready():
     node = _FakeStatusNode()
     spins = []
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         spins.append(timeout_sec)
         n.deliver(False)
 
@@ -710,7 +710,7 @@ def test_wait_for_services_ready_bounded_wait_times_out_when_never_ready():
 def test_wait_for_services_ready_ignores_status_samples_that_stay_false():
     node = _FakeStatusNode()
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         n.deliver(False)
 
     with pytest.raises(ServiceUnavailable):
@@ -732,7 +732,7 @@ def test_wait_for_services_ready_falls_back_when_status_never_publishes(capsys):
     its own wait_for_service check."""
     node = _FakeStatusNode()
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         pass  # nothing ever delivered
 
     _wait_for_services_ready(
@@ -754,7 +754,7 @@ def test_wait_for_services_ready_falls_back_when_field_missing(capsys):
     than being treated as services_ready=false and waited out."""
     node = _FakeStatusNode()
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         node._callback(_FakeStatusMessage(json.dumps({"physics_device": "cpu"})))
 
     _wait_for_services_ready(
@@ -777,7 +777,7 @@ def test_wait_for_services_ready_false_then_true_still_proceeds_with_grace():
     node = _FakeStatusNode()
     deliveries = iter([False, False, True])
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         n.deliver(next(deliveries))
 
     _wait_for_services_ready(

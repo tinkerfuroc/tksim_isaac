@@ -147,6 +147,52 @@ tests/test_run_sim_arena_cli.py tests/test_run_sim_arena_wiring.py` --
 83 passed. No GPU boot for this change (deferred: live confirmation that
 the moved call site actually closes the wall-clock gap end to end).
 
+### Second review round (2026-09-07): `spin_once`'s timeout is keyword-only
+
+**Finding.** Both `_wait_for_services_ready` implementations
+(`tools/gpsr_spawn.py`, `ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/
+scenario_runner.py`) called `spin_once(node, 0.5)` -- a positional
+`timeout_sec`. Real `rclpy.spin_once`'s signature is `spin_once(node, *,
+executor=None, timeout_sec=None)`: `timeout_sec` is keyword-only. Against
+real rclpy this raises `TypeError: spin_once() takes 1 positional argument
+but 2 were given` on the very first loop iteration -- including the
+"already ready" fast path this whole task exists to preserve. Every unit
+test passed anyway because each test double's fake `spin_once(n,
+timeout_sec)` accepts the positional call fine; the mismatch only fires
+against the real function, which no test in the suite exercised for this
+call site.
+
+**Fix.** Both call sites now call `spin_once(node, timeout_sec=0.5)`.
+Grepped the whole branch for other `rclpy.spin_once`/
+`spin_until_future_complete` calls: every other call site in the repo
+already uses the keyword form (`tools/gpsr_spawn.py`'s own
+`spin_until_future_complete` calls, `scenario_runner.py`'s
+`ScenarioRunner.call()`, `controller_reconciler.py`,
+`ompl_plan_smoke.py`, etc.) -- these two were the only positional
+holdouts. Also checked the two helpers' other injected-rclpy-shaped calls
+(`node.create_subscription(msg_type, topic, callback, qos_profile)`,
+`node.destroy_subscription(subscription)`) against real
+`rclpy.node.Node`'s signatures (`inspect.signature` under `python3.10`)
+-- both match; no `*` before the arguments these helpers pass.
+
+**Test-double hardening.** Every fake `spin_once` in
+`tests/test_gpsr_spawn_cli.py` and `tests/test_scenario_runner.py` is now
+declared `def spin_once(n, *, timeout_sec=None)` (was `def spin_once(n,
+timeout_sec)`), so a future regression back to the positional call form
+raises `TypeError` inside the test itself instead of silently passing.
+Verified directly: reverting either production call site back to
+`spin_once(node, 0.5)` against the now-keyword-only doubles fails 6/34
+(`test_gpsr_spawn_cli.py`) and 4/14 (`test_scenario_runner.py`) with
+exactly that `TypeError`; restoring the keyword-argument call makes both
+files pass again (34 passed; 14 passed).
+
+`tests/test_scenario_runner.py` needs real `rclpy`/`simulation_interfaces`
+(`pytest.importorskip`s them) and does not load under the repo's Python
+3.12 uv venv; run under `python3.10` with `PYTHONPATH` carrying
+`.ros-vendor/humble/opt/ros/humble/local/lib/python3.10/dist-packages`
+(carries `simulation_interfaces`) plus the `ros2_ws/src/tinker_sim_bridge`
+and `simulation` source trees.
+
 ## 2026-09-06 — Task #30: boot-time spawn-pose guard (a 171 deg, 1.3 m silent spawn miss)
 
 **Symptom.** A GPSR run observed the robot base at `(-0.69, -2.19)` yaw

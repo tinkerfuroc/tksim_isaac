@@ -376,7 +376,7 @@ def test_scenario_runner_wait_for_services_ready_waits_then_proceeds_on_true() -
     node = _WaitStatusNode()
     deliveries = iter([False, False, True])
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         del timeout_sec
         n.deliver(next(deliveries))
 
@@ -392,7 +392,7 @@ def test_scenario_runner_wait_for_services_ready_waits_then_proceeds_on_true() -
 def test_scenario_runner_wait_for_services_ready_times_out_when_never_ready() -> None:
     node = _WaitStatusNode()
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         del timeout_sec
         n.deliver(False)
 
@@ -413,7 +413,7 @@ def test_scenario_runner_wait_for_services_ready_falls_back_when_status_never_pu
     existing per-call wait_for_service budget, not block the full 300s."""
     node = _WaitStatusNode()
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         del n, timeout_sec  # nothing ever delivered
 
     scenario_runner._wait_for_services_ready(
@@ -432,7 +432,7 @@ def test_scenario_runner_wait_for_services_ready_falls_back_when_status_never_pu
 def test_scenario_runner_wait_for_services_ready_falls_back_when_field_missing() -> None:
     node = _WaitStatusNode()
 
-    def spin_once(n, timeout_sec):
+    def spin_once(n, *, timeout_sec=None):
         del timeout_sec
         n._callback(_WaitStatusMessage(json.dumps({"physics_device": "cpu"})))
 

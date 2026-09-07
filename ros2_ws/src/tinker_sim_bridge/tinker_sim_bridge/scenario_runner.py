@@ -216,7 +216,7 @@ def _wait_for_services_ready(
     try:
         grace_deadline = now() + grace_s
         while not status["seen"] and now() < grace_deadline:
-            spin_once(node, 0.5)
+            spin_once(node, timeout_sec=0.5)
         if not status["seen"]:
             node.get_logger().warning(
                 f"/sim/status/isaac did not publish within {grace_s:.0f}s -- "
@@ -238,7 +238,7 @@ def _wait_for_services_ready(
             )
             deadline = now() + timeout_s
             while not ready["value"] and now() < deadline:
-                spin_once(node, 0.5)
+                spin_once(node, timeout_sec=0.5)
             if not ready["value"]:
                 raise RuntimeError(
                     f"/sim/status/isaac never reported services_ready after "
