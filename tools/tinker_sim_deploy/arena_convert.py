@@ -830,6 +830,96 @@ def author_preview_surface_material(stage) -> int:
     return rewritten
 
 
+def _prepend_translate(xformable, offset) -> None:
+    """Author (or update) ``xformable``'s translate op so it lands *first*
+    in ``xformOpOrder`` -- i.e. outermost, applied last to a point -- ahead
+    of whatever ops (typically a lone unit-scale op, see ``_compose_object``)
+    already exist there.
+
+    Per this module's xformOp convention (top-of-file docstring): the op
+    added first in the "conceptual" translate/rotate/scale sequence ends up
+    outermost, so a translate authored in *this* op's value is expressed
+    directly in the prim's own parent-space units (here: metres, after the
+    existing scale op has already been applied) rather than in the raw
+    pre-scale mesh units. Idempotent: re-running against a prim that already
+    carries a ``recenter`` translate (a standalone repair re-run) updates
+    that op's value in place instead of stacking a second one.
+    """
+    from pxr import UsdGeom
+
+    existing = xformable.GetOrderedXformOps()
+    translate_ops = [op for op in existing if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+    if translate_ops:
+        translate_op = translate_ops[0]
+        translate_op.Set(offset)
+        others = [op for op in existing if op.GetOpType() != UsdGeom.XformOp.TypeTranslate]
+    else:
+        others = list(existing)
+        translate_op = xformable.AddTranslateOp(opSuffix="recenter")
+        translate_op.Set(offset)
+    xformable.SetXformOpOrder([translate_op] + others)
+
+
+def recenter_object_origin(stage) -> tuple[float, float, float]:
+    """Recentre a composed object's geometry onto its rigid-body origin.
+
+    Confirmed live (Task 32 forensics): the raw upstream YCB meshes carry
+    over through this pipeline with an *uncentered* origin -- the scan's
+    turntable/reference frame, not the object's own body. For
+    ``ycb_010_tomato_soup_can`` the collision mesh's own footprint does not
+    even contain the tracked rigid-body origin (it sits ~8.4cm outside the
+    can along Y). Every downstream consumer of that origin -- PhysX rigid-
+    body truth, ``/sim/truth/object_state``, ``/spawn_entity`` placement --
+    is therefore that far off from where the physical object actually is,
+    independent of the collider geometry itself being correct.
+
+    Computes the collision mesh's AABB in the object's root (``/World``)
+    frame and authors a corrective ``xformOp:translate`` on both the
+    ``geom`` and ``collision`` wrapper Xforms (see ``_compose_object``) so
+    the collision bbox's XY centroid lands at (0, 0). The existing Z
+    convention -- base anchored at bbox min Z = 0, i.e. the object's ground
+    contact plane -- is intentional and preserved exactly: the Z component
+    of the translate is ``-bbox_min_z``, which is a no-op (to floating-point
+    noise) for any object already satisfying it, and only ever nudges an
+    already-correct base plane to be exact.
+
+    Applying the identical offset to both wrappers keeps the visual and
+    collision meshes coincident (this is the point of the shared numeric
+    value, not a coincidence). Returns the ``(dx, dy, dz)`` offset applied,
+    for callers that want to log/report it (e.g. a republish migration).
+    """
+    from pxr import Gf, Usd, UsdGeom
+
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError("recentre requires a default prim")
+    geom_root = stage.GetPrimAtPath(default_prim.GetPath().AppendChild("geom"))
+    collision_root = stage.GetPrimAtPath(default_prim.GetPath().AppendChild("collision"))
+    if not collision_root:
+        raise RuntimeError(
+            f"{default_prim.GetPath()}: recentre requires a 'collision' child (see _compose_object)"
+        )
+
+    # ignoreVisibility=True: collision_root is authored invisible (see
+    # _compose_object), and its bound must still be measured regardless --
+    # mirrors the same call in _compose_object's own bounds-overlap guard.
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"], False, True)
+    collision_range = cache.ComputeWorldBound(collision_root).ComputeAlignedRange()
+    cmin, cmax = collision_range.GetMin(), collision_range.GetMax()
+    offset = Gf.Vec3d(
+        -(cmin[0] + cmax[0]) / 2.0,
+        -(cmin[1] + cmax[1]) / 2.0,
+        -cmin[2],
+    )
+
+    for child in (geom_root, collision_root):
+        if not child:
+            raise RuntimeError(f"{default_prim.GetPath()}: recentre requires a 'geom' and 'collision' child")
+        _prepend_translate(UsdGeom.Xformable(child), offset)
+
+    return (float(offset[0]), float(offset[1]), float(offset[2]))
+
+
 def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: Path) -> None:
     """Wrap the two independent raw conversions (DAE visual, STL collision)
     into one flattened ``usd_path``, structured per the collider-placement
@@ -904,6 +994,7 @@ def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: P
     if not found_mesh:
         raise RuntimeError(f"{usd_path}: no collision mesh geometry found under {collision_root.GetPath()}")
     UsdGeom.Imageable(collision_root).MakeInvisible()
+    recenter_object_origin(stage)
     author_object_rigid_body(stage)
     author_preview_surface_material(stage)
 
