@@ -1115,12 +1115,17 @@ class IsaacWholeRobotBackend:
         # "articulation/is_sleeping" name/value pair rather than raising or
         # publishing a placeholder.
         self._articulation_sleep_ids: tuple[int, int] | None = None
-        # Set by step() every tick (observability only, #33): whether that
-        # tick actually pushed changed drive targets to PhysX (the
-        # TargetWriteGate's should_write() result), so
-        # parity_gripper_targets() can publish "articulation/target_write"
-        # without step() itself needing any new bookkeeping beyond this one
-        # assignment.
+        # Self-check (review round 2): if get_physx_simulation_interface().
+        # is_sleeping()'s first successful return value isn't a real bool,
+        # the field is disabled for the rest of this backend's life (never
+        # reset on rebind) -- see _articulation_is_sleeping().
+        self._articulation_is_sleeping_disabled = False
+        self._articulation_is_sleeping_type_logged = False
+        # Set by step() every tick (observability only, #33), reset False
+        # at the top of every step() and only set True once
+        # write_data_to_sim() has returned without raising THIS tick, so
+        # "articulation/target_write" means "PhysX actually received this
+        # tick's targets", not merely "the write gate said yes".
         self._last_target_write = False
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
@@ -3837,15 +3842,16 @@ class IsaacWholeRobotBackend:
         parallel. The URDF expresses this as ``<mimic joint="drive_joint"
         multiplier="1">`` on all five follower joints (the finger joints on -x
         axes, which the importer baked as 180 deg frame flips, so a uniform +1
-        mirror is kinematically right). robot.usd does carry a
-        ``PhysxMimicJointAPI:rotX`` (gearing -1) on all five followers, but it
-        creates NO live PhysX constraint -- corrected 2026-09-07, the prior
+        mirror is kinematically right). Corrected 2026-09-07 (the prior
         "robot.usd dropped every <mimic>" claim here was never actually
-        measured: freezing the five followers at 0 does not stop drive_joint
-        from closing, and driving the followers independently does not move
-        drive_joint either. Whatever the schema authors, the linkage is
-        unconstrained in PhysX, so the coupling is restored here in software
-        regardless.
+        measured): robot.usd authors ``physxMimicJoint:rotX:*`` attribute
+        values (gearing -1.0, referenceJoint drive_joint) on the five
+        followers WITHOUT applying ``PhysxMimicJointAPI`` in apiSchemas; the
+        live Kit stage reports ``PhysxMimicJointAPI:rotX`` among the applied
+        schemas; in both readings PhysX creates NO constraint (measured
+        2026-09-07: followers held at 0 -> drive still closes; followers
+        driven -> drive does not move). The software mirror is the only
+        coupling.
 
         URDF mimic semantics are ``q_follower = multiplier * q_drive`` -- the
         driving joint's ACTUAL angle. Mirroring drive_joint's commanded TARGET
@@ -3891,6 +3897,16 @@ class IsaacWholeRobotBackend:
             self._position_targets[0, index] = follower_target
 
     def step(self) -> None:
+        # Observability only (#33): published as "articulation/target_write"
+        # by parity_gripper_targets(). Reset here, at the very top, so every
+        # return path this tick (including the PHYSICS_READY rebind branch
+        # below, which never reaches a write at all) defaults to "not
+        # delivered"; only set True after write_data_to_sim() itself
+        # returns without raising, further down -- the published value
+        # means "PhysX actually received this tick's targets", not "the
+        # write gate said yes" (review round 3, `_write_targets` alone
+        # cannot tell a caller whether the write actually landed).
+        self._last_target_write = False
         if self.step_profile["enabled"]:
             self.step_profile["_mark"] = self.step_profile["_clock"]()
         if not self._refresh_robot_handles():
@@ -3959,11 +3975,6 @@ class IsaacWholeRobotBackend:
         _write_targets = self._target_write_gate.should_write(
             (self._position_targets, self._velocity_targets, self._effort_targets)
         )
-        # Observability only (#33): published as "articulation/target_write"
-        # by parity_gripper_targets() -- whether THIS tick actually pushed
-        # changed drive targets to PhysX, or the write gate skipped an
-        # unchanged repeat.
-        self._last_target_write = bool(_write_targets)
         effort_writer = getattr(self._robot, "set_joint_effort_target", None)
         if effort_writer is None and self._safety_stopped:
             raise RuntimeError(
@@ -4001,6 +4012,9 @@ class IsaacWholeRobotBackend:
                 )
             )
             self.step_profile["target_writes"] += 1
+            # Only set True once write_data_to_sim() above has returned
+            # without raising -- see the reset at the top of step().
+            self._last_target_write = True
         if _t is not None:
             _sp["write_data"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
@@ -5307,26 +5321,37 @@ class IsaacWholeRobotBackend:
         return self.PARITY_GRIPPER_JOINTS, pos, vel, physx_tau
 
     def _resolve_articulation_sleep_ids(self) -> tuple[int, int] | None:
-        """Best-effort ``(stage_id, prim_id)`` for the articulation root,
-        for ``get_physx_simulation_interface().is_sleeping(stage_id,
+        """Best-effort ``(stage_id, prim_id)`` for the articulation ROOT
+        BODY, for ``get_physx_simulation_interface().is_sleeping(stage_id,
         prim_id)`` -- #33 bench round ahh follow-up (``articulation/
         is_sleeping`` in ``parity_gripper_targets()``). Called once per
         ``_refresh_robot_handles`` rebind, never per tick: a stage/prim
         lookup is not something the hot path should pay for, and the ids
         this resolves don't change between rebinds anyway.
 
+        Review round 2 fix: this used to resolve ``cfg.prim_path`` itself
+        (``/World/Tinker``, a plain Xform with no ``PhysicsRigidBodyAPI``)
+        -- ``is_sleeping`` on a non-rigid-body prim id produced a native
+        ``omni.physx.plugin`` C++ error on EVERY tick on a live bench (not
+        visible to any Python ``except`` here) while the field silently
+        published 0. The actual articulation/body root is
+        ``<prim_path>/base_link`` (confirmed live: apiSchemas include
+        ``PhysicsRigidBodyAPI``/``PhysicsArticulationRootAPI``/
+        ``PhysxArticulationAPI``, see ``$TMP/task33-coupling-test.md``). Only
+        resolve a prim that actually carries ``UsdPhysics.RigidBodyAPI`` at
+        resolve time; anything else (missing prim, missing API, any
+        exception) returns ``None`` and the caller omits the field rather
+        than publishing a placeholder.
+
         No Kit/USD stage is available in a headless unit-test construction
         (``omni.usd``/``pxr`` fail to import there, matching every other
-        lazy-pxr-import method in this class), and even on a live bench the
-        exact PhysX API surface for this is unverified -- this is
-        explicitly a "cheap if available" diagnostic per the task, not a
-        contract anything depends on. Any failure at all returns ``None``;
-        the caller then simply omits the field rather than publishing a
-        placeholder.
+        lazy-pxr-import method in this class) -- this is explicitly a
+        "cheap if available" diagnostic per the task, not a contract
+        anything depends on.
         """
         try:
             import omni.usd
-            from pxr import PhysicsSchemaTools
+            from pxr import PhysicsSchemaTools, UsdPhysics
 
             stage = omni.usd.get_context().get_stage()
             if stage is None:
@@ -5335,11 +5360,13 @@ class IsaacWholeRobotBackend:
                 getattr(getattr(self._robot, "cfg", None), "prim_path", "")
                 or "/World/Tinker"
             )
-            robot_prim = stage.GetPrimAtPath(robot_prim_path)
-            if not robot_prim.IsValid():
+            body_prim = stage.GetPrimAtPath(f"{robot_prim_path}/base_link")
+            if not body_prim.IsValid() or not body_prim.HasAPI(
+                UsdPhysics.RigidBodyAPI
+            ):
                 return None
             stage_id = omni.usd.get_context().get_stage_id()
-            prim_id = PhysicsSchemaTools.sdfPathToInt(robot_prim.GetPath())
+            prim_id = PhysicsSchemaTools.sdfPathToInt(body_prim.GetPath())
             return int(stage_id), int(prim_id)
         except Exception:
             return None
@@ -5348,17 +5375,46 @@ class IsaacWholeRobotBackend:
         """Per-tick ``is_sleeping`` read using the ids cached by
         ``_resolve_articulation_sleep_ids`` -- ``None`` (never published,
         per the "if cheaply available, else omit" contract) if the ids
-        never resolved or the read itself fails.
+        never resolved, the read itself fails, or the field has been
+        disabled by the self-check below.
+
+        Self-check (review round 2): the underlying PhysX binding's return
+        type for this call is unverified beyond one live smoke test: if the
+        interface ever returns something other than a real ``bool`` on the
+        FIRST successful call, that is treated as "this PhysX build's API
+        doesn't mean what we assumed" -- log once and disable the field for
+        the rest of THIS backend's life (not just until the next rebind;
+        ``_articulation_is_sleeping_disabled`` is never reset by
+        ``_refresh_robot_handles``), rather than silently coercing whatever
+        came back through ``bool(...)`` every tick.
         """
+        if getattr(self, "_articulation_is_sleeping_disabled", False):
+            return None
         ids = getattr(self, "_articulation_sleep_ids", None)
         if ids is None:
             return None
         try:
             from omni.physx import get_physx_simulation_interface
 
-            return bool(get_physx_simulation_interface().is_sleeping(ids[0], ids[1]))
+            result = get_physx_simulation_interface().is_sleeping(ids[0], ids[1])
         except Exception:
             return None
+        if not isinstance(result, bool):
+            self._articulation_is_sleeping_disabled = True
+            if not getattr(self, "_articulation_is_sleeping_type_logged", False):
+                self._articulation_is_sleeping_type_logged = True
+                print(
+                    json.dumps(
+                        {
+                            "event": "articulation_is_sleeping_unexpected_type",
+                            "type": type(result).__name__,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+        return result
 
     def parity_gripper_targets(self) -> tuple[list[str], list[float]] | None:
         """Per-tick, per-LAYER position-target readback for the three
@@ -5526,6 +5582,10 @@ class IsaacWholeRobotBackend:
         if getter is None:
             raise AttributeError(f"{getter_name} unavailable on this PhysX view")
         raw = getter()
+        # .numpy() relies on this backend's CPU physics pin: a CUDA tensor's
+        # .numpy() raises (into the caller's batch except), which would
+        # darken this whole topic after one log line if physics ever ran
+        # on GPU here.
         arr = raw.numpy() if hasattr(raw, "numpy") else raw
         return [float(arr[0][index]) for index in indices]
 

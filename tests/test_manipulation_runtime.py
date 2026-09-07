@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -2463,6 +2463,114 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._robot.root_view = None
 
         self.assertIsNone(backend.parity_gripper_targets())
+
+    def test_resolve_articulation_sleep_ids_requires_the_rigid_body_api(
+        self,
+    ) -> None:
+        """Review round 2: the articulation ROOT BODY is
+        ``<prim_path>/base_link``, not the robot's top Xform
+        (``cfg.prim_path`` itself, e.g. ``/World/Tinker``, which carries no
+        ``PhysicsRigidBodyAPI``) -- ``is_sleeping()`` on a non-rigid-body
+        prim id produced a native PhysX C++ error on EVERY tick on a live
+        bench while the field silently published 0. Only a prim that
+        actually carries ``UsdPhysics.RigidBodyAPI`` at resolve time may be
+        resolved; a real in-memory USD stage (this venv's bare ``pxr`` has
+        no ``PhysicsSchemaTools``, so that one call is faked) proves both
+        directions: resolved with the API applied, omitted without it."""
+        from pxr import Usd, UsdPhysics
+
+        backend = _backend()
+        backend._robot.cfg = SimpleNamespace(prim_path="/World/Tinker")
+        stage = Usd.Stage.CreateInMemory()
+        stage.DefinePrim("/World/Tinker", "Xform")
+        body_prim = stage.DefinePrim("/World/Tinker/base_link", "Xform")
+        UsdPhysics.RigidBodyAPI.Apply(body_prim)
+
+        fake_context = SimpleNamespace(
+            get_stage=lambda: stage, get_stage_id=lambda: 12345
+        )
+        fake_usd = ModuleType("omni.usd")
+        fake_usd.get_context = lambda: fake_context
+        fake_schema_tools = SimpleNamespace(sdfPathToInt=lambda path: 987)
+
+        with patch.dict(sys.modules, {"omni.usd": fake_usd}):
+            with patch("omni.usd", fake_usd, create=True):
+                with patch("pxr.PhysicsSchemaTools", fake_schema_tools, create=True):
+                    resolved = backend._resolve_articulation_sleep_ids()
+
+        self.assertEqual(resolved, (12345, 987))
+
+        # Without RigidBodyAPI on base_link, the same stage/context must
+        # omit (return None) instead of resolving a bad prim id.
+        bare_stage = Usd.Stage.CreateInMemory()
+        bare_stage.DefinePrim("/World/Tinker", "Xform")
+        bare_stage.DefinePrim("/World/Tinker/base_link", "Xform")  # no API
+        fake_context2 = SimpleNamespace(
+            get_stage=lambda: bare_stage, get_stage_id=lambda: 1
+        )
+        fake_usd2 = ModuleType("omni.usd")
+        fake_usd2.get_context = lambda: fake_context2
+
+        with patch.dict(sys.modules, {"omni.usd": fake_usd2}):
+            with patch("omni.usd", fake_usd2, create=True):
+                omitted = backend._resolve_articulation_sleep_ids()
+
+        self.assertIsNone(omitted)
+
+    def test_articulation_is_sleeping_self_check_disables_on_non_bool_return(
+        self,
+    ) -> None:
+        """Review round 2: if ``is_sleeping()``'s first successful return
+        value isn't a real ``bool``, the field must be disabled (logged
+        once) for the rest of this backend's life rather than silently
+        coerced through ``bool(...)`` every tick."""
+        backend = _backend()
+        backend._articulation_sleep_ids = (1, 2)
+        fake_iface = SimpleNamespace(is_sleeping=lambda stage_id, prim_id: 1)  # int
+        fake_physx = ModuleType("omni.physx")
+        fake_physx.get_physx_simulation_interface = lambda: fake_iface
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            with patch.dict(sys.modules, {"omni.physx": fake_physx}):
+                first = backend._articulation_is_sleeping()
+                second = backend._articulation_is_sleeping()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertTrue(backend._articulation_is_sleeping_disabled)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the type-mismatch diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "articulation_is_sleeping_unexpected_type")
+        self.assertEqual(payload["type"], "int")
+
+    def test_step_leaves_target_write_false_when_write_data_to_sim_raises(
+        self,
+    ) -> None:
+        """Review round 2: ``articulation/target_write`` must mean
+        "PhysX actually received this tick's targets", not "the write gate
+        said yes" -- a ``write_data_to_sim()`` failure that
+        ``_maybe_recover_simulation_view`` swallows must leave
+        ``_last_target_write`` ``False`` for that tick, and a PRIOR tick's
+        ``True`` must not leak into a failing tick either (reset happens at
+        the very top of every ``step()`` call). Uses the safety-stop path
+        (same minimal-setup shape as
+        ``test_safety_stop_reapplies_explicit_hold_without_reviving_old_epoch``
+        above) so the write is actually attempted without needing the
+        wheel-slew machinery the free-run path requires."""
+        backend = _backend()
+        backend.set_safety_stop(True)
+        backend._last_target_write = True  # stale True from a prior tick
+
+        def _raise(target: object) -> None:
+            raise RuntimeError("injected write_data_to_sim failure")
+
+        backend._robot.write_data_to_sim = _raise
+        backend._maybe_recover_simulation_view = lambda error: True  # swallow
+
+        backend.step()
+
+        self.assertFalse(backend._last_target_write)
 
     def test_usd_camera_pose_to_ros_optical_identity_looks_down_world_minus_z(
         self,

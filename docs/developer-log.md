@@ -633,18 +633,21 @@ observability only):**
   raised to an arbitrary larger number.
 - `_mirror_gripper_mimic_targets()`'s docstring claimed "robot.usd dropped
   every `<mimic>`" as the reason the coupling is restored in software.
-  Measured 2026-09-07: the live stage DOES carry a `PhysxMimicJointAPI:
-  rotX` (gearing -1) on all five followers, but it creates no live PhysX
-  constraint at all (freezing the five followers at 0 does not stop
-  `drive_joint` from closing; driving the followers independently does not
-  move `drive_joint` either) -- the operational conclusion (the coupling
-  must be restored in software regardless) is unchanged, only the reason
-  given was wrong. A second, near-identical claim in the `ImplicitActuatorCfg`
-  comment block earlier in `__init__` (`backend.py` ~1508-1511: "the
-  URDF->USD import dropped every `<mimic>`... no drive and no coupling")
-  makes the same now-inaccurate claim and was left untouched -- out of this
-  round's scope (only the one flagged location was in the brief), noted
-  here for a follow-up pass.
+  Review round 2 (2026-09-07): that claim conflated two different
+  readings and was corrected to be exactly what was measured, no more:
+  robot.usd authors `physxMimicJoint:rotX:*` attribute values (gearing
+  -1.0, referenceJoint drive_joint) on the five followers WITHOUT applying
+  `PhysxMimicJointAPI` in apiSchemas; the live Kit stage reports
+  `PhysxMimicJointAPI:rotX` among the applied schemas; in both readings
+  PhysX creates NO constraint (measured 2026-09-07: followers held at 0 ->
+  drive still closes; followers driven -> drive does not move). The
+  software mirror is the only coupling -- the operational conclusion is
+  unchanged, only the file-vs-runtime claim was corrected. A second,
+  near-identical claim in the `ImplicitActuatorCfg` comment block earlier
+  in `__init__` (`backend.py` ~1508-1511: "the URDF->USD import dropped
+  every `<mimic>`... no drive and no coupling") was deliberately left
+  as-is per this round's brief (only the one flagged location was in
+  scope), noted here for a follow-up pass.
 
 **Tests** (`tests/test_manipulation_runtime.py`): the readback against a
 scrambled (non-contiguous, includes a non-target joint) joint order with
@@ -663,6 +666,70 @@ as the round above: `tests/test_manipulation_runtime.py` 171 passed / 5
 subtests passed (165 baseline + 6 new); `tests/test_ros_gateway.py` /
 `tests/test_gateway_simtime_deadlines.py` unaffected (27 / 7 passed). No
 GPU boot for this diagnostic-only change.
+
+**Review round 2 (2026-09-07, live smoke on the round above): the
+publisher itself was bench-safe (29/29 names, gains 200/20/2.5/2.0 and
+1500/55/2.5/17453.29, 48.9 Hz wall at RTF 0.41, +0.5-0.8 ms/step, zero
+Python tracebacks) but `articulation/is_sleeping` resolved the WRONG
+prim.** `_resolve_articulation_sleep_ids` used `cfg.prim_path` itself
+(`/World/Tinker`, a plain Xform with no `PhysicsRigidBodyAPI`) -- the
+actual articulation/body root is `<prim_path>/base_link` (confirmed by
+the headless coupling probe, `$TMP/task33-coupling-test.md`, which called
+`get_physx_simulation_interface().is_sleeping(stage_id, prim_id)` on
+`/World/Tinker/base_link` successfully). Querying the wrong prim id
+produced a native `omni.physx.plugin [Error] Error executing isSleeping.`
+on EVERY tick in the live smoke -- 11,843 lines in one boot, a C++-level
+log Python's `except` cannot see at all -- while the field kept silently
+publishing 0. Fixed: `_resolve_articulation_sleep_ids` now resolves
+`<prim_path>/base_link` and only accepts it if `body_prim.HasAPI(
+UsdPhysics.RigidBodyAPI)` at resolve time; anything else (wrong prim,
+missing API, any exception) still omits the field rather than publishing
+a placeholder. Also added a one-time self-check: if `is_sleeping()`'s
+first successful return value isn't a real `bool`, the field disables
+itself for the rest of the backend's life (not just until the next
+rebind) and logs once, rather than silently coercing whatever came back
+through `bool(...)` every tick forever.
+
+Also this round: `articulation/target_write` used to latch right after
+the write GATE's decision (`_target_write_gate.should_write()`), before
+`write_data_to_sim()` had even been attempted -- so a swallowed
+`write_data_to_sim()` failure (the existing `_maybe_recover_simulation_view`
+path) would still publish `target_write=1` for a tick that never actually
+reached PhysX. `_last_target_write` is now reset `False` at the very top
+of `step()` (covering every return path, including the PHYSICS_READY
+rebind branch that never attempts a write at all) and only set `True`
+after `write_data_to_sim()` has returned without raising, so the
+published value means "PhysX actually received this tick's targets," not
+"the gate said yes." A one-line comment was also added at the `.numpy()`
+conversion in `_parity_read_dof_param` noting it relies on this backend's
+CPU physics pin (a CUDA tensor's `.numpy()` would raise into the batch
+except and darken the topic after one log line) -- no code change, this
+backend is CPU-physics-only today.
+
+The `_mirror_gripper_mimic_targets()` mimic-comment fix from the round
+above was further corrected to state exactly what was measured, no more
+(see the bullet above this one) -- the coordinator's review caught that
+the first pass's wording implied the shipped file itself carries the
+applied `PhysxMimicJointAPI` schema, which is the OPPOSITE of what the
+offline asset read found (attribute values authored, but the API not
+applied in the file; the API only shows up applied on the live Kit
+stage).
+
+Tests added to `tests/test_manipulation_runtime.py`: a real in-memory USD
+stage (`pxr.Usd.Stage.CreateInMemory()` -- this venv's bare `pxr` has
+`UsdPhysics` but no `PhysicsSchemaTools`, so only that one call is faked
+via `unittest.mock.patch`) with `base_link` carrying `RigidBodyAPI`
+resolves; without the API, omits; a fake `omni.physx` interface returning
+a non-`bool` from `is_sleeping()` disables the field after exactly one
+log line, and a second call confirms it stays disabled without calling
+the interface again; and `write_data_to_sim()` raising (swallowed by a
+stubbed `_maybe_recover_simulation_view`) leaves `_last_target_write`
+`False` even when a prior tick had left it `True`. Same ROS-env pytest
+incantation: `tests/test_manipulation_runtime.py` 174 passed / 5 subtests
+passed (171 baseline + 3 new); `tests/test_ros_gateway.py` /
+`tests/test_gateway_simtime_deadlines.py` unaffected (27 / 7 passed). No
+GPU boot for this diagnostic-only change (the wrong-prim finding above
+came from the coordinator's own live smoke, not a run in this round).
 
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
