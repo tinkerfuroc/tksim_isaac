@@ -284,6 +284,78 @@ subtests passed, 0 failed (up from 117: 5 new cases). No GPU boot for this
 change; PR #18's boot-time `spawn_pose_check` assertion and the
 `spawn_pose_trace` instrumentation above remain in place as the live guard
 that would have caught this immediately had they existed before it did.
+## 2026-09-06 — Task #11 follow-on: truth evaluator only republished the first object in `objects[]`
+
+**Symptom.** Bench round `agw`: `/sim/truth/object_state` (the public topic
+the bench's `truth_recorder.py` subscribes to) only ever carried
+`delivery_object` across 10085 frames, even though the internal stream
+(`/sim/internal/physics_truth`) carried `bench_soup_100_anygrasp_agw_a1` and
+`bench_sugar_box_100_anygrasp_agw_a1` poses from t~309s onward, and
+`ContactTruth` messages for those same bench objects reached the bench log
+fine. So the backend-side spawned-entity truth work (#11, merged as PR #14,
+`backend.py` `_spawned_object_states()`/`truth_state()`) was producing
+correct data that a downstream hop was silently dropping.
+
+**Root cause.** `truth_evaluator.py`'s `TruthFrame.from_mapping` (~line 151)
+parsed only `payload.get("object")` (singular) and never touched
+`payload.get("objects")` (plural) at all. `_on_truth` then published at most
+one `ObjectTruth` per frame from `frame.object`. `backend.py`'s
+`truth_state()` (~3417-3421) deliberately keeps `object` = `objects[0]`
+"unchanged for existing consumers" and appends spawned entities *after* the
+declared ones in `objects[]` (~2941-2944) — so any spawned body is always
+`objects[1:]` and never reaches `frame.object`, and therefore never reaches
+the public topic. Contacts were unaffected because `_on_truth` already
+loops `for contact in frame.contacts` (~512-520); only the object republish
+path lacked the equivalent loop. The internal `/sim/internal/physics_truth`
+stream already carried the full `objects[]` array — this was purely a
+bridge-side republish gap, requiring only a bridge rebuild (no backend or
+scenario changes) to fix.
+
+**Fix** (`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/truth_evaluator.py`):
+`TruthFrame` gained an `objects: tuple[Mapping[str, Any], ...]` field,
+parsed from `payload["objects"]` when present, falling back to a
+single-element tuple built from the legacy singular `payload["object"]`
+otherwise (empty tuple when neither is present). `object` (singular) is
+kept as a back-compat alias = `objects[0] if objects else None`, so nothing
+that reads `frame.object` needed to change. `_on_truth` replaced its single
+`if frame.object is not None: ... publish` block with
+`for obj in frame.objects: ... self._object_pub.publish(...)`, mirroring
+the existing contacts loop; `retained_by_gripper` is set only for the
+element that `is frame.object` (i.e. `objects[0]`) since retention is
+evaluated against a single task object, and `False` for every other
+republished entity.
+
+**Audit of `TruthEvaluatorCore.process`/`evaluate()` metrics.** These still
+key off `frame.object` only (unchanged semantics, as required — this task
+did not touch retention logic). `evaluate()` computes `lift_m`,
+`translation_m`, `drift_m`/`drift_deg`, `stable_window_s`, and `retained`
+against `frame.object`'s pose alone; if per-spawned-object retention
+metrics are ever wanted (e.g. "is `bench_soup_...` also retained"), that is
+a separate, not-yet-scoped change to `evaluate()`/`RetentionMetrics`, not
+covered here.
+
+**Tests** (`tests/test_manipulation_evaluator.py`): `test_objects_plural_parses_declared_and_spawned_entities`
+feeds a payload with `objects = [declared, spawned]` and asserts
+`TruthFrame.objects` has both entries in order with the spawned object's id
+and pose intact, and that `frame.object` still aliases `objects[0]`.
+`test_legacy_singular_object_still_yields_exactly_one_entry` and
+`test_no_object_yields_empty_objects_tuple` cover the back-compat and
+no-object cases. All three fail on the pre-fix code with
+`AttributeError: 'TruthFrame' object has no attribute 'objects'`.
+`test_on_truth_publishes_one_object_truth_per_object_in_frame` is an
+AST-based structural check (rclpy isn't importable in this venv, matching
+the existing test file's pattern for `TruthEvaluatorNode`) asserting
+`_on_truth` contains a `for x in frame.objects:` loop that calls
+`self._object_pub.publish(...)`; it fails on pre-fix code with
+`AssertionError: _on_truth must loop over frame.objects ...`. Full file:
+19 passed (was 15 before this round). No other test file in the repo
+exercises `TruthFrame`/`ObjectTruth`/`_on_truth` behaviorally — the other
+files matching `truth_evaluator` (`test_contract_guard.py`,
+`test_integrated_evidence_index.py`, `test_integrated_static_contracts.py`,
+`test_integrated_ompl_launch_contract.py`, `test_qualification_manifest.py`,
+`test_integrated_qualification.py`) only assert static contract facts
+(node/topic/message-type names, launch cardinality) unaffected by this
+change.
 
 ## 2026-09-06 — Task #27: gripper facade false stall at low RTF (dwell ran on the wall clock)
 
@@ -351,7 +423,8 @@ actuation response, or a lower stall_epsilon combined with sensor noise,
 could still trip a false-ish stall inside that 0.1s SIM margin. Not
 reproduced live; flagged for whoever next tunes `stall_dwell_s` or
 actuation timing.
-## 2026-09-06 — Task #28: contact-report enablement was invisible in the sim log
+
+## 2026-09-06 — Task #11: contact-report enablement was invisible in the sim log
 
 **Symptom.** A whole bench round (`agv`) came back with `/sim/truth/contacts`
 publishing nothing, `/sim/parity/finger_contact` flat zero on every axis for
@@ -389,9 +462,11 @@ diagnostics in `backend.py`, alongside the existing `wheel_collider` /
   falling back to naming the constructor argument for callers
   (`manipulation-core`, probes) that pass `enable_contacts` explicitly.
 - In `_on_contact_report_event`, the first time a pair actually gets
-  recorded (not merely reported and filtered out): `{"event":
-  "contact_report_first_event", "simulation_time": <t>, "pair": [body_a,
-  body_b]}`, gated by a one-shot bool so it never repeats per-contact.
+  recorded (not merely reported and filtered out, and — after the #28 merge
+  below — only counting a monitored ARM/GRASP/EXTRA pair, not a trace-only
+  one): `{"event": "contact_report_first_event", "simulation_time": <t>,
+  "pair": [body_a, body_b]}`, gated by a one-shot bool so it never repeats
+  per-contact.
 
 **Operational rule.** For any round that depends on contacts, restart Isaac
 Sim itself — a task-stack-only restart keeps the prior process's
@@ -405,8 +480,97 @@ Non-GPU coverage added (`tests/test_manipulation_runtime.py`,
 `test_contact_report_first_event_logged_exactly_once`): two recorded contact
 events (found, then persist) against a backend test double produce exactly
 one `contact_report_first_event` line, carrying the expected body-pair and a
-`simulation_time` field. Full suite: 103 passed, 3 subtests passed, 0
-failed.
+`simulation_time` field. Full suite (pre-#28): 103 passed, 3 subtests passed,
+0 failed.
+
+## 2026-09-06 — Task #28: contact reporting only sees the arm and the fingers, not the gripper base or the wrist camera
+
+**Why.** A bench round on `agv` pushed the target object with the robot but
+could not tell *who* pushed it: `_on_contact_report_event`
+(`simulation/tinker_sim_isaac/backend.py`) only records a pair when one
+actor's trailing prim name is in `ARM_CONTACT_BODIES` (`link1..link7`) or
+`GRASP_CONTACT_BODIES` (`left_finger`, `right_finger`, `link_tcp`) — a shove
+from the gripper base, the wrist-camera housing, or anything else past
+`link7` was invisible on `contact_pairs()`/`contact_state()`, and there was
+no way to get the raw per-sample contact points (only the force-weighted
+average) to see where on an object it was pushed.
+
+**Fix: two env-gated additions to the same monitored-pair path, no change
+to default behavior.**
+
+- `TINKER_SIM_CONTACT_EXTRA_BODIES` (comma-separated body names, default
+  empty): adds these names to the boot-time monitored set alongside
+  `ARM_CONTACT_BODIES`/`GRASP_CONTACT_BODIES`, so their pairs are recorded
+  by `contact_pairs()` and aggregated by `contact_state()` under their own
+  name key, the same mechanism `GRASP_CONTACT_BODIES` already use.
+  `left_finger`/`right_finger` aggregation is untouched — this only adds new
+  keys. Unset, `self._contact_extra_bodies == ()` and the monitored set is
+  byte-identical to before.
+- `TINKER_SIM_CONTACT_TRACE_BODIES` (comma-separated names, default empty,
+  ported from a local validation branch, commit 045bf77): any pair where
+  either actor's trailing name matches is recorded on a separate
+  `contact_trace_pairs()` accessor regardless of the monitored set, keeping
+  up to 4 raw per-sample points/normals (`points`, `normals`,
+  `point_count`) instead of only the force-weighted average — for pointing
+  a probe at one object and seeing every pair that touches it, with where.
+  This does not add entries to `contact_pairs()`/`contact_state()`.
+
+Both are logged once at boot as a `contact_bodies` JSON line (next to the
+subscribe call, `enable_contacts` branch) so a live run can confirm which
+bodies are covered without reading source: `{"event": "contact_bodies",
+"arm": [...], "grasp": [...], "extra": [...], "trace": [...]}`.
+
+**Resolved body names for the bench.** The robot's link names come straight
+from `integration/model-bundle-r2/simulator_full_urdf/source-tinker-full.urdf`
+(the sim's `/World/Tinker/{name}` prims are 1:1 with this URDF's `<link>`
+names — `ARM_CONTACT_BODIES`/`GRASP_CONTACT_BODIES` are already exact
+matches to `link1..link7`/`left_finger`/`right_finger`/`link_tcp` there).
+Walking the fixed-joint chain past `link7`:
+- Gripper base / palm: `xarm_gripper_base_link` (`link_eef` -> `gripper_fix`
+  (fixed) -> `xarm_gripper_base_link`, line 556).
+- Wrist camera housing / cam-stand: `xarm_camera_link` (`link_eef` ->
+  `xarm_camera_joint` (fixed) -> `xarm_camera_bottom_screw_frame` ->
+  `xarm_camera_link_joint` (fixed) -> `xarm_camera_link`, line 947) — this is
+  the only body in that chain with collision geometry (a 0.02505 x 0.09 x
+  0.025 m box), and it is what the `cam-stand` wrist-camera preset
+  (`head_camera_aim.py`) repositions; `cam-stand` itself is a TF/render
+  preset, not a separate rigid body.
+- "Wrist housing" pushes proper (i.e. on `link7` itself) are already visible
+  today via `ARM_CONTACT_BODIES` and need no new env value.
+
+Recommended bench value:
+`TINKER_SIM_CONTACT_EXTRA_BODIES=xarm_gripper_base_link,xarm_camera_link`.
+
+**Tests.** `tests/test_manipulation_runtime.py`: unset-env parity
+(`test_contact_extra_bodies_unset_matches_default_monitored_set`), extra
+bodies recorded and aggregated like a grasp body without touching
+`left_finger`/`right_finger`
+(`test_contact_extra_bodies_env_records_pair_like_grasp_bodies`), the ported
+trace-bodies tests
+(`test_contact_report_drops_unmonitored_pair_without_trace_env`,
+`test_contact_report_trace_env_records_unmonitored_pair_with_point_and_normal`),
+and (added on the #11 merge, below) leaf-or-full-path matching for both
+matchers against the bench's actual truth-pair shape, where a spawned
+entity's rigid body IS its own scenario prim path
+(`test_contact_trace_and_extra_bodies_match_full_scenario_prim_path`).
+Full incantation from `pytest-suite-ros-env-incantation`: see below for the
+merged suite's final count (both #11's and #28's tests included).
+
+**Follow-up (same day, on the #11 merge).** `_on_contact_report_event`'s
+`monitored`/`is_traced` checks originally matched `TINKER_SIM_CONTACT_EXTRA_BODIES`
+only by reconstructing `/World/Tinker/{name}` and `TINKER_SIM_CONTACT_TRACE_BODIES`
+only by the actor's own leaf. The bench's real truth pairs carry full prim
+paths on both sides (e.g. `a="/World/Tinker/left_finger"`,
+`b="/World/Scenario/bench_sugar_box_100_anygrasp_agt_a1"` — the spawned
+entity prim itself is the rigid body), and sets
+`TINKER_SIM_CONTACT_TRACE_BODIES`/`_EXTRA_BODIES` to bare leaf names. Added
+`_contact_name_matches(actor_path, names)`: compares the actor's leaf against
+each configured name, accepting either a bare leaf or a full path on the env
+side (falling back to that entry's own leaf) — the same leaf resolution the
+pre-existing `ARM_CONTACT_BODIES`/`GRASP_CONTACT_BODIES` matching already
+relies on structurally. `contact_report_first_event` only fires for a
+monitored (ARM/GRASP/EXTRA) pair — a trace-only pair does not count as the
+backend's first contact.
 
 ## 2026-09-06 — Task #25: bound `controller_reconciler`'s post-success teardown so it cannot wedge the launch chain
 
