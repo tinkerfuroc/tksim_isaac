@@ -155,15 +155,21 @@ def usd_camera_pose_to_ros_optical(
     convention (+Z forward, +Y down), to diff against the ROS TF frames
     ``xarm_camera_color_optical_frame``/``_aimed`` in one recording.
 
-    *position*/*quaternion_wxyz* are the render camera prim's own
-    ``ComputeLocalToWorldTransform`` (the exact transform the renderer
-    reads) -- native USD camera convention, looks down -Z with +Y up. This
-    is a pure relabelling of that SAME prim's axes about its OWN current
-    local X, not a re-derivation of the un-corrected mount frame: it stays
-    correct even when a ``TINKER_SIM_WRIST_CAMERA_AIM`` preset
-    (tool-forward/cam-stand) has rotated the render camera away from the
-    raw URDF chain, because whatever the prim actually renders from is what
-    gets relabelled.
+    *position*/*quaternion_wxyz* are the render camera prim's actual world
+    pose -- native USD camera convention, looks down -Z with +Y up --
+    however the caller obtained it: a direct ``ComputeLocalToWorldTransform``
+    for a world-fixed mount (cached once at init, see
+    ``_camera_world_pose_static``), or, for a robot-mounted camera, that
+    SAME prim's world pose recomposed every tick from a live
+    articulation-tensor link pose and its cached static mount offset (see
+    ``camera_optical_pose_world`` -- Task #36 fixed the latter to no longer
+    read a live pxr transform on a physics-driven prim, which goes stale
+    under the default fabric-on config). Either way this is a pure
+    relabelling of that SAME prim's axes about its OWN current local X, not
+    a re-derivation of the un-corrected mount frame: it stays correct even
+    when a ``TINKER_SIM_WRIST_CAMERA_AIM`` preset (tool-forward/cam-stand)
+    has rotated the render camera away from the raw URDF chain, because
+    whatever the prim actually renders from is what gets relabelled.
 
     Composes ``quaternion_wxyz (x) OPTICAL_TO_USD_CAMERA_WXYZ`` -- a
     Hamilton product with the flip on the RIGHT, i.e. applied about the
@@ -173,6 +179,77 @@ def usd_camera_pose_to_ros_optical(
     since a 180 deg rotation is its own inverse.
     """
     return position, _quaternion_multiply_wxyz(quaternion_wxyz, OPTICAL_TO_USD_CAMERA_WXYZ)
+
+
+def _compose_wxyz(
+    parent_position: tuple[float, float, float],
+    parent_quaternion_wxyz: tuple[float, float, float, float],
+    local_position: tuple[float, float, float],
+    local_quaternion_wxyz: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """``parent_T_world (x) local_T_parent`` -> world pose of the local frame.
+
+    *local_position*/*local_quaternion_wxyz* are expressed in *parent*'s own
+    frame (e.g. ``body_T_camera``); *parent_position*/*parent_quaternion_wxyz*
+    is that frame's own world pose (e.g. a live ``body_pos_w``/
+    ``body_quat_w`` tensor read). Pure arithmetic -- no USD/physics query --
+    so the per-tick wrist-camera pose composition needs no pxr call at all.
+    """
+    rotated = _rotate_by_quaternion(parent_quaternion_wxyz, local_position)
+    world_position = (
+        parent_position[0] + rotated[0],
+        parent_position[1] + rotated[1],
+        parent_position[2] + rotated[2],
+    )
+    world_quaternion = _quaternion_multiply_wxyz(
+        parent_quaternion_wxyz, local_quaternion_wxyz
+    )
+    return world_position, world_quaternion
+
+
+def _pose_from_matrix(
+    matrix: Any,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Decompose a ``Gf.Matrix4d`` into ``(position, quaternion_wxyz)``.
+
+    Shared by every one-time pxr transform read in ``CameraRig.initialize``
+    (world-fixed camera pose, mount-to-camera static offset) -- never called
+    per tick.
+    """
+    translation = matrix.ExtractTranslation()
+    rotation = matrix.ExtractRotationQuat().GetNormalized()
+    position = (float(translation[0]), float(translation[1]), float(translation[2]))
+    quaternion_wxyz = (
+        float(rotation.GetReal()),
+        float(rotation.GetImaginary()[0]),
+        float(rotation.GetImaginary()[1]),
+        float(rotation.GetImaginary()[2]),
+    )
+    return position, quaternion_wxyz
+
+
+def _rigid_body_ancestor(prim: Any) -> Any | None:
+    """Nearest ancestor of *prim* (inclusive) carrying ``UsdPhysics.RigidBodyAPI``.
+
+    Task #36: a camera spec's ``mount_prim`` (e.g. the D435 macro's optical
+    frame) is frequently several FIXED joints below the actual
+    PhysX-simulated link -- the URDF importer keeps those intermediate
+    frames as plain child ``Xform`` prims welded onto one real rigid body.
+    That rigid body is the only prim in the chain PhysX writes a live world
+    pose for (``data.body_pos_w``/``body_quat_w``); everything below it
+    (including ``mount_prim`` and the render camera itself) is static
+    relative to it. Returns ``None`` if no ancestor up to the stage root
+    carries the API -- the caller fails soft (no tensor-backed pose for
+    that camera).
+    """
+    from pxr import UsdPhysics
+
+    candidate = prim
+    while candidate is not None and candidate.IsValid():
+        if candidate.HasAPI(UsdPhysics.RigidBodyAPI):
+            return candidate
+        candidate = candidate.GetParent()
+    return None
 
 
 def camera_xform_ops(
@@ -630,12 +707,33 @@ class CameraRig:
             raise ValueError("camera rig requires at least one camera spec")
         self.specs = tuple(specs)
         self._sensors: dict[str, Any] = {}
-        #: Task #36: each spec's actual render-camera prim path (set by
-        #: ``initialize()``), so ``camera_optical_pose_world()`` can read the
-        #: SAME prim's live ``ComputeLocalToWorldTransform`` the renderer
-        #: itself uses -- no separate mount-prim search or duplicated
-        #: correction-preset logic.
-        self._camera_prim_paths: dict[str, str] = {}
+        #: Task #36 fix: under the default fabric-on config
+        #: (``/physics/updateToUsd=False``, see the developer log) PhysX
+        #: stops writing rigid-body transforms back into USD, so a per-tick
+        #: ``ComputeLocalToWorldTransform`` on a physics-driven prim can
+        #: read a stale (e.g. spawn-time) pose. Robot-mounted cameras
+        #: therefore get their WORLD pose from the fabric-independent
+        #: articulation tensors instead (``IsaacWholeRobotBackend.
+        #: body_pose_world``); only the STATIC offset from that body to the
+        #: render camera is ever read from USD, once, here in
+        #: ``initialize()`` (a plain pxr read is fine for something that
+        #: never changes after boot). ``_mount_body_names`` is the
+        #: articulation body name each camera's fixed mount chain resolves
+        #: to (see ``_rigid_body_ancestor``); ``_mount_local_pose`` is that
+        #: body's static local pose (position, quaternion_wxyz) of the
+        #: render camera prim, i.e. ``body_T_camera``.
+        self._mount_body_names: dict[str, str] = {}
+        self._mount_local_pose: dict[
+            str, tuple[tuple[float, float, float], tuple[float, float, float, float]]
+        ] = {}
+        #: World-fixed cameras (``mount_translation`` set, e.g. the arena
+        #: spectator) have no articulation body at all -- their render
+        #: prim's world pose never changes after ``initialize()`` authors
+        #: it, so it is cached directly here instead of re-reading pxr (or
+        #: needing a body lookup) on every tick.
+        self._camera_world_pose_static: dict[
+            str, tuple[tuple[float, float, float], tuple[float, float, float, float]]
+        ] = {}
         #: Camera names ``camera_optical_pose_world()`` has already logged an
         #: "unresolved prim" diagnostic for, so it fires once per backend
         #: life rather than once per publish tick (matches
@@ -791,6 +889,9 @@ class CameraRig:
                     UsdGeom.XformOp.PrecisionDouble
                 ).Set(Gf.Vec3d(*spec.mount_translation))
                 mount_path = mount_prim.GetPath().pathString
+                # World-fixed: no articulation body to track (see
+                # ``_camera_world_pose_static`` below).
+                mount_search_prim = None
             else:
                 mounts = [
                     prim
@@ -803,8 +904,8 @@ class CameraRig:
                         f"/World/Tinker, found {len(mounts)}"
                     )
                 mount_path = mounts[0].GetPath().pathString
+                mount_search_prim = mounts[0]
             camera_path = f"{mount_path}/rtx_camera"
-            self._camera_prim_paths[spec.name] = camera_path
             camera = RtxCamera(camera_path, tick_rate=float(spec.tick_rate_hz))
             prim = stage.GetPrimAtPath(camera_path)
             usd_camera = UsdGeom.Camera(prim)
@@ -839,6 +940,31 @@ class CameraRig:
                     xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
                         Gf.Vec3d(*value)
                     )
+            # Task #36: cache this camera's world-pose derivation ONCE, now,
+            # while a plain pxr read is still safe (either it never changes
+            # again -- the world-fixed case -- or it is exactly the static
+            # offset a live tensor-backed body pose gets composed with every
+            # tick; see ``camera_optical_pose_world`` and the module
+            # docstring on ``_rigid_body_ancestor``).
+            if mount_search_prim is None:
+                matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+                    Usd.TimeCode.Default()
+                )
+                self._camera_world_pose_static[spec.name] = _pose_from_matrix(matrix)
+            else:
+                body_prim = _rigid_body_ancestor(mount_search_prim)
+                if body_prim is not None:
+                    body_matrix = UsdGeom.Xformable(body_prim).ComputeLocalToWorldTransform(
+                        Usd.TimeCode.Default()
+                    )
+                    camera_matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+                        Usd.TimeCode.Default()
+                    )
+                    # Row-vector USD convention: world = local * parent_world,
+                    # so local = world * parent_world^-1.
+                    local_matrix = camera_matrix * body_matrix.GetInverse()
+                    self._mount_body_names[spec.name] = body_prim.GetName()
+                    self._mount_local_pose[spec.name] = _pose_from_matrix(local_matrix)
             color_only = is_color_only(spec)
             if color_only:
                 self._color_only.add(spec.name)
@@ -1019,28 +1145,71 @@ class CameraRig:
             wp.synchronize_stream(sync_device)
         return frames
 
+    def mount_body_name(self, name: str) -> str | None:
+        """Articulation body *name*'s render camera is fixed to (see
+        ``initialize()`` / ``_rigid_body_ancestor``).
+
+        Callers (``ros_gateway``) use this to fetch that body's live,
+        fabric-independent world pose from the backend
+        (``IsaacWholeRobotBackend.body_pose_world``) and pass it into
+        ``camera_optical_pose_world``. ``None`` for a world-fixed camera (no
+        moving mount -- its pose is cached directly, see
+        ``_camera_world_pose_static``) or before ``initialize()`` has
+        resolved *name*.
+        """
+        return self._mount_body_names.get(name)
+
     def camera_optical_pose_world(
-        self, name: str
+        self,
+        name: str,
+        body_pose_world: tuple[
+            tuple[float, float, float], tuple[float, float, float, float]
+        ]
+        | None = None,
     ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
         """World pose of *name*'s render camera, in the ROS optical convention.
 
         Task #36 diagnostic: lets the grasp bench diff the sim's ACTUAL
-        rendered wrist-camera pose against the ROS TF
+        wrist-camera pose against the ROS TF
         ``xarm_camera_color_optical_frame``/``_aimed`` in one recording, in
-        the debugging of a constant ~15 mm base-x perception bias. Reads the
-        SAME ``rtx_camera`` prim's live ``ComputeLocalToWorldTransform`` the
-        renderer itself uses (not the mount prim, and not a recomputation
-        from the spec's static ``mount_rotation_wxyz`` -- this is the actual
-        current pose, including whatever the arm's forward kinematics and
-        any ``TINKER_SIM_WRIST_CAMERA_AIM`` preset put it at this tick), then
-        converts via ``usd_camera_pose_to_ros_optical``.
+        the debugging of a constant ~15 mm base-x perception bias.
+
+        Fabric-safe by construction (fixed during review of the first cut of
+        this publisher, which read a live ``ComputeLocalToWorldTransform`` on
+        the physics-driven render prim every tick -- silently stale under the
+        default fabric-on config, where PhysX stops writing rigid-body
+        transforms back into USD). The world pose is now composed from two
+        pieces, NEITHER of which touches pxr on this call:
+
+        * *body_pose_world* -- ``(position, quaternion_xyzw)``, scalar-last
+          (``IsaacWholeRobotBackend``'s own convention), of the articulation
+          body the camera is fixed to, as of THIS tick -- the caller reads
+          this from the fabric-independent ``body_pos_w``/``body_quat_w``
+          tensors (``backend.body_pose_world(self.mount_body_name(name))``),
+          the same source ``parity_tcp_frame`` uses. Reordered to this
+          module's own scalar-first convention before composing. ``None``
+          for a world-fixed camera (see ``_camera_world_pose_static``) or if
+          the caller has no pose for this tick (fails soft, same as an
+          unresolved mount).
+        * the STATIC offset from that body to the render camera
+          (``_mount_local_pose``), read from USD exactly once, in
+          ``initialize()``, while a plain pxr read is still safe -- it never
+          changes again, including any ``TINKER_SIM_WRIST_CAMERA_AIM``
+          preset, which is baked into the spec (hence the offset) before
+          ``initialize()`` ever authors the prim.
 
         Fails soft: returns ``None`` (logged once per camera name) if
-        ``initialize()`` has not run for *name* or its prim is no longer
-        valid -- callers should skip publishing that tick, not raise.
+        *name* was not resolved by ``initialize()`` (world-fixed or
+        robot-mounted) or -- for a robot-mounted camera -- *body_pose_world*
+        is ``None`` this tick.
         """
-        path = self._camera_prim_paths.get(name)
-        if path is None:
+        static_pose = self._camera_world_pose_static.get(name)
+        if static_pose is not None:
+            position, quaternion_wxyz = static_pose
+            return usd_camera_pose_to_ros_optical(position, quaternion_wxyz)
+
+        mount_pose = self._mount_local_pose.get(name)
+        if mount_pose is None or body_pose_world is None:
             if name not in self._optical_pose_missing_logged:
                 self._optical_pose_missing_logged.add(name)
                 print(
@@ -1051,36 +1220,20 @@ class CameraRig:
                     flush=True,
                 )
             return None
-        import omni.usd
-        from pxr import Usd, UsdGeom
 
-        stage = omni.usd.get_context().get_stage()
-        prim = stage.GetPrimAtPath(path)
-        if not prim.IsValid():
-            if name not in self._optical_pose_missing_logged:
-                self._optical_pose_missing_logged.add(name)
-                print(
-                    json.dumps(
-                        {
-                            "event": "camera_optical_pose_unresolved",
-                            "camera": name,
-                            "prim_path": path,
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-            return None
-        matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
-            Usd.TimeCode.Default()
+        body_position, body_quaternion_xyzw = body_pose_world
+        # The backend's body_pos_w/body_quat_w are scalar-last (xyzw); this
+        # module's own convention (mount_rotation_wxyz, _mount_local_pose)
+        # is scalar-first -- reorder once here, at the one seam between the
+        # two conventions.
+        body_quaternion_wxyz = (
+            body_quaternion_xyzw[3],
+            body_quaternion_xyzw[0],
+            body_quaternion_xyzw[1],
+            body_quaternion_xyzw[2],
         )
-        translation = matrix.ExtractTranslation()
-        rotation = matrix.ExtractRotationQuat().GetNormalized()
-        position = (float(translation[0]), float(translation[1]), float(translation[2]))
-        render_quaternion_wxyz = (
-            float(rotation.GetReal()),
-            float(rotation.GetImaginary()[0]),
-            float(rotation.GetImaginary()[1]),
-            float(rotation.GetImaginary()[2]),
+        local_position, local_quaternion_wxyz = mount_pose
+        world_position, world_quaternion_wxyz = _compose_wxyz(
+            body_position, body_quaternion_wxyz, local_position, local_quaternion_wxyz
         )
-        return usd_camera_pose_to_ros_optical(position, render_quaternion_wxyz)
+        return usd_camera_pose_to_ros_optical(world_position, world_quaternion_wxyz)

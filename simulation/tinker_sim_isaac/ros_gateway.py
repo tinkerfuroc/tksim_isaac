@@ -1332,10 +1332,19 @@ class RosStandardGateway:
             # Task #36: same gate/cadence as the TCP parity block above.
             # Fails soft: self._camera_rig is None with cameras off, and
             # camera_optical_pose_world() returns None (logged once) until
-            # the wrist camera's render prim is resolved.
+            # the wrist camera's mount is resolved. The mount BODY's live
+            # pose comes from the backend's fabric-independent articulation
+            # tensors (same source parity_tcp_frame uses above), not a pxr
+            # prim read -- see camera_rig.CameraRig.camera_optical_pose_world.
             if self._camera_rig is not None:
+                mount_body = self._camera_rig.mount_body_name("wrist_camera")
+                mount_body_pose = (
+                    self.backend.body_pose_world(mount_body)
+                    if mount_body is not None
+                    else None
+                )
                 wrist_camera_pose = self._camera_rig.camera_optical_pose_world(
-                    "wrist_camera"
+                    "wrist_camera", mount_body_pose
                 )
                 if wrist_camera_pose is not None:
                     position, quaternion_wxyz = wrist_camera_pose

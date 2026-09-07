@@ -156,6 +156,80 @@ diagnostic-only change; the bench recording against the live TF frames is
 the follow-up that actually answers the 15 mm bias question this publisher
 exists for.
 
+### Task #36 follow-up — Fabric-safe pose (mount read once at init)
+
+**The problem.** Review of the addendum above found that
+`camera_optical_pose_world()`'s per-tick `UsdGeom.Xformable(prim).
+ComputeLocalToWorldTransform()` reads the wrist camera's `rtx_camera`
+prim -- a child of an articulation link, i.e. a physics-driven prim. Under
+the default fabric-on config (`resolve_use_fabric()` in `backend.py`;
+`/physics/updateToUsd=False`, see the Task #35 entry and the #11/#26/#30
+history of this exact failure mode in this codebase) PhysX stops writing
+rigid-body transforms back into USD every step, so a plain pxr read
+returns the LAST-WRITTEN (e.g. spawn-time) pose, not the live one -- silently
+stale during exactly the arm motion this publisher exists to diagnose.
+`parity_tcp_frame()` (Task #35) avoids this by reading
+`body_pos_w`/`body_quat_w` off the articulation data directly; the camera
+code did not.
+
+**The fix.** `camera_optical_pose_world()` no longer touches pxr per tick.
+Instead, at `initialize()` time -- while PhysX has not yet stepped and a
+plain USD read is still legitimate, and because the offset in question
+never changes again after boot -- the rig resolves, for each robot-mounted
+camera, the nearest ancestor prim of its `mount_prim` search result that
+carries `UsdPhysics.RigidBodyAPI` (`_rigid_body_ancestor()`; a camera
+spec's named mount, e.g. `xarm_camera_color_optical_frame`, is typically
+several FIXED joints below the actual PhysX-simulated link the URDF
+importer keeps as one rigid body -- exactly why the task description
+suggested checking `xarm_camera_link`/`link_eef`/`link7` rather than
+assuming the spec's own `mount_prim` name is a tensor body). It then reads,
+ONCE, `camera_matrix * body_matrix.GetInverse()` (row-vector USD
+convention: `world = local * parent_world`) to get the STATIC
+`body_T_camera` offset, decomposed and cached as
+`CameraRig._mount_local_pose[name]` (position, quaternion_wxyz) alongside
+the resolved body's name in `_mount_body_names[name]`. World-fixed cameras
+(the arena spectator; `mount_translation` set, no articulation body at
+all) get their entire world pose cached directly at init instead
+(`_camera_world_pose_static`), since it is static too and needs no body
+lookup.
+
+Every tick, `ros_gateway.py` now does: `body_name =
+camera_rig.mount_body_name("wrist_camera")`, then `backend.body_pose_world
+(body_name)` -- a new `IsaacWholeRobotBackend` method reading the SAME
+`body_pos_w`/`body_quat_w` tensors as `parity_tcp_frame` (Fabric-independent,
+scalar-last quaternion, `None` if the body is not in `data.body_names`) --
+and passes that live pose into `camera_optical_pose_world(name,
+body_pose_world)`, which composes it with the cached static offset
+(`_compose_wxyz`, pure arithmetic: rotate the local offset by the link's
+current world orientation, add; multiply the quaternions) before the same
+`usd_camera_pose_to_ros_optical()` conversion as before. `None` on either
+side (unresolved mount, or the body's tensor not found this tick) fails
+soft exactly as before -- one `camera_optical_pose_unresolved` log latch,
+no publish that tick.
+
+**Tests** (`tests/test_manipulation_runtime.py`): two new composition
+tests -- `_mount_local_pose`/`_mount_body_names` set directly (bypassing
+`initialize()`, no Kit needed), a known link pose (position + scalar-last
+quaternion, matching `body_pose_world`'s own convention) composed with a
+known static mount offset, checked against a hand-derived (independently,
+via plain rotation matrices, not this module's own quaternion helpers)
+expectation for position and the optical +z/+y axes -- one with the link
+at identity, one with the link yawed 90 deg about world Z and a mount
+offset with an X component (discriminates a left- vs right-multiply
+composition bug the boresight-only check cannot); and a regression test
+that monkeypatches `UsdGeom.Xformable.ComputeLocalToWorldTransform` to
+raise and confirms a normal per-tick call still succeeds -- proving the
+per-tick path is pure Python. The existing publisher/env-gate/fail-soft
+tests were adjusted for the new two-argument `camera_optical_pose_world`
+signature and the new `mount_body_name`/`body_pose_world` plumbing
+(fakes updated, same assertions). Full suite:
+`tests/test_manipulation_runtime.py` 152 passed, 5 subtests passed, 0
+failed (149 passed before this follow-up's 3 new tests);
+`tests/test_camera_rig.py` and the other camera test files unaffected (119
+passed, 1 subtests passed). No GPU boot for this diagnostic-only change;
+the live bench recording against `updateToUsd=False` fabric-on is the
+follow-up that actually validates the fix tracks the arm during motion.
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping

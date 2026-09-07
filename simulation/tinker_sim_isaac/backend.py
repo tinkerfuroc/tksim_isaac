@@ -4814,6 +4814,46 @@ class IsaacWholeRobotBackend:
             ),
         }
 
+    def body_pose_world(
+        self, name: str
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """World pose (position, quaternion_xyzw) of an arbitrary articulation
+        body, read from the SAME ``body_pos_w``/``body_quat_w`` tensors as
+        ``parity_tcp_frame``/``_robot_truth_state`` (view-free, Fabric-
+        independent -- not a separate PhysX query).
+
+        Task #36 fix: the wrist-camera parity pose composes this (the live
+        pose of the articulation body the camera is fixed to) with the
+        camera's own static mount offset, instead of a raw pxr prim read on
+        the physics-driven render prim itself -- that read goes stale under
+        the default fabric-on config (``/physics/updateToUsd=False``), since
+        PhysX stops writing rigid-body transforms back into USD.
+
+        Returns ``None`` if *name* is not in ``data.body_names`` -- callers
+        should skip publishing that tick, not raise (same fail-soft contract
+        as ``parity_tcp_frame``).
+        """
+        data = self._robot.data
+        body_names = tuple(getattr(data, "body_names", ()))
+        if name not in body_names:
+            return None
+        index = body_names.index(name)
+        position = tuple(
+            float(value)
+            for value in self._torch_value(data.body_pos_w)[0, index]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        quaternion = tuple(
+            float(value)
+            for value in self._torch_value(data.body_quat_w)[0, index]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        return position, quaternion
+
     def truth_state(self, evaluator_token: object) -> Mapping[str, object]:
         if evaluator_token is not self.TRUTH_TOKEN:
             raise PermissionError("truth state is evaluator-only")

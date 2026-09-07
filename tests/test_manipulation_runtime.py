@@ -45,6 +45,7 @@ from tinker_sim_isaac.backend import (
     spawn_root_rot_xyzw,
 )
 from tinker_sim_isaac.camera_rig import (
+    OPTICAL_TO_USD_CAMERA_WXYZ,
     CameraRig,
     _rotate_by_quaternion,
     load_camera_specs,
@@ -2028,6 +2029,120 @@ class ManipulationRuntimeTest(unittest.TestCase):
         for actual, expected in zip(forward, (0.0, 0.0, -1.0)):
             self.assertAlmostEqual(actual, expected, places=9)
 
+    def test_camera_optical_pose_world_composes_link_and_mount_pose(self) -> None:
+        """Task #36 fix: camera_optical_pose_world's per-tick composition
+        (a known articulation-tensor link pose (position + SCALAR-LAST
+        quaternion, matching IsaacWholeRobotBackend.body_pose_world) with a
+        known static local mount transform (position + SCALAR-FIRST
+        quaternion, matching what initialize() would cache)), checked
+        against a hand-derived expectation -- position and the optical
+        +z/+y axes -- with the link at identity."""
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+        # Mimic exactly what initialize() would have cached for a
+        # robot-mounted camera: mount 0.5 m along the link's own local +Z,
+        # oriented by the standard REP-103 mount flip (the real value every
+        # spec's mount_rotation_wxyz happens to equal today).
+        rig._mount_body_names["wrist_camera"] = "xarm_camera_link"
+        rig._mount_local_pose["wrist_camera"] = (
+            (0.0, 0.0, 0.5),
+            OPTICAL_TO_USD_CAMERA_WXYZ,
+        )
+        link_position = (10.0, 20.0, 0.0)
+        link_quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)  # identity, scalar-last
+
+        position, quaternion_wxyz = rig.camera_optical_pose_world(
+            "wrist_camera", (link_position, link_quaternion_xyzw)
+        )
+
+        for actual, expected in zip(position, (10.0, 20.0, 0.5)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        for actual, expected in zip(forward, (0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(down, (0.0, 1.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_camera_optical_pose_world_composes_link_and_mount_pose_with_yaw(
+        self,
+    ) -> None:
+        """Same composition as above, but with the link yawed 90 deg about
+        world Z and a mount offset with an X component -- a left- vs
+        right-multiply bug in the link/mount composition (unlike the
+        optical-flip composition already covered above) would rotate the
+        offset the wrong way and land 'down' on the wrong world axis, while
+        leaving the boresight (the mount's own +Z, unaffected by a Z yaw)
+        unable to discriminate it -- hence checking both.
+
+        Independently hand-derived (rotation matrices, not this module's
+        quaternion helpers): a 90 deg yaw about +Z maps local (x, y) ->
+        (-y, x), so the mount's local (0.1, 0.0) offset lands at world
+        (0.0, 0.1); the mount's own +Z boresight is untouched by a Z yaw
+        (still world +Z); its local +Y (down, once flipped into the
+        optical frame) is yawed onto world -X.
+        """
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+        rig._mount_body_names["wrist_camera"] = "xarm_camera_link"
+        rig._mount_local_pose["wrist_camera"] = (
+            (0.1, 0.0, 0.5),
+            OPTICAL_TO_USD_CAMERA_WXYZ,
+        )
+        half = math.pi / 4.0
+        link_quaternion_xyzw = (0.0, 0.0, math.sin(half), math.cos(half))
+        link_position = (10.0, 20.0, 0.0)
+
+        position, quaternion_wxyz = rig.camera_optical_pose_world(
+            "wrist_camera", (link_position, link_quaternion_xyzw)
+        )
+
+        for actual, expected in zip(position, (10.0, 20.1, 0.5)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        for actual, expected in zip(forward, (0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(down, (-1.0, 0.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_camera_optical_pose_world_per_tick_never_touches_pxr(self) -> None:
+        """Regression test for the review finding on commit f8277df: the
+        first cut of this publisher read a live ``ComputeLocalToWorldTransform``
+        on the physics-driven render prim every tick, which goes stale under
+        the default fabric-on config (``/physics/updateToUsd=False`` --
+        PhysX stops writing rigid-body transforms back into USD). The fix
+        composes a tensor-sourced link pose with a mount offset cached once
+        at init; this test proves the per-tick call path is pure Python by
+        monkeypatching ``UsdGeom.Xformable.ComputeLocalToWorldTransform`` to
+        raise and confirming a normal (already-"initialized") call still
+        succeeds."""
+        from pxr import UsdGeom
+
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+        rig._mount_body_names["wrist_camera"] = "xarm_camera_link"
+        rig._mount_local_pose["wrist_camera"] = (
+            (0.0, 0.0, 0.5),
+            OPTICAL_TO_USD_CAMERA_WXYZ,
+        )
+
+        def _must_not_be_called(self, *args, **kwargs):
+            raise AssertionError(
+                "camera_optical_pose_world's per-tick path must not call "
+                "ComputeLocalToWorldTransform -- that read is fabric-unsafe "
+                "on a physics-driven prim; see commit f8277df's review"
+            )
+
+        with patch.object(
+            UsdGeom.Xformable,
+            "ComputeLocalToWorldTransform",
+            _must_not_be_called,
+        ):
+            result = rig.camera_optical_pose_world(
+                "wrist_camera",
+                ((10.0, 20.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+            )
+
+        self.assertIsNotNone(result)
+
     def test_camera_optical_pose_world_fails_soft_and_logs_once_before_initialize(
         self,
     ) -> None:
@@ -2108,14 +2223,29 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def parity_tcp_frame(self):
                 return None  # keep this test focused on the camera block
 
+            def body_pose_world(self, name):
+                assert name == "xarm_camera_link"
+                # Arbitrary tensor-style body pose; the fake camera rig
+                # below ignores it and returns a fixed pose -- this test
+                # exercises the gateway's plumbing (mount lookup -> backend
+                # tensor read -> camera_rig composition -> publish), not
+                # CameraRig's own composition math (see
+                # test_camera_optical_pose_world_composes_link_and_mount_pose).
+                return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+
         class _FakeWristCameraRig:
             def __init__(self, pose) -> None:
                 self._pose = pose
                 self.calls = 0
 
-            def camera_optical_pose_world(self, name):
+            def mount_body_name(self, name):
+                assert name == "wrist_camera"
+                return "xarm_camera_link"
+
+            def camera_optical_pose_world(self, name, body_pose_world=None):
                 self.calls += 1
                 assert name == "wrist_camera"
+                assert body_pose_world == ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
                 return self._pose
 
         class _RecordingPublisher:
@@ -2250,12 +2380,22 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def parity_tcp_frame(self):
                 return None
 
+            def body_pose_world(self, name):
+                raise AssertionError(
+                    "must not be called: _UnresolvedCameraRig.mount_body_name "
+                    "returns None, so there is no body to look up"
+                )
+
         class _UnresolvedCameraRig:
             def __init__(self) -> None:
                 self.calls = 0
 
-            def camera_optical_pose_world(self, name):
+            def mount_body_name(self, name):
+                return None  # not yet resolved by initialize()
+
+            def camera_optical_pose_world(self, name, body_pose_world=None):
                 self.calls += 1
+                assert body_pose_world is None
                 return None  # unresolved this tick
 
         class _RecordingPublisher:
