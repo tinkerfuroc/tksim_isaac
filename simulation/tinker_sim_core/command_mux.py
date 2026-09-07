@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import logging
 import math
 import secrets
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+# The mux is a plain library (no ROS dependency), so it logs through the
+# standard `logging` module rather than an rclpy node logger. A consumer that
+# wants these lines in its own log (e.g. the command gateway node) attaches a
+# handler to this logger name -- see CommandGateway's forwarding handler.
+logger = logging.getLogger(__name__)
+
+# Rate limit for the repeated "still stale" line so a long-held source does
+# not spam one line per composed frame (up to 150 Hz at the gateway).
+STALE_HOLD_ACTIVE_LOG_PERIOD_S = 1.0
 
 COMMAND_FRAME_PREFIX = "tinker_command_epoch:"
 COMMAND_SNAPSHOT_PREFIX = "snapshot:"
@@ -210,6 +220,11 @@ class JointCommandMux:
         self._latest: dict[str, tuple[float, JointCommand]] = {}
         self._measured_positions: dict[str, float] = {}
         self._stale_position_holds: dict[str, dict[str, float]] = {}
+        # Observability only (#33): when a source's hold started (steady
+        # time) and when it was last logged, so stale_hold/_active/_cleared
+        # can report an age/duration without changing any composed packet.
+        self._stale_since: dict[str, float] = {}
+        self._stale_hold_last_logged: dict[str, float] = {}
         self._velocity_controlled: dict[str, set[str]] = {
             source: set() for source in self.sources
         }
@@ -238,7 +253,17 @@ class JointCommandMux:
         else:
             retired_velocities.update(velocity_controlled.intersection(command.names))
             velocity_controlled.difference_update(command.names)
-        self._stale_position_holds.pop(source, None)
+        was_stale = self._stale_position_holds.pop(source, None) is not None
+        if was_stale:
+            # Observability only: report how long the source was held before
+            # this fresh command replaced the hold.
+            stale_since = self._stale_since.pop(source, steady_time)
+            self._stale_hold_last_logged.pop(source, None)
+            logger.info(
+                "stale_hold_cleared source=%s stale_for_s=%.3f",
+                source,
+                steady_time - stale_since,
+            )
         self._latest[source] = (steady_time, command)
 
     def observe_positions(
@@ -262,7 +287,17 @@ class JointCommandMux:
                 joints.clear()
             for joints in self._retired_velocities.values():
                 joints.clear()
+            logger.info(
+                "mux_stop state=engaged held=%s",
+                _format_held(self._stopped_packets),
+            )
         elif not active and self.safety_stop:
+            # Log what was held before clearing it -- the observability
+            # point of a "released" line is what is no longer force-held.
+            logger.info(
+                "mux_stop state=released held=%s",
+                _format_held(self._stopped_packets),
+            )
             self._stopped_packets = ()
         self.safety_stop = active
 
@@ -301,6 +336,7 @@ class JointCommandMux:
             stale = force_safe or steady_time - record[0] > policy.timeout_s
             command = record[1]
             if stale and not force_safe:
+                first_stale = source not in self._stale_position_holds
                 # Freeze the measured hold at the watchdog transition. Later
                 # observations must not make a timed-out source move again.
                 self._stale_position_holds.setdefault(
@@ -311,6 +347,32 @@ class JointCommandMux:
                         if name in self._measured_positions
                     },
                 )
+                # Observability only (#33): announce the hold once, then at
+                # most once per second while it continues. Neither branch
+                # changes the composed packet above.
+                age = steady_time - record[0]
+                joints, hold_pos = _format_hold(self._stale_position_holds[source])
+                if first_stale:
+                    self._stale_since[source] = steady_time
+                    self._stale_hold_last_logged[source] = steady_time
+                    logger.info(
+                        "stale_hold source=%s joints=%s hold_pos=%s age_s=%.3f clock=steady",
+                        source,
+                        joints,
+                        hold_pos,
+                        age,
+                    )
+                else:
+                    last_logged = self._stale_hold_last_logged.get(source, -math.inf)
+                    if steady_time - last_logged >= STALE_HOLD_ACTIVE_LOG_PERIOD_S:
+                        self._stale_hold_last_logged[source] = steady_time
+                        logger.info(
+                            "stale_hold_active source=%s joints=%s hold_pos=%s age_s=%.3f clock=steady",
+                            source,
+                            joints,
+                            hold_pos,
+                            age,
+                        )
             stale_hold = self._stale_position_holds.get(source, {})
             if command.positions:
                 hold = stale_hold if stale and not force_safe else self._measured_positions
@@ -354,6 +416,30 @@ class JointCommandMux:
             packet.validate()
             packets.append(packet)
         return tuple(packets)
+
+
+def _format_hold(hold: Mapping[str, float]) -> tuple[str, str]:
+    """Render a stale-hold dict as parallel ``joints=``/``hold_pos=`` strings.
+
+    ``hold`` is built from ``command.names`` in order (dict comprehension),
+    so its keys and values are already aligned one-to-one.
+    """
+    return (
+        ",".join(hold.keys()),
+        ",".join(f"{value:.4f}" for value in hold.values()),
+    )
+
+
+def _format_held(packets: Sequence[JointCommand]) -> str:
+    """Render the joint:position pairs a stop() transition force-holds, for
+    the mux_stop observability line. Packets without positions (a source
+    that had never reported a measured position) contribute nothing.
+    """
+    return " ".join(
+        f"{name}:{position:.4f}"
+        for packet in packets
+        for name, position in zip(packet.names, packet.positions)
+    )
 
 
 def command_from_sequences(

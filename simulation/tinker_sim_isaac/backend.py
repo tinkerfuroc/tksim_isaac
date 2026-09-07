@@ -368,6 +368,13 @@ GRIPPER_EFFORT_CEILING_NM = 2.5
 # than being read as an over-range request.
 GRIPPER_EFFORT_FULL_SCALE_N = 10.0
 
+# Observability only (#33): cap on how many gripper_command_target lines
+# _log_gripper_command_target prints within GRIPPER_COMMAND_TARGET_LOG_WINDOW_S,
+# so a fast-oscillating source (e.g. a stale-hold/fresh flap) cannot spam the
+# log; the first line after a quiet period is never dropped by this cap.
+GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW = 5
+GRIPPER_COMMAND_TARGET_LOG_WINDOW_S = 1.0
+
 
 def resolve_gripper_effort_ceiling_nm(value: str | None) -> float:
     """Parse ``TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`` (N*m, default
@@ -2820,6 +2827,46 @@ class IsaacWholeRobotBackend:
             if effort < 0.0:
                 raise ValueError("drive_joint effort limit must be non-negative")
 
+    def _log_gripper_command_target(
+        self, old: float | None, new: float, effort: float | None
+    ) -> None:
+        """Announce a drive_joint command-target replacement (observability
+        only, #33). Called from _apply_joint_command only when the incoming
+        packet actually changes ``_drive_command_target``; a run of identical
+        alternations (e.g. a source flapping between two targets) is capped
+        at GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW lines per
+        GRIPPER_COMMAND_TARGET_LOG_WINDOW_S, but the first line after a quiet
+        period always gets through because the sliding window has aged out.
+        """
+        now = time.monotonic()
+        window = self._gripper_command_log_window = getattr(
+            self, "_gripper_command_log_window", []
+        )
+        window[:] = [
+            stamp
+            for stamp in window
+            if now - stamp < GRIPPER_COMMAND_TARGET_LOG_WINDOW_S
+        ]
+        if len(window) >= GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW:
+            return
+        window.append(now)
+        self._gripper_command_log_index = (
+            getattr(self, "_gripper_command_log_index", 0) + 1
+        )
+        drive_index = getattr(self, "_drive_joint_index", None)
+        applied = float("nan")
+        if drive_index is not None:
+            try:
+                applied = float(self._position_targets[0, drive_index])
+            except (IndexError, TypeError, ValueError):
+                pass
+        print(
+            f"gripper_command_target old={old} new={new} effort={effort} "
+            f"source_packet={self._gripper_command_log_index} "
+            f"applied={applied:.6f}",
+            flush=True,
+        )
+
     def _apply_joint_command(self, command: JointCommand) -> None:
         # Gather in Python, then write each target tensor once.  Every torch
         # element write releases the GIL; under a live bridge the gateway's
@@ -2841,7 +2888,15 @@ class IsaacWholeRobotBackend:
                     # first-contact force gradually instead of the impulsive
                     # spike (12-190 N) that ejects a light object before the
                     # jaw captures it.
-                    self._drive_command_target = float(command.positions[offset])
+                    old_drive_target = getattr(self, "_drive_command_target", None)
+                    new_drive_target = float(command.positions[offset])
+                    self._drive_command_target = new_drive_target
+                    if new_drive_target != old_drive_target:
+                        self._log_gripper_command_target(
+                            old_drive_target,
+                            new_drive_target,
+                            command.efforts[offset] if command.efforts else None,
+                        )
                 else:
                     position_index.append(index)
                     position_values.append(command.positions[offset])

@@ -4,6 +4,128 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-07 — Task #33: observability for the stale-hold / gripper-target / safety-gate chain
+
+**Purpose.** Task #33's stale-hold repro (`$TMP/task33-stale-hold-repro.md`)
+traces a lapsed 0.5 s gripper-command watchdog through `command_mux.py` (holds
+the last measured `drive_joint` angle), into `backend.py`'s
+`_apply_joint_command` (overwrites `_drive_command_target` from whatever
+packet next names `drive_joint`), but none of it was visible on a live bench
+log. This round adds observability only -- no packet, target, or publish
+value this chain produces changes; every new branch either logs alongside an
+existing decision or reads a pure function a second time purely to report an
+edge.
+
+**`simulation/tinker_sim_core/command_mux.py`** (plain library, no ROS
+handle -- logs through `logging.getLogger(__name__)`):
+- `stale_hold source=<src> joints=<names> hold_pos=<vals> age_s=<age>
+  clock=steady` once when a source's composed packet first freezes at its
+  watchdog transition (`_compose_packets`, the existing
+  `_stale_position_holds.setdefault` site).
+- `stale_hold_active source=<src> ...` (same fields) at most once per second
+  while the hold continues -- a source held for minutes does not spam one
+  line per composed frame (up to 150 Hz at the gateway).
+- `stale_hold_cleared source=<src> stale_for_s=<duration>` when a fresh
+  `accept()` replaces an active hold.
+- `mux_stop state=engaged|released held=<joint>:<pos> ...` once per
+  `stop(True)`/`stop(False)` transition (not per call -- the existing
+  `if active and not self.safety_stop` / `elif not active and
+  self.safety_stop` guards already gate real transitions only), listing the
+  measured positions force-held by `_stopped_packets`.
+
+**`simulation/tinker_sim_isaac/backend.py`** (module already logs via bare
+`print(json.dumps(...))`/plain `print()`, no `logging` import -- this stays
+consistent with that, not a JSON line, per the exact format requested):
+`_apply_joint_command` now logs `gripper_command_target old=<old> new=<new>
+effort=<effort> source_packet=<n> applied=<_position_targets[0,drive]>`
+whenever the incoming packet actually changes `_drive_command_target`
+(`old != new`; the very first command logs `old=None`). `applied` is the
+ramp's current output at that instant -- the value `_ramp_drive_target()`
+last wrote, i.e. what the facade would see this tick, not the new commanded
+target, which only takes effect once the ramp catches up. `source_packet` is
+a monotonic call-sequence number (`_apply_joint_command` carries no other
+packet identity today). Rate-limited to
+`GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW` (5) lines per
+`GRIPPER_COMMAND_TARGET_LOG_WINDOW_S` (1.0 s) via a sliding timestamp window,
+so a fast oscillation (e.g. a source flapping stale/fresh) cannot spam the
+log -- but the window ages out on its own, so the first line after any quiet
+period always gets through.
+
+**`ros2_ws/.../command_gateway.py`**: the mux's `logging` records never
+reached the bridge log on their own -- `rclpy`'s `get_logger()` is a separate
+sink from Python's `logging` module. `CommandGateway.__init__` now attaches a
+`_RclpyLogForwarder` (a `logging.Handler` that calls
+`self.get_logger().info/warning/error`) to the
+`tinker_sim_core.command_mux` logger and sets `propagate = False` (keep it
+out of an unrouted root-logger stdout copy). Also new in this file, same
+principle -- log alongside an existing decision, never change it:
+- `safety_gate armed reason=timeout gap_s=<since last sample>` /
+  `safety_gate armed reason=sample` / `safety_gate cleared reason=sample
+  gap_s=<duration held>` on every real `_safety_active` transition
+  (`_enforce_safety_deadline`'s timeout arm, `_safety_stop`'s explicit
+  sample arm/clear). `gap_s` means different things by design: for an
+  armed-by-timeout line it is the heartbeat gap that caused it; for a
+  cleared line it is how long the gate was held.
+- `command_rejected source=<src> reason=<reason> count=<n since last line>`
+  from `_accept`'s three existing `self._rejected[source] = ...` branches
+  (safety-active-at-entry, safety-active-after-deadline-check, and the
+  except-handler), rate-limited to at most one line per second per source;
+  drops inside the window are still counted and folded into the next line's
+  `count` once the window reopens, so nothing is silently lost, only
+  batched.
+
+**`ros2_ws/.../safety_supervisor.py`**: `_refresh_desired_stop` gained
+`_log_source_transitions()`, which reads each tracker's `requires_stop()` a
+second time (pure, no side effect) purely to detect a per-source edge the
+existing `any(...)` OR cannot itself report, logging `safety_source
+source=<name> state=expired|recovered age_s=<age> deadline_s=<deadline>`.
+`_publish()` logs `safety_stop_published value=<bool>
+reason=<comma-joined source names, or "none">` whenever the published value
+actually changes (compared against `_published_stop` before it is
+overwritten) -- the 0.25 s reconcile heartbeat republishes the *unchanged*
+value far more often than it flips, so this is on-change, not on-publish.
+`reason=none` on an active stop is itself informative: it means the trigger
+was a controller-management hold (`startup_hold`/`restore_pending`/not
+`management_ready`), not any of `xarm`/`collision`/`operator`.
+
+**How to read a plateau against these lines.** A bench force/position
+plateau with no `stale_hold` line in the same window did not stall because a
+command source went stale -- look at `gripper_command_target` instead: if
+`new` keeps changing while the pads have stopped moving, the *ramp* is the
+bottleneck, not the mux. Conversely a `stale_hold` immediately followed by a
+`gripper_command_target` restating the *same* frozen value confirms the mux
+hold is what is driving `_drive_command_target`, not a live command. A
+`safety_gate armed reason=timeout` immediately upstream of a run of
+`command_rejected ... blocked by safety stop` lines confirms a lost
+heartbeat, not a rejected-for-cause command, caused the gap.
+
+**Tests.** `tests/test_command_mux.py`: two new `unittest.TestCase`s
+(`JointCommandMuxStaleHoldLoggingTest`, `JointCommandMuxStopLoggingTest`)
+using `self.assertLogs("tinker_sim_core.command_mux", level="INFO")` against
+a fake steady clock passed straight to `accept()`/`compose()` -- no real
+sleep. `tests/test_manipulation_runtime.py`: two new tests on
+`_apply_joint_command` capturing `stdout` (`contextlib.redirect_stdout`,
+following the module's existing print-capture pattern) confirming the
+exact old/new/effort/applied fields and the 5-lines/s rate limit.
+`tests/test_command_gateway_logging.py` (new) and
+`tests/test_safety_supervisor_logging.py` (new): `object.__new__` test
+doubles in the style of `test_command_gateway_keepalive.py`, with
+`unittest.mock.patch` pinning `time.monotonic` to a dict-backed fake clock
+so `gap_s`/`age_s` assertions are exact rather than wall-clock-flaky.
+
+These two files import `rclpy`/`std_msgs` and are skipped in this sandbox
+(`ModuleNotFoundError: No module named 'rclpy._rclpy_pybind11'` -- the
+system ROS install is built for Python 3.10, this worktree's `.venv` is
+3.12); confirmed pre-existing (`test_command_gateway_keepalive.py` skips
+identically here) and not a regression. They were instead run and passed
+under the system `python3.10` (which has a matching `rclpy`) with
+`PYTHONPATH` extended to `ros2_ws/src/tinker_sim_bridge` and `simulation`:
+10 passed (`test_command_gateway_logging.py` + `test_command_gateway_keepalive.py`),
+12 passed (`test_safety_supervisor_logging.py` +
+`test_command_gateway_logging.py` + `test_command_gateway_keepalive.py`).
+`tests/test_manipulation_runtime.py` + `tests/test_command_mux.py` under the
+regular `uv run` (3.12) incantation: 178 passed, 5 subtests passed.
+
 ## 2026-09-06 — Task #35: backend-only TCP/pad parity publisher
 
 **Purpose.** A diagnostic for the grasp bench: the left pad's inner face was

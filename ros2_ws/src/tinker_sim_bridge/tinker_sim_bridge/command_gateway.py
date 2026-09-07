@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
@@ -22,6 +23,29 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
     new_command_session,
 )
+
+# #33: the mux's stale-hold observability lines are plain logging.getLogger
+# records (it has no ROS handle of its own -- see command_mux.py). rclpy's
+# get_logger() output is a separate sink from Python's `logging` module, so
+# without this bridge those lines never reach the bridge log.
+_MUX_LOGGER_NAME = "tinker_sim_core.command_mux"
+
+
+class _RclpyLogForwarder(logging.Handler):
+    """Forward one logger's records into a ROS node's logger."""
+
+    def __init__(self, ros_logger) -> None:
+        super().__init__()
+        self._ros_logger = ros_logger
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = self.format(record)
+        if record.levelno >= logging.ERROR:
+            self._ros_logger.error(message)
+        elif record.levelno >= logging.WARNING:
+            self._ros_logger.warning(message)
+        else:
+            self._ros_logger.info(message)
 
 
 class CommandGateway(Node):
@@ -76,7 +100,18 @@ class CommandGateway(Node):
             ),
         }
         self._mux = JointCommandMux(sources)
+        mux_logger = logging.getLogger(_MUX_LOGGER_NAME)
+        mux_logger.setLevel(logging.INFO)
+        mux_logger.addHandler(_RclpyLogForwarder(self.get_logger()))
+        # The mux logger has no other consumer; keep its lines out of the
+        # root logger too (avoids a duplicate, unrouted stdout copy).
+        mux_logger.propagate = False
         self._rejected: dict[str, str] = {}
+        # #33 observability: per-source rate-limit state for command_rejected
+        # (last log time + drops accumulated since that line), and when the
+        # safety gate last armed (for the "cleared" line's held duration).
+        self._rejected_log_state: dict[str, dict[str, float | int]] = {}
+        self._safety_armed_at: float | None = None
         # Discovery is not proof of an effective safety-clear state.
         self._safety_active = True
         self._safety_timeout_s = float(self.get_parameter("safety_timeout_s").value)
@@ -138,13 +173,45 @@ class CommandGateway(Node):
             clock=Clock(clock_type=ClockType.STEADY_TIME),
         )
 
+    def _log_safety_gate(
+        self, state: str, reason: str, gap_s: float | None = None
+    ) -> None:
+        """Observability only (#33): announce every _safety_active transition."""
+        if gap_s is None:
+            self.get_logger().info(f"safety_gate {state} reason={reason}")
+        else:
+            self.get_logger().info(
+                f"safety_gate {state} reason={reason} gap_s={gap_s:.3f}"
+            )
+
+    def _log_command_rejected(self, source: str, reason: str) -> None:
+        """Observability only (#33): report a dropped _accept message,
+        rate-limited to at most one line per second per source. Drops that
+        land inside the window are still counted and folded into the next
+        line's ``count`` once the window reopens, so no drop goes unreported.
+        """
+        log_state = self._rejected_log_state = getattr(self, "_rejected_log_state", {})
+        state = log_state.setdefault(source, {"last": None, "count": 0})
+        state["count"] = int(state["count"]) + 1
+        last = state["last"]
+        now = time.monotonic()
+        if last is not None and now - float(last) < 1.0:
+            return
+        self.get_logger().info(
+            f"command_rejected source={source} reason={reason} count={state['count']}"
+        )
+        state["last"] = now
+        state["count"] = 0
+
     def _accept(self, source: str, message: JointState) -> None:
         if self._safety_active:
             self._rejected[source] = "blocked by safety stop"
+            self._log_command_rejected(source, "blocked by safety stop")
             return
         self._enforce_safety_deadline()
         if self._safety_active:
             self._rejected[source] = "blocked by safety stop"
+            self._log_command_rejected(source, "blocked by safety stop")
             return
         try:
             command = self._owned_command(
@@ -158,6 +225,7 @@ class CommandGateway(Node):
             self._rejected.pop(source, None)
         except Exception as error:
             self._rejected[source] = str(error)
+            self._log_command_rejected(source, str(error))
             self.get_logger().error(f"rejected {source} joint command: {error}")
 
     def _owned_command(
@@ -230,10 +298,17 @@ class CommandGateway(Node):
         )
 
     def _safety_stop(self, message: Bool) -> None:
-        self._safety_last_sample_at = time.monotonic()
+        now = time.monotonic()
+        self._safety_last_sample_at = now
         active = bool(message.data)
         if active == self._safety_active:
             return
+        if active:
+            self._safety_armed_at = now
+            self._log_safety_gate("armed", "sample")
+        else:
+            armed_at = getattr(self, "_safety_armed_at", now)
+            self._log_safety_gate("cleared", "sample", now - armed_at)
         self._safety_active = active
         if hasattr(self, "_command_session_id"):
             self._advance_command_epoch()
@@ -256,6 +331,10 @@ class CommandGateway(Node):
         if self._safety_active:
             return
         self._safety_active = True
+        self._safety_armed_at = now
+        self._log_safety_gate(
+            "armed", "timeout", now - last if last is not None else float("nan")
+        )
         self._advance_command_epoch()
         self._mux.stop(True)
         self._snapshot_id = 0

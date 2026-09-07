@@ -30,6 +30,7 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
 )
 from tinker_sim_isaac.backend import (
+    GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW,
     GRIPPER_EFFORT_CEILING_NM,
     GRIPPER_EFFORT_FULL_SCALE_N,
     IsaacWholeRobotBackend,
@@ -1192,6 +1193,69 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # straight into _position_targets. The velocity retirement above is the
         # subject; the captured target confirms the command committed.
         self.assertAlmostEqual(float(backend._drive_command_target), 0.6)
+
+    def test_gripper_command_target_logs_old_new_and_applied_on_change(self) -> None:
+        """#33 observability: _apply_joint_command must announce every real
+        change to _drive_command_target, alongside the ramp target currently
+        applied to _position_targets (the pre-ramp value the facade would
+        see this instant, not the commanded target).
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._position_targets = torch.tensor([[0.05, -1.0]], dtype=torch.float32)
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._apply_joint_command(
+                JointCommand(("drive_joint",), positions=(0.83,), efforts=(10.0,))
+            )
+            backend._apply_joint_command(
+                JointCommand(("drive_joint",), positions=(0.15,), efforts=(5.0,))
+            )
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("gripper_command_target ")
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("old=None", lines[0])
+        self.assertIn("new=0.83", lines[0])
+        self.assertIn("effort=10.0", lines[0])
+        self.assertIn("applied=0.050000", lines[0])
+        self.assertIn("old=0.83", lines[1])
+        self.assertIn("new=0.15", lines[1])
+        self.assertIn("effort=5.0", lines[1])
+        self.assertAlmostEqual(float(backend._drive_command_target), 0.15)
+
+    def test_gripper_command_target_rate_limits_identical_alternations(self) -> None:
+        backend = _backend()
+        backend._drive_joint_index = 0
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            for _ in range(4):
+                backend._apply_joint_command(
+                    JointCommand(("drive_joint",), positions=(0.83,))
+                )
+                backend._apply_joint_command(
+                    JointCommand(("drive_joint",), positions=(0.15,))
+                )
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("gripper_command_target ")
+        ]
+        # 8 real alternations requested in the same instant; capped at
+        # GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW lines/s, not dropped
+        # entirely.
+        self.assertEqual(len(lines), GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW)
+        # An unchanged repeat of the same target is not a "change" at all
+        # and must not consume any of the rate-limit budget.
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._apply_joint_command(
+                JointCommand(("drive_joint",), positions=(0.15,))
+            )
+        self.assertEqual(captured.getvalue().strip(), "")
 
     def test_snapshot_boundary_preserves_active_mixed_base_and_arm_packets(self) -> None:
         backend = _backend()
