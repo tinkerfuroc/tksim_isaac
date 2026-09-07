@@ -46,6 +46,7 @@ parser.add_argument(
 )
 parser.add_argument("--grasp-config", default="", help="JSON with close_events[].arm_joints (optional; --pose supplies the built-in bench poses)")
 parser.add_argument("--pose", default="side", choices=("side", "topdown"), help="built-in arm pose: side = bench bottle side-grasp (TCP 0.5375 ahead, 0.7446 up, tool z=+x); topdown = knife pinch (tool z=-z), fingertips --tcp-above-top above the pedestal")
+parser.add_argument("--arm-joints", default="", help="d1,d2,d3,d4,d5,d6,d7 (DEGREES, xArm7 joint1..joint7 order): instead of --pose/--tcp-xz IK, hold the arm at exactly this configuration and run the normal phase-B close from it (--no-object for a free close). Overrides --pose and --tcp-xz; incompatible with --descend-from (there is no separate staged pose to descend from -- the arm goes straight to the given configuration and settles there); --closing-axis is ignored in this mode (the jaw's closing direction is whatever this configuration puts it at, not a --closing-axis assumption -- it is measured from the finger link positions and printed in the arm_joints event)")
 parser.add_argument("--grasp-index", type=int, default=0)
 parser.add_argument("--close-target", type=float, default=0.85)
 parser.add_argument("--record-s", type=float, default=3.0)
@@ -113,8 +114,10 @@ import torch  # noqa: E402
 
 ROOT = Path.cwd()
 sys.path.insert(0, str(ROOT / "simulation"))
+sys.path.insert(0, str(ROOT))
 from tinker_sim_core.command_mux import JointCommand  # noqa: E402
 from tinker_sim_isaac.backend import IsaacWholeRobotBackend  # noqa: E402
+from validation.arm_joints_parse import parse_arm_joints_deg  # noqa: E402
 
 OUT = Path(args.out)
 OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -788,7 +791,21 @@ def planar_topdown_ik(x: float, z: float, joint7: float, seed: dict[str, float] 
 
 
 ik_family = bool(args.tcp_xz)
-if ik_family:
+if args.arm_joints:
+    # Diagnostic override: hold exactly this configuration instead of an IK
+    # or built-in pose. --tcp-xz's closing-axis assumption is meaningless
+    # here (the jaw's closing direction falls out of whatever configuration
+    # this is, and is measured -- not assumed -- in the arm_joints event
+    # below), so the two are mutually exclusive rather than silently picking
+    # one.
+    if ik_family:
+        raise SystemExit("--arm-joints is incompatible with --tcp-xz; pick one arm-pose source")
+    try:
+        arm_pose = parse_arm_joints_deg(args.arm_joints)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    arm_source = f"arm_joints_deg:{args.arm_joints}"
+elif ik_family:
     planar_topdown_ik._fk = _urdf_fk_factory()  # type: ignore[attr-defined]
     _gx, _gz = (float(v) for v in args.tcp_xz.split(","))
     _j7 = 0.0 if args.closing_axis == "y" else math.pi / 2
@@ -811,6 +828,39 @@ pad_mid = [(a + b) / 2 for a, b in zip(lf_p, rf_p)]
 pad_axis = [a - b for a, b in zip(lf_p, rf_p)]
 emit(event="staged", settle_s=settled, tcp=tcp_p, tcp_quat_wxyz=tcp_q, left_finger=lf_p, right_finger=rf_p, pad_mid=pad_mid, pad_axis=pad_axis, gap=math.dist(lf_p, rf_p),
      root=backend.root_state() if hasattr(backend, "root_state") else None)
+
+if args.arm_joints:
+    # --arm-joints diagnostic: since --closing-axis is not in play here, the
+    # jaw's closing direction is measured (not assumed) straight from the
+    # settled finger link positions -- the same pad_axis the staged event
+    # above reports -- and reported alongside its gravity component. The
+    # "reach" axis (tcp -> pad_mid) is the direction the fingers extend from
+    # the wrist toward the pinch point in this configuration; its gravity
+    # component says whether the reach is level, angled up, or angled down.
+    def _unit(v: list[float]) -> list[float]:
+        n = math.sqrt(sum(c * c for c in v))
+        return [c / n for c in v] if n > 1e-9 else [0.0, 0.0, 0.0]
+
+    def _gravity_component(v_unit: list[float]) -> float:
+        # positive = axis points downward, i.e. aligned with gravity (world -z)
+        return -v_unit[2]
+
+    _n_arm, _pos_arm, _, _ = backend.joint_state()
+    measured_deg = [math.degrees(float(_pos_arm[JIDX[j]])) for j in ARM]
+    target_deg = [math.degrees(arm_pose[j]) for j in ARM]
+    closing_axis_world = _unit(pad_axis)
+    reach_axis_world = _unit([a - b for a, b in zip(pad_mid, tcp_p)])
+    emit(
+        event="arm_joints",
+        target_deg=target_deg,
+        measured_deg=measured_deg,
+        tcp=tcp_p,
+        tcp_quat_wxyz=tcp_q,
+        closing_axis_world=closing_axis_world,
+        closing_axis_gravity_component=_gravity_component(closing_axis_world),
+        finger_reach_axis_world=reach_axis_world,
+        finger_reach_axis_gravity_component=_gravity_component(reach_axis_world),
+    )
 
 # --------------------------------------------------------- optional RGB capture
 # A replicator observer camera looking at the TCP; app.update() renders it even
@@ -918,6 +968,11 @@ else:
 # Descent staging: park the arm above the grasp before the object appears.
 stage_pose = arm_pose
 if args.descend_from > 0.0:
+    if args.arm_joints:
+        # --arm-joints holds one exact configuration; there is no separate
+        # staged pose above it to descend from (the object, if any, is
+        # spawned directly at that configuration's pinch point).
+        raise SystemExit("--descend-from is not supported with --arm-joints (the arm goes straight to the given configuration)")
     if not ik_family:
         raise SystemExit("--descend-from needs --tcp-xz (planar IK family)")
     stage_pose = planar_topdown_ik(_gx, _gz + args.descend_from, _j7, seed=arm_pose)
