@@ -2400,9 +2400,10 @@ class IsaacWholeRobotBackend:
         self._gripper_effort_limit = limit
         # #20 cap5-analysis: write_joint_effort_limit_to_sim_index (above) and
         # the actuator-model mirror only touch Isaac Lab-side buffers; the
-        # probe (validation/gripper_close_probe.py
-        # _write_physx_max_forces_direct) proved that is NOT sufficient proof
-        # the cap reaches the PhysX solver -- bit-identical 15 s hold physics
+        # probe's direct PhysX max-force write/readback (on the instrumented
+        # gripper_close_probe branch, not this one) proved that is NOT
+        # sufficient proof the cap reaches the PhysX solver -- bit-identical
+        # 15 s hold physics
         # was measured across cap 5 through cap 180 on the follower joints
         # through this same writer alone. Re-assert the mapped limit straight
         # on the PhysX tensor view, which is what actually binds the ceiling
@@ -2432,9 +2433,10 @@ class IsaacWholeRobotBackend:
         # ::test_gripper_effort_limit_never_authors_usd_drive.
         #
         # #20 review: only latch _gripper_effort_limit_written once the direct
-        # PhysX write actually lands. If it raises, the dedup guard above
-        # (L2178-2185) must NOT skip the next identical-effort command --
-        # otherwise a write that silently failed once would never be retried.
+        # PhysX write actually lands. If it raises, the
+        # _gripper_effort_limit_written dedup guard at the top of this method
+        # must NOT skip the next identical-effort command -- otherwise a write
+        # that silently failed once would never be retried.
         physx_max_force, physx_write_ok = self._write_gripper_drive_physx_max_force(
             index, limit
         )
@@ -2475,9 +2477,18 @@ class IsaacWholeRobotBackend:
         ``_set_gripper_effort_limit`` call, and invisible from the Isaac Lab
         buffers, which keep reading 200/20.
 
-        Ported from validation/gripper_close_probe.py's
-        ``_write_physx_max_forces_direct`` /
-        ``_read_physx_max_forces`` (#20 hwcap probes). ``set_dof_max_forces``
+        The deleted helper's stated rationale -- carrying the runtime ceiling
+        through a stage re-parse / actuator reconstruction -- is already
+        covered without touching USD: ``_set_gripper_effort_limit``'s
+        actuator-model mirror updates the owning ImplicitActuator's own
+        ``effort_limit`` tensor, which is what Isaac Lab re-applies on
+        reset/reinit (issue #128). So there is no reset-persistence argument
+        for re-adding the USD write.
+
+        Ported from the direct PhysX max-force write/readback in
+        validation/gripper_close_probe.py on the instrumented probe branch
+        (#20 hwcap probes; that helper is not on this branch).
+        ``set_dof_max_forces``
         takes the FULL per-joint row, not a sparse column, so this clones the
         current row, patches only ``index``, and pushes the whole row back --
         using warp arrays for both payload and indices, per the Task #12

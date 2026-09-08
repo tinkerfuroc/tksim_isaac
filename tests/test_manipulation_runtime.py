@@ -1206,8 +1206,9 @@ class ManipulationRuntimeTest(unittest.TestCase):
         (root_view.set_dof_max_forces) raises -- e.g. Warp's runtime not yet
         initialized in-process -- the failure must be logged (not silently
         swallowed) and _gripper_effort_limit_written must stay False so a
-        later identical-effort command is NOT dedup-skipped (L2178-2185) but
-        retries the write instead."""
+        later identical-effort command is NOT dedup-skipped by the
+        _gripper_effort_limit_written guard at the top of
+        _set_gripper_effort_limit, but retries the write instead."""
         backend = _backend()
         backend._default_gripper_effort_limit = 2.5
         backend._gripper_effort_full_scale_n = 10.0

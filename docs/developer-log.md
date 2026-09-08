@@ -76,10 +76,17 @@ exercised it — and asserts zero `DriveAPI` applications and zero
 mapped cap.
 
 **Caveat on prior numbers.** Any `validation/gripper_close_probe.py` run that
-passed `--drive-effort-limit` before this fix went through the reverting path,
-so its clamp figures describe a 35809.86/0 drive joint and are not comparable
-with runs that leave the flag off. Nothing was re-run for this change; it is
-code-only.
+passed `--drive-effort-limit` before this fix went through the reverting path.
+How much that invalidates depends on what the run did next, because the
+effort-limit block runs before any later gain write. For the default
+`--mirror-mode target` with 3-part configs, nothing rewrites `drive_joint`'s
+gains afterwards, so those clamp figures describe a 35809.86/0 drive joint and
+are not comparable with flag-off runs. For `--mirror-mode central`, or a 5-part
+config whose `run_close` calls
+`set_follower_gains(..., drive_stiffness, drive_damping)`, `drive_joint`'s k/d
+were rewritten after the reversion — whether that write actually binds in PhysX
+was never measured, so those runs are unknown rather than either clean or
+invalid. Nothing was re-run for this change; it is code-only.
 
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
