@@ -11,6 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
 
+from tinker_sim_core.observability import format_duration
 from tinker_sim_core.safety_gating import effective_stop
 
 
@@ -104,6 +105,10 @@ class SafetySupervisor(Node):
         self._stop_episode_recorded = False
         self._controllers_inflight = False
         self._switch_inflight = False
+        # #33 observability: last-seen requires_stop() per required source, so
+        # a flip can be reported without changing _refresh_desired_stop's
+        # existing computation.
+        self._source_stop_state: dict[str, bool] = {}
         source_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -140,7 +145,57 @@ class SafetySupervisor(Node):
             self._source_trackers[name].update(bool(message.data), time.monotonic())
         self._reconcile()
 
+    def _log_source_transitions(self) -> None:
+        """Observability only (#33): announce when a required source's
+        requires_stop() state flips. _desired_stop below is the OR of every
+        source plus optional operator input, so on its own it cannot say
+        which source moved; this reads each tracker again (pure, no side
+        effect) purely to report the per-source edge.
+        """
+        for name, tracker in self._source_trackers.items():
+            now = time.monotonic()
+            current = tracker.requires_stop(now)
+            previous = self._source_stop_state.get(name)
+            if previous is not None and previous != current:
+                # ``received_at`` is only ``None`` before this source's very
+                # first sample ever, which cannot itself flip requires_stop()
+                # from a prior state -- but the "recovered" transition after
+                # a heartbeat that landed while this tracker was still fresh
+                # from an even earlier sample degrades the same way, so this
+                # never assumes a start time exists.
+                age = (
+                    now - tracker.received_at
+                    if tracker.received_at is not None
+                    else None
+                )
+                self.get_logger().info(
+                    "safety_source source=%s state=%s age_s=%s deadline_s=%.3f"
+                    % (
+                        name,
+                        "expired" if current else "recovered",
+                        format_duration(age),
+                        tracker.deadline_s,
+                    )
+                )
+            self._source_stop_state[name] = current
+
+    def _stop_reasons(self) -> list[str]:
+        """Observability only (#33): the source names presently requiring a
+        stop, for the safety_stop_published line. An empty list means the
+        active value (if True) comes from a controller-management hold
+        rather than any source.
+        """
+        now = time.monotonic()
+        reasons = [
+            name
+            for name, tracker in self._source_trackers.items()
+            if tracker.requires_stop(now)
+        ]
+        reasons.extend(name for name in self.OPTIONAL_SOURCES if self._sources.get(name))
+        return reasons
+
     def _refresh_desired_stop(self) -> None:
+        self._log_source_transitions()
         desired = any(
             tracker.requires_stop(time.monotonic())
             for tracker in self._source_trackers.values()
@@ -191,7 +246,17 @@ class SafetySupervisor(Node):
     def _publish(self, active: bool) -> None:
         message = Bool()
         message.data = active
+        changed = active != self._published_stop
         self._stop.publish(message)
+        if changed:
+            # Observability only (#33): announce every value change, not
+            # every republish (the 0.25 s heartbeat repeats the unchanged
+            # value far more often than it actually flips).
+            reasons = self._stop_reasons()
+            self.get_logger().info(
+                f"safety_stop_published value={active} "
+                f"reason={','.join(reasons) if reasons else 'none'}"
+            )
         self._published_stop = active
 
     def _reconcile(self) -> None:
