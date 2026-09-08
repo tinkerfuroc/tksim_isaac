@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -21,6 +21,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 sys.path.insert(0, str(ROOT / "validation"))
+CAMERA_CONTRACT = ROOT / "simulation/sensors/hardware-parity.json"
 
 from tinker_sim_core.command_mux import (
     JointCommand,
@@ -29,6 +30,7 @@ from tinker_sim_core.command_mux import (
     encode_snapshot_packet,
 )
 from tinker_sim_isaac.backend import (
+    GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW,
     GRIPPER_EFFORT_CEILING_NM,
     GRIPPER_EFFORT_FULL_SCALE_N,
     IsaacWholeRobotBackend,
@@ -42,6 +44,13 @@ from tinker_sim_isaac.backend import (
     resolve_spawn_yaw_via_view,
     resolve_use_fabric,
     spawn_root_rot_xyzw,
+)
+from tinker_sim_isaac.camera_rig import (
+    OPTICAL_TO_USD_CAMERA_WXYZ,
+    CameraRig,
+    _rotate_by_quaternion,
+    load_camera_specs,
+    usd_camera_pose_to_ros_optical,
 )
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_isaac.ros_gateway import PhysicsTruthJsonlWriter, RosStandardGateway
@@ -313,6 +322,13 @@ def _backend() -> IsaacWholeRobotBackend:
         if item.strip()
     )
     backend._contact_report_first_event_logged = False
+    backend._parity_tcp_bodies_missing_logged = False
+    backend._parity_gripper_torque_unresolved_logged = False
+    backend._parity_gripper_torque_error_logged = False
+    backend._parity_gripper_targets_unresolved_logged = False
+    backend._parity_gripper_targets_error_logged = False
+    backend._articulation_sleep_ids = None
+    backend._last_target_write = False
     backend._robot_view_identity = id(backend._robot.root_view)
     backend._clock_step_origin = 0
     backend._clock_elapsed_steps = 0
@@ -1218,6 +1234,54 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         self.assertTrue(backend._gripper_effort_limit_written)
 
+    def test_probe_gripper_close_probe_never_authors_usd_drive(self) -> None:
+        """#33: validation/gripper_close_probe.py must not author a
+        UsdPhysics.DriveAPI on the follower joints either.
+
+        The follower joints (left_finger_joint, right_outer_knuckle_joint,
+        etc.) have NO DriveAPI in robot.usd at all -- unlike drive_joint,
+        which the fix above stopped re-authoring. Applying one at runtime
+        would create a drive whose USD stiffness/damping default to 0/0, and
+        omni.physx's USD change listener would re-sync the runtime gains from
+        that stage edit -- the same mechanism (measured on drive_joint, bench
+        round ahi) that reverted its gains to 35809.86/0, except here it
+        would zero the followers outright.
+
+        gripper_close_probe.py imports isaacsim at module load (see
+        tests/test_gripper_close_probe_arm_joints.py, which cannot import it
+        either), so this is a source-level check rather than an exercised
+        call path: the probe's source must not contain the call sites that
+        perform the authoring. The parenthesis is deliberate -- it matches
+        only an actual call (``UsdPhysics.DriveAPI.Apply(...)`` /
+        ``drive.CreateMaxForceAttr(...)``), not the bare API names that
+        legitimately appear in comments/docstrings describing why the probe
+        does NOT do this anymore.
+        """
+        probe_source = (ROOT / "validation" / "gripper_close_probe.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "DriveAPI.Apply(",
+            probe_source,
+            "gripper_close_probe.py must not apply a UsdPhysics.DriveAPI on "
+            "any joint -- the follower joints have no DriveAPI in the asset, "
+            "so authoring one and letting omni.physx re-sync from the stage "
+            "zeros their gains (#33 mechanism)",
+        )
+        self.assertNotIn(
+            "CreateMaxForceAttr(",
+            probe_source,
+            "gripper_close_probe.py must not author physics:maxForce on a "
+            "USD drive; the direct PhysX tensor-view write "
+            "(_write_physx_max_forces_direct) is what binds the cap",
+        )
+        self.assertNotIn(
+            "_author_usd_max_force",
+            probe_source,
+            "the USD-authoring helper must be removed entirely, not just "
+            "made unreachable",
+        )
+
     def test_set_gripper_effort_limit_physx_write_failure_does_not_latch_written(
         self,
     ) -> None:
@@ -1337,6 +1401,266 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # straight into _position_targets. The velocity retirement above is the
         # subject; the captured target confirms the command committed.
         self.assertAlmostEqual(float(backend._drive_command_target), 0.6)
+
+    def test_gripper_command_target_logs_old_new_and_applied_on_change(self) -> None:
+        """#33 observability: _apply_joint_command must announce every real
+        change to _drive_command_target, alongside the ramp target currently
+        applied to _position_targets (the pre-ramp value the facade would
+        see this instant, not the commanded target).
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._position_targets = torch.tensor([[0.05, -1.0]], dtype=torch.float32)
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._apply_joint_command(
+                JointCommand(("drive_joint",), positions=(0.83,), efforts=(10.0,))
+            )
+            backend._apply_joint_command(
+                JointCommand(("drive_joint",), positions=(0.15,), efforts=(5.0,))
+            )
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("gripper_command_target ")
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("old=None", lines[0])
+        self.assertIn("new=0.83", lines[0])
+        self.assertIn("effort=10.0", lines[0])
+        self.assertIn("applied=0.050000", lines[0])
+        self.assertIn("old=0.83", lines[1])
+        self.assertIn("new=0.15", lines[1])
+        self.assertIn("effort=5.0", lines[1])
+        self.assertAlmostEqual(float(backend._drive_command_target), 0.15)
+
+    def test_gripper_command_target_rate_limits_identical_alternations(self) -> None:
+        backend = _backend()
+        backend._drive_joint_index = 0
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            for _ in range(4):
+                backend._apply_joint_command(
+                    JointCommand(("drive_joint",), positions=(0.83,))
+                )
+                backend._apply_joint_command(
+                    JointCommand(("drive_joint",), positions=(0.15,))
+                )
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("gripper_command_target ")
+        ]
+        # 8 real alternations requested in the same instant; capped at
+        # GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW lines/s, not dropped
+        # entirely.
+        self.assertEqual(len(lines), GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW)
+        # An unchanged repeat of the same target is not a "change" at all
+        # and must not consume any of the rate-limit budget.
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend._apply_joint_command(
+                JointCommand(("drive_joint",), positions=(0.15,))
+            )
+        self.assertEqual(captured.getvalue().strip(), "")
+
+    def test_safety_stop_transition_logs_engage_then_release(self) -> None:
+        """#33 observability: every real ``_safety_stopped`` flip announces
+        state/reason/drive-snapshot on engage and applied/measured on
+        release, through the caller-provided ``reason``.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(True, reason="sample_true")
+            backend.set_safety_stop(False, reason="sample_false")
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("sim_safety_stop ")
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("state=engaged", lines[0])
+        self.assertIn("reason=sample_true", lines[0])
+        self.assertIn("wall_age_s=n/a", lines[0])
+        # joint_pos[0, 0] (the drive DOF) is 0.25 in _FakeRobot's fixture --
+        # the snapshot latched by the engage.
+        self.assertIn("drive_snapshot=0.250", lines[0])
+        self.assertIn("state=released", lines[1])
+        self.assertIn("reason=sample_false", lines[1])
+        self.assertIn("drive_applied=0.250", lines[1])
+        self.assertIn("drive_measured=0.250", lines[1])
+
+    def test_safety_stop_repeated_sample_logs_nothing(self) -> None:
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend.set_safety_stop(True, reason="sample_true")
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(True, reason="sample_true")
+
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_safety_stop_transition_safe_when_drive_index_unresolved(self) -> None:
+        """Boot-time safety: a fresh backend has no ``_drive_joint_index``
+        yet and starts with ``_safety_snapshot`` unset (``_backend()``'s
+        default). Both transitions must still log, degrading the drive
+        fields to "n/a" instead of raising.
+        """
+        backend = _backend()
+        self.assertIsNone(backend._safety_snapshot)
+        self.assertFalse(hasattr(backend, "_drive_joint_index"))
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(True)
+            backend.set_safety_stop(False)
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("sim_safety_stop ")
+        ]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("reason=unspecified", lines[0])
+        self.assertIn("drive_snapshot=n/a", lines[0])
+        self.assertIn("drive_applied=n/a", lines[1])
+        self.assertIn("drive_measured=n/a", lines[1])
+
+    def test_safety_release_logs_applied_targets_reset_with_ramp_value_and_measured(
+        self,
+    ) -> None:
+        """A release's ``applied_targets_reset`` line reports the value that
+        was sitting in ``_position_targets`` before the replace (the
+        gripper's frozen-hold/ramp value) as ``drive_before``, and the
+        fresh joint_pos-derived hold target -- identical to the measured
+        state -- as ``drive_after``.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._safety_stopped = True
+        backend._safety_snapshot = backend._robot.data.joint_pos.clone()
+        # A value distinct from joint_pos[0, 0] (0.25), standing in for
+        # whatever the drive's ramp/hold target was before this release.
+        backend._position_targets = torch.tensor([[0.62, -0.4]], dtype=torch.float32)
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.set_safety_stop(False, reason="sample_false")
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("applied_targets_reset ")
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("source=sample_false", lines[0])
+        self.assertIn("drive_before=0.620", lines[0])
+        self.assertIn("drive_after=0.250", lines[0])
+        self.assertIn("measured=0.250", lines[0])
+
+    def test_step_safety_reassert_logs_once_per_engage_not_per_tick(self) -> None:
+        """step()'s per-tick ``_position_targets.copy_(_safety_snapshot)``
+        reassertion runs every physics step while stopped; its
+        ``applied_targets_reset`` line must fire once (on the first tick
+        after the engage) and stay silent on every following tick.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend.set_safety_stop(True)
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            backend.step()
+            backend.step()
+            backend.step()
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("applied_targets_reset ")
+            and "source=step_safety_reassert" in line
+        ]
+        self.assertEqual(len(lines), 1)
+
+    def test_refresh_robot_handles_rebind_logs_applied_targets_reset(self) -> None:
+        """``_refresh_robot_handles`` re-seeds ``_position_targets`` on every
+        root-view identity change with NO safety stop involved -- the same
+        re-origination shape the safety-stop lines cover. A genuine rebind
+        (``reapply_spawn_yaw=True``, the default) must log
+        ``source=refresh_robot_handles:reset_rebind`` with the pre-rebind
+        value as ``drive_before``.
+        """
+        backend = _backend()
+        backend._drive_joint_index = 0
+        backend._position_targets = torch.tensor([[0.42, -1.0]], dtype=torch.float32)
+        backend._robot_view_identity = -1  # force a "new view" rebind
+        backend._clock_step_origin = 0
+        backend._sim = SimpleNamespace(get_physics_step_count=lambda: 42)
+        backend._object_views = {}
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            self.assertTrue(backend._refresh_robot_handles())
+
+        lines = [
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith("applied_targets_reset ")
+            and "source=refresh_robot_handles:reset_rebind" in line
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("drive_before=0.420", lines[0])
+        # The reseed is joint_pos.clone(); joint_pos[0, 0] is 0.25 in
+        # _FakeRobot's fixture.
+        self.assertIn("drive_after=0.250", lines[0])
+        self.assertIn("measured=0.250", lines[0])
+
+    def test_step_profile_changed_targets_includes_drive_joint_past_old_top_8_cap(
+        self,
+    ) -> None:
+        """#33 follow-up: ``changed_targets`` used to keep only the top 8
+        most-changed keys, which silently dropped ``pos:drive_joint`` (a
+        low-traffic key) whenever 8+ other joints changed more often in the
+        same window -- exactly the blind spot the mid-close stall
+        investigation ran into. With 9 other joints changing every round
+        and ``drive_joint`` changing once, the old cap would keep the 8
+        highest-count "other" keys and drop both ``drive_joint`` (count 1)
+        and one tied "other" key; the fix must publish all 10.
+        """
+        backend = _backend()
+        num_joints = 10
+        names = [f"joint{i}" for i in range(1, num_joints)]
+        names.insert(0, "drive_joint")
+        backend._joint_index = {name: index for index, name in enumerate(names)}
+        backend._position_targets = torch.zeros((1, num_joints), dtype=torch.float32)
+        backend._velocity_targets = torch.zeros((1, num_joints), dtype=torch.float32)
+        backend._effort_targets = torch.zeros((1, num_joints), dtype=torch.float32)
+        backend.step_profile = {
+            "enabled": True,
+            "target_writes": 0,
+            "n": 1,
+            "targets": 0.0,
+            "write_data": 0.0,
+            "physx": 0.0,
+            "robot_update": 0.0,
+            "object_views": 0.0,
+        }
+        backend._profile_changed_targets()  # seed _profile_last_pushed
+
+        for round_index in range(9):
+            backend._position_targets = backend._position_targets.clone()
+            for other in range(1, num_joints):
+                backend._position_targets[0, other] = float(round_index + 1)
+            backend._profile_changed_targets()
+        backend._position_targets = backend._position_targets.clone()
+        backend._position_targets[0, 0] = 1.0  # drive_joint, once
+        backend._profile_changed_targets()
+
+        snapshot = backend.step_profile_snapshot()
+        changed = snapshot["changed_targets"]
+        self.assertEqual(len(changed), num_joints)
+        self.assertIn("pos:drive_joint", changed)
+        self.assertEqual(changed["pos:drive_joint"], 1)
 
     def test_snapshot_boundary_preserves_active_mixed_base_and_arm_packets(self) -> None:
         backend = _backend()
@@ -1480,7 +1804,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def begin_command_snapshot(self, snapshot: int) -> None:
                 pass
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.events.append(("stop", active))
                 self.safety_stopped = active
                 if not active:
@@ -1536,7 +1860,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def begin_command_snapshot(self, snapshot: int) -> None:
                 self.events.append(("snapshot", snapshot))
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.safety_stopped = active
                 self.events.append(("stop", active))
 
@@ -1592,7 +1916,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.stops: list[bool] = []
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.stops.append(active)
 
         backend = _Backend()
@@ -1615,7 +1939,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         class _Backend:
             safety_stopped = False
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.safety_stopped = active
 
         gateway = object.__new__(RosStandardGateway)
@@ -1644,7 +1968,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.stops: list[bool] = []
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.stops.append(active)
                 self.safety_stopped = active
 
@@ -1672,7 +1996,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         class _Backend:
             safety_stopped = False
 
-            def set_safety_stop(self, active: bool) -> None:
+            def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
                 self.safety_stopped = active
 
         backend = _Backend()
@@ -2060,6 +2384,899 @@ class ManipulationRuntimeTest(unittest.TestCase):
             self.assertAlmostEqual(float(actual), expected)
         for actual, expected in zip(robot["tcp_pose"]["quaternion_xyzw"], [0.4, 0.3, 0.2, 0.1]):
             self.assertAlmostEqual(float(actual), expected)
+
+    def test_parity_tcp_frame_publishes_world_and_base_link_geometry(self) -> None:
+        """Task #35 end to end through the backend method: link_tcp world
+        pose, its base_link-relative pose, and the pad inner-face/midpoint
+        points expressed in base_link -- all read from the same body_pos_w/
+        body_quat_w tensors as _robot_truth_state (no separate PhysX query).
+        """
+        backend = _backend()
+        backend._robot.data.body_names = (
+            "base", "link_tcp", "left_finger", "right_finger",
+        )
+        backend._robot.data.body_pos_w = torch.cat(
+            [
+                backend._robot.data.body_pos_w,
+                torch.tensor(
+                    [[[5.0, 4.9295, 0.5], [5.0, 5.0705, 0.5]]], dtype=torch.float32
+                ),
+            ],
+            dim=1,
+        )
+        backend._robot.data.body_quat_w = torch.cat(
+            [
+                backend._robot.data.body_quat_w,
+                torch.tensor(
+                    [[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]], dtype=torch.float32
+                ),
+            ],
+            dim=1,
+        )
+        # link_tcp itself: overwrite the shared fixture's [1,2,3] entry with a
+        # pose offset from a non-trivial root, so tcp_pose_base is a real
+        # translation, not a no-op.
+        backend._robot.data.body_pos_w[0, 1] = torch.tensor([5.5, 5.0, 1.0])
+        backend._robot.data.body_quat_w[0, 1] = torch.tensor([0.0, 0.0, 0.0, 1.0])
+        backend._robot.data.root_pos_w = torch.tensor([[5.0, 5.0, 0.5]], dtype=torch.float32)
+        backend._robot.data.root_quat_w = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
+
+        frame = backend.parity_tcp_frame()
+
+        self.assertIsNotNone(frame)
+        for actual, expected in zip(frame["tcp_pose_world"]["xyz"], (5.5, 5.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(frame["tcp_pose_base"]["xyz"], (0.5, 0.0, 0.5)):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(
+            frame["tcp_pose_base"]["quaternion_xyzw"], (0.0, 0.0, 0.0, 1.0)
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+        left_point, right_point, midpoint = frame["pad_points_base"]
+        for actual, expected in zip(left_point, (0.0, -0.0445, -0.02755)):
+            self.assertAlmostEqual(actual, expected, places=5)
+        for actual, expected in zip(right_point, (0.0, 0.0445, -0.02755)):
+            self.assertAlmostEqual(actual, expected, places=5)
+        for actual, expected in zip(midpoint, (0.0, 0.0, -0.02755)):
+            self.assertAlmostEqual(actual, expected, places=5)
+
+    def test_parity_tcp_frame_fails_soft_and_logs_once_when_unresolved(self) -> None:
+        """link_tcp/left_finger/right_finger absent from body_names (e.g. a
+        gripper-less articulation) must not raise -- just log once and let
+        the gateway skip publishing that tick."""
+        backend = _backend()  # body_names is only ("base", "link_tcp")
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            first = backend.parity_tcp_frame()
+            second = backend.parity_tcp_frame()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the unresolved-bodies diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "parity_tcp_bodies_unresolved")
+        self.assertEqual(
+            sorted(payload["missing"]), ["left_finger", "right_finger"]
+        )
+
+    def test_parity_gripper_torque_returns_six_joints_from_physx_projected_forces(
+        self,
+    ) -> None:
+        """#33: parity_gripper_torque() must return the six
+        PARITY_GRIPPER_JOINTS in order, with position/velocity from the same
+        joint_pos/joint_vel tensors joint_state() reads, but torque from
+        root_view.get_dof_projected_joint_forces() at the resolved DOF
+        indices -- deliberately DIFFERENT here from data.applied_torque (the
+        Isaac Lab actuator model's post-clip COMMAND echo) so a test that
+        accidentally reads the wrong tensor fails loudly. The joint order is
+        scrambled (and includes a non-gripper joint) to prove the indices
+        are resolved by name, not assumed contiguous."""
+        backend = _backend()
+        joint_names = (
+            "joint1",
+            "right_finger_joint",
+            "drive_joint",
+            "right_inner_knuckle_joint",
+            "left_finger_joint",
+            "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint",
+        )
+        backend.joint_names = joint_names
+        backend._joint_index = {name: index for index, name in enumerate(joint_names)}
+        backend._parity_gripper_joint_indices = tuple(
+            backend._joint_index[name] for name in backend.PARITY_GRIPPER_JOINTS
+        )
+        backend._robot.data.joint_pos = torch.tensor(
+            [[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]], dtype=torch.float32
+        )
+        backend._robot.data.joint_vel = torch.tensor(
+            [[20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0]], dtype=torch.float32
+        )
+        physx_row = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0]
+        backend._robot.root_view = SimpleNamespace(
+            get_dof_projected_joint_forces=lambda: [physx_row]
+        )
+
+        result = backend.parity_gripper_torque()
+
+        self.assertIsNotNone(result)
+        names, positions, velocities, physx_tau = result
+        self.assertEqual(names, backend.PARITY_GRIPPER_JOINTS)
+        for name, pos, vel, tau in zip(names, positions, velocities, physx_tau):
+            index = joint_names.index(name)
+            self.assertAlmostEqual(pos, 10.0 + index, places=6)
+            self.assertAlmostEqual(vel, 20.0 + index, places=6)
+            self.assertAlmostEqual(tau, 100.0 + index, places=6)
+
+    def test_parity_gripper_torque_fails_soft_and_logs_once_when_view_raises(
+        self,
+    ) -> None:
+        """#33: root_view.get_dof_projected_joint_forces() raising (a real
+        PhysX API surface -- e.g. queried before the first physics step)
+        must not propagate; log once and return None so the gateway skips
+        that tick's publish, the same fail-soft contract as
+        parity_tcp_frame()."""
+        backend = _backend()
+        joint_names = (
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_inner_knuckle_joint",
+            "right_finger_joint",
+        )
+        backend.joint_names = joint_names
+        backend._joint_index = {name: index for index, name in enumerate(joint_names)}
+        backend._parity_gripper_joint_indices = tuple(
+            backend._joint_index[name] for name in backend.PARITY_GRIPPER_JOINTS
+        )
+
+        def _raise():
+            raise RuntimeError("physx view not ready")
+
+        backend._robot.root_view = SimpleNamespace(
+            get_dof_projected_joint_forces=_raise
+        )
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            first = backend.parity_gripper_torque()
+            second = backend.parity_gripper_torque()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the read-error diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "parity_gripper_torque_read_error")
+
+    def test_parity_gripper_targets_returns_per_layer_readback_for_three_joints(
+        self,
+    ) -> None:
+        """#33 follow-up (bench round ahh): parity_gripper_targets() must
+        return "<joint>/<field>" names for PARITY_GRIPPER_TARGET_JOINTS in
+        order, with py_target from _position_targets, lab_target from
+        data.joint_pos_target, physx_target/physx_k/physx_d/physx_max_force/
+        physx_max_vel each from ONE PhysX view call batched across all
+        three joints (not one call per joint), measured from data.joint_pos,
+        and lab_applied_effort from data.applied_torque. The joint order is
+        scrambled (and includes a non-target joint) to prove the indices
+        are resolved by name."""
+        backend = _backend()
+        joint_names = (
+            "joint1",
+            "right_outer_knuckle_joint",
+            "drive_joint",
+            "left_finger_joint",
+        )
+        backend.joint_names = joint_names
+        backend._joint_index = {name: index for index, name in enumerate(joint_names)}
+        backend._parity_gripper_target_indices = tuple(
+            backend._joint_index[name] for name in backend.PARITY_GRIPPER_TARGET_JOINTS
+        )
+        backend._position_targets = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32
+        )
+        backend._robot.data.joint_pos = torch.tensor(
+            [[10.0, 11.0, 12.0, 13.0]], dtype=torch.float32
+        )
+        backend._robot.data.joint_pos_target = torch.tensor(
+            [[20.0, 21.0, 22.0, 23.0]], dtype=torch.float32
+        )
+        backend._robot.data.applied_torque = torch.tensor(
+            [[30.0, 31.0, 32.0, 33.0]], dtype=torch.float32
+        )
+        calls: list[str] = []
+
+        def _tracked(name: str, row: list[float]):
+            def _getter():
+                calls.append(name)
+                return [row]
+
+            return _getter
+
+        backend._robot.root_view = SimpleNamespace(
+            get_dof_position_targets=_tracked(
+                "get_dof_position_targets", [40.0, 41.0, 42.0, 43.0]
+            ),
+            get_dof_stiffnesses=_tracked(
+                "get_dof_stiffnesses", [50.0, 51.0, 52.0, 53.0]
+            ),
+            get_dof_dampings=_tracked("get_dof_dampings", [60.0, 61.0, 62.0, 63.0]),
+            get_dof_max_forces=_tracked(
+                "get_dof_max_forces", [70.0, 71.0, 72.0, 73.0]
+            ),
+            get_dof_max_velocities=_tracked(
+                "get_dof_max_velocities", [80.0, 81.0, 82.0, 83.0]
+            ),
+        )
+        backend._last_target_write = True
+        backend._articulation_sleep_ids = None  # unresolved -- field omitted
+
+        result = backend.parity_gripper_targets()
+
+        self.assertIsNotNone(result)
+        names, values = result
+        row = dict(zip(names, values))
+        expected_by_field = {
+            "py_target": 1.0,
+            "lab_target": 20.0,
+            "physx_target": 40.0,
+            "physx_k": 50.0,
+            "physx_d": 60.0,
+            "physx_max_force": 70.0,
+            "physx_max_vel": 80.0,
+            "measured": 10.0,
+            "lab_applied_effort": 30.0,
+        }
+        for joint_name in backend.PARITY_GRIPPER_TARGET_JOINTS:
+            index = joint_names.index(joint_name)
+            for field, base in expected_by_field.items():
+                self.assertAlmostEqual(
+                    row[f"{joint_name}/{field}"], base + index, places=6
+                )
+        self.assertEqual(row["articulation/target_write"], 1.0)
+        self.assertNotIn("articulation/is_sleeping", names)
+        # Each PhysX getter is called exactly once, batched across all
+        # three joints -- not once per joint (which would be 3x these).
+        for getter_name in (
+            "get_dof_position_targets",
+            "get_dof_stiffnesses",
+            "get_dof_dampings",
+            "get_dof_max_forces",
+            "get_dof_max_velocities",
+        ):
+            self.assertEqual(calls.count(getter_name), 1)
+
+    def test_parity_gripper_targets_returns_none_on_a_double_without_a_view(
+        self,
+    ) -> None:
+        """A test double lacking a PhysX view (root_view/root_physx_view
+        both absent/None -- the shape every non-Isaac test double in this
+        file has) must return None rather than raising, same fail-soft
+        contract as parity_gripper_torque()."""
+        backend = _backend()
+        joint_names = ("drive_joint", "left_finger_joint", "right_outer_knuckle_joint")
+        backend.joint_names = joint_names
+        backend._joint_index = {name: index for index, name in enumerate(joint_names)}
+        backend._parity_gripper_target_indices = tuple(
+            backend._joint_index[name] for name in backend.PARITY_GRIPPER_TARGET_JOINTS
+        )
+        backend._robot.root_view = None
+
+        self.assertIsNone(backend.parity_gripper_targets())
+
+    def test_resolve_articulation_sleep_ids_requires_the_rigid_body_api(
+        self,
+    ) -> None:
+        """Review round 2: the articulation ROOT BODY is
+        ``<prim_path>/base_link``, not the robot's top Xform
+        (``cfg.prim_path`` itself, e.g. ``/World/Tinker``, which carries no
+        ``PhysicsRigidBodyAPI``) -- ``is_sleeping()`` on a non-rigid-body
+        prim id produced a native PhysX C++ error on EVERY tick on a live
+        bench while the field silently published 0. Only a prim that
+        actually carries ``UsdPhysics.RigidBodyAPI`` at resolve time may be
+        resolved; a real in-memory USD stage (this venv's bare ``pxr`` has
+        no ``PhysicsSchemaTools``, so that one call is faked) proves both
+        directions: resolved with the API applied, omitted without it.
+
+        Round 3 fix: the "omitted" half must ALSO patch
+        ``pxr.PhysicsSchemaTools`` (the method imports it unconditionally,
+        before the ``HasAPI`` check) -- without that patch this venv's real
+        ``pxr`` lacking ``PhysicsSchemaTools`` raises ``ImportError``
+        first, and the method's outer ``except Exception: return None``
+        masks that as a "None" that looks like the HasAPI gate fired but
+        actually never ran (the reviewer proved the old test still passed
+        with the gate deleted). Tracking whether the fake ``sdfPathToInt``
+        was actually CALLED distinguishes the two: the resolved branch must
+        call it once, the omitted branch must never reach it.
+        """
+        from pxr import Usd, UsdPhysics
+
+        backend = _backend()
+        backend._robot.cfg = SimpleNamespace(prim_path="/World/Tinker")
+        stage = Usd.Stage.CreateInMemory()
+        stage.DefinePrim("/World/Tinker", "Xform")
+        body_prim = stage.DefinePrim("/World/Tinker/base_link", "Xform")
+        UsdPhysics.RigidBodyAPI.Apply(body_prim)
+
+        fake_context = SimpleNamespace(
+            get_stage=lambda: stage, get_stage_id=lambda: 12345
+        )
+        fake_usd = ModuleType("omni.usd")
+        fake_usd.get_context = lambda: fake_context
+        resolved_sdf_calls: list[object] = []
+        fake_schema_tools = SimpleNamespace(
+            sdfPathToInt=lambda path: resolved_sdf_calls.append(path) or 987
+        )
+
+        with patch.dict(sys.modules, {"omni.usd": fake_usd}):
+            with patch("omni.usd", fake_usd, create=True):
+                with patch("pxr.PhysicsSchemaTools", fake_schema_tools, create=True):
+                    resolved = backend._resolve_articulation_sleep_ids()
+
+        self.assertEqual(resolved, (12345, 987))
+        self.assertEqual(len(resolved_sdf_calls), 1)
+
+        # Without RigidBodyAPI on base_link, the same stage/context (and the
+        # SAME PhysicsSchemaTools patch, so an ImportError can't masquerade
+        # as the HasAPI gate) must omit (return None) WITHOUT ever calling
+        # sdfPathToInt -- proving the gate itself, not an import failure,
+        # is what produced the None.
+        bare_stage = Usd.Stage.CreateInMemory()
+        bare_stage.DefinePrim("/World/Tinker", "Xform")
+        bare_stage.DefinePrim("/World/Tinker/base_link", "Xform")  # no API
+        fake_context2 = SimpleNamespace(
+            get_stage=lambda: bare_stage, get_stage_id=lambda: 1
+        )
+        fake_usd2 = ModuleType("omni.usd")
+        fake_usd2.get_context = lambda: fake_context2
+        omitted_sdf_calls: list[object] = []
+        fake_schema_tools2 = SimpleNamespace(
+            sdfPathToInt=lambda path: omitted_sdf_calls.append(path) or 987
+        )
+
+        with patch.dict(sys.modules, {"omni.usd": fake_usd2}):
+            with patch("omni.usd", fake_usd2, create=True):
+                with patch("pxr.PhysicsSchemaTools", fake_schema_tools2, create=True):
+                    omitted = backend._resolve_articulation_sleep_ids()
+
+        self.assertIsNone(omitted)
+        self.assertEqual(len(omitted_sdf_calls), 0)
+
+    def test_articulation_is_sleeping_self_check_disables_on_non_bool_return(
+        self,
+    ) -> None:
+        """Review round 2: if ``is_sleeping()``'s first successful return
+        value isn't a real ``bool``, the field must be disabled (logged
+        once) for the rest of this backend's life rather than silently
+        coerced through ``bool(...)`` every tick."""
+        backend = _backend()
+        backend._articulation_sleep_ids = (1, 2)
+        fake_iface = SimpleNamespace(is_sleeping=lambda stage_id, prim_id: 1)  # int
+        fake_physx = ModuleType("omni.physx")
+        fake_physx.get_physx_simulation_interface = lambda: fake_iface
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            with patch.dict(sys.modules, {"omni.physx": fake_physx}):
+                first = backend._articulation_is_sleeping()
+                second = backend._articulation_is_sleeping()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertTrue(backend._articulation_is_sleeping_disabled)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the type-mismatch diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "articulation_is_sleeping_unexpected_type")
+        self.assertEqual(payload["type"], "int")
+
+    def test_step_leaves_target_write_false_when_write_data_to_sim_raises(
+        self,
+    ) -> None:
+        """Review round 2: ``articulation/target_write`` must mean
+        "PhysX actually received this tick's targets", not "the write gate
+        said yes" -- a ``write_data_to_sim()`` failure that
+        ``_maybe_recover_simulation_view`` swallows must leave
+        ``_last_target_write`` ``False`` for that tick, and a PRIOR tick's
+        ``True`` must not leak into a failing tick either (reset happens at
+        the very top of every ``step()`` call). Uses the safety-stop path
+        (same minimal-setup shape as
+        ``test_safety_stop_reapplies_explicit_hold_without_reviving_old_epoch``
+        above) so the write is actually attempted without needing the
+        wheel-slew machinery the free-run path requires."""
+        backend = _backend()
+        backend.set_safety_stop(True)
+        backend._last_target_write = True  # stale True from a prior tick
+
+        def _raise(target: object) -> None:
+            raise RuntimeError("injected write_data_to_sim failure")
+
+        backend._robot.write_data_to_sim = _raise
+        backend._maybe_recover_simulation_view = lambda error: True  # swallow
+
+        backend.step()
+
+        self.assertFalse(backend._last_target_write)
+
+    def test_usd_camera_pose_to_ros_optical_identity_looks_down_world_minus_z(
+        self,
+    ) -> None:
+        """Task #36 worked example: a USD camera at the origin with no local
+        rotation looks down -Z with +Y up (native convention). Converting to
+        ROS optical must publish a frame whose +Z (forward) points along
+        world -Z and whose +Y (down) points along world -Y."""
+        position, quaternion_wxyz = usd_camera_pose_to_ros_optical(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)
+        )
+        self.assertEqual(position, (0.0, 0.0, 0.0))
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        for actual, expected in zip(forward, (0.0, 0.0, -1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(down, (0.0, -1.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_usd_camera_pose_to_ros_optical_composes_about_the_cameras_own_axis(
+        self,
+    ) -> None:
+        """A camera yawed 90 deg about world Z: the flip must compose about
+        the camera's OWN current local X (Hamilton product on the RIGHT),
+        landing optical 'down' at world +X here -- a left-multiply ordering
+        bug would instead land it at world -X. (The forward axis alone does
+        not discriminate the two orders: it sits on the yaw's own rotation
+        axis either way, unchanged by the bug.)"""
+        half = math.pi / 4.0
+        yaw90_wxyz = (math.cos(half), 0.0, 0.0, math.sin(half))
+        _position, quaternion_wxyz = usd_camera_pose_to_ros_optical(
+            (0.0, 0.0, 0.0), yaw90_wxyz
+        )
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        for actual, expected in zip(down, (1.0, 0.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(forward, (0.0, 0.0, -1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_camera_optical_pose_world_composes_link_and_mount_pose(self) -> None:
+        """Task #36 fix: camera_optical_pose_world's per-tick composition
+        (a known articulation-tensor link pose (position + SCALAR-LAST
+        quaternion, matching IsaacWholeRobotBackend.body_pose_world) with a
+        known static local mount transform (position + SCALAR-FIRST
+        quaternion, matching what initialize() would cache)), checked
+        against a hand-derived expectation -- position and the optical
+        +z/+y axes -- with the link at identity."""
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+        # Mimic exactly what initialize() would have cached for a
+        # robot-mounted camera: mount 0.5 m along the link's own local +Z,
+        # oriented by the standard REP-103 mount flip (the real value every
+        # spec's mount_rotation_wxyz happens to equal today).
+        rig._mount_body_names["wrist_camera"] = "xarm_camera_link"
+        rig._mount_local_pose["wrist_camera"] = (
+            (0.0, 0.0, 0.5),
+            OPTICAL_TO_USD_CAMERA_WXYZ,
+        )
+        link_position = (10.0, 20.0, 0.0)
+        link_quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)  # identity, scalar-last
+
+        position, quaternion_wxyz = rig.camera_optical_pose_world(
+            "wrist_camera", (link_position, link_quaternion_xyzw)
+        )
+
+        for actual, expected in zip(position, (10.0, 20.0, 0.5)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        for actual, expected in zip(forward, (0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(down, (0.0, 1.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_camera_optical_pose_world_composes_link_and_mount_pose_with_yaw(
+        self,
+    ) -> None:
+        """Same composition as above, but with the link yawed 90 deg about
+        world Z and a mount offset with an X component -- a left- vs
+        right-multiply bug in the link/mount composition (unlike the
+        optical-flip composition already covered above) would rotate the
+        offset the wrong way and land 'down' on the wrong world axis, while
+        leaving the boresight (the mount's own +Z, unaffected by a Z yaw)
+        unable to discriminate it -- hence checking both.
+
+        Independently hand-derived (rotation matrices, not this module's
+        quaternion helpers): a 90 deg yaw about +Z maps local (x, y) ->
+        (-y, x), so the mount's local (0.1, 0.0) offset lands at world
+        (0.0, 0.1); the mount's own +Z boresight is untouched by a Z yaw
+        (still world +Z); its local +Y (down, once flipped into the
+        optical frame) is yawed onto world -X.
+        """
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+        rig._mount_body_names["wrist_camera"] = "xarm_camera_link"
+        rig._mount_local_pose["wrist_camera"] = (
+            (0.1, 0.0, 0.5),
+            OPTICAL_TO_USD_CAMERA_WXYZ,
+        )
+        half = math.pi / 4.0
+        link_quaternion_xyzw = (0.0, 0.0, math.sin(half), math.cos(half))
+        link_position = (10.0, 20.0, 0.0)
+
+        position, quaternion_wxyz = rig.camera_optical_pose_world(
+            "wrist_camera", (link_position, link_quaternion_xyzw)
+        )
+
+        for actual, expected in zip(position, (10.0, 20.1, 0.5)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        forward = _rotate_by_quaternion(quaternion_wxyz, (0.0, 0.0, 1.0))
+        down = _rotate_by_quaternion(quaternion_wxyz, (0.0, 1.0, 0.0))
+        for actual, expected in zip(forward, (0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+        for actual, expected in zip(down, (-1.0, 0.0, 0.0)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_camera_optical_pose_world_per_tick_never_touches_pxr(self) -> None:
+        """Regression test for the review finding on commit f8277df: the
+        first cut of this publisher read a live ``ComputeLocalToWorldTransform``
+        on the physics-driven render prim every tick, which goes stale under
+        the default fabric-on config (``/physics/updateToUsd=False`` --
+        PhysX stops writing rigid-body transforms back into USD). The fix
+        composes a tensor-sourced link pose with a mount offset cached once
+        at init; this test proves the per-tick call path is pure Python by
+        monkeypatching ``UsdGeom.Xformable.ComputeLocalToWorldTransform`` to
+        raise and confirming a normal (already-"initialized") call still
+        succeeds."""
+        from pxr import UsdGeom
+
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+        rig._mount_body_names["wrist_camera"] = "xarm_camera_link"
+        rig._mount_local_pose["wrist_camera"] = (
+            (0.0, 0.0, 0.5),
+            OPTICAL_TO_USD_CAMERA_WXYZ,
+        )
+
+        def _must_not_be_called(self, *args, **kwargs):
+            raise AssertionError(
+                "camera_optical_pose_world's per-tick path must not call "
+                "ComputeLocalToWorldTransform -- that read is fabric-unsafe "
+                "on a physics-driven prim; see commit f8277df's review"
+            )
+
+        with patch.object(
+            UsdGeom.Xformable,
+            "ComputeLocalToWorldTransform",
+            _must_not_be_called,
+        ):
+            result = rig.camera_optical_pose_world(
+                "wrist_camera",
+                ((10.0, 20.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+            )
+
+        self.assertIsNotNone(result)
+
+    def test_camera_optical_pose_world_fails_soft_and_logs_once_before_initialize(
+        self,
+    ) -> None:
+        """Task #36: camera_optical_pose_world() must not raise if
+        initialize() has not run for the named camera (no Kit/pxr yet) --
+        log once and let the gateway skip publishing that tick, the same
+        fail-soft contract as parity_tcp_frame()."""
+        rig = CameraRig(load_camera_specs(CAMERA_CONTRACT))
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            first = rig.camera_optical_pose_world("wrist_camera")
+            second = rig.camera_optical_pose_world("wrist_camera")
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "the unresolved-camera diagnostic must log once")
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "camera_optical_pose_unresolved")
+        self.assertEqual(payload["camera"], "wrist_camera")
+
+    def test_gateway_registers_wrist_camera_pose_publishers_gated_by_env(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'PoseStamped, "/sim/parity/wrist_camera_pose", reliable', source
+        )
+        self.assertIn(
+            'PoseStamped, "/sim/parity/wrist_camera_pose_base", reliable', source
+        )
+        self.assertIn('camera_pose.header.frame_id = "world"', source)
+        self.assertIn('camera_pose_base.header.frame_id = "base_link"', source)
+        # Same env gate as the rest of #35/#36's parity block -- no separate
+        # flag for the camera topics.
+        self.assertIn(
+            'os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"', source
+        )
+
+    def test_wrist_camera_pose_publishers_emit_world_and_base_every_tick(self) -> None:
+        """Task #36 end to end through the gateway: the wrist camera's world
+        pose (as CameraRig.camera_optical_pose_world reports it) and its
+        base_link-relative pose (via the same pose_in_frame() the #35 TCP
+        parity block reuses), published every publish() tick alongside the
+        TCP topics."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import Point32, PolygonStamped, PoseStamped, WrenchStamped
+
+        class _ParityCameraBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                # Root yawed 180 deg about Z, at (1, 2, 0.5) -- a non-trivial
+                # frame so the base_link transform actually exercises
+                # pose_in_frame's rotation, not just a translation.
+                return {
+                    "position": (1.0, 2.0, 0.5),
+                    "quaternion_wxyz": (0.0, 0.0, 0.0, 1.0),
+                    "angular_velocity_world": (0.0, 0.0, 0.0),
+                }
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None  # keep this test focused on the camera block
+
+            def parity_gripper_torque(self):
+                return None  # keep this test focused on the camera block
+
+            def body_pose_world(self, name):
+                assert name == "xarm_camera_link"
+                # Arbitrary tensor-style body pose; the fake camera rig
+                # below ignores it and returns a fixed pose -- this test
+                # exercises the gateway's plumbing (mount lookup -> backend
+                # tensor read -> camera_rig composition -> publish), not
+                # CameraRig's own composition math (see
+                # test_camera_optical_pose_world_composes_link_and_mount_pose).
+                return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+
+        class _FakeWristCameraRig:
+            def __init__(self, pose) -> None:
+                self._pose = pose
+                self.calls = 0
+
+            def mount_body_name(self, name):
+                assert name == "wrist_camera"
+                return "xarm_camera_link"
+
+            def camera_optical_pose_world(self, name, body_pose_world=None):
+                self.calls += 1
+                assert name == "wrist_camera"
+                assert body_pose_world == ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+                return self._pose
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _ParityCameraBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway._PoseStamped = PoseStamped
+        gateway._PolygonStamped = PolygonStamped
+        gateway._Point32 = Point32
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway.tcp_pose_pub = _RecordingPublisher()
+        gateway.tcp_pose_base_pub = _RecordingPublisher()
+        gateway.pad_points_pub = _RecordingPublisher()
+        gateway.wrist_camera_pose_pub = _RecordingPublisher()
+        gateway.wrist_camera_pose_base_pub = _RecordingPublisher()
+        gateway._parity_tcp_enabled = True
+        # Camera at (2, 2, 0.5) with an identity optical orientation in
+        # world -- one metre along the root's own +X, at the same height.
+        camera_rig = _FakeWristCameraRig(((2.0, 2.0, 0.5), (1.0, 0.0, 0.0, 0.0)))
+        gateway._camera_rig = camera_rig
+        gateway.camera_skipped_frames = 0
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(camera_rig.calls, 3)
+        self.assertEqual(len(gateway.wrist_camera_pose_pub.messages), 3)
+        self.assertEqual(len(gateway.wrist_camera_pose_base_pub.messages), 3)
+
+        world_pose = gateway.wrist_camera_pose_pub.messages[0]
+        self.assertEqual(world_pose.header.frame_id, "world")
+        for actual, expected in zip(
+            (world_pose.pose.position.x, world_pose.pose.position.y, world_pose.pose.position.z),
+            (2.0, 2.0, 0.5),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(
+            (
+                world_pose.pose.orientation.x,
+                world_pose.pose.orientation.y,
+                world_pose.pose.orientation.z,
+                world_pose.pose.orientation.w,
+            ),
+            (0.0, 0.0, 0.0, 1.0),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+        # Hand-derived via backend.pose_in_frame: relative = (1, 0, 0) in
+        # world, rotated by the 180-deg-about-Z root's inverse -> (-1, 0, 0);
+        # the orientation likewise composes to another 180-about-Z, (0, 0,
+        # -1, 0) scalar-last.
+        base_pose = gateway.wrist_camera_pose_base_pub.messages[0]
+        self.assertEqual(base_pose.header.frame_id, "base_link")
+        for actual, expected in zip(
+            (base_pose.pose.position.x, base_pose.pose.position.y, base_pose.pose.position.z),
+            (-1.0, 0.0, 0.0),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(
+            (
+                base_pose.pose.orientation.x,
+                base_pose.pose.orientation.y,
+                base_pose.pose.orientation.z,
+                base_pose.pose.orientation.w,
+            ),
+            (0.0, 0.0, -1.0, 0.0),
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_wrist_camera_pose_publishers_skip_when_env_disabled_or_camera_unresolved(
+        self,
+    ) -> None:
+        """TINKER_SIM_PARITY_TCP=0 must fully disable the camera topics too
+        (no camera_optical_pose_world() calls at all); a resolvable-but-
+        currently-unresolved camera rig (fail-soft, returns None) must skip
+        publishing without raising."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        class _NoOpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {
+                    "position": (0.0, 0.0, 0.0),
+                    "quaternion_wxyz": (1.0, 0.0, 0.0, 0.0),
+                    "angular_velocity_world": (0.0, 0.0, 0.0),
+                }
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
+                return None
+
+            def body_pose_world(self, name):
+                raise AssertionError(
+                    "must not be called: _UnresolvedCameraRig.mount_body_name "
+                    "returns None, so there is no body to look up"
+                )
+
+        class _UnresolvedCameraRig:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def mount_body_name(self, name):
+                return None  # not yet resolved by initialize()
+
+            def camera_optical_pose_world(self, name, body_pose_world=None):
+                self.calls += 1
+                assert body_pose_world is None
+                return None  # unresolved this tick
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        def _new_gateway(*, parity_tcp_enabled: bool, camera_rig) -> RosStandardGateway:
+            gateway = object.__new__(RosStandardGateway)
+            gateway.backend = _NoOpBackend()
+            gateway._Clock = Clock
+            gateway._JointState = JointState
+            gateway._Imu = Imu
+            gateway._String = String
+            gateway._WrenchStamped = WrenchStamped
+            gateway._PoseStamped = PoseStamped
+            gateway._PolygonStamped = PolygonStamped
+            gateway.clock_pub = _RecordingPublisher()
+            gateway.joint_pub = _RecordingPublisher()
+            gateway.imu_pub = _RecordingPublisher()
+            gateway.status_pub = _RecordingPublisher()
+            gateway.contact_pub = _RecordingPublisher()
+            gateway.physics_truth_pub = _RecordingPublisher()
+            gateway.cloud_pub = _RecordingPublisher()
+            gateway.tcp_pose_pub = _RecordingPublisher()
+            gateway.tcp_pose_base_pub = _RecordingPublisher()
+            gateway.pad_points_pub = _RecordingPublisher()
+            gateway.wrist_camera_pose_pub = _RecordingPublisher()
+            gateway.wrist_camera_pose_base_pub = _RecordingPublisher()
+            gateway._parity_tcp_enabled = parity_tcp_enabled
+            gateway._camera_rig = camera_rig
+            gateway.camera_skipped_frames = 0
+            gateway._cloud_publish_enabled = lambda: False
+            gateway._last_command_error = None
+            gateway._command_stream_lost = False
+            gateway._command_epoch = 0
+            gateway._last_logical_snapshot_id = -1
+            gateway.development_lidar = False
+            gateway._publish_profile_enabled = False
+            gateway._state_stride = 1_000_000
+            gateway._imu_stride = 1_000_000
+            gateway._status_stride = 1_000_000
+            gateway._tick = 0
+            return gateway
+
+        disabled_rig = _UnresolvedCameraRig()
+        disabled_gateway = _new_gateway(parity_tcp_enabled=False, camera_rig=disabled_rig)
+        disabled_gateway.publish()
+        self.assertEqual(len(disabled_gateway.wrist_camera_pose_pub.messages), 0)
+        self.assertEqual(len(disabled_gateway.wrist_camera_pose_base_pub.messages), 0)
+        self.assertEqual(disabled_rig.calls, 0)
+
+        unresolved_rig = _UnresolvedCameraRig()
+        unresolved_gateway = _new_gateway(parity_tcp_enabled=True, camera_rig=unresolved_rig)
+        unresolved_gateway.publish()
+        self.assertEqual(len(unresolved_gateway.wrist_camera_pose_pub.messages), 0)
+        self.assertEqual(len(unresolved_gateway.wrist_camera_pose_base_pub.messages), 0)
+        self.assertEqual(unresolved_rig.calls, 1)
+
+        no_camera_gateway = _new_gateway(parity_tcp_enabled=True, camera_rig=None)
+        no_camera_gateway.publish()  # must not raise with no camera rig at all
+        self.assertEqual(len(no_camera_gateway.wrist_camera_pose_pub.messages), 0)
 
     def test_command_target_truth_exposes_active_physx_targets(self) -> None:
         backend = _backend()
@@ -2807,6 +4024,105 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertIsNone(_BE._quaternion_xyzw_from_physx(None))
         self.assertIsNone(_BE._quaternion_xyzw_from_physx((1.0, 2.0)))
 
+    def test_pad_points_world_mirrors_toward_centreline_at_rest_orientation(
+        self,
+    ) -> None:
+        """Task #35 pad-inner-face math. Both finger links share one static
+        rest orientation -- a 180 deg rotation about local X, xyzw (1,0,0,0)
+        -- confirmed live via pxr on the shipped robot USD (see
+        docs/developer-log.md 2026-09-06, Task #35): rotating each finger's
+        fixed LEFT/RIGHT_FINGER_PAD_LOCAL_OFFSET by that orientation is what
+        turns the local mesh offset into "toward the jaw centreline" in
+        world space. Fingers at +/-0.0705 m (matching the live pxr readback
+        of the finger link origins) with the 26 mm inset must land the inner
+        faces at +/-0.0445 m and their midpoint at 0 along the closing axis.
+        """
+        from tinker_sim_isaac import backend as backend_module
+
+        rest_quaternion = (1.0, 0.0, 0.0, 0.0)
+        left_pose = ((0.0, -0.0705, 0.0), rest_quaternion)
+        right_pose = ((0.0, 0.0705, 0.0), rest_quaternion)
+
+        left_point, right_point, midpoint = backend_module.pad_points_world(
+            left_pose, right_pose
+        )
+
+        self.assertAlmostEqual(left_point[1], -0.0445, places=6)
+        self.assertAlmostEqual(right_point[1], 0.0445, places=6)
+        self.assertAlmostEqual(midpoint[1], 0.0, places=6)
+        self.assertAlmostEqual(
+            left_point[2], -backend_module.PAD_MID_REACH_M, places=6
+        )
+        self.assertAlmostEqual(
+            right_point[2], -backend_module.PAD_MID_REACH_M, places=6
+        )
+
+    def test_pad_points_world_rotates_consistently_under_an_additional_yaw(
+        self,
+    ) -> None:
+        """Composing an extra 90 deg yaw onto the rest orientation must
+        rotate both inner-face points (and their midpoint) the same way a
+        single rigid transform would -- i.e. the closing-axis separation
+        the two inner faces started with (before the yaw) reappears, after
+        the yaw, along the axis the yaw rotated the closing axis onto."""
+        from tinker_sim_isaac import backend as backend_module
+
+        rest_quaternion = (1.0, 0.0, 0.0, 0.0)
+        yaw_90_z = (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0))
+        combined = backend_module._quaternion_multiply_xyzw(yaw_90_z, rest_quaternion)
+
+        left_pose = (
+            backend_module.rotate_vector_xyzw(yaw_90_z, (0.0, -0.0705, 0.0)),
+            combined,
+        )
+        right_pose = (
+            backend_module.rotate_vector_xyzw(yaw_90_z, (0.0, 0.0705, 0.0)),
+            combined,
+        )
+
+        left_point, right_point, midpoint = backend_module.pad_points_world(
+            left_pose, right_pose
+        )
+
+        # The un-yawed case put the +/-0.0445 m separation on Y (see the
+        # test above); a 90 deg yaw about Z carries that separation onto X,
+        # not Y, and leaves Z untouched.
+        self.assertAlmostEqual(left_point[0], 0.0445, places=6)
+        self.assertAlmostEqual(right_point[0], -0.0445, places=6)
+        self.assertAlmostEqual(left_point[1], 0.0, places=6)
+        self.assertAlmostEqual(right_point[1], 0.0, places=6)
+        self.assertAlmostEqual(midpoint[0], 0.0, places=6)
+        self.assertAlmostEqual(
+            left_point[2], -backend_module.PAD_MID_REACH_M, places=6
+        )
+
+    def test_pose_in_frame_expresses_a_world_pose_relative_to_a_yawed_root(
+        self,
+    ) -> None:
+        """Task #35 base_link transform math, checked against a known root
+        pose: a root translated by (1, 2, 0) and yawed 90 deg about Z, and a
+        world point one metre along world +X from the root -- expressed in
+        the root's own frame that point must be one metre along the root's
+        LOCAL -Y (since +X world is -Y in a frame yawed +90 deg about Z)."""
+        from tinker_sim_isaac import backend as backend_module
+
+        root_position = (1.0, 2.0, 0.0)
+        root_quaternion = (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0))
+        world_position = (2.0, 2.0, 0.0)  # root_position + 1 m along world +X
+        world_quaternion = root_quaternion  # co-oriented with the root itself
+
+        local_position, local_quaternion = backend_module.pose_in_frame(
+            root_position, root_quaternion, world_position, world_quaternion
+        )
+
+        self.assertAlmostEqual(local_position[0], 0.0, places=6)
+        self.assertAlmostEqual(local_position[1], -1.0, places=6)
+        self.assertAlmostEqual(local_position[2], 0.0, places=6)
+        # Co-oriented with the frame itself -> the relative orientation is
+        # the identity quaternion.
+        for actual, expected in zip(local_quaternion, (0.0, 0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, places=6)
+
     def test_manipulation_profile_and_artifact_are_strict(self) -> None:
         profile = json.loads(
             (ROOT / "simulation/profiles/manipulation-core.json").read_text(encoding="utf-8")
@@ -2913,6 +4229,8 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway._last_logical_snapshot_id = -1
         gateway.development_lidar = False
         gateway._publish_profile_enabled = False
+        # Unrelated to this test (#22); off so publish() skips the #35 block.
+        gateway._parity_tcp_enabled = False
         # Large strides so state/imu/status only fire on tick 0 (0 % N == 0
         # for any N); every subsequent tick must skip the status heartbeat.
         gateway._state_stride = 1_000_000
@@ -2934,6 +4252,682 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         forces = [msg.wrench.force.z for msg in gateway.contact_pub.messages]
         self.assertTrue(all(abs(force - 6.0) < 1e-6 for force in forces))
+
+    def test_gateway_registers_parity_tcp_publishers_gated_by_env(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('PoseStamped, "/sim/parity/tcp_pose", reliable', source)
+        self.assertIn(
+            'PoseStamped, "/sim/parity/tcp_pose_base", reliable', source
+        )
+        self.assertIn(
+            'PolygonStamped, "/sim/parity/pad_points", reliable', source
+        )
+        self.assertIn('tcp_pose.header.frame_id = "world"', source)
+        self.assertIn('tcp_pose_base.header.frame_id = "base_link"', source)
+        self.assertIn('pad_points.header.frame_id = "base_link"', source)
+        self.assertIn(
+            'os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"', source
+        )
+
+    def test_parity_tcp_publishers_emit_world_base_and_pad_points_every_tick(
+        self,
+    ) -> None:
+        """Task #35: the three parity topics publish at the same cadence as
+        /sim/internal/physics_truth (unconditional, every tick), independent
+        of the status heartbeat stride -- same contract as #22's finger
+        contact wrench above."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import Point32, PolygonStamped, PoseStamped, WrenchStamped
+
+        class _ParityTcpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return {
+                    "tcp_pose_world": {
+                        "xyz": (0.5, 0.0, 0.6),
+                        "quaternion_xyzw": (0.0, 0.0, 0.0, 1.0),
+                    },
+                    "tcp_pose_base": {
+                        "xyz": (0.1, 0.0, 0.2),
+                        "quaternion_xyzw": (0.0, 0.0, 0.0, 1.0),
+                    },
+                    "pad_points_base": (
+                        (0.1, -0.0445, 0.15),
+                        (0.1, 0.0445, 0.15),
+                        (0.1, 0.0, 0.15),
+                    ),
+                }
+
+            def parity_gripper_torque(self):
+                return None  # keep this test focused on the TCP/pad block
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _ParityTcpBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway._PoseStamped = PoseStamped
+        gateway._PolygonStamped = PolygonStamped
+        gateway._Point32 = Point32
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway.tcp_pose_pub = _RecordingPublisher()
+        gateway.tcp_pose_base_pub = _RecordingPublisher()
+        gateway.pad_points_pub = _RecordingPublisher()
+        gateway._parity_tcp_enabled = True
+        gateway._camera_rig = None
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(len(gateway.tcp_pose_pub.messages), 3)
+        self.assertEqual(len(gateway.tcp_pose_base_pub.messages), 3)
+        self.assertEqual(len(gateway.pad_points_pub.messages), 3)
+
+        tcp_pose = gateway.tcp_pose_pub.messages[0]
+        self.assertEqual(tcp_pose.header.frame_id, "world")
+        self.assertAlmostEqual(tcp_pose.pose.position.x, 0.5, places=6)
+        self.assertAlmostEqual(tcp_pose.pose.orientation.w, 1.0, places=6)
+
+        tcp_pose_base = gateway.tcp_pose_base_pub.messages[0]
+        self.assertEqual(tcp_pose_base.header.frame_id, "base_link")
+        self.assertAlmostEqual(tcp_pose_base.pose.position.z, 0.2, places=6)
+
+        pad_points = gateway.pad_points_pub.messages[0]
+        self.assertEqual(pad_points.header.frame_id, "base_link")
+        self.assertEqual(len(pad_points.polygon.points), 3)
+        self.assertAlmostEqual(pad_points.polygon.points[0].y, -0.0445, places=5)
+        self.assertAlmostEqual(pad_points.polygon.points[1].y, 0.0445, places=5)
+        self.assertAlmostEqual(pad_points.polygon.points[2].y, 0.0, places=5)
+
+    def test_parity_tcp_publishers_skip_publish_when_env_disabled_or_unresolved(
+        self,
+    ) -> None:
+        """TINKER_SIM_PARITY_TCP=0 must fully disable the block (no publish
+        calls at all); a resolvable-but-currently-unresolved backend (##35's
+        fail-soft contract) must skip publishing without raising."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        class _NoOpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                self.calls = getattr(self, "calls", 0) + 1
+                return None  # unresolved this tick
+
+            def parity_gripper_torque(self):
+                return None  # keep this test focused on the TCP/pad block
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        def _new_gateway(backend, *, parity_tcp_enabled: bool) -> RosStandardGateway:
+            gateway = object.__new__(RosStandardGateway)
+            gateway.backend = backend
+            gateway._Clock = Clock
+            gateway._JointState = JointState
+            gateway._Imu = Imu
+            gateway._String = String
+            gateway._WrenchStamped = WrenchStamped
+            gateway._PoseStamped = PoseStamped
+            gateway._PolygonStamped = PolygonStamped
+            gateway.clock_pub = _RecordingPublisher()
+            gateway.joint_pub = _RecordingPublisher()
+            gateway.imu_pub = _RecordingPublisher()
+            gateway.status_pub = _RecordingPublisher()
+            gateway.contact_pub = _RecordingPublisher()
+            gateway.physics_truth_pub = _RecordingPublisher()
+            gateway.cloud_pub = _RecordingPublisher()
+            gateway.tcp_pose_pub = _RecordingPublisher()
+            gateway.tcp_pose_base_pub = _RecordingPublisher()
+            gateway.pad_points_pub = _RecordingPublisher()
+            gateway._parity_tcp_enabled = parity_tcp_enabled
+            gateway._camera_rig = None
+            gateway._cloud_publish_enabled = lambda: False
+            gateway._last_command_error = None
+            gateway._command_stream_lost = False
+            gateway._command_epoch = 0
+            gateway._last_logical_snapshot_id = -1
+            gateway.development_lidar = False
+            gateway._publish_profile_enabled = False
+            gateway._state_stride = 1_000_000
+            gateway._imu_stride = 1_000_000
+            gateway._status_stride = 1_000_000
+            gateway._tick = 0
+            return gateway
+
+        disabled_backend = _NoOpBackend()
+        disabled_gateway = _new_gateway(disabled_backend, parity_tcp_enabled=False)
+        disabled_gateway.publish()
+        self.assertEqual(len(disabled_gateway.tcp_pose_pub.messages), 0)
+        self.assertEqual(len(disabled_gateway.pad_points_pub.messages), 0)
+        self.assertEqual(getattr(disabled_backend, "calls", 0), 0)
+
+        unresolved_backend = _NoOpBackend()
+        unresolved_gateway = _new_gateway(unresolved_backend, parity_tcp_enabled=True)
+        unresolved_gateway.publish()
+        self.assertEqual(len(unresolved_gateway.tcp_pose_pub.messages), 0)
+        self.assertEqual(len(unresolved_gateway.tcp_pose_base_pub.messages), 0)
+        self.assertEqual(len(unresolved_gateway.pad_points_pub.messages), 0)
+        self.assertEqual(unresolved_backend.calls, 1)
+
+    def test_gateway_registers_gripper_physx_tau_publisher_gated_by_env(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'JointState, "/sim/parity/gripper_physx_tau", reliable', source
+        )
+        self.assertIn("self.backend.parity_gripper_torque()", source)
+        self.assertIn(
+            'os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"', source
+        )
+
+    def test_gripper_physx_tau_publisher_emits_every_tick_with_sim_stamp(
+        self,
+    ) -> None:
+        """#33: /sim/parity/gripper_physx_tau publishes at the same cadence
+        as the other parity topics (unconditional, every publish() tick, not
+        gated on the status-heartbeat stride), stamped with the same sim
+        clock the /clock and /isaac_joint_states publishes use this tick,
+        with name/position/velocity/effort taken straight from
+        backend.parity_gripper_torque()."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        gripper_names = (
+            "drive_joint",
+            "left_finger_joint",
+            "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint",
+            "right_inner_knuckle_joint",
+            "right_finger_joint",
+        )
+        gripper_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        gripper_velocities = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+        gripper_physx_tau = [2.0, 2.1, 2.2, 2.3, 2.4, 2.5]
+
+        class _GripperTorqueBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
+                return (
+                    gripper_names,
+                    list(gripper_positions),
+                    list(gripper_velocities),
+                    list(gripper_physx_tau),
+                )
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _GripperTorqueBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway._PoseStamped = PoseStamped
+        gateway._PolygonStamped = PolygonStamped
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway.tcp_pose_pub = _RecordingPublisher()
+        gateway.tcp_pose_base_pub = _RecordingPublisher()
+        gateway.pad_points_pub = _RecordingPublisher()
+        gateway.gripper_physx_tau_pub = _RecordingPublisher()
+        gateway._parity_tcp_enabled = True
+        gateway._camera_rig = None
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(len(gateway.gripper_physx_tau_pub.messages), 3)
+        message = gateway.gripper_physx_tau_pub.messages[0]
+        self.assertEqual(list(message.name), list(gripper_names))
+        for actual, expected in zip(message.position, gripper_positions):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(message.velocity, gripper_velocities):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(message.effort, gripper_physx_tau):
+            self.assertAlmostEqual(actual, expected, places=6)
+        self.assertEqual(message.header.stamp, gateway.clock_pub.messages[0].clock)
+
+    def test_gripper_physx_tau_publisher_skips_when_env_disabled_or_unresolved(
+        self,
+    ) -> None:
+        """TINKER_SIM_PARITY_TCP=0 must fully disable this topic too (no
+        parity_gripper_torque() calls at all); a resolvable-but-currently-
+        unresolved backend (#33's fail-soft contract, returns None) must
+        skip publishing without raising."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        class _NoOpBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
+                self.calls = getattr(self, "calls", 0) + 1
+                return None  # unresolved this tick
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        def _new_gateway(backend, *, parity_tcp_enabled: bool) -> RosStandardGateway:
+            gateway = object.__new__(RosStandardGateway)
+            gateway.backend = backend
+            gateway._Clock = Clock
+            gateway._JointState = JointState
+            gateway._Imu = Imu
+            gateway._String = String
+            gateway._WrenchStamped = WrenchStamped
+            gateway._PoseStamped = PoseStamped
+            gateway._PolygonStamped = PolygonStamped
+            gateway.clock_pub = _RecordingPublisher()
+            gateway.joint_pub = _RecordingPublisher()
+            gateway.imu_pub = _RecordingPublisher()
+            gateway.status_pub = _RecordingPublisher()
+            gateway.contact_pub = _RecordingPublisher()
+            gateway.physics_truth_pub = _RecordingPublisher()
+            gateway.cloud_pub = _RecordingPublisher()
+            gateway.tcp_pose_pub = _RecordingPublisher()
+            gateway.tcp_pose_base_pub = _RecordingPublisher()
+            gateway.pad_points_pub = _RecordingPublisher()
+            gateway.gripper_physx_tau_pub = _RecordingPublisher()
+            gateway._parity_tcp_enabled = parity_tcp_enabled
+            gateway._camera_rig = None
+            gateway._cloud_publish_enabled = lambda: False
+            gateway._last_command_error = None
+            gateway._command_stream_lost = False
+            gateway._command_epoch = 0
+            gateway._last_logical_snapshot_id = -1
+            gateway.development_lidar = False
+            gateway._publish_profile_enabled = False
+            gateway._state_stride = 1_000_000
+            gateway._imu_stride = 1_000_000
+            gateway._status_stride = 1_000_000
+            gateway._tick = 0
+            return gateway
+
+        disabled_backend = _NoOpBackend()
+        disabled_gateway = _new_gateway(disabled_backend, parity_tcp_enabled=False)
+        disabled_gateway.publish()
+        self.assertEqual(len(disabled_gateway.gripper_physx_tau_pub.messages), 0)
+        self.assertEqual(getattr(disabled_backend, "calls", 0), 0)
+
+        unresolved_backend = _NoOpBackend()
+        unresolved_gateway = _new_gateway(unresolved_backend, parity_tcp_enabled=True)
+        unresolved_gateway.publish()
+        self.assertEqual(len(unresolved_gateway.gripper_physx_tau_pub.messages), 0)
+        self.assertEqual(unresolved_backend.calls, 1)
+
+    def test_gateway_registers_gripper_targets_publisher_gated_by_env(self) -> None:
+        source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'JointState, "/sim/parity/gripper_targets", reliable', source
+        )
+        self.assertIn("self.backend.parity_gripper_targets()", source)
+
+    def test_gripper_targets_publisher_emits_names_and_values_from_backend(
+        self,
+    ) -> None:
+        """#33 follow-up (bench round ahh): /sim/parity/gripper_targets
+        publishes the backend's (names, values) straight through, stamped
+        with the tick's sim clock, same cadence/gate as the sibling parity
+        topics."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        names = ("drive_joint/py_target", "drive_joint/measured", "articulation/target_write")
+        values = [0.34, 0.30, 1.0]
+
+        class _GripperTargetsBackend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
+                return None
+
+            def parity_gripper_targets(self):
+                return list(names), list(values)
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        gateway = object.__new__(RosStandardGateway)
+        gateway.backend = _GripperTargetsBackend()
+        gateway._Clock = Clock
+        gateway._JointState = JointState
+        gateway._Imu = Imu
+        gateway._String = String
+        gateway._WrenchStamped = WrenchStamped
+        gateway._PoseStamped = PoseStamped
+        gateway._PolygonStamped = PolygonStamped
+        gateway.clock_pub = _RecordingPublisher()
+        gateway.joint_pub = _RecordingPublisher()
+        gateway.imu_pub = _RecordingPublisher()
+        gateway.status_pub = _RecordingPublisher()
+        gateway.contact_pub = _RecordingPublisher()
+        gateway.physics_truth_pub = _RecordingPublisher()
+        gateway.cloud_pub = _RecordingPublisher()
+        gateway.tcp_pose_pub = _RecordingPublisher()
+        gateway.tcp_pose_base_pub = _RecordingPublisher()
+        gateway.pad_points_pub = _RecordingPublisher()
+        gateway.gripper_physx_tau_pub = _RecordingPublisher()
+        gateway.gripper_targets_pub = _RecordingPublisher()
+        gateway._parity_tcp_enabled = True
+        gateway._camera_rig = None
+        gateway._cloud_publish_enabled = lambda: False
+        gateway._last_command_error = None
+        gateway._command_stream_lost = False
+        gateway._command_epoch = 0
+        gateway._last_logical_snapshot_id = -1
+        gateway.development_lidar = False
+        gateway._publish_profile_enabled = False
+        gateway._state_stride = 1_000_000
+        gateway._imu_stride = 1_000_000
+        gateway._status_stride = 1_000_000
+        gateway._tick = 0
+
+        for _ in range(3):
+            gateway.publish()
+
+        self.assertEqual(len(gateway.gripper_targets_pub.messages), 3)
+        message = gateway.gripper_targets_pub.messages[0]
+        self.assertEqual(list(message.name), list(names))
+        for actual, expected in zip(message.position, values):
+            self.assertAlmostEqual(actual, expected, places=6)
+        self.assertEqual(message.header.stamp, gateway.clock_pub.messages[0].clock)
+
+    def test_gripper_targets_publisher_skips_cleanly_on_none_disabled_or_raise(
+        self,
+    ) -> None:
+        """Fail-soft contract: TINKER_SIM_PARITY_TCP=0 disables the topic
+        entirely (no parity_gripper_targets() calls); a backend returning
+        None publishes nothing; a backend whose parity_gripper_targets()
+        RAISES must not propagate out of publish() -- the gateway-side
+        try/except (distinct from the backend's own internal fail-soft)
+        must log once and continue publishing everything else."""
+        from rosgraph_msgs.msg import Clock
+        from sensor_msgs.msg import Imu, JointState
+        from std_msgs.msg import String
+        from geometry_msgs.msg import PolygonStamped, PoseStamped, WrenchStamped
+
+        class _Logger:
+            def __init__(self) -> None:
+                self.errors: list[str] = []
+
+            def error(self, message: str) -> None:
+                self.errors.append(message)
+
+        class _Backend:
+            dt = 0.02
+            physics_device = "cpu"
+            safety_stopped = False
+            simulation_time = 0.0
+            TRUTH_TOKEN = object()
+
+            def __init__(self, mode: str) -> None:
+                self.mode = mode
+                self.calls = 0
+
+            def joint_state(self):
+                return ((), [], [], [])
+
+            def root_state(self):
+                return {"angular_velocity_world": (0.0, 0.0, 0.0)}
+
+            def contact_state(self):
+                return {}
+
+            def physics_truth_frame(self, token):
+                return {}
+
+            def parity_tcp_frame(self):
+                return None
+
+            def parity_gripper_torque(self):
+                return None
+
+            def parity_gripper_targets(self):
+                self.calls += 1
+                if self.mode == "none":
+                    return None
+                raise RuntimeError("physx view not ready")
+
+        class _RecordingPublisher:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def publish(self, message) -> None:
+                self.messages.append(message)
+
+        def _new_gateway(backend, *, parity_tcp_enabled: bool) -> RosStandardGateway:
+            gateway = object.__new__(RosStandardGateway)
+            gateway.backend = backend
+            gateway._Clock = Clock
+            gateway._JointState = JointState
+            gateway._Imu = Imu
+            gateway._String = String
+            gateway._WrenchStamped = WrenchStamped
+            gateway._PoseStamped = PoseStamped
+            gateway._PolygonStamped = PolygonStamped
+            gateway.clock_pub = _RecordingPublisher()
+            gateway.joint_pub = _RecordingPublisher()
+            gateway.imu_pub = _RecordingPublisher()
+            gateway.status_pub = _RecordingPublisher()
+            gateway.contact_pub = _RecordingPublisher()
+            gateway.physics_truth_pub = _RecordingPublisher()
+            gateway.cloud_pub = _RecordingPublisher()
+            gateway.tcp_pose_pub = _RecordingPublisher()
+            gateway.tcp_pose_base_pub = _RecordingPublisher()
+            gateway.pad_points_pub = _RecordingPublisher()
+            gateway.gripper_physx_tau_pub = _RecordingPublisher()
+            gateway.gripper_targets_pub = _RecordingPublisher()
+            gateway._parity_tcp_enabled = parity_tcp_enabled
+            gateway._camera_rig = None
+            gateway._cloud_publish_enabled = lambda: False
+            gateway._last_command_error = None
+            gateway._command_stream_lost = False
+            gateway._command_epoch = 0
+            gateway._last_logical_snapshot_id = -1
+            gateway.development_lidar = False
+            gateway._publish_profile_enabled = False
+            gateway._state_stride = 1_000_000
+            gateway._imu_stride = 1_000_000
+            gateway._status_stride = 1_000_000
+            gateway._tick = 0
+            # A SHARED logger instance -- get_logger() must return the same
+            # object every call so error counts accumulate across ticks,
+            # unlike the "must not raise" fixtures elsewhere in this file
+            # that construct a fresh _Logger() per call and never inspect it.
+            logger = _Logger()
+            gateway.node = SimpleNamespace(get_logger=lambda: logger)
+            return gateway
+
+        disabled_backend = _Backend("none")
+        disabled_gateway = _new_gateway(disabled_backend, parity_tcp_enabled=False)
+        disabled_gateway.publish()
+        self.assertEqual(len(disabled_gateway.gripper_targets_pub.messages), 0)
+        self.assertEqual(disabled_backend.calls, 0)
+
+        none_backend = _Backend("none")
+        none_gateway = _new_gateway(none_backend, parity_tcp_enabled=True)
+        none_gateway.publish()
+        self.assertEqual(len(none_gateway.gripper_targets_pub.messages), 0)
+        self.assertEqual(none_backend.calls, 1)
+
+        raising_backend = _Backend("raise")
+        raising_gateway = _new_gateway(raising_backend, parity_tcp_enabled=True)
+        for _ in range(2):
+            raising_gateway.publish()
+        self.assertEqual(len(raising_gateway.gripper_targets_pub.messages), 0)
+        self.assertEqual(raising_backend.calls, 2)
+        # publish() itself must not have raised (physics_truth still fires
+        # every tick), and the failure is logged exactly once, not per tick.
+        self.assertEqual(len(raising_gateway.physics_truth_pub.messages), 2)
+        self.assertEqual(len(raising_gateway.node.get_logger().errors), 1)
 
     def test_gateway_publishes_raw_truth_without_persisting_physics_truth(self) -> None:
         source = (ROOT / "simulation/tinker_sim_isaac/ros_gateway.py").read_text(

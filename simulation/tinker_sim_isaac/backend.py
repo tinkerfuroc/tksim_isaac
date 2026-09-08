@@ -15,6 +15,7 @@ from tinker_sim_isaac.physics_rate import (
 )
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
 from tinker_sim_core.command_mux import JointCommand, decode_snapshot_packet
+from tinker_sim_core.observability import format_duration
 from tinker_sim_core.occupancy import OccupancyMap
 
 
@@ -368,6 +369,23 @@ GRIPPER_EFFORT_CEILING_NM = 2.5
 # than being read as an over-range request.
 GRIPPER_EFFORT_FULL_SCALE_N = 10.0
 
+# Observability only (#33): cap on how many gripper_command_target lines
+# _log_gripper_command_target prints within GRIPPER_COMMAND_TARGET_LOG_WINDOW_S,
+# so a fast-oscillating source (e.g. a stale-hold/fresh flap) cannot spam the
+# log; the first line after a quiet period is never dropped by this cap.
+GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW = 5
+GRIPPER_COMMAND_TARGET_LOG_WINDOW_S = 1.0
+
+# Observability only (#33): cap on how many applied_targets_reset lines
+# _log_applied_targets_reset prints in TOTAL (across every source -- engage,
+# release, step()'s reassert, _refresh_robot_handles) within
+# APPLIED_TARGETS_RESET_LOG_WINDOW_S. A safety engage/release pair or a
+# rapid stop/clear flap should be fully visible; a pathological flap must
+# still be capped so it cannot spam the log. Suppressed lines are still
+# counted; the next line to get through reports how many were dropped.
+APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW = 5
+APPLIED_TARGETS_RESET_LOG_WINDOW_S = 1.0
+
 
 def resolve_gripper_effort_ceiling_nm(value: str | None) -> float:
     """Parse ``TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`` (N*m, default
@@ -648,6 +666,141 @@ def bind_fused_actuator_model(robot: Any) -> None:
     robot._apply_actuator_model = types.MethodType(_fused_apply_actuator_model, robot)
 
 
+# --- Task #35: TCP/pad-inner-face parity geometry ---------------------------
+# Provenance: a live ``pxr`` readback of the shipped robot USD (see
+# $TMP/task31-jaw-opening-findings.md for the original probe, re-verified
+# 2026-09-06 against artifacts/robot/tinker2/*/robot.usd). For both
+# /tinker_full/{left,right}_finger, ``UsdGeom.BBoxCache.ComputeLocalBound``
+# on the finger's own ``collisions`` prim (i.e. relative to the finger
+# link's own origin, before that link's world transform is applied) gives:
+#   X (width, both):        -16.0 / +16.0 mm
+#   Y (closing axis) left:  -26.0 / +5.9 mm     right: -5.9 / +26.0 mm
+#   Z (reach axis, both):    -5.9 / +61.0 mm
+# The two collision meshes are mirror images of one another (their link
+# frames share the same orientation -- both fingers rotate about local X
+# only, confirmed via ComputeLocalToWorldTransform); each pad's INNER face
+# (the surface that actually meets a grasped object) is the extreme 26.0 mm
+# from the link origin -- local Y = -0.026 on the left finger, +0.026 on
+# the right -- at the pad's mid-reach height.
+PAD_INNER_INSET_M = 0.026
+PAD_MID_REACH_M = (-0.0059 + 0.0610) / 2.0
+# Fixed offsets in each finger LINK's OWN FRAME from the link origin to the
+# centre of its inner face. Rotate by that link's current body_quat_w (the
+# same tensor the physics-truth tcp_pose read already uses) to place the
+# point in world space -- this is correct through the whole open/close
+# range because it is a point painted on the rigid pad, not a world-frame
+# constant; the closing motion is captured entirely by body_quat_w.
+LEFT_FINGER_PAD_LOCAL_OFFSET = (0.0, -PAD_INNER_INSET_M, PAD_MID_REACH_M)
+RIGHT_FINGER_PAD_LOCAL_OFFSET = (0.0, PAD_INNER_INSET_M, PAD_MID_REACH_M)
+
+
+def rotate_vector_xyzw(
+    quaternion_xyzw: Iterable[float], vector: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    """Rotate *vector* by the unit quaternion *quaternion_xyzw* (x, y, z, w).
+
+    Scalar-last, matching every other quaternion in this module
+    (``_quaternion_xyzw_from_physx``, ``root_state``, ``spawn_root_rot_xyzw``).
+    """
+    x, y, z, w = (float(value) for value in quaternion_xyzw)
+    vx, vy, vz = vector
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return (
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    )
+
+
+def _conjugate_xyzw(
+    quaternion_xyzw: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    x, y, z, w = quaternion_xyzw
+    return (-x, -y, -z, w)
+
+
+def _quaternion_multiply_xyzw(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Hamilton product ``a (x) b``, both scalar-last."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def finger_inner_face_world(
+    position: tuple[float, float, float],
+    quaternion_xyzw: tuple[float, float, float, float],
+    local_offset: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """World-frame centre of a finger pad's inner face.
+
+    *local_offset* is fixed in the finger link's own frame (see
+    ``LEFT_FINGER_PAD_LOCAL_OFFSET`` / ``RIGHT_FINGER_PAD_LOCAL_OFFSET``
+    above); rotating it by *quaternion_xyzw* -- that link's own current
+    ``body_quat_w`` -- places it correctly in world space at any joint
+    angle.
+    """
+    rotated = rotate_vector_xyzw(quaternion_xyzw, local_offset)
+    return (
+        position[0] + rotated[0],
+        position[1] + rotated[1],
+        position[2] + rotated[2],
+    )
+
+
+def pad_points_world(
+    left_finger_pose: tuple[
+        tuple[float, float, float], tuple[float, float, float, float]
+    ],
+    right_finger_pose: tuple[
+        tuple[float, float, float], tuple[float, float, float, float]
+    ],
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    """Left inner-face, right inner-face, and their midpoint -- world frame."""
+    left_position, left_quaternion = left_finger_pose
+    right_position, right_quaternion = right_finger_pose
+    left_point = finger_inner_face_world(
+        left_position, left_quaternion, LEFT_FINGER_PAD_LOCAL_OFFSET
+    )
+    right_point = finger_inner_face_world(
+        right_position, right_quaternion, RIGHT_FINGER_PAD_LOCAL_OFFSET
+    )
+    midpoint = tuple((a + b) / 2.0 for a, b in zip(left_point, right_point))
+    return left_point, right_point, midpoint
+
+
+def pose_in_frame(
+    frame_position: tuple[float, float, float],
+    frame_quaternion_xyzw: tuple[float, float, float, float],
+    world_position: tuple[float, float, float],
+    world_quaternion_xyzw: tuple[float, float, float, float] | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float] | None]:
+    """Express *world_position* (and optionally an orientation) in *frame*'s
+    own frame (e.g. base_link), given the frame's own world pose.
+    """
+    inverse = _conjugate_xyzw(frame_quaternion_xyzw)
+    relative = tuple(w - f for w, f in zip(world_position, frame_position))
+    local_position = rotate_vector_xyzw(inverse, relative)
+    local_quaternion = (
+        _quaternion_multiply_xyzw(inverse, world_quaternion_xyzw)
+        if world_quaternion_xyzw is not None
+        else None
+    )
+    return local_position, local_quaternion
+
+
 class IsaacWholeRobotBackend:
     """CPU-PhysX articulation controlled only by standard JointState commands."""
 
@@ -680,6 +833,51 @@ class IsaacWholeRobotBackend:
     CONTACT_FORCE_THRESHOLD = 1.0
     ARM_CONTACT_BODIES = tuple(f"link{index}" for index in range(1, 8))
     GRASP_CONTACT_BODIES = ("left_finger", "right_finger", "link_tcp")
+    # Bodies the #35 TCP/pad parity publisher needs resolved by name in
+    # data.body_names; see parity_tcp_frame().
+    PARITY_TCP_BODIES = ("link_tcp", "left_finger", "right_finger")
+    # The six gripper joints the #33 PhysX-torque parity publisher needs
+    # resolved by name in joint_names; see parity_gripper_torque(). Order is
+    # the published JointState.name order (drive first, then the five mimic
+    # followers) -- not necessarily the articulation's own DOF ordering.
+    PARITY_GRIPPER_JOINTS = (
+        "drive_joint",
+        "left_finger_joint",
+        "left_inner_knuckle_joint",
+        "right_outer_knuckle_joint",
+        "right_inner_knuckle_joint",
+        "right_finger_joint",
+    )
+    # #33 follow-up (bench round ahh): the three joints whose PER-LAYER
+    # position target (Python's own _position_targets, Isaac Lab's
+    # data.joint_pos_target, and PhysX's own get_dof_position_targets) the
+    # mid-close stall investigation needs side by side -- see
+    # parity_gripper_targets(). drive_joint is the master; left_finger_joint
+    # is the pad readback #20's bounded-lead clamp already reads;
+    # right_outer_knuckle_joint is a mimic follower on the OPPOSITE side of
+    # the linkage from left_finger_joint.
+    PARITY_GRIPPER_TARGET_JOINTS = (
+        "drive_joint",
+        "left_finger_joint",
+        "right_outer_knuckle_joint",
+    )
+    # Published as "<joint>/<field>" names, values in JointState.position --
+    # see parity_gripper_targets(). Mirrors validation/gripper_close_probe.py's
+    # #33 readback rows exactly (py_target/lab_target/physx_target/physx_k/
+    # physx_d/physx_max_force/physx_max_vel already exist there as CSV
+    # columns; measured/lab_applied_effort are the pre-existing joint_state()
+    # fields, added here so one topic carries the whole per-tick picture).
+    PARITY_GRIPPER_TARGET_FIELDS = (
+        "py_target",
+        "lab_target",
+        "physx_target",
+        "physx_k",
+        "physx_d",
+        "physx_max_force",
+        "physx_max_vel",
+        "measured",
+        "lab_applied_effort",
+    )
 
     def __init__(
         self,
@@ -894,6 +1092,41 @@ class IsaacWholeRobotBackend:
         # "contact_report_first_event" diagnostic (see there) fires exactly
         # once per backend life instead of once per contact.
         self._contact_report_first_event_logged = False
+        # Set once parity_tcp_frame() fails to resolve link_tcp/left_finger/
+        # right_finger, so the "unresolved" diagnostic (see there) logs once
+        # per backend life instead of once per publish tick.
+        self._parity_tcp_bodies_missing_logged = False
+        # Set once parity_gripper_torque() cannot resolve the six gripper
+        # joints / the PhysX view's projected-forces call, or once that call
+        # raises -- see there. Two flags: the joints/view are a static
+        # property of the articulation (checked once is enough), while a
+        # read error could in principle recur with a different message, but
+        # the fail-soft contract is still "log once, then skip silently".
+        self._parity_gripper_torque_unresolved_logged = False
+        self._parity_gripper_torque_error_logged = False
+        # Same two-flag shape as parity_gripper_torque above, for
+        # parity_gripper_targets() (#33 bench round ahh follow-up).
+        self._parity_gripper_targets_unresolved_logged = False
+        self._parity_gripper_targets_error_logged = False
+        # Best-effort articulation-root (stage_id, prim_id) for
+        # get_physx_simulation_interface().is_sleeping(), resolved once per
+        # rebind by _refresh_robot_handles; None if unresolved/unavailable,
+        # in which case parity_gripper_targets() simply omits the
+        # "articulation/is_sleeping" name/value pair rather than raising or
+        # publishing a placeholder.
+        self._articulation_sleep_ids: tuple[int, int] | None = None
+        # Self-check (review round 2): if get_physx_simulation_interface().
+        # is_sleeping()'s first successful return value isn't a real bool,
+        # the field is disabled for the rest of this backend's life (never
+        # reset on rebind) -- see _articulation_is_sleeping().
+        self._articulation_is_sleeping_disabled = False
+        self._articulation_is_sleeping_type_logged = False
+        # Set by step() every tick (observability only, #33), reset False
+        # at the top of every step() and only set True once
+        # write_data_to_sim() has returned without raising THIS tick, so
+        # "articulation/target_write" means "PhysX actually received this
+        # tick's targets", not merely "the write gate said yes".
+        self._last_target_write = False
         self._contact_path_decoder = lambda path_id: str(
             PhysicsSchemaTools.intToSdfPath(path_id)
         )
@@ -2033,6 +2266,26 @@ class IsaacWholeRobotBackend:
             for name in ("left_finger_joint", "right_finger_joint")
             if name in self._joint_index
         )
+        # #33: the six PARITY_GRIPPER_JOINTS DOF indices, resolved once here
+        # (rebuilt only when the articulation view changes, same lifetime as
+        # _gripper_mimic_indices above) rather than re-looked-up per publish
+        # tick in parity_gripper_torque(). A name missing from this
+        # articulation (e.g. a gripper-less rig) lands as None so the reader
+        # can fail soft instead of raising a KeyError.
+        self._parity_gripper_joint_indices = tuple(
+            self._joint_index.get(name) for name in self.PARITY_GRIPPER_JOINTS
+        )
+        # #33 follow-up: the three PARITY_GRIPPER_TARGET_JOINTS DOF indices,
+        # same resolve-once-per-rebind shape as the six above.
+        self._parity_gripper_target_indices = tuple(
+            self._joint_index.get(name) for name in self.PARITY_GRIPPER_TARGET_JOINTS
+        )
+        # Best-effort, resolved once per rebind (cheap: one stage/prim
+        # lookup, not a per-tick cost) -- see _articulation_is_sleeping().
+        # Any failure (no live Kit/USD stage, unavailable API, wrong prim
+        # path) leaves this None and parity_gripper_targets() simply omits
+        # the field, per its "if cheaply available, else omit" contract.
+        self._articulation_sleep_ids = self._resolve_articulation_sleep_ids()
         self._safety_nominal_stiffness = self._read_joint_gain_values(
             "joint_stiffness",
             self.NOMINAL_ARM_STIFFNESS,
@@ -2047,8 +2300,33 @@ class IsaacWholeRobotBackend:
         )
         self._safety_gains_applied = False
         self._velocity_targets = self._torch.zeros_like(self._robot.data.joint_vel)
+        # Observability only (#33): this reseed is a wholesale
+        # `_position_targets` replace with NO safety stop involved -- the
+        # same re-origination shape #33's stale-hold/gripper-target chain
+        # is hunting, so it gets the same `applied_targets_reset` line as
+        # the safety engage/release/reassert sites. `drive_before` reads
+        # whatever was in `_position_targets` before this call (`None` --
+        # renders "n/a" -- on the very first bind, when the attribute
+        # doesn't exist yet); `source` distinguishes a genuine STOP->PLAY
+        # reset rebind from a state-preserving mid-run view recovery, same
+        # tag `_log_spawn_pose_trace` above already uses for the same
+        # `reapply_spawn_yaw` classification.
+        _reset_drive_index = getattr(self, "_drive_joint_index", None)
+        _reset_drive_before = self._safety_drive_scalar(
+            getattr(self, "_position_targets", None), _reset_drive_index
+        )
         self._position_targets = self._robot.data.joint_pos.clone()
         self._effort_targets = self._torch.zeros_like(self._robot.data.joint_vel)
+        try:
+            self._log_applied_targets_reset(
+                "refresh_robot_handles:"
+                + ("reset_rebind" if reapply_spawn_yaw else "view_recovery"),
+                _reset_drive_before,
+                self._safety_drive_scalar(self._position_targets, _reset_drive_index),
+                self._safety_drive_scalar(self._robot_joint_pos(), _reset_drive_index),
+            )
+        except Exception:
+            pass
         # Cached once here (only rebuilt when the articulation view changes,
         # not per physics step) so the vectorised wheel slew in step() never
         # pays for a fresh tensor allocation on the hot path.
@@ -2147,8 +2425,14 @@ class IsaacWholeRobotBackend:
     def gripper_effort_limit(self) -> float:
         return float(self._gripper_effort_limit)
 
-    def set_safety_stop(self, active: bool) -> None:
-        """Latch a physical hold target and invalidate all pre-stop commands."""
+    def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
+        """Latch a physical hold target and invalidate all pre-stop commands.
+
+        ``reason`` is an optional, caller-provided string naming the trigger
+        (observability only, #33) -- e.g. the gateway passes "init",
+        "sample_true", "safety_stale". It never affects behaviour; omitted
+        it renders as "unspecified" in the log lines below.
+        """
         if bool(active) == self._safety_stopped:
             # A repeated identical sample must return before it clears the
             # acceleration-limited wheel state (see tests/test_base_velocity_slew.py).
@@ -2158,7 +2442,11 @@ class IsaacWholeRobotBackend:
         # happen to compare equal to what was last written. A repeated
         # identical sample returned above and is deliberately not a transition.
         self._target_write_gate.force_next()
+        drive_index = getattr(self, "_drive_joint_index", None)
         if active:
+            drive_before = self._safety_drive_scalar(
+                getattr(self, "_position_targets", None), drive_index
+            )
             self._pending_snapshot_id = None
             self._pending_snapshot_commands.clear()
             self._command_snapshot_id = None
@@ -2171,7 +2459,21 @@ class IsaacWholeRobotBackend:
             self._applied_wheel_velocities = {
                 index: 0.0 for index in getattr(self, "_wheel_indices", ())
             }
+            self._safety_hold_reassert_logged = False
+            self._log_safety_stop_transition(True, reason, drive_index)
+            try:
+                self._log_applied_targets_reset(
+                    reason or "unspecified",
+                    drive_before,
+                    self._safety_drive_scalar(self._position_targets, drive_index),
+                    self._safety_drive_scalar(self._robot_joint_pos(), drive_index),
+                )
+            except Exception:
+                pass
             return
+        drive_before = self._safety_drive_scalar(
+            getattr(self, "_position_targets", None), drive_index
+        )
         self._restore_safety_actuator_gains()
         self._safety_stopped = False
         # Clearing a stop creates a fresh hold target. It must not restore the
@@ -2180,6 +2482,146 @@ class IsaacWholeRobotBackend:
         self._velocity_targets.zero_()
         self._effort_targets.zero_()
         self._safety_snapshot = None
+        self._log_safety_stop_transition(False, reason, drive_index)
+        try:
+            self._log_applied_targets_reset(
+                reason or "unspecified",
+                drive_before,
+                self._safety_drive_scalar(self._position_targets, drive_index),
+                self._safety_drive_scalar(self._robot_joint_pos(), drive_index),
+            )
+        except Exception:
+            pass
+
+    def _robot_joint_pos(self) -> Any:
+        """``self._robot.data.joint_pos``, via getattr chains only.
+
+        Observability call sites (#33) use this instead of the direct
+        attribute chain so a mid-teardown/invalidated robot handle degrades
+        a log line's "measured" field to "n/a" instead of raising an
+        AttributeError out of an observability call in set_safety_stop/
+        step(). Never raises: a broken handle here returns ``None``.
+        """
+        try:
+            data = getattr(self, "_robot", None)
+            data = getattr(data, "data", None)
+            return getattr(data, "joint_pos", None)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safety_drive_scalar(tensor: Any, drive_index: int | None) -> float | None:
+        """Best-effort ``float(tensor[0, drive_index])`` for a log line.
+
+        Observability only (#33): returns ``None`` (renders "n/a" via
+        ``format_duration``) instead of raising on a missing index, an
+        untensor-like value, or a test double that doesn't shape like one.
+        Catches any ``Exception`` (not just the obvious index/type/value
+        trio) -- this is called from inside guarded log helpers whose whole
+        point is to never propagate.
+        """
+        if drive_index is None or tensor is None:
+            return None
+        try:
+            return float(tensor[0, drive_index])
+        except Exception:
+            return None
+
+    def _log_safety_stop_transition(
+        self, active: bool, reason: str | None, drive_index: int | None
+    ) -> None:
+        """Announce a real ``_safety_stopped`` transition (observability
+        only, #33). Called from ``set_safety_stop`` only after the flag
+        actually flips -- a repeated identical sample already returned
+        before reaching here. The backend has no wall clock of its own
+        (that is the gateway's job), so ``wall_age_s`` is always unknown
+        from here. The entire body is guarded: ``set_safety_stop`` is
+        reached from ``_adopt_command_epoch``/``_enter_command_stream_lost``
+        deep inside spin_once()'s unguarded loop, so a log line here (a
+        BrokenPipeError from ``print``, or a RuntimeError from an
+        invalidated PhysX view read) must never be the reason the sim
+        process dies -- it must never raise.
+        """
+        try:
+            reason_text = reason if reason else "unspecified"
+            try:
+                sim_t = format_duration(self.simulation_time)
+            except Exception:
+                sim_t = "n/a"
+            line = (
+                f"sim_safety_stop state={'engaged' if active else 'released'} "
+                f"reason={reason_text} sim_t={sim_t} wall_age_s={format_duration(None)}"
+            )
+            if active:
+                snapshot = self._safety_drive_scalar(
+                    getattr(self, "_safety_snapshot", None), drive_index
+                )
+                line += f" drive_snapshot={format_duration(snapshot)}"
+            else:
+                applied = self._safety_drive_scalar(
+                    getattr(self, "_position_targets", None), drive_index
+                )
+                measured = self._safety_drive_scalar(
+                    self._robot_joint_pos(), drive_index
+                )
+                line += (
+                    f" drive_applied={format_duration(applied)} "
+                    f"drive_measured={format_duration(measured)}"
+                )
+            print(line, flush=True)
+        except Exception:
+            return
+
+    def _log_applied_targets_reset(
+        self,
+        source: str,
+        drive_before: float | None,
+        drive_after: float | None,
+        measured: float | None,
+    ) -> None:
+        """Announce a wholesale ``_position_targets`` replace/copy (not an
+        element-wise command write) -- observability only, #33: safety
+        engage (snapshot clone), safety release (fresh joint_pos-derived
+        hold target), step()'s per-tick reassertion while stopped (caller
+        rate-limits that one to once per engage itself, via
+        ``_safety_hold_reassert_logged``, rather than calling this per
+        tick), and ``_refresh_robot_handles``' per-rebind reseed. Rate-
+        limited to APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW lines per
+        APPLIED_TARGETS_RESET_LOG_WINDOW_S IN TOTAL (one shared window
+        across every source, not one per source) so a rapid stop/clear flap
+        cannot spam the log; a suppressed line still increments a counter,
+        reported as ``dropped=<n>`` on the next line that gets through, so
+        nothing suppressed goes unaccounted for. Must never raise.
+        """
+        try:
+            now = time.monotonic()
+            state = self._applied_targets_reset_log_state = getattr(
+                self, "_applied_targets_reset_log_state", []
+            )
+            state[:] = [
+                stamp
+                for stamp in state
+                if now - stamp < APPLIED_TARGETS_RESET_LOG_WINDOW_S
+            ]
+            if len(state) >= APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW:
+                self._applied_targets_reset_dropped = (
+                    getattr(self, "_applied_targets_reset_dropped", 0) + 1
+                )
+                return
+            state.append(now)
+            dropped = getattr(self, "_applied_targets_reset_dropped", 0)
+            self._applied_targets_reset_dropped = 0
+            print(
+                f"applied_targets_reset source={source} "
+                f"drive_before={format_duration(drive_before)} "
+                f"drive_after={format_duration(drive_after)} "
+                f"measured={format_duration(measured)} "
+                f"sim_t={format_duration(self.simulation_time)} "
+                f"dropped={dropped}",
+                flush=True,
+            )
+        except Exception:
+            return
 
     def _read_joint_gain_values(self, attribute: str, fallback: float) -> tuple[float, ...]:
         """Read the configured arm gains, retaining a deterministic fallback for test doubles."""
@@ -2665,6 +3107,46 @@ class IsaacWholeRobotBackend:
             if effort < 0.0:
                 raise ValueError("drive_joint effort limit must be non-negative")
 
+    def _log_gripper_command_target(
+        self, old: float | None, new: float, effort: float | None
+    ) -> None:
+        """Announce a drive_joint command-target replacement (observability
+        only, #33). Called from _apply_joint_command only when the incoming
+        packet actually changes ``_drive_command_target``; a run of identical
+        alternations (e.g. a source flapping between two targets) is capped
+        at GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW lines per
+        GRIPPER_COMMAND_TARGET_LOG_WINDOW_S, but the first line after a quiet
+        period always gets through because the sliding window has aged out.
+        """
+        now = time.monotonic()
+        window = self._gripper_command_log_window = getattr(
+            self, "_gripper_command_log_window", []
+        )
+        window[:] = [
+            stamp
+            for stamp in window
+            if now - stamp < GRIPPER_COMMAND_TARGET_LOG_WINDOW_S
+        ]
+        if len(window) >= GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW:
+            return
+        window.append(now)
+        self._gripper_command_log_index = (
+            getattr(self, "_gripper_command_log_index", 0) + 1
+        )
+        drive_index = getattr(self, "_drive_joint_index", None)
+        applied = float("nan")
+        if drive_index is not None:
+            try:
+                applied = float(self._position_targets[0, drive_index])
+            except (IndexError, TypeError, ValueError):
+                pass
+        print(
+            f"gripper_command_target old={old} new={new} effort={effort} "
+            f"source_packet={self._gripper_command_log_index} "
+            f"applied={applied:.6f}",
+            flush=True,
+        )
+
     def _apply_joint_command(self, command: JointCommand) -> None:
         # Gather in Python, then write each target tensor once.  Every torch
         # element write releases the GIL; under a live bridge the gateway's
@@ -2686,7 +3168,15 @@ class IsaacWholeRobotBackend:
                     # first-contact force gradually instead of the impulsive
                     # spike (12-190 N) that ejects a light object before the
                     # jaw captures it.
-                    self._drive_command_target = float(command.positions[offset])
+                    old_drive_target = getattr(self, "_drive_command_target", None)
+                    new_drive_target = float(command.positions[offset])
+                    self._drive_command_target = new_drive_target
+                    if new_drive_target != old_drive_target:
+                        self._log_gripper_command_target(
+                            old_drive_target,
+                            new_drive_target,
+                            command.efforts[offset] if command.efforts else None,
+                        )
                 else:
                     position_index.append(index)
                     position_values.append(command.positions[offset])
@@ -3368,8 +3858,16 @@ class IsaacWholeRobotBackend:
         parallel. The URDF expresses this as ``<mimic joint="drive_joint"
         multiplier="1">`` on all five follower joints (the finger joints on -x
         axes, which the importer baked as 180 deg frame flips, so a uniform +1
-        mirror is kinematically right). robot.usd dropped every <mimic>, so the
-        coupling is restored here in software.
+        mirror is kinematically right). Corrected 2026-09-07 (the prior
+        "robot.usd dropped every <mimic>" claim here was never actually
+        measured): robot.usd authors ``physxMimicJoint:rotX:*`` attribute
+        values (gearing -1.0, referenceJoint drive_joint) on the five
+        followers WITHOUT applying ``PhysxMimicJointAPI`` in apiSchemas; the
+        live Kit stage reports ``PhysxMimicJointAPI:rotX`` among the applied
+        schemas; in both readings PhysX creates NO constraint (measured
+        2026-09-07: followers held at 0 -> drive still closes; followers
+        driven -> drive does not move). The software mirror is the only
+        coupling.
 
         URDF mimic semantics are ``q_follower = multiplier * q_drive`` -- the
         driving joint's ACTUAL angle. Mirroring drive_joint's commanded TARGET
@@ -3415,6 +3913,16 @@ class IsaacWholeRobotBackend:
             self._position_targets[0, index] = follower_target
 
     def step(self) -> None:
+        # Observability only (#33): published as "articulation/target_write"
+        # by parity_gripper_targets(). Reset here, at the very top, so every
+        # return path this tick (including the PHYSICS_READY rebind branch
+        # below, which never reaches a write at all) defaults to "not
+        # delivered"; only set True after write_data_to_sim() itself
+        # returns without raising, further down -- the published value
+        # means "PhysX actually received this tick's targets", not "the
+        # write gate said yes" (review round 3, `_write_targets` alone
+        # cannot tell a caller whether the write actually landed).
+        self._last_target_write = False
         if self.step_profile["enabled"]:
             self.step_profile["_mark"] = self.step_profile["_clock"]()
         if not self._refresh_robot_handles():
@@ -3429,6 +3937,23 @@ class IsaacWholeRobotBackend:
         if self._safety_stopped:
             if self._safety_snapshot is None:
                 self._safety_snapshot = self._robot.data.joint_pos.clone()
+            # Observability only (#33): this reassert runs every physics
+            # tick while stopped, so only the first tick after an engage
+            # (set_safety_stop(True) arms this flag) is logged -- a per-tick
+            # line would spam the log for the whole duration of the stop.
+            # `drive_before` is computed lazily (only when this tick will
+            # actually log) and every read here is getattr-guarded so a
+            # broken/mid-teardown handle degrades a field to "n/a" instead
+            # of raising out of step()'s unguarded caller.
+            reassert_logged = getattr(self, "_safety_hold_reassert_logged", True)
+            drive_index = getattr(self, "_drive_joint_index", None)
+            drive_before = (
+                None
+                if reassert_logged
+                else self._safety_drive_scalar(
+                    getattr(self, "_position_targets", None), drive_index
+                )
+            )
             # Reassert the latched target and retire any buffer mutation that
             # could have arrived after the command epoch was stopped.  These
             # are ordinary articulation targets, not a state write.
@@ -3436,6 +3961,21 @@ class IsaacWholeRobotBackend:
             self._velocity_targets.zero_()
             self._effort_targets.zero_()
             self._apply_safety_actuator_hold()
+            if not reassert_logged:
+                self._safety_hold_reassert_logged = True
+                try:
+                    self._log_applied_targets_reset(
+                        "step_safety_reassert",
+                        drive_before,
+                        self._safety_drive_scalar(
+                            getattr(self, "_position_targets", None), drive_index
+                        ),
+                        self._safety_drive_scalar(
+                            self._robot_joint_pos(), drive_index
+                        ),
+                    )
+                except Exception:
+                    pass
         else:
             self._slew_wheel_targets()
             self._ramp_drive_target()
@@ -3488,6 +4028,9 @@ class IsaacWholeRobotBackend:
                 )
             )
             self.step_profile["target_writes"] += 1
+            # Only set True once write_data_to_sim() above has returned
+            # without raising -- see the reset at the top of step().
+            self._last_target_write = True
         if _t is not None:
             _sp["write_data"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
@@ -3888,8 +4431,17 @@ class IsaacWholeRobotBackend:
         # were byte-identical re-sends the write gate skipped.
         out["target_writes"] = sp["target_writes"]
         if sp.get("changed_targets"):
+            # #33 follow-up: this used to cap at the top-8 most-changed
+            # keys, which silently dropped a low-traffic joint like
+            # pos:drive_joint whenever 8+ other joints (arm + wheels) moved
+            # more often in the same window -- exactly the visibility the
+            # mid-close stall investigation needed and didn't have. The key
+            # space here is bounded by construction (at most 3 labels *
+            # num_joints distinct keys, reset every snapshot call, never
+            # user-input-driven), so there is no unbounded-growth risk in
+            # publishing all of it.
             out["changed_targets"] = dict(
-                sorted(sp["changed_targets"].items(), key=lambda kv: -kv[1])[:8]
+                sorted(sp["changed_targets"].items(), key=lambda kv: -kv[1])
             )
             sp["changed_targets"] = {}
         # PhysX solver steps per control step (1 unless TINKER_SIM_CONTROL_HZ
@@ -4607,6 +5159,491 @@ class IsaacWholeRobotBackend:
             "joint_velocities": velocities,
             "joint_efforts": efforts,
         }
+
+    def parity_tcp_frame(self) -> Mapping[str, object] | None:
+        """World + base_link-relative TCP and pad-inner-face geometry.
+
+        Task #35 diagnostic: lets the grasp bench diff the sim's PHYSICAL
+        tool-centre-point and pad faces against the ROS TF ``link_tcp`` in
+        one recording. Reads the same ``body_pos_w``/``body_quat_w`` tensors
+        as ``_robot_truth_state`` (view-free through the articulation data,
+        not a separate PhysX query) and the pad-geometry constants above.
+
+        Fails soft: returns ``None`` if ``link_tcp`` or either finger link
+        is not in ``data.body_names`` (logged once, not per tick).
+        """
+        data = self._robot.data
+        body_names = tuple(getattr(data, "body_names", ()))
+        missing = [name for name in self.PARITY_TCP_BODIES if name not in body_names]
+        if missing:
+            if not self._parity_tcp_bodies_missing_logged:
+                self._parity_tcp_bodies_missing_logged = True
+                print(
+                    json.dumps(
+                        {"event": "parity_tcp_bodies_unresolved", "missing": missing},
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        def _body_pose(
+            name: str,
+        ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+            index = body_names.index(name)
+            position = tuple(
+                float(value)
+                for value in self._torch_value(data.body_pos_w)[0, index]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            quaternion = tuple(
+                float(value)
+                for value in self._torch_value(data.body_quat_w)[0, index]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            return position, quaternion
+
+        tcp_position, tcp_quaternion = _body_pose("link_tcp")
+        left_pose = _body_pose("left_finger")
+        right_pose = _body_pose("right_finger")
+        base_position = tuple(
+            float(value)
+            for value in self._torch_value(data.root_pos_w)[0].detach().cpu().tolist()
+        )
+        base_quaternion = tuple(
+            float(value)
+            for value in self._torch_value(data.root_quat_w)[0].detach().cpu().tolist()
+        )
+
+        tcp_position_base, tcp_quaternion_base = pose_in_frame(
+            base_position, base_quaternion, tcp_position, tcp_quaternion
+        )
+        left_point, right_point, midpoint = pad_points_world(left_pose, right_pose)
+        left_point_base, _ = pose_in_frame(base_position, base_quaternion, left_point)
+        right_point_base, _ = pose_in_frame(base_position, base_quaternion, right_point)
+        midpoint_base, _ = pose_in_frame(base_position, base_quaternion, midpoint)
+
+        return {
+            "tcp_pose_world": {"xyz": tcp_position, "quaternion_xyzw": tcp_quaternion},
+            "tcp_pose_base": {
+                "xyz": tuple(tcp_position_base),
+                "quaternion_xyzw": tuple(tcp_quaternion_base),
+            },
+            "pad_points_base": (
+                tuple(left_point_base),
+                tuple(right_point_base),
+                tuple(midpoint_base),
+            ),
+        }
+
+    def parity_gripper_torque(
+        self,
+    ) -> tuple[tuple[str, ...], list[float], list[float], list[float]] | None:
+        """PhysX-MEASURED joint torque for the six gripper joints, next to
+        ``joint_state()``'s Python actuator echo.
+
+        ``joint_state()``'s ``effort`` column is ``data.applied_torque`` --
+        the Isaac Lab actuator MODEL's post-clip command
+        (``clamp(k*error - d*velocity)``) that gets SET INTO the sim, not
+        what PhysX actually delivered. This reads exactly the call the grasp
+        bench's ``physx_tau`` rows use
+        (``validation/gripper_close_probe.py``'s ``_read_physx_joint_forces``):
+        ``root_view.get_dof_projected_joint_forces()`` -- "projects the
+        link's incoming joint force[s] in the motion direction", i.e. the
+        constraint solver's actual output along each joint's motion axis --
+        so a bench recording of both topics agrees by construction with the
+        probe's own numbers.
+
+        Position/velocity come from the same ``data.joint_pos``/
+        ``data.joint_vel`` tensors as ``joint_state()``; only the torque
+        column differs (PhysX view vs. Isaac Lab actuator echo). Gripper
+        joint indices are resolved once at bind time
+        (``_parity_gripper_joint_indices``, alongside
+        ``_gripper_mimic_indices``), not re-looked-up per tick.
+
+        Fails soft: returns ``None`` (logged once) if any of
+        ``PARITY_GRIPPER_JOINTS`` is missing from this articulation, if the
+        PhysX view exposes no ``get_dof_projected_joint_forces`` (e.g. a
+        gripper-less rig or a stub/test double), or if that call raises --
+        the caller (``ros_gateway.publish()``) must skip that tick's publish,
+        not raise.
+        """
+        indices = getattr(self, "_parity_gripper_joint_indices", None)
+        if indices is None or any(index is None for index in indices):
+            if not self._parity_gripper_torque_unresolved_logged:
+                self._parity_gripper_torque_unresolved_logged = True
+                missing = [
+                    name
+                    for name, index in zip(self.PARITY_GRIPPER_JOINTS, indices or ())
+                    if index is None
+                ]
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_torque_joints_unresolved",
+                            "missing": missing,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        getter = (
+            getattr(root_view, "get_dof_projected_joint_forces", None)
+            if root_view is not None
+            else None
+        )
+        if getter is None:
+            if not self._parity_gripper_torque_unresolved_logged:
+                self._parity_gripper_torque_unresolved_logged = True
+                print(
+                    json.dumps({"event": "parity_gripper_torque_view_unavailable"}),
+                    flush=True,
+                )
+            return None
+
+        try:
+            forces = getter()
+            arr = forces.numpy() if hasattr(forces, "numpy") else forces
+            physx_tau = [float(arr[0][index]) for index in indices]
+        except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+            if not self._parity_gripper_torque_error_logged:
+                self._parity_gripper_torque_error_logged = True
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_torque_read_error",
+                            "error": str(error)[:160],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        data = self._robot.data
+        joint_pos = self._torch_value(data.joint_pos)[0]
+        joint_vel = self._torch_value(data.joint_vel)[0]
+        pos = [float(joint_pos[index]) for index in indices]
+        vel = [float(joint_vel[index]) for index in indices]
+        return self.PARITY_GRIPPER_JOINTS, pos, vel, physx_tau
+
+    def _resolve_articulation_sleep_ids(self) -> tuple[int, int] | None:
+        """Best-effort ``(stage_id, prim_id)`` for the articulation ROOT
+        BODY, for ``get_physx_simulation_interface().is_sleeping(stage_id,
+        prim_id)`` -- #33 bench round ahh follow-up (``articulation/
+        is_sleeping`` in ``parity_gripper_targets()``). Called once per
+        ``_refresh_robot_handles`` rebind, never per tick: a stage/prim
+        lookup is not something the hot path should pay for, and the ids
+        this resolves don't change between rebinds anyway.
+
+        Review round 2 fix: this used to resolve ``cfg.prim_path`` itself
+        (``/World/Tinker``, a plain Xform with no ``PhysicsRigidBodyAPI``)
+        -- ``is_sleeping`` on a non-rigid-body prim id produced a native
+        ``omni.physx.plugin`` C++ error on EVERY tick on a live bench (not
+        visible to any Python ``except`` here) while the field silently
+        published 0. The actual articulation/body root is
+        ``<prim_path>/base_link`` (confirmed live: apiSchemas include
+        ``PhysicsRigidBodyAPI``/``PhysicsArticulationRootAPI``/
+        ``PhysxArticulationAPI``, see ``$TMP/task33-coupling-test.md``). Only
+        resolve a prim that actually carries ``UsdPhysics.RigidBodyAPI`` at
+        resolve time; anything else (missing prim, missing API, any
+        exception) returns ``None`` and the caller omits the field rather
+        than publishing a placeholder.
+
+        No Kit/USD stage is available in a headless unit-test construction
+        (``omni.usd``/``pxr`` fail to import there, matching every other
+        lazy-pxr-import method in this class) -- this is explicitly a
+        "cheap if available" diagnostic per the task, not a contract
+        anything depends on.
+        """
+        try:
+            import omni.usd
+            from pxr import PhysicsSchemaTools, UsdPhysics
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return None
+            robot_prim_path = str(
+                getattr(getattr(self._robot, "cfg", None), "prim_path", "")
+                or "/World/Tinker"
+            )
+            body_prim = stage.GetPrimAtPath(f"{robot_prim_path}/base_link")
+            if not body_prim.IsValid() or not body_prim.HasAPI(
+                UsdPhysics.RigidBodyAPI
+            ):
+                return None
+            stage_id = omni.usd.get_context().get_stage_id()
+            prim_id = PhysicsSchemaTools.sdfPathToInt(body_prim.GetPath())
+            return int(stage_id), int(prim_id)
+        except Exception:
+            return None
+
+    def _articulation_is_sleeping(self) -> bool | None:
+        """Per-tick ``is_sleeping`` read using the ids cached by
+        ``_resolve_articulation_sleep_ids`` -- ``None`` (never published,
+        per the "if cheaply available, else omit" contract) if the ids
+        never resolved, the read itself fails, or the field has been
+        disabled by the self-check below.
+
+        Self-check (review round 2): the underlying PhysX binding's return
+        type for this call is unverified beyond one live smoke test: if the
+        interface ever returns something other than a real ``bool`` on the
+        FIRST successful call, that is treated as "this PhysX build's API
+        doesn't mean what we assumed" -- log once and disable the field for
+        the rest of THIS backend's life (not just until the next rebind;
+        ``_articulation_is_sleeping_disabled`` is never reset by
+        ``_refresh_robot_handles``), rather than silently coercing whatever
+        came back through ``bool(...)`` every tick.
+        """
+        if getattr(self, "_articulation_is_sleeping_disabled", False):
+            return None
+        ids = getattr(self, "_articulation_sleep_ids", None)
+        if ids is None:
+            return None
+        try:
+            from omni.physx import get_physx_simulation_interface
+
+            result = get_physx_simulation_interface().is_sleeping(ids[0], ids[1])
+        except Exception:
+            return None
+        if not isinstance(result, bool):
+            self._articulation_is_sleeping_disabled = True
+            if not getattr(self, "_articulation_is_sleeping_type_logged", False):
+                self._articulation_is_sleeping_type_logged = True
+                print(
+                    json.dumps(
+                        {
+                            "event": "articulation_is_sleeping_unexpected_type",
+                            "type": type(result).__name__,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+        return result
+
+    def parity_gripper_targets(self) -> tuple[list[str], list[float]] | None:
+        """Per-tick, per-LAYER position-target readback for the three
+        ``PARITY_GRIPPER_TARGET_JOINTS`` -- #33 bench round ahh follow-up: a
+        mid-close stall showed ``drive_joint`` sitting at 0.341 rad with
+        Isaac Lab's effort echo pinned at +2.5 while PhysX behaved as
+        though its own drive target already equalled the measured position
+        (or its gains were ~0), and the PhysX-side per-tick target had
+        never actually been recorded on a live bench. This publishes, for
+        each of the three joints, Python's own commanded target
+        (``_position_targets``, ``py_target``), Isaac Lab's actuator-model
+        input buffer (``data.joint_pos_target``, ``lab_target``), and the
+        PhysX solver's own drive target (``root_view.
+        get_dof_position_targets()``, ``physx_target``) side by side, plus
+        the live PhysX gains/limits driving that target
+        (``physx_k``/``physx_d``/``physx_max_force``/``physx_max_vel``) and
+        the measured position/Lab-applied-effort those targets are
+        supposedly tracking toward -- exactly the row
+        ``validation/gripper_close_probe.py``'s ``--arm-stream-hz`` CSV
+        already computes in-process, published live instead of only
+        available from a probe run.
+
+        Fails soft, same two-flag shape as ``parity_gripper_torque``:
+        returns ``None`` (logged once) if any of ``PARITY_GRIPPER_TARGET_
+        JOINTS`` is unresolved, the PhysX view is unavailable, or ANY read
+        in the batch raises -- the caller must skip that tick's publish,
+        not raise. Unlike ``validation/gripper_close_probe.py``'s per-field
+        NaN degradation (a CSV column must never go missing), this mirrors
+        the OTHER parity publishers in this file: one bad read drops the
+        whole tick rather than mixing real and NaN values in one message.
+        """
+        indices = getattr(self, "_parity_gripper_target_indices", None)
+        if indices is None or any(index is None for index in indices):
+            if not self._parity_gripper_targets_unresolved_logged:
+                self._parity_gripper_targets_unresolved_logged = True
+                missing = [
+                    name
+                    for name, index in zip(
+                        self.PARITY_GRIPPER_TARGET_JOINTS, indices or ()
+                    )
+                    if index is None
+                ]
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_targets_joints_unresolved",
+                            "missing": missing,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        if root_view is None:
+            if not self._parity_gripper_targets_unresolved_logged:
+                self._parity_gripper_targets_unresolved_logged = True
+                print(
+                    json.dumps({"event": "parity_gripper_targets_view_unavailable"}),
+                    flush=True,
+                )
+            return None
+
+        try:
+            # One PhysX view call per parameter (batched across all three
+            # joints), not one call per joint -- five getter calls total,
+            # each a single small (1, num_dofs) CPU tensor/array read.
+            physx_target = self._parity_read_dof_param(
+                root_view, "get_dof_position_targets", indices
+            )
+            physx_k = self._parity_read_dof_param(
+                root_view, "get_dof_stiffnesses", indices
+            )
+            physx_d = self._parity_read_dof_param(
+                root_view, "get_dof_dampings", indices
+            )
+            physx_max_force = self._parity_read_dof_param(
+                root_view, "get_dof_max_forces", indices
+            )
+            physx_max_vel = self._parity_read_dof_param(
+                root_view, "get_dof_max_velocities", indices
+            )
+            data = self._robot.data
+            joint_pos = self._torch_value(data.joint_pos)[0]
+            py_targets = self._torch_value(self._position_targets)[0]
+            lab_target_tensor = getattr(data, "joint_pos_target", None)
+            lab_targets = (
+                self._torch_value(lab_target_tensor)[0]
+                if lab_target_tensor is not None
+                else None
+            )
+            applied_torque_tensor = getattr(data, "applied_torque", None)
+            applied_torque = (
+                self._torch_value(applied_torque_tensor)[0]
+                if applied_torque_tensor is not None
+                else None
+            )
+            names: list[str] = []
+            values: list[float] = []
+            for row, joint_name in enumerate(self.PARITY_GRIPPER_TARGET_JOINTS):
+                index = indices[row]
+                row_values = {
+                    "py_target": float(py_targets[index]),
+                    "lab_target": (
+                        float(lab_targets[index])
+                        if lab_targets is not None
+                        else float("nan")
+                    ),
+                    "physx_target": physx_target[row],
+                    "physx_k": physx_k[row],
+                    "physx_d": physx_d[row],
+                    "physx_max_force": physx_max_force[row],
+                    "physx_max_vel": physx_max_vel[row],
+                    "measured": float(joint_pos[index]),
+                    "lab_applied_effort": (
+                        float(applied_torque[index])
+                        if applied_torque is not None
+                        else float("nan")
+                    ),
+                }
+                for field in self.PARITY_GRIPPER_TARGET_FIELDS:
+                    names.append(f"{joint_name}/{field}")
+                    values.append(row_values[field])
+        except Exception as error:  # pragma: no cover - defensive, PhysX/Lab API surface
+            if not self._parity_gripper_targets_error_logged:
+                self._parity_gripper_targets_error_logged = True
+                print(
+                    json.dumps(
+                        {
+                            "event": "parity_gripper_targets_read_error",
+                            "error": str(error)[:160],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return None
+
+        names.append("articulation/target_write")
+        values.append(1.0 if getattr(self, "_last_target_write", False) else 0.0)
+        sleeping = self._articulation_is_sleeping()
+        if sleeping is not None:
+            names.append("articulation/is_sleeping")
+            values.append(1.0 if sleeping else 0.0)
+        return names, values
+
+    @staticmethod
+    def _parity_read_dof_param(
+        root_view: Any, getter_name: str, indices: tuple[int, ...]
+    ) -> list[float]:
+        """One PhysX tensor-view call for the named per-DOF parameter
+        (``get_dof_position_targets``/``get_dof_stiffnesses``/
+        ``get_dof_dampings``/``get_dof_max_forces``/
+        ``get_dof_max_velocities``, shape ``(num_instances, num_dofs)``, env
+        0), then extract every requested index from that one read -- same
+        shape as ``validation/gripper_close_probe.py``'s
+        ``_read_physx_dof_param``. Raises (the caller's batch try/except
+        catches it) rather than degrading per-field, matching
+        ``parity_gripper_targets()``'s whole-tick fail-soft contract.
+        """
+        getter = getattr(root_view, getter_name, None)
+        if getter is None:
+            raise AttributeError(f"{getter_name} unavailable on this PhysX view")
+        raw = getter()
+        # .numpy() relies on this backend's CPU physics pin: a CUDA tensor's
+        # .numpy() raises (into the caller's batch except), which would
+        # darken this whole topic after one log line if physics ever ran
+        # on GPU here.
+        arr = raw.numpy() if hasattr(raw, "numpy") else raw
+        return [float(arr[0][index]) for index in indices]
+
+    def body_pose_world(
+        self, name: str
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """World pose (position, quaternion_xyzw) of an arbitrary articulation
+        body, read from the SAME ``body_pos_w``/``body_quat_w`` tensors as
+        ``parity_tcp_frame``/``_robot_truth_state`` (view-free, Fabric-
+        independent -- not a separate PhysX query).
+
+        Task #36 fix: the wrist-camera parity pose composes this (the live
+        pose of the articulation body the camera is fixed to) with the
+        camera's own static mount offset, instead of a raw pxr prim read on
+        the physics-driven render prim itself -- that read goes stale under
+        the default fabric-on config (``/physics/updateToUsd=False``), since
+        PhysX stops writing rigid-body transforms back into USD.
+
+        Returns ``None`` if *name* is not in ``data.body_names`` -- callers
+        should skip publishing that tick, not raise (same fail-soft contract
+        as ``parity_tcp_frame``).
+        """
+        data = self._robot.data
+        body_names = tuple(getattr(data, "body_names", ()))
+        if name not in body_names:
+            return None
+        index = body_names.index(name)
+        position = tuple(
+            float(value)
+            for value in self._torch_value(data.body_pos_w)[0, index]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        quaternion = tuple(
+            float(value)
+            for value in self._torch_value(data.body_quat_w)[0, index]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        return position, quaternion
 
     def truth_state(self, evaluator_token: object) -> Mapping[str, object]:
         if evaluator_token is not self.TRUTH_TOKEN:

@@ -88,6 +88,733 @@ were rewritten after the reversion — whether that write actually binds in Phys
 was never measured, so those runs are unknown rather than either clean or
 invalid. Nothing was re-run for this change; it is code-only.
 
+## 2026-09-07 — Task #33: observability for the stale-hold / gripper-target / safety-gate chain
+
+**Purpose.** Task #33's stale-hold repro (`$TMP/task33-stale-hold-repro.md`)
+traces a lapsed 0.5 s gripper-command watchdog through `command_mux.py` (holds
+the last measured `drive_joint` angle), into `backend.py`'s
+`_apply_joint_command` (overwrites `_drive_command_target` from whatever
+packet next names `drive_joint`), but none of it was visible on a live bench
+log. This round adds observability only -- no packet, target, or publish
+value this chain produces changes; every new branch either logs alongside an
+existing decision or reads a pure function a second time purely to report an
+edge.
+
+**`simulation/tinker_sim_core/command_mux.py`** (plain library, no ROS
+handle -- logs through `logging.getLogger(__name__)`):
+- `stale_hold source=<src> joints=<names> hold_pos=<vals> age_s=<age>
+  clock=steady` once when a source's composed packet first freezes at its
+  watchdog transition (`_compose_packets`, the existing
+  `_stale_position_holds.setdefault` site).
+- `stale_hold_active source=<src> ...` (same fields) at most once per second
+  while the hold continues -- a source held for minutes does not spam one
+  line per composed frame (up to 150 Hz at the gateway).
+- `stale_hold_cleared source=<src> stale_for_s=<duration>` when a fresh
+  `accept()` replaces an active hold.
+- `mux_stop state=engaged|released held=<joint>:<pos> ...` once per
+  `stop(True)`/`stop(False)` transition (not per call -- the existing
+  `if active and not self.safety_stop` / `elif not active and
+  self.safety_stop` guards already gate real transitions only), listing the
+  measured positions force-held by `_stopped_packets`.
+
+**`simulation/tinker_sim_isaac/backend.py`** (module already logs via bare
+`print(json.dumps(...))`/plain `print()`, no `logging` import -- this stays
+consistent with that, not a JSON line, per the exact format requested):
+`_apply_joint_command` now logs `gripper_command_target old=<old> new=<new>
+effort=<effort> source_packet=<n> applied=<_position_targets[0,drive]>`
+whenever the incoming packet actually changes `_drive_command_target`
+(`old != new`; the very first command logs `old=None`). `applied` is the
+ramp's current output at that instant -- the value `_ramp_drive_target()`
+last wrote, i.e. what the facade would see this tick, not the new commanded
+target, which only takes effect once the ramp catches up. `source_packet` is
+a monotonic call-sequence number (`_apply_joint_command` carries no other
+packet identity today). Rate-limited to
+`GRIPPER_COMMAND_TARGET_LOG_MAX_PER_WINDOW` (5) lines per
+`GRIPPER_COMMAND_TARGET_LOG_WINDOW_S` (1.0 s) via a sliding timestamp window,
+so a fast oscillation (e.g. a source flapping stale/fresh) cannot spam the
+log -- but the window ages out on its own, so the first line after any quiet
+period always gets through.
+
+**`ros2_ws/.../command_gateway.py`**: the mux's `logging` records never
+reached the bridge log on their own -- `rclpy`'s `get_logger()` is a separate
+sink from Python's `logging` module. `CommandGateway.__init__` now attaches a
+`_RclpyLogForwarder` (a `logging.Handler` that calls
+`self.get_logger().info/warning/error`) to the
+`tinker_sim_core.command_mux` logger and sets `propagate = False` (keep it
+out of an unrouted root-logger stdout copy). Also new in this file, same
+principle -- log alongside an existing decision, never change it:
+- `safety_gate armed reason=timeout gap_s=<since last sample>` /
+  `safety_gate armed reason=sample` / `safety_gate cleared reason=sample
+  gap_s=<duration held>` on every real `_safety_active` transition
+  (`_enforce_safety_deadline`'s timeout arm, `_safety_stop`'s explicit
+  sample arm/clear). `gap_s` means different things by design: for an
+  armed-by-timeout line it is the heartbeat gap that caused it; for a
+  cleared line it is how long the gate was held.
+- `command_rejected source=<src> reason=<reason> count=<n since last line>`
+  from `_accept`'s three existing `self._rejected[source] = ...` branches
+  (safety-active-at-entry, safety-active-after-deadline-check, and the
+  except-handler), rate-limited to at most one line per second per source;
+  drops inside the window are still counted and folded into the next line's
+  `count` once the window reopens, so nothing is silently lost, only
+  batched.
+
+**`ros2_ws/.../safety_supervisor.py`**: `_refresh_desired_stop` gained
+`_log_source_transitions()`, which reads each tracker's `requires_stop()` a
+second time (pure, no side effect) purely to detect a per-source edge the
+existing `any(...)` OR cannot itself report, logging `safety_source
+source=<name> state=expired|recovered age_s=<age> deadline_s=<deadline>`.
+`_publish()` logs `safety_stop_published value=<bool>
+reason=<comma-joined source names, or "none">` whenever the published value
+actually changes (compared against `_published_stop` before it is
+overwritten) -- the 0.25 s reconcile heartbeat republishes the *unchanged*
+value far more often than it flips, so this is on-change, not on-publish.
+`reason=none` on an active stop is itself informative: it means the trigger
+was a controller-management hold (`startup_hold`/`restore_pending`/not
+`management_ready`), not any of `xarm`/`collision`/`operator`.
+
+**How to read a plateau against these lines.** A bench force/position
+plateau with no `stale_hold` line in the same window did not stall because a
+command source went stale -- look at `gripper_command_target` instead: if
+`new` keeps changing while the pads have stopped moving, the *ramp* is the
+bottleneck, not the mux. Conversely a `stale_hold` immediately followed by a
+`gripper_command_target` restating the *same* frozen value confirms the mux
+hold is what is driving `_drive_command_target`, not a live command. A
+`safety_gate armed reason=timeout` immediately upstream of a run of
+`command_rejected ... blocked by safety stop` lines confirms a lost
+heartbeat, not a rejected-for-cause command, caused the gap.
+
+**Tests.** `tests/test_command_mux.py`: two new `unittest.TestCase`s
+(`JointCommandMuxStaleHoldLoggingTest`, `JointCommandMuxStopLoggingTest`)
+using `self.assertLogs("tinker_sim_core.command_mux", level="INFO")` against
+a fake steady clock passed straight to `accept()`/`compose()` -- no real
+sleep. `tests/test_manipulation_runtime.py`: two new tests on
+`_apply_joint_command` capturing `stdout` (`contextlib.redirect_stdout`,
+following the module's existing print-capture pattern) confirming the
+exact old/new/effort/applied fields and the 5-lines/s rate limit.
+`tests/test_command_gateway_logging.py` (new) and
+`tests/test_safety_supervisor_logging.py` (new): `object.__new__` test
+doubles in the style of `test_command_gateway_keepalive.py`, with
+`unittest.mock.patch` pinning `time.monotonic` to a dict-backed fake clock
+so `gap_s`/`age_s` assertions are exact rather than wall-clock-flaky.
+
+These two files import `rclpy`/`std_msgs` and are skipped in this sandbox
+(`ModuleNotFoundError: No module named 'rclpy._rclpy_pybind11'` -- the
+system ROS install is built for Python 3.10, this worktree's `.venv` is
+3.12); confirmed pre-existing (`test_command_gateway_keepalive.py` skips
+identically here) and not a regression. They were instead run and passed
+under the system `python3.10` (which has a matching `rclpy`) with
+`PYTHONPATH` extended to `ros2_ws/src/tinker_sim_bridge` and `simulation`:
+10 passed (`test_command_gateway_logging.py` + `test_command_gateway_keepalive.py`),
+12 passed (`test_safety_supervisor_logging.py` +
+`test_command_gateway_logging.py` + `test_command_gateway_keepalive.py`).
+`tests/test_manipulation_runtime.py` + `tests/test_command_mux.py` under the
+regular `uv run` (3.12) incantation: 178 passed, 5 subtests passed.
+
+## 2026-09-06 — Task #35: backend-only TCP/pad parity publisher
+
+**Purpose.** A diagnostic for the grasp bench: the left pad's inner face was
+observed meeting a can 29-30 mm from TF `link_tcp` at drive 0, while the USD
+puts the pad faces at +-44.5 mm about the sim's `link_tcp` prim -- all URDFs
+agree statically, so if the discrepancy is real it is runtime-only. To let a
+bench diff the sim's PHYSICAL tool-centre-point and pad faces against the ROS
+TF `link_tcp` in one recording, `ros_gateway.py` now publishes, every
+`publish()` tick (same unconditional cadence as `/sim/internal/physics_truth`
+and the #22 `/sim/parity/finger_contact` wrench), gated by
+`TINKER_SIM_PARITY_TCP` (default `"1"`, `"0"` disables):
+
+- `/sim/parity/tcp_pose` (`geometry_msgs/PoseStamped`, frame `world`): the
+  articulation's `link_tcp` body world pose.
+- `/sim/parity/tcp_pose_base` (`PoseStamped`, frame `base_link`): the same
+  pose expressed in the robot root frame.
+- `/sim/parity/pad_points` (`geometry_msgs/PolygonStamped`, frame
+  `base_link`): `[left inner-face centre, right inner-face centre,
+  midpoint]`.
+
+**Read path.** `backend.py` gains `IsaacWholeRobotBackend.parity_tcp_frame()`,
+which resolves `link_tcp`/`left_finger`/`right_finger` in
+`data.body_names` and reads their world pose from the same
+`body_pos_w`/`body_quat_w` tensors `_robot_truth_state()` already uses for
+`tcp_pose` (view-free through the articulation data -- no separate PhysX
+query; `IPhysx.get_rigidbody_transformation` is for non-articulated rigid
+bodies, e.g. spawned objects via `_iter_spawned_bodies`, not articulation
+links). Fails soft: if any of the three bodies is missing, it logs
+`{"event": "parity_tcp_bodies_unresolved", "missing": [...]}` once (a
+`_parity_tcp_bodies_missing_logged` latch, mirroring
+`_contact_report_first_event_logged`) and returns `None`; the gateway then
+skips publishing that tick without raising.
+
+**Pad-inner-face constants and their provenance.** A live `pxr` probe of the
+shipped robot USD (`artifacts/robot/tinker2/*/robot.usd`, re-verifying
+`$TMP/task31-jaw-opening-findings.md`) gave, via
+`UsdGeom.BBoxCache.ComputeLocalBound` on each finger's own `collisions` prim
+(i.e. relative to that finger LINK's own origin, before its world transform):
+
+```
+              X (width)        Y (closing axis)      Z (reach axis)
+left_finger   -16.0/+16.0 mm   -26.0/+5.9 mm         -5.9/+61.0 mm
+right_finger  -16.0/+16.0 mm   -5.9/+26.0 mm         -5.9/+61.0 mm
+```
+
+Both finger links share one static rest orientation (confirmed via
+`ComputeLocalToWorldTransform` on both prims: a ~180 deg rotation about
+local X, matching that both `left_finger_joint`/`right_finger_joint` are
+revolute about local X) -- the two collision meshes are mirror images of
+one another, not the link frames. Each pad's INNER face (the surface that
+meets a grasped object) is therefore the extreme 26.0 mm from the link
+origin: local Y = -0.026 on the left finger, +0.026 on the right, both at
+the reach-axis midpoint `PAD_MID_REACH_M = (-0.0059 + 0.0610) / 2 ~=
+0.02755`. `backend.py` module-level constants `PAD_INNER_INSET_M`,
+`PAD_MID_REACH_M`, `LEFT_FINGER_PAD_LOCAL_OFFSET`,
+`RIGHT_FINGER_PAD_LOCAL_OFFSET` carry this exact derivation in a comment.
+`finger_inner_face_world()` rotates the fixed link-local offset by that
+link's CURRENT `body_quat_w` before adding it to the link's world position
+-- correct through the whole open/close range because it is a point
+painted on the rigid pad, not a world-frame constant; a live pxr check of
+the rest pose confirmed the mirrored +-0.0445 m inner-face separation this
+produces (from finger origins at +-0.0705 m) against the shipped USD.
+`pose_in_frame()` (quaternion conjugate + Hamilton product, both
+scalar-last like every other quaternion in this module) expresses a world
+pose in an arbitrary frame's own frame, used both for `tcp_pose_base` and
+for expressing the pad points in `base_link`.
+
+**Tests** (`tests/test_manipulation_runtime.py`): pure pad-inner-face/
+midpoint math against the rest orientation and under an added yaw (verifies
+the mirrored separation "rotates with" the closing axis rather than staying
+pinned to world Y); `pose_in_frame` against a known yawed root pose;
+`IsaacWholeRobotBackend.parity_tcp_frame()` end to end (world + base_link
+poses, pad points) and its fail-soft/log-once contract when
+`left_finger`/`right_finger` are absent from `body_names`; the gateway's
+publisher registration/topic/frame_id/env-gate strings; and a `publish()`
+runtime test (mirroring the #22 finger-contact-wrench test) asserting all
+three topics fire every tick and that `TINKER_SIM_PARITY_TCP=0` (or an
+unresolved frame) fully skips publishing without raising. Full suite:
+`tests/test_manipulation_runtime.py` 138 passed, 5 subtests passed, 0
+failed. No GPU boot for this diagnostic-only change; a bench recording
+against the live TF `link_tcp` is the follow-up that actually answers the
+29-30 mm question this publisher exists for.
+
+### Task #36 addendum — wrist colour camera optical-frame parity publisher
+
+**Purpose.** The grasp bench sees a constant ~15 mm perception bias along
+base X on two different objects and suspects the wrist camera extrinsic.
+Same idea as #35's TCP/pad topics, same env gate (`TINKER_SIM_PARITY_TCP`),
+same unconditional every-`publish()`-tick cadence: publish the sim's
+ACTUAL rendered wrist colour camera pose so the bench can diff it against
+the ROS TF frames `xarm_camera_color_optical_frame`/`_aimed` in one
+recording.
+
+- `/sim/parity/wrist_camera_pose` (`PoseStamped`, frame `world`): the wrist
+  colour camera's ROS OPTICAL frame (x right, y down, z forward) pose in
+  world.
+- `/sim/parity/wrist_camera_pose_base` (`PoseStamped`, frame `base_link`):
+  the same pose expressed in the robot root frame, via `backend.py`'s
+  existing `pose_in_frame()` (reused as-is, no new backend method).
+
+**Read path and convention.** `camera_rig.py` gains
+`CameraRig.camera_optical_pose_world(name)`: it looks up the SAME
+`rtx_camera` prim path `initialize()` created for that spec (cached in
+`self._camera_prim_paths`, set at `camera_path = f"{mount_path}/rtx_camera"`
+-- no separate mount-prim search or re-derivation of the un-corrected mount
+frame), reads its live `UsdGeom.Xformable(prim).ComputeLocalToWorldTransform`
+(the exact transform the renderer itself uses, at whatever pose the arm's
+forward kinematics and any `TINKER_SIM_WRIST_CAMERA_AIM` preset put it at
+this tick), and converts native USD camera convention (looks down -Z, +Y
+up) to ROS optical (+Z forward, +Y down) via the new pure function
+`usd_camera_pose_to_ros_optical()`. That conversion is exactly
+`quaternion_wxyz (x) OPTICAL_TO_USD_CAMERA_WXYZ` -- the SAME module
+constant `initialize()` already uses to go optical->usd for the `orient`
+xform op (the current, Task #15-fixed value, `(0, 1, 0, 0)`, 180 deg about
+X; the nearby code comment describing a `(0, 0, 1, 0)` "y-flip variant" for
+this artifact is pre-#15/stale and was NOT used here), composed on the
+RIGHT (Hamilton product) so the flip is about the camera's OWN current
+local X, not a fixed world axis -- verified by a 90 deg-world-Z-yaw test
+that a left-multiply ordering bug would fail (forward alone does not
+discriminate the two orders, since it sits on the yaw's own rotation axis
+either way; only a cross-axis vector like optical "down" does). Fails
+soft, matching `parity_tcp_frame()`: if `initialize()` has not resolved
+that camera's prim (or the prim later becomes invalid), it logs
+`{"event": "camera_optical_pose_unresolved", "camera": ...}` once (a
+`_optical_pose_missing_logged` latch) and returns `None`; the gateway skips
+publishing that tick.
+
+`ros_gateway.py`'s `publish()` reuses `pose_in_frame()` directly (imported
+from `backend.py`) with `self.backend.root_state()`'s position/
+`quaternion_wxyz` (converted to xyzw by reordering) as the frame -- no new
+backend method needed, since a camera pose is not a backend/articulation
+concept the way TCP/pad points are.
+
+**Tests** (`tests/test_manipulation_runtime.py`): the pure
+`usd_camera_pose_to_ros_optical()` conversion at identity (camera at the
+origin looking down world -Z with +Y up must publish optical +Z along
+world -Z and +Y along world -Y) and under a 90 deg world-Z yaw (the
+order-discriminating case above); `CameraRig.camera_optical_pose_world()`'s
+fail-soft/log-once contract before `initialize()` has run (no Kit/pxr
+needed for this path); the gateway's publisher registration/topic/
+frame_id/env-gate source strings; a `publish()` runtime test with a fake
+camera rig and a non-trivial (180 deg-about-Z) root pose, asserting both
+topics fire every tick with hand-derived-via-`pose_in_frame` world and
+base_link values; and the disabled/unresolved/no-camera-rig skip contract
+(no publish calls, no raise). Full suite: `tests/test_manipulation_runtime.py`
+149 passed, 5 subtests passed, 0 failed (143 passed before this task's 6
+new tests); `tests/test_camera_rig.py` and the other camera test files
+unaffected (119 passed, 1 subtests passed). No GPU boot for this
+diagnostic-only change; the bench recording against the live TF frames is
+the follow-up that actually answers the 15 mm bias question this publisher
+exists for.
+
+### Task #36 follow-up — Fabric-safe pose (mount read once at init)
+
+**The problem.** Review of the addendum above found that
+`camera_optical_pose_world()`'s per-tick `UsdGeom.Xformable(prim).
+ComputeLocalToWorldTransform()` reads the wrist camera's `rtx_camera`
+prim -- a child of an articulation link, i.e. a physics-driven prim. Under
+the default fabric-on config (`resolve_use_fabric()` in `backend.py`;
+`/physics/updateToUsd=False`, see the Task #35 entry and the #11/#26/#30
+history of this exact failure mode in this codebase) PhysX stops writing
+rigid-body transforms back into USD every step, so a plain pxr read
+returns the LAST-WRITTEN (e.g. spawn-time) pose, not the live one -- silently
+stale during exactly the arm motion this publisher exists to diagnose.
+`parity_tcp_frame()` (Task #35) avoids this by reading
+`body_pos_w`/`body_quat_w` off the articulation data directly; the camera
+code did not.
+
+**The fix.** `camera_optical_pose_world()` no longer touches pxr per tick.
+Instead, at `initialize()` time -- while PhysX has not yet stepped and a
+plain USD read is still legitimate, and because the offset in question
+never changes again after boot -- the rig resolves, for each robot-mounted
+camera, the nearest ancestor prim of its `mount_prim` search result that
+carries `UsdPhysics.RigidBodyAPI` (`_rigid_body_ancestor()`; a camera
+spec's named mount, e.g. `xarm_camera_color_optical_frame`, is typically
+several FIXED joints below the actual PhysX-simulated link the URDF
+importer keeps as one rigid body -- exactly why the task description
+suggested checking `xarm_camera_link`/`link_eef`/`link7` rather than
+assuming the spec's own `mount_prim` name is a tensor body). It then reads,
+ONCE, `camera_matrix * body_matrix.GetInverse()` (row-vector USD
+convention: `world = local * parent_world`) to get the STATIC
+`body_T_camera` offset, decomposed and cached as
+`CameraRig._mount_local_pose[name]` (position, quaternion_wxyz) alongside
+the resolved body's name in `_mount_body_names[name]`. World-fixed cameras
+(the arena spectator; `mount_translation` set, no articulation body at
+all) get their entire world pose cached directly at init instead
+(`_camera_world_pose_static`), since it is static too and needs no body
+lookup.
+
+Every tick, `ros_gateway.py` now does: `body_name =
+camera_rig.mount_body_name("wrist_camera")`, then `backend.body_pose_world
+(body_name)` -- a new `IsaacWholeRobotBackend` method reading the SAME
+`body_pos_w`/`body_quat_w` tensors as `parity_tcp_frame` (Fabric-independent,
+scalar-last quaternion, `None` if the body is not in `data.body_names`) --
+and passes that live pose into `camera_optical_pose_world(name,
+body_pose_world)`, which composes it with the cached static offset
+(`_compose_wxyz`, pure arithmetic: rotate the local offset by the link's
+current world orientation, add; multiply the quaternions) before the same
+`usd_camera_pose_to_ros_optical()` conversion as before. `None` on either
+side (unresolved mount, or the body's tensor not found this tick) fails
+soft exactly as before -- one `camera_optical_pose_unresolved` log latch,
+no publish that tick.
+
+**Tests** (`tests/test_manipulation_runtime.py`): two new composition
+tests -- `_mount_local_pose`/`_mount_body_names` set directly (bypassing
+`initialize()`, no Kit needed), a known link pose (position + scalar-last
+quaternion, matching `body_pose_world`'s own convention) composed with a
+known static mount offset, checked against a hand-derived (independently,
+via plain rotation matrices, not this module's own quaternion helpers)
+expectation for position and the optical +z/+y axes -- one with the link
+at identity, one with the link yawed 90 deg about world Z and a mount
+offset with an X component (discriminates a left- vs right-multiply
+composition bug the boresight-only check cannot); and a regression test
+that monkeypatches `UsdGeom.Xformable.ComputeLocalToWorldTransform` to
+raise and confirms a normal per-tick call still succeeds -- proving the
+per-tick path is pure Python. The existing publisher/env-gate/fail-soft
+tests were adjusted for the new two-argument `camera_optical_pose_world`
+signature and the new `mount_body_name`/`body_pose_world` plumbing
+(fakes updated, same assertions). Full suite:
+`tests/test_manipulation_runtime.py` 152 passed, 5 subtests passed, 0
+failed (149 passed before this follow-up's 3 new tests);
+`tests/test_camera_rig.py` and the other camera test files unaffected (119
+passed, 1 subtests passed). No GPU boot for this diagnostic-only change;
+the live bench recording against `updateToUsd=False` fabric-on is the
+follow-up that actually validates the fix tracks the arm during motion.
+
+### Task #33 addendum — PhysX-measured gripper joint torque parity publisher
+
+**Purpose.** The #20 chain above needed the gripper joints' PhysX-MEASURED
+torque to diagnose real clamp force, but `/isaac_joint_states`' `effort`
+field is `data.applied_torque` -- the Isaac Lab actuator MODEL's own
+post-clip COMMAND (`clamp(k*error - d*velocity)`) set INTO the sim, not
+what the PhysX solver actually delivered (this is the same distinction
+`validation/gripper_close_probe.py`'s `_read_physx_joint_forces()` draws
+between its `tau`/`tau_drive` rows and its `physx_tau` row). Same idea as
+#35/#36's parity topics, same env gate (`TINKER_SIM_PARITY_TCP`), same
+unconditional every-`publish()`-tick cadence: publish the six gripper
+joints' (`drive_joint`, `left_finger_joint`, `left_inner_knuckle_joint`,
+`right_outer_knuckle_joint`, `right_inner_knuckle_joint`,
+`right_finger_joint`) measured PhysX torque next to the existing
+actuator-echo topic, so a bench recording of both agrees by construction
+with the probe's own numbers.
+
+- `/sim/parity/gripper_physx_tau` (`sensor_msgs/JointState`): `name` is the
+  six gripper joints in that fixed order; `position`/`velocity` are the
+  same `data.joint_pos`/`data.joint_vel` tensors `joint_state()` reads;
+  `effort` is the PhysX-measured torque (see read path below), not the
+  actuator echo.
+
+**Read path.** `backend.py` gains a `PARITY_GRIPPER_JOINTS` class constant
+(the six names, in publish order) and
+`IsaacWholeRobotBackend.parity_gripper_torque()`. The six joints' DOF
+indices are resolved once, at bind time, into
+`self._parity_gripper_joint_indices` (alongside the existing
+`_gripper_mimic_indices`/`_drive_joint_index` resolution), not re-looked-up
+per publish tick. The torque itself is exactly the probe's read:
+`root_view.get_dof_projected_joint_forces()` (`root_view`/`root_physx_view`,
+whichever the articulation exposes) -- "projects the link's incoming joint
+force[s] in the motion direction", i.e. the constraint solver's actual
+output along each joint's motion axis, as opposed to
+`get_dof_max_forces()`/`data.joint_effort_limits` (the CEILING, not the
+delivered value) used by the #20 effort-limit read/write paths. Fails soft,
+matching `parity_tcp_frame()`: any of the six joints missing from
+`joint_names`, the view lacking `get_dof_projected_joint_forces`, or that
+call raising, each log once (`parity_gripper_torque_joints_unresolved`/
+`_view_unavailable`/`_read_error`, via two latches --
+`_parity_gripper_torque_unresolved_logged` for the two static/joint-
+resolution cases, `_parity_gripper_torque_error_logged` for a read
+exception) and return `None`; the gateway skips publishing that tick
+without raising.
+
+**Tests** (`tests/test_manipulation_runtime.py`): the helper against a
+scrambled (non-contiguous, includes a non-gripper joint) joint order with a
+fake `root_view.get_dof_projected_joint_forces()` row DELIBERATELY
+different from `data.applied_torque`, proving indices are resolved by name
+and the torque column is the PhysX view's, not the actuator echo;
+`parity_gripper_torque()`'s fail-soft/log-once contract when the view call
+raises; the gateway's publisher registration/topic/env-gate source
+strings; a `publish()` runtime test asserting the topic fires every tick
+with `name`/`position`/`velocity`/`effort` taken straight from the backend
+call and `header.stamp` matching that tick's `/clock` sample; and the
+disabled/unresolved skip contract (no publish calls, no raise) --
+mirroring the #35/#36 gateway test shape throughout. The four pre-existing
+fake backends in this file that already define `parity_tcp_frame()` and
+run with `_parity_tcp_enabled = True` needed a `parity_gripper_torque()`
+returning `None` added alongside, since `publish()` now calls it
+unconditionally in that same gated block. Full suite:
+`tests/test_manipulation_runtime.py` 157 passed, 5 subtests passed, 0
+failed (152 passed before this task's 5 new tests). No GPU boot for this
+diagnostic-only change; a live bench recording of both `effort` fields side
+by side against the probe's own `physx_tau` is the follow-up that confirms
+they agree outside the unit-test fakes.
+
+### Task #33 follow-up — sim-side safety-stop transitions, their trigger, and the drive-target snapshot
+
+**Purpose.** The chain above covers the mux and the bridge nodes; the sim
+process itself (`simulation/tinker_sim_isaac/backend.py`,
+`simulation/tinker_sim_isaac/ros_gateway.py`) had no equivalent -- a
+`_safety_stopped` flip on a live bench log was invisible, and there was no
+way to tell which of the gateway's ~10 `backend.set_safety_stop(...)` call
+sites (init, a direct sample, the heartbeat-timeout re-arm, a rejected
+command baseline, the two-phase baseline preflight/commit, an epoch/session
+adoption, a lost command stream, its recovery) triggered a given transition.
+Observability only, same contract as the addendum above: reuses
+`format_duration()` (`tinker_sim_core/observability.py`) and the
+never-raise pattern, no packet/target/publish value changes.
+
+**`backend.py`**: `set_safety_stop(active, reason=None)` gained an optional,
+caller-named `reason` kwarg (default `None` -> renders `"unspecified"`; no
+call site is required to pass it, so this is not a behaviour change). On
+every *real* `_safety_stopped` flip (the existing repeated-identical-sample
+early return is unchanged and still logs nothing) it prints
+`sim_safety_stop state=engaged|released reason=<reason> sim_t=<simulation_time>
+wall_age_s=n/a` -- `wall_age_s` is always `n/a` from here because the
+backend has no wall clock of its own, only `simulation_time` (that's the
+gateway's job, see below). An engage appends
+`drive_snapshot=<_safety_snapshot[0, drive_index]>` (the frozen hold target
+just latched); a release appends `drive_applied=<_position_targets[0,
+drive_index]> drive_measured=<joint_pos[0, drive_index]>` (both equal
+immediately after a release, since the fresh hold target IS the measured
+joint position at that instant -- expected, not a bug). The whole body is
+wrapped `try/except Exception: return` (review round 2, `2a305cb`): this
+path is reached from `_adopt_command_epoch`/`_enter_command_stream_lost`
+deep inside `spin_once()`'s unguarded loop, so a `print` `BrokenPipeError`
+or a stale-view `RuntimeError` from a log-only read must never kill the sim
+process. **`reason="init"` never actually appears in a log**: the backend
+boots with `_safety_stopped=True` (`IsaacWholeRobotBackend.__init__`), so
+the constructor's `set_safety_stop(True, reason="init")` hits the
+repeated-identical-sample early return before reaching the print -- the
+first visible transition on a live log is always `state=released
+reason=sample_false` (the gateway's first genuine clear sample).
+
+A second line, `applied_targets_reset source=<...> drive_before=<...>
+drive_after=<...> measured=<...> sim_t=<...> dropped=<n>`, fires at the
+FOUR places that replace the whole `_position_targets` tensor (not an
+element-wise command write): `set_safety_stop`'s engage (snapshot clone)
+and release (fresh `joint_pos.clone()` hold target); `step()`'s per-tick
+`_position_targets.copy_(_safety_snapshot)` reassertion while stopped
+(guarded by a `_safety_hold_reassert_logged` flag, armed `False` on every
+engage, so it fires once on the first tick after the engage, not once per
+physics tick for the whole duration of the stop); and
+`_refresh_robot_handles`' `_position_targets = joint_pos.clone()` reseed on
+every root-view identity change (review round 2 addition -- this one has
+NO safety stop involved at all, the exact re-origination shape #33's
+stale-hold/gripper-target chain is hunting; `source=refresh_robot_handles:
+reset_rebind` for a genuine STOP -> spawn -> PLAY reset or
+`:view_recovery` for `_maybe_recover_simulation_view`'s state-preserving
+rebind, same `reapply_spawn_yaw` classification `_log_spawn_pose_trace`
+already uses; `drive_before` is `n/a` on the very first boot bind, when
+`_position_targets` doesn't exist yet). Every argument these four sites
+pass is computed through `_safety_drive_scalar`/a new `_robot_joint_pos()`
+getattr-chain helper (review round 2: NEVER a bare `self._robot.data.
+joint_pos` attribute chain, which can raise before `_log_applied_targets_
+reset`'s own try is even entered) and each call site is additionally
+wrapped in its own local `try/except`, so nothing this line reads can
+propagate. Rate-limited to `APPLIED_TARGETS_RESET_LOG_MAX_PER_WINDOW` (5)
+lines per `APPLIED_TARGETS_RESET_LOG_WINDOW_S` (1.0 s) IN TOTAL -- one
+shared window across all four sources, not five per source (the original
+comment claimed "per source"; the implementation was always a single
+counter, and review round 2 fixed the comment instead of the behaviour);
+a suppressed line increments a counter that the next line to get through
+reports as `dropped=<n>`, so nothing suppressed is unaccounted for. The
+ros_gateway paths that only *call* `backend.set_safety_stop(...)` (baseline
+preflight/commit, `_adopt_command_epoch`, `_enter_command_stream_lost`, its
+recovery) don't duplicate this line themselves -- the backend is the single
+source of truth for every wholesale `_position_targets` replace, and every
+one of those gateway paths already routes through `set_safety_stop`.
+
+**`ros_gateway.py`**: every one of the ~10 `backend.set_safety_stop(...)`
+call sites now passes a distinct `reason=`: `"init"` (constructor),
+`"sample_true"`/`"sample_false"` (a direct `/sim/hardware/safety_stop`
+sample, both in `_apply_safety_stop`'s non-session-protocol branch and its
+default when no caller overrides it), `"safety_stale"`
+(`_enforce_safety_deadline`'s heartbeat-timeout re-arm, passed explicitly
+into `_apply_safety_stop`), `"command_baseline_rejected"`
+(`_reject_staged_baseline`), `"command_baseline_preflight"` /
+`"command_baseline_commit"` (`_commit_staged_baseline`'s two-phase stop/
+clear), `"session_reset"` / `"command_epoch_retired"`
+(`_adopt_command_epoch`, keyed off its existing `new_session` bool),
+`"command_stream_lost"` (`_enter_command_stream_lost`), and
+`"command_stream_recovered"` (the snapshot-apply loop's mid-stream clear).
+
+The staleness evaluation (`_sim_age_stale`) gained `source`/`wall_age`
+kwargs (both observability only, default `"unspecified"`/`None`, no return-
+value change -- refactored to compute `sim_age` once instead of three early
+returns, same boolean result) and now logs through
+`self.node.get_logger().info(...)`: `sim_safety_stale source=<source>
+wall_age_s=<...> sim_age_s=<...> timeout_s=<...> stale=<bool>`. Rate-limited
+to at most one line per second per `source` while `stale=True` stays true
+(the deadline checks run every spin); a `stale=True -> False` transition
+always gets one line regardless of the window so a recovery is never
+silently swallowed by it; a source that has never gone stale stays silent.
+Both callers (`_enforce_command_deadline`, `_enforce_safety_deadline`) pass
+`source="command_stream"` / `"safety_heartbeat"` and their own already-
+computed wall age. **Reading `stale=` on this line**: both callers only
+reach `_sim_age_stale` AFTER their own wall-clock check already failed
+(`now - last >= timeout`) -- the sample is already wall-stale by
+construction whenever this line is emitted at all. `stale=` is therefore
+the SIM-time verdict on top of that: `stale=True` means stale in BOTH
+clocks (a genuinely dead publisher, or the sim genuinely outpacing it) and
+the deadline actually fires; `stale=False` means wall-stale-but-sim-fresh
+-- the stepping loop itself stalled (an RTX render stride, a loaded box)
+while a healthy sample sat queued in DDS -- and the deadline is deliberately
+NOT applied. It is never evidence of a fully healthy sample; it only
+distinguishes "the loop stalled" from "the publisher died."
+
+**Tests.** `tests/test_manipulation_runtime.py`: engage-then-release prints
+both lines with the expected reason/state/drive fields; a repeated identical
+sample logs nothing; a fresh backend (no `_drive_joint_index` yet,
+`_safety_snapshot is None`) degrades every drive field to `n/a` without
+raising; a release's `applied_targets_reset` reports the pre-replace
+`_position_targets` value (the "ramp" value) as `drive_before` and the
+joint_pos-derived fresh target as `drive_after`/`measured`; `step()`'s
+per-tick reassertion logs exactly once across three consecutive ticks while
+stopped; review round 2 added a rebind test (`_robot_view_identity` forced
+to a new value, no safety stop involved) asserting
+`source=refresh_robot_handles:reset_rebind` with the pre-rebind value as
+`drive_before`. `tests/test_ros_gateway.py`: a fake backend recording
+`(active, reason)` pairs confirms a direct sample carries `"sample_true"`,
+`_enforce_safety_deadline` under a fake-clock timeout carries
+`"safety_stale"`, and `_adopt_command_epoch` carries `"command_epoch_retired"`
+or `"session_reset"` depending on `new_session`; a fake `node.get_logger()`
+confirms the stale line is rate-limited to one per second, a stale->fresh
+transition always logs, and a never-stale source stays silent. Full suite
+under the repo's ROS-env pytest incantation (`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
++ lark-shim `PYTHONPATH`, sourced `/opt/ros/humble/setup.bash` without
+`set -u`, `uv run --frozen --no-sync`), review round 2 (`2a305cb` review
+fixes, this commit):
+`tests/test_manipulation_runtime.py` 165 passed / 5 subtests passed (157
+baseline + 8 new, +1 over the first round's 164/7); `tests/test_ros_gateway.py`
+27 passed (21 baseline + 6 new, unchanged this round);
+`tests/test_gateway_simtime_deadlines.py` 7 passed, unaffected. No GPU boot
+for this diagnostic-only change.
+
+### Task #33 follow-up — gripper per-tick target parity publisher (bench round ahh)
+
+**Context, not a fix.** Bench round ahh showed a mid-close stall with
+`drive_joint` sitting at 0.341 rad while Isaac Lab's `data.applied_torque`
+echo stayed pinned at +2.5 -- consistent with either PhysX's own drive
+target already sitting near the measured position, or its stiffness/damping
+gains reading near zero, but nothing on the live bench had ever recorded
+the PhysX-side per-tick drive target to tell those two apart. Observability
+only -- no fix, no behaviour change.
+
+**New:** `/sim/parity/gripper_targets` (`sensor_msgs/JointState`, same
+reliable QoS and `TINKER_SIM_PARITY_TCP` env gate as the sibling parity
+topics, unconditional every `publish()` tick). For `drive_joint`,
+`left_finger_joint`, and `right_outer_knuckle_joint`
+(`PARITY_GRIPPER_TARGET_JOINTS` -- the drive, the pad readback #20's
+bounded-lead clamp already uses, and a mimic follower on the opposite side
+of the linkage), publishes nine `"<joint>/<field>"` names in `position`:
+`py_target` (`backend._position_targets`, Python's own commanded target),
+`lab_target` (`data.joint_pos_target`, Isaac Lab's actuator-model input
+buffer), `physx_target` (`root_view.get_dof_position_targets()`, the PhysX
+solver's own drive target -- the layer that had never been recorded),
+`physx_k`/`physx_d`/`physx_max_force`/`physx_max_vel` (the live PhysX
+gains/limits driving that target), `measured` (`data.joint_pos`), and
+`lab_applied_effort` (`data.applied_torque`). Plus `articulation/
+target_write` (1 if `step()`'s `TargetWriteGate` actually pushed changed
+targets to PhysX that tick, else 0 -- a repeated identical-target tick
+skips the write entirely, see `step()`'s `_write_targets` gate) and, if
+cheaply resolvable, `articulation/is_sleeping` (`get_physx_simulation_
+interface().is_sleeping(stage_id, prim_id)` on the articulation root,
+ids resolved once per `_refresh_robot_handles` rebind, never per tick --
+unverified against a live Kit process in this round, so a resolution
+failure at any point just omits the field entirely rather than publishing
+a placeholder).
+
+**Backend:** `IsaacWholeRobotBackend.parity_gripper_targets()` mirrors
+`validation/gripper_close_probe.py`'s existing `--arm-stream-hz` readback
+rows exactly (same `_read_physx_dof_param`/`_read_physx_position_targets`/
+`_read_lab_position_targets` sources, same one-call-per-parameter batching
+across all three joints via a new `_parity_read_dof_param` static helper --
+five PhysX view calls total per tick, not fifteen). Same two-flag fail-soft
+shape as `parity_gripper_torque`: any of the three joints unresolved, the
+PhysX view unavailable, or any read in the batch raising all return `None`
+(logged once), unlike the probe's own per-field NaN degradation -- this
+mirrors the OTHER parity publishers in this file (one bad read drops the
+whole tick) rather than mixing real and NaN values in one message. The
+gateway wraps its own publish call in a second try/except (log once, not
+per tick) so a message-construction failure on that side can't interrupt
+the `physics_truth` publish immediately after it either.
+
+**Per-tick cost (not measured on a live bench this round -- no GPU/Kit run
+in scope):** five small `(1, num_dofs)` PhysX tensor/array reads (one per
+parameter, batched across all three joints) plus four already-in-memory
+tensor slices (`_position_targets`/`joint_pos`/`joint_pos_target`/
+`applied_torque`) and one already-resolved `is_sleeping` call -- the same
+order of magnitude as the existing `parity_gripper_torque` publisher next
+to it (one PhysX view call), roughly 5x that call count. Expected to be a
+small fraction of the ~24 ms/physics-step budget measured for the
+sensor-rich profile (`sim-rtf-sensor-rich-baseline.md`); a live bench
+recording that confirms this is the follow-up.
+
+**Also this round (both fixed while reading the surrounding code, still
+observability only):**
+- `step_profile_snapshot()`'s `changed_targets` used to keep only the
+  top-8 most-changed `"<label>:<joint>"` keys by count. A low-traffic key
+  like `pos:drive_joint` (the gripper closes far less often than the arm
+  moves or the base drives) silently fell off that list whenever 8+ other
+  joints changed more in the same window -- exactly the blind spot the
+  mid-close stall investigation ran into. The key space is bounded by
+  construction (at most 3 labels x `num_joints`, reset every snapshot
+  call, never user-input-driven), so the cap is simply removed rather than
+  raised to an arbitrary larger number.
+- `_mirror_gripper_mimic_targets()`'s docstring claimed "robot.usd dropped
+  every `<mimic>`" as the reason the coupling is restored in software.
+  Review round 2 (2026-09-07): that claim conflated two different
+  readings and was corrected to be exactly what was measured, no more:
+  robot.usd authors `physxMimicJoint:rotX:*` attribute values (gearing
+  -1.0, referenceJoint drive_joint) on the five followers WITHOUT applying
+  `PhysxMimicJointAPI` in apiSchemas; the live Kit stage reports
+  `PhysxMimicJointAPI:rotX` among the applied schemas; in both readings
+  PhysX creates NO constraint (measured 2026-09-07: followers held at 0 ->
+  drive still closes; followers driven -> drive does not move). The
+  software mirror is the only coupling -- the operational conclusion is
+  unchanged, only the file-vs-runtime claim was corrected. A second,
+  near-identical claim in the `ImplicitActuatorCfg` comment block earlier
+  in `__init__` (`backend.py` ~1508-1511: "the URDF->USD import dropped
+  every `<mimic>`... no drive and no coupling") was deliberately left
+  as-is per this round's brief (only the one flagged location was in
+  scope), noted here for a follow-up pass.
+
+**Tests** (`tests/test_manipulation_runtime.py`): the readback against a
+scrambled (non-contiguous, includes a non-target joint) joint order with
+tracked PhysX getter stubs, proving indices resolve by name and every
+`get_dof_*` call fires exactly once (batched, not once per joint); a
+double lacking a PhysX view returns `None`; the gateway publishes the
+backend's `(names, values)` straight through with the tick's sim stamp;
+the gateway skips cleanly (no publish, no raise) when
+`TINKER_SIM_PARITY_TCP=0`, when the backend returns `None`, and when the
+backend's `parity_gripper_targets()` raises -- the last case logging
+exactly once across two ticks while `physics_truth` keeps publishing
+every tick regardless; and `step_profile_snapshot()` with 9 other joints
+changing every round and `drive_joint` changing once, proving all 10 keys
+(not 8) come through. Full suite under the same ROS-env pytest incantation
+as the round above: `tests/test_manipulation_runtime.py` 171 passed / 5
+subtests passed (165 baseline + 6 new); `tests/test_ros_gateway.py` /
+`tests/test_gateway_simtime_deadlines.py` unaffected (27 / 7 passed). No
+GPU boot for this diagnostic-only change.
+
+**Review round 2 (2026-09-07, live smoke on the round above): the
+publisher itself was bench-safe (29/29 names, gains 200/20/2.5/2.0 and
+1500/55/2.5/17453.29, 48.9 Hz wall at RTF 0.41, +0.5-0.8 ms/step, zero
+Python tracebacks) but `articulation/is_sleeping` resolved the WRONG
+prim.** `_resolve_articulation_sleep_ids` used `cfg.prim_path` itself
+(`/World/Tinker`, a plain Xform with no `PhysicsRigidBodyAPI`) -- the
+actual articulation/body root is `<prim_path>/base_link` (confirmed by
+the headless coupling probe, `$TMP/task33-coupling-test.md`, which called
+`get_physx_simulation_interface().is_sleeping(stage_id, prim_id)` on
+`/World/Tinker/base_link` successfully). Querying the wrong prim id
+produced a native `omni.physx.plugin [Error] Error executing isSleeping.`
+on EVERY tick in the live smoke -- 11,843 lines in one boot, a C++-level
+log Python's `except` cannot see at all -- while the field kept silently
+publishing 0. Fixed: `_resolve_articulation_sleep_ids` now resolves
+`<prim_path>/base_link` and only accepts it if `body_prim.HasAPI(
+UsdPhysics.RigidBodyAPI)` at resolve time; anything else (wrong prim,
+missing API, any exception) still omits the field rather than publishing
+a placeholder. Also added a one-time self-check: if `is_sleeping()`'s
+first successful return value isn't a real `bool`, the field disables
+itself for the rest of the backend's life (not just until the next
+rebind) and logs once, rather than silently coercing whatever came back
+through `bool(...)` every tick forever.
+
+Also this round: `articulation/target_write` used to latch right after
+the write GATE's decision (`_target_write_gate.should_write()`), before
+`write_data_to_sim()` had even been attempted -- so a swallowed
+`write_data_to_sim()` failure (the existing `_maybe_recover_simulation_view`
+path) would still publish `target_write=1` for a tick that never actually
+reached PhysX. `_last_target_write` is now reset `False` at the very top
+of `step()` (covering every return path, including the PHYSICS_READY
+rebind branch that never attempts a write at all) and only set `True`
+after `write_data_to_sim()` has returned without raising, so the
+published value means "PhysX actually received this tick's targets," not
+"the gate said yes." A one-line comment was also added at the `.numpy()`
+conversion in `_parity_read_dof_param` noting it relies on this backend's
+CPU physics pin (a CUDA tensor's `.numpy()` would raise into the batch
+except and darken the topic after one log line) -- no code change, this
+backend is CPU-physics-only today.
+
+The `_mirror_gripper_mimic_targets()` mimic-comment fix from the round
+above was further corrected to state exactly what was measured, no more
+(see the bullet above this one) -- the coordinator's review caught that
+the first pass's wording implied the shipped file itself carries the
+applied `PhysxMimicJointAPI` schema, which is the OPPOSITE of what the
+offline asset read found (attribute values authored, but the API not
+applied in the file; the API only shows up applied on the live Kit
+stage).
+
+Tests added to `tests/test_manipulation_runtime.py`: a real in-memory USD
+stage (`pxr.Usd.Stage.CreateInMemory()` -- this venv's bare `pxr` has
+`UsdPhysics` but no `PhysicsSchemaTools`, so only that one call is faked
+via `unittest.mock.patch`) with `base_link` carrying `RigidBodyAPI`
+resolves; without the API, omits; a fake `omni.physx` interface returning
+a non-`bool` from `is_sleeping()` disables the field after exactly one
+log line, and a second call confirms it stays disabled without calling
+the interface again; and `write_data_to_sim()` raising (swallowed by a
+stubbed `_maybe_recover_simulation_view`) leaves `_last_target_write`
+`False` even when a prior tick had left it `True`. Same ROS-env pytest
+incantation: `tests/test_manipulation_runtime.py` 174 passed / 5 subtests
+passed (171 baseline + 3 new); `tests/test_ros_gateway.py` /
+`tests/test_gateway_simtime_deadlines.py` unaffected (27 / 7 passed). No
+GPU boot for this diagnostic-only change (the wrong-prim finding above
+came from the coordinator's own live smoke, not a run in this round).
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping
