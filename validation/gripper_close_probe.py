@@ -361,6 +361,26 @@ if args.drive_effort_limit is not None:
     # 50 Nm cap (reuses the backend's own effort-limit writer + actuator-model
     # sync). This is the #20 sweep: quantify the clamp-normal force each object
     # geometry reaches as the drive ceiling rises.
+    #
+    # #33 caveat on OLDER runs of this flag: until the #33 fix, the backend's
+    # effort-limit path also authored physics:maxForce onto drive_joint's USD
+    # DriveAPI, and omni.physx's USD change listener answered that by
+    # re-creating the drive from the stage -- replacing the runtime gains
+    # (200/20) with the asset's authored drive, 35809.86 / 0.0 in PhysX radian
+    # units (robot.usd authors stiffness 625.0 in USD degree units, damping
+    # 0.0). This block runs BEFORE any later gain write, so which pre-fix runs
+    # are affected depends on what the run does next:
+    #   - default --mirror-mode target with 3-part configs: nothing rewrites
+    #     drive_joint's gains afterwards, so the whole close ran a ~180x-stiff,
+    #     zero-damping drive_joint. Those numbers are not comparable with runs
+    #     that leave the flag off.
+    #   - --mirror-mode central (below), or a 5-part config, whose run_close
+    #     calls set_follower_gains(..., drive_stiffness, drive_damping): those
+    #     rewrite drive_joint's k/d after the reversion. Whether that write
+    #     actually binds in PhysX was never measured, so treat those runs as
+    #     unknown rather than clean.
+    # Do NOT author USD drives from this probe either -- write the PhysX tensor
+    # view directly.
     backend._default_gripper_effort_limit = float(args.drive_effort_limit)
     backend._gripper_effort_limit_written = False
     backend._set_gripper_effort_limit(float(args.drive_effort_limit))
