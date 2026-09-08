@@ -336,6 +336,99 @@ def resolve_use_fabric(
     return use_fabric
 
 
+# Task #20 (gripper creep/retention): the hardware-scale torque-cap bracket
+# (validation/gripper_close_probe.py --drive-effort-limit/--follower-effort-
+# limit, $TMP/hwcap-result.md + hwcap2-result.md) swept drive+follower joint
+# effort limits at 1.5/2.0/2.5/3.0 N*m on a 15 s bottle side-pinch hold. 2.5
+# is the highest cap that HOLDS: drive target stays flat (no advance past the
+# contact point), tilt decays to ~0 deg, and the grasp survives lift (17.5 N
+# pad force at 2.5/2.5 vs the bracket's own 3.0/3.0 leg, which still creeps --
+# tilt to 16 deg by 15 s and drops on lift). This is the hardware mechanism,
+# not a workaround: a real position-controlled gripper stalls at its torque
+# limit instead of continuing to overhaul the servo target through the
+# object, which is what stopped the sim's PD from tipping the object along
+# the finger arc (the root cause behind every friction/material lever tried
+# and falsified earlier in #20 -- see docs/developer-log.md 2026-09-06). Pad
+# force at this cap (11-17 N) is still below the ~30 N hardware clamp; the
+# sim's contact model tips objects before that force is reachable without
+# creep (open item, docs/developer-log.md). Pin this to the user's measured
+# hardware clamp at commanded 10 N (native_gripper_max_effort) once available.
+GRIPPER_EFFORT_CEILING_NM = 2.5
+# GripperCommand.max_effort (N, hardware fingertip convention) full-scale
+# reference for the proportional map below. The manipulation stack's real
+# commands top out at 10 N (native_gripper_max_effort default used by both
+# the grasp close and the pre-open -- pick_and_place does not override it;
+# grasp_benchmark's pre-open sends 5 N; the bridge's own reopen sends 50 N),
+# confirmed by tracing gripper_facade.py's request.command.max_effort ->
+# JointState.effort passthrough (unmodified, no substitution) through
+# command_gateway.py's _owned_command projection (also unmodified) into
+# backend._apply_joint_command. 10 N is therefore "full commanded grip"
+# hardware-side and maps to the full GRIPPER_EFFORT_CEILING_NM; anything at
+# or above it (e.g. the bridge's 50 N reopen) saturates at the ceiling rather
+# than being read as an over-range request.
+GRIPPER_EFFORT_FULL_SCALE_N = 10.0
+
+
+def resolve_gripper_effort_ceiling_nm(value: str | None) -> float:
+    """Parse ``TINKER_SIM_GRIPPER_EFFORT_CEILING_NM`` (N*m, default
+    ``GRIPPER_EFFORT_CEILING_NM``). Unset/blank/non-finite/non-positive falls
+    back to the default rather than raising -- this is an operator tuning
+    knob, not a safety-relevant input like the spawn pose resolvers.
+    """
+    if value is None or not value.strip():
+        return GRIPPER_EFFORT_CEILING_NM
+    try:
+        ceiling = float(value)
+    except (TypeError, ValueError):
+        return GRIPPER_EFFORT_CEILING_NM
+    if not math.isfinite(ceiling) or ceiling <= 0.0:
+        return GRIPPER_EFFORT_CEILING_NM
+    return ceiling
+
+
+def resolve_gripper_effort_full_scale_n(value: str | None) -> float:
+    """Parse ``TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N`` (N, default
+    ``GRIPPER_EFFORT_FULL_SCALE_N``). Same fail-open semantics as
+    ``resolve_gripper_effort_ceiling_nm``.
+    """
+    if value is None or not value.strip():
+        return GRIPPER_EFFORT_FULL_SCALE_N
+    try:
+        full_scale = float(value)
+    except (TypeError, ValueError):
+        return GRIPPER_EFFORT_FULL_SCALE_N
+    if not math.isfinite(full_scale) or full_scale <= 0.0:
+        return GRIPPER_EFFORT_FULL_SCALE_N
+    return full_scale
+
+
+def gripper_effort_limit_nm(
+    commanded_n: float | None,
+    ceiling_nm: float,
+    full_scale_n: float,
+) -> float:
+    """Map a commanded ``GripperCommand.max_effort`` (N, fingertip) onto the
+    drive_joint effort-limit ceiling (N*m).
+
+    ``0``/unset/negative/non-finite all mean "no explicit limit requested",
+    which resolves to the full ceiling -- today's default behaviour (a bare
+    close/open with no effort field still gets the hardware-parity cap, not
+    zero authority). Anything else is scaled linearly against
+    ``full_scale_n`` and clamped to ``[0, ceiling_nm]``, so a command at or
+    above full scale saturates at the ceiling instead of over-shooting it.
+    """
+    if (
+        commanded_n is None
+        or not math.isfinite(commanded_n)
+        or commanded_n <= 0.0
+    ):
+        return ceiling_nm
+    scale = full_scale_n if full_scale_n > 0.0 else GRIPPER_EFFORT_FULL_SCALE_N
+    fraction = commanded_n / scale
+    fraction = max(0.0, min(1.0, fraction))
+    return ceiling_nm * fraction
+
+
 def _yaw_deg_from_quat_xyzw(quat_xyzw: Iterable[float]) -> float:
     qx, qy, qz, qw = (float(value) for value in quat_xyzw)
     return math.degrees(
@@ -560,7 +653,10 @@ class IsaacWholeRobotBackend:
 
     TRUTH_TOKEN = object()
     PHYSICS_TRUTH_SCHEMA_VERSION = 2
-    DEFAULT_GRIPPER_EFFORT_LIMIT = 80.0
+    # Historical name for the class-level default; now equal to the
+    # hardware-parity ceiling (#20) rather than an arbitrary 80 Nm cap. The
+    # per-instance value is env-overridable -- see __init__.
+    DEFAULT_GRIPPER_EFFORT_LIMIT = GRIPPER_EFFORT_CEILING_NM
     # The stopped arm uses one explicit actuator path.  These fixed gains are
     # intentionally sized for a five-physics-frame (5 / 120 s) stop: the
     # velocity term removes motion immediately, while the position term keeps
@@ -701,7 +797,15 @@ class IsaacWholeRobotBackend:
         self._pending_snapshot_count = 0
         self._pending_snapshot_index = 0
         self._pending_snapshot_commands: list[JointCommand] = []
-        self._default_gripper_effort_limit = self.DEFAULT_GRIPPER_EFFORT_LIMIT
+        # #20: env-overridable ceiling + full-scale for the commanded-effort
+        # -> joint-limit map (gripper_effort_limit_nm). See
+        # GRIPPER_EFFORT_CEILING_NM / GRIPPER_EFFORT_FULL_SCALE_N above.
+        self._default_gripper_effort_limit = resolve_gripper_effort_ceiling_nm(
+            os.environ.get("TINKER_SIM_GRIPPER_EFFORT_CEILING_NM")
+        )
+        self._gripper_effort_full_scale_n = resolve_gripper_effort_full_scale_n(
+            os.environ.get("TINKER_SIM_GRIPPER_EFFORT_FULL_SCALE_N")
+        )
         self._gripper_effort_limit = self._default_gripper_effort_limit
         # The first commanded limit always reaches PhysX; later identical
         # requests are no-ops (see _set_gripper_effort_limit).
@@ -1171,6 +1275,17 @@ class IsaacWholeRobotBackend:
                     joint_names_expr=["drive_joint"],
                     stiffness=200.0,
                     damping=20.0,
+                    # Hardware-parity torque ceiling (#20): must equal the
+                    # module constant GRIPPER_EFFORT_CEILING_NM (kept a
+                    # literal, not a name reference, so the config
+                    # construction test can read it via ast.literal_eval).
+                    # This is the config-time baseline the runtime effort map
+                    # (_set_gripper_effort_limit / gripper_effort_limit_nm)
+                    # overrides per commanded GripperCommand.max_effort; it
+                    # also seeds _default_gripper_effort_limit on first
+                    # articulation init (see the config-readback block after
+                    # the view rebuild).
+                    effort_limit_sim=2.5,
                 ),
                 # The gripper is a mimic linkage: the URDF mimics all five
                 # finger/knuckle joints to drive_joint 1:1, but the URDF->USD
@@ -1193,22 +1308,30 @@ class IsaacWholeRobotBackend:
                 # warm-start/Fabric parse path, so this control mirror is the
                 # permanent coupling.)
                 #
-                # effort_limit_sim caps the follower reaction. Unbounded, a
-                # follower pinned short of its target (e.g. the jaw closing onto
-                # the desk) pushes k*error ~= 1500*0.56 ~= 840, which overwhelms
-                # drive_joint's 0 lower limit and back-drives it to -0.57 (drops
-                # the object). The cap must sit below that ~840 so the drive's
-                # hard limit stays enforceable, yet above the DYNAMIC grip demand
-                # -- the static estimate (~45 = k*0.03 steady tracking) undershot
-                # badly (a cap of 80 saturated the followers under real contact,
-                # lag regressed to 0.11 rad and the 37 N squeeze was lost). 180
-                # restores the grip (measured) while staying ~4-5x below 840, so
-                # the limit holds and the coupling is preserved.
+                # effort_limit_sim caps the follower reaction. This used to be
+                # sized at 180 purely to keep drive_joint's own limit
+                # enforceable (a follower pinned short of its target pushes
+                # k*error ~= 1500*0.56 ~= 840, which back-drove drive_joint
+                # past its 0 lower limit and dropped the object unless the
+                # follower cap stayed a few times below that). #20's
+                # hardware-scale torque-cap bracket ($TMP/hwcap-result.md,
+                # hwcap2-result.md) found that reasoning was solving the
+                # wrong problem: 180 (and even a much lower cap of 5) is still
+                # high enough that the PD keeps authority to tip the grasped
+                # object along the finger arc instead of stalling like the
+                # real position-controlled gripper does at its torque limit.
+                # 2.5 N*m is the highest cap in the bracket that holds --
+                # drive target flat, tilt decaying to ~0, retained on lift --
+                # while a real hardware gripper's own clamp is torque-limited
+                # the same way. Kept a literal (must equal the module constant
+                # GRIPPER_EFFORT_CEILING_NM) so the config construction test
+                # can read it via ast.literal_eval; followers are config-only
+                # here, no runtime effort-limit write targets them.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
                     stiffness=1500.0,
                     damping=55.0,
-                    effort_limit_sim=180.0,
+                    effort_limit_sim=2.5,
                 ),
                 "casters": ImplicitActuatorCfg(
                     joint_names_expr=["rear_.*_swivel_joint", "rear_.*_wheel_joint"],
@@ -2286,10 +2409,17 @@ class IsaacWholeRobotBackend:
     def _set_gripper_effort_limit(self, requested: float) -> None:
         if not math.isfinite(requested) or requested < 0.0:
             raise ValueError("drive_joint effort limit must be finite and non-negative")
-        limit = (
-            self._default_gripper_effort_limit
-            if requested == 0.0
-            else min(requested, self._default_gripper_effort_limit)
+        # #20: requested is GripperCommand.max_effort (N, hardware fingertip
+        # convention), mapped proportionally onto the hardware-parity joint
+        # ceiling rather than passed through 1:1 -- see gripper_effort_limit_nm.
+        limit = gripper_effort_limit_nm(
+            requested,
+            self._default_gripper_effort_limit,
+            getattr(
+                self,
+                "_gripper_effort_full_scale_n",
+                GRIPPER_EFFORT_FULL_SCALE_N,
+            ),
         )
         index = self._joint_index.get("drive_joint")
         if index is None:
@@ -2329,7 +2459,178 @@ class IsaacWholeRobotBackend:
                 continue
             model_limits[:, local_index] = limit
         self._gripper_effort_limit = limit
-        self._gripper_effort_limit_written = True
+        # #20 cap5-analysis: write_joint_effort_limit_to_sim_index (above) and
+        # the actuator-model mirror only touch Isaac Lab-side buffers; the
+        # probe's direct PhysX max-force write/readback (on the instrumented
+        # gripper_close_probe branch, not this one) proved that is NOT
+        # sufficient proof the cap reaches the PhysX solver -- bit-identical
+        # 15 s hold physics
+        # was measured across cap 5 through cap 180 on the follower joints
+        # through this same writer alone. Re-assert the mapped limit straight
+        # on the PhysX tensor view, which is what actually binds the ceiling
+        # this method computes.
+        #
+        # #33: this used to ALSO author physics:maxForce onto drive_joint's USD
+        # DriveAPI. That is removed, and must not come back. Measured on bench
+        # round ahi (2026-09-08, per-tick PhysX readback): drive_joint's PhysX
+        # stiffness/damping held the configured 200/20 until the stack's first
+        # GripperCommand, and at that exact sample -- this method's first write,
+        # max_force 2.5 -> 1.25 -- flipped to 35809.86 / 0.0 and stayed there
+        # for the whole run. 35809.86/0 is the ASSET's drive: robot.usd authors
+        # PhysicsDriveAPI:angular stiffness 625.0 on /tinker_full/joints/
+        # drive_joint in USD degree units (625 * 180/pi = 35809.86 PhysX radian
+        # units) with damping 0.0. Applying a UsdPhysics.DriveAPI on the live
+        # prim makes omni.physx's USD change listener re-create the drive from
+        # the stage, discarding the runtime tensor-view gains Isaac Lab wrote
+        # from ImplicitActuatorCfg("gripper", stiffness=200, damping=20). A
+        # headless one-variable control confirmed it: with only the USD
+        # authoring no-op'd, the gains stayed 200/20 over 726 rows and
+        # get_dof_max_forces still read 1.25 then 2.5 -- the direct tensor-view
+        # write alone is sufficient for the cap. Nothing reading the Isaac Lab
+        # API could have seen this: data.joint_stiffness/joint_damping read
+        # 200/20 in BOTH legs (the Lab buffers are never re-synced), which is
+        # why it took a per-tick PhysX readback to find.
+        # Regression guard: tests/test_manipulation_runtime.py
+        # ::test_gripper_effort_limit_never_authors_usd_drive.
+        #
+        # #20 review: only latch _gripper_effort_limit_written once the direct
+        # PhysX write actually lands. If it raises, the
+        # _gripper_effort_limit_written dedup guard at the top of this method
+        # must NOT skip the next identical-effort command -- otherwise a write
+        # that silently failed once would never be retried.
+        physx_max_force, physx_write_ok = self._write_gripper_drive_physx_max_force(
+            index, limit
+        )
+        self._gripper_effort_limit_written = physx_write_ok
+        print(
+            json.dumps(
+                {
+                    "event": "gripper_effort_limit",
+                    "commanded_n": requested,
+                    "limit_nm": limit,
+                    "physx_max_force": physx_max_force,
+                    "physx_write_ok": physx_write_ok,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    def _write_gripper_drive_physx_max_force(
+        self, index: int, limit: float
+    ) -> tuple[list[float], bool]:
+        """Re-assert ``limit`` on drive_joint straight on the PhysX tensor
+        view (bypassing the Isaac Lab wrapper), then read the effective value
+        back off PhysX.
+
+        This tensor-view write is the whole mechanism: it is what makes the
+        computed ceiling bind in the solver, and #33's headless one-variable
+        control showed it is also *sufficient* on its own
+        (``get_dof_max_forces`` reads back the new cap with no USD involved).
+
+        #33: do NOT add USD ``DriveAPI``/``physics:maxForce`` authoring here.
+        It does not help the cap land, and it actively breaks the joint:
+        omni.physx's USD change listener re-creates drive_joint's drive from
+        the stage on any such edit, replacing the runtime gains Isaac Lab
+        wrote (200/20) with the asset's authored drive (35809.86 / 0.0 in
+        PhysX radian units, from robot.usd's degree-unit stiffness 625.0 and
+        damping 0.0) -- measured on bench round ahi at the first
+        ``_set_gripper_effort_limit`` call, and invisible from the Isaac Lab
+        buffers, which keep reading 200/20.
+
+        The deleted helper's stated rationale -- carrying the runtime ceiling
+        through a stage re-parse / actuator reconstruction -- is already
+        covered without touching USD: ``_set_gripper_effort_limit``'s
+        actuator-model mirror updates the owning ImplicitActuator's own
+        ``effort_limit`` tensor, which is what Isaac Lab re-applies on
+        reset/reinit (issue #128). So there is no reset-persistence argument
+        for re-adding the USD write.
+
+        Ported from the direct PhysX max-force write/readback in
+        validation/gripper_close_probe.py on the instrumented probe branch
+        (#20 hwcap probes; that helper is not on this branch).
+        ``set_dof_max_forces``
+        takes the FULL per-joint row, not a sparse column, so this clones the
+        current row, patches only ``index``, and pushes the whole row back --
+        using warp arrays for both payload and indices, per the Task #12
+        precedent (RigidBodyView tensor-API writes need WARP arrays, not
+        torch, to land).
+
+        Returns ``(physx_max_force_row, ok)``. ``ok`` is False if the direct
+        PhysX write raised (the Isaac Lab-side write already issued above
+        stays in place, so it degrades to the pre-#20 behaviour); the caller
+        must NOT latch ``_gripper_effort_limit_written`` when ``ok`` is
+        False, so the next identical-effort command retries the write rather
+        than silently dedup-skipping forever. Under
+        ``TINKER_SIM_STRICT_PHYSX_WRITES=1`` the exception is re-raised
+        instead of being swallowed, for callers that would rather fail loud.
+        """
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        setter = getattr(root_view, "set_dof_max_forces", None) if root_view is not None else None
+        physx_write_ok = True
+        if setter is not None:
+            try:
+                import warp as wp
+
+                # #20 review: wp.from_torch does NOT lazily initialize the
+                # Warp runtime -- it reads
+                # warp._src.context.runtime.cpu_device directly and raises
+                # AttributeError if Warp hasn't been initialized in-process
+                # yet (e.g. a gripper command issued before the first
+                # physics step, ahead of the fused-actuator path that would
+                # otherwise have self-init'd it). wp.array(...) DOES
+                # self-init, per the Task #12 warp-array fix
+                # (set_entity_pose_physics, above) -- build the payload the
+                # same way here rather than via wp.from_torch, and also
+                # force init explicitly (idempotent) as a second guard.
+                wp.init()
+
+                full = self._robot.data.joint_effort_limits.clone()
+                full[0, index] = float(limit)
+                full_cpu = full.detach().to(
+                    device="cpu", dtype=self._torch.float32
+                ).contiguous()
+                forces_wp = wp.array(
+                    full_cpu.numpy(), dtype=wp.float32, device="cpu"
+                )
+                indices_wp = wp.array([0], dtype=wp.int32, device="cpu")
+                setter(forces_wp, indices=indices_wp)
+            except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+                physx_write_ok = False
+                print(
+                    json.dumps(
+                        {
+                            "event": "gripper_physx_max_force_write_error",
+                            "level": "warning",
+                            "error": str(error)[:160],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                if os.environ.get("TINKER_SIM_STRICT_PHYSX_WRITES") == "1":
+                    raise
+        return self._read_gripper_drive_physx_max_force(index), physx_write_ok
+
+    def _read_gripper_drive_physx_max_force(self, index: int) -> list[float]:
+        root_view = getattr(self._robot, "root_view", None) or getattr(
+            self._robot, "root_physx_view", None
+        )
+        getter = getattr(root_view, "get_dof_max_forces", None) if root_view is not None else None
+        if getter is None:
+            return [float("nan")]
+        try:
+            forces = getter()
+            arr = forces.numpy() if hasattr(forces, "numpy") else forces
+            return [float(arr[0][index])]
+        except Exception as error:  # pragma: no cover - defensive, PhysX API surface
+            print(
+                json.dumps({"gripper_physx_max_force_read_error": str(error)[:160]}),
+                flush=True,
+            )
+            return [float("nan")]
 
     def command_joints(self, command: JointCommand) -> bool:
         if self._safety_stopped:
