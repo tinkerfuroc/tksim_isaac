@@ -4,6 +4,83 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-08 — Task #33: the gripper's own effort-limit write silently reverted drive_joint's PhysX gains
+
+**Finding.** On the grasp bench, `drive_joint` was not running the gains the
+sim configures. Isaac Lab builds it from
+`ImplicitActuatorCfg("gripper", stiffness=200, damping=20)`, and that is what
+PhysX held — right up until the stack sent its first `GripperCommand`. From
+that moment on the joint ran at stiffness 35809.86 with damping 0.0, for the
+rest of the run. Every #33 clamp measurement taken after the first gripper
+packet was therefore taken on a ~180x-stiff, completely undamped drive joint.
+
+**Measurement 1 — bench round ahi (per-tick PhysX readback).** The instrument
+built for this round reads `stiffness`/`damping`/`max_force` straight off the
+PhysX articulation view every control tick, rather than off the Isaac Lab
+buffers. It shows 200/20 on `drive_joint` for the whole pre-command window;
+at the exact sample where `_set_gripper_effort_limit` performs its first
+write (`max_force` 2.5 -> 1.25) the pair becomes 35809.86 / 0.0 and never
+returns. The mimic followers (`left_finger_joint`,
+`right_outer_knuckle_joint`) stay at 1500/55 throughout — only `drive_joint`
+moves.
+
+Where 35809.86/0 comes from: the asset. `artifacts/robot/tinker2/347aef…/
+robot.usd` authors a `PhysicsDriveAPI:angular` on
+`/tinker_full/joints/drive_joint` with stiffness 625.0 in USD *degree* units
+(625 * 180/pi = 35809.86 in PhysX radian units), damping 0.0, maxForce 50 and
+maxJointVelocity 114.59 deg/s (= 2.0 rad/s). The follower joints carry no
+DriveAPI at all in the asset, which is exactly why they were untouched — and
+the tell that the reverted values were being re-read from the stage rather
+than computed by anything at runtime.
+
+**Measurement 2 — headless one-variable control.** Two headless legs,
+identical but for one line. Leg A calls `backend._set_gripper_effort_limit(5.0)`
+as shipped: the PhysX gains flip to 35809.86/0 *inside the call*, before any
+physics step is taken. Leg B replaces only
+`backend._author_gripper_drive_usd_max_force` with a no-op: the gains stay
+200/20 across 726 sampled rows, and `get_dof_max_forces` still reads 1.25 and
+then 2.5 — so the direct tensor-view write (`set_dof_max_forces`) alone is
+sufficient to make the cap bind, and the USD authoring buys nothing.
+
+**Mechanism.** `_author_gripper_drive_usd_max_force` applied a
+`UsdPhysics.DriveAPI` (both the "angular" and "linear" instances) on
+`drive_joint`'s live prim and authored `physics:maxForce` on it. omni.physx
+keeps a USD change listener on the stage; that edit makes it re-create the
+joint's drive *from the stage*, which discards the runtime tensor-view gains
+Isaac Lab had written and reinstates the asset's authored drive. Introduced
+by 67cd278 on the PR #20 branch; neither `dev` nor `main` ever carried it.
+
+**Why it hid for so long.** Isaac Lab's `data.joint_stiffness` and
+`data.joint_damping` read 200/20 in *both* legs of the control — the Lab-side
+buffers are never re-synced after omni.physx rebuilds the drive. Any check
+written against the Isaac Lab API, which is the natural place to look, would
+have reported the joint as correctly configured. Only a readback off the
+PhysX view could see it, which is why this needed the round-ahi instrument
+rather than another round of hypotheses.
+
+**Fix.** Delete the runtime USD authoring at the source: the helper and its
+call in `_write_gripper_drive_physx_max_force` are gone, and that method's
+docstring plus the `#20 cap5-analysis` comment block now record the measured
+facts — the tensor-view write is what binds the cap, USD authoring re-syncs
+the drive from the stage and reverts the gains — instead of asserting the USD
+write was required. The direct warp write, the Isaac Lab writer, the
+actuator-model mirror, the readback and the dedup/latch logic are unchanged,
+so the #20 effort-cap behaviour is otherwise intact.
+
+Regression guard: `tests/test_manipulation_runtime.py
+::test_gripper_effort_limit_never_authors_usd_drive` injects recording
+`omni.usd`/`pxr` doubles into `sys.modules` — neither is importable in the
+unit-test venv, so the old helper failed closed and no unit test ever
+exercised it — and asserts zero `DriveAPI` applications and zero
+`physics:maxForce` authoring while `set_dof_max_forces` still lands the
+mapped cap.
+
+**Caveat on prior numbers.** Any `validation/gripper_close_probe.py` run that
+passed `--drive-effort-limit` before this fix went through the reverting path,
+so its clamp figures describe a 35809.86/0 drive joint and are not comparable
+with runs that leave the flag off. Nothing was re-run for this change; it is
+code-only.
+
 ## 2026-09-06 — Task #20: gripper joint effort limits at hardware scale (2.5 N*m), commanded effort mapped onto that ceiling
 
 **The whole #20 chain, in brief.** The gripper's "creep" (an object tipping
