@@ -2893,18 +2893,43 @@ class IsaacWholeRobotBackend:
         self._gripper_effort_limit = limit
         # #20 cap5-analysis: write_joint_effort_limit_to_sim_index (above) and
         # the actuator-model mirror only touch Isaac Lab-side buffers; the
-        # probe (validation/gripper_close_probe.py _write_physx_max_forces_
-        # direct / _author_usd_max_force) proved that is NOT sufficient proof
-        # the cap reaches the PhysX solver -- bit-identical 15 s hold physics
+        # probe's direct PhysX max-force write/readback (on the instrumented
+        # gripper_close_probe branch, not this one) proved that is NOT
+        # sufficient proof the cap reaches the PhysX solver -- bit-identical
+        # 15 s hold physics
         # was measured across cap 5 through cap 180 on the follower joints
         # through this same writer alone. Re-assert the mapped limit straight
-        # on the PhysX tensor view and author it onto drive_joint's USD
-        # DriveAPI so the runtime ceiling this method computes actually binds.
+        # on the PhysX tensor view, which is what actually binds the ceiling
+        # this method computes.
+        #
+        # #33: this used to ALSO author physics:maxForce onto drive_joint's USD
+        # DriveAPI. That is removed, and must not come back. Measured on bench
+        # round ahi (2026-09-08, per-tick PhysX readback): drive_joint's PhysX
+        # stiffness/damping held the configured 200/20 until the stack's first
+        # GripperCommand, and at that exact sample -- this method's first write,
+        # max_force 2.5 -> 1.25 -- flipped to 35809.86 / 0.0 and stayed there
+        # for the whole run. 35809.86/0 is the ASSET's drive: robot.usd authors
+        # PhysicsDriveAPI:angular stiffness 625.0 on /tinker_full/joints/
+        # drive_joint in USD degree units (625 * 180/pi = 35809.86 PhysX radian
+        # units) with damping 0.0. Applying a UsdPhysics.DriveAPI on the live
+        # prim makes omni.physx's USD change listener re-create the drive from
+        # the stage, discarding the runtime tensor-view gains Isaac Lab wrote
+        # from ImplicitActuatorCfg("gripper", stiffness=200, damping=20). A
+        # headless one-variable control confirmed it: with only the USD
+        # authoring no-op'd, the gains stayed 200/20 over 726 rows and
+        # get_dof_max_forces still read 1.25 then 2.5 -- the direct tensor-view
+        # write alone is sufficient for the cap. Nothing reading the Isaac Lab
+        # API could have seen this: data.joint_stiffness/joint_damping read
+        # 200/20 in BOTH legs (the Lab buffers are never re-synced), which is
+        # why it took a per-tick PhysX readback to find.
+        # Regression guard: tests/test_manipulation_runtime.py
+        # ::test_gripper_effort_limit_never_authors_usd_drive.
         #
         # #20 review: only latch _gripper_effort_limit_written once the direct
-        # PhysX write actually lands. If it raises, the dedup guard above
-        # (L2178-2185) must NOT skip the next identical-effort command --
-        # otherwise a write that silently failed once would never be retried.
+        # PhysX write actually lands. If it raises, the
+        # _gripper_effort_limit_written dedup guard at the top of this method
+        # must NOT skip the next identical-effort command -- otherwise a write
+        # that silently failed once would never be retried.
         physx_max_force, physx_write_ok = self._write_gripper_drive_physx_max_force(
             index, limit
         )
@@ -2927,12 +2952,36 @@ class IsaacWholeRobotBackend:
         self, index: int, limit: float
     ) -> tuple[list[float], bool]:
         """Re-assert ``limit`` on drive_joint straight on the PhysX tensor
-        view (bypassing the Isaac Lab wrapper) and author it onto the USD
-        DriveAPI, then read the effective value back off PhysX.
+        view (bypassing the Isaac Lab wrapper), then read the effective value
+        back off PhysX.
 
-        Ported from validation/gripper_close_probe.py's
-        ``_write_physx_max_forces_direct`` / ``_author_usd_max_force`` /
-        ``_read_physx_max_forces`` (#20 hwcap probes). ``set_dof_max_forces``
+        This tensor-view write is the whole mechanism: it is what makes the
+        computed ceiling bind in the solver, and #33's headless one-variable
+        control showed it is also *sufficient* on its own
+        (``get_dof_max_forces`` reads back the new cap with no USD involved).
+
+        #33: do NOT add USD ``DriveAPI``/``physics:maxForce`` authoring here.
+        It does not help the cap land, and it actively breaks the joint:
+        omni.physx's USD change listener re-creates drive_joint's drive from
+        the stage on any such edit, replacing the runtime gains Isaac Lab
+        wrote (200/20) with the asset's authored drive (35809.86 / 0.0 in
+        PhysX radian units, from robot.usd's degree-unit stiffness 625.0 and
+        damping 0.0) -- measured on bench round ahi at the first
+        ``_set_gripper_effort_limit`` call, and invisible from the Isaac Lab
+        buffers, which keep reading 200/20.
+
+        The deleted helper's stated rationale -- carrying the runtime ceiling
+        through a stage re-parse / actuator reconstruction -- is already
+        covered without touching USD: ``_set_gripper_effort_limit``'s
+        actuator-model mirror updates the owning ImplicitActuator's own
+        ``effort_limit`` tensor, which is what Isaac Lab re-applies on
+        reset/reinit (issue #128). So there is no reset-persistence argument
+        for re-adding the USD write.
+
+        Ported from the direct PhysX max-force write/readback in
+        validation/gripper_close_probe.py on the instrumented probe branch
+        (#20 hwcap probes; that helper is not on this branch).
+        ``set_dof_max_forces``
         takes the FULL per-joint row, not a sparse column, so this clones the
         current row, patches only ``index``, and pushes the whole row back --
         using warp arrays for both payload and indices, per the Task #12
@@ -2995,7 +3044,6 @@ class IsaacWholeRobotBackend:
                 )
                 if os.environ.get("TINKER_SIM_STRICT_PHYSX_WRITES") == "1":
                     raise
-        self._author_gripper_drive_usd_max_force(limit)
         return self._read_gripper_drive_physx_max_force(index), physx_write_ok
 
     def _read_gripper_drive_physx_max_force(self, index: int) -> list[float]:
@@ -3015,38 +3063,6 @@ class IsaacWholeRobotBackend:
                 flush=True,
             )
             return [float("nan")]
-
-    def _author_gripper_drive_usd_max_force(self, limit: float) -> None:
-        """Author ``physics:maxForce`` on drive_joint's USD DriveAPI so a
-        stage re-parse (reset going back through actuator construction)
-        still carries the runtime ceiling; the tensor-API write above only
-        touches the live PhysX buffers. Best-effort, no-op outside a live
-        Isaac Sim stage (both imports fail closed in unit tests / headless
-        construction).
-        """
-        try:
-            import omni.usd
-            from pxr import Usd, UsdPhysics
-        except ImportError:
-            return
-        stage = omni.usd.get_context().get_stage()
-        if stage is None:
-            return
-        robot_prim_path = str(
-            getattr(getattr(self._robot, "cfg", None), "prim_path", "") or "/World/Tinker"
-        )
-        robot_prim = stage.GetPrimAtPath(robot_prim_path)
-        if not robot_prim.IsValid():
-            return
-        for prim in Usd.PrimRange(robot_prim):
-            if prim.GetName() != "drive_joint":
-                continue
-            for instance in ("angular", "linear"):
-                try:
-                    drive = UsdPhysics.DriveAPI.Apply(prim, instance)
-                    drive.CreateMaxForceAttr(float(limit))
-                except Exception:  # pragma: no cover - defensive, schema surface
-                    pass
 
     def command_joints(self, command: JointCommand) -> bool:
         if self._safety_stopped:
