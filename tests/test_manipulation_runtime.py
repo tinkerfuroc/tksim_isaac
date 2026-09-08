@@ -69,6 +69,90 @@ class _FakeGripperRootView:
         return [list(self._row)]
 
 
+class _FakeUsdPrim:
+    """Minimal USD prim double: enough surface for the stage walk that the
+    (removed) runtime DriveAPI authoring performed -- GetName / IsValid.
+    """
+
+    def __init__(self, name: str, children: tuple["_FakeUsdPrim", ...] = ()) -> None:
+        self._name = name
+        self.children = children
+
+    def GetName(self) -> str:  # noqa: N802 - mirrors the pxr API spelling
+        return self._name
+
+    def IsValid(self) -> bool:  # noqa: N802 - mirrors the pxr API spelling
+        return True
+
+
+class _FakeUsdStage:
+    def __init__(self, root: _FakeUsdPrim) -> None:
+        self._root = root
+        self.get_prim_at_path_calls: list[str] = []
+
+    def GetPrimAtPath(self, path: str) -> _FakeUsdPrim:  # noqa: N802
+        self.get_prim_at_path_calls.append(str(path))
+        return self._root
+
+
+class _RecordingUsdModules:
+    """sys.modules doubles for ``omni.usd`` / ``pxr`` that RECORD every
+    ``UsdPhysics.DriveAPI.Apply`` and ``CreateMaxForceAttr`` call.
+
+    #33: omni.physx keeps a USD change listener on the stage; applying a
+    DriveAPI (or authoring physics:* on an existing one) makes it re-create
+    that joint's drive from the stage, discarding the runtime tensor-view
+    gains Isaac Lab wrote from ImplicitActuatorCfg. Measured on bench round
+    ahi: drive_joint's PhysX stiffness/damping flipped 200/20 -> 35809.86/0
+    (the asset's 625 deg-unit stiffness, 0 damping) at the first
+    _set_gripper_effort_limit write and stayed there. So the backend must
+    never touch the USD drive at runtime; these doubles let a unit test
+    assert that with no Isaac Sim in the process.
+    """
+
+    def __init__(self) -> None:
+        self.apply_calls: list[tuple[str, str]] = []
+        self.max_force_calls: list[tuple[str, float]] = []
+        self.drive_prim = _FakeUsdPrim("drive_joint")
+        self.root_prim = _FakeUsdPrim("tinker_full", (self.drive_prim,))
+        self.stage = _FakeUsdStage(self.root_prim)
+
+        recorder = self
+
+        class _FakeDrive:
+            def __init__(self, prim: _FakeUsdPrim, instance: str) -> None:
+                self._prim = prim
+                self._instance = instance
+
+            def CreateMaxForceAttr(self, value: float) -> object:  # noqa: N802
+                recorder.max_force_calls.append((self._instance, float(value)))
+                return SimpleNamespace(Set=lambda _value: None)
+
+        class _FakeDriveAPI:
+            @staticmethod
+            def Apply(prim: _FakeUsdPrim, instance: str) -> _FakeDrive:  # noqa: N802
+                recorder.apply_calls.append((prim.GetName(), str(instance)))
+                return _FakeDrive(prim, instance)
+
+        def _prim_range(prim: _FakeUsdPrim) -> tuple[_FakeUsdPrim, ...]:
+            return (prim,) + tuple(prim.children)
+
+        self.modules = {
+            "omni": SimpleNamespace(
+                usd=SimpleNamespace(
+                    get_context=lambda: SimpleNamespace(get_stage=lambda: self.stage)
+                )
+            ),
+            "omni.usd": SimpleNamespace(
+                get_context=lambda: SimpleNamespace(get_stage=lambda: self.stage)
+            ),
+            "pxr": SimpleNamespace(
+                Usd=SimpleNamespace(PrimRange=_prim_range),
+                UsdPhysics=SimpleNamespace(DriveAPI=_FakeDriveAPI),
+            ),
+        }
+
+
 class _FakeRobot:
     device = "cpu"
     num_base_dofs = 2
@@ -1042,6 +1126,77 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(effort_events[0]["limit_nm"], 1.25)
         self.assertAlmostEqual(effort_events[0]["physx_max_force"][0], 1.25)
         self.assertTrue(effort_events[0]["physx_write_ok"])
+        self.assertTrue(backend._gripper_effort_limit_written)
+
+    def test_gripper_effort_limit_never_authors_usd_drive(self) -> None:
+        """#33: _set_gripper_effort_limit must NEVER author drive_joint's USD
+        DriveAPI.
+
+        Measured, bench round ahi (2026-09-08, per-tick PhysX readback):
+        drive_joint's PhysX stiffness/damping were the configured 200/20 until
+        the stack's first GripperCommand; at that exact sample -- the first
+        _set_gripper_effort_limit write (max_force 2.5 -> 1.25) -- they became
+        35809.86 / 0.0 and stayed there for the rest of the run. 35809.86 is
+        the asset's own authored drive stiffness (robot.usd authors
+        PhysicsDriveAPI:angular stiffness 625.0 in USD degree units on
+        /tinker_full/joints/drive_joint; 625 * 180/pi = 35809.86 PhysX radian
+        units) with damping 0.0. The follower joints, which carry no DriveAPI
+        in the asset, kept 1500/55.
+
+        Mechanism: applying UsdPhysics.DriveAPI on the live prim and authoring
+        physics:maxForce makes omni.physx's USD change listener re-create the
+        drive from the stage, discarding the runtime tensor-view gains Isaac
+        Lab wrote from ImplicitActuatorCfg("gripper", stiffness=200,
+        damping=20). A headless one-variable control confirmed it: with the
+        USD authoring replaced by a no-op the gains held at 200/20 for 726
+        rows while get_dof_max_forces still read the new cap, so the direct
+        tensor-view write alone is sufficient. Isaac Lab's
+        data.joint_stiffness/joint_damping read 200/20 in BOTH legs (the Lab
+        buffers are not re-synced), so nothing reading the Lab API could see
+        the defect -- hence this test asserts on the USD surface directly.
+        """
+        backend = _backend()
+        backend._default_gripper_effort_limit = 2.5
+        backend._gripper_effort_full_scale_n = 10.0
+        root_view = backend._robot.root_view
+
+        # Pre-warm Warp so its one-time init banner cannot land in the
+        # captured window -- see the matching note on
+        # test_set_gripper_effort_limit_writes_direct_physx_max_force.
+        import warp as _wp
+
+        _wp.init()
+
+        usd = _RecordingUsdModules()
+        # omni.usd is not importable in this venv, so the pre-#33 authoring
+        # helper failed closed and never ran under unit test. Inject module
+        # doubles so a USD write WOULD be observable, then prove none happens.
+        with patch.dict(sys.modules, usd.modules):
+            with contextlib.redirect_stdout(io.StringIO()):
+                backend._set_gripper_effort_limit(5.0)
+
+        self.assertEqual(
+            usd.apply_calls,
+            [],
+            "_set_gripper_effort_limit must not apply UsdPhysics.DriveAPI at "
+            "runtime: omni.physx re-syncs the drive from the stage and reverts "
+            "drive_joint's PhysX gains to the asset's 35809.86/0 (bench ahi)",
+        )
+        self.assertEqual(
+            usd.max_force_calls,
+            [],
+            "_set_gripper_effort_limit must not author physics:maxForce on the "
+            "USD drive; the direct tensor-view write is what binds the cap",
+        )
+
+        # ...and the cap still lands on PhysX through the tensor view alone.
+        drive_index = backend._joint_index["drive_joint"]
+        self.assertEqual(len(root_view.set_dof_max_forces_calls), 1)
+        written = root_view.set_dof_max_forces_calls[0]["forces"]
+        self.assertAlmostEqual(float(written[0][drive_index]), 1.25)
+        self.assertAlmostEqual(
+            float(root_view.get_dof_max_forces()[0][drive_index]), 1.25
+        )
         self.assertTrue(backend._gripper_effort_limit_written)
 
     def test_set_gripper_effort_limit_physx_write_failure_does_not_latch_written(
