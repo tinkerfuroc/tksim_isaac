@@ -681,50 +681,6 @@ def _write_physx_max_forces_direct(ids: list[int], limit: float) -> None:
         print(json.dumps({"physx_max_force_write_error": str(error)[:160]}), flush=True)
 
 
-def _author_usd_max_force(ids: list[int], limit: float, event: str = "follower_usd_drive_authored") -> None:
-    """Author physics:maxForce on each targeted joint's UsdPhysics.DriveAPI
-    directly on the stage, in addition to the runtime tensor-API write, so a
-    stage re-parse (a reset that rebuilds the actuator from the USD prim)
-    still carries the cap. Best-effort: the follower joints are mimic joints
-    the importer dropped drives for, so a DriveAPI may not already be applied
-    -- Apply() creates it. Per-joint failures are logged, not fatal.
-    """
-    try:
-        import omni.usd
-        from pxr import Usd, UsdPhysics
-    except ImportError:
-        return
-    id_to_name = {index: name for name, index in JIDX.items()}
-    target_names = {id_to_name[i] for i in ids if i in id_to_name}
-    if not target_names:
-        return
-    stage = omni.usd.get_context().get_stage()
-    if stage is None:
-        return
-    robot_prim_path = str(getattr(getattr(backend._robot, "cfg", None), "prim_path", "") or "/World/Tinker")
-    robot_prim = stage.GetPrimAtPath(robot_prim_path)
-    if not robot_prim.IsValid():
-        return
-    authored, errors = [], []
-    for prim in Usd.PrimRange(robot_prim):
-        name = prim.GetName()
-        if name not in target_names:
-            continue
-        for instance in ("angular", "linear"):
-            try:
-                drive = UsdPhysics.DriveAPI.Apply(prim, instance)
-                drive.CreateMaxForceAttr(float(limit))
-                authored.append(f"{name}:{instance}")
-            except Exception as error:  # pragma: no cover - defensive, schema surface
-                errors.append(f"{name}:{instance}:{str(error)[:80]}")
-    print(json.dumps({
-        "event": event,
-        "requested": limit,
-        "authored": authored,
-        "errors": errors,
-    }), flush=True)
-
-
 def _patch_actuator_effort_limit_cache(ids: list[int], limit: float) -> None:
     """Mirror the PhysX effort-limit write into the owning ImplicitActuator's
     cached tensors -- the same workaround backend._set_gripper_effort_limit
@@ -758,16 +714,19 @@ def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower
     _set_gripper_effort_limit / _write_safety_effort_limit): PhysX
     write_joint_effort_limit_to_sim_index(limits=..., joint_ids=..., env_ids=...).
     Also patches the owning ImplicitActuator's cached effort_limit/
-    effort_limit_sim tensors in place, re-asserts the cap directly on the
-    PhysX tensor view (_write_physx_max_forces_direct) and authors it onto
-    each follower joint's USD DriveAPI (_author_usd_max_force) so a stage
-    re-parse would still carry it, and reads the effective limit back both
-    from Isaac Lab's data.joint_effort_limits and straight from PhysX
-    (get_dof_max_forces) for the event -- #20 evidence (bit-identical hold
-    physics at cap 5/50/100 vs cap-180) shows the write reaching the
-    tensor-API buffer is NOT sufficient proof it reaches the solver's actual
-    joint-drive force limit for these mimic joints; the physx_max_force
-    readback is what would catch that gap. A no-op unless
+    effort_limit_sim tensors in place and re-asserts the cap directly on the
+    PhysX tensor view (_write_physx_max_forces_direct); reads the effective
+    limit back both from Isaac Lab's data.joint_effort_limits and straight
+    from PhysX (get_dof_max_forces) for the event -- #20 evidence
+    (bit-identical hold physics at cap 5/50/100 vs cap-180) shows the write
+    reaching the tensor-API buffer is NOT sufficient proof it reaches the
+    solver's actual joint-drive force limit for these mimic joints; the
+    physx_max_force readback is what would catch that gap. Does NOT author a
+    UsdPhysics.DriveAPI on the follower joints -- the followers have no
+    DriveAPI in robot.usd, so authoring one creates a drive whose USD
+    stiffness/damping default to 0, and omni.physx's USD change listener
+    re-syncs the runtime gains from that stage edit, zeroing them (#33: the
+    same mechanism that reverted drive_joint's gains). A no-op unless
     --follower-effort-limit was passed.
     """
     if args.follower_effort_limit is None:
@@ -776,7 +735,6 @@ def apply_follower_effort_limit(emit_event: bool = False, event: str = "follower
     _write_gain("limits", "write_joint_effort_limit_to_sim_index", limit, mimic_ids)
     _write_physx_max_forces_direct(mimic_ids, limit)
     _patch_actuator_effort_limit_cache(mimic_ids, limit)
-    _author_usd_max_force(mimic_ids, limit)
     if emit_event:
         print(json.dumps({
             "event": event,

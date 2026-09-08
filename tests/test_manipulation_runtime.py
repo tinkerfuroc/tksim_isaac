@@ -1234,6 +1234,54 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         self.assertTrue(backend._gripper_effort_limit_written)
 
+    def test_probe_gripper_close_probe_never_authors_usd_drive(self) -> None:
+        """#33: validation/gripper_close_probe.py must not author a
+        UsdPhysics.DriveAPI on the follower joints either.
+
+        The follower joints (left_finger_joint, right_outer_knuckle_joint,
+        etc.) have NO DriveAPI in robot.usd at all -- unlike drive_joint,
+        which the fix above stopped re-authoring. Applying one at runtime
+        would create a drive whose USD stiffness/damping default to 0/0, and
+        omni.physx's USD change listener would re-sync the runtime gains from
+        that stage edit -- the same mechanism (measured on drive_joint, bench
+        round ahi) that reverted its gains to 35809.86/0, except here it
+        would zero the followers outright.
+
+        gripper_close_probe.py imports isaacsim at module load (see
+        tests/test_gripper_close_probe_arm_joints.py, which cannot import it
+        either), so this is a source-level check rather than an exercised
+        call path: the probe's source must not contain the call sites that
+        perform the authoring. The parenthesis is deliberate -- it matches
+        only an actual call (``UsdPhysics.DriveAPI.Apply(...)`` /
+        ``drive.CreateMaxForceAttr(...)``), not the bare API names that
+        legitimately appear in comments/docstrings describing why the probe
+        does NOT do this anymore.
+        """
+        probe_source = (ROOT / "validation" / "gripper_close_probe.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "DriveAPI.Apply(",
+            probe_source,
+            "gripper_close_probe.py must not apply a UsdPhysics.DriveAPI on "
+            "any joint -- the follower joints have no DriveAPI in the asset, "
+            "so authoring one and letting omni.physx re-sync from the stage "
+            "zeros their gains (#33 mechanism)",
+        )
+        self.assertNotIn(
+            "CreateMaxForceAttr(",
+            probe_source,
+            "gripper_close_probe.py must not author physics:maxForce on a "
+            "USD drive; the direct PhysX tensor-view write "
+            "(_write_physx_max_forces_direct) is what binds the cap",
+        )
+        self.assertNotIn(
+            "_author_usd_max_force",
+            probe_source,
+            "the USD-authoring helper must be removed entirely, not just "
+            "made unreachable",
+        )
+
     def test_set_gripper_effort_limit_physx_write_failure_does_not_latch_written(
         self,
     ) -> None:
