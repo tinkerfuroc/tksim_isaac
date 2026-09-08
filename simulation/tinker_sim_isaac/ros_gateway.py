@@ -18,6 +18,8 @@ from tinker_sim_core.command_mux import (
     decode_command_frame,
     decode_snapshot_packet,
 )
+from tinker_sim_core.observability import format_duration
+from tinker_sim_isaac.backend import pose_in_frame
 from tinker_sim_isaac.camera_rig import (
     camera_info_fields,
     depth_to_16uc1_mm,
@@ -114,7 +116,12 @@ class RosStandardGateway:
             qos_profile_sensor_data,
         )
         from rclpy.signals import SignalHandlerOptions
-        from geometry_msgs.msg import WrenchStamped
+        from geometry_msgs.msg import (
+            Point32,
+            PolygonStamped,
+            PoseStamped,
+            WrenchStamped,
+        )
         from rosgraph_msgs.msg import Clock
         from sensor_msgs.msg import Imu, JointState, PointCloud2, PointField
         from std_msgs.msg import Bool, String
@@ -135,7 +142,7 @@ class RosStandardGateway:
         self._safety_active = True
         self._safety_timeout_s = SAFETY_HEARTBEAT_TIMEOUT_S
         self._safety_last_sample_at: float | None = None
-        self.backend.set_safety_stop(True)
+        self.backend.set_safety_stop(True, reason="init")
         # Isaac does not mint or increment epochs.  The gateway owns the
         # session/generation token and Isaac adopts only a fresh session's
         # first snapshot after a safety-clear sample.
@@ -172,6 +179,9 @@ class RosStandardGateway:
         self._Bool = Bool
         self._String = String
         self._WrenchStamped = WrenchStamped
+        self._PoseStamped = PoseStamped
+        self._PolygonStamped = PolygonStamped
+        self._Point32 = Point32
         self.clock_pub = self.node.create_publisher(Clock, "/clock", reliable)
         self.joint_pub = self.node.create_publisher(
             JointState, "/isaac_joint_states", reliable
@@ -199,6 +209,68 @@ class RosStandardGateway:
         self.contact_pub = self.node.create_publisher(
             WrenchStamped, "/sim/parity/finger_contact", reliable
         )
+        # Task #35: backend-only TCP/pad-inner-face parity diagnostic, so the
+        # grasp bench can diff the sim's PHYSICAL tool-centre-point and pad
+        # faces against the ROS TF link_tcp in one recording. Default on;
+        # TINKER_SIM_PARITY_TCP=0 disables (e.g. a bench that only cares
+        # about /sim/parity/finger_contact).
+        self._parity_tcp_enabled = (
+            os.environ.get("TINKER_SIM_PARITY_TCP", "1") != "0"
+        )
+        self.tcp_pose_pub = None
+        self.tcp_pose_base_pub = None
+        self.pad_points_pub = None
+        self.wrist_camera_pose_pub = None
+        self.wrist_camera_pose_base_pub = None
+        self.gripper_physx_tau_pub = None
+        self.gripper_targets_pub = None
+        if self._parity_tcp_enabled:
+            self.tcp_pose_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/tcp_pose", reliable
+            )
+            self.tcp_pose_base_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/tcp_pose_base", reliable
+            )
+            self.pad_points_pub = self.node.create_publisher(
+                PolygonStamped, "/sim/parity/pad_points", reliable
+            )
+            # Task #36: same env gate as the TCP/pad parity above -- the
+            # grasp bench's ~15 mm constant base-x perception bias (two
+            # objects) is suspected to be a wrist-camera extrinsic mismatch,
+            # and this lets the bench diff the sim's ACTUAL rendered wrist
+            # colour optical-frame pose against the ROS TF
+            # xarm_camera_color_optical_frame/_aimed in one recording.
+            # Publishing itself is additionally fail-soft on self._camera_rig
+            # (None with cameras off, or a name/prim not yet resolved) --
+            # see publish().
+            self.wrist_camera_pose_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/wrist_camera_pose", reliable
+            )
+            self.wrist_camera_pose_base_pub = self.node.create_publisher(
+                PoseStamped, "/sim/parity/wrist_camera_pose_base", reliable
+            )
+            # Task #33: same env gate as the rest of this block -- the
+            # grasp bench needs the PhysX-MEASURED joint torque of the six
+            # gripper joints next to /isaac_joint_states' effort field
+            # (the Python actuator model's echo of its own command, not
+            # what PhysX actually delivered) to diagnose real clamp force.
+            # Fail-soft on backend.parity_gripper_torque() returning None --
+            # see publish().
+            self.gripper_physx_tau_pub = self.node.create_publisher(
+                JointState, "/sim/parity/gripper_physx_tau", reliable
+            )
+            # Task #33 follow-up (bench round ahh): a mid-close stall showed
+            # drive_joint sitting at 0.341 rad with Isaac Lab's effort echo
+            # pinned +2.5 while PhysX behaved as if its own drive target
+            # already equalled the measured position (or its gains were
+            # ~0) -- the per-tick PhysX target had never been recorded on a
+            # live bench. Same env gate/cadence as the rest of this block.
+            # Fail-soft on backend.parity_gripper_targets() returning None,
+            # or on any exception while building/publishing this message --
+            # see publish().
+            self.gripper_targets_pub = self.node.create_publisher(
+                JointState, "/sim/parity/gripper_targets", reliable
+            )
         self._camera_rig = camera_rig
         self.camera_skipped_frames = 0
         self._camera_streams: list[dict[str, Any]] = []
@@ -407,7 +479,13 @@ class RosStandardGateway:
             if node is not None:
                 node.get_logger().error(f"rejected safety-stop message: {error}")
 
-    def _apply_safety_stop(self, active: bool) -> None:
+    def _apply_safety_stop(self, active: bool, *, reason: str | None = None) -> None:
+        # Observability only (#33): the caller may name the trigger
+        # explicitly (e.g. the heartbeat-timeout path passes "safety_stale");
+        # otherwise this is a direct application of an /sim/hardware/safety_stop
+        # sample, so the default just says which value it carried.
+        if reason is None:
+            reason = "sample_true" if active else "sample_false"
         if not getattr(self, "_session_protocol_enabled", False):
             if active == self._safety_active:
                 return
@@ -415,7 +493,7 @@ class RosStandardGateway:
             self._command_epoch += 1
             if active:
                 self._last_snapshot_id = -1
-            self.backend.set_safety_stop(active)
+            self.backend.set_safety_stop(active, reason=reason)
             return
         if active:
             self._baseline_resync_until = None
@@ -433,14 +511,14 @@ class RosStandardGateway:
             )
             self._retire_command_epoch()
             self._last_snapshot_id = -1
-            self.backend.set_safety_stop(True)
+            self.backend.set_safety_stop(True, reason=reason)
             return
         self._safety_active = False
         self._arm_baseline_resynchronization()
         # A clear sample alone never releases the actuator hold.  A valid,
         # post-boundary command must arrive as well.
         if not getattr(self, "_command_stream_lost", False):
-            self.backend.set_safety_stop(False)
+            self.backend.set_safety_stop(False, reason=reason)
 
     def _retire_command_epoch(
         self, *, retire: bool = True, reset_snapshot: bool = True
@@ -525,7 +603,7 @@ class RosStandardGateway:
             # staging and restores the physical hold target.  This is the
             # rollback boundary for a backend without a stopped-state command
             # transaction API.
-            self.backend.set_safety_stop(True)
+            self.backend.set_safety_stop(True, reason="command_baseline_rejected")
             # set_safety_stop early-returns when the stop is already active,
             # so it cannot be relied on to drop staging on the abort path.
             self._discard_backend_snapshot_staging()
@@ -573,7 +651,7 @@ class RosStandardGateway:
             # The backend must be stopped throughout preflight.  begin_* may
             # stage packet ordering internally, so reset that staging before
             # the real commit pass below.
-            self.backend.set_safety_stop(True)
+            self.backend.set_safety_stop(True, reason="command_baseline_preflight")
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
                 self._validate_staged_command(staged_command)
@@ -590,7 +668,7 @@ class RosStandardGateway:
             # physics step can interleave with this single gateway turn, and
             # every failure path below restores the physical stop before the
             # command stream can be considered accepted.
-            self.backend.set_safety_stop(False)
+            self.backend.set_safety_stop(False, reason="command_baseline_commit")
             for staged_command, staged_snapshot, _ in packets_to_apply:
                 begin_snapshot(staged_snapshot)
                 _cj_t0 = time.perf_counter()
@@ -635,7 +713,10 @@ class RosStandardGateway:
                 else:
                     sessions.add(known_session)
                 self._retired_command_sessions = sessions
-        self.backend.set_safety_stop(True)
+        self.backend.set_safety_stop(
+            True,
+            reason="session_reset" if new_session else "command_epoch_retired",
+        )
         self._command_stream_lost = True
         self._command_loss_at = getattr(
             self, "_last_safety_clear_at", received_at
@@ -671,7 +752,7 @@ class RosStandardGateway:
         self._retire_command_epoch(retire=False, reset_snapshot=False)
         self._snapshot_baseline_pending = True
         self._snapshot_recovery_floor = self._last_logical_snapshot_id
-        self.backend.set_safety_stop(True)
+        self.backend.set_safety_stop(True, reason="command_stream_lost")
         self._last_command_error = "command stream expired"
 
     def _sim_receipt_time(self) -> float | None:
@@ -682,7 +763,14 @@ class RosStandardGateway:
         except (AttributeError, TypeError, ValueError):
             return None
 
-    def _sim_age_stale(self, received_sim_at: object, timeout: float) -> bool:
+    def _sim_age_stale(
+        self,
+        received_sim_at: object,
+        timeout: float,
+        *,
+        source: str = "unspecified",
+        wall_age: float | None = None,
+    ) -> bool:
         """Whether a receipt is also stale measured in *simulation* time.
 
         The heartbeat/command publishers run on wall clock in separate
@@ -700,13 +788,64 @@ class RosStandardGateway:
         expiry until stepping resumes is safe by construction.  Receipts
         with no simulation stamp (older tests, exotic backends) keep the
         wall-only behavior.
+
+        ``source`` and ``wall_age`` are observability only (#33): they name
+        the caller and its already-computed wall-clock age for the
+        ``sim_safety_stale`` log line; they never affect the return value.
         """
-        if received_sim_at is None:
-            return True
-        sim_now = self._sim_receipt_time()
-        if sim_now is None:
-            return True
-        return sim_now - float(received_sim_at) >= timeout
+        sim_age: float | None = None
+        if received_sim_at is not None:
+            sim_now = self._sim_receipt_time()
+            if sim_now is not None:
+                sim_age = sim_now - float(received_sim_at)
+        stale = sim_age is None or sim_age >= timeout
+        self._log_sim_age_stale(source, wall_age, sim_age, timeout, stale)
+        return stale
+
+    def _log_sim_age_stale(
+        self,
+        source: str,
+        wall_age: float | None,
+        sim_age: float | None,
+        timeout: float,
+        stale: bool,
+    ) -> None:
+        """Observability only (#33): announce a stale-receipt evaluation.
+
+        Rate-limited to at most one line per second per ``source`` while
+        ``stale`` stays ``True`` (the deadline checks run every spin, and a
+        genuinely dead publisher would otherwise print every spin for as
+        long as it stays dead). A stale -> fresh transition always gets one
+        line regardless of the window, so a recovery is never silently
+        swallowed; a loop that has never been stale for this source stays
+        silent. Must never raise: a log line cannot be the reason the
+        gateway loses its safety hold.
+        """
+        try:
+            node = getattr(self, "node", None)
+            get_logger = getattr(node, "get_logger", None)
+            if get_logger is None:
+                return
+            state = self._stale_log_state = getattr(self, "_stale_log_state", {})
+            entry = state.setdefault(source, {"was_stale": False, "last_log_at": None})
+            now = time.monotonic()
+            if stale:
+                last_log_at = entry["last_log_at"]
+                if last_log_at is not None and now - float(last_log_at) < 1.0:
+                    entry["was_stale"] = True
+                    return
+            elif not entry["was_stale"]:
+                return
+            get_logger().info(
+                f"sim_safety_stale source={source} "
+                f"wall_age_s={format_duration(wall_age)} "
+                f"sim_age_s={format_duration(sim_age)} "
+                f"timeout_s={format_duration(timeout)} stale={stale}"
+            )
+            entry["last_log_at"] = now
+            entry["was_stale"] = stale
+        except Exception:
+            return
 
     def _enforce_command_deadline(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -719,7 +858,10 @@ class RosStandardGateway:
         if last is None or now - last < timeout:
             return
         if not self._sim_age_stale(
-            getattr(self, "_last_command_received_sim_at", None), timeout
+            getattr(self, "_last_command_received_sim_at", None),
+            timeout,
+            source="command_stream",
+            wall_age=now - last,
         ):
             return
         self._enter_command_stream_lost(now)
@@ -733,13 +875,16 @@ class RosStandardGateway:
         if last is not None and now - last < timeout:
             return
         if last is not None and not self._sim_age_stale(
-            getattr(self, "_safety_last_sample_sim_at", None), timeout
+            getattr(self, "_safety_last_sample_sim_at", None),
+            timeout,
+            source="safety_heartbeat",
+            wall_age=None if last is None else now - last,
         ):
             return
         if self._safety_active:
             return
         try:
-            self._apply_safety_stop(True)
+            self._apply_safety_stop(True, reason="safety_stale")
             self._last_command_error = "safety heartbeat expired"
         except Exception as error:
             self._last_command_error = str(error)
@@ -1065,7 +1210,9 @@ class RosStandardGateway:
                 for staged_command, staged_snapshot, _ in packets_to_apply:
                     begin_snapshot(staged_snapshot)
                     if self._command_stream_lost:
-                        self.backend.set_safety_stop(False)
+                        self.backend.set_safety_stop(
+                            False, reason="command_stream_recovered"
+                        )
                         self._command_stream_lost = False
                     _cj_t0 = time.perf_counter()
                     accepted = self.backend.command_joints(staged_command)
@@ -1254,6 +1401,166 @@ class RosStandardGateway:
         contact.header.frame_id = "link_tcp"
         contact.wrench.force.z = float(force)
         self.contact_pub.publish(contact)
+        # Task #35: same cadence as physics_truth below (unconditional, every
+        # tick) -- a stride-gated sample would miss the transient tool-centre
+        # motion a grasp bench needs to diff against TF link_tcp. Fails soft:
+        # backend.parity_tcp_frame() returns None (and logs once) if
+        # link_tcp/left_finger/right_finger cannot be resolved this tick.
+        if self._parity_tcp_enabled:
+            parity_tcp = self.backend.parity_tcp_frame()
+            if parity_tcp is not None:
+                tcp_world = parity_tcp["tcp_pose_world"]
+                tcp_pose = self._PoseStamped()
+                tcp_pose.header.stamp = stamp
+                tcp_pose.header.frame_id = "world"
+                (
+                    tcp_pose.pose.position.x,
+                    tcp_pose.pose.position.y,
+                    tcp_pose.pose.position.z,
+                ) = tcp_world["xyz"]
+                (
+                    tcp_pose.pose.orientation.x,
+                    tcp_pose.pose.orientation.y,
+                    tcp_pose.pose.orientation.z,
+                    tcp_pose.pose.orientation.w,
+                ) = tcp_world["quaternion_xyzw"]
+                self.tcp_pose_pub.publish(tcp_pose)
+
+                tcp_base = parity_tcp["tcp_pose_base"]
+                tcp_pose_base = self._PoseStamped()
+                tcp_pose_base.header.stamp = stamp
+                tcp_pose_base.header.frame_id = "base_link"
+                (
+                    tcp_pose_base.pose.position.x,
+                    tcp_pose_base.pose.position.y,
+                    tcp_pose_base.pose.position.z,
+                ) = tcp_base["xyz"]
+                (
+                    tcp_pose_base.pose.orientation.x,
+                    tcp_pose_base.pose.orientation.y,
+                    tcp_pose_base.pose.orientation.z,
+                    tcp_pose_base.pose.orientation.w,
+                ) = tcp_base["quaternion_xyzw"]
+                self.tcp_pose_base_pub.publish(tcp_pose_base)
+
+                pad_points = self._PolygonStamped()
+                pad_points.header.stamp = stamp
+                pad_points.header.frame_id = "base_link"
+                pad_points.polygon.points = [
+                    self._Point32(x=float(x), y=float(y), z=float(z))
+                    for (x, y, z) in parity_tcp["pad_points_base"]
+                ]
+                self.pad_points_pub.publish(pad_points)
+            # Task #36: same gate/cadence as the TCP parity block above.
+            # Fails soft: self._camera_rig is None with cameras off, and
+            # camera_optical_pose_world() returns None (logged once) until
+            # the wrist camera's mount is resolved. The mount BODY's live
+            # pose comes from the backend's fabric-independent articulation
+            # tensors (same source parity_tcp_frame uses above), not a pxr
+            # prim read -- see camera_rig.CameraRig.camera_optical_pose_world.
+            if self._camera_rig is not None:
+                mount_body = self._camera_rig.mount_body_name("wrist_camera")
+                mount_body_pose = (
+                    self.backend.body_pose_world(mount_body)
+                    if mount_body is not None
+                    else None
+                )
+                wrist_camera_pose = self._camera_rig.camera_optical_pose_world(
+                    "wrist_camera", mount_body_pose
+                )
+                if wrist_camera_pose is not None:
+                    position, quaternion_wxyz = wrist_camera_pose
+                    quaternion_xyzw = (
+                        quaternion_wxyz[1],
+                        quaternion_wxyz[2],
+                        quaternion_wxyz[3],
+                        quaternion_wxyz[0],
+                    )
+                    camera_pose = self._PoseStamped()
+                    camera_pose.header.stamp = stamp
+                    camera_pose.header.frame_id = "world"
+                    (
+                        camera_pose.pose.position.x,
+                        camera_pose.pose.position.y,
+                        camera_pose.pose.position.z,
+                    ) = position
+                    (
+                        camera_pose.pose.orientation.x,
+                        camera_pose.pose.orientation.y,
+                        camera_pose.pose.orientation.z,
+                        camera_pose.pose.orientation.w,
+                    ) = quaternion_xyzw
+                    self.wrist_camera_pose_pub.publish(camera_pose)
+
+                    root = self.backend.root_state()
+                    root_quaternion_wxyz = root["quaternion_wxyz"]
+                    root_quaternion_xyzw = (
+                        root_quaternion_wxyz[1],
+                        root_quaternion_wxyz[2],
+                        root_quaternion_wxyz[3],
+                        root_quaternion_wxyz[0],
+                    )
+                    position_base, quaternion_base = pose_in_frame(
+                        root["position"],
+                        root_quaternion_xyzw,
+                        position,
+                        quaternion_xyzw,
+                    )
+                    camera_pose_base = self._PoseStamped()
+                    camera_pose_base.header.stamp = stamp
+                    camera_pose_base.header.frame_id = "base_link"
+                    (
+                        camera_pose_base.pose.position.x,
+                        camera_pose_base.pose.position.y,
+                        camera_pose_base.pose.position.z,
+                    ) = position_base
+                    (
+                        camera_pose_base.pose.orientation.x,
+                        camera_pose_base.pose.orientation.y,
+                        camera_pose_base.pose.orientation.z,
+                        camera_pose_base.pose.orientation.w,
+                    ) = quaternion_base
+                    self.wrist_camera_pose_base_pub.publish(camera_pose_base)
+            # Task #33: same gate/cadence as the TCP parity block above
+            # (unconditional, every physics-truth tick). Fails soft:
+            # backend.parity_gripper_torque() returns None (and logs once)
+            # if any gripper joint or the PhysX view's projected-forces call
+            # is unresolved this tick.
+            gripper_physx_tau = self.backend.parity_gripper_torque()
+            if gripper_physx_tau is not None:
+                names, positions, velocities, physx_tau = gripper_physx_tau
+                gripper_message = self._JointState()
+                gripper_message.header.stamp = stamp
+                gripper_message.name = list(names)
+                gripper_message.position = positions
+                gripper_message.velocity = velocities
+                gripper_message.effort = physx_tau
+                self.gripper_physx_tau_pub.publish(gripper_message)
+            # Task #33 follow-up (bench round ahh): same gate/cadence as the
+            # parity block above. backend.parity_gripper_targets() already
+            # fails soft (returns None, logs once, backend-side) if the
+            # target joints or a PhysX/Lab read is unresolved; this try
+            # additionally guards message construction/publish itself so a
+            # failure THERE can't propagate into the physics_truth publish
+            # below it either -- logged once, not per tick.
+            try:
+                gripper_targets = self.backend.parity_gripper_targets()
+                if gripper_targets is not None:
+                    names, values = gripper_targets
+                    targets_message = self._JointState()
+                    targets_message.header.stamp = stamp
+                    targets_message.name = list(names)
+                    targets_message.position = list(values)
+                    self.gripper_targets_pub.publish(targets_message)
+            except Exception as error:
+                if not getattr(self, "_gripper_targets_publish_error_logged", False):
+                    self._gripper_targets_publish_error_logged = True
+                    node = getattr(self, "node", None)
+                    get_logger = getattr(node, "get_logger", None)
+                    if get_logger is not None:
+                        get_logger().error(
+                            f"gripper_targets publish failed: {error}"
+                        )
         physics_truth = self._String()
         frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
         frame["command_gateway"] = {

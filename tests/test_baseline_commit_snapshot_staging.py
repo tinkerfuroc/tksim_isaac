@@ -164,7 +164,7 @@ class _StrictBackend(_StagingOnlyBackend):
         self.safety_stopped = True
         self.commands: list[object] = []
 
-    def set_safety_stop(self, active: bool) -> None:
+    def set_safety_stop(self, active: bool, reason: str | None = None) -> None:
         # Mirrors the real early return that makes the second
         # `set_safety_stop(True)` a no-op.
         if bool(active) == self.safety_stopped:

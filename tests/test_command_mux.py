@@ -259,5 +259,141 @@ class JointCommandMuxTest(unittest.TestCase):
         self.assertEqual(self.mux.compose(1.0)[0].positions, (0.4, -0.2))
 
 
+class JointCommandMuxStaleHoldLoggingTest(unittest.TestCase):
+    """#33 observability: the mux must announce a source's stale-hold
+    transitions through the standard `logging` module (it is a plain
+    library with no ROS handle of its own), rate-limited while the hold
+    continues. None of this changes a single composed packet -- see the
+    unchanged assertions in JointCommandMuxTest above for that guarantee.
+    """
+
+    LOGGER_NAME = "tinker_sim_core.command_mux"
+
+    def setUp(self) -> None:
+        self.mux = JointCommandMux(
+            {"gripper": CommandSource(frozenset({"drive_joint"}), 0.5)}
+        )
+
+    def test_fresh_to_stale_then_active_then_cleared(self) -> None:
+        self.mux.accept(
+            "gripper", JointCommand(("drive_joint",), positions=(0.83,)), 1.0
+        )
+        self.mux.observe_positions(("drive_joint",), (0.83,))
+
+        # First composition past the 0.5 s timeout: exactly one stale_hold
+        # record, no stale_hold_active yet.
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            self.mux.compose(1.6)
+        stale_hold_lines = [m for m in captured.output if "stale_hold " in m]
+        active_lines = [m for m in captured.output if "stale_hold_active" in m]
+        self.assertEqual(len(stale_hold_lines), 1)
+        self.assertEqual(len(active_lines), 0)
+        self.assertIn("source=gripper", stale_hold_lines[0])
+        self.assertIn("joints=drive_joint", stale_hold_lines[0])
+        self.assertIn("hold_pos=0.8300", stale_hold_lines[0])
+        self.assertIn("age_s=0.600", stale_hold_lines[0])
+        self.assertIn("clock=steady", stale_hold_lines[0])
+
+        # Recomposing 0.1 s later (still under the 1 s active-log period)
+        # must not add another line at all.
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(self.LOGGER_NAME, level="INFO"):
+                self.mux.compose(1.7)
+
+        # Once the active-log period elapses, exactly one rate-limited
+        # stale_hold_active record appears (not a stale_hold repeat).
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            self.mux.compose(2.7)
+        self.assertEqual(
+            len([m for m in captured.output if "stale_hold_active" in m]), 1
+        )
+        self.assertEqual(len([m for m in captured.output if "stale_hold " in m]), 0)
+
+        # A fresh accept clears the hold and logs its duration.
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            self.mux.accept(
+                "gripper", JointCommand(("drive_joint",), positions=(0.2,)), 3.0
+            )
+        cleared_lines = [m for m in captured.output if "stale_hold_cleared" in m]
+        self.assertEqual(len(cleared_lines), 1)
+        self.assertIn("source=gripper", cleared_lines[0])
+        self.assertIn("stale_for_s=1.400", cleared_lines[0])
+
+
+class JointCommandMuxStopLoggingTest(unittest.TestCase):
+    """#33 observability: stop() must announce each engage/release
+    transition and the measured positions it force-holds, exactly once per
+    transition (not once per stop()/compose() call).
+    """
+
+    LOGGER_NAME = "tinker_sim_core.command_mux"
+
+    def setUp(self) -> None:
+        self.mux = JointCommandMux(
+            {"base": CommandSource(frozenset({"left", "right"}), 0.25)}
+        )
+        self.mux.observe_positions(("left", "right"), (0.4, -0.2))
+
+    def test_engage_logs_held_positions_once(self) -> None:
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            self.mux.stop(True)
+        engaged = [m for m in captured.output if "mux_stop state=engaged" in m]
+        self.assertEqual(len(engaged), 1)
+        self.assertIn("held=left:0.4000 right:-0.2000", engaged[0])
+
+        # Calling stop(True) again while already engaged is a no-op and
+        # must not add another line.
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(self.LOGGER_NAME, level="INFO"):
+                self.mux.stop(True)
+
+    def test_release_logs_what_was_held(self) -> None:
+        self.mux.stop(True)
+
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            self.mux.stop(False)
+        released = [m for m in captured.output if "mux_stop state=released" in m]
+        self.assertEqual(len(released), 1)
+        self.assertIn("held=left:0.4000 right:-0.2000", released[0])
+
+    def test_release_without_a_prior_engage_is_a_silent_no_op(self) -> None:
+        """#33: stop(False) on a mux that was never engaged (safety_stop
+        already False) must not raise and must not log a "released" line --
+        there was nothing held to report releasing.
+        """
+        self.mux.stop(False)  # no prior stop(True)
+        self.assertFalse(self.mux.safety_stop)
+
+
+class JointCommandMuxStaleHoldClearedNoneToleranceTest(unittest.TestCase):
+    """#33: stale_hold_cleared must degrade to stale_for_s=n/a rather than
+    raising or fabricating a zero-length hold if the paired _stale_since
+    bookkeeping is ever missing when a fresh command arrives.
+    """
+
+    LOGGER_NAME = "tinker_sim_core.command_mux"
+
+    def test_missing_stale_since_degrades_to_n_a(self) -> None:
+        mux = JointCommandMux(
+            {"gripper": CommandSource(frozenset({"drive_joint"}), 0.5)}
+        )
+        mux.accept(
+            "gripper", JointCommand(("drive_joint",), positions=(0.83,)), 1.0
+        )
+        mux.observe_positions(("drive_joint",), (0.83,))
+        mux.compose(1.6)  # times out -> populates _stale_position_holds
+        # Simulate the bookkeeping gap this test exists to guard: the hold
+        # is present but its start time is not.
+        mux._stale_since.pop("gripper", None)
+
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            mux.accept(
+                "gripper", JointCommand(("drive_joint",), positions=(0.2,)), 3.0
+            )
+        cleared = [m for m in captured.output if "stale_hold_cleared" in m]
+        self.assertEqual(len(cleared), 1)
+        self.assertIn("stale_for_s=n/a", cleared[0])
+
+
 if __name__ == "__main__":
     unittest.main()
