@@ -1605,13 +1605,28 @@ class RosStandardGateway:
             _prof["n"] += 1
         self._tick += 1
 
+    def publish_reset_boundary(self) -> None:
+        """Publish restored joints and the new epoch through their sole owners."""
+        stamp = self._stamp()
+        clock = self._Clock()
+        clock.clock = stamp
+        self.clock_pub.publish(clock)
+        names, positions, velocities, efforts = self.backend.joint_state()
+        message = self._JointState()
+        message.header.stamp = stamp
+        message.name = list(names)
+        message.position = positions
+        message.velocity = velocities
+        message.effort = efforts
+        self.joint_pub.publish(message)
+
     def publish_cameras(self) -> None:
         """Publish one same-stamp color+depth+info set per camera.
 
         A camera whose annotator has no frame this tick is skipped and counted
         rather than fabricated; the counter keeps stalls observable.
         """
-        if self._camera_rig is None:
+        if getattr(self, "_scoped_reset_publishing", False) or self._camera_rig is None:
             return
         _prof = self._camera_profile if self._publish_profile_enabled else None
         _t = time.monotonic if _prof is not None else None
@@ -1885,6 +1900,9 @@ class RosStandardGateway:
         return message
 
     def close(self) -> None:
+        reset = getattr(self, "_scoped_reset", None)
+        if reset is not None:
+            reset.transport.close()
         if self._executor is not None:
             self._executor.shutdown()
             self._executor_thread.join(timeout=2.0)

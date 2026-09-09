@@ -2409,7 +2409,9 @@ class IsaacWholeRobotBackend:
         prior process's last published sample, matching hardware parity
         (real ROS time is wall-clock and never goes backward).
         """
-        return self.simulation_time + self._clock_epoch_s
+        return self.simulation_time + self._clock_epoch_s - getattr(
+            self, "_ros_reset_origin_s", 0.0
+        )
 
     @property
     def physics_frame_index(self) -> int:

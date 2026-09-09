@@ -55,11 +55,12 @@ class SafetySupervisor(Node):
     """
 
     REQUIRED_SOURCES = ("xarm", "collision")
-    OPTIONAL_SOURCES = ("operator",)
+    OPTIONAL_SOURCES = ("operator", "reset")
     SOURCES = {
         "xarm": "/sim/safety/xarm",
         "collision": "/sim/safety/collision",
         "operator": "/sim/safety/operator",
+        "reset": "/sim/safety/reset",
     }
 
     def __init__(self) -> None:
@@ -100,6 +101,7 @@ class SafetySupervisor(Node):
         self._management_ready = False
         self._startup_hold = True
         self._controller_active: bool | None = None
+        self._controller_state: str | None = None
         self._controller_was_active: bool | None = None
         self._restore_pending = False
         self._stop_episode_recorded = False
@@ -121,6 +123,9 @@ class SafetySupervisor(Node):
         )
         self._stop = self.create_publisher(
             Bool, "/sim/hardware/safety_stop", stop_qos
+        )
+        self._reset_ready_pub = self.create_publisher(
+            Bool, "/sim/safety/reset_ready", stop_qos
         )
         for name, topic in self.SOURCES.items():
             self.create_subscription(
@@ -243,11 +248,22 @@ class SafetySupervisor(Node):
         # consumer that misses this stream must assert its own stop.
         self._publish(active)
 
+    def _reset_is_ready(self) -> bool:
+        return (
+            self._sources.get("reset", False)
+            and self._management_ready and self._manage_controllers
+            and self._controller_state == "inactive"
+            and not self._switch_inflight
+        )
+
     def _publish(self, active: bool) -> None:
         message = Bool()
         message.data = active
         changed = active != self._published_stop
         self._stop.publish(message)
+        ready = Bool()
+        ready.data = self._reset_is_ready()
+        self._reset_ready_pub.publish(ready)
         if changed:
             # Observability only (#33): announce every value change, not
             # every republish (the 0.25 s heartbeat repeats the unchanged
@@ -312,11 +328,13 @@ class SafetySupervisor(Node):
         )
         if controller is None:
             self._controller_active = None
+            self._controller_state = None
             self.get_logger().warning(
                 f"configured controller is not listed: {self._controller}"
             )
             return
-        active = str(getattr(controller, "state", "")).lower() == "active"
+        self._controller_state = str(getattr(controller, "state", "")).lower()
+        active = self._controller_state == "active"
         self._controller_active = active
         if self._desired_stop and not self._stop_episode_recorded:
             # The initial fail-safe stop also needs an episode baseline.

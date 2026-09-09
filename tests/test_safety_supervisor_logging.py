@@ -66,6 +66,7 @@ def _supervisor(logger: _LogRecorder) -> SafetySupervisor:
     supervisor._controller_was_active = None
     supervisor._stop_episode_recorded = False
     supervisor._stop = _Recorder()
+    supervisor._reset_ready_pub = _Recorder()
     supervisor.get_logger = lambda: logger
     return supervisor
 

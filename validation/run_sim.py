@@ -905,6 +905,10 @@ def _enable_sim_control_services(app: Any, gateway: Any | None = None) -> None:
     """
     from isaacsim.core.utils.extensions import enable_extension
 
+    if gateway is not None:
+        from tinker_sim_isaac.scoped_reset import install_scoped_reset
+
+        install_scoped_reset(gateway)
     enable_extension("isaacsim.ros2.sim_control")
     app.update()
     if gateway is not None:

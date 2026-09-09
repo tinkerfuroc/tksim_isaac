@@ -39,7 +39,7 @@ def test_effective_stop_has_one_transient_local_publisher() -> None:
     assert safety.count('"/sim/hardware/safety_stop"') == 1
     assert "DurabilityPolicy.TRANSIENT_LOCAL" in safety
     assert 'REQUIRED_SOURCES = ("xarm", "collision")' in safety
-    assert 'OPTIONAL_SOURCES = ("operator",)' in safety
+    assert 'OPTIONAL_SOURCES = ("operator", "reset")' in safety
     assert "name: None for name in self.REQUIRED_SOURCES" in safety
     assert "self._sources.update({name: False for name in self.OPTIONAL_SOURCES})" in safety
     assert "SafetySourceTracker" in safety
@@ -197,7 +197,7 @@ def test_safety_does_not_clear_until_all_sources_are_initialized() -> None:
 
 def test_operator_source_is_optional_and_defaults_clear() -> None:
     safety = _source("safety_supervisor.py")
-    assert 'OPTIONAL_SOURCES = ("operator",)' in safety
+    assert 'OPTIONAL_SOURCES = ("operator", "reset")' in safety
     assert "self._sources.update({name: False for name in self.OPTIONAL_SOURCES})" in safety
     assert "REQUIRED_SOURCES" in safety
 
