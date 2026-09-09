@@ -4,6 +4,64 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-09 — /livox/imu was a stub: four defects in one small message
+
+Follow-up to the raycast lidar below, kept as a separate change because it is
+a separate concern.
+
+**What was wrong.** `/livox/imu` looked well-formed and was wrong four ways:
+
+1. `linear_acceleration` was never assigned, so it published `(0, 0, 0)`. That
+   is not a noise-free ideal reading. An accelerometer measures SPECIFIC FORCE,
+   `f = a - g`, so a stationary sensor reads ~`+9.81 m/s^2` along its
+   gravity-opposing axis; zero means freefall. FAST-LIO uses precisely this
+   vector to find "down" before it will initialise, which is why the tk26_sim
+   reference bothers to finite-difference an acceleration.
+2. The angular velocity came from `root_ang_vel_w` -- the WORLD frame -- while
+   the message was stamped `livox360`. On a planar base yawing about z the two
+   coincide, so it was accidentally correct for ordinary driving and wrong the
+   moment the robot pitched or rolled. That is why it survived this long.
+3. It was sampled at the articulation ROOT with no lever-arm term. A real IMU
+   0.195 m above the rotation centre feels centripetal and tangential
+   acceleration whenever the base turns.
+4. `angular_velocity_covariance` and `linear_acceleration_covariance` were left
+   all-zero, which by REP-145 means "unknown"; a consumer that trusts it reads
+   zero variance, i.e. a perfect sensor. (`orientation_covariance[0] = -1.0`
+   was already right and is kept -- the sim reports no orientation, as the real
+   driver does not.)
+
+**What it does now.** `simulation/tinker_sim_isaac/imu_model.py` holds the
+physics as pure functions -- no Isaac, no ROS import -- so specific force,
+frame rotation and the lever arm are unit-testable on their own.
+`backend.imu_state()` reads the simulator; the gateway assembles the message.
+
+The sample body is resolved by preference `livox_frame` then `base_link`,
+following the existing `_base_link_body_index` fail-soft pattern. When the
+import keeps `livox_frame` as a distinct body, PhysX reports ITS acceleration
+with the centripetal and tangential terms already included, so the lever arm is
+intrinsic and no manual `omega x (omega x r)` is applied; the explicit
+lever-arm path exists only for the welded case, using the URDF's livox_joint
+origin (0.09, 0, 0.195).
+
+Acceleration comes from `body_com_acc_w` (PhysX `get_link_accelerations()`),
+not from differencing velocity: differencing lags half a step and amplifies
+per-step solver jitter. A backend without that view falls back to a backward
+difference rather than publishing zeros, and the first sample of that fallback
+reports no acceleration rather than inventing one.
+
+**Deliberately NOT modelled: noise and bias.** A real ICM-40609 has both, but
+the simulator's value is determinism and the reference sim publishes a clean
+signal too. If FAST-LIO later needs realistic noise, it belongs in
+`imu_model.py` behind a spec flag, not smeared through the gateway.
+
+**Lesson repeated from the lidar change.** Several suites build the gateway
+with `object.__new__` to exercise `publish()` without a live backend, so every
+attribute the publish path reads must tolerate a skipped `__init__` -- hence
+the `getattr` defaults, matching how `_services_ready` is already read. The
+legacy `root_state` compatibility path likewise uses `.get` with defaults: a
+minimal test double supplied only the one field the old stub happened to read,
+and a missing field must degrade the sample, never raise inside `publish()`.
+
 ## 2026-09-09 — /livox/lidar becomes a real sensor: the PhysX raycast lidar
 
 **What was wrong.** `/livox/lidar` was never a sensor. `ros_gateway.

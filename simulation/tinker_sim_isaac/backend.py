@@ -5065,6 +5065,106 @@ class IsaacWholeRobotBackend:
             ),
         }
 
+    #: Bodies the IMU may be sampled from, best first. ``livox_frame`` is the
+    #: sensor's own URDF link: when the import keeps it as a distinct body,
+    #: PhysX reports its acceleration with the lever-arm terms already in it,
+    #: so no manual ``omega x (omega x r)`` is needed. The URDF importer welds
+    #: fixed-joint links onto their parent often enough that this cannot be
+    #: assumed, hence the ordered fallback.
+    IMU_BODY_PREFERENCE = ("livox_frame", "base_link")
+
+    def _imu_body_index(self) -> tuple[int | None, str]:
+        """``(body index, name)`` for the IMU's sample body.
+
+        ``(None, "root")`` when neither preferred body is resolvable -- the
+        caller then falls back to the articulation root, exactly as the
+        pre-existing IMU did, rather than failing a boot over a sensor.
+        """
+        try:
+            body_names = tuple(getattr(self._robot.data, "body_names", ()))
+        except AttributeError:
+            return None, "root"
+        for name in self.IMU_BODY_PREFERENCE:
+            if name in body_names:
+                return body_names.index(name), name
+        return None, "root"
+
+    def imu_state(self) -> dict[str, Any]:
+        """World-frame state for the ``/livox/imu`` sample.
+
+        Returns the sampled body's orientation, angular velocity, linear
+        acceleration and (when available) angular acceleration, all in the
+        world frame, plus which body they came from and whether the
+        acceleration is a real PhysX reading or a fallback.
+
+        The physics that turns this into a sensor-frame accelerometer and
+        gyro reading lives in ``tinker_sim_isaac.imu_model``; this method only
+        reads the simulator.
+        """
+        data = self._robot.data
+        index, body = self._imu_body_index()
+
+        if index is None:
+            quaternion_xyzw = tuple(
+                float(value)
+                for value in self._torch_value(data.root_quat_w)[0].detach().cpu()
+            )
+            angular = tuple(
+                float(value)
+                for value in self._torch_value(data.root_ang_vel_w)[0].detach().cpu()
+            )
+            linear_velocity = tuple(
+                float(value)
+                for value in self._torch_value(data.root_lin_vel_w)[0].detach().cpu()
+            )
+        else:
+            quaternion_xyzw = tuple(
+                float(value)
+                for value in self._torch_value(data.body_quat_w)[0, index].detach().cpu()
+            )
+            angular = tuple(
+                float(value)
+                for value in self._torch_value(data.body_ang_vel_w)[0, index].detach().cpu()
+            )
+            linear_velocity = tuple(
+                float(value)
+                for value in self._torch_value(data.body_lin_vel_w)[0, index].detach().cpu()
+            )
+
+        state: dict[str, Any] = {
+            "body": body,
+            "quaternion_wxyz": (
+                quaternion_xyzw[3],
+                quaternion_xyzw[0],
+                quaternion_xyzw[1],
+                quaternion_xyzw[2],
+            ),
+            "angular_velocity_world": angular,
+            "linear_velocity_world": linear_velocity,
+            "linear_acceleration_world": None,
+            "angular_acceleration_world": None,
+        }
+
+        # PhysX reports link accelerations directly. Preferred over
+        # differencing velocity, which lags half a step and amplifies solver
+        # jitter -- but the view is not guaranteed across physics backends, so
+        # a missing/short array is a soft miss and the gateway differences
+        # instead.
+        try:
+            accelerations = self._torch_value(data.body_com_acc_w)
+        except (AttributeError, RuntimeError, TypeError):
+            accelerations = None
+        if accelerations is not None and index is not None:
+            try:
+                spatial = accelerations[0, index].detach().cpu()
+                values = [float(value) for value in spatial]
+                if len(values) >= 6:
+                    state["linear_acceleration_world"] = tuple(values[0:3])
+                    state["angular_acceleration_world"] = tuple(values[3:6])
+            except (IndexError, RuntimeError, TypeError, ValueError):
+                pass
+        return state
+
     def contact_state(self) -> dict[str, dict[str, float | bool]]:
         state: dict[str, dict[str, float | bool]] = {
             name: {"in_contact": False, "force": 0.0}
