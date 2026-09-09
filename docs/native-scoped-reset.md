@@ -22,8 +22,13 @@ Successful standard spawn calls register new bodies without replacing existing
 baselines. Unregistered bodies and additional articulations outside the
 supported robot are rejected rather than assigned an invented initial state.
 
-The reset checks for a stationary robot and observes the arm and gripper action
-status publishers. An active action or an action arriving while establishing
+The reset observes commanded arm, gripper, pan/tilt and root poses over a
+0.25-second wall-clock window. Joint spans must remain within 0.0005 radians,
+root component spans within 0.0005 meters, and quaternion distance within
+0.0005. All measured positions and velocities must be finite. Passive caster
+rotation and noisy mimic-joint velocities do not establish commanded-arm
+motion; root-pose observation still detects actual base travel.
+The reset also observes arm and gripper action status publishers. An active action or an action arriving while establishing
 the stop rejects the reset before restoring physics. The scope is the idle
 manipulation qualification graph; active navigation or other external motion
 workflows are not qualified by this adapter.
@@ -79,7 +84,7 @@ not publish a stop clear.
 
 CPU evidence on 2026-09-09:
 
-- 98 focused reset, gateway, supervisor, provider bootstrap, and clock-deadline
+- 104 focused reset, gateway, supervisor, provider bootstrap, and clock-deadline
   tests passed under the Humble Python environment.
 - 181 backend runtime tests and 5 subtests passed under native Python 3.12,
   using bundled Humble message modules. These tests used CPU tensors and mocks,
@@ -115,3 +120,15 @@ capture without motion, and the normal fresh-capture planner response. Repeat
 pause/resume and reset qualification with the existing assertions unchanged.
 Check explicit rejection for active motion and preservation of an independent
 operator stop. CPU success alone does not establish any of these live results.
+
+The first native06 scope-3 attempt was rejected before stop assertion or state
+mutation with an idle-observation timeout. A read-only follow-up confirmed both
+action status publishers, terminal status 4 for their retained goals, and a
+clear effective stop. Over 33 samples in three wall seconds, arm joint spans
+were below 0.000009 radians and gripper spans below 0.000066 radians, while the
+left finger reported 0.041518 rad/s, an outer knuckle 0.029937 rad/s, and a
+passive rear wheel 0.025360 rad/s. The initial blanket 0.02 rad/s threshold
+therefore rejected this settled contact state. The pose-window revision has
+CPU regressions for those noise values and for actual slow joint/root motion.
+The existing native acceptance evaluator limits are unchanged. This failed
+attempt remains failed evidence; a new live scoped reset is required.

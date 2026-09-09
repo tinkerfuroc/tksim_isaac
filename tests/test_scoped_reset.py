@@ -363,3 +363,56 @@ def test_ros_transport_uses_only_its_reset_source_and_no_controller_client(monke
         if transport is not None:
             transport.close()
         rclpy.shutdown()
+
+
+def stationary_fixture():
+    names = [f"joint{i}" for i in range(1, 8)] + ["drive_joint", "pan_joint", "tilt_joint", "rear_wheel_joint", "left_finger_joint"]
+    root = {"position": (0., 0., 0.), "quaternion_wxyz": (1., 0., 0., 0.),
+            "linear_velocity_world": (0., 0., 0.), "angular_velocity_world": (0., 0., 0.)}
+    return names, [0.] * len(names), [0.] * len(names), root
+
+
+def test_stationary_window_accepts_contact_velocity_noise_and_passive_wheel_rotation():
+    from tinker_sim_isaac.scoped_reset import StationaryWindow
+    window = StationaryWindow()
+    names, positions, velocities, root = stationary_fixture()
+    velocities[7] = .02244
+    velocities[-1] = .041518
+    velocities[-2] = .02536
+    assert not window.observe(0., names, positions, velocities, root)
+    for tick in range(1, 6):
+        positions[7] = .00006 * (tick % 2)
+        positions[-2] += .001
+        stationary = window.observe(tick * .1, names, positions, velocities, root)
+    assert stationary
+
+
+@pytest.mark.parametrize("kind", ["joint", "root", "rotation", "nonfinite"])
+def test_stationary_window_rejects_actual_slow_displacement_or_invalid_measurement(kind):
+    from tinker_sim_isaac.scoped_reset import StationaryWindow
+    window = StationaryWindow()
+    names, positions, velocities, root = stationary_fixture()
+    assert not window.observe(0., names, positions, velocities, root)
+    if kind == "joint":
+        positions[0] = .001
+    elif kind == "root":
+        root["position"] = (.001, 0., 0.)
+    elif kind == "rotation":
+        root["quaternion_wxyz"] = (.99995, 0., 0., .01)
+    else:
+        velocities[0] = float("nan")
+    assert not window.observe(.3, names, positions, velocities, root)
+    assert window.reason != "stationary"
+
+
+def test_idle_timeout_reports_the_specific_unmet_observer_prerequisite():
+    from tinker_sim_isaac.scoped_reset import ResetTransport
+    transport = object.__new__(ResetTransport)
+    transport.timeout_s = 0.
+    transport.action_topics = ["arm", "gripper"]
+    transport.node = SimpleNamespace(count_publishers=lambda topic: 1)
+    transport.effective_stop = False
+    transport.reset_ready = False
+    transport.stationary_window = SimpleNamespace(reason="drive_joint measured span exceeds 0.0005")
+    with pytest.raises(ResetFailure, match="stationary observation=drive_joint measured span"):
+        asyncio.run(transport._wait(lambda: False, "idle observation"))

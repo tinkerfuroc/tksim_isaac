@@ -268,6 +268,73 @@ class PhysicsBaseline:
         backend._target_write_gate.force_next()
 
 
+
+class StationaryWindow:
+    """Detect a stable commanded posture despite contact-solver velocity noise."""
+
+    REQUIRED_JOINTS = tuple(f"joint{i}" for i in range(1, 8)) + ("drive_joint",)
+
+    def __init__(self):
+        from collections import deque
+        self.samples = deque()
+        self.reason = "collecting a stationary pose window"
+
+    def observe(self, now, names, positions, velocities, root):
+        import math
+
+        required = set(self.REQUIRED_JOINTS)
+        if not required.issubset(names) or len(positions) != len(names) or len(velocities) != len(names):
+            self.reason = "required measured joints are missing"
+            self.samples.clear()
+            return False
+        root_position = tuple(float(v) for v in root["position"])
+        quaternion = tuple(float(v) for v in root["quaternion_wxyz"])
+        values = (
+            list(positions) + list(velocities) + list(root_position) + list(quaternion)
+            + list(root["linear_velocity_world"]) + list(root["angular_velocity_world"])
+        )
+        if not all(math.isfinite(v) for v in values):
+            self.reason = "nonfinite measured joint or root state"
+            self.samples.clear()
+            return False
+        norm = math.sqrt(sum(v * v for v in quaternion))
+        if norm < 1e-12:
+            self.reason = "invalid root quaternion"
+            self.samples.clear()
+            return False
+        quaternion = tuple(v / norm for v in quaternion)
+        measured = dict(zip(names, positions))
+        monitored = self.REQUIRED_JOINTS + tuple(
+            name for name in ("pan_joint", "tilt_joint") if name in measured
+        )
+        pose = tuple(float(measured[name]) for name in monitored) + root_position
+        self.samples.append((float(now), pose, quaternion))
+        while len(self.samples) > 1 and self.samples[1][0] <= now - .25:
+            self.samples.popleft()
+        if now - self.samples[0][0] < .25:
+            self.reason = "collecting a 0.25 second stationary pose window"
+            return False
+        # Passive caster/wheel rotation and mimic-joint velocity noise do not
+        # establish arm motion. The root pose still detects actual base travel.
+        for index in range(len(pose)):
+            span = max(s[1][index] for s in self.samples) - min(s[1][index] for s in self.samples)
+            if span > .0005:
+                name = monitored[index] if index < len(monitored) else "root position"
+                self.reason = f"{name} measured span {span:.6g} exceeds 0.0005"
+                return False
+        reference = self.samples[0][2]
+        for _, _, current in self.samples:
+            distance = min(
+                math.sqrt(sum((a - b) ** 2 for a, b in zip(reference, current))),
+                math.sqrt(sum((a + b) ** 2 for a, b in zip(reference, current))),
+            )
+            if distance > .0005:
+                self.reason = f"root orientation distance {distance:.6g} exceeds 0.0005"
+                return False
+        self.reason = "stationary"
+        return True
+
+
 class ResetTransport:
     """ROS observation and the provider's one optional supervisor stop input."""
 
@@ -287,6 +354,7 @@ class ResetTransport:
         self.reset_ready = False
         self._reset_asserted_at = 0.0
         self._reset_ready_at = 0.0
+        self.stationary_window = StationaryWindow()
         self._Bool = Bool
         self.node = Node("tinker_scoped_reset")
         qos = QoSProfile(
@@ -340,11 +408,11 @@ class ResetTransport:
         self.publisher.publish(message)
 
     def _stationary(self):
-        import math
-        _, _, velocities, _ = self.gateway.backend.joint_state()
+        names, positions, velocities, _ = self.gateway.backend.joint_state()
         root = self.gateway.backend.root_state()
-        values = list(velocities) + list(root["linear_velocity_world"]) + list(root["angular_velocity_world"])
-        return all(math.isfinite(value) and abs(value) <= 0.02 for value in values)
+        return self.stationary_window.observe(
+            time.monotonic(), names, positions, velocities, root
+        )
 
     async def _wait(self, predicate, description, *, reject_action=False):
         deadline = time.monotonic() + self.timeout_s
@@ -360,7 +428,12 @@ class ResetTransport:
             else:
                 stable_since = None
             await asyncio.sleep(0.02)
-        raise ResetFailure(f"{description} timed out")
+        missing = [topic for topic in self.action_topics if self.node.count_publishers(topic) == 0]
+        raise ResetFailure(
+            f"{description} timed out; missing action publishers={missing}; "
+            f"effective stop={self.effective_stop}; reset ready={self.reset_ready}; "
+            f"stationary observation={self.stationary_window.reason}"
+        )
 
     async def idle(self):
         # Monitor from service startup, including retained action status.
