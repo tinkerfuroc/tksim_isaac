@@ -5620,7 +5620,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             [[0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.0]], dtype=torch.float32
         )
         backend._mirror_gripper_mimic_targets()
-        expected = 0.43 + 1.2 / 120.0  # measured angle + one control step of feed-forward
+        expected = 0.43  # measured angle; velocity is mirrored independently
         for index in backend._gripper_mimic_indices:
             self.assertAlmostEqual(
                 float(backend._position_targets[0, index]),
@@ -5635,6 +5635,26 @@ class ManipulationRuntimeTest(unittest.TestCase):
         backend._mirror_gripper_mimic_targets()
         for index in backend._gripper_mimic_indices:
             self.assertAlmostEqual(float(backend._position_targets[0, index]), 0.43, places=6)
+
+    def test_gripper_mimic_comoving_linkage_has_no_parasitic_pd_torque(self) -> None:
+        backend = object.__new__(IsaacWholeRobotBackend)
+        backend._torch = torch
+        backend.dt = 1.0 / 120.0
+        backend._drive_joint_index = 0
+        backend._gripper_mimic_indices = (1, 2)
+        backend._robot = SimpleNamespace(data=SimpleNamespace(
+            joint_pos=torch.tensor([[0.14, 0.14, 0.14, 0.7]]),
+            joint_vel=torch.tensor([[0.3, 0.3, 0.3, 0.2]])))
+        backend._position_targets = torch.tensor([[0.28, 0.0, 0.0, 0.7]])
+        backend._velocity_targets = torch.tensor([[0.0, 0.0, 0.0, 0.2]])
+        backend._mirror_gripper_mimic_targets()
+        data = backend._robot.data
+        torque = (1500.0 * (backend._position_targets - data.joint_pos)
+                  + 55.0 * (backend._velocity_targets - data.joint_vel))
+        self.assertTrue(torch.allclose(torque[0, 1:3], torch.zeros(2), atol=1e-5),
+                        f"Aligned moving linkage must not generate braking torque: {torque}")
+        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.28, places=6)
+        self.assertAlmostEqual(float(backend._velocity_targets[0, 3]), 0.2, places=6)
 
     def test_gripper_lead_clamp_defaults_off_with_measured_mirror(self) -> None:
         """With mimic-correct followers the press is bounded by drive_joint's

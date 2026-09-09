@@ -3899,10 +3899,12 @@ class IsaacWholeRobotBackend:
         before; the followers' 1500 gains now act as the linkage constraint,
         not as motors.
 
-        A one-step velocity feed-forward (q + qdot*dt) removes the followers'
-        control-step lag in steady motion; at stall qdot ~ 0 so the followers
-        hold exactly the drive's angle. getattr guards keep step() test doubles
-        happy.
+        Mirror both measured position and velocity. Damping acts on relative
+        linkage motion; a follower already moving with the master must not
+        brake toward zero velocity. Position-only prediction with a zero
+        velocity target generated -12.75 N*m of requested follower torque at
+        0.3 rad/s, even when the linkage was perfectly aligned. Do not add a
+        second position prediction on top of the measured velocity target.
         """
         drive_index = getattr(self, "_drive_joint_index", None)
         mimic_indices = getattr(self, "_gripper_mimic_indices", ())
@@ -3914,15 +3916,17 @@ class IsaacWholeRobotBackend:
             return
         try:
             follower_target = float(self._torch_value(joint_pos)[0, drive_index])
+            follower_velocity = 0.0
             joint_vel = getattr(data, "joint_vel", None)
             if joint_vel is not None:
-                follower_target += float(self._torch_value(joint_vel)[0, drive_index]) * float(
-                    getattr(self, "dt", 0.0)
-                )
+                follower_velocity = float(self._torch_value(joint_vel)[0, drive_index])
         except (IndexError, TypeError, ValueError):
             return
+        velocity_targets = getattr(self, "_velocity_targets", None)
         for index in mimic_indices:
             self._position_targets[0, index] = follower_target
+            if velocity_targets is not None:
+                velocity_targets[0, index] = follower_velocity
 
     def step(self) -> None:
         # Observability only (#33): published as "articulation/target_write"
