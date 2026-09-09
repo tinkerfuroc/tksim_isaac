@@ -1520,50 +1520,15 @@ class IsaacWholeRobotBackend:
                     # the view rebuild).
                     effort_limit_sim=2.5,
                 ),
-                # The gripper is a mimic linkage: the URDF mimics all five
-                # finger/knuckle joints to drive_joint 1:1, but the URDF->USD
-                # import dropped every <mimic> (in robot.usd these joints carry
-                # no drive and no coupling), so closing drive_joint left the
-                # fingers passive and the jaw closed straight through. These
-                # gains actively drive the joints, and step() mirrors
-                # drive_joint's target into them each step
-                # (_mirror_gripper_mimic_targets) so the parallelogram tracks
-                # the master 1:1 and grip force transmits to the pads. The 180
-                # deg frame flips the importer baked for the URDF's negative
-                # axes make a uniform +1 mirror correct for all five.
-                #
-                # Stiffness sized from the measured yield: at k=200 the
-                # followers lag 0.13-0.17 rad under an ~11.7 N grip (physics
-                # probe), which lets the object extrude; k~=1500 (7-8x) pulls
-                # that toward <=0.02 rad for a firm hold, damping ~sqrt(k)-scaled
-                # from the 200/20 baseline (20*sqrt(1500/200)~=55). (The rigid
-                # PhysxMimicJoint constraint is a proven dead end on this
-                # warm-start/Fabric parse path, so this control mirror is the
-                # permanent coupling.)
-                #
-                # effort_limit_sim caps the follower reaction. This used to be
-                # sized at 180 purely to keep drive_joint's own limit
-                # enforceable (a follower pinned short of its target pushes
-                # k*error ~= 1500*0.56 ~= 840, which back-drove drive_joint
-                # past its 0 lower limit and dropped the object unless the
-                # follower cap stayed a few times below that). #20's
-                # hardware-scale torque-cap bracket ($TMP/hwcap-result.md,
-                # hwcap2-result.md) found that reasoning was solving the
-                # wrong problem: 180 (and even a much lower cap of 5) is still
-                # high enough that the PD keeps authority to tip the grasped
-                # object along the finger arc instead of stalling like the
-                # real position-controlled gripper does at its torque limit.
-                # 2.5 N*m is the highest cap in the bracket that holds --
-                # drive target flat, tilt decaying to ~0, retained on lift --
-                # while a real hardware gripper's own clamp is torque-limited
-                # the same way. Kept a literal (must equal the module constant
-                # GRIPPER_EFFORT_CEILING_NM) so the config construction test
-                # can read it via ast.literal_eval; followers are config-only
-                # here, no runtime effort-limit write targets them.
+                # Native mimic constraints transmit the master's effort through
+                # the linkage. Followers have no independent position/velocity
+                # motor; their reaction forces are internal constraint forces.
+                # The imported gearing and joint references are retained, with
+                # compliance removed before the initial PhysX parse.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
-                    stiffness=1500.0,
-                    damping=55.0,
+                    stiffness=0.0,
+                    damping=0.0,
                     effort_limit_sim=2.5,
                 ),
                 "casters": ImplicitActuatorCfg(
@@ -1696,6 +1661,12 @@ class IsaacWholeRobotBackend:
         self.arena_friction_bound = self._apply_arena_friction_material()
         self.arena_surface_boxes = self._apply_arena_support_surface_colliders()
         self.gripper_friction_bound = self._apply_gripper_friction_material()
+        from tinker_sim_isaac.gripper_mimic import configure_gripper_mimic_constraints
+        self.gripper_native_mimic_count = configure_gripper_mimic_constraints(self._sim.stage)
+        if self.gripper_native_mimic_count != 5:
+            raise RuntimeError("Expected five authored native gripper mimic constraints")
+        print(json.dumps({"gripper_native_mimic_constraints": self.gripper_native_mimic_count,
+                          "compliance": "rigid", "follower_drives": "passive"}), flush=True)
         omni.kit.app.get_app().update()
         self._sim.reset()
         # Task #30 trace: the truth root pose the moment sim.reset() returns,
@@ -3861,72 +3832,6 @@ class IsaacWholeRobotBackend:
                 target = current  # optional hard cap: freeze on raw contact force
         self._position_targets[0, drive_index] = target
 
-    def _mirror_gripper_mimic_targets(self) -> None:
-        """Couple the five gripper mimic joints to drive_joint's MEASURED angle.
-
-        The xArm gripper is a single-DOF mechanism: one motor drives the left
-        outer knuckle; the right knuckle is gear-coupled to it, and each finger
-        rides a parallelogram (outer knuckle + inner knuckle) that keeps the pad
-        parallel. The URDF expresses this as ``<mimic joint="drive_joint"
-        multiplier="1">`` on all five follower joints (the finger joints on -x
-        axes, which the importer baked as 180 deg frame flips, so a uniform +1
-        mirror is kinematically right). Corrected 2026-09-07 (the prior
-        "robot.usd dropped every <mimic>" claim here was never actually
-        measured): robot.usd authors ``physxMimicJoint:rotX:*`` attribute
-        values (gearing -1.0, referenceJoint drive_joint) on the five
-        followers WITHOUT applying ``PhysxMimicJointAPI`` in apiSchemas; the
-        live Kit stage reports ``PhysxMimicJointAPI:rotX`` among the applied
-        schemas; in both readings PhysX creates NO constraint (measured
-        2026-09-07: followers held at 0 -> drive still closes; followers
-        driven -> drive does not move). The software mirror is the only
-        coupling.
-
-        URDF mimic semantics are ``q_follower = multiplier * q_drive`` -- the
-        driving joint's ACTUAL angle. Mirroring drive_joint's commanded TARGET
-        instead (the previous implementation) only agrees with that in free
-        motion; the moment the drive knuckle is blocked by an object the
-        followers keep chasing the far-away target as five independent
-        k=1500 motors: the right knuckle over-runs the stalled left one and
-        shoves the object into the weak pad, and the finger joints curl the
-        pads 0.2-0.4 rad about the finger axis (measured: 25 N vs 5 N pads,
-        12 deg bottle tilt; the bench's "pads close through to 0.728, 18 mm
-        past the knife" and the 200+ N first-contact spikes). Tracking the
-        measured angle makes a blocked knuckle stop the whole linkage, the
-        pinch symmetric, and drive_joint's actuator (its effort limit, i.e.
-        the facade's max_effort) the true grip-force bound. Measured on the
-        bench objects at the bench grasp poses: bottle 7/7 retained through
-        a lift (peak = hold ~20 N, tilt <= 6 deg) vs a hooked, tilted shove
-        before; the followers' 1500 gains now act as the linkage constraint,
-        not as motors.
-
-        Mirror both measured position and velocity. Damping acts on relative
-        linkage motion; a follower already moving with the master must not
-        brake toward zero velocity. Position-only prediction with a zero
-        velocity target generated -12.75 N*m of requested follower torque at
-        0.3 rad/s, even when the linkage was perfectly aligned. Do not add a
-        second position prediction on top of the measured velocity target.
-        """
-        drive_index = getattr(self, "_drive_joint_index", None)
-        mimic_indices = getattr(self, "_gripper_mimic_indices", ())
-        if drive_index is None or not mimic_indices:
-            return
-        data = getattr(self._robot, "data", None)
-        joint_pos = getattr(data, "joint_pos", None)
-        if joint_pos is None:
-            return
-        try:
-            follower_target = float(self._torch_value(joint_pos)[0, drive_index])
-            follower_velocity = 0.0
-            joint_vel = getattr(data, "joint_vel", None)
-            if joint_vel is not None:
-                follower_velocity = float(self._torch_value(joint_vel)[0, drive_index])
-        except (IndexError, TypeError, ValueError):
-            return
-        velocity_targets = getattr(self, "_velocity_targets", None)
-        for index in mimic_indices:
-            self._position_targets[0, index] = follower_target
-            if velocity_targets is not None:
-                velocity_targets[0, index] = follower_velocity
 
     def step(self) -> None:
         # Observability only (#33): published as "articulation/target_write"
@@ -3998,7 +3903,6 @@ class IsaacWholeRobotBackend:
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
         self._maybe_check_spawn_pose()
-        self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
         # persist until changed and this backend uses implicit (stateless)
