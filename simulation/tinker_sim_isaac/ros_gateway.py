@@ -19,6 +19,7 @@ from tinker_sim_core.command_mux import (
     decode_snapshot_packet,
 )
 from tinker_sim_core.observability import format_duration
+from tinker_sim_isaac import imu_model
 from tinker_sim_isaac.backend import pose_in_frame
 from tinker_sim_isaac.camera_rig import (
     camera_info_fields,
@@ -46,6 +47,18 @@ MAX_RETIRED_COMMAND_EPOCHS = 64
 # when the backend carries no occupancy map.  Finite and inside the 40 m lidar
 # bound so the qualification cloud consumer always receives a non-empty cloud.
 _FALLBACK_LIDAR_RANGE_M = 1.0
+#: Frame the Livox sensors publish in. Not a URDF link: the bridge launches own
+#: a static ``base_link -> livox360`` transform (see
+#: ros2_ws/src/tinker_sim_bridge/launch/navigation.launch.py), which is why the
+#: lidar and IMU share it.
+_LIVOX_FRAME_ID = "livox360"
+#: Declared by simulation/sensors/hardware-parity.json (imu.tick_rate_hz); the
+#: real Mid-360's internal IMU samples at 200 Hz.
+_DEFAULT_IMU_RATE_HZ = 200.0
+#: The URDF's ``livox_joint`` origin, base_link -> livox_frame. Used ONLY when
+#: the import welded that link onto its parent so the IMU has to be sampled
+#: from ``base_link`` and carry the lever arm by hand.
+_LIVOX_MOUNT_OFFSET_XYZ = (0.09, 0.0, 0.195)
 # Safety and command messages use separate ROS topics.  Tolerate only a short
 # bounded packet gap at that boundary; no packet is applied while resyncing.
 BASELINE_RESYNC_WINDOW_S = 0.25
@@ -105,6 +118,7 @@ class RosStandardGateway:
         development_lidar: bool = False,
         camera_rig: Any | None = None,
         lidar_rig: Any | None = None,
+        imu_rate_hz: float = _DEFAULT_IMU_RATE_HZ,
         camera_pointcloud: bool = False,
     ) -> None:
         import rclpy
@@ -374,7 +388,16 @@ class RosStandardGateway:
         if lidar_rig is not None:
             lidar_hz = float(lidar_rig.spec.tick_rate_hz)
         self._lidar_stride = max(1, round((1.0 / lidar_hz) / backend.dt))
-        self._imu_stride = max(1, round((1.0 / 200.0) / backend.dt))
+        # Declared by simulation/sensors/hardware-parity.json (imu.tick_rate_hz),
+        # matching the real Mid-360's 200 Hz internal IMU.
+        self._imu_stride = max(1, round((1.0 / imu_rate_hz) / backend.dt))
+        self._imu_sample_period_s = 1.0 / imu_rate_hz
+        self._imu_frame_id = _LIVOX_FRAME_ID
+        #: Only used when the URDF import welded `livox_frame` onto its
+        #: parent and the IMU is sampled from `base_link` instead; mirrors
+        #: the URDF's livox_joint origin.
+        self._imu_mount_offset = _LIVOX_MOUNT_OFFSET_XYZ
+        self._imu_previous_velocity: tuple[float, float, float] | None = None
         self._status_stride = max(1, round((1.0 / 2.0) / backend.dt))
         self._tick = 0
         # Opt-in wall-time attribution of publish() (TINKER_SIM_PROFILE=1,
@@ -1359,18 +1382,7 @@ class RosStandardGateway:
             self.joint_pub.publish(message)
         _lap("joint_state")
         if self._tick % self._imu_stride == 0:
-            state = self.backend.root_state()
-            message = self._Imu()
-            message.header.stamp = stamp
-            message.header.frame_id = "livox360"
-            message.orientation_covariance[0] = -1.0
-            angular = state["angular_velocity_world"]
-            (
-                message.angular_velocity.x,
-                message.angular_velocity.y,
-                message.angular_velocity.z,
-            ) = angular
-            self.imu_pub.publish(message)
+            self.imu_pub.publish(self._imu_message(stamp))
         _lap("imu")
         if self._cloud_publish_enabled():
             if getattr(self, "lidar_rig", None) is not None:
@@ -1790,6 +1802,103 @@ class RosStandardGateway:
             return bool(rig.frame_ready)
         return bool(self.development_lidar) and self._tick % self._lidar_stride == 0
 
+    def _imu_message(self, stamp):
+        """``/livox/imu`` from the sensor body's own state.
+
+        Replaces a stub that published a world-frame angular velocity stamped
+        ``livox360`` and left ``linear_acceleration`` unassigned -- i.e. an
+        accelerometer reading (0, 0, 0), which is permanent freefall rather
+        than the ~9.81 m/s^2 a level sensor reads at rest. FAST-LIO uses that
+        vector to find "down" before it will initialise.
+        """
+        message = self._Imu()
+        message.header.stamp = stamp
+        message.header.frame_id = getattr(self, "_imu_frame_id", _LIVOX_FRAME_ID)
+        # REP-145: negative first element = "no orientation from this sensor",
+        # which is also what the real driver reports.
+        message.orientation_covariance[0] = imu_model.ORIENTATION_UNAVAILABLE
+
+        state = self._imu_backend_state()
+        acceleration = state.get("linear_acceleration_world")
+        if acceleration is None:
+            # Backend exposes no acceleration view; difference the body's own
+            # velocity over the elapsed sim time instead of publishing zeros.
+            acceleration = imu_model.finite_difference_acceleration(
+                state["linear_velocity_world"],
+                getattr(self, "_imu_previous_velocity", None),
+                getattr(self, "_imu_sample_period_s", 1.0 / _DEFAULT_IMU_RATE_HZ),
+            )
+        self._imu_previous_velocity = state["linear_velocity_world"]
+
+        sample = imu_model.imu_sample(
+            quaternion_wxyz=state["quaternion_wxyz"],
+            angular_velocity_world=state["angular_velocity_world"],
+            linear_acceleration_world=acceleration,
+            angular_acceleration_world=state.get("angular_acceleration_world")
+            or (0.0, 0.0, 0.0),
+            lever_arm_world=self._imu_lever_arm_world(state),
+        )
+
+        (
+            message.angular_velocity.x,
+            message.angular_velocity.y,
+            message.angular_velocity.z,
+        ) = sample.angular_velocity
+        (
+            message.linear_acceleration.x,
+            message.linear_acceleration.y,
+            message.linear_acceleration.z,
+        ) = sample.linear_acceleration
+        # All-zero covariance reads as "unknown" (REP-145) and invites
+        # consumers to treat the signal as exact; declare a small one instead.
+        for axis in (0, 4, 8):
+            message.angular_velocity_covariance[axis] = (
+                imu_model.ANGULAR_VELOCITY_VARIANCE
+            )
+            message.linear_acceleration_covariance[axis] = (
+                imu_model.LINEAR_ACCELERATION_VARIANCE
+            )
+        return message
+
+    def _imu_backend_state(self):
+        """Backend IMU state, falling back to ``root_state`` on older backends."""
+        reader = getattr(self.backend, "imu_state", None)
+        if reader is not None:
+            return reader()
+        state = self.backend.root_state()
+        # `.get` with defaults, not `[]`: this is the compatibility path for
+        # backends that predate `imu_state`, including minimal test doubles
+        # that only supply the one field the old stub happened to read. A
+        # missing field must degrade the sample, never raise inside publish().
+        return {
+            "body": "root",
+            "quaternion_wxyz": state.get("quaternion_wxyz", (1.0, 0.0, 0.0, 0.0)),
+            "angular_velocity_world": state.get(
+                "angular_velocity_world", (0.0, 0.0, 0.0)
+            ),
+            "linear_velocity_world": state.get(
+                "linear_velocity_world", (0.0, 0.0, 0.0)
+            ),
+            "linear_acceleration_world": None,
+            "angular_acceleration_world": None,
+        }
+
+    def _imu_lever_arm_world(self, state):
+        """Sensor offset from the sampled body, rotated into the world frame.
+
+        Zero when the sampled body IS the sensor's link (``livox_frame``),
+        which is the normal case and the reason this is usually a no-op: PhysX
+        already reports that link's acceleration with the centripetal and
+        tangential terms in it. Non-zero only when the URDF import welded
+        ``livox_frame`` onto its parent and we are sampling ``base_link``.
+        """
+        if state.get("body") == "livox_frame":
+            return (0.0, 0.0, 0.0)
+        return imu_model.rotate_vector(
+            state["quaternion_wxyz"],
+            getattr(self, "_imu_mount_offset", _LIVOX_MOUNT_OFFSET_XYZ),
+        )
+
     def _live_point_cloud(self, stamp):
         """PointCloud2 from the live PhysX raycast rig, or ``None``.
 
@@ -1865,7 +1974,7 @@ class RosStandardGateway:
                     )
         message = self._PointCloud2()
         message.header.stamp = stamp
-        message.header.frame_id = "livox360"
+        message.header.frame_id = _LIVOX_FRAME_ID
         message.height = 1
         message.width = len(points)
         message.is_bigendian = False
