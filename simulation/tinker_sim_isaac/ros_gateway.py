@@ -1384,8 +1384,19 @@ class RosStandardGateway:
         if self._tick % self._imu_stride == 0:
             self.imu_pub.publish(self._imu_message(stamp))
         _lap("imu")
+        rig = getattr(self, "lidar_rig", None)
+        if rig is not None:
+            # Drive the frame accumulator from the publish path as well as
+            # from the rig's physics callback. The callback is only dispatched
+            # when physics is stepped through SimulationManager; the
+            # production loop steps through IsaacLab's SimulationContext, where
+            # it is not, and the first live nav battery consequently saw
+            # /livox/lidar silent for an entire run while the sensor happily
+            # cast rays. Folding is deduplicated by physics step, so having
+            # both drivers is safe rather than double-counting.
+            rig.accumulate()
         if self._cloud_publish_enabled():
-            if getattr(self, "lidar_rig", None) is not None:
+            if rig is not None:
                 cloud = self._live_point_cloud(stamp)
                 if cloud is not None:
                     self.cloud_pub.publish(cloud)
@@ -1405,6 +1416,11 @@ class RosStandardGateway:
                 "lidar_source": (
                     "raycast" if getattr(self, "lidar_rig", None) is not None else "occupancy"
                 ),
+                # Frame-assembly counters. A raycast lidar that constructs
+                # cleanly can still publish nothing if its accumulator never
+                # closes a window; without these that failure is invisible
+                # from outside the process.
+                "lidar": self._lidar_diagnostics(),
                 "safety_stop": bool(self.backend.safety_stopped),
                 # Task #39: whether isaacsim.ros2.sim_control's services
                 # (/spawn_entity et al) are being advertised at a point where
@@ -1801,6 +1817,19 @@ class RosStandardGateway:
         if rig is not None:
             return bool(rig.frame_ready)
         return bool(self.development_lidar) and self._tick % self._lidar_stride == 0
+
+    def _lidar_diagnostics(self):
+        """Frame-assembly counters for the status heartbeat, or ``None``."""
+        rig = getattr(self, "lidar_rig", None)
+        if rig is None:
+            return None
+        reader = getattr(rig, "diagnostics", None)
+        if reader is None:
+            return None
+        try:
+            return reader()
+        except Exception:  # noqa: BLE001 - a diagnostic must never break status
+            return None
 
     def _imu_message(self, stamp):
         """``/livox/imu`` from the sensor body's own state.
