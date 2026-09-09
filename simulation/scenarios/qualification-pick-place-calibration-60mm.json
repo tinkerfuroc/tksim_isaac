@@ -1,0 +1,236 @@
+{
+  "schema_version": 2,
+  "id": "qualification-pick-place-calibration-60mm",
+  "qualification_gate": "pick-place-positive",
+  "seed": 7,
+  "world": {
+    "mode": "current"
+  },
+  "robot": {
+    "id": "tinker2",
+    "initial_pose": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "actors": [
+    {
+      "id": "qualification_pedestal",
+      "class_name": "static_pedestal",
+      "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
+      "asset_sha256": "c4a5e9812224a217bdba21ab81c679fac6c107c3501263a43335c3c0695a8e19",
+      "fixed": true,
+      "role": "support",
+      "owner": "sim_fixture",
+      "region": "source-region",
+      "planning_scene_id": "sim_fixture/pedestal",
+      "pose": {
+        "xyz": [
+          0.65,
+          0.0,
+          0.0
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": "qualification_place_pedestal",
+      "class_name": "static_pedestal",
+      "asset_uri": "simulation/assets/primitives/qualification-pedestal.usda",
+      "asset_sha256": "c4a5e9812224a217bdba21ab81c679fac6c107c3501263a43335c3c0695a8e19",
+      "fixed": true,
+      "role": "support",
+      "owner": "sim_fixture",
+      "region": "place-region",
+      "planning_scene_id": "sim_fixture/place_pedestal",
+      "pose": {
+        "xyz": [
+          0.85,
+          0.0,
+          0.0
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "objects": [
+    {
+      "id": "qualification_cube",
+      "class_name": "dynamic_cube",
+      "asset_uri": "simulation/assets/primitives/task-object-60mm.usda",
+      "asset_sha256": "544f694477dfa093357f16adf8587dee2f3c5e6fe10465c9309376f64ca404f0",
+      "gravity": true,
+      "collision": true,
+      "role": "pick-target",
+      "owner": "sim_fixture",
+      "region": "source-region",
+      "planning_scene_id": "sim_fixture/qualification_cube",
+      "pose": {
+        "xyz": [
+          0.65,
+          0.0,
+          0.6
+        ],
+        "quaternion_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "events": [
+    {
+      "at_sim_time": 0.0,
+      "event": "spawn_once_while_paused"
+    }
+  ],
+  "postconditions": [
+    {
+      "name": "fixture ready",
+      "path": "planning_scene_fixture.state",
+      "operator": "equals",
+      "value": "FIXTURE_READY"
+    },
+    {
+      "name": "fixture revision",
+      "path": "planning_scene_fixture.revision",
+      "operator": "equals",
+      "value": "calibration-60mm-v1"
+    }
+  ],
+  "planning_scene": {
+    "revision": "calibration-60mm-v1",
+    "frame_id": "base_link",
+    "target_source_id": "sim_fixture/qualification_cube",
+    "target_handoff": "pick_and_place/object_mesh",
+    "objects": [
+      {
+        "id": "sim_fixture/pedestal",
+        "class": "static",
+        "primitive": {
+          "type": "box",
+          "dimensions": [
+            0.12,
+            0.12,
+            0.6
+          ]
+        },
+        "pose": {
+          "xyz": [
+            0.65,
+            0.0,
+            0.3
+          ],
+          "quaternion_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        }
+      },
+      {
+        "id": "sim_fixture/qualification_cube",
+        "class": "target",
+        "primitive": {
+          "type": "box",
+          "dimensions": [
+            0.06,
+            0.06,
+            0.06
+          ]
+        },
+        "pose": {
+          "xyz": [
+            0.65,
+            0.0,
+            0.63
+          ],
+          "quaternion_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        }
+      },
+      {
+        "id": "sim_fixture/place_pedestal",
+        "class": "static",
+        "primitive": {
+          "type": "box",
+          "dimensions": [
+            0.12,
+            0.12,
+            0.6
+          ]
+        },
+        "pose": {
+          "xyz": [
+            0.85,
+            0.0,
+            0.3
+          ],
+          "quaternion_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        }
+      }
+    ],
+    "revision_digest": "cf1f8dabd0eb7066639bcc37c4062d31b0add693c78cb13dbf1936ede0c5b7fa"
+  },
+  "integrated": {
+    "stage": "E",
+    "fixture_revision": "calibration-60mm-v1",
+    "fixture_digest": "cf1f8dabd0eb7066639bcc37c4062d31b0add693c78cb13dbf1936ede0c5b7fa",
+    "authority": "physics_truth",
+    "execution_profile": "sim_ompl",
+    "goal": {
+      "target_object_id": "pick_and_place/object_mesh",
+      "target_source_id": "sim_fixture/qualification_cube",
+      "place_region": "place-region"
+    },
+    "acceptance": {
+      "polarity": "positive"
+    },
+    "expected_scene": {
+      "owned_ids": [
+        "sim_fixture/pedestal",
+        "sim_fixture/qualification_cube",
+        "sim_fixture/place_pedestal"
+      ],
+      "attached_ids": [],
+      "task_target_id": "pick_and_place/object_mesh"
+    },
+    "expected_physical": [
+      "bilateral_contact",
+      "lift",
+      "transport",
+      "bounded_tcp_object_drift",
+      "release_in_place_region",
+      "settled_speed",
+      "no_arm_obstacle_contact"
+    ],
+    "expected_negative": null,
+    "forbidden_endpoints": [
+      "/isaac_joint_commands"
+    ],
+    "terminal_policy": "verified by independent raw-truth replay"
+  }
+}
