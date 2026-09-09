@@ -617,6 +617,49 @@ def gateway_lidar_enabled(sensor_profile: str, qualification: bool) -> bool:
     return False
 
 
+def raycast_lidar_enabled(
+    sensor_profile: str, qualification: bool, map_lidar: bool
+) -> bool:
+    """Whether to build the live PhysX raycast lidar for this run.
+
+    The live sensor is the default wherever a lidar is published at all: it
+    casts against the physics scene, so it sees spawned objects and the person
+    capsule, which the occupancy-map raycast structurally cannot. ``--map-lidar``
+    forces the legacy source back on.
+
+    It is deliberately keyed to the same predicate as the development lidar, so
+    exactly one source feeds ``/livox/lidar`` in every profile.
+    """
+    if map_lidar:
+        return False
+    return gateway_lidar_enabled(sensor_profile, qualification)
+
+
+def build_lidar_rig(root: Path, app: Any) -> Any:
+    """Construct and initialise the live raycast lidar, or fail loudly.
+
+    Called after the backend, exactly like ``CameraRig``: the sensor is a USD
+    prim and can only be created once ``backend.__init__`` has run
+    ``sim.reset()``.
+    """
+    from tinker_sim_isaac.lidar_rig import RaycastLidar, load_lidar_spec
+
+    spec = load_lidar_spec(root / "simulation/sensors/hardware-parity.json")
+    rig = RaycastLidar(spec)
+    rig.initialize(app)
+    print(
+        f"[run_sim] live raycast lidar: {spec.channels}ch x {spec.columns}col "
+        f"= {spec.num_rays} rays @ {spec.tick_rate_hz:g} Hz "
+        f"({spec.points_per_second:.0f} pts/s), "
+        f"elevation {spec.elevation_min_deg:g}..{spec.elevation_max_deg:g} deg, "
+        f"range {spec.min_range_m:g}..{spec.max_range_m:g} m, "
+        f"sweep={'on' if spec.sweep else 'off'}, "
+        f"mount={rig.sensor_path} offset={rig.mount_translation}",
+        flush=True,
+    )
+    return rig
+
+
 def sensor_rich_implies_ros(sensor_profile: str, ros: bool) -> bool:
     """sensor-rich exists to serve hardware-parity topics; it forces --ros."""
     return sensor_profile == "sensor-rich" and not ros
@@ -888,6 +931,16 @@ def main() -> int:
     parser.add_argument("--qualification", action="store_true")
     parser.add_argument("--livestream", action="store_true")
     parser.add_argument("--camera-pointcloud", action="store_true")
+    parser.add_argument(
+        "--map-lidar",
+        action="store_true",
+        help=(
+            "Publish /livox/lidar from the arena occupancy map (the legacy "
+            "development lidar) instead of the live PhysX raycast sensor. The "
+            "map raycast cannot see spawned objects or the person capsule; "
+            "this exists as an escape hatch and for reproducing older runs."
+        ),
+    )
     parser.add_argument("--arena-colors", action="store_true")
     args, kit_args = parser.parse_known_args()
 
@@ -1079,9 +1132,15 @@ def main() -> int:
             if args.ros:
                 from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
+                lidar_rig = None
+                if raycast_lidar_enabled(
+                    args.sensor_profile, args.qualification, args.map_lidar
+                ):
+                    lidar_rig = build_lidar_rig(root, app)
                 gateway = RosStandardGateway(
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
+                    lidar_rig=lidar_rig,
                 )
                 # Task #39: backend (and the streaming viewport, above) are
                 # fully constructed -- safe to advertise sim_control's
@@ -1357,12 +1416,18 @@ def main() -> int:
             )
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
+            lidar_rig = None
+            if raycast_lidar_enabled(
+                args.sensor_profile, args.qualification, args.map_lidar
+            ):
+                lidar_rig = build_lidar_rig(root, app)
             gateway = RosStandardGateway(
                 backend,
                 development_lidar=gateway_lidar_enabled(
                     args.sensor_profile, args.qualification
                 ),
                 camera_rig=camera_rig,
+                lidar_rig=lidar_rig,
                 camera_pointcloud=args.camera_pointcloud,
             )
             # Task #39: backend and camera_rig warm-up (the ~90s window with
@@ -1570,9 +1635,15 @@ def main() -> int:
             if args.ros:
                 from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
+                lidar_rig = None
+                if raycast_lidar_enabled(
+                    args.sensor_profile, args.qualification, args.map_lidar
+                ):
+                    lidar_rig = build_lidar_rig(root, app)
                 gateway = RosStandardGateway(
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
+                    lidar_rig=lidar_rig,
                 )
             if args.qualification:
                 from tinker_sim_isaac.qualification_visual_capture import (

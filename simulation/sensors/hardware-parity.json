@@ -56,7 +56,19 @@
     "frame_id": "livox360",
     "tick_rate_hz": 10,
     "require_tick_rate_equal_scan_rate_base_hz": true,
-    "qos": "sensor_data"
+    "qos": "sensor_data",
+    "raycast": {
+      "implementation": "isaacsim.sensors.experimental.physics.RaycastSensor",
+      "mount_prim": "livox_frame",
+      "channels": 57,
+      "columns": 349,
+      "elevation_range_deg": [-7.0, 52.0],
+      "min_range_m": 0.2,
+      "max_range_m": 40.0,
+      "sweep": true,
+      "self_filter": true,
+      "rationale": "57 x 349 = 19893 rays at 10 Hz = 198930 points/s, against the Mid-360's 200000, with ~1.03 deg spacing in both axes over its -7..+52 deg by 360 deg field. sweep spreads ray firing across the frame via ray_time_offsets, which the plugin treats as a firing SCHEDULE (the USD schema documents only the pose extrapolation, not the deferral): without it the whole pattern is cast every physics step, measured 27.89 vs 4.47 ms/step in an empty room. Cost measured WITH the real robot on the stage, against a no-sensor baseline in the SAME scene (the robot's ~200 convex-decomposition collision shapes make every scene query dearer, and dominate the absolute number): marginal sensor cost is +0.75 s of compute per simulated second at this full scale, +0.50 at 32x360, +0.25 at 16x360 and +0.22 at 8x360 -- nearly flat below 16x360, so trimming past that buys little. Drop channels/columns if a live nav run needs the RTF back. min_range_m matches the hardware pointcloud_to_laserscan range_min and offsets each ray's START; raising it does NOT recover cost (0.2 -> 0.7 m moved cost 3%) because the expense is testing rays against the robot's shapes, not hitting them. max_range_m is the datasheet range and is nearly free (8 m vs 40 m differed under 4%). self_filter drops returns on the robot's own body: 9840 of 19893 points (49.5%) hit the robot, an artefact of the over-approximated convex-hull COLLISION geometry the raycast sees rather than the visual shape a real Mid-360 would; enabling report_hit_prim_paths to identify them measured 31.95 vs 31.91 ms/step, inside noise."
+    }
   },
   "imu": {
     "topic": "/livox/imu",

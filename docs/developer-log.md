@@ -4,6 +4,118 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-09 — /livox/lidar becomes a real sensor: the PhysX raycast lidar
+
+**What was wrong.** `/livox/lidar` was never a sensor. `ros_gateway.
+_development_point_cloud` traced 181 rays across the arena occupancy PGM at
+1 deg spacing, every point at `z = 0`, from a point hard-coded 0.12 m ahead of
+`base_link` with the height ignored. It read the MAP, so it could not see a
+spawned object or the person capsule -- it re-published what Nav2 already holds
+as `static_layer`. `"rtx_lidar"` in `sensor-rich.json` was inert metadata;
+`SimulationProfile.modules` is parsed and never read by any code.
+
+**What replaced it.** `simulation/tinker_sim_isaac/lidar_rig.py`: an
+`isaacsim.sensors.experimental.physics` `RaycastSensor` on the robot,
+57 channels x 349 azimuth columns = 19,893 rays at 10 Hz = 198,930 points/s,
+against the Mid-360's 200,000, over its -7..+52 deg by 360 deg field. The
+extension declares no RTX dependency, so it runs in `navigation-parity`
+(`render=false`, CPU physics) as well as `sensor-rich`. Post-`play()` spawns
+are hit with no registration -- confirmed by a cube created mid-run moving a
+reading from 9.5 m to 2.75 m.
+
+**Three findings that shaped it, all measured (throwaway probes, headless).**
+
+*`depths` is broken in Isaac Sim 6.0.1.* Six axis-aligned rays into geometry at
+hand-checked distances returned `depths = [3.5] * 6` -- ray 0's value
+replicated across every ray -- while the same reading's `hit_positions` were
+all correct (`[[3.5,0,0], [-5.5,0,0], [0,7.5,0], [0,-9.5,0], [0,0,10.5],
+[0,0,-1.0]]`). The rays are cast correctly; only the depth field lies. The rig
+reads `hit_positions` and derives range as its norm. This cost two probe rounds:
+uniform depths look exactly like a collapsed ray pattern, and it took reading
+the authored `rayDirections` back off the prim (128 distinct rows, matching
+input) to rule that out.
+
+*`ray_time_offsets` is a firing schedule, not just pose extrapolation.* The USD
+schema documents only "the world transform is extrapolated to currentTime +
+offset". Incomplete: the plugin also defers each ray to its offset instant. The
+shipped example's `_generate_rotating_rays` docstring says so; the schema does
+not. Spreading a frame's offsets across `1/tick_rate` measured 4.47 vs
+27.89 ms/step at full scale. This is the ONLY rate control the sensor has --
+`sensorPeriod` exists only on the contact and IMU sensors and is deprecated,
+and toggling the inherited `enabled` attribute at runtime does not gate casting
+(an earlier run where it appeared to had `initialize_physics` throwing in its
+log and was degraded).
+
+*A frame must be ACCUMULATED.* Because rays fire on their own step, the reading
+buffer holds only that step's rays and is cleared each step -- populated counts
+stay flat at ~500 of 19,893 across the window rather than growing. The union
+over one window recovers the pattern exactly. `FrameAccumulator` folds
+`window_steps` readings (12 at 120 Hz physics / 10 Hz lidar) into one frame and
+publishes when the window closes, so the cadence is phase-locked to the scan
+rather than to `_tick`. A miss is a ZERO VECTOR in `hit_positions`, which is
+also how an unfired ray reads -- both contribute no point, so one test covers
+both.
+
+**Cost, measured with the real robot on the stage.** Against a no-sensor
+baseline in the SAME scene, because the robot's ~200 convex-decomposition
+collision shapes make every scene query dearer and dominate the absolute
+number (21.5 ms/step with no sensor at all): marginal sensor cost is +0.75 s of
+compute per simulated second at full scale, +0.50 at 32x360, +0.25 at 16x360,
++0.22 at 8x360. Nearly flat below 16x360, so trimming past that buys little.
+An earlier empty-room measurement suggested ~0.35 s/s and was not
+representative; a mid-analysis reading of ~1.9 s/s was wrong in the other
+direction, from comparing a robot-present run against an empty-room baseline.
+`max_range` is not a lever (8 m vs 40 m differed under 4%), and neither is
+`min_range` (0.2 -> 0.7 m moved cost 3%): the expense is testing rays against
+the robot's shapes, not hitting them.
+
+**Self-hits.** 9,840 of 19,893 points -- 49.5% of a frame -- land on the robot
+itself, far more than a real Mid-360 loses to its own chassis, because the
+raycast sees the inflated convex-hull COLLISION geometry rather than the visual
+shape. Filtering therefore moves the sim toward hardware behaviour, not away.
+`report_hit_prim_paths` identifies them and is effectively free at this scale
+(31.95 vs 31.91 ms/step, inside noise); only the ~3,300 live rays per step are
+path-tested, since checking all 19,893 in Python every step would cost more
+than the raycast. After filtering, frames carry ~11,000 points and the nearest
+return moves from 0.20 m (the robot's own shell) to ~0.46 m.
+
+**Mount and TF.** The sensor is created under the URDF's `livox_frame`, walking
+up to the nearest `RigidBodyAPI` ancestor because the URDF importer welds
+fixed-joint links onto their parent and the sensor's world transform comes from
+a rigid body's pose (the same trap `camera_rig` documents for optical frames).
+On the shipped artifact `livox_frame` carries the API itself, so the offset is
+zero. The sim bridge's `base_link -> livox360` static TF moved from
+(0.12, 0, 0.25) to the URDF's (0.09, 0, 0.195): it now matches both where the
+sensor actually is and the height `arena_map.livox_scan_height()` slices the
+AMCL map at. The old value predated any real sensor and agreed with neither.
+The hardware launch files are untouched.
+
+**pointcloud_to_laserscan now takes the hardware values verbatim** (min_height
+0.0, max_height 2.0, angle -1.44..1.436, range 0.2..8.0). The previous
++/-180 deg, +/-0.05 m band existed only because the cloud was a planar ring.
+Tabletops becoming scan hits and the robot being blind behind itself are the
+PARITY TARGET, not regressions: they shape nav_back and spin recoveries on
+hardware.
+
+**A bug worth remembering.** The frame accumulator initially produced nothing
+at all while looking healthy. Root cause: `SimulationManager`'s dispatcher
+calls physics-step callbacks with `(step_dt, context)`, and the handler
+declared one optional argument, so every invocation raised `TypeError` inside
+the message bus, which swallowed it. The signature must match the sensor
+extension's own `_SensorStepManager._on_physics_step(step_dt, context=None)`.
+The `except Exception: return` in the read path hid it further; that path now
+reports the first failure of each kind once.
+
+**Not done here.** The synthetic `/livox/imu` is untouched and is NOT accurate:
+`linear_acceleration` is never assigned (so it reads (0,0,0) -- permanent
+freefall rather than ~9.81 m/s2 at rest), the angular velocity is world-frame
+but stamped `livox360`, it is sampled at the articulation root so there is no
+lever-arm term, and the angular/linear covariances are left all-zero. Nothing
+in the sim stack consumes it today beyond a contract_guard existence check, but
+it is a hard prerequisite for FAST-LIO in sim. AMCL parity evidence is pinned
+bit-identical to the map raycast and has to be re-earned against this source,
+with the spawn-mislocation flag off.
+
 ## 2026-09-08 — Task #33: the gripper's own effort-limit write silently reverted drive_joint's PhysX gains
 
 **Finding.** On the grasp bench, `drive_joint` was not running the gains the
