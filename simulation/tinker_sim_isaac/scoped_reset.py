@@ -194,7 +194,8 @@ class PhysicsBaseline:
                     raise ResetFailure(f"initial rigid-body state unavailable: {path}")
                 self.backend._park_views[path] = view
             pose = tuple(float(v) for v in view.get_transforms().numpy()[0])
-            velocity = tuple(float(v) for v in view.get_velocities().numpy()[0])
+            kinematic = UsdPhysics.RigidBodyAPI(prim).GetKinematicEnabledAttr().Get()
+            velocity = None if kinematic else tuple(float(v) for v in view.get_velocities().numpy()[0])
             bodies[path] = (pose, velocity)
         return bodies
 
@@ -259,7 +260,8 @@ class PhysicsBaseline:
             pose, velocity = self.bodies[path]
             if not backend.set_entity_pose_physics(
                 path, position=pose[:3], quaternion_xyzw=pose[3:],
-                linear_velocity=velocity[:3], angular_velocity=velocity[3:],
+                linear_velocity=None if velocity is None else velocity[:3],
+                angular_velocity=None if velocity is None else velocity[3:],
             ):
                 raise ResetFailure(f"initial state write failed: {path}")
 

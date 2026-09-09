@@ -229,8 +229,8 @@ def _resolve(context):
         # switching remains disabled until the successful controller handoff.
         safety_supervisor,
         Node(
-            package="controller_manager",
-            executable="ros2_control_node",
+            package="tinker_sim_control",
+            executable="controller_manager_node",
             output="screen",
             parameters=[
                 {"robot_description": robot_description, "use_sim_time": True},

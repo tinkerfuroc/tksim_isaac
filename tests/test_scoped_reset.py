@@ -252,7 +252,8 @@ def test_physics_baseline_restores_original_robot_and_spawn_state_without_rebind
         set_joint_effort_target=lambda p: None,
         write_data_to_sim=lambda: writes.append("write"),
     )
-    bodies = {"/cube": ((1, 2, 3, 0, 0, 0, 1), (0,) * 6)}
+    bodies = {"/cube": ((1, 2, 3, 0, 0, 0, 1), (0,) * 6),
+              "/table": ((0, 0, 0, 0, 0, 0, 1), None)}
     backend = SimpleNamespace(
         _robot=robot, _torch_value=lambda v: v,
         _position_targets=tensor([[9, 9]]), _velocity_targets=tensor([[9, 9]]),
@@ -281,6 +282,10 @@ def test_physics_baseline_restores_original_robot_and_spawn_state_without_rebind
     restored = dict(item for item in writes if isinstance(item, tuple) and item[0].startswith("/"))
     assert restored["/cube"]["position"] == (1, 2, 3)
     assert restored["/new"]["position"] == (4, 5, 6)
+    assert restored["/cube"]["linear_velocity"] == (0,) * 3
+    assert restored["/table"]["position"] == (0, 0, 0)
+    assert restored["/table"]["linear_velocity"] is None
+    assert restored["/table"]["angular_velocity"] is None
     bodies["/unregistered"] = bodies["/cube"]
     with pytest.raises(ResetFailure, match="initial state"):
         baseline.prepare()

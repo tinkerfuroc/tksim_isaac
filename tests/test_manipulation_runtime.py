@@ -2781,7 +2781,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             sdfPathToInt=lambda path: resolved_sdf_calls.append(path) or 987
         )
 
-        with patch.dict(sys.modules, {"omni.usd": fake_usd}):
+        with patch.dict(sys.modules, {"omni": ModuleType("omni"), "omni.usd": fake_usd}):
             with patch("omni.usd", fake_usd, create=True):
                 with patch("pxr.PhysicsSchemaTools", fake_schema_tools, create=True):
                     resolved = backend._resolve_articulation_sleep_ids()
@@ -2807,7 +2807,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             sdfPathToInt=lambda path: omitted_sdf_calls.append(path) or 987
         )
 
-        with patch.dict(sys.modules, {"omni.usd": fake_usd2}):
+        with patch.dict(sys.modules, {"omni": ModuleType("omni"), "omni.usd": fake_usd2}):
             with patch("omni.usd", fake_usd2, create=True):
                 with patch("pxr.PhysicsSchemaTools", fake_schema_tools2, create=True):
                     omitted = backend._resolve_articulation_sleep_ids()
@@ -5696,6 +5696,25 @@ class ManipulationRuntimeTest(unittest.TestCase):
         vel = view.velocities.numpy()[0].tolist()
         self.assertEqual([round(v, 4) for v in vel], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.assertIs(backend._park_views[path], view)
+
+    def test_set_entity_pose_physics_restores_kinematic_pose_without_velocity_write(self) -> None:
+        class KinematicView:
+            def get_transforms(self):
+                return SimpleNamespace(device="cpu")
+
+            def set_transforms(self, data, indices):
+                self.transforms = data.numpy()
+
+            def set_velocities(self, data, indices):
+                raise AssertionError("PhysX forbids velocity writes to kinematic actors")
+
+        backend = object.__new__(IsaacWholeRobotBackend)
+        view = KinematicView()
+        backend._park_views = {"/World/table": view}
+        self.assertTrue(backend.set_entity_pose_physics(
+            "/World/table", [1., 2., 3.], [0., 0., 0., 1.],
+            linear_velocity=None, angular_velocity=None))
+        self.assertEqual(view.transforms[0].tolist(), [1., 2., 3., 0., 0., 0., 1.])
 
     def test_set_entity_pose_physics_false_without_resolvable_view(self) -> None:
         """No cached view and no live PhysX (unit env) -> graceful False."""

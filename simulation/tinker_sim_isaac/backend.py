@@ -4863,8 +4863,8 @@ class IsaacWholeRobotBackend:
         prim_path: str,
         position: "list[float]",
         quaternion_xyzw: "list[float]",
-        linear_velocity: "list[float]" = (0.0, 0.0, 0.0),
-        angular_velocity: "list[float]" = (0.0, 0.0, 0.0),
+        linear_velocity: "list[float] | None" = (0.0, 0.0, 0.0),
+        angular_velocity: "list[float] | None" = (0.0, 0.0, 0.0),
     ) -> bool:
         """Move a rigid body to a world pose PHYSICS-EFFECTIVELY (tensor write).
 
@@ -4881,6 +4881,8 @@ class IsaacWholeRobotBackend:
 
         ``position`` is world xyz; ``quaternion_xyzw`` is [qx, qy, qz, qw]
         (scalar last), matching the tensor transform row exactly (no reorder).
+        Both velocity arguments may be None for a kinematic actor, whose pose
+        can be restored but whose velocity PhysX does not allow us to assign.
 
         The per-prim view is cached and NEVER released (these views have no
         release API). Holding a view on a prim that is later DELETED
@@ -4938,7 +4940,7 @@ class IsaacWholeRobotBackend:
                 dtype=_wp.float32,
                 device=device,
             )
-            velocities = _wp.array(
+            velocities = None if linear_velocity is None and angular_velocity is None else _wp.array(
                 _np.asarray(
                     [
                         [
@@ -4963,7 +4965,8 @@ class IsaacWholeRobotBackend:
         # Let a backend write failure raise: the caller wraps this and logs the
         # exact error, which is more useful than a silent False.
         view.set_transforms(transforms, indices)
-        view.set_velocities(velocities, indices)
+        if velocities is not None:
+            view.set_velocities(velocities, indices)
         return True
 
     def _robot_truth_state(self) -> dict[str, object]:
