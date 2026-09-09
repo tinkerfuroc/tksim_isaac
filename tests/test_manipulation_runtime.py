@@ -961,6 +961,44 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(backend.gripper_effort_limit, 12.0)
         self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
 
+    def test_scoped_reset_restores_readonly_gripper_limit_through_real_setter(self) -> None:
+        from tinker_sim_isaac.scoped_reset import PhysicsBaseline, ResetFailure
+
+        for failed_write in (False, True):
+            with self.subTest(failed_write=failed_write):
+                backend = _backend()
+                robot = backend._robot
+                backend._default_gripper_effort_limit = 2.5
+                backend._gripper_effort_full_scale_n = 10.0
+                backend._set_gripper_effort_limit(2.5)  # 2.5 N maps to 0.625 Nm.
+                self.assertEqual(backend.gripper_effort_limit, 0.625)
+                with self.assertRaises(AttributeError):
+                    backend.gripper_effort_limit = 0.625
+                robot.data.root_link_pose_w = torch.cat(
+                    (robot.data.root_pos_w, robot.data.root_quat_w), dim=-1
+                )
+                robot.data.root_com_vel_w = torch.zeros((1, 6))
+                robot.reset = lambda: None
+                robot.write_joint_state_to_sim_index = lambda **kwargs: None
+                backend._base_hold_pose = None
+                baseline = PhysicsBaseline(backend, read_bodies=lambda: {})
+                backend._set_gripper_effort_limit(10.0)
+                backend._safety_stopped = True
+                if failed_write:
+                    backend._write_gripper_drive_physx_max_force = lambda *args: ([], False)
+                    with self.assertRaisesRegex(ResetFailure, "gripper effort limit"):
+                        baseline.restore()
+                else:
+                    baseline.restore()
+                    self.assertEqual(backend.gripper_effort_limit, 0.625)
+                    self.assertEqual(robot.limit_calls[-1]["limits"].tolist(), [[0.625]])
+                    self.assertEqual(float(robot.actuators["gripper"].effort_limit[0, 0]), 0.625)
+                    self.assertEqual(robot.root_view.get_dof_max_forces()[0][0], 0.625)
+                    writes = len(robot.limit_calls)
+                    baseline.restore()
+                    self.assertEqual(len(robot.limit_calls), writes + 1)
+
+
     def test_repeated_identical_gripper_effort_limit_writes_once(self) -> None:
         """The bridge re-sends the gripper packet at 150 Hz; an unchanged ceiling
         must not reach the PhysX writer again (each write costs a physics step)."""

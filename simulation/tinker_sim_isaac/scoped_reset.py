@@ -238,7 +238,17 @@ class PhysicsBaseline:
             backend._base_hold_pose = self.root_pose.clone()
             backend._base_hold_vel = self.root_velocity.clone()
         if self.gripper_effort is not None:
-            backend.gripper_effort_limit = self.gripper_effort
+            # The read-only property is Nm; the existing setter accepts
+            # commanded fingertip force in N and updates both the actuator
+            # model and the live PhysX drive. Invert its configured scale.
+            requested_n = (
+                self.gripper_effort * backend._gripper_effort_full_scale_n
+                / backend._default_gripper_effort_limit
+            )
+            backend._gripper_effort_limit_written = False
+            backend._set_gripper_effort_limit(requested_n)
+            if not backend._gripper_effort_limit_written:
+                raise ResetFailure("Initial gripper effort limit did not reach PhysX")
         backend._contact_pairs_by_key.clear()
         backend._target_write_gate.force_next()
         robot.set_joint_position_target(backend._position_targets)

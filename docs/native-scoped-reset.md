@@ -132,3 +132,17 @@ therefore rejected this settled contact state. The pose-window revision has
 CPU regressions for those noise values and for actual slow joint/root motion.
 The existing native acceptance evaluator limits are unchanged. This failed
 attempt remains failed evidence; a new live scoped reset is required.
+
+The subsequent native07 scope-3 attempt established the idle and stop boundary,
+then failed because restoration assigned the backend's read-only
+`gripper_effort_limit` property. It remained paused with the reset stop asserted.
+Restoration now uses the existing backend effort setter, converting saved Nm
+back to its configured commanded-force units (N). That setter updates the
+implicit actuator model and the live PhysX drive; a failed PhysX write aborts
+the reset. The regression uses the real backend property and setter with CPU
+tensors and a PhysX-view double, including unequal force/torque scales and
+repeated restoration. No other restoration assignment targets a read-only
+backend property. Native07's failed attempt is preserved; this fix still
+requires a new live reset.
+Follow-up CPU verification passed 182 runtime tests plus 7 subtests and 26
+scoped-reset tests. No simulator was launched for those checks.
