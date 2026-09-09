@@ -618,30 +618,36 @@ def gateway_lidar_enabled(sensor_profile: str, qualification: bool) -> bool:
 
 
 def raycast_lidar_enabled(
-    sensor_profile: str, qualification: bool, map_lidar: bool
+    sensor_profile: str, qualification: bool, raycast_lidar: bool
 ) -> bool:
     """Whether to build the live PhysX raycast lidar for this run.
 
-    The live sensor is the default wherever a lidar is published at all: it
-    casts against the physics scene, so it sees spawned objects and the person
-    capsule, which the occupancy-map raycast structurally cannot. ``--map-lidar``
-    forces the legacy source back on.
+    OPT-IN, and off by default. The raycast sensor is the right long-term
+    source -- it casts against the physics scene, so it sees spawned objects
+    and the person capsule, which the occupancy-map raycast structurally
+    cannot -- but it does not work yet.
 
-    It is deliberately keyed to the same predicate as the development lidar, so
+    Measured in a live navigation-parity run: the sensor reports ``is_valid``,
+    returns a full 19,893-ray reading, and (with ``sweep`` disabled) casts
+    full-length 40 m rays from the correct world origin -- and hits NOTHING.
+    Not the ground plane its first ray descends into ~2.2 m ahead, not the
+    robot it is bolted to. It therefore publishes correctly-timed EMPTY clouds,
+    which is strictly worse for navigation than the fake it replaced: Nav2 gets
+    no ``/scan``, AMCL never converges, and no goal is ever accepted.
+
+    Until that is understood the occupancy lidar stays the default, because it
+    works. Enable this with ``--raycast-lidar`` for investigation.
+
+    It is otherwise keyed to the same predicate as the development lidar, so
     exactly one source feeds ``/livox/lidar`` in every profile.
     """
-    if map_lidar:
+    if not raycast_lidar:
         return False
     return gateway_lidar_enabled(sensor_profile, qualification)
 
 
 def build_lidar_rig(root: Path, app: Any) -> Any:
-    """Construct and initialise the live raycast lidar, or fail loudly.
-
-    Called after the backend, exactly like ``CameraRig``: the sensor is a USD
-    prim and can only be created once ``backend.__init__`` has run
-    ``sim.reset()``.
-    """
+    """Construct and initialise the live raycast lidar, or fail loudly."""
     from tinker_sim_isaac.lidar_rig import RaycastLidar, load_lidar_spec
 
     spec = load_lidar_spec(root / "simulation/sensors/hardware-parity.json")
@@ -935,10 +941,22 @@ def main() -> int:
         "--map-lidar",
         action="store_true",
         help=(
-            "Publish /livox/lidar from the arena occupancy map (the legacy "
-            "development lidar) instead of the live PhysX raycast sensor. The "
-            "map raycast cannot see spawned objects or the person capsule; "
-            "this exists as an escape hatch and for reproducing older runs."
+            "Deprecated no-op: the occupancy-map lidar is the default again "
+            "(see --raycast-lidar). Accepted so existing scripts keep working."
+        ),
+    )
+    parser.add_argument(
+        "--raycast-lidar",
+        action="store_true",
+        help=(
+            "Publish /livox/lidar from the live PhysX raycast sensor instead "
+            "of the arena occupancy map. OFF BY DEFAULT and NOT yet working: "
+            "in a live navigation-parity run the sensor reports valid, casts "
+            "full-length 40 m rays and returns a full 19,893-ray reading, but "
+            "the PhysX scene query hits nothing at all -- not the ground it "
+            "points at, not the robot it is mounted on -- so it publishes "
+            "empty clouds at the correct rate and Nav2 cannot localise. The "
+            "occupancy lidar cannot see spawned objects, but it does work."
         ),
     )
     parser.add_argument("--arena-colors", action="store_true")
@@ -1102,6 +1120,11 @@ def main() -> int:
                 expected_objects=expected_objects, scenario=args.scenario,
                 task=args.scenario,
             )
+            lidar_rig = None
+            if raycast_lidar_enabled(
+                args.sensor_profile, args.qualification, args.raycast_lidar
+            ):
+                lidar_rig = build_lidar_rig(root, app)
             set_entity_state_backend_holder["backend"] = backend
             arena_camera_eye = None
             arena_camera_target = None
@@ -1132,11 +1155,6 @@ def main() -> int:
             if args.ros:
                 from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
-                lidar_rig = None
-                if raycast_lidar_enabled(
-                    args.sensor_profile, args.qualification, args.map_lidar
-                ):
-                    lidar_rig = build_lidar_rig(root, app)
                 gateway = RosStandardGateway(
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
@@ -1308,6 +1326,11 @@ def main() -> int:
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
             )
+            lidar_rig = None
+            if raycast_lidar_enabled(
+                args.sensor_profile, args.qualification, args.raycast_lidar
+            ):
+                lidar_rig = build_lidar_rig(root, app)
             set_entity_state_backend_holder["backend"] = backend
             from tinker_sim_isaac.camera_rig import (
                 CameraRig,
@@ -1416,11 +1439,6 @@ def main() -> int:
             )
             from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
-            lidar_rig = None
-            if raycast_lidar_enabled(
-                args.sensor_profile, args.qualification, args.map_lidar
-            ):
-                lidar_rig = build_lidar_rig(root, app)
             gateway = RosStandardGateway(
                 backend,
                 development_lidar=gateway_lidar_enabled(
@@ -1624,6 +1642,11 @@ def main() -> int:
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
             )
+            lidar_rig = None
+            if raycast_lidar_enabled(
+                args.sensor_profile, args.qualification, args.raycast_lidar
+            ):
+                lidar_rig = build_lidar_rig(root, app)
             set_entity_state_backend_holder["backend"] = backend
             if backend.physics_device != "cpu":
                 raise RuntimeError("manipulation-core selected a non-CPU physics device")
@@ -1635,11 +1658,6 @@ def main() -> int:
             if args.ros:
                 from tinker_sim_isaac.ros_gateway import RosStandardGateway
 
-                lidar_rig = None
-                if raycast_lidar_enabled(
-                    args.sensor_profile, args.qualification, args.map_lidar
-                ):
-                    lidar_rig = build_lidar_rig(root, app)
                 gateway = RosStandardGateway(
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),

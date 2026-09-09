@@ -4,6 +4,85 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-09 — the raycast lidar publishes EMPTY clouds in a live run; back to opt-in
+
+The live Nav2 battery against PR #24's raycast lidar FAILED, and the failure is
+worse than a no-op: `/livox/lidar` published nothing usable, so Nav2 got no
+`/scan`, AMCL never converged, `map -> odom` never existed, and no
+`navigate_to_pose` goal was ever accepted. The occupancy-map lidar it replaced
+was fake, but it worked. **The raycast source is therefore opt-in
+(`--raycast-lidar`) until this is understood, and the occupancy lidar is the
+default again.**
+
+**Defect 1 (FIXED): the frame accumulator was never driven.** The rig subscribed
+to `SimulationEvent.PHYSICS_POST_STEP` via `SimulationManager.register_callback`.
+That event is not dispatched in the production loop, which steps physics through
+IsaacLab's `SimulationContext` — measured `callback_folds: 0` against
+`poll_folds: 1261` over a full run. Every probe that validated the design drove
+`SimulationManager.step()` directly, which is exactly why it passed on the bench
+and failed in the sim. The gateway now also polls `accumulate()` on its publish
+path, and folding is deduplicated by the sensor's own `physics_step` so both
+drivers together cannot double-count. After this, the topic publishes at the
+right rate.
+
+**Defect 2 (OPEN, the blocker): the scene query hits nothing.** With the
+accumulator running, every published cloud has `width: 0`. Diagnostics added to
+`/sim/status/isaac` localise it precisely:
+
+* `is_valid: true`, `last_reading_len: 19893`, `path_table_len: 19893` — the
+  sensor is healthy and returning every ray.
+* `raw_hits: 0` counted BEFORE self-filtering, and `self_hits: 0` — so this is
+  not the self-filter eating the frame. No ray hits anything.
+* `ray_origin_world: [-1.91, -2.0001, 0.2725]` — exactly right for a robot
+  spawned at (-2, -2) with the sensor 0.09 forward and 0.195 up. The mount and
+  pose tracking are correct.
+
+**Defect 3 (found while isolating 2): `sweep` produces zero-length rays here.**
+With `sweep: true` (as merged), `ray_end_world == ray_origin_world` for every
+ray — the ray has no length at all. With `sweep: false` the same ray becomes
+`[37.79, -2.04, -4.60]`, a genuine 40 m cast. So `ray_time_offsets` scheduling
+does not work under this stepping path either, plausibly the same root cause as
+defect 1: the plugin's step clock never advances the way `SimulationManager.step`
+makes it.
+
+But even with full-length rays, `raw_hits` stays 0. That first ray leaves
+z=0.2725 descending at 7 deg and should strike the ground plane ~2.2 m ahead; it
+travels the full 40 m to z=-4.6 instead, straight through. It does not hit the
+robot it is mounted on either, where the bench measured 49.5% self-hits. The
+PhysX scene query is returning nothing in this configuration.
+
+**Ruled out by measurement, so nobody repeats them:**
+
+* Prim authoring order. Authoring the prim BEFORE `sim.reset()` via a backend
+  pre-reset hook gave results identical to authoring it after — same ray
+  geometry, same zero hits. The schema's "attributes are read once at simulation
+  start" warning is real but is NOT what is happening here. That experiment's
+  backend plumbing was reverted rather than shipped.
+* The self-filter (`self_hits: 0`).
+* An unevaluated or invalid sensor (`is_valid: true`, full-length reading).
+* A bad mount or pose (`ray_origin_world` is correct to 4 decimal places).
+
+**Next suspects, untested:** the profile's `use_fabric` setting; the CPU-vs-GPU
+PhysX pipeline (`physics_device: "cpu"` here — the bench harness that worked was
+also CPU, but used a plain `UsdPhysics.Scene` rather than IsaacLab's
+`SimulationContext`); and whether the sensor's scene-query handle binds to the
+scene IsaacLab actually creates.
+
+**RTF, for whatever it is worth:** 0.214 measured with nav attached over 491
+`/clock` samples — while the lidar was hitting nothing, so this is the cost of
+casting alone, not of a working sensor. Any RTF conclusion has to wait until the
+sensor works; the earlier +0.75 s/sim-s bench figure is neither contradicted nor
+confirmed.
+
+**Process lessons from the run itself.** The first battery attempt was lost
+because the orchestrator entered an isolated worktree while a subagent was
+mid-run against the main checkout, which retroactively confined that agent's
+shell and orphaned a sim holding a GPU. Never change worktree state while a
+subagent is running against another directory. Second: backgrounding a launcher
+with `&` in a non-interactive shell leaves SIGINT set to `SIG_IGN` on the
+wrapper, so `kill -INT` is silently swallowed — signal the worker child one
+level down rather than escalating to SIGKILL.
+
 ## 2026-09-09 — /livox/imu was a stub: four defects in one small message
 
 Follow-up to the raycast lidar below, kept as a separate change because it is
