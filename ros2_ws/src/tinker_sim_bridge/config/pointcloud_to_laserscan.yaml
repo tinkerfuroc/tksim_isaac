@@ -1,15 +1,32 @@
+# Mirrors the HARDWARE Mid-360 laserscan launch verbatim
+# (tk26_navigation/src/livox_ros_driver2/launch/laserscan_MID360_launch.py),
+# because parity is the point: Nav2 must see the same scan shape in sim as on
+# the robot.
+#
+# The previous values (+/-180 deg, a +/-0.05 m height band, range_min 0.3)
+# existed only because the simulated cloud was a planar occupancy-map raycast
+# at z = 0 -- a full-circle band was the only thing that could work against a
+# flat ring. Now that /livox/lidar carries a real 3-D scan from the PhysX
+# raycast sensor, the hardware numbers are both meaningful and required.
+#
+# Two consequences are the PARITY TARGET, not regressions to fix:
+#   * the height band is measured UP FROM THE SENSOR, so tabletops and other
+#     raised surfaces become scan hits -- on the real robot they do too, and
+#     that is what shapes Nav2's obstacle behaviour;
+#   * the 165 deg front sector leaves the robot blind behind itself, which is
+#     what drives its nav_back and spin recoveries on hardware.
 pointcloud_to_laserscan:
   ros__parameters:
     use_sim_time: true
     target_frame: livox360
     transform_tolerance: 0.01
-    min_height: -0.05
-    max_height: 0.05
-    angle_min: -3.141592653589793
-    angle_max: 3.141592653589793
-    angle_increment: 0.017453292519943295
+    min_height: 0.0
+    max_height: 2.0
+    angle_min: -1.44
+    angle_max: 1.436
+    angle_increment: 0.008
     scan_time: 0.1
-    range_min: 0.3
-    range_max: 40.0
+    range_min: 0.2
+    range_max: 8.0
     use_inf: true
     inf_epsilon: 1.0

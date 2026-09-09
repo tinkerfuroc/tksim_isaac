@@ -104,6 +104,7 @@ class RosStandardGateway:
         *,
         development_lidar: bool = False,
         camera_rig: Any | None = None,
+        lidar_rig: Any | None = None,
         camera_pointcloud: bool = False,
     ) -> None:
         import rclpy
@@ -131,6 +132,12 @@ class RosStandardGateway:
         self.rclpy = rclpy
         self.backend = backend
         self.development_lidar = development_lidar
+        # A live PhysX raycast lidar, when one was built (see
+        # `tinker_sim_isaac.lidar_rig`). When present it supersedes the
+        # occupancy-map development lidar: the rig sees the actual physics
+        # scene, including bodies spawned after boot, which the map raycast
+        # structurally cannot.
+        self.lidar_rig = lidar_rig
         self.node = Node("tinker_isaac_gateway")
         # Keep commands and safety transitions in one FIFO.  Draining separate
         # queues by category can apply an old command after a stop has been
@@ -357,7 +364,16 @@ class RosStandardGateway:
             )
             self._executor_thread.start()
         self._state_stride = max(1, round((1.0 / 50.0) / backend.dt))
-        self._lidar_stride = max(1, round((1.0 / 10.0) / backend.dt))
+        # The lidar rate is declared in the sensor contract
+        # (`simulation/sensors/hardware-parity.json`, lidar.tick_rate_hz), not
+        # hard-coded here. It stays 10 Hz by default: the hardware launch
+        # file's `publish_freq = 20.0` carries the comment "(Step 1 probe --
+        # was 10.0)", so 20 Hz is a recent hardware experiment rather than the
+        # baseline the sim is meant to match.
+        lidar_hz = 10.0
+        if lidar_rig is not None:
+            lidar_hz = float(lidar_rig.spec.tick_rate_hz)
+        self._lidar_stride = max(1, round((1.0 / lidar_hz) / backend.dt))
         self._imu_stride = max(1, round((1.0 / 200.0) / backend.dt))
         self._status_stride = max(1, round((1.0 / 2.0) / backend.dt))
         self._tick = 0
@@ -1357,7 +1373,12 @@ class RosStandardGateway:
             self.imu_pub.publish(message)
         _lap("imu")
         if self._cloud_publish_enabled():
-            self.cloud_pub.publish(self._development_point_cloud(stamp))
+            if getattr(self, "lidar_rig", None) is not None:
+                cloud = self._live_point_cloud(stamp)
+                if cloud is not None:
+                    self.cloud_pub.publish(cloud)
+            else:
+                self.cloud_pub.publish(self._development_point_cloud(stamp))
         _lap("cloud")
         if self._tick % self._status_stride == 0:
             status = {
@@ -1366,6 +1387,12 @@ class RosStandardGateway:
                 "joint_command_topic": "/isaac_joint_commands",
                 "last_command_error": self._last_command_error,
                 "development_lidar": self.development_lidar,
+                # Which source is actually feeding /livox/lidar. "raycast" is
+                # the live PhysX sensor; "occupancy" is the static-map
+                # development raycast, which cannot see spawned bodies.
+                "lidar_source": (
+                    "raycast" if getattr(self, "lidar_rig", None) is not None else "occupancy"
+                ),
                 "safety_stop": bool(self.backend.safety_stopped),
                 # Task #39: whether isaacsim.ros2.sim_control's services
                 # (/spawn_entity et al) are being advertised at a point where
@@ -1752,8 +1779,52 @@ class RosStandardGateway:
         PointCloud2 is available").  Occupancy (when present) only shapes the
         raycast in :meth:`_development_point_cloud`; the dev lidar itself is the
         qualification sensor source and must always publish.
+
+        With a live raycast rig attached the cadence comes from the sensor
+        instead of the tick counter: the rig assembles a frame across the
+        sweep window and is ready exactly when that window closes, which is
+        the same 10 Hz but phase-locked to the scan rather than to `_tick`.
         """
+        rig = getattr(self, "lidar_rig", None)
+        if rig is not None:
+            return bool(rig.frame_ready)
         return bool(self.development_lidar) and self._tick % self._lidar_stride == 0
+
+    def _live_point_cloud(self, stamp):
+        """PointCloud2 from the live PhysX raycast rig, or ``None``.
+
+        Points arrive already in the sensor's own frame (the sensor is created
+        with ``output_frame="SENSOR"``), so there is no transform to apply --
+        only the same x/y/z FLOAT32 packing the development lidar uses, which
+        is what every consumer in tk26_navigation reads.
+        """
+        frame = self.lidar_rig.take_frame()
+        if frame is None:
+            return None
+        points, _times = frame
+        message = self._PointCloud2()
+        message.header.stamp = stamp
+        message.header.frame_id = self.lidar_rig.spec.frame_id
+        message.height = 1
+        message.width = int(points.shape[0])
+        message.is_bigendian = False
+        message.is_dense = True
+        for index, name in enumerate(("x", "y", "z")):
+            field = self._PointField()
+            field.name = name
+            field.offset = 4 * index
+            field.datatype = self._PointField.FLOAT32
+            field.count = 1
+            message.fields.append(field)
+        message.point_step = 12
+        message.row_step = 12 * message.width
+        # array.array('B') is rclpy's native uint8[] storage, so assignment is
+        # a memcpy; handing it `bytes` triggers per-element validation and was
+        # measured at ~45 ms/scan on the camera path.
+        # `take_frame` returns a fresh, contiguous float32 (M, 3) array, so
+        # this is already the exact little-endian x/y/z byte layout.
+        message.data = array.array("B", points.tobytes())
+        return message
 
     def _development_point_cloud(self, stamp):
         state = self.backend.root_state()

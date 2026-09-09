@@ -878,3 +878,115 @@ class SimSafetyStaleLoggingTest(unittest.TestCase):
             gateway._sim_age_stale(9.9, 0.5, source="src", wall_age=0.05)
         )
         self.assertEqual(logger.info_lines, [])
+
+
+class _FakeLidarRig:
+    """Stands in for ``lidar_rig.RaycastLidar`` without a running simulator.
+
+    Only the three members the gateway touches: the spec's ``frame_id`` and
+    ``tick_rate_hz``, the ``frame_ready`` latch, and ``take_frame``.
+    """
+
+    def __init__(self, points, *, frame_id: str = "livox360", ready: bool = True):
+        import numpy as np
+
+        self.spec = SimpleNamespace(frame_id=frame_id, tick_rate_hz=10.0)
+        self._points = np.asarray(points, dtype="float32").reshape(-1, 3)
+        self.frame_ready = ready
+        self.take_frame_calls = 0
+
+    def take_frame(self):
+        import numpy as np
+
+        self.take_frame_calls += 1
+        if not self.frame_ready:
+            return None
+        self.frame_ready = False
+        return self._points, np.zeros(self._points.shape[0])
+
+
+def _live_lidar_gateway(rig) -> RosStandardGateway:
+    from builtin_interfaces.msg import Time  # type: ignore[import-untyped]
+    from sensor_msgs.msg import PointCloud2, PointField  # type: ignore[import-untyped]
+
+    gateway = object.__new__(RosStandardGateway)
+    gateway.backend = _CloudBackend(None)
+    # The live rig supersedes the map raycast even when the development-lidar
+    # flag is set: both cannot feed /livox/lidar at once.
+    gateway.development_lidar = True
+    gateway.lidar_rig = rig
+    gateway._tick = 0
+    gateway._lidar_stride = 1
+    gateway._PointCloud2 = PointCloud2
+    gateway._PointField = PointField
+    gateway._stamp = lambda: Time(sec=0, nanosec=0)
+    return gateway
+
+
+class RosLiveRaycastLidarTest(unittest.TestCase):
+    """The live PhysX raycast source feeding ``/livox/lidar``."""
+
+    def test_publish_cadence_follows_the_sensor_not_the_tick_counter(self) -> None:
+        """The rig completes a frame when its sweep window closes.
+
+        Gating on ``_tick % stride`` instead would drift out of phase with the
+        scan and publish half-assembled frames.
+        """
+        rig = _FakeLidarRig([[1.0, 0.0, 0.0]], ready=False)
+        gateway = _live_lidar_gateway(rig)
+        self.assertFalse(gateway._cloud_publish_enabled())
+        rig.frame_ready = True
+        self.assertTrue(gateway._cloud_publish_enabled())
+
+    def test_live_cloud_packs_xyz_float32(self) -> None:
+        """Same 12-byte x/y/z layout every tk26_navigation consumer reads."""
+        points = [[1.0, 2.0, 3.0], [-4.0, 5.0, 6.0]]
+        gateway = _live_lidar_gateway(_FakeLidarRig(points))
+        cloud = gateway._live_point_cloud(_cloud_stamp())
+
+        self.assertEqual(cloud.width, 2)
+        self.assertEqual(cloud.height, 1)
+        self.assertEqual(cloud.point_step, 12)
+        self.assertEqual(cloud.row_step, 24)
+        self.assertEqual([field.name for field in cloud.fields], ["x", "y", "z"])
+        self.assertEqual([field.offset for field in cloud.fields], [0, 4, 8])
+        self.assertFalse(cloud.is_bigendian)
+        self.assertEqual(len(cloud.data), 24)
+
+        import struct
+
+        unpacked = struct.unpack("<6f", bytes(cloud.data))
+        self.assertEqual(list(unpacked), [1.0, 2.0, 3.0, -4.0, 5.0, 6.0])
+
+    def test_live_cloud_uses_the_spec_frame(self) -> None:
+        gateway = _live_lidar_gateway(_FakeLidarRig([[1.0, 0.0, 0.0]]))
+        cloud = gateway._live_point_cloud(_cloud_stamp())
+        self.assertEqual(cloud.header.frame_id, "livox360")
+
+    def test_an_empty_frame_still_publishes_a_valid_cloud(self) -> None:
+        """A frame where every ray missed is a legitimate zero-width cloud."""
+        import numpy as np
+
+        gateway = _live_lidar_gateway(_FakeLidarRig(np.zeros((0, 3))))
+        cloud = gateway._live_point_cloud(_cloud_stamp())
+        self.assertEqual(cloud.width, 0)
+        self.assertEqual(len(cloud.data), 0)
+
+    def test_no_frame_ready_yields_none_rather_than_a_stale_cloud(self) -> None:
+        rig = _FakeLidarRig([[1.0, 0.0, 0.0]], ready=False)
+        gateway = _live_lidar_gateway(rig)
+        self.assertIsNone(gateway._live_point_cloud(_cloud_stamp()))
+
+    def test_a_frame_is_consumed_once(self) -> None:
+        """Re-publishing the same frame would double-count points downstream."""
+        rig = _FakeLidarRig([[1.0, 0.0, 0.0]])
+        gateway = _live_lidar_gateway(rig)
+        self.assertIsNotNone(gateway._live_point_cloud(_cloud_stamp()))
+        self.assertIsNone(gateway._live_point_cloud(_cloud_stamp()))
+
+    def test_status_reports_which_source_feeds_the_topic(self) -> None:
+        live = _live_lidar_gateway(_FakeLidarRig([[1.0, 0.0, 0.0]]))
+        self.assertIsNotNone(getattr(live, "lidar_rig", None))
+
+        legacy = _cloud_gateway(development_lidar=True, occupancy=None)
+        self.assertIsNone(getattr(legacy, "lidar_rig", None))
