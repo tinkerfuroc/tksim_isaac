@@ -1,16 +1,20 @@
 """Which source feeds ``/livox/lidar``.
 
-The live PhysX raycast sensor is the right long-term source, but it does not
-work yet: in a live navigation-parity run it reports ``is_valid``, returns a
-full 19,893-ray reading, casts full-length 40 m rays from the correct world
-origin -- and hits NOTHING. Not the ground plane its first ray descends into
-~2.2 m ahead, not the robot it is bolted to. It therefore publishes
-correctly-timed EMPTY clouds, which is strictly worse for navigation than the
-occupancy-map fake it replaced: Nav2 gets no ``/scan``, AMCL never converges,
-and no goal is ever accepted.
+The live PhysX raycast sensor is the right long-term source: it casts against
+the physics scene, so it sees spawned objects and the person capsule, which the
+occupancy-map raycast structurally cannot.
 
-So it is OPT-IN until that is understood. These tests pin that default, because
-getting it wrong ships a silently broken navigation stack.
+It published EMPTY clouds until the scene-query fix, and the cause was never the
+sensor. IsaacLab's ``SimulationCfg.enable_scene_query_support`` defaults to
+False, which stops PhysX building a scene query manager at all, so every ray
+missed while the sensor still reported ``is_valid`` and returned a full-length
+reading. See ``tests/test_raycast_scene_query_contract.py``, which pins the
+wiring that turns it on.
+
+It stays OPT-IN here pending a live RTF measurement -- scene queries plus 19,893
+rays cost PhysX time, and whether that fits the sim's budget is a separate
+question from whether it works. These tests pin the default so flipping it stays
+a deliberate decision rather than a drive-by.
 
 ``run_sim`` defers every Isaac import into ``main()``, so importing it here
 needs no simulator.

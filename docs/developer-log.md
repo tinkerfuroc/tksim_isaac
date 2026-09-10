@@ -4,6 +4,85 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-09 (later) — root cause of the empty clouds: IsaacLab ships PhysX scene queries OFF
+
+The raycast lidar was never broken. **IsaacLab's
+`SimulationCfg.enable_scene_query_support` defaults to `False`, and with it off
+PhysX does not build a scene query manager at all,** so every raycast in the
+process silently misses. IsaacLab's own docstring says exactly that:
+
+> If set to False, the physics engine does not create the scene query manager
+> and the scene query functionality will not be available.
+
+A raycast lidar is nothing but scene queries. The flag is only settable at
+`SimulationCfg` construction, so it has to be decided before the backend
+exists — which is why `run_sim` now evaluates `raycast_lidar_enabled()` above
+the backend construction at all three profile sites and passes the result as
+`scene_query_support=`.
+
+**The evidence.** An isolated probe built the same `SimulationContext` the
+backend builds (CPU, `use_fabric`, same dt), authored colliders the way
+NVIDIA's own raycast-sensor test does, and compared the raw
+`omni.physx` scene query against the sensor reading from one origin. One flag
+flipped, nothing else changed:
+
+| `enable_scene_query_support` | raw `raycast_closest` | sensor |
+|---|---|---|
+| `False` | `hit: false` both rays | `is_valid: true`, `ray_count: 2`, **hits 0**, empty hit paths |
+| `True` | `/World/Ground` @1.0, `/World/Wall` @4.9 | **hits 2**, correct hit prim paths |
+
+The `False` row reproduces the live failure exactly, including the misleading
+`is_valid: true` with a full-length reading.
+
+**Why it never reproduced on the bench.**
+`isaaclab_physx/physics/physx_manager.py` force-enables the flag whenever a GUI
+is attached (`if has_gui: cfg.enable_scene_query_support = True`), and a plain
+`UsdPhysics.Scene` — what the bench harness and NVIDIA's tests use — has scene
+queries on by default. **Only a headless IsaacLab run is affected**, which is
+precisely what production is and what every probe wasn't.
+
+**Two earlier "defects" were this same cause and are withdrawn.**
+
+* *"`ray_time_offsets` sweep produces zero-length rays."* No. With scene
+  queries on, sweep casts correctly and returns real hit endpoints, so the ~9x
+  cost saving the sweep buys is still available.
+* *"The stepping API is the problem."* No. Measured by subscribing to
+  `omni.physx` step events directly: IsaacLab's `sim.step()` dispatched 20
+  events over 20 steps and the plugin's own clock advanced through 20 distinct
+  values. The plugin was ticking the whole time. What genuinely is absent under
+  IsaacLab is `SimulationManager`'s `PHYSICS_POST_STEP` (0 dispatches under
+  **both** `sim.step()` and `SimulationManager.step()`), so the gateway keeps
+  polling the rig from its publish path — but that only ever affected frame
+  assembly, never whether a ray hit anything.
+
+Ruled out by measurement, so nobody repeats them: prim authoring order, the
+self-filter, sensor validity, mount/pose, `use_fabric`, and the scene-query
+handle binding to the wrong scene (there is one scene and the binding is fine —
+the query manager simply did not exist).
+
+**Nothing else in the tree used scene queries**, so this flag broke only the
+lidar. Runs without `--raycast-lidar` are unchanged: `False` was already the
+effective default, and it is now passed explicitly.
+
+### Also fixed: `tinker-sim launch ... -- --flag` silently dropped the flag
+
+Found while trying to verify the above on a live run. The wrapper collects
+passthrough arguments with `argparse.REMAINDER`, which keeps the literal `--`
+separator as the remainder's first element — and the separator is *required* to
+get a `run_sim`-only flag past the wrapper's own parser. Forwarding it is
+silently destructive, because `run_sim` parses with `parse_known_args()` where a
+leading `--` means "everything after this is positional":
+
+    parse_known_args(["--", "--raycast-lidar"])  -> raycast_lidar=False
+    parse_known_args(["--raycast-lidar"])        -> raycast_lidar=True
+
+So `tinker-sim launch ... -- --raycast-lidar` booted the **occupancy** lidar
+with no error: `/sim/status/isaac` reported `lidar_source: "occupancy"`,
+`lidar: null`. A healthy-looking run measuring the wrong thing — the same class
+of silent failure as the scene-query default it was being used to investigate,
+and it costs a GPU run every time. The wrapper now strips a leading `--` before
+forwarding. This affected every `run_sim`-only flag, not just this one.
+
 ## 2026-09-09 — the raycast lidar publishes EMPTY clouds in a live run; back to opt-in
 
 The live Nav2 battery against PR #24's raycast lidar FAILED, and the failure is
