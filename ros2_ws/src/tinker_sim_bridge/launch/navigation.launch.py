@@ -12,6 +12,11 @@ if _tools.is_dir() and str(_tools) not in sys.path:
 
 from tinker_sim_deploy.runtime import resolve_arena_map_yaml, resolve_current_artifact
 
+from tinker_sim_bridge.nav_params_overlay import (
+    default_destination,
+    write_prior_map_params,
+)
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -68,6 +73,25 @@ def _resolve(context):
     bridge_share = Path(FindPackageShare("tinker_sim_bridge").perform(context))
     nav_share = Path(FindPackageShare("navigation_bringup").perform(context))
     env = {"PYTHONPATH": str(root / "simulation") + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    # Hardware's nav2_dwb_params.yaml sets the GLOBAL costmap up for SLAM
+    # without a prior map: a rolling 10x10 m window and no static_layer. This
+    # launch does not run SLAM -- it starts map_server on the arena map and
+    # localizes with AMCL -- so under the rolling window a goal beyond half
+    # the window is simply not on the costmap and the planner rejects it
+    # WITHOUT SEARCHING ("The goal sent to the planner is off the global
+    # costmap"). Measured live: a GPSR person-standing spot 3.4 m away,
+    # verified free against the published OccupancyGrid, was refused, and
+    # navigate_to_pose aborted after 108 s of recovery behaviours.
+    #
+    # gpsr.launch.py already applies the rollback the upstream file documents;
+    # this launch needs it for the same reason. The upstream file is
+    # hardware's and is left untouched -- the overlay writes a copy.
+    upstream_nav_params = (
+        workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"
+    )
+    nav_params = write_prior_map_params(
+        upstream_nav_params, default_destination(upstream_nav_params)
+    )
     return [
         Node(
             package="tinker_sim_bridge", executable="base_facade", output="screen",
@@ -129,7 +153,7 @@ def _resolve(context):
             PythonLaunchDescriptionSource(str(nav_share / "launch/localization_no_ekf_launch.py")),
             launch_arguments={
                 "use_sim_time": "True", "map": str(map_yaml),
-                "params_file": str(workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"),
+                "params_file": str(nav_params),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
         ),
@@ -145,7 +169,7 @@ def _resolve(context):
             PythonLaunchDescriptionSource(str(nav_share / "launch/navigation_dwb_launch.py")),
             launch_arguments={
                 "use_sim_time": "True",
-                "params_file": str(workspace / "src/tk26_navigation/src/navigation_bringup/params/nav2_dwb_params.yaml"),
+                "params_file": str(nav_params),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
         ),
