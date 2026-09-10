@@ -4,6 +4,58 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-10 — live Nav2 battery: the lidar chain works end to end, and it sees a person
+
+Run live: navigation-parity, arena `rcw2026`, headless, `--ros`, `--raycast-lidar`,
+40 Hz physics / 40 Hz control, `TINKER_SIM_LIDAR_CHANNELS=44` (columns left at
+the contract 349), plus the full `tinker_sim_bridge` navigation stack. Every
+stage that failed the previous battery now passes:
+
+| check | previous battery | this one |
+|---|---|---|
+| `/livox/lidar` non-empty | `width: 0` | **3,686-3,738 points/frame** |
+| real 3D structure | — | **z-spread 2.015 m**, radius 1.85-7.21 m |
+| `/scan` from pointcloud_to_laserscan | absent | **360 beams, 159 finite returns**, angle_min -1.44 / max 1.436 |
+| AMCL converged (`map->odom`) | never existed | **exists** |
+| `navigate_to_pose` accepted | never | **accepted** |
+| RTF, full stack attached | — | **0.521** |
+
+That RTF was measured with Nav2 attached AND while an unrelated 8-core stack
+was loading the box (loadavg 26 of 32), so it is a pessimistic figure.
+
+**DYNAMIC OBSTACLE: CONFIRMED.** This is the capability the whole change
+exists for -- the occupancy-map lidar raycasts a PGM, so a body absent from
+`map.yaml` is structurally invisible to it. A person USD spawned 1.5 m in front
+of the robot, sim-only (no Nav2 needed), counting points in a sensor-frame box
+and in a 1.0-2.0 m range band:
+
+| | box | band | cloud total |
+|---|---|---|---|
+| before spawn | 905 | 1,031 | 3,749 |
+| **with person** | **1,229** | **1,355** | **4,083** |
+| after delete | 905 | 1,031 | 3,759 |
+
++324 points in both measures, in **6 of 6 sampled frames**, and deleting the
+person returns both counts to exactly baseline. A controlled, reversible
+detection rather than drift.
+
+**Still open: the goal aborted.** `planner_server: GridBased: failed to create
+plan with tolerance 0.10 ... failed to generate a valid path to (1.32, 0.10)` —
+the planner never produced a path, so the controller never ran. The goal was
+chosen as `robot_map_pose + 1.5 m`, and map is offset from world by ~1.83 m
+here, so it plausibly landed in a wall or unknown space. Needs a goal taken
+from a known-free arena waypoint before anything is concluded about Nav2.
+
+**A probe bug worth not repeating.** The battery's first dynamic-obstacle
+attempt computed the person's position from the robot's pose in the MAP frame
+and passed it to `/spawn_entity`, which takes WORLD coordinates. With a ~1.83 m
+offset the person landed ~3.9 m away, outside the measurement box, and the test
+reported "not seen" for a body the sensor was never pointed at. The simulator's
+own `spawn_pose_check` was `ok` throughout (robot at world (-2.0000, -1.9999),
+error 7.7e-5 m) — the frame error was entirely in the probe. Take the robot's
+world pose from `spawn_pose_trace`/`spawn_pose_check`, not from TF's map frame,
+when talking to the spawn service.
+
 ## 2026-09-10 — the working raycast lidar costs ~half the RTF budget; measured recipes to get it back
 
 With the scene-query fix the lidar finally hits geometry, and it is expensive.
