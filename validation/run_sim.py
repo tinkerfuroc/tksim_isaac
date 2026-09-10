@@ -1054,6 +1054,7 @@ def main() -> int:
 
     def stop(_signum: int, _frame: object) -> None:
         nonlocal running
+        print(json.dumps({"event": "simulation_stop_signal", "signal": _signum}), flush=True)
         running = False
 
     signal.signal(signal.SIGINT, stop)
@@ -1775,6 +1776,9 @@ def main() -> int:
         failed = True
         traceback.print_exc()
     finally:
+        print(json.dumps({"event": "simulation_loop_exit", "running": running,
+                          "app_running": app.is_running(), "failed": failed,
+                          "duration_s": args.duration}), flush=True)
         if args.livestream:
             _clear_stream_ready_file(stream_ready_file)
         for subscription in streaming_event_subscriptions:

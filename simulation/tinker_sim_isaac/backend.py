@@ -11,6 +11,7 @@ from tinker_sim_isaac.physics_rate import (
     physics_substeps,
     resolve_control_hz,
     resolve_physics_hz,
+    configure_scene_velocity_iterations,
     resolve_solver_iterations,
 )
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
@@ -1271,6 +1272,13 @@ class IsaacWholeRobotBackend:
                         box,
                         translation=(x, y, 0.6),
                     )
+
+        scene_velocity = configure_scene_velocity_iterations(
+            self._sim.stage.GetPrimAtPath(self._sim.cfg.physics_prim_path),
+            _os.environ.get("TINKER_SIM_SCENE_VELOCITY_ITERATIONS"),
+        )
+        if scene_velocity is not None:
+            print(json.dumps({"scene_velocity_iterations": scene_velocity}), flush=True)
 
         # Opt-in articulation solver iteration override; unset, the USD's
         # authored counts (32 position / 1 velocity for tinker2) apply.

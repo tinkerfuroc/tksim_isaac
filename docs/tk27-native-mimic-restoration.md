@@ -108,3 +108,27 @@ default while respecting an explicit environment override. This default belongs
 to tk27 simulation startup; the generic simulator default remains unchanged.
 The earlier 128-iteration failure used software follower motors and is not
 equivalent to this rigid native linkage configuration.
+
+## Explicit scene velocity iteration experiments
+
+`TINKER_SIM_SCENE_VELOCITY_ITERATIONS` optionally sets both PhysX scene
+velocity-iteration bounds to an integer from 0 through 255 before the first
+simulation reset. Unset, all existing scene and articulation defaults remain
+unchanged. Scene bounds are necessary for a position-only TGS experiment:
+changing only the robot count can still leave an interacting object's larger
+count active for the solver island. This option does not rewrite measured
+velocities, object poses, contact forces, or qualification thresholds.
+
+The real USD-attribute unit test verifies default preservation, zero and eight
+iteration readback, and invalid values without changing existing attributes.
+All five solver-override tests and eight physics-rate tests pass. Runtime
+qualification of zero iterations is pending; this is not a promoted default.
+
+References: [PhysX constraint solver](https://nvidia-omniverse.github.io/PhysX/physx/5.8.0/docs/Simulation.html#solver-iterations)
+and the installed Isaac Lab `physx_manager_cfg.py` scene-bound documentation.
+
+Native shutdown now records the received signal and loop exit flags. Wall
+launch 38 records SIGINT, running=false, app_running=true, failed=false and
+duration=0. A strace of launch 39 attributes the first SIGINT to an external
+process, PID 2848715 / UID 1002, outside the launch process tree. This explains
+the interruption; it is not a physics crash.
