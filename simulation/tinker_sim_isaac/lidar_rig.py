@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -163,6 +164,76 @@ def _positive_int(raw: Mapping[str, Any], key: str, where: str) -> int:
     return value
 
 
+#: Below this the vertical fan is too sparse to put more than a stripe or two
+#: on a person-sized obstacle at room range.
+MINIMUM_LIDAR_CHANNELS = 8
+#: Below this the azimuth spacing gets wide enough that a person can fall
+#: BETWEEN two beams -- see test_the_floors_still_see_a_dynamic_obstacle.
+MINIMUM_LIDAR_COLUMNS = 90
+
+
+def _resolve_axis(
+    contract: int, override: str | None, name: str, floor: int
+) -> int:
+    """One axis of :func:`resolve_lidar_scale`."""
+    if override is None or not str(override).strip():
+        return int(contract)
+    text = str(override).strip()
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{name} must be a whole number, got {override!r}"
+        ) from None
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {override!r}")
+    if value > int(contract):
+        raise ValueError(
+            f"{name}={value} exceeds the hardware contract's {contract}; the "
+            "contract is what the Mid-360 actually does, and a run claiming "
+            "more would invalidate parity results measured against it"
+        )
+    if value < floor:
+        raise ValueError(
+            f"{name}={value} is below the {floor} floor; past it the scan can "
+            "no longer be relied on to see a person-sized dynamic obstacle"
+        )
+    return value
+
+
+def resolve_lidar_scale(
+    channels: int,
+    columns: int,
+    channels_override: str | None,
+    columns_override: str | None,
+) -> tuple[int, int]:
+    """Resolve the ray grid, honouring explicit opt-in overrides.
+
+    Every ray is a PhysX scene query paid ``physics_hz`` times per simulated
+    second, so ray count is the dominant term in the sensor's wall-clock cost
+    -- and the only effective one. Measured live in navigation-parity at 60 Hz
+    physics / 30 Hz control: the occupancy lidar runs at RTF 0.927 and the full
+    19,893-ray raycast at 0.483, i.e. the sensor costs ~0.99 s per simulated
+    second. ``max_range`` and ``min_range`` were both measured worth under 4%,
+    because the expense is TESTING each ray against the robot's ~200 convex
+    collision hulls rather than hitting anything.
+
+    Unset, the contract is returned unchanged. Lowering is a deliberate
+    fidelity-for-speed trade; raising is refused, because the contract file is
+    the hardware's own specification.
+    """
+    return (
+        _resolve_axis(
+            channels, channels_override, "TINKER_SIM_LIDAR_CHANNELS",
+            MINIMUM_LIDAR_CHANNELS,
+        ),
+        _resolve_axis(
+            columns, columns_override, "TINKER_SIM_LIDAR_COLUMNS",
+            MINIMUM_LIDAR_COLUMNS,
+        ),
+    )
+
+
 def load_lidar_spec(path: Path | str) -> LidarSpec:
     """Load the lidar contract; malformed declarations raise, never guess.
 
@@ -204,14 +275,22 @@ def load_lidar_spec(path: Path | str) -> LidarSpec:
     if not isinstance(self_filter, bool):
         raise LidarSpecError("lidar.raycast.self_filter must be a boolean")
 
+    # Opt-in fidelity-for-RTF trade; unset, the contract is used as written.
+    channels, columns = resolve_lidar_scale(
+        _positive_int(geometry, "channels", "lidar.raycast"),
+        _positive_int(geometry, "columns", "lidar.raycast"),
+        os.environ.get("TINKER_SIM_LIDAR_CHANNELS"),
+        os.environ.get("TINKER_SIM_LIDAR_COLUMNS"),
+    )
+
     return LidarSpec(
         pointcloud_topic=_string(lidar, "pointcloud_topic", "lidar"),
         scan_topic=_string(lidar, "scan_topic", "lidar"),
         frame_id=_string(lidar, "frame_id", "lidar"),
         tick_rate_hz=_positive(lidar, "tick_rate_hz", "lidar"),
         mount_prim=_string(geometry, "mount_prim", "lidar.raycast"),
-        channels=_positive_int(geometry, "channels", "lidar.raycast"),
-        columns=_positive_int(geometry, "columns", "lidar.raycast"),
+        channels=channels,
+        columns=columns,
         elevation_min_deg=elevation_min,
         elevation_max_deg=elevation_max,
         min_range_m=min_range,

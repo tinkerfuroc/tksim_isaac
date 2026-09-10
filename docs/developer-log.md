@@ -4,6 +4,60 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-10 — the working raycast lidar costs ~half the RTF budget; measured recipes to get it back
+
+With the scene-query fix the lidar finally hits geometry, and it is expensive.
+All numbers below are live navigation-parity runs (arena `rcw2026`, headless,
+`--ros`, no Nav2), RTF measured as sim-seconds per wall-second over ~30 s of
+`/clock` (400-900 samples per run):
+
+| config | rays | pts/s | RTF |
+|---|---|---|---|
+| occupancy lidar (the fake), 60/30 | — | — | **0.927** |
+| raycast full, stock 120 Hz/120 Hz | 19,893 | 198,930 | **0.151** |
+| raycast full, 60/30 | 19,893 | 198,930 | **0.483**, 0.490 |
+| raycast 32ch, 60/30 | 11,168 | 111,680 | **0.613** |
+| raycast full, 40/40 | 19,893 | 198,930 | **0.514** |
+| raycast 44ch, 40/40 | 15,356 | 153,560 | **0.551** |
+| raycast full, 40/40, self-filter OFF | 19,893 | 198,930 | 0.590 (unusable, see below) |
+
+**The sensor, not the simulator, is the budget.** At 60/30 the sim without it
+runs at 0.927 (1.079 s of compute per simulated second); with the full pattern
+it runs at 0.483 (2.070 s/sim-s). The lidar costs ~0.99 s/sim-s, and cost is
+very close to linear in ray count — 4.98e-5 s/ray at 19,893 and 4.94e-5 at
+11,168 — which makes ray count the only useful lever. `max_range` and
+`min_range` were previously measured worth under 4% each, because the expense
+is TESTING each ray against the robot's ~200 convex hulls, not hitting them.
+
+**Lowering `physics_hz` helps more than it looks.** With `sweep` on, the sensor
+fires a fixed 198,930 rays per SIMULATED second regardless of the physics rate,
+so dropping 60 Hz to 40 Hz cuts the simulator's own per-step cost without
+giving up any lidar fidelity: full scale goes 0.483 -> 0.514. Note the guard in
+`physics_rate.resolve_control_hz` — the control rate must divide the physics
+rate into whole substeps, so 40/30 is refused and 40/40 is the usable pair.
+
+**`TINKER_SIM_LIDAR_CHANNELS` / `_COLUMNS`** were added for this trade,
+mirroring `resolve_physics_hz`: the contract file stays the hardware's own
+specification, a run may deliberately lower the scale, and raising it is
+refused. Prefer cutting CHANNELS over COLUMNS: `pointcloud_to_laserscan`
+flattens the cloud to a 2D scan between `min_height` 0.0 and `max_height` 2.0,
+so azimuth resolution is what the navigation stack actually consumes, while
+vertical rays mostly contribute redundant points to it. 44 channels keeps the
+full 1.03 deg azimuth spacing and 77% of the vertical fan.
+
+**CORRECTION — "report_hit_prim_paths is free" was wrong.** The old 31.95 vs
+31.91 ms/step measurement was taken while scene queries were disabled, so no
+ray hit anything and no path was ever resolved; it measured nothing. Re-measured
+with rays actually hitting, the self-filter costs 0.514 -> 0.590, about 0.25
+s/sim-s. It cannot simply be turned off — without it the frame carries the
+~9,840 self-hits (`last_points` 14,002 vs 4,870) and the robot is walled in by
+its own body. **A cheaper self-filter is the largest single RTF lever left**:
+the plugin resolves a path string per hit and `self_hit_mask` then runs a
+Python `startswith` per live ray. Untried ideas: vectorising the mask with
+`np.char`, or dropping the path table entirely in favour of a per-ray hull
+distance (the robot's silhouette is constant in the SENSOR frame — but the arm
+moves, so that is only sound for a fixed-arm navigation run).
+
 ## 2026-09-09 (later) — root cause of the empty clouds: IsaacLab ships PhysX scene queries OFF
 
 The raycast lidar was never broken. **IsaacLab's
