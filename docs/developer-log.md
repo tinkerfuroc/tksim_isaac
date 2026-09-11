@@ -4,6 +4,191 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-10 — live Nav2 battery: the lidar chain works end to end, and it sees a person
+
+Run live: navigation-parity, arena `rcw2026`, headless, `--ros`, `--raycast-lidar`,
+40 Hz physics / 40 Hz control, `TINKER_SIM_LIDAR_CHANNELS=44` (columns left at
+the contract 349), plus the full `tinker_sim_bridge` navigation stack. Every
+stage that failed the previous battery now passes:
+
+| check | previous battery | this one |
+|---|---|---|
+| `/livox/lidar` non-empty | `width: 0` | **3,686-3,738 points/frame** |
+| real 3D structure | — | **z-spread 2.015 m**, radius 1.85-7.21 m |
+| `/scan` from pointcloud_to_laserscan | absent | **360 beams, 159 finite returns**, angle_min -1.44 / max 1.436 |
+| AMCL converged (`map->odom`) | never existed | **exists** |
+| `navigate_to_pose` accepted | never | **accepted** |
+| RTF, full stack attached | — | **0.521** |
+
+That RTF was measured with Nav2 attached AND while an unrelated 8-core stack
+was loading the box (loadavg 26 of 32), so it is a pessimistic figure.
+
+**DYNAMIC OBSTACLE: CONFIRMED.** This is the capability the whole change
+exists for -- the occupancy-map lidar raycasts a PGM, so a body absent from
+`map.yaml` is structurally invisible to it. A person USD spawned 1.5 m in front
+of the robot, sim-only (no Nav2 needed), counting points in a sensor-frame box
+and in a 1.0-2.0 m range band:
+
+| | box | band | cloud total |
+|---|---|---|---|
+| before spawn | 905 | 1,031 | 3,749 |
+| **with person** | **1,229** | **1,355** | **4,083** |
+| after delete | 905 | 1,031 | 3,759 |
+
++324 points in both measures, in **6 of 6 sampled frames**, and deleting the
+person returns both counts to exactly baseline. A controlled, reversible
+detection rather than drift.
+
+**Still open: the goal aborted.** `planner_server: GridBased: failed to create
+plan with tolerance 0.10 ... failed to generate a valid path to (1.32, 0.10)` —
+the planner never produced a path, so the controller never ran. The goal was
+chosen as `robot_map_pose + 1.5 m`, and map is offset from world by ~1.83 m
+here, so it plausibly landed in a wall or unknown space. Needs a goal taken
+from a known-free arena waypoint before anything is concluded about Nav2.
+
+**A probe bug worth not repeating.** The battery's first dynamic-obstacle
+attempt computed the person's position from the robot's pose in the MAP frame
+and passed it to `/spawn_entity`, which takes WORLD coordinates. With a ~1.83 m
+offset the person landed ~3.9 m away, outside the measurement box, and the test
+reported "not seen" for a body the sensor was never pointed at. The simulator's
+own `spawn_pose_check` was `ok` throughout (robot at world (-2.0000, -1.9999),
+error 7.7e-5 m) — the frame error was entirely in the probe. Take the robot's
+world pose from `spawn_pose_trace`/`spawn_pose_check`, not from TF's map frame,
+when talking to the spawn service.
+
+## 2026-09-10 — the working raycast lidar costs ~half the RTF budget; measured recipes to get it back
+
+With the scene-query fix the lidar finally hits geometry, and it is expensive.
+All numbers below are live navigation-parity runs (arena `rcw2026`, headless,
+`--ros`, no Nav2), RTF measured as sim-seconds per wall-second over ~30 s of
+`/clock` (400-900 samples per run):
+
+| config | rays | pts/s | RTF |
+|---|---|---|---|
+| occupancy lidar (the fake), 60/30 | — | — | **0.927** |
+| raycast full, stock 120 Hz/120 Hz | 19,893 | 198,930 | **0.151** |
+| raycast full, 60/30 | 19,893 | 198,930 | **0.483**, 0.490 |
+| raycast 32ch, 60/30 | 11,168 | 111,680 | **0.613** |
+| raycast full, 40/40 | 19,893 | 198,930 | **0.514** |
+| raycast 44ch, 40/40 | 15,356 | 153,560 | **0.551** |
+| raycast full, 40/40, self-filter OFF | 19,893 | 198,930 | 0.590 (unusable, see below) |
+
+**The sensor, not the simulator, is the budget.** At 60/30 the sim without it
+runs at 0.927 (1.079 s of compute per simulated second); with the full pattern
+it runs at 0.483 (2.070 s/sim-s). The lidar costs ~0.99 s/sim-s, and cost is
+very close to linear in ray count — 4.98e-5 s/ray at 19,893 and 4.94e-5 at
+11,168 — which makes ray count the only useful lever. `max_range` and
+`min_range` were previously measured worth under 4% each, because the expense
+is TESTING each ray against the robot's ~200 convex hulls, not hitting them.
+
+**Lowering `physics_hz` helps more than it looks.** With `sweep` on, the sensor
+fires a fixed 198,930 rays per SIMULATED second regardless of the physics rate,
+so dropping 60 Hz to 40 Hz cuts the simulator's own per-step cost without
+giving up any lidar fidelity: full scale goes 0.483 -> 0.514. Note the guard in
+`physics_rate.resolve_control_hz` — the control rate must divide the physics
+rate into whole substeps, so 40/30 is refused and 40/40 is the usable pair.
+
+**`TINKER_SIM_LIDAR_CHANNELS` / `_COLUMNS`** were added for this trade,
+mirroring `resolve_physics_hz`: the contract file stays the hardware's own
+specification, a run may deliberately lower the scale, and raising it is
+refused. Prefer cutting CHANNELS over COLUMNS: `pointcloud_to_laserscan`
+flattens the cloud to a 2D scan between `min_height` 0.0 and `max_height` 2.0,
+so azimuth resolution is what the navigation stack actually consumes, while
+vertical rays mostly contribute redundant points to it. 44 channels keeps the
+full 1.03 deg azimuth spacing and 77% of the vertical fan.
+
+**CORRECTION — "report_hit_prim_paths is free" was wrong.** The old 31.95 vs
+31.91 ms/step measurement was taken while scene queries were disabled, so no
+ray hit anything and no path was ever resolved; it measured nothing. Re-measured
+with rays actually hitting, the self-filter costs 0.514 -> 0.590, about 0.25
+s/sim-s. It cannot simply be turned off — without it the frame carries the
+~9,840 self-hits (`last_points` 14,002 vs 4,870) and the robot is walled in by
+its own body. **A cheaper self-filter is the largest single RTF lever left**:
+the plugin resolves a path string per hit and `self_hit_mask` then runs a
+Python `startswith` per live ray. Untried ideas: vectorising the mask with
+`np.char`, or dropping the path table entirely in favour of a per-ray hull
+distance (the robot's silhouette is constant in the SENSOR frame — but the arm
+moves, so that is only sound for a fixed-arm navigation run).
+
+## 2026-09-09 (later) — root cause of the empty clouds: IsaacLab ships PhysX scene queries OFF
+
+The raycast lidar was never broken. **IsaacLab's
+`SimulationCfg.enable_scene_query_support` defaults to `False`, and with it off
+PhysX does not build a scene query manager at all,** so every raycast in the
+process silently misses. IsaacLab's own docstring says exactly that:
+
+> If set to False, the physics engine does not create the scene query manager
+> and the scene query functionality will not be available.
+
+A raycast lidar is nothing but scene queries. The flag is only settable at
+`SimulationCfg` construction, so it has to be decided before the backend
+exists — which is why `run_sim` now evaluates `raycast_lidar_enabled()` above
+the backend construction at all three profile sites and passes the result as
+`scene_query_support=`.
+
+**The evidence.** An isolated probe built the same `SimulationContext` the
+backend builds (CPU, `use_fabric`, same dt), authored colliders the way
+NVIDIA's own raycast-sensor test does, and compared the raw
+`omni.physx` scene query against the sensor reading from one origin. One flag
+flipped, nothing else changed:
+
+| `enable_scene_query_support` | raw `raycast_closest` | sensor |
+|---|---|---|
+| `False` | `hit: false` both rays | `is_valid: true`, `ray_count: 2`, **hits 0**, empty hit paths |
+| `True` | `/World/Ground` @1.0, `/World/Wall` @4.9 | **hits 2**, correct hit prim paths |
+
+The `False` row reproduces the live failure exactly, including the misleading
+`is_valid: true` with a full-length reading.
+
+**Why it never reproduced on the bench.**
+`isaaclab_physx/physics/physx_manager.py` force-enables the flag whenever a GUI
+is attached (`if has_gui: cfg.enable_scene_query_support = True`), and a plain
+`UsdPhysics.Scene` — what the bench harness and NVIDIA's tests use — has scene
+queries on by default. **Only a headless IsaacLab run is affected**, which is
+precisely what production is and what every probe wasn't.
+
+**Two earlier "defects" were this same cause and are withdrawn.**
+
+* *"`ray_time_offsets` sweep produces zero-length rays."* No. With scene
+  queries on, sweep casts correctly and returns real hit endpoints, so the ~9x
+  cost saving the sweep buys is still available.
+* *"The stepping API is the problem."* No. Measured by subscribing to
+  `omni.physx` step events directly: IsaacLab's `sim.step()` dispatched 20
+  events over 20 steps and the plugin's own clock advanced through 20 distinct
+  values. The plugin was ticking the whole time. What genuinely is absent under
+  IsaacLab is `SimulationManager`'s `PHYSICS_POST_STEP` (0 dispatches under
+  **both** `sim.step()` and `SimulationManager.step()`), so the gateway keeps
+  polling the rig from its publish path — but that only ever affected frame
+  assembly, never whether a ray hit anything.
+
+Ruled out by measurement, so nobody repeats them: prim authoring order, the
+self-filter, sensor validity, mount/pose, `use_fabric`, and the scene-query
+handle binding to the wrong scene (there is one scene and the binding is fine —
+the query manager simply did not exist).
+
+**Nothing else in the tree used scene queries**, so this flag broke only the
+lidar. Runs without `--raycast-lidar` are unchanged: `False` was already the
+effective default, and it is now passed explicitly.
+
+### Also fixed: `tinker-sim launch ... -- --flag` silently dropped the flag
+
+Found while trying to verify the above on a live run. The wrapper collects
+passthrough arguments with `argparse.REMAINDER`, which keeps the literal `--`
+separator as the remainder's first element — and the separator is *required* to
+get a `run_sim`-only flag past the wrapper's own parser. Forwarding it is
+silently destructive, because `run_sim` parses with `parse_known_args()` where a
+leading `--` means "everything after this is positional":
+
+    parse_known_args(["--", "--raycast-lidar"])  -> raycast_lidar=False
+    parse_known_args(["--raycast-lidar"])        -> raycast_lidar=True
+
+So `tinker-sim launch ... -- --raycast-lidar` booted the **occupancy** lidar
+with no error: `/sim/status/isaac` reported `lidar_source: "occupancy"`,
+`lidar: null`. A healthy-looking run measuring the wrong thing — the same class
+of silent failure as the scene-query default it was being used to investigate,
+and it costs a GPU run every time. The wrapper now strips a leading `--` before
+forwarding. This affected every `run_sim`-only flag, not just this one.
+
 ## 2026-09-09 — the raycast lidar publishes EMPTY clouds in a live run; back to opt-in
 
 The live Nav2 battery against PR #24's raycast lidar FAILED, and the failure is

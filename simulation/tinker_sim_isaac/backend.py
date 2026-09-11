@@ -896,6 +896,7 @@ class IsaacWholeRobotBackend:
         wall_color_fn: Callable[[int], tuple[float, float, float]] | None = None,
         arena_artifact: Path | None = None,
         spawn_xy: tuple[float, float] = (0.0, 0.0),
+        scene_query_support: bool = False,
     ) -> None:
         spawn_x, spawn_y = validate_spawn_xy(spawn_xy)
         # Commanded spawn xy, remembered for the boot-time spawn-pose guard
@@ -1217,6 +1218,26 @@ class IsaacWholeRobotBackend:
                 device=self.physics_device,
                 render_interval=1,
                 use_fabric=_use_fabric,
+                # PhysX builds no scene query manager unless asked, and
+                # IsaacLab defaults this OFF for speed. Every raycast then
+                # silently misses: the sensor still reports is_valid, still
+                # returns a full-length reading, still casts full-length rays
+                # from the correct world origin, and hits NOTHING -- not the
+                # ground plane, not the robot it is mounted on. That is how
+                # PR #24's lidar published correctly-timed EMPTY clouds for an
+                # entire Nav2 battery with no error logged anywhere.
+                #
+                # Measured in isolation, this flag alone flipped:
+                #   False -> raw raycast_closest MISSES, sensor hits 0
+                #   True  -> hits /World/Ground @1.0, sensor reports hit paths
+                #
+                # It is only settable here, at SimulationCfg construction, so
+                # the caller has to know about the lidar before the backend
+                # exists. Left off by default because it costs PhysX time that
+                # a run without a raycast sensor has no use for. (IsaacLab
+                # force-enables it whenever a GUI is attached, which is why
+                # this never reproduced interactively.)
+                enable_scene_query_support=bool(scene_query_support),
             )
         )
         self._timeline = omni.timeline.get_timeline_interface()
