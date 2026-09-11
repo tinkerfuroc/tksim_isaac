@@ -19,6 +19,7 @@ from tinker_sim_core.command_mux import (
     decode_snapshot_packet,
 )
 from tinker_sim_core.observability import format_duration
+from tinker_sim_isaac import imu_model
 from tinker_sim_isaac.backend import pose_in_frame
 from tinker_sim_isaac.camera_rig import (
     camera_info_fields,
@@ -46,6 +47,18 @@ MAX_RETIRED_COMMAND_EPOCHS = 64
 # when the backend carries no occupancy map.  Finite and inside the 40 m lidar
 # bound so the qualification cloud consumer always receives a non-empty cloud.
 _FALLBACK_LIDAR_RANGE_M = 1.0
+#: Frame the Livox sensors publish in. Not a URDF link: the bridge launches own
+#: a static ``base_link -> livox360`` transform (see
+#: ros2_ws/src/tinker_sim_bridge/launch/navigation.launch.py), which is why the
+#: lidar and IMU share it.
+_LIVOX_FRAME_ID = "livox360"
+#: Declared by simulation/sensors/hardware-parity.json (imu.tick_rate_hz); the
+#: real Mid-360's internal IMU samples at 200 Hz.
+_DEFAULT_IMU_RATE_HZ = 200.0
+#: The URDF's ``livox_joint`` origin, base_link -> livox_frame. Used ONLY when
+#: the import welded that link onto its parent so the IMU has to be sampled
+#: from ``base_link`` and carry the lever arm by hand.
+_LIVOX_MOUNT_OFFSET_XYZ = (0.09, 0.0, 0.195)
 # Safety and command messages use separate ROS topics.  Tolerate only a short
 # bounded packet gap at that boundary; no packet is applied while resyncing.
 BASELINE_RESYNC_WINDOW_S = 0.25
@@ -104,6 +117,8 @@ class RosStandardGateway:
         *,
         development_lidar: bool = False,
         camera_rig: Any | None = None,
+        lidar_rig: Any | None = None,
+        imu_rate_hz: float = _DEFAULT_IMU_RATE_HZ,
         camera_pointcloud: bool = False,
     ) -> None:
         import rclpy
@@ -131,6 +146,12 @@ class RosStandardGateway:
         self.rclpy = rclpy
         self.backend = backend
         self.development_lidar = development_lidar
+        # A live PhysX raycast lidar, when one was built (see
+        # `tinker_sim_isaac.lidar_rig`). When present it supersedes the
+        # occupancy-map development lidar: the rig sees the actual physics
+        # scene, including bodies spawned after boot, which the map raycast
+        # structurally cannot.
+        self.lidar_rig = lidar_rig
         self.node = Node("tinker_isaac_gateway")
         # Keep commands and safety transitions in one FIFO.  Draining separate
         # queues by category can apply an old command after a stop has been
@@ -357,8 +378,26 @@ class RosStandardGateway:
             )
             self._executor_thread.start()
         self._state_stride = max(1, round((1.0 / 50.0) / backend.dt))
-        self._lidar_stride = max(1, round((1.0 / 10.0) / backend.dt))
-        self._imu_stride = max(1, round((1.0 / 200.0) / backend.dt))
+        # The lidar rate is declared in the sensor contract
+        # (`simulation/sensors/hardware-parity.json`, lidar.tick_rate_hz), not
+        # hard-coded here. It stays 10 Hz by default: the hardware launch
+        # file's `publish_freq = 20.0` carries the comment "(Step 1 probe --
+        # was 10.0)", so 20 Hz is a recent hardware experiment rather than the
+        # baseline the sim is meant to match.
+        lidar_hz = 10.0
+        if lidar_rig is not None:
+            lidar_hz = float(lidar_rig.spec.tick_rate_hz)
+        self._lidar_stride = max(1, round((1.0 / lidar_hz) / backend.dt))
+        # Declared by simulation/sensors/hardware-parity.json (imu.tick_rate_hz),
+        # matching the real Mid-360's 200 Hz internal IMU.
+        self._imu_stride = max(1, round((1.0 / imu_rate_hz) / backend.dt))
+        self._imu_sample_period_s = 1.0 / imu_rate_hz
+        self._imu_frame_id = _LIVOX_FRAME_ID
+        #: Only used when the URDF import welded `livox_frame` onto its
+        #: parent and the IMU is sampled from `base_link` instead; mirrors
+        #: the URDF's livox_joint origin.
+        self._imu_mount_offset = _LIVOX_MOUNT_OFFSET_XYZ
+        self._imu_previous_velocity: tuple[float, float, float] | None = None
         self._status_stride = max(1, round((1.0 / 2.0) / backend.dt))
         self._tick = 0
         # Opt-in wall-time attribution of publish() (TINKER_SIM_PROFILE=1,
@@ -380,6 +419,16 @@ class RosStandardGateway:
         self._spin_profile = {
             "events": 0, "commands": 0, "safety": 0, "command_joints_s": 0.0, "n": 0,
         }
+        # Task #39: isaacsim.ros2.sim_control's services (/spawn_entity et
+        # al) can be advertised well before the caller can actually pump Kit
+        # regularly enough to serve them (backend/camera warm-up). False here
+        # and flipped by mark_services_ready() at the one point run_sim.py's
+        # main() knows that warm-up is over and its main loop is about to
+        # start -- see validation/run_sim.py's _enable_sim_control_services.
+        # A client should treat this as the readiness gate ahead of any
+        # /spawn_entity-family call, not wait_for_service() alone.
+        self._services_ready = False
+        self._services_ready_since: float | None = None
 
     def _spin_executor(self) -> None:
         from rclpy.executors import ExternalShutdownException
@@ -1333,21 +1382,26 @@ class RosStandardGateway:
             self.joint_pub.publish(message)
         _lap("joint_state")
         if self._tick % self._imu_stride == 0:
-            state = self.backend.root_state()
-            message = self._Imu()
-            message.header.stamp = stamp
-            message.header.frame_id = "livox360"
-            message.orientation_covariance[0] = -1.0
-            angular = state["angular_velocity_world"]
-            (
-                message.angular_velocity.x,
-                message.angular_velocity.y,
-                message.angular_velocity.z,
-            ) = angular
-            self.imu_pub.publish(message)
+            self.imu_pub.publish(self._imu_message(stamp))
         _lap("imu")
+        rig = getattr(self, "lidar_rig", None)
+        if rig is not None:
+            # Drive the frame accumulator from the publish path as well as
+            # from the rig's physics callback. The callback is only dispatched
+            # when physics is stepped through SimulationManager; the
+            # production loop steps through IsaacLab's SimulationContext, where
+            # it is not, and the first live nav battery consequently saw
+            # /livox/lidar silent for an entire run while the sensor happily
+            # cast rays. Folding is deduplicated by physics step, so having
+            # both drivers is safe rather than double-counting.
+            rig.accumulate()
         if self._cloud_publish_enabled():
-            self.cloud_pub.publish(self._development_point_cloud(stamp))
+            if rig is not None:
+                cloud = self._live_point_cloud(stamp)
+                if cloud is not None:
+                    self.cloud_pub.publish(cloud)
+            else:
+                self.cloud_pub.publish(self._development_point_cloud(stamp))
         _lap("cloud")
         if self._tick % self._status_stride == 0:
             status = {
@@ -1356,7 +1410,30 @@ class RosStandardGateway:
                 "joint_command_topic": "/isaac_joint_commands",
                 "last_command_error": self._last_command_error,
                 "development_lidar": self.development_lidar,
+                # Which source is actually feeding /livox/lidar. "raycast" is
+                # the live PhysX sensor; "occupancy" is the static-map
+                # development raycast, which cannot see spawned bodies.
+                "lidar_source": (
+                    "raycast" if getattr(self, "lidar_rig", None) is not None else "occupancy"
+                ),
+                # Frame-assembly counters. A raycast lidar that constructs
+                # cleanly can still publish nothing if its accumulator never
+                # closes a window; without these that failure is invisible
+                # from outside the process.
+                "lidar": self._lidar_diagnostics(),
                 "safety_stop": bool(self.backend.safety_stopped),
+                # Task #39: whether isaacsim.ros2.sim_control's services
+                # (/spawn_entity et al) are being advertised at a point where
+                # they can actually be served promptly -- see
+                # mark_services_ready(). Clients (e.g. tools/gpsr_spawn.py)
+                # should gate their first call on this, not just
+                # wait_for_service(), which returns true far earlier.
+                # getattr(..., default) rather than a direct attribute read:
+                # test doubles built via object.__new__(RosStandardGateway)
+                # (skipping __init__) exercise this publish() path without
+                # ever going through the constructor that sets these.
+                "services_ready": getattr(self, "_services_ready", False),
+                "services_ready_since": getattr(self, "_services_ready_since", None),
             }
             if self._camera_rig is not None:
                 status["camera_skipped_frames"] = self.camera_skipped_frames
@@ -1704,6 +1781,21 @@ class RosStandardGateway:
             if self.node.context.ok():
                 raise
 
+    def mark_services_ready(self) -> None:
+        """Record that isaacsim.ros2.sim_control's services are being
+        advertised at a point where the main loop is about to start pumping
+        Kit regularly -- i.e. requests can now actually be served promptly.
+
+        Called exactly once, by ``run_sim.py``'s ``_enable_sim_control_services``
+        (Task #39), right where the boot-config JSON prints today. Idempotent
+        and safe to call more than once; the timestamp is only recorded on
+        the first call.
+        """
+        if self._services_ready:
+            return
+        self._services_ready = True
+        self._services_ready_since = self.backend.simulation_time
+
     def _cloud_publish_enabled(self) -> bool:
         """Whether the development lidar cloud should publish on this tick.
 
@@ -1715,8 +1807,162 @@ class RosStandardGateway:
         PointCloud2 is available").  Occupancy (when present) only shapes the
         raycast in :meth:`_development_point_cloud`; the dev lidar itself is the
         qualification sensor source and must always publish.
+
+        With a live raycast rig attached the cadence comes from the sensor
+        instead of the tick counter: the rig assembles a frame across the
+        sweep window and is ready exactly when that window closes, which is
+        the same 10 Hz but phase-locked to the scan rather than to `_tick`.
         """
+        rig = getattr(self, "lidar_rig", None)
+        if rig is not None:
+            return bool(rig.frame_ready)
         return bool(self.development_lidar) and self._tick % self._lidar_stride == 0
+
+    def _lidar_diagnostics(self):
+        """Frame-assembly counters for the status heartbeat, or ``None``."""
+        rig = getattr(self, "lidar_rig", None)
+        if rig is None:
+            return None
+        reader = getattr(rig, "diagnostics", None)
+        if reader is None:
+            return None
+        try:
+            return reader()
+        except Exception:  # noqa: BLE001 - a diagnostic must never break status
+            return None
+
+    def _imu_message(self, stamp):
+        """``/livox/imu`` from the sensor body's own state.
+
+        Replaces a stub that published a world-frame angular velocity stamped
+        ``livox360`` and left ``linear_acceleration`` unassigned -- i.e. an
+        accelerometer reading (0, 0, 0), which is permanent freefall rather
+        than the ~9.81 m/s^2 a level sensor reads at rest. FAST-LIO uses that
+        vector to find "down" before it will initialise.
+        """
+        message = self._Imu()
+        message.header.stamp = stamp
+        message.header.frame_id = getattr(self, "_imu_frame_id", _LIVOX_FRAME_ID)
+        # REP-145: negative first element = "no orientation from this sensor",
+        # which is also what the real driver reports.
+        message.orientation_covariance[0] = imu_model.ORIENTATION_UNAVAILABLE
+
+        state = self._imu_backend_state()
+        acceleration = state.get("linear_acceleration_world")
+        if acceleration is None:
+            # Backend exposes no acceleration view; difference the body's own
+            # velocity over the elapsed sim time instead of publishing zeros.
+            acceleration = imu_model.finite_difference_acceleration(
+                state["linear_velocity_world"],
+                getattr(self, "_imu_previous_velocity", None),
+                getattr(self, "_imu_sample_period_s", 1.0 / _DEFAULT_IMU_RATE_HZ),
+            )
+        self._imu_previous_velocity = state["linear_velocity_world"]
+
+        sample = imu_model.imu_sample(
+            quaternion_wxyz=state["quaternion_wxyz"],
+            angular_velocity_world=state["angular_velocity_world"],
+            linear_acceleration_world=acceleration,
+            angular_acceleration_world=state.get("angular_acceleration_world")
+            or (0.0, 0.0, 0.0),
+            lever_arm_world=self._imu_lever_arm_world(state),
+        )
+
+        (
+            message.angular_velocity.x,
+            message.angular_velocity.y,
+            message.angular_velocity.z,
+        ) = sample.angular_velocity
+        (
+            message.linear_acceleration.x,
+            message.linear_acceleration.y,
+            message.linear_acceleration.z,
+        ) = sample.linear_acceleration
+        # All-zero covariance reads as "unknown" (REP-145) and invites
+        # consumers to treat the signal as exact; declare a small one instead.
+        for axis in (0, 4, 8):
+            message.angular_velocity_covariance[axis] = (
+                imu_model.ANGULAR_VELOCITY_VARIANCE
+            )
+            message.linear_acceleration_covariance[axis] = (
+                imu_model.LINEAR_ACCELERATION_VARIANCE
+            )
+        return message
+
+    def _imu_backend_state(self):
+        """Backend IMU state, falling back to ``root_state`` on older backends."""
+        reader = getattr(self.backend, "imu_state", None)
+        if reader is not None:
+            return reader()
+        state = self.backend.root_state()
+        # `.get` with defaults, not `[]`: this is the compatibility path for
+        # backends that predate `imu_state`, including minimal test doubles
+        # that only supply the one field the old stub happened to read. A
+        # missing field must degrade the sample, never raise inside publish().
+        return {
+            "body": "root",
+            "quaternion_wxyz": state.get("quaternion_wxyz", (1.0, 0.0, 0.0, 0.0)),
+            "angular_velocity_world": state.get(
+                "angular_velocity_world", (0.0, 0.0, 0.0)
+            ),
+            "linear_velocity_world": state.get(
+                "linear_velocity_world", (0.0, 0.0, 0.0)
+            ),
+            "linear_acceleration_world": None,
+            "angular_acceleration_world": None,
+        }
+
+    def _imu_lever_arm_world(self, state):
+        """Sensor offset from the sampled body, rotated into the world frame.
+
+        Zero when the sampled body IS the sensor's link (``livox_frame``),
+        which is the normal case and the reason this is usually a no-op: PhysX
+        already reports that link's acceleration with the centripetal and
+        tangential terms in it. Non-zero only when the URDF import welded
+        ``livox_frame`` onto its parent and we are sampling ``base_link``.
+        """
+        if state.get("body") == "livox_frame":
+            return (0.0, 0.0, 0.0)
+        return imu_model.rotate_vector(
+            state["quaternion_wxyz"],
+            getattr(self, "_imu_mount_offset", _LIVOX_MOUNT_OFFSET_XYZ),
+        )
+
+    def _live_point_cloud(self, stamp):
+        """PointCloud2 from the live PhysX raycast rig, or ``None``.
+
+        Points arrive already in the sensor's own frame (the sensor is created
+        with ``output_frame="SENSOR"``), so there is no transform to apply --
+        only the same x/y/z FLOAT32 packing the development lidar uses, which
+        is what every consumer in tk26_navigation reads.
+        """
+        frame = self.lidar_rig.take_frame()
+        if frame is None:
+            return None
+        points, _times = frame
+        message = self._PointCloud2()
+        message.header.stamp = stamp
+        message.header.frame_id = self.lidar_rig.spec.frame_id
+        message.height = 1
+        message.width = int(points.shape[0])
+        message.is_bigendian = False
+        message.is_dense = True
+        for index, name in enumerate(("x", "y", "z")):
+            field = self._PointField()
+            field.name = name
+            field.offset = 4 * index
+            field.datatype = self._PointField.FLOAT32
+            field.count = 1
+            message.fields.append(field)
+        message.point_step = 12
+        message.row_step = 12 * message.width
+        # array.array('B') is rclpy's native uint8[] storage, so assignment is
+        # a memcpy; handing it `bytes` triggers per-element validation and was
+        # measured at ~45 ms/scan on the camera path.
+        # `take_frame` returns a fresh, contiguous float32 (M, 3) array, so
+        # this is already the exact little-endian x/y/z byte layout.
+        message.data = array.array("B", points.tobytes())
+        return message
 
     def _development_point_cloud(self, stamp):
         state = self.backend.root_state()
@@ -1757,7 +2003,7 @@ class RosStandardGateway:
                     )
         message = self._PointCloud2()
         message.header.stamp = stamp
-        message.header.frame_id = "livox360"
+        message.header.frame_id = _LIVOX_FRAME_ID
         message.height = 1
         message.width = len(points)
         message.is_bigendian = False

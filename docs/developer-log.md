@@ -4,6 +4,440 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-10 — live Nav2 battery: the lidar chain works end to end, and it sees a person
+
+Run live: navigation-parity, arena `rcw2026`, headless, `--ros`, `--raycast-lidar`,
+40 Hz physics / 40 Hz control, `TINKER_SIM_LIDAR_CHANNELS=44` (columns left at
+the contract 349), plus the full `tinker_sim_bridge` navigation stack. Every
+stage that failed the previous battery now passes:
+
+| check | previous battery | this one |
+|---|---|---|
+| `/livox/lidar` non-empty | `width: 0` | **3,686-3,738 points/frame** |
+| real 3D structure | — | **z-spread 2.015 m**, radius 1.85-7.21 m |
+| `/scan` from pointcloud_to_laserscan | absent | **360 beams, 159 finite returns**, angle_min -1.44 / max 1.436 |
+| AMCL converged (`map->odom`) | never existed | **exists** |
+| `navigate_to_pose` accepted | never | **accepted** |
+| RTF, full stack attached | — | **0.521** |
+
+That RTF was measured with Nav2 attached AND while an unrelated 8-core stack
+was loading the box (loadavg 26 of 32), so it is a pessimistic figure.
+
+**DYNAMIC OBSTACLE: CONFIRMED.** This is the capability the whole change
+exists for -- the occupancy-map lidar raycasts a PGM, so a body absent from
+`map.yaml` is structurally invisible to it. A person USD spawned 1.5 m in front
+of the robot, sim-only (no Nav2 needed), counting points in a sensor-frame box
+and in a 1.0-2.0 m range band:
+
+| | box | band | cloud total |
+|---|---|---|---|
+| before spawn | 905 | 1,031 | 3,749 |
+| **with person** | **1,229** | **1,355** | **4,083** |
+| after delete | 905 | 1,031 | 3,759 |
+
++324 points in both measures, in **6 of 6 sampled frames**, and deleting the
+person returns both counts to exactly baseline. A controlled, reversible
+detection rather than drift.
+
+**Still open: the goal aborted.** `planner_server: GridBased: failed to create
+plan with tolerance 0.10 ... failed to generate a valid path to (1.32, 0.10)` —
+the planner never produced a path, so the controller never ran. The goal was
+chosen as `robot_map_pose + 1.5 m`, and map is offset from world by ~1.83 m
+here, so it plausibly landed in a wall or unknown space. Needs a goal taken
+from a known-free arena waypoint before anything is concluded about Nav2.
+
+**A probe bug worth not repeating.** The battery's first dynamic-obstacle
+attempt computed the person's position from the robot's pose in the MAP frame
+and passed it to `/spawn_entity`, which takes WORLD coordinates. With a ~1.83 m
+offset the person landed ~3.9 m away, outside the measurement box, and the test
+reported "not seen" for a body the sensor was never pointed at. The simulator's
+own `spawn_pose_check` was `ok` throughout (robot at world (-2.0000, -1.9999),
+error 7.7e-5 m) — the frame error was entirely in the probe. Take the robot's
+world pose from `spawn_pose_trace`/`spawn_pose_check`, not from TF's map frame,
+when talking to the spawn service.
+
+## 2026-09-10 — the working raycast lidar costs ~half the RTF budget; measured recipes to get it back
+
+With the scene-query fix the lidar finally hits geometry, and it is expensive.
+All numbers below are live navigation-parity runs (arena `rcw2026`, headless,
+`--ros`, no Nav2), RTF measured as sim-seconds per wall-second over ~30 s of
+`/clock` (400-900 samples per run):
+
+| config | rays | pts/s | RTF |
+|---|---|---|---|
+| occupancy lidar (the fake), 60/30 | — | — | **0.927** |
+| raycast full, stock 120 Hz/120 Hz | 19,893 | 198,930 | **0.151** |
+| raycast full, 60/30 | 19,893 | 198,930 | **0.483**, 0.490 |
+| raycast 32ch, 60/30 | 11,168 | 111,680 | **0.613** |
+| raycast full, 40/40 | 19,893 | 198,930 | **0.514** |
+| raycast 44ch, 40/40 | 15,356 | 153,560 | **0.551** |
+| raycast full, 40/40, self-filter OFF | 19,893 | 198,930 | 0.590 (unusable, see below) |
+
+**The sensor, not the simulator, is the budget.** At 60/30 the sim without it
+runs at 0.927 (1.079 s of compute per simulated second); with the full pattern
+it runs at 0.483 (2.070 s/sim-s). The lidar costs ~0.99 s/sim-s, and cost is
+very close to linear in ray count — 4.98e-5 s/ray at 19,893 and 4.94e-5 at
+11,168 — which makes ray count the only useful lever. `max_range` and
+`min_range` were previously measured worth under 4% each, because the expense
+is TESTING each ray against the robot's ~200 convex hulls, not hitting them.
+
+**Lowering `physics_hz` helps more than it looks.** With `sweep` on, the sensor
+fires a fixed 198,930 rays per SIMULATED second regardless of the physics rate,
+so dropping 60 Hz to 40 Hz cuts the simulator's own per-step cost without
+giving up any lidar fidelity: full scale goes 0.483 -> 0.514. Note the guard in
+`physics_rate.resolve_control_hz` — the control rate must divide the physics
+rate into whole substeps, so 40/30 is refused and 40/40 is the usable pair.
+
+**`TINKER_SIM_LIDAR_CHANNELS` / `_COLUMNS`** were added for this trade,
+mirroring `resolve_physics_hz`: the contract file stays the hardware's own
+specification, a run may deliberately lower the scale, and raising it is
+refused. Prefer cutting CHANNELS over COLUMNS: `pointcloud_to_laserscan`
+flattens the cloud to a 2D scan between `min_height` 0.0 and `max_height` 2.0,
+so azimuth resolution is what the navigation stack actually consumes, while
+vertical rays mostly contribute redundant points to it. 44 channels keeps the
+full 1.03 deg azimuth spacing and 77% of the vertical fan.
+
+**CORRECTION — "report_hit_prim_paths is free" was wrong.** The old 31.95 vs
+31.91 ms/step measurement was taken while scene queries were disabled, so no
+ray hit anything and no path was ever resolved; it measured nothing. Re-measured
+with rays actually hitting, the self-filter costs 0.514 -> 0.590, about 0.25
+s/sim-s. It cannot simply be turned off — without it the frame carries the
+~9,840 self-hits (`last_points` 14,002 vs 4,870) and the robot is walled in by
+its own body. **A cheaper self-filter is the largest single RTF lever left**:
+the plugin resolves a path string per hit and `self_hit_mask` then runs a
+Python `startswith` per live ray. Untried ideas: vectorising the mask with
+`np.char`, or dropping the path table entirely in favour of a per-ray hull
+distance (the robot's silhouette is constant in the SENSOR frame — but the arm
+moves, so that is only sound for a fixed-arm navigation run).
+
+## 2026-09-09 (later) — root cause of the empty clouds: IsaacLab ships PhysX scene queries OFF
+
+The raycast lidar was never broken. **IsaacLab's
+`SimulationCfg.enable_scene_query_support` defaults to `False`, and with it off
+PhysX does not build a scene query manager at all,** so every raycast in the
+process silently misses. IsaacLab's own docstring says exactly that:
+
+> If set to False, the physics engine does not create the scene query manager
+> and the scene query functionality will not be available.
+
+A raycast lidar is nothing but scene queries. The flag is only settable at
+`SimulationCfg` construction, so it has to be decided before the backend
+exists — which is why `run_sim` now evaluates `raycast_lidar_enabled()` above
+the backend construction at all three profile sites and passes the result as
+`scene_query_support=`.
+
+**The evidence.** An isolated probe built the same `SimulationContext` the
+backend builds (CPU, `use_fabric`, same dt), authored colliders the way
+NVIDIA's own raycast-sensor test does, and compared the raw
+`omni.physx` scene query against the sensor reading from one origin. One flag
+flipped, nothing else changed:
+
+| `enable_scene_query_support` | raw `raycast_closest` | sensor |
+|---|---|---|
+| `False` | `hit: false` both rays | `is_valid: true`, `ray_count: 2`, **hits 0**, empty hit paths |
+| `True` | `/World/Ground` @1.0, `/World/Wall` @4.9 | **hits 2**, correct hit prim paths |
+
+The `False` row reproduces the live failure exactly, including the misleading
+`is_valid: true` with a full-length reading.
+
+**Why it never reproduced on the bench.**
+`isaaclab_physx/physics/physx_manager.py` force-enables the flag whenever a GUI
+is attached (`if has_gui: cfg.enable_scene_query_support = True`), and a plain
+`UsdPhysics.Scene` — what the bench harness and NVIDIA's tests use — has scene
+queries on by default. **Only a headless IsaacLab run is affected**, which is
+precisely what production is and what every probe wasn't.
+
+**Two earlier "defects" were this same cause and are withdrawn.**
+
+* *"`ray_time_offsets` sweep produces zero-length rays."* No. With scene
+  queries on, sweep casts correctly and returns real hit endpoints, so the ~9x
+  cost saving the sweep buys is still available.
+* *"The stepping API is the problem."* No. Measured by subscribing to
+  `omni.physx` step events directly: IsaacLab's `sim.step()` dispatched 20
+  events over 20 steps and the plugin's own clock advanced through 20 distinct
+  values. The plugin was ticking the whole time. What genuinely is absent under
+  IsaacLab is `SimulationManager`'s `PHYSICS_POST_STEP` (0 dispatches under
+  **both** `sim.step()` and `SimulationManager.step()`), so the gateway keeps
+  polling the rig from its publish path — but that only ever affected frame
+  assembly, never whether a ray hit anything.
+
+Ruled out by measurement, so nobody repeats them: prim authoring order, the
+self-filter, sensor validity, mount/pose, `use_fabric`, and the scene-query
+handle binding to the wrong scene (there is one scene and the binding is fine —
+the query manager simply did not exist).
+
+**Nothing else in the tree used scene queries**, so this flag broke only the
+lidar. Runs without `--raycast-lidar` are unchanged: `False` was already the
+effective default, and it is now passed explicitly.
+
+### Also fixed: `tinker-sim launch ... -- --flag` silently dropped the flag
+
+Found while trying to verify the above on a live run. The wrapper collects
+passthrough arguments with `argparse.REMAINDER`, which keeps the literal `--`
+separator as the remainder's first element — and the separator is *required* to
+get a `run_sim`-only flag past the wrapper's own parser. Forwarding it is
+silently destructive, because `run_sim` parses with `parse_known_args()` where a
+leading `--` means "everything after this is positional":
+
+    parse_known_args(["--", "--raycast-lidar"])  -> raycast_lidar=False
+    parse_known_args(["--raycast-lidar"])        -> raycast_lidar=True
+
+So `tinker-sim launch ... -- --raycast-lidar` booted the **occupancy** lidar
+with no error: `/sim/status/isaac` reported `lidar_source: "occupancy"`,
+`lidar: null`. A healthy-looking run measuring the wrong thing — the same class
+of silent failure as the scene-query default it was being used to investigate,
+and it costs a GPU run every time. The wrapper now strips a leading `--` before
+forwarding. This affected every `run_sim`-only flag, not just this one.
+
+## 2026-09-09 — the raycast lidar publishes EMPTY clouds in a live run; back to opt-in
+
+The live Nav2 battery against PR #24's raycast lidar FAILED, and the failure is
+worse than a no-op: `/livox/lidar` published nothing usable, so Nav2 got no
+`/scan`, AMCL never converged, `map -> odom` never existed, and no
+`navigate_to_pose` goal was ever accepted. The occupancy-map lidar it replaced
+was fake, but it worked. **The raycast source is therefore opt-in
+(`--raycast-lidar`) until this is understood, and the occupancy lidar is the
+default again.**
+
+**Defect 1 (FIXED): the frame accumulator was never driven.** The rig subscribed
+to `SimulationEvent.PHYSICS_POST_STEP` via `SimulationManager.register_callback`.
+That event is not dispatched in the production loop, which steps physics through
+IsaacLab's `SimulationContext` — measured `callback_folds: 0` against
+`poll_folds: 1261` over a full run. Every probe that validated the design drove
+`SimulationManager.step()` directly, which is exactly why it passed on the bench
+and failed in the sim. The gateway now also polls `accumulate()` on its publish
+path, and folding is deduplicated by the sensor's own `physics_step` so both
+drivers together cannot double-count. After this, the topic publishes at the
+right rate.
+
+**Defect 2 (OPEN, the blocker): the scene query hits nothing.** With the
+accumulator running, every published cloud has `width: 0`. Diagnostics added to
+`/sim/status/isaac` localise it precisely:
+
+* `is_valid: true`, `last_reading_len: 19893`, `path_table_len: 19893` — the
+  sensor is healthy and returning every ray.
+* `raw_hits: 0` counted BEFORE self-filtering, and `self_hits: 0` — so this is
+  not the self-filter eating the frame. No ray hits anything.
+* `ray_origin_world: [-1.91, -2.0001, 0.2725]` — exactly right for a robot
+  spawned at (-2, -2) with the sensor 0.09 forward and 0.195 up. The mount and
+  pose tracking are correct.
+
+**Defect 3 (found while isolating 2): `sweep` produces zero-length rays here.**
+With `sweep: true` (as merged), `ray_end_world == ray_origin_world` for every
+ray — the ray has no length at all. With `sweep: false` the same ray becomes
+`[37.79, -2.04, -4.60]`, a genuine 40 m cast. So `ray_time_offsets` scheduling
+does not work under this stepping path either, plausibly the same root cause as
+defect 1: the plugin's step clock never advances the way `SimulationManager.step`
+makes it.
+
+But even with full-length rays, `raw_hits` stays 0. That first ray leaves
+z=0.2725 descending at 7 deg and should strike the ground plane ~2.2 m ahead; it
+travels the full 40 m to z=-4.6 instead, straight through. It does not hit the
+robot it is mounted on either, where the bench measured 49.5% self-hits. The
+PhysX scene query is returning nothing in this configuration.
+
+**Ruled out by measurement, so nobody repeats them:**
+
+* Prim authoring order. Authoring the prim BEFORE `sim.reset()` via a backend
+  pre-reset hook gave results identical to authoring it after — same ray
+  geometry, same zero hits. The schema's "attributes are read once at simulation
+  start" warning is real but is NOT what is happening here. That experiment's
+  backend plumbing was reverted rather than shipped.
+* The self-filter (`self_hits: 0`).
+* An unevaluated or invalid sensor (`is_valid: true`, full-length reading).
+* A bad mount or pose (`ray_origin_world` is correct to 4 decimal places).
+
+**Next suspects, untested:** the profile's `use_fabric` setting; the CPU-vs-GPU
+PhysX pipeline (`physics_device: "cpu"` here — the bench harness that worked was
+also CPU, but used a plain `UsdPhysics.Scene` rather than IsaacLab's
+`SimulationContext`); and whether the sensor's scene-query handle binds to the
+scene IsaacLab actually creates.
+
+**RTF, for whatever it is worth:** 0.214 measured with nav attached over 491
+`/clock` samples — while the lidar was hitting nothing, so this is the cost of
+casting alone, not of a working sensor. Any RTF conclusion has to wait until the
+sensor works; the earlier +0.75 s/sim-s bench figure is neither contradicted nor
+confirmed.
+
+**Process lessons from the run itself.** The first battery attempt was lost
+because the orchestrator entered an isolated worktree while a subagent was
+mid-run against the main checkout, which retroactively confined that agent's
+shell and orphaned a sim holding a GPU. Never change worktree state while a
+subagent is running against another directory. Second: backgrounding a launcher
+with `&` in a non-interactive shell leaves SIGINT set to `SIG_IGN` on the
+wrapper, so `kill -INT` is silently swallowed — signal the worker child one
+level down rather than escalating to SIGKILL.
+
+## 2026-09-09 — /livox/imu was a stub: four defects in one small message
+
+Follow-up to the raycast lidar below, kept as a separate change because it is
+a separate concern.
+
+**What was wrong.** `/livox/imu` looked well-formed and was wrong four ways:
+
+1. `linear_acceleration` was never assigned, so it published `(0, 0, 0)`. That
+   is not a noise-free ideal reading. An accelerometer measures SPECIFIC FORCE,
+   `f = a - g`, so a stationary sensor reads ~`+9.81 m/s^2` along its
+   gravity-opposing axis; zero means freefall. FAST-LIO uses precisely this
+   vector to find "down" before it will initialise, which is why the tk26_sim
+   reference bothers to finite-difference an acceleration.
+2. The angular velocity came from `root_ang_vel_w` -- the WORLD frame -- while
+   the message was stamped `livox360`. On a planar base yawing about z the two
+   coincide, so it was accidentally correct for ordinary driving and wrong the
+   moment the robot pitched or rolled. That is why it survived this long.
+3. It was sampled at the articulation ROOT with no lever-arm term. A real IMU
+   0.195 m above the rotation centre feels centripetal and tangential
+   acceleration whenever the base turns.
+4. `angular_velocity_covariance` and `linear_acceleration_covariance` were left
+   all-zero, which by REP-145 means "unknown"; a consumer that trusts it reads
+   zero variance, i.e. a perfect sensor. (`orientation_covariance[0] = -1.0`
+   was already right and is kept -- the sim reports no orientation, as the real
+   driver does not.)
+
+**What it does now.** `simulation/tinker_sim_isaac/imu_model.py` holds the
+physics as pure functions -- no Isaac, no ROS import -- so specific force,
+frame rotation and the lever arm are unit-testable on their own.
+`backend.imu_state()` reads the simulator; the gateway assembles the message.
+
+The sample body is resolved by preference `livox_frame` then `base_link`,
+following the existing `_base_link_body_index` fail-soft pattern. When the
+import keeps `livox_frame` as a distinct body, PhysX reports ITS acceleration
+with the centripetal and tangential terms already included, so the lever arm is
+intrinsic and no manual `omega x (omega x r)` is applied; the explicit
+lever-arm path exists only for the welded case, using the URDF's livox_joint
+origin (0.09, 0, 0.195).
+
+Acceleration comes from `body_com_acc_w` (PhysX `get_link_accelerations()`),
+not from differencing velocity: differencing lags half a step and amplifies
+per-step solver jitter. A backend without that view falls back to a backward
+difference rather than publishing zeros, and the first sample of that fallback
+reports no acceleration rather than inventing one.
+
+**Deliberately NOT modelled: noise and bias.** A real ICM-40609 has both, but
+the simulator's value is determinism and the reference sim publishes a clean
+signal too. If FAST-LIO later needs realistic noise, it belongs in
+`imu_model.py` behind a spec flag, not smeared through the gateway.
+
+**Lesson repeated from the lidar change.** Several suites build the gateway
+with `object.__new__` to exercise `publish()` without a live backend, so every
+attribute the publish path reads must tolerate a skipped `__init__` -- hence
+the `getattr` defaults, matching how `_services_ready` is already read. The
+legacy `root_state` compatibility path likewise uses `.get` with defaults: a
+minimal test double supplied only the one field the old stub happened to read,
+and a missing field must degrade the sample, never raise inside `publish()`.
+
+## 2026-09-09 — /livox/lidar becomes a real sensor: the PhysX raycast lidar
+
+**What was wrong.** `/livox/lidar` was never a sensor. `ros_gateway.
+_development_point_cloud` traced 181 rays across the arena occupancy PGM at
+1 deg spacing, every point at `z = 0`, from a point hard-coded 0.12 m ahead of
+`base_link` with the height ignored. It read the MAP, so it could not see a
+spawned object or the person capsule -- it re-published what Nav2 already holds
+as `static_layer`. `"rtx_lidar"` in `sensor-rich.json` was inert metadata;
+`SimulationProfile.modules` is parsed and never read by any code.
+
+**What replaced it.** `simulation/tinker_sim_isaac/lidar_rig.py`: an
+`isaacsim.sensors.experimental.physics` `RaycastSensor` on the robot,
+57 channels x 349 azimuth columns = 19,893 rays at 10 Hz = 198,930 points/s,
+against the Mid-360's 200,000, over its -7..+52 deg by 360 deg field. The
+extension declares no RTX dependency, so it runs in `navigation-parity`
+(`render=false`, CPU physics) as well as `sensor-rich`. Post-`play()` spawns
+are hit with no registration -- confirmed by a cube created mid-run moving a
+reading from 9.5 m to 2.75 m.
+
+**Three findings that shaped it, all measured (throwaway probes, headless).**
+
+*`depths` is broken in Isaac Sim 6.0.1.* Six axis-aligned rays into geometry at
+hand-checked distances returned `depths = [3.5] * 6` -- ray 0's value
+replicated across every ray -- while the same reading's `hit_positions` were
+all correct (`[[3.5,0,0], [-5.5,0,0], [0,7.5,0], [0,-9.5,0], [0,0,10.5],
+[0,0,-1.0]]`). The rays are cast correctly; only the depth field lies. The rig
+reads `hit_positions` and derives range as its norm. This cost two probe rounds:
+uniform depths look exactly like a collapsed ray pattern, and it took reading
+the authored `rayDirections` back off the prim (128 distinct rows, matching
+input) to rule that out.
+
+*`ray_time_offsets` is a firing schedule, not just pose extrapolation.* The USD
+schema documents only "the world transform is extrapolated to currentTime +
+offset". Incomplete: the plugin also defers each ray to its offset instant. The
+shipped example's `_generate_rotating_rays` docstring says so; the schema does
+not. Spreading a frame's offsets across `1/tick_rate` measured 4.47 vs
+27.89 ms/step at full scale. This is the ONLY rate control the sensor has --
+`sensorPeriod` exists only on the contact and IMU sensors and is deprecated,
+and toggling the inherited `enabled` attribute at runtime does not gate casting
+(an earlier run where it appeared to had `initialize_physics` throwing in its
+log and was degraded).
+
+*A frame must be ACCUMULATED.* Because rays fire on their own step, the reading
+buffer holds only that step's rays and is cleared each step -- populated counts
+stay flat at ~500 of 19,893 across the window rather than growing. The union
+over one window recovers the pattern exactly. `FrameAccumulator` folds
+`window_steps` readings (12 at 120 Hz physics / 10 Hz lidar) into one frame and
+publishes when the window closes, so the cadence is phase-locked to the scan
+rather than to `_tick`. A miss is a ZERO VECTOR in `hit_positions`, which is
+also how an unfired ray reads -- both contribute no point, so one test covers
+both.
+
+**Cost, measured with the real robot on the stage.** Against a no-sensor
+baseline in the SAME scene, because the robot's ~200 convex-decomposition
+collision shapes make every scene query dearer and dominate the absolute
+number (21.5 ms/step with no sensor at all): marginal sensor cost is +0.75 s of
+compute per simulated second at full scale, +0.50 at 32x360, +0.25 at 16x360,
++0.22 at 8x360. Nearly flat below 16x360, so trimming past that buys little.
+An earlier empty-room measurement suggested ~0.35 s/s and was not
+representative; a mid-analysis reading of ~1.9 s/s was wrong in the other
+direction, from comparing a robot-present run against an empty-room baseline.
+`max_range` is not a lever (8 m vs 40 m differed under 4%), and neither is
+`min_range` (0.2 -> 0.7 m moved cost 3%): the expense is testing rays against
+the robot's shapes, not hitting them.
+
+**Self-hits.** 9,840 of 19,893 points -- 49.5% of a frame -- land on the robot
+itself, far more than a real Mid-360 loses to its own chassis, because the
+raycast sees the inflated convex-hull COLLISION geometry rather than the visual
+shape. Filtering therefore moves the sim toward hardware behaviour, not away.
+`report_hit_prim_paths` identifies them and is effectively free at this scale
+(31.95 vs 31.91 ms/step, inside noise); only the ~3,300 live rays per step are
+path-tested, since checking all 19,893 in Python every step would cost more
+than the raycast. After filtering, frames carry ~11,000 points and the nearest
+return moves from 0.20 m (the robot's own shell) to ~0.46 m.
+
+**Mount and TF.** The sensor is created under the URDF's `livox_frame`, walking
+up to the nearest `RigidBodyAPI` ancestor because the URDF importer welds
+fixed-joint links onto their parent and the sensor's world transform comes from
+a rigid body's pose (the same trap `camera_rig` documents for optical frames).
+On the shipped artifact `livox_frame` carries the API itself, so the offset is
+zero. The sim bridge's `base_link -> livox360` static TF moved from
+(0.12, 0, 0.25) to the URDF's (0.09, 0, 0.195): it now matches both where the
+sensor actually is and the height `arena_map.livox_scan_height()` slices the
+AMCL map at. The old value predated any real sensor and agreed with neither.
+The hardware launch files are untouched.
+
+**pointcloud_to_laserscan now takes the hardware values verbatim** (min_height
+0.0, max_height 2.0, angle -1.44..1.436, range 0.2..8.0). The previous
++/-180 deg, +/-0.05 m band existed only because the cloud was a planar ring.
+Tabletops becoming scan hits and the robot being blind behind itself are the
+PARITY TARGET, not regressions: they shape nav_back and spin recoveries on
+hardware.
+
+**A bug worth remembering.** The frame accumulator initially produced nothing
+at all while looking healthy. Root cause: `SimulationManager`'s dispatcher
+calls physics-step callbacks with `(step_dt, context)`, and the handler
+declared one optional argument, so every invocation raised `TypeError` inside
+the message bus, which swallowed it. The signature must match the sensor
+extension's own `_SensorStepManager._on_physics_step(step_dt, context=None)`.
+The `except Exception: return` in the read path hid it further; that path now
+reports the first failure of each kind once.
+
+**Not done here.** The synthetic `/livox/imu` is untouched and is NOT accurate:
+`linear_acceleration` is never assigned (so it reads (0,0,0) -- permanent
+freefall rather than ~9.81 m/s2 at rest), the angular velocity is world-frame
+but stamped `livox360`, it is sampled at the articulation root so there is no
+lever-arm term, and the angular/linear covariances are left all-zero. Nothing
+in the sim stack consumes it today beyond a contract_guard existence check, but
+it is a hard prerequisite for FAST-LIO in sim. AMCL parity evidence is pinned
+bit-identical to the map raycast and has to be re-earned against this source,
+with the spawn-mislocation flag off.
+
 ## 2026-09-08 — Task #33: the gripper's own effort-limit write silently reverted drive_joint's PhysX gains
 
 **Finding.** On the grasp bench, `drive_joint` was not running the gains the
@@ -87,6 +521,253 @@ config whose `run_close` calls
 were rewritten after the reversion — whether that write actually binds in PhysX
 was never measured, so those runs are unknown rather than either clean or
 invalid. Nothing was re-run for this change; it is code-only.
+
+## 2026-09-07 — Task #41: pan_tilt facade keepalive timer thrashed stale_hold at low RTF
+
+**Symptom.** A bench round logged 2835 `stale_hold`/`stale_hold_cleared`
+pairs (~1.18 Hz cycle, ~0.85s period) from the mux's pan_tilt
+`CommandSource` -- harmless that round because the mux's stale-hold
+substitute happened to match what the facade was already sending (head
+idle), but the churn is a symptom of a real mechanism: a real
+`/pan_tilt_controller/cmd` sweep in progress could get clamped mid-motion
+to a stale measured position.
+
+**Root cause.** `pan_tilt_facade.py`'s `_hold_target` republish timer
+(`self.create_timer(0.2, self._hold_target)`) had no explicit `clock=`
+argument, so it ran on the node's default clock -- `ROS_TIME` under the
+bridge's `use_sim_time=True` launch, i.e. paced in SIM seconds. The
+consumer, `CommandGateway`'s pan_tilt `CommandSource` (0.5s timeout,
+`command_gateway.py:99-101`), judges staleness in the mux against
+`time.monotonic()` -- WALL seconds (same clock the gateway's own 150 Hz
+publish timer and `_enforce_safety_deadline` are explicitly pinned to via
+`Clock(clock_type=ClockType.STEADY_TIME)`, `command_gateway.py:135-139`).
+At RTF < 0.4 a 0.2 sim-s republish costs more than 0.5 wall-s to land, so
+every tick arrived after the deadline -- continuous churn. This is the same
+family as Task #27 (facade dwell on the wall clock while the node runs sim
+time) but the inverse direction: there the *deadline* logic ran on the
+wrong clock, here the *keepalive* logic does.
+
+**Fix.** `pan_tilt_facade.py`'s hold timer now passes
+`clock=Clock(clock_type=ClockType.STEADY_TIME)`, mirroring
+`command_gateway.py`'s own 150 Hz timer and `gripper_facade.py`'s 20 Hz
+keepalive (`gripper_facade.py` was already correct here, confirmed by
+reading it, not assumed). Header timestamps inside `_hold_target` still use
+`self.get_clock().now()`, which stays sim time -- only the timer's own tick
+cadence changed. Swept the rest of the bridge for the identical defect
+(a keepalive/republish timer on a `use_sim_time` node feeding a
+wall-clock-gated `CommandSource`): `base_facade.py` and `xarm_facade.py`
+were already `STEADY_TIME`; `command_gateway.py`'s own 150 Hz tick and
+`gripper_facade.py`'s two timers were already `STEADY_TIME`. `pan_tilt`
+was the only one still on the node's default clock.
+
+**Test.** `tests/test_pan_tilt_facade_keepalive.py` (new):
+`test_hold_timer_created_with_steady_clock` patches `Node.create_timer`
+with a recording double and asserts the `_hold_target` timer's `clock=`
+kwarg has `clock_type == ClockType.STEADY_TIME`;
+`test_hold_republish_cadence_is_wall_clock_bounded_at_low_rtf` drives a
+synthetic `/clock` feed at RTF ~0.25 (`use_sim_time=True`) and asserts the
+wall-clock gap between consecutive `/sim/controller/pan_tilt_commands`
+publishes stays <= 0.35s. Pre-fix, both fail: the first with
+`AssertionError: _hold_target timer must pass an explicit clock=`, the
+second with only 3 republishes in 3 wall-s (~0.85s gaps, matching the
+bench's 2835-pair measurement); post-fix, both pass with ~15 republishes in
+3 wall-s. Full targeted run (python3.10, ROS-sourced,
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`): `test_pan_tilt_facade_keepalive.py`,
+`test_head_tf.py`, `test_head_initial_pose.py`,
+`test_command_gateway_keepalive.py`, `test_gateway_simtime_deadlines.py`,
+`test_xarm_safety_heartbeat.py`, `test_gripper_executor_humble.py` together:
+47 passed. `tests/test_manipulation_runtime.py` (uv/lark-shim incantation):
+132 passed, 3 subtests passed, unaffected.
+
+
+## 2026-09-07 — Task #39: `/spawn_entity` advertised ~100s before it can be served
+
+**Symptom.** A `/spawn_entity` (or sibling `simulation_interfaces`) call made
+right after `wait_for_service()` returned true could still fail with
+rclpy/`rmw_fastrtps_shared_cpp`'s "failed to send response (timeout): client
+will not receive response" -- a middleware-level failure, not the caller's
+own timeout budget expiring. In one dataset (`01-sim.log`) the extension
+came up at wall 18.9s, then a 93s gap with nothing else logged, then the
+failed-response warning at wall 117.7s; `scenario_runner`'s own six
+boot-time spawns all round-tripped cleanly before that gap, ruling them out
+as the failing call and pointing at a later, separate client (the GPSR
+overlay's `tools/gpsr_spawn.py`, own budget `SPAWN_TIMEOUT_S = 120`).
+
+**Root cause.** `validation/run_sim.py` called
+`enable_extension("isaacsim.ros2.sim_control")` immediately after
+`SimulationApp` construction, before the sensor profile branches ran at
+all -- i.e. before the backend, camera rig, or `RosStandardGateway` existed.
+`enable_extension` registers the extension's ROS services (`/spawn_entity`,
+`/set_entity_state`, `/delete_entity`, `/set_simulation_state`,
+`/load_world`, `/reset_simulation`) synchronously, but Kit only *serves*
+them from its own asyncio loop, which nothing pumps regularly until each
+profile's main loop starts. Backend construction
+(`IsaacWholeRobotBackend.__init__`) has no `app.update()` call at all, and
+camera warm-up (`CameraRig.initialize`, sensor-rich only) has only a
+handful; together they can run for a couple of minutes on a cold shader
+cache. A request that reaches the extension in that window queues past both
+the caller's own timeout budget and, at the DDS layer, the point at which a
+response can even be correlated back to it. `wait_for_service()` -- the only
+readiness signal any client checked -- returns true the instant the
+extension is enabled, long before any of this warm-up is done, so it
+actively misleads a client into thinking a prompt response is possible.
+
+**Fix.** `_enable_sim_control_services(app, gateway=None)` (`run_sim.py`)
+now does the enable + one `app.update()`, and is called once per sensor
+profile branch, at the same point the boot-config JSON prints today -- i.e.
+after backend construction, camera-rig warm-up (sensor-rich), and gateway
+construction are all behind it, right before that branch's main loop starts.
+The pre-enable `_install_set_entity_state_physics` monkeypatch (Task #12/#20)
+stays at the old early call site: it only patches a class method and does
+not itself need the extension enabled or any long-running object to exist
+yet, and must run before `enable_extension`'s `on_startup` captures the
+unpatched bound method.
+
+`RosStandardGateway` (`ros_gateway.py`) gained `services_ready` /
+`services_ready_since` on `/sim/status/isaac` (a JSON string message):
+`False`/`None` at gateway construction, flipped by the new
+`mark_services_ready()` method (idempotent, timestamped with
+`backend.simulation_time`) at the same call site as the extension enable.
+
+`tools/gpsr_spawn.py`'s `_make_ros_service_client` now calls
+`_wait_for_services_ready` (its own bounded wait, default
+`SERVICES_READY_TIMEOUT_S = 300s`, logged) before the existing
+`wait_for_service` 10s checks on `/spawn_entity`/`/delete_entity`, which
+remain as a secondary check. A not-ready sim now fails fast and
+diagnosably ("`/sim/status/isaac` never reported services_ready after
+300s") instead of racing `SPAWN_TIMEOUT_S` and surfacing as an opaque DDS
+timeout.
+
+**How a client should gate a first `/spawn_entity`-family call going
+forward:** wait for `/sim/status/isaac`'s `services_ready` to be `true`
+first; `wait_for_service()` alone is necessary but not sufficient -- it only
+proves the extension is enabled, not that Kit is being pumped regularly
+enough to serve a request promptly.
+
+### Review round (2026-09-07): test-double regression, scenario_runner gap, absent-status fallback
+
+Three findings from review against the fix above, all addressed:
+
+1. **`RosStandardGateway.publish()` read `self._services_ready` directly**,
+   which broke `tests/test_manipulation_runtime.py`'s
+   `test_finger_contact_wrench_publishes_every_tick_not_at_status_cadence`
+   -- its gateway double is built via `object.__new__(RosStandardGateway)`
+   (skips `__init__`, so `_services_ready`/`_services_ready_since` never
+   get set) and exercises `publish()`'s status block. Fixed with
+   `getattr(self, "_services_ready", False)` (and the `_since` sibling) so
+   any double built this way degrades to "not ready" instead of raising;
+   also added the two attributes directly to that test's double for
+   belt-and-suspenders. `tests/test_manipulation_runtime.py`: 129 passed, 0
+   failed (was 128 passed, 1 failed).
+
+2. **`ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/scenario_runner.py`
+   had no `services_ready` gate at all.** Its `ScenarioRunner.call()` bounds
+   both the `wait_for_service` discovery and the response wait to a single
+   `--timeout` (default 20.0s; `gpsr.launch.py` never raises it), with no
+   retry beyond the very first `/reset_simulation`. Moving the sim's
+   `_enable_sim_control_services` call point later (this same task) makes
+   the ~100s warm-up gap it exists to describe worse for this client, not
+   better. Added a duplicate of `tools/gpsr_spawn.py`'s
+   `_wait_for_services_ready` (same fallback behavior as finding 3 below)
+   directly in `scenario_runner.py` -- not imported, since
+   `tinker_sim_bridge` is a separate `ament_python` package built by
+   colcon and the top-level `tools/` tree is not installed anywhere colcon
+   looks; a cross-package import would tie the bridge's build to a tree
+   outside it. Wired into `main()` right after `ScenarioRunner`
+   construction, ahead of `node.execute(operations)`. `tests/
+   test_scenario_runner.py`: 14 passed (10 pre-existing + 4 new), run under
+   `python3.10` (this file `pytest.importorskip`s real `rclpy`, whose
+   Humble-built C extension does not load under the repo's Python 3.12 uv
+   venv).
+
+3. **`tools/gpsr_spawn.py`'s `_wait_for_services_ready` had no fallback for
+   an older sim / absent `/sim/status/isaac`.** If the topic never
+   published at all, or published without a `services_ready` key (a
+   pre-#39 sim binary), the function spun for the full
+   `SERVICES_READY_TIMEOUT_S` (300s) and then raised, turning what used to
+   be a ~20-30s `wait_for_service`-only success into a 300s failure.
+   Added `SERVICES_READY_GRACE_S = 10.0`: the function now waits only that
+   long for *any* status sample; if none arrives, or the first one that
+   does has no `services_ready` key, it logs a warning and returns
+   immediately, leaving the caller's own `wait_for_service` checks (the
+   pre-#39 path) to run unmodified. Once a sample carrying the key is seen
+   -- `services_ready: false` included -- it commits to the full bounded
+   wait exactly as before. Same fallback duplicated into
+   `scenario_runner.py`'s copy (finding 2). `tests/test_gpsr_spawn_cli.py`:
+   34 passed (31 pre-existing + 3 new, including the false-then-true
+   commit-after-grace case).
+
+**Tests.** `tests/test_run_sim_services_readiness.py` (new): unit tests on
+`_enable_sim_control_services` itself (fakes for `enable_extension`/the
+app/gateway, asserting the enable -> `app.update` -> `mark_services_ready`
+order, and that a missing gateway is tolerated); source-order regression
+tests per sensor-profile branch of `main()` (`inspect.getsource`, same
+pattern as the existing structural tests in
+`test_manipulation_gate_executor.py`) asserting backend construction, (on
+sensor-rich) camera-rig warm-up, and gateway construction all precede the
+`_enable_sim_control_services(...)` call in that branch's source, plus a
+regression that the old early call site carries no `enable_extension(`
+call. `tests/test_ros_gateway.py`: `/sim/status/isaac` carries
+`services_ready: false`/`services_ready_since: null` before
+`mark_services_ready()`, `true`/the recorded `backend.simulation_time`
+after, and a second call does not move the timestamp.
+`tests/test_gpsr_spawn_cli.py`: `_wait_for_services_ready` spins through
+false samples and returns once a true sample arrives, cleans up its
+subscription either way, and raises `ServiceUnavailable` once its own
+bounded timeout elapses without ever seeing `services_ready: true` (fake
+`/sim/status/isaac` node + injectable clock, no rclpy needed). Full
+targeted run:
+`tests/test_run_sim_services_readiness.py tests/test_ros_gateway.py
+tests/test_gpsr_spawn_cli.py tests/test_set_entity_state_physics.py
+tests/test_run_sim_arena_cli.py tests/test_run_sim_arena_wiring.py` --
+83 passed. No GPU boot for this change (deferred: live confirmation that
+the moved call site actually closes the wall-clock gap end to end).
+
+### Second review round (2026-09-07): `spin_once`'s timeout is keyword-only
+
+**Finding.** Both `_wait_for_services_ready` implementations
+(`tools/gpsr_spawn.py`, `ros2_ws/src/tinker_sim_bridge/tinker_sim_bridge/
+scenario_runner.py`) called `spin_once(node, 0.5)` -- a positional
+`timeout_sec`. Real `rclpy.spin_once`'s signature is `spin_once(node, *,
+executor=None, timeout_sec=None)`: `timeout_sec` is keyword-only. Against
+real rclpy this raises `TypeError: spin_once() takes 1 positional argument
+but 2 were given` on the very first loop iteration -- including the
+"already ready" fast path this whole task exists to preserve. Every unit
+test passed anyway because each test double's fake `spin_once(n,
+timeout_sec)` accepts the positional call fine; the mismatch only fires
+against the real function, which no test in the suite exercised for this
+call site.
+
+**Fix.** Both call sites now call `spin_once(node, timeout_sec=0.5)`.
+Grepped the whole branch for other `rclpy.spin_once`/
+`spin_until_future_complete` calls: every other call site in the repo
+already uses the keyword form (`tools/gpsr_spawn.py`'s own
+`spin_until_future_complete` calls, `scenario_runner.py`'s
+`ScenarioRunner.call()`, `controller_reconciler.py`,
+`ompl_plan_smoke.py`, etc.) -- these two were the only positional
+holdouts. Also checked the two helpers' other injected-rclpy-shaped calls
+(`node.create_subscription(msg_type, topic, callback, qos_profile)`,
+`node.destroy_subscription(subscription)`) against real
+`rclpy.node.Node`'s signatures (`inspect.signature` under `python3.10`)
+-- both match; no `*` before the arguments these helpers pass.
+
+**Test-double hardening.** Every fake `spin_once` in
+`tests/test_gpsr_spawn_cli.py` and `tests/test_scenario_runner.py` is now
+declared `def spin_once(n, *, timeout_sec=None)` (was `def spin_once(n,
+timeout_sec)`), so a future regression back to the positional call form
+raises `TypeError` inside the test itself instead of silently passing.
+Verified directly: reverting either production call site back to
+`spin_once(node, 0.5)` against the now-keyword-only doubles fails 6/34
+(`test_gpsr_spawn_cli.py`) and 4/14 (`test_scenario_runner.py`) with
+exactly that `TypeError`; restoring the keyword-argument call makes both
+files pass again (34 passed; 14 passed).
+
+`tests/test_scenario_runner.py` needs real `rclpy`/`simulation_interfaces`
+(`pytest.importorskip`s them) and does not load under the repo's Python
+3.12 uv venv; run under `python3.10` with `PYTHONPATH` carrying
+`.ros-vendor/humble/opt/ros/humble/local/lib/python3.10/dist-packages`
+(carries `simulation_interfaces`) plus the `ros2_ws/src/tinker_sim_bridge`
+and `simulation` source trees.
 
 ## 2026-09-07 — Task #33: observability for the stale-hold / gripper-target / safety-gate chain
 
@@ -3974,3 +4655,188 @@ Per-object `(dx, dy, dz)` translate applied (metres, printed by the CLI):
 
 `tests/test_ycb_object_recenter.py` (new), `tests/test_ycb_physics_repair.py`,
 `tests/test_arena_convert.py`, and `tests/test_ycb_import_cli.py` all green.
+## 2026-09-06: contact-report force divided by the control-tick dt, not the physics dt (#29)
+
+**Symptom**: bench facade `contact_force_n` reads 1.8-3.5 N/finger at
+`TINKER_SIM_CONTROL_HZ=30` (agw run) vs 6-8 N/finger at the 120 Hz default
+(agx run) on grasps that look otherwise identical. A clean A/B probe
+(identical drive/pad/tilt trajectory, only `TINKER_SIM_CONTROL_HZ` changed)
+reproduced it in isolation: 20.74 N at 120 Hz vs 5.12 N at 30 Hz --
+`0.247 ~= 1/4`, and drive angle / pad position tracked within 1-2% of each
+other at every sampled instant across the whole run, so the closure itself
+was not different, only the reported force.
+
+**Root cause**: `_on_contact_report_event` (`backend.py`, formerly line
+3729) computed `normal_force = sum(impulse) / self.dt`. PhysX's
+`subscribe_contact_report_events` callback fires once per solver SUBSTEP,
+i.e. once per `physics_dt` (`1/physics_hz`), independent of `control_hz`.
+`self.dt` is `1/control_hz` (`backend.py:574`), and
+`physics_substeps = physics_hz/control_hz` substeps run per control tick
+(`backend.py:573`, `1218-1227`). At the default `control_hz == physics_hz`
+(120/120), `physics_substeps == 1` and `self.dt == self.physics_dt`, so the
+formula happened to be correct -- masking the bug until `TINKER_SIM_CONTROL_HZ`
+was lowered. At 30 Hz control / 120 Hz physics, `physics_substeps == 4`, so
+every reported force was an impulse from one `physics_dt`-sized window
+divided by a `self.dt` that is 4x too large: exactly the observed
+20.74 N / 5.12 N ratio.
+
+**Consumers of the bug**: everything that reads `contact_pairs()` or
+`contact_state()` inherited the same rate-dependent 4x-at-30Hz
+under-report -- the probe's `lf`/`rf` columns, `/sim/truth/contacts`,
+`/sim/parity/finger_contact`, and (most importantly) the gripper facade's
+`contact_force_n` gate: a force-based stall/success threshold at
+`control_hz < physics_hz` would need up to `physics_substeps`x more real
+force to cross the same nominal threshold than it does at 120 Hz, i.e. it
+silently gets harder to satisfy exactly when control_hz is lowered for RTF.
+
+**PR #16 was a wrong theory, now closed**: commit `75388ee` ("gripper mimic
+mirror runs per physics substep") moved `_ramp_drive_target` /
+`_mirror_gripper_mimic_targets` into the per-substep loop, theorizing the
+follower PD's one-step velocity feed-forward was stale for the extra
+substeps at low `control_hz`. It never touched `_on_contact_report_event`
+or the force formula, and per the task's measurement record it left the
+20.74 N / 5.12 N gap completely unchanged -- confirming the mimic-mirror
+cadence and the contact-force formula are unrelated code paths, and that
+`75388ee`'s theory does not explain this symptom. That commit is not on
+this branch's history; this fix targets the actual formula bug instead.
+
+**Fix**: `normal_force = sum(impulse) / self.physics_dt`. The callback
+receives no per-step `dt`/`current_time` argument (only `contact_headers`,
+`contact_data`), so there is no "actual step dt" to prefer over
+`physics_dt` -- `physics_dt` is exactly the substep's own fixed integration
+window and is the correct, and only available, divisor.
+
+**Audit of other `self.dt` sites in `backend.py`** (grepped every
+`/ self.dt`, `* self.dt`, and `self.dt` near contact/impulse/report/wrench;
+`ros_gateway.py` has no dt-based contact math, it only reads
+`contact_state()`):
+- `backend.py:1180`, `2685`, `2756` (`self._robot.update(self.dt)`): called
+  once per `step()` (one control tick), after `_step_simulation()` has
+  already run all `physics_substeps` PhysX steps for that tick -- the
+  correct elapsed time for that single buffer refresh is the control-tick
+  duration, `self.dt`. No change.
+- `backend.py:2252` (`_slew_wheel_targets`, `WHEEL_VELOCITY_SLEW_RAD_S2 *
+  self.dt`) and `backend.py:2601` (`_ramp_drive_target`, `slew * self.dt`):
+  both are called exactly once per `step()` (`step()`'s single call to
+  `_slew_wheel_targets()`/`_ramp_drive_target()`, not inside the substep
+  loop in `_step_simulation`), so the per-tick slew rate correctly uses the
+  control-tick `self.dt`. No change.
+- `backend.py:2685` region / `_mirror_gripper_mimic_targets`'s one-step
+  velocity feed-forward (`joint_vel * self.dt`): also called once per
+  `step()`, same reasoning -- the feed-forward spans one control tick. No
+  change. (This is the code path `75388ee` theorized about and moved
+  per-substep; that move is not present here and this fix does not
+  reintroduce it -- no live evidence ties it to a real symptom.)
+- `backend.py:754` (`SimulationCfg(dt=self.physics_dt, ...)`),
+  `backend.py:1744` (`simulation_time`, `steps * self.physics_dt`), and
+  `backend.py:2835` (`PhysxManager.update_simulation(get_physics_dt(), ...)`):
+  already used `physics_dt` correctly; left untouched.
+
+**Tests** (`tests/test_manipulation_runtime.py`): added
+`test_contact_report_force_divides_by_physics_dt_not_control_dt` --
+`physics_hz=120`, `control_hz=30` (`physics_dt=1/120`, `dt=1/30`,
+`physics_substeps=4`), one contact event with impulse `0.05`, asserts the
+recorded force is `6.0` (`0.05 * 120`) and explicitly not `1.5`
+(`0.05 * 30`, the pre-fix value). Fails on the pre-fix formula with:
+```
+E       AssertionError: 1.5 != 6.0 within 7 places (4.5 difference)
+```
+Added `test_contact_report_force_at_matched_rates_is_byte_identical_path`
+(`physics_hz == control_hz == 120`, `physics_substeps=1`) asserting the
+120/120 case is unchanged by the fix (`self.dt == self.physics_dt` there,
+so both formulas agree). Updated the four pre-existing contact-report
+tests (`test_contact_report_uses_identified_bodies_and_reported_normal`,
+`..._sums_normal_impulses_without_tangential_cancellation`,
+`..._uses_deterministic_normal_for_degenerate_average`,
+`..._first_event_logged_exactly_once`) to set `backend.physics_dt = 0.1`
+instead of `backend.dt = 0.1`, since the divisor variable changed; their
+expected `normal_force` values are unchanged because they set only one dt
+field and it now maps to the divisor the formula actually uses. Full
+suite: `tests/test_manipulation_runtime.py` 111 passed, 3 subtests passed,
+0 failed (was 109 passed pre-change; +2 new tests).
+
+**Not addressed here**: `$TMP/task29-measurement-check.md`'s bench
+divergence (soup-can/sugar-box drive-angle and squeeze-depth differing
+between 30 Hz and 120 Hz control) is a separate, unconfirmed
+control_hz-dependent effect in the close/stall-detection cadence, not
+reproduced by the clean side-pinch probe and not explained by this
+measurement bug -- it needs its own live investigation.
+
+## 2026-09-07 — TINKER_SIM_TRACK_OBJECTS log flood: blind per-tick PhysX queries of absent prims (#38)
+
+**Symptom**: `_log_tracked_objects` (opt-in via `TINKER_SIM_TRACK_OBJECTS`,
+built for the 2026-08-31 vanishing-spawn investigation) fires at its own
+~4 Hz cadence and, on every fire, calls
+`IPhysx.get_rigidbody_transformation(path)` for *every* path in
+`_tracked_object_paths` -- parsed blind from the env var with no existence
+check. A bench round logged 1424 bursts of the underlying carb/omni.physx
+ERROR line ("did not locate any object" / "Error executing
+getRigidBodyTransformation") because two of the tracked paths were spawned
+late (or already removed) and every tick before/after that queried them
+anyway. The Python side already handled the failure gracefully (`ret_val`
+check, try/except), but that C++-level ERROR log line is emitted from
+inside the PhysX call itself, before it ever returns to Python, so no
+amount of Python-side error handling suppresses it.
+
+**Cause**: unlike `_iter_spawned_bodies` (the "good pattern": re-derives
+its candidate list from `/World/Scenario`'s stage children, filtered by
+`RigidBodyAPI`, once per `_object_discovery_interval`, so it structurally
+cannot blind-query a path for more than one interval), `_log_tracked_objects`
+never re-derives or memoizes presence at all -- it queries the same static,
+env-parsed path list forever, for the whole backend lifetime, regardless of
+whether the prim ever existed or has since been removed.
+
+**Fix**: added `_resolve_tracked_objects()`, mirroring `_iter_spawned_bodies`'s
+discipline: at the `_object_discovery_interval` cadence (driven from
+`step()`, same as `_refresh_object_views`/`_heal_detached_scenario_bodies`),
+check each tracked path against the live stage
+(`stage.GetPrimAtPath(path).IsValid()` + `HasAPI(UsdPhysics.RigidBodyAPI)`)
+and maintain a `_tracked_object_resolved` set. `_log_tracked_objects` now
+only calls `get_rigidbody_transformation` for paths in that set -- an
+unresolved path is skipped every tick, not queried-then-caught. Logging is
+transition-based (mirroring the single-shot guard pattern used elsewhere,
+e.g. `_contact_report_first_event_logged`): "resolved" once when a path
+first becomes present, "missing" once when a previously-present path
+disappears, "unresolved" once for a path that has never resolved --
+instead of a per-tick state print. Two in-repo code paths that confirm a
+tracked prim's rigid body just went live get an immediate `force=True`
+re-check instead of waiting out the discovery interval:
+`_heal_detached_scenario_bodies` (when a watched spawn transitions to
+attached) and `set_entity_pose_physics` (when a park view is first
+resolved for a prim path). Output format for paths that do resolve is
+unchanged.
+
+**Tests** (`tests/test_manipulation_runtime.py`, net-new -- no prior test
+covered `TINKER_SIM_TRACK_OBJECTS`/`_log_tracked_objects` at all): a fake
+`omni.usd`/`pxr` stage stub (`_fake_omni_usd_and_pxr`) whose `GetPrimAtPath`
+re-checks a live, test-mutable `present_paths` set, plus a fake
+`omni.physx` module whose `get_rigidbody_transformation` asserts if called
+with a path outside an allowed set.
+- `test_log_tracked_objects_never_queries_unresolved_paths`: two present +
+  two absent paths, several ticks -- zero PhysX queries reach the absent
+  paths, present paths are queried every tick as before, and each absent
+  path logs exactly one "unresolved" line (not once per tick).
+- `test_tracked_object_resolves_on_spawn_without_waiting_for_interval`: a
+  path absent at first (`_object_discovery_interval=1000`, so a plain tick
+  would not naturally refresh) becomes present, and a forced re-check
+  (`force=True`, the spawn/park hook path) resolves it immediately -- one
+  "resolved" log line, and the very next `_log_tracked_objects()` call
+  queries it.
+- `test_tracked_object_stops_querying_after_despawn`: a present, queried
+  path disappears; the next `_resolve_tracked_objects()` call notices,
+  logs exactly one "missing" line, and no further PhysX query reaches that
+  path afterward (repeat ticks do not re-log "missing").
+
+Fail-first check: with the pre-fix `backend.py` (no
+`_resolve_tracked_objects`), all three new tests fail with
+`AttributeError: 'IsaacWholeRobotBackend' object has no attribute
+'_resolve_tracked_objects'`. Full suite (ROS-sourced, lark-shim on
+PYTHONPATH, `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`):
+`tests/test_manipulation_runtime.py` **132 passed, 3 subtests passed** (129
+baseline + 3 new).
+
+**Not addressed here**: the design doc for this task also traced a related
+"Physics tensor entity not valid ... velocities set to zero" warning to the
+vendored `isaacsim.ros2.sim_control` extension's `/get_entity_state` handler
+-- an out-of-tree call site this repo does not own and has no fix point
+for; left open.

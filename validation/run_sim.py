@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 
 
 STREAM_SIGNAL_PORT = 49100
@@ -616,6 +617,59 @@ def gateway_lidar_enabled(sensor_profile: str, qualification: bool) -> bool:
     return False
 
 
+def raycast_lidar_enabled(
+    sensor_profile: str, qualification: bool, raycast_lidar: bool
+) -> bool:
+    """Whether to build the live PhysX raycast lidar for this run.
+
+    The raycast sensor is the better source -- it casts against the physics
+    scene, so it sees spawned objects and the person capsule, which the
+    occupancy-map raycast structurally cannot.
+
+    It published EMPTY clouds until the scene-query fix. The sensor was never
+    at fault: IsaacLab's ``SimulationCfg.enable_scene_query_support`` defaults
+    to False, and its own docstring says that with it off "the physics engine
+    does not create the scene query manager and the scene query functionality
+    will not be available". A raycast lidar is nothing but scene queries, so
+    every ray missed while the sensor still reported ``is_valid`` and returned
+    a full-length reading -- a silent failure with nothing logged anywhere.
+    IsaacLab force-enables the flag when a GUI is attached, which is why it
+    only ever bit headless runs.
+
+    This predicate therefore does double duty: it decides whether to build the
+    rig AND whether the backend turns scene queries on, which must be settled
+    before ``SimulationCfg`` is constructed. Keep the two coupled -- queries
+    without a rig pay PhysX cost for nothing, a rig without queries publishes
+    empty clouds, and both failures are silent.
+
+    It is otherwise keyed to the same predicate as the development lidar, so
+    exactly one source feeds ``/livox/lidar`` in every profile.
+    """
+    if not raycast_lidar:
+        return False
+    return gateway_lidar_enabled(sensor_profile, qualification)
+
+
+def build_lidar_rig(root: Path, app: Any) -> Any:
+    """Construct and initialise the live raycast lidar, or fail loudly."""
+    from tinker_sim_isaac.lidar_rig import RaycastLidar, load_lidar_spec
+
+    spec = load_lidar_spec(root / "simulation/sensors/hardware-parity.json")
+    rig = RaycastLidar(spec)
+    rig.initialize(app)
+    print(
+        f"[run_sim] live raycast lidar: {spec.channels}ch x {spec.columns}col "
+        f"= {spec.num_rays} rays @ {spec.tick_rate_hz:g} Hz "
+        f"({spec.points_per_second:.0f} pts/s), "
+        f"elevation {spec.elevation_min_deg:g}..{spec.elevation_max_deg:g} deg, "
+        f"range {spec.min_range_m:g}..{spec.max_range_m:g} m, "
+        f"sweep={'on' if spec.sweep else 'off'}, "
+        f"mount={rig.sensor_path} offset={rig.mount_translation}",
+        flush=True,
+    )
+    return rig
+
+
 def sensor_rich_implies_ros(sensor_profile: str, ros: bool) -> bool:
     """sensor-rich exists to serve hardware-parity topics; it forces --ros."""
     return sensor_profile == "sensor-rich" and not ros
@@ -833,6 +887,40 @@ def _install_set_entity_state_physics(backend_holder: dict) -> None:
     )
 
 
+def _enable_sim_control_services(app: Any, gateway: Any | None = None) -> None:
+    """Advertise ``isaacsim.ros2.sim_control``'s ROS services (``/spawn_entity``,
+    ``/set_entity_state``, ``/delete_entity``, ``/set_simulation_state``,
+    ``/load_world``, ``/reset_simulation``) and flip the gateway's
+    ``services_ready`` flag once they are.
+
+    Task #39: call this ONLY once every long-running boot step before it
+    (backend construction, camera-rig warm-up, gateway construction) has
+    finished -- i.e. right where the boot-config JSON prints today, just
+    before the main loop starts pumping ``app.update()``/
+    ``gateway.spin_once()`` on every tick.
+
+    ``enable_extension`` registers the services synchronously, but Kit only
+    *serves* them from its own asyncio loop, which nothing pumps regularly
+    until the main loop starts. Backend construction
+    (``IsaacWholeRobotBackend.__init__``) and camera warm-up
+    (``CameraRig.initialize``) together can run for a couple of minutes with
+    only a handful of incidental ``app.update()`` calls in between; a
+    request that reaches the extension in that window queues past both the
+    caller's own timeout budget and, at the DDS layer, the point at which a
+    response can even be correlated back to it -- ``rmw_fastrtps_shared_cpp``'s
+    "failed to send response (timeout): client will not receive response".
+    Advertising the services this late instead of at process start closes
+    that window: ``wait_for_service()`` no longer returns true before a
+    request can actually be served promptly.
+    """
+    from isaacsim.core.utils.extensions import enable_extension
+
+    enable_extension("isaacsim.ros2.sim_control")
+    app.update()
+    if gateway is not None:
+        gateway.mark_services_ready()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -853,6 +941,27 @@ def main() -> int:
     parser.add_argument("--qualification", action="store_true")
     parser.add_argument("--livestream", action="store_true")
     parser.add_argument("--camera-pointcloud", action="store_true")
+    parser.add_argument(
+        "--map-lidar",
+        action="store_true",
+        help=(
+            "Deprecated no-op: the occupancy-map lidar is the default again "
+            "(see --raycast-lidar). Accepted so existing scripts keep working."
+        ),
+    )
+    parser.add_argument(
+        "--raycast-lidar",
+        action="store_true",
+        help=(
+            "Publish /livox/lidar from the live PhysX raycast sensor instead "
+            "of the arena occupancy map. Unlike the occupancy raycast, this "
+            "casts against the physics scene, so it sees spawned objects and "
+            "the person capsule. Passing this also switches PhysX scene "
+            "queries on for the run (SimulationCfg.enable_scene_query_support), "
+            "which IsaacLab defaults OFF and without which every ray silently "
+            "misses -- that is what made the sensor publish empty clouds."
+        ),
+    )
     parser.add_argument("--arena-colors", action="store_true")
     args, kit_args = parser.parse_known_args()
 
@@ -975,11 +1084,16 @@ def main() -> int:
         # once it is constructed further below.
         set_entity_state_backend_holder: dict = {"backend": None}
         if args.ros:
-            from isaacsim.core.utils.extensions import enable_extension
-
+            # Only the monkeypatch goes in this early -- it must run before
+            # the extension's own on_startup captures the unpatched bound
+            # method (see _install_set_entity_state_physics's docstring).
+            # Enabling isaacsim.ros2.sim_control itself is deferred to just
+            # before each profile's main loop starts (Task #39,
+            # _enable_sim_control_services): enabling it here, before the
+            # backend/camera-rig/gateway below exist, advertises
+            # /spawn_entity et al. long before anything pumps Kit's asyncio
+            # loop regularly enough to serve them.
             _install_set_entity_state_physics(set_entity_state_backend_holder)
-            enable_extension("isaacsim.ros2.sim_control")
-            app.update()
         if args.sensor_profile == "navigation-parity":
             root = Path(__file__).resolve().parents[1]
             sys.path.insert(0, str(root / "simulation"))
@@ -1002,13 +1116,22 @@ def main() -> int:
                 validate_arena_spawn(arena_dir, spawn_xy)
             expected_objects = _expected_scenario_objects(root, args.scenario, args.arena)
             from tinker_sim_isaac.backend import IsaacNavigationBackend
+            # Decided BEFORE the backend exists: PhysX only builds a scene
+            # query manager if SimulationCfg asks at construction time, and
+            # the raycast lidar is nothing but scene queries.
+            raycast_lidar = raycast_lidar_enabled(
+                args.sensor_profile, args.qualification, args.raycast_lidar
+            )
             backend = IsaacNavigationBackend(
                 usd_path=args.artifact, map_yaml=args.map_yaml, seed=args.seed,
                 render=args.livestream or not args.headless, enable_contacts=False,
                 arena_artifact=arena_dir, spawn_xy=spawn_xy,
                 expected_objects=expected_objects, scenario=args.scenario,
-                task=args.scenario,
+                task=args.scenario, scene_query_support=raycast_lidar,
             )
+            lidar_rig = None
+            if raycast_lidar:
+                lidar_rig = build_lidar_rig(root, app)
             set_entity_state_backend_holder["backend"] = backend
             arena_camera_eye = None
             arena_camera_target = None
@@ -1042,7 +1165,12 @@ def main() -> int:
                 gateway = RosStandardGateway(
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
+                    lidar_rig=lidar_rig,
                 )
+                # Task #39: backend (and the streaming viewport, above) are
+                # fully constructed -- safe to advertise sim_control's
+                # services now, right before this branch's main loop starts.
+                _enable_sim_control_services(app, gateway)
             stream_update_stride = 1
             stream_physics_frames = 0
             if args.livestream:
@@ -1180,6 +1308,10 @@ def main() -> int:
                 wall_color_fn = lambda index: wall_color(index)[1]  # noqa: E731
             from tinker_sim_isaac.backend import IsaacWholeRobotBackend
 
+            # See the navigation-parity site: settable only at construction.
+            raycast_lidar = raycast_lidar_enabled(
+                args.sensor_profile, args.qualification, args.raycast_lidar
+            )
             backend = IsaacWholeRobotBackend(
                 usd_path=args.artifact,
                 map_yaml=args.map_yaml,
@@ -1204,7 +1336,11 @@ def main() -> int:
                 wall_color_fn=wall_color_fn,
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
+                scene_query_support=raycast_lidar,
             )
+            lidar_rig = None
+            if raycast_lidar:
+                lidar_rig = build_lidar_rig(root, app)
             set_entity_state_backend_holder["backend"] = backend
             from tinker_sim_isaac.camera_rig import (
                 CameraRig,
@@ -1319,8 +1455,14 @@ def main() -> int:
                     args.sensor_profile, args.qualification
                 ),
                 camera_rig=camera_rig,
+                lidar_rig=lidar_rig,
                 camera_pointcloud=args.camera_pointcloud,
             )
+            # Task #39: backend and camera_rig warm-up (the ~90s window with
+            # almost no app.update() calls) are both fully behind us here --
+            # safe to advertise sim_control's services now, right before the
+            # boot-config print and the main loop below.
+            _enable_sim_control_services(app, gateway)
             camera_hz = _resolve_camera_hz(
                 robot_min_camera_hz,
                 os.environ.get("TINKER_SIM_CAMERA_HZ"),
@@ -1497,6 +1639,10 @@ def main() -> int:
                 validate_arena_spawn(arena_dir, spawn_xy)
             from tinker_sim_isaac.backend import IsaacWholeRobotBackend
 
+            # See the navigation-parity site: settable only at construction.
+            raycast_lidar = raycast_lidar_enabled(
+                args.sensor_profile, args.qualification, args.raycast_lidar
+            )
             backend = IsaacWholeRobotBackend(
                 usd_path=artifact,
                 map_yaml=None,
@@ -1509,7 +1655,11 @@ def main() -> int:
                 task=args.scenario,
                 arena_artifact=arena_dir,
                 spawn_xy=spawn_xy,
+                scene_query_support=raycast_lidar,
             )
+            lidar_rig = None
+            if raycast_lidar:
+                lidar_rig = build_lidar_rig(root, app)
             set_entity_state_backend_holder["backend"] = backend
             if backend.physics_device != "cpu":
                 raise RuntimeError("manipulation-core selected a non-CPU physics device")
@@ -1524,6 +1674,7 @@ def main() -> int:
                 gateway = RosStandardGateway(
                     backend,
                     development_lidar=gateway_lidar_enabled(args.sensor_profile, args.qualification),
+                    lidar_rig=lidar_rig,
                 )
             if args.qualification:
                 from tinker_sim_isaac.qualification_visual_capture import (
@@ -1535,6 +1686,12 @@ def main() -> int:
                     backend=backend,
                     event_pump=gateway.spin_once if gateway is not None else None,
                 )
+            if args.ros:
+                # Task #39: backend (and, under --qualification, the visual
+                # capture warm-up above) are fully constructed -- safe to
+                # advertise sim_control's services now, right before the
+                # boot-config print and the main loop below.
+                _enable_sim_control_services(app, gateway)
             print(
                 json.dumps(
                     {
@@ -1609,6 +1766,12 @@ def main() -> int:
             world = World(stage_units_in_meters=1.0, backend="torch", device="cpu")
             world.scene.add_default_ground_plane()
             world.reset()
+            if args.ros:
+                # No RosStandardGateway exists on this profile (Task #39
+                # readiness has nothing to flip), but the extension itself
+                # still only needs enabling once world construction (fast,
+                # here) is done.
+                _enable_sim_control_services(app)
             print(
                 json.dumps(
                     {

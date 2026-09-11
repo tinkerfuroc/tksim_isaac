@@ -188,6 +188,7 @@ class _StubGateway:
         RosStandardGateway._discard_backend_snapshot_staging
     )
     _reject_staged_baseline = RosStandardGateway._reject_staged_baseline
+    _spin_stats = RosStandardGateway._spin_stats
 
     def __init__(self, backend) -> None:
         self.backend = backend

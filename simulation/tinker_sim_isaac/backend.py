@@ -896,6 +896,7 @@ class IsaacWholeRobotBackend:
         wall_color_fn: Callable[[int], tuple[float, float, float]] | None = None,
         arena_artifact: Path | None = None,
         spawn_xy: tuple[float, float] = (0.0, 0.0),
+        scene_query_support: bool = False,
     ) -> None:
         spawn_x, spawn_y = validate_spawn_xy(spawn_xy)
         # Commanded spawn xy, remembered for the boot-time spawn-pose guard
@@ -1035,6 +1036,16 @@ class IsaacWholeRobotBackend:
         )
         self._tracked_object_views: dict[str, Any] = {}
         self._tracked_object_step = 0
+        # Resolved-path registry for the tracked set (Task #38): a tracked
+        # path is queried through PhysX only once it is confirmed present on
+        # the stage with RigidBodyAPI -- see _resolve_tracked_objects. Blind
+        # per-tick queries of an absent/removed prim both fail softly in
+        # Python AND emit a carb/omni.physx ERROR log line from inside the
+        # C++ call, which floods the log forever for any not-yet-spawned or
+        # already-deleted tracked path.
+        self._tracked_object_resolved: set[str] = set()
+        self._tracked_object_unresolved_logged: set[str] = set()
+        self._tracked_object_resolve_step = 0
         # Self-healing watchdog for the mid-play spawn attach race: about 1
         # in 3 /spawn_entity spawns onto a playing timeline never enters
         # PhysX (prim created and acked, RigidBodyAPI authored, but no
@@ -1207,6 +1218,26 @@ class IsaacWholeRobotBackend:
                 device=self.physics_device,
                 render_interval=1,
                 use_fabric=_use_fabric,
+                # PhysX builds no scene query manager unless asked, and
+                # IsaacLab defaults this OFF for speed. Every raycast then
+                # silently misses: the sensor still reports is_valid, still
+                # returns a full-length reading, still casts full-length rays
+                # from the correct world origin, and hits NOTHING -- not the
+                # ground plane, not the robot it is mounted on. That is how
+                # PR #24's lidar published correctly-timed EMPTY clouds for an
+                # entire Nav2 battery with no error logged anywhere.
+                #
+                # Measured in isolation, this flag alone flipped:
+                #   False -> raw raycast_closest MISSES, sensor hits 0
+                #   True  -> hits /World/Ground @1.0, sensor reports hit paths
+                #
+                # It is only settable here, at SimulationCfg construction, so
+                # the caller has to know about the lidar before the backend
+                # exists. Left off by default because it costs PhysX time that
+                # a run without a raycast sensor has no use for. (IsaacLab
+                # force-enables it whenever a GUI is attached, which is why
+                # this never reproduced interactively.)
+                enable_scene_query_support=bool(scene_query_support),
             )
         )
         self._timeline = omni.timeline.get_timeline_interface()
@@ -4055,6 +4086,7 @@ class IsaacWholeRobotBackend:
         # getattr defaults: test doubles construct via object.__new__ and
         # call step() without running __init__.
         if getattr(self, "_tracked_object_paths", ()):
+            self._resolve_tracked_objects()
             self._log_tracked_objects()
         if getattr(self, "_heal_detached_spawns", False):
             self._heal_detached_scenario_bodies()
@@ -4299,6 +4331,11 @@ class IsaacWholeRobotBackend:
                         flush=True,
                     )
                 state["healed"] = 1
+                # A newly-attached spawn may be a tracked path (Task #38):
+                # resolve it now rather than waiting out the next discovery
+                # interval, so _log_tracked_objects can query it on the very
+                # next tick it fires.
+                self._resolve_tracked_objects(force=True)
                 continue
             state["attempts"] += 1
             if state["attempts"] >= 3:
@@ -4330,6 +4367,94 @@ class IsaacWholeRobotBackend:
                     flush=True,
                 )
 
+    def _resolve_tracked_objects(self, *, force: bool = False) -> None:
+        """Refresh which TINKER_SIM_TRACK_OBJECTS paths currently resolve to
+        a live stage prim carrying RigidBodyAPI (Task #38).
+
+        Mirrors the "good pattern" ``_iter_spawned_bodies`` already uses for
+        scenario children: re-derive presence from the stage instead of
+        blind-querying PhysX forever. Runs at the same cadence
+        (``_object_discovery_interval``) so steady-state cost is one
+        ``GetPrimAtPath``/``HasAPI`` check per tracked path per interval, not
+        per tick. ``force=True`` lets a spawn-attach or park code path ask
+        for an immediate re-check instead of waiting out the interval, so a
+        freshly (re)spawned tracked prim is picked up without delay.
+
+        Logs a transition, not a state: "resolved" the first tick a path is
+        seen present, "missing" the first tick a previously-present path is
+        gone, "unresolved" once for a path that has never resolved at all --
+        mirroring the single-shot guard pattern used elsewhere (e.g.
+        ``_parity_tcp_bodies_missing_logged``, ``_contact_report_first_event_logged``).
+        """
+        paths = getattr(self, "_tracked_object_paths", ())
+        if not paths:
+            return
+        step = getattr(self, "_tracked_object_resolve_step", 0) + 1
+        self._tracked_object_resolve_step = step
+        interval = max(1, int(getattr(self, "_object_discovery_interval", 1)))
+        if not force and step != 1 and step % interval:
+            return
+        try:
+            import omni.usd
+            from pxr import UsdPhysics
+
+            stage = omni.usd.get_context().get_stage()
+        except (AttributeError, ImportError, RuntimeError):
+            return
+        resolved = getattr(self, "_tracked_object_resolved", None)
+        if resolved is None:
+            resolved = set()
+            self._tracked_object_resolved = resolved
+        unresolved_logged = getattr(self, "_tracked_object_unresolved_logged", None)
+        if unresolved_logged is None:
+            unresolved_logged = set()
+            self._tracked_object_unresolved_logged = unresolved_logged
+        for path in paths:
+            prim = stage.GetPrimAtPath(path)
+            present = bool(prim.IsValid()) and prim.HasAPI(UsdPhysics.RigidBodyAPI)
+            was_present = path in resolved
+            if present and not was_present:
+                resolved.add(path)
+                unresolved_logged.discard(path)
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": "resolved",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            elif not present and was_present:
+                resolved.discard(path)
+                unresolved_logged.add(path)
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": "missing",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            elif not present and path not in unresolved_logged:
+                unresolved_logged.add(path)
+                print(
+                    json.dumps(
+                        {
+                            "tracked_object": path,
+                            "t": round(self.simulation_time, 3),
+                            "state": "unresolved",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
     def _log_tracked_objects(self) -> None:
         """Print tracked rigid-body world poses (TINKER_SIM_TRACK_OBJECTS).
 
@@ -4339,6 +4464,12 @@ class IsaacWholeRobotBackend:
         views have no release API) on a deleted prim invalidates the shared
         SimulationView and kills the boot. See
         ``_heal_detached_scenario_bodies``.
+
+        Only queries paths ``_resolve_tracked_objects`` has confirmed
+        present (Task #38): PhysX's ``get_rigidbody_transformation`` on an
+        absent prim both fails softly here AND emits its own carb/omni.physx
+        ERROR log line from inside the C++ call, so blind-querying an
+        absent/removed path every tick floods the log forever.
         """
         self._tracked_object_step += 1
         interval = max(1, int(0.25 * self.control_hz))
@@ -4350,7 +4481,10 @@ class IsaacWholeRobotBackend:
             physx = get_physx_interface()
         except (AttributeError, ImportError, RuntimeError):
             return
+        resolved = getattr(self, "_tracked_object_resolved", ())
         for path in self._tracked_object_paths:
+            if path not in resolved:
+                continue
             try:
                 result = physx.get_rigidbody_transformation(path)
             except (AttributeError, RuntimeError, TypeError) as error:
@@ -4792,6 +4926,10 @@ class IsaacWholeRobotBackend:
             if not count:
                 return False
             self._park_views[prim_path] = view
+            # A parked prim's rigid body just confirmed live; if it is a
+            # tracked path (Task #38), resolve it immediately instead of
+            # waiting out the next discovery interval.
+            self._resolve_tracked_objects(force=True)
         # The PhysxManager SimulationView uses the WARP frontend, whose
         # set_transforms/set_velocities require WARP arrays: they call
         # wp.types.type_ctype(tensor.dtype), which rejects a torch tensor's
@@ -4948,6 +5086,106 @@ class IsaacWholeRobotBackend:
             ),
         }
 
+    #: Bodies the IMU may be sampled from, best first. ``livox_frame`` is the
+    #: sensor's own URDF link: when the import keeps it as a distinct body,
+    #: PhysX reports its acceleration with the lever-arm terms already in it,
+    #: so no manual ``omega x (omega x r)`` is needed. The URDF importer welds
+    #: fixed-joint links onto their parent often enough that this cannot be
+    #: assumed, hence the ordered fallback.
+    IMU_BODY_PREFERENCE = ("livox_frame", "base_link")
+
+    def _imu_body_index(self) -> tuple[int | None, str]:
+        """``(body index, name)`` for the IMU's sample body.
+
+        ``(None, "root")`` when neither preferred body is resolvable -- the
+        caller then falls back to the articulation root, exactly as the
+        pre-existing IMU did, rather than failing a boot over a sensor.
+        """
+        try:
+            body_names = tuple(getattr(self._robot.data, "body_names", ()))
+        except AttributeError:
+            return None, "root"
+        for name in self.IMU_BODY_PREFERENCE:
+            if name in body_names:
+                return body_names.index(name), name
+        return None, "root"
+
+    def imu_state(self) -> dict[str, Any]:
+        """World-frame state for the ``/livox/imu`` sample.
+
+        Returns the sampled body's orientation, angular velocity, linear
+        acceleration and (when available) angular acceleration, all in the
+        world frame, plus which body they came from and whether the
+        acceleration is a real PhysX reading or a fallback.
+
+        The physics that turns this into a sensor-frame accelerometer and
+        gyro reading lives in ``tinker_sim_isaac.imu_model``; this method only
+        reads the simulator.
+        """
+        data = self._robot.data
+        index, body = self._imu_body_index()
+
+        if index is None:
+            quaternion_xyzw = tuple(
+                float(value)
+                for value in self._torch_value(data.root_quat_w)[0].detach().cpu()
+            )
+            angular = tuple(
+                float(value)
+                for value in self._torch_value(data.root_ang_vel_w)[0].detach().cpu()
+            )
+            linear_velocity = tuple(
+                float(value)
+                for value in self._torch_value(data.root_lin_vel_w)[0].detach().cpu()
+            )
+        else:
+            quaternion_xyzw = tuple(
+                float(value)
+                for value in self._torch_value(data.body_quat_w)[0, index].detach().cpu()
+            )
+            angular = tuple(
+                float(value)
+                for value in self._torch_value(data.body_ang_vel_w)[0, index].detach().cpu()
+            )
+            linear_velocity = tuple(
+                float(value)
+                for value in self._torch_value(data.body_lin_vel_w)[0, index].detach().cpu()
+            )
+
+        state: dict[str, Any] = {
+            "body": body,
+            "quaternion_wxyz": (
+                quaternion_xyzw[3],
+                quaternion_xyzw[0],
+                quaternion_xyzw[1],
+                quaternion_xyzw[2],
+            ),
+            "angular_velocity_world": angular,
+            "linear_velocity_world": linear_velocity,
+            "linear_acceleration_world": None,
+            "angular_acceleration_world": None,
+        }
+
+        # PhysX reports link accelerations directly. Preferred over
+        # differencing velocity, which lags half a step and amplifies solver
+        # jitter -- but the view is not guaranteed across physics backends, so
+        # a missing/short array is a soft miss and the gateway differences
+        # instead.
+        try:
+            accelerations = self._torch_value(data.body_com_acc_w)
+        except (AttributeError, RuntimeError, TypeError):
+            accelerations = None
+        if accelerations is not None and index is not None:
+            try:
+                spatial = accelerations[0, index].detach().cpu()
+                values = [float(value) for value in spatial]
+                if len(values) >= 6:
+                    state["linear_acceleration_world"] = tuple(values[0:3])
+                    state["angular_acceleration_world"] = tuple(values[3:6])
+            except (IndexError, RuntimeError, TypeError, ValueError):
+                pass
+        return state
+
     def contact_state(self) -> dict[str, dict[str, float | bool]]:
         state: dict[str, dict[str, float | bool]] = {
             name: {"in_contact": False, "force": 0.0}
@@ -5064,7 +5302,18 @@ class IsaacWholeRobotBackend:
                     continue
                 normal_impulses.append((abs(projected_impulse), normal, sample_index))
 
-            normal_force = sum(value[0] for value in normal_impulses) / self.dt
+            # subscribe_contact_report_events fires this callback once per
+            # PhysX solver SUBSTEP (physics_dt = 1/physics_hz), independent
+            # of control_hz: with physics_substeps = physics_hz/control_hz
+            # substeps per control tick, self.dt (1/control_hz) is
+            # physics_substeps times too large whenever control_hz <
+            # physics_hz. The callback receives no per-step dt/current_time
+            # argument (only contact_headers, contact_data), so the impulse
+            # -- itself accumulated over exactly one physics_dt -- must be
+            # converted to a force with physics_dt, not the control-tick
+            # self.dt (Task #29; confirmed by A/B probe: 20.74 N at 120 Hz
+            # vs a wrong 5.12 N at 30 Hz for an identical trajectory).
+            normal_force = sum(value[0] for value in normal_impulses) / self.physics_dt
             if normal_force <= self.CONTACT_FORCE_THRESHOLD:
                 self._contact_pairs_by_key.pop(key, None)
                 self._contact_trace_pairs_by_key.pop(key, None)

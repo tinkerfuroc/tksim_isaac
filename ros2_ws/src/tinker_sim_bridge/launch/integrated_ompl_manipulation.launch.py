@@ -546,7 +546,15 @@ def _resolve(context):
                 launch_ros.actions.Node(
                     package="tf2_ros", executable="static_transform_publisher", name="livox360_static_tf",
                     arguments=[
-                        "--x", "0.12", "--y", "0.0", "--z", "0.25",
+                        # Must match where the sim's raycast lidar prim
+                        # actually sits: the URDF's livox_joint, base_link ->
+                        # livox_frame at (0.09, 0, 0.195). It also has to match
+                        # the height the AMCL map is rasterized at --
+                        # tools/tinker_sim_deploy/arena_map.py slices the arena
+                        # colliders at livox_scan_height(), read from that same
+                        # joint. The previous (0.12, 0, 0.25) predated any real
+                        # sensor and agreed with neither.
+                        "--x", "0.09", "--y", "0.0", "--z", "0.195",
                         "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
                         "--frame-id", "base_link", "--child-frame-id", "livox360",
                     ],

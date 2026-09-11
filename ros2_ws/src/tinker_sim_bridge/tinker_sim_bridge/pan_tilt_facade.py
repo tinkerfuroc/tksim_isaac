@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from tinker_vision_msgs_26.msg import PanTiltCommand, PanTiltState
@@ -54,7 +55,15 @@ class PanTiltFacade(Node):
         self._target_pan = self._initial_pan
         self._target_tilt = self._initial_tilt
         self._initial_pose_reached = False
-        self.create_timer(0.2, self._hold_target)
+        # STEADY_TIME, not sim-time: the mux's pan_tilt CommandSource expires
+        # 0.5 WALL seconds after the last message, so a keepalive timer paced
+        # by the node's use_sim_time clock stops meeting that deadline
+        # whenever RTF < 0.4 -- 0.2 sim-s costs more than 0.5 wall-s to elapse
+        # -- and thrashes stale_hold/stale_hold_cleared forever (2835 pairs in
+        # one bench round). Mirrors command_gateway.py's own 150 Hz timer.
+        self.create_timer(
+            0.2, self._hold_target, clock=Clock(clock_type=ClockType.STEADY_TIME)
+        )
 
     def _optional_degrees(self, name: str) -> float | None:
         """NaN is this node's "unset" -- rclpy has no optional double."""

@@ -11,6 +11,7 @@ import re
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -270,6 +271,36 @@ class _FakeRigidView:
 
     def get_velocities(self) -> _ArrayValue:
         return self._velocities
+
+
+def _fake_omni_usd_and_pxr(present_paths: set[str]) -> dict[str, object]:
+    """Return a ``sys.modules`` overlay (for ``patch.dict``) stubbing
+    ``omni.usd``/``pxr`` for ``_resolve_tracked_objects`` (Task #38).
+
+    ``present_paths`` is a live set the test mutates in place to simulate a
+    spawn/despawn between calls -- ``GetPrimAtPath`` always re-checks
+    membership rather than snapshotting it once.
+    """
+    pxr = types.ModuleType("pxr")
+    pxr.UsdPhysics = SimpleNamespace(RigidBodyAPI="RigidBodyAPI")
+
+    class _Prim:
+        def __init__(self, path: str) -> None:
+            self._path = path
+
+        def IsValid(self) -> bool:
+            return self._path in present_paths
+
+        def HasAPI(self, api: object) -> bool:
+            return api == "RigidBodyAPI" and self._path in present_paths
+
+    stage = SimpleNamespace(GetPrimAtPath=lambda path: _Prim(path))
+    omni = types.ModuleType("omni")
+    omni.__path__ = []
+    omni_usd = types.ModuleType("omni.usd")
+    omni_usd.get_context = lambda: SimpleNamespace(get_stage=lambda: stage)
+    omni.usd = omni_usd
+    return {"pxr": pxr, "omni": omni, "omni.usd": omni_usd}
 
 
 def _backend() -> IsaacWholeRobotBackend:
@@ -3461,7 +3492,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_uses_identified_bodies_and_reported_normal(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_persist = "persist"
         backend._contact_event_lost = "lost"
@@ -3504,7 +3535,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_sums_normal_impulses_without_tangential_cancellation(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -3549,7 +3580,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
 
     def test_contact_report_uses_deterministic_normal_for_degenerate_average(self) -> None:
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -3591,7 +3622,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # actor in ARM_CONTACT_BODIES/GRASP_CONTACT_BODIES) stays invisible on
         # both the existing and the new accessor -- unchanged default behavior.
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -3627,7 +3658,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # its force, point, and normal kept on the new trace accessor.
         with patch.dict(os.environ, {"TINKER_SIM_CONTACT_TRACE_BODIES": "Bottle"}):
             backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -3683,7 +3714,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # stays invisible -- byte-identical to the pre-existing monitored set.
         backend = _backend()
         self.assertEqual(backend._contact_extra_bodies, ())
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -3727,7 +3758,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             backend._contact_extra_bodies,
             ("xarm_gripper_base_link", "xarm_camera_link"),
         )
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -3784,7 +3815,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             },
         ):
             backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -3821,6 +3852,92 @@ class ManipulationRuntimeTest(unittest.TestCase):
             traced[0]["body_b"], "/World/Scenario/bench_sugar_box_100_anygrasp_agw_a1"
         )
 
+
+    def test_contact_report_force_divides_by_physics_dt_not_control_dt(self) -> None:
+        # Task #29: subscribe_contact_report_events fires once per PhysX
+        # solver SUBSTEP (physics_dt = 1/physics_hz), regardless of
+        # control_hz, so the impulse it delivers is a physics_dt-sized
+        # sample. At control_hz=30 with physics_hz=120 there are
+        # physics_substeps=4 substeps per control tick and self.dt (1/30)
+        # is 4x physics_dt (1/120) -- dividing by self.dt under-reports the
+        # true force by 4x (probe A/B: 20.74 N @120 Hz vs 5.12 N @30 Hz on
+        # an identical drive/pad/tilt trajectory). The formula must divide
+        # by physics_dt, the substep's own integration window, not by the
+        # control-tick dt.
+        backend = _backend()
+        backend.physics_hz = 120.0
+        backend.control_hz = 30.0
+        backend.physics_dt = 1.0 / 120.0
+        backend.dt = 1.0 / 30.0
+        backend.physics_substeps = 4
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/left_finger",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 0.05),
+            position=(0.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pair = backend.contact_pairs()[0]
+        # impulse (0.05) / physics_dt (1/120) == 6.0 N -- the correct value.
+        self.assertAlmostEqual(float(pair["normal_force"]), 6.0)
+        # impulse (0.05) / self.dt (1/30) == 1.5 N -- the pre-fix bug value,
+        # exactly 4x too low. Must NOT be what gets recorded.
+        self.assertNotAlmostEqual(float(pair["normal_force"]), 1.5)
+
+    def test_contact_report_force_at_matched_rates_is_byte_identical_path(self) -> None:
+        # When control_hz == physics_hz, self.dt == self.physics_dt, so the
+        # fixed formula (divide by physics_dt) must reproduce exactly the
+        # same value the old formula (divide by self.dt) gave at 120 Hz --
+        # the fix must not disturb the already-correct 120/120 case.
+        backend = _backend()
+        backend.physics_hz = 120.0
+        backend.control_hz = 120.0
+        backend.physics_dt = 1.0 / 120.0
+        backend.dt = 1.0 / 120.0
+        backend.physics_substeps = 1
+        backend._contact_event_found = "found"
+        backend._contact_event_lost = "lost"
+        backend._contact_event_persist = "persist"
+        backend._contact_path_decoder = {
+            1: "/World/Tinker/left_finger",
+            2: "/World/Scenario/delivery_object",
+        }.__getitem__
+        header = SimpleNamespace(
+            actor0=1,
+            actor1=2,
+            collider0=11,
+            collider1=22,
+            type="found",
+            contact_data_offset=0,
+            num_contact_data=1,
+        )
+        sample = SimpleNamespace(
+            impulse=(0.0, 0.0, 0.05),
+            position=(0.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        )
+        backend._on_contact_report_event([header], [sample])
+
+        pair = backend.contact_pairs()[0]
+        self.assertAlmostEqual(float(pair["normal_force"]), 0.05 * 120.0)
+        self.assertAlmostEqual(float(pair["normal_force"]), 6.0)
+
     def test_contact_report_first_event_logged_exactly_once(self) -> None:
         # #28 observability: a stale contacts-off boot produced a
         # structurally-silent /sim/truth/contacts for a whole bench round
@@ -3828,7 +3945,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
         # must print a one-line marker exactly once per backend life, not
         # once per contact (see _on_contact_report_event).
         backend = _backend()
-        backend.dt = 0.1
+        backend.physics_dt = 0.1
         backend._contact_event_found = "found"
         backend._contact_event_lost = "lost"
         backend._contact_event_persist = "persist"
@@ -4007,6 +4124,151 @@ class ManipulationRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(objects[0]["prim_path"], "/World/Scenario/delivery_object")
         self.assertNotEqual(objects[0]["pose"]["xyz"], [9.0, 9.0, 9.0])
+
+    def _tracked_backend(self, paths: tuple[str, ...]) -> IsaacWholeRobotBackend:
+        backend = _backend()
+        backend._tracked_object_paths = paths
+        backend._tracked_object_step = 0
+        backend._tracked_object_resolve_step = 0
+        backend._tracked_object_resolved = set()
+        backend._tracked_object_unresolved_logged = set()
+        return backend
+
+    @staticmethod
+    def _fake_physx_module(allowed: set[str], calls: list[str]):
+        class _Physx:
+            def get_rigidbody_transformation(self, path: str) -> dict:
+                assert path in allowed, f"blind PhysX query of unresolved path {path}"
+                calls.append(path)
+                return {
+                    "ret_val": True,
+                    "position": (1.0, 2.0, 3.0),
+                    "rotation": (0.0, 0.0, 0.0, 1.0),
+                }
+
+        physx = types.ModuleType("omni.physx")
+        physx.get_physx_interface = lambda: _Physx()
+        return physx
+
+    def test_log_tracked_objects_never_queries_unresolved_paths(self) -> None:
+        # Task #38: an absent/never-spawned tracked path must never reach a
+        # blind PhysX query -- get_rigidbody_transformation on a nonexistent
+        # prim fails softly in Python but also emits a carb/omni.physx ERROR
+        # log line from inside the C++ call, so blind-querying it every tick
+        # floods the log forever. Two present + two absent paths, several
+        # ticks: absent paths are never queried, and each logs "unresolved"
+        # exactly once (not once per tick).
+        backend = self._tracked_backend(
+            (
+                "/World/Scenario/present_a",
+                "/World/Scenario/present_b",
+                "/World/Scenario/absent_a",
+                "/World/Scenario/absent_b",
+            )
+        )
+        backend._object_discovery_interval = 1
+        backend.control_hz = 4.0  # _log_tracked_objects interval = 1 tick
+
+        present = {"/World/Scenario/present_a", "/World/Scenario/present_b"}
+        overlay = _fake_omni_usd_and_pxr(present)
+        calls: list[str] = []
+        overlay["omni.physx"] = self._fake_physx_module(present, calls)
+
+        with patch.dict(sys.modules, overlay):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                for _ in range(6):
+                    backend._resolve_tracked_objects()
+                    backend._log_tracked_objects()
+
+        # Zero queries reached the absent paths; the present ones were
+        # queried normally (once per tick).
+        self.assertTrue(calls)
+        self.assertTrue(all(path in present for path in calls))
+        self.assertEqual(calls.count("/World/Scenario/present_a"), 6)
+        self.assertEqual(calls.count("/World/Scenario/present_b"), 6)
+
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
+        unresolved = [line for line in lines if line.get("state") == "unresolved"]
+        self.assertEqual(
+            sorted(line["tracked_object"] for line in unresolved),
+            ["/World/Scenario/absent_a", "/World/Scenario/absent_b"],
+        )
+
+    def test_tracked_object_resolves_on_spawn_without_waiting_for_interval(self) -> None:
+        # A tracked path that appears mid-run (spawn) must be picked up by
+        # the very next tick, not up to one discovery interval later --
+        # exercised here via the force=True path a spawn/park hook uses
+        # (_heal_detached_scenario_bodies / set_entity_pose_physics).
+        backend = self._tracked_backend(("/World/Scenario/late_spawn",))
+        backend._object_discovery_interval = 1000  # would not naturally refresh
+        backend.control_hz = 4.0
+
+        present: set[str] = set()
+        overlay = _fake_omni_usd_and_pxr(present)
+
+        with patch.dict(sys.modules, overlay):
+            with contextlib.redirect_stdout(io.StringIO()):
+                backend._resolve_tracked_objects()  # first call always runs
+            self.assertNotIn("/World/Scenario/late_spawn", backend._tracked_object_resolved)
+
+            present.add("/World/Scenario/late_spawn")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                backend._resolve_tracked_objects(force=True)
+            self.assertIn("/World/Scenario/late_spawn", backend._tracked_object_resolved)
+            lines = [
+                json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()
+            ]
+            resolved_lines = [line for line in lines if line.get("state") == "resolved"]
+            self.assertEqual(len(resolved_lines), 1)
+
+            calls: list[str] = []
+            with patch.dict(
+                sys.modules, {"omni.physx": self._fake_physx_module(present, calls)}
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    backend._log_tracked_objects()
+            self.assertEqual(calls, ["/World/Scenario/late_spawn"])
+
+    def test_tracked_object_stops_querying_after_despawn(self) -> None:
+        # A tracked path that disappears (despawn) must stop being queried
+        # after the next discovery refresh, and log the transition exactly
+        # once -- not every tick thereafter.
+        backend = self._tracked_backend(("/World/Scenario/gone_soon",))
+        backend._object_discovery_interval = 1
+        backend.control_hz = 4.0
+
+        present = {"/World/Scenario/gone_soon"}
+        overlay = _fake_omni_usd_and_pxr(present)
+        calls: list[str] = []
+        overlay["omni.physx"] = self._fake_physx_module(present, calls)
+
+        with patch.dict(sys.modules, overlay):
+            with contextlib.redirect_stdout(io.StringIO()):
+                backend._resolve_tracked_objects()
+                backend._log_tracked_objects()
+            self.assertEqual(calls, ["/World/Scenario/gone_soon"])
+
+            present.discard("/World/Scenario/gone_soon")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                backend._resolve_tracked_objects()
+                backend._log_tracked_objects()
+            lines = [
+                json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()
+            ]
+            missing = [line for line in lines if line.get("state") == "missing"]
+            self.assertEqual(len(missing), 1)
+            # No further PhysX query after the despawn is noticed.
+            self.assertEqual(calls, ["/World/Scenario/gone_soon"])
+
+            stdout2 = io.StringIO()
+            with contextlib.redirect_stdout(stdout2):
+                backend._resolve_tracked_objects()
+                backend._log_tracked_objects()
+            self.assertNotIn('"missing"', stdout2.getvalue())
+            self.assertEqual(calls, ["/World/Scenario/gone_soon"])
 
     def test_quaternion_xyzw_from_physx_maps_scalar_last(self) -> None:
         from tinker_sim_isaac.backend import IsaacWholeRobotBackend as _BE
@@ -4237,6 +4499,8 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway._imu_stride = 1_000_000
         gateway._status_stride = 1_000_000
         gateway._tick = 0
+        gateway._services_ready = False
+        gateway._services_ready_since = None
 
         for _ in range(3):
             gateway.publish()
