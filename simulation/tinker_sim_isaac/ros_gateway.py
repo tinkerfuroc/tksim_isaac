@@ -1365,7 +1365,7 @@ class RosStandardGateway:
     #: that produces the payload: contact_state(), parity_tcp_frame() and a
     #: json.dumps() of the entire physics-truth frame, each previously run on
     #: EVERY control tick whether or not anything consumed the result.
-    def _has_listeners(self, *publishers: Any) -> bool:
+    def _has_listeners(self, *names: str) -> bool:
         """True if any of ``publishers`` currently has a subscriber.
 
         ``TINKER_SIM_PUBLISH_GATE=0`` forces this True, restoring the old
@@ -1386,7 +1386,16 @@ class RosStandardGateway:
         """
         if os.environ.get("TINKER_SIM_PUBLISH_GATE") == "0":
             return True
-        for publisher in publishers:
+        resolved = 0
+        for name in names:
+            publisher = getattr(self, name, None)
+            if publisher is None:
+                # Not every caller of this gateway constructs every publisher
+                # (tests build partial instances, and optional parity
+                # publishers are env-gated). A publisher that does not exist
+                # cannot have a listener -- that is not a reason to raise.
+                continue
+            resolved += 1
             counter = getattr(publisher, "get_subscription_count", None)
             if counter is None:
                 return True
@@ -1395,7 +1404,8 @@ class RosStandardGateway:
                     return True
             except Exception:  # noqa: BLE001 - never let telemetry kill the loop
                 return True
-        return False
+        # Nothing resolved at all: behave exactly as before the gate existed.
+        return resolved == 0
 
     def publish(self) -> None:
         _prof = self._publish_profile if self._publish_profile_enabled else None
@@ -1499,7 +1509,7 @@ class RosStandardGateway:
         # Subscriber-gating keeps the cadence EXACTLY as documented above for
         # the manipulation/qualification runs that do subscribe, and costs a
         # nav run nothing. See _has_listeners.
-        if self._has_listeners(self.contact_pub):
+        if self._has_listeners("contact_pub"):
             contacts = self.backend.contact_state()
             force = sum(
                 float(item["force"])
@@ -1517,13 +1527,13 @@ class RosStandardGateway:
         # backend.parity_tcp_frame() returns None (and logs once) if
         # link_tcp/left_finger/right_finger cannot be resolved this tick.
         if self._parity_tcp_enabled and self._has_listeners(
-            self.tcp_pose_pub,
-            self.tcp_pose_base_pub,
-            self.gripper_targets_pub,
-            self.gripper_physx_tau_pub,
-            self.pad_points_pub,
-            self.wrist_camera_pose_pub,
-            self.wrist_camera_pose_base_pub,
+            "tcp_pose_pub",
+            "tcp_pose_base_pub",
+            "gripper_targets_pub",
+            "gripper_physx_tau_pub",
+            "pad_points_pub",
+            "wrist_camera_pose_pub",
+            "wrist_camera_pose_base_pub",
         ):
             parity_tcp = self.backend.parity_tcp_frame()
             if parity_tcp is not None:
@@ -1679,7 +1689,7 @@ class RosStandardGateway:
                         get_logger().error(
                             f"gripper_targets publish failed: {error}"
                         )
-        if self._has_listeners(self.physics_truth_pub):
+        if self._has_listeners("physics_truth_pub"):
             physics_truth = self._String()
             frame = dict(
                 self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN)
