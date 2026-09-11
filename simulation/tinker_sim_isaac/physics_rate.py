@@ -11,6 +11,10 @@ import math
 # grasp/collision behaviour this simulator is used to validate.
 MINIMUM_PHYSICS_HZ = 30.0
 
+#: What an unset ``TINKER_SIM_CONTROL_HZ`` resolves to. Capped by the physics
+#: rate, since a control step can never be shorter than a solver step.
+DEFAULT_CONTROL_HZ = 60.0
+
 
 def resolve_physics_hz(default_hz: float, override: str | None) -> float:
     """Resolve the physics rate, honouring an explicit opt-in override.
@@ -62,11 +66,30 @@ def resolve_control_hz(physics_hz: float, override: str | None) -> float:
     the physics rate by a whole factor: each control step then runs
     ``physics_hz / control_hz`` solver steps of the validated length, and
     every per-step wrapper cost is paid ``control_hz`` times a second instead
-    of ``physics_hz``. Unset, the control rate equals the physics rate and
-    the simulator behaves exactly as before.
+    of ``physics_hz``.
+
+    Unset, this is :data:`DEFAULT_CONTROL_HZ`, NOT the physics rate. It used
+    to equal the physics rate, which meant the shipped default was a rate
+    nothing was ever validated at: every RTF figure and every recommendation
+    in this project's history was measured at 60. Measured live on
+    navigation-parity (arena rcw2026, Kit pumped at 10 Hz):
+
+        control 120   RTF 0.438
+        control  60   RTF 0.543
+
+    Contact fidelity is NOT affected. PhysX still steps at the validated
+    ``1/physics_hz``; a control step simply runs ``physics_hz / control_hz``
+    whole solver steps of that same length. Lowering ``physics_hz`` is the
+    change that alters contact behaviour (measured: 5 mm of trajectory drift
+    after 10 s versus <0.5 mm), and this is deliberately not that.
+
+    What DOES change is the cadence of everything the control step drives:
+    command target writes, ``/clock``, and the gateway publish. Note the IMU
+    in particular -- the hardware contract declares 200 Hz, which was already
+    unreachable at a 120 Hz control rate and is now published at 60.
     """
     if override is None or not str(override).strip():
-        return float(physics_hz)
+        return min(float(physics_hz), DEFAULT_CONTROL_HZ)
     try:
         value = float(str(override).strip())
     except (TypeError, ValueError):

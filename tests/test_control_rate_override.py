@@ -43,13 +43,47 @@ class ControlRateOverrideTest(unittest.TestCase):
     def setUpClass(cls):
         cls.module = _load()
 
-    def test_default_is_the_physics_rate(self):
-        """Unset, one PhysX step per control step -- today's behaviour."""
+    def test_default_is_the_validated_control_rate_not_the_physics_rate(self):
+        """Unset resolves to DEFAULT_CONTROL_HZ, deliberately below physics.
+
+        This used to return the physics rate, which made the shipped default a
+        cadence nothing was validated at: every RTF number and every
+        recommendation in this project's history was taken at 60. Measured live
+        on navigation-parity with Kit pumped at 10 Hz, control 120 gives RTF
+        0.438 and control 60 gives 0.543 -- the difference between missing and
+        clearing the project's 0.5 floor.
+
+        Contact fidelity is untouched: PhysX still steps at 1/physics_hz and a
+        control step just runs whole substeps of it. Lowering PHYSICS rate is
+        the change that alters contact behaviour, and this is not that.
+        """
         resolve = self.module.resolve_control_hz
-        self.assertEqual(resolve(120.0, None), 120.0)
-        self.assertEqual(resolve(120.0, ""), 120.0)
-        self.assertEqual(resolve(120.0, "  "), 120.0)
+        default = self.module.DEFAULT_CONTROL_HZ
+        self.assertEqual(resolve(120.0, None), default)
+        self.assertEqual(resolve(120.0, ""), default)
+        self.assertEqual(resolve(120.0, "  "), default)
+        self.assertLess(
+            default, 120.0, "a default equal to the physics rate is the bug"
+        )
+
+    def test_default_never_exceeds_the_physics_rate(self):
+        """A control step can never be shorter than a solver step.
+
+        With a physics rate at or below the default, the default must yield to
+        it rather than produce a fractional substep count.
+        """
+        resolve = self.module.resolve_control_hz
         self.assertEqual(resolve(60.0, None), 60.0)
+        self.assertEqual(resolve(30.0, None), 30.0)
+        for physics_hz in (30.0, 60.0, 120.0):
+            control = resolve(physics_hz, None)
+            ratio = physics_hz / control
+            self.assertAlmostEqual(
+                ratio,
+                round(ratio),
+                msg=f"physics {physics_hz} / default control {control} must be "
+                "a whole number of PhysX substeps",
+            )
 
     def test_override_lowers_the_control_rate(self):
         resolve = self.module.resolve_control_hz

@@ -937,6 +937,12 @@ class RosStandardGateway:
     # backlog larger than this is drained over the following steps.
     INTAKE_BATCH_LIMIT = 512
 
+    #: publish() calls between publish-profile emissions under
+    #: TINKER_SIM_PROFILE=1. 600 is 5 s at a 120 Hz control rate -- long
+    #: enough that the per-lap averages are stable, short enough that a
+    #: 30 s probe window still yields several samples.
+    _PUBLISH_PROFILE_EVERY = 600
+
     def _take_pending(self) -> int:
         """Take every waiting message from the gateway's DDS readers.
 
@@ -1354,6 +1360,43 @@ class RosStandardGateway:
         prof["n"] = 0
         return out
 
+    #: Publishers whose MESSAGE is expensive to build are gated on this. It is
+    #: not an optimisation of the publish call (that is cheap) but of the work
+    #: that produces the payload: contact_state(), parity_tcp_frame() and a
+    #: json.dumps() of the entire physics-truth frame, each previously run on
+    #: EVERY control tick whether or not anything consumed the result.
+    def _has_listeners(self, *publishers: Any) -> bool:
+        """True if any of ``publishers`` currently has a subscriber.
+
+        ``TINKER_SIM_PUBLISH_GATE=0`` forces this True, restoring the old
+        unconditional every-tick behaviour. That is both an escape hatch and
+        the only honest way to A/B the gate: the two arms then differ by
+        nothing except this predicate, in one build.
+
+        Fails OPEN: if a publisher does not expose ``get_subscription_count``
+        (a fake in tests, a future rclpy change), it is treated as having
+        listeners and the payload is built exactly as before. A gate that
+        silently stopped publishing truth data on an API change would be far
+        worse than the wasted work it saves.
+
+        These are volatile diagnostic streams, so skipping them while nobody
+        listens is not observable: DDS was already dropping the messages. A
+        subscriber that joins mid-run is picked up as soon as discovery
+        completes, on the next tick.
+        """
+        if os.environ.get("TINKER_SIM_PUBLISH_GATE") == "0":
+            return True
+        for publisher in publishers:
+            counter = getattr(publisher, "get_subscription_count", None)
+            if counter is None:
+                return True
+            try:
+                if counter() > 0:
+                    return True
+            except Exception:  # noqa: BLE001 - never let telemetry kill the loop
+                return True
+        return False
+
     def publish(self) -> None:
         _prof = self._publish_profile if self._publish_profile_enabled else None
         _t = time.monotonic if _prof is not None else None
@@ -1445,23 +1488,43 @@ class RosStandardGateway:
         # misses transient/marginal grasp contact and reads zero for most of
         # a trial, while /sim/internal/physics_truth below (also unconditional)
         # carries the real force. Keep this at the same cadence as that block.
-        contacts = self.backend.contact_state()
-        force = sum(
-            float(item["force"])
-            for name, item in contacts.items()
-            if name in {"left_finger", "right_finger"}
-        )
-        contact = self._WrenchStamped()
-        contact.header.stamp = stamp
-        contact.header.frame_id = "link_tcp"
-        contact.wrench.force.z = float(force)
-        self.contact_pub.publish(contact)
+        # ...but only when something is actually listening. Measured
+        # 2026-09-11: with the bridge attached this publish path cost 5.10 s of
+        # wall per SIMULATED second -- 84% of all wall time -- while the
+        # simulator underneath ran at RTF 1.04. The dominant term is building
+        # these grasp-bench frames every tick for nobody: a navigation run has
+        # no truth_evaluator and no grasp bench, so contact_state(),
+        # parity_tcp_frame() and a json.dumps() of the whole physics-truth
+        # frame were being computed 120x a second and dropped by DDS.
+        # Subscriber-gating keeps the cadence EXACTLY as documented above for
+        # the manipulation/qualification runs that do subscribe, and costs a
+        # nav run nothing. See _has_listeners.
+        if self._has_listeners(self.contact_pub):
+            contacts = self.backend.contact_state()
+            force = sum(
+                float(item["force"])
+                for name, item in contacts.items()
+                if name in {"left_finger", "right_finger"}
+            )
+            contact = self._WrenchStamped()
+            contact.header.stamp = stamp
+            contact.header.frame_id = "link_tcp"
+            contact.wrench.force.z = float(force)
+            self.contact_pub.publish(contact)
         # Task #35: same cadence as physics_truth below (unconditional, every
         # tick) -- a stride-gated sample would miss the transient tool-centre
         # motion a grasp bench needs to diff against TF link_tcp. Fails soft:
         # backend.parity_tcp_frame() returns None (and logs once) if
         # link_tcp/left_finger/right_finger cannot be resolved this tick.
-        if self._parity_tcp_enabled:
+        if self._parity_tcp_enabled and self._has_listeners(
+            self.tcp_pose_pub,
+            self.tcp_pose_base_pub,
+            self.gripper_targets_pub,
+            self.gripper_physx_tau_pub,
+            self.pad_points_pub,
+            self.wrist_camera_pose_pub,
+            self.wrist_camera_pose_base_pub,
+        ):
             parity_tcp = self.backend.parity_tcp_frame()
             if parity_tcp is not None:
                 tcp_world = parity_tcp["tcp_pose_world"]
@@ -1616,21 +1679,41 @@ class RosStandardGateway:
                         get_logger().error(
                             f"gripper_targets publish failed: {error}"
                         )
-        physics_truth = self._String()
-        frame = dict(self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN))
-        frame["command_gateway"] = {
-            "last_command_error": self._last_command_error,
-            "command_stream_lost": bool(self._command_stream_lost),
-            "active_epoch": self._command_epoch,
-            "last_snapshot_id": self._last_logical_snapshot_id,
-        }
-        physics_truth.data = json.dumps(
-            frame, sort_keys=True, separators=(",", ":"), allow_nan=False
-        )
-        self.physics_truth_pub.publish(physics_truth)
+        if self._has_listeners(self.physics_truth_pub):
+            physics_truth = self._String()
+            frame = dict(
+                self.backend.physics_truth_frame(self.backend.TRUTH_TOKEN)
+            )
+            frame["command_gateway"] = {
+                "last_command_error": self._last_command_error,
+                "command_stream_lost": bool(self._command_stream_lost),
+                "active_epoch": self._command_epoch,
+                "last_snapshot_id": self._last_logical_snapshot_id,
+            }
+            physics_truth.data = json.dumps(
+                frame, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+            self.physics_truth_pub.publish(physics_truth)
         _lap("truth")
         if _prof is not None:
             _prof["n"] += 1
+            # Emit the per-lap breakdown from HERE, not from the camera cycle.
+            # _emit_step_profile in run_sim is only reached via publish_cameras
+            # (it is documented as "where SENSOR-RICH wall time goes"), so a
+            # camera-less profile such as navigation-parity produced no publish
+            # attribution at all -- which is exactly the profile whose bridge
+            # cost turned out to be 84% of wall time. Costing a bridge you
+            # cannot see inside is guesswork; this makes it measurable.
+            if _prof["n"] >= self._PUBLISH_PROFILE_EVERY:
+                import sys as _sys
+
+                snapshot = self.publish_profile_snapshot()
+                print(
+                    "[tinker-sim] publish_profile "
+                    + json.dumps(snapshot, sort_keys=True),
+                    file=_sys.stdout,
+                    flush=True,
+                )
         self._tick += 1
 
     def publish_cameras(self) -> None:

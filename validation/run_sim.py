@@ -1240,14 +1240,50 @@ def main() -> int:
             next_step_wall = time.monotonic()
             next_collision_heartbeat = time.monotonic()
             collision_heartbeat_period_s = 0.1
+            # Section timing for the CAMERA-LESS loop. _emit_step_profile only
+            # runs from the camera cycle, so navigation-parity -- the profile
+            # whose ROS bridge turned out to cost 84% of wall time -- had no
+            # attribution at all. publish()'s own laps account for just 0.93 of
+            # the 5.10 s/sim-s the bridge costs, so the rest is in spin_once(),
+            # backend.step() under a live bridge, or the loop around them. This
+            # says which, instead of inviting another guess.
+            # How often to pump Kit for ROS service/action handlers.
+            # Measured live (navigation-parity, arena rcw2026, quiet box):
+            #
+            #   pump every step (old)  RTF 0.146    other 33-35 ms/iter
+            #   pump 30 Hz             RTF 0.309    other  8.5-9.9
+            #   pump 10 Hz             RTF 0.438    other  2.7
+            #
+            # 10 Hz bounds service/action handler latency at ~100 ms, which is
+            # well inside what a /spawn_entity, reset or lifecycle transition
+            # needs, and is what makes the RTF budget work. Raise it if a
+            # handler ever needs to be more responsive than that;
+            # TINKER_SIM_KIT_PUMP_HZ=0 restores the old every-step pump.
+            _kit_pump_hz = float(os.environ.get("TINKER_SIM_KIT_PUMP_HZ", "10") or 10)
+            if _kit_pump_hz <= 0.0:
+                kit_pump_stride = 1
+            else:
+                kit_pump_stride = max(1, int(round(backend.control_hz / _kit_pump_hz)))
+            kit_pump_step = 0
+            print(
+                f"[run_sim] kit pump: every {kit_pump_stride} control step(s) "
+                f"(~{backend.control_hz / kit_pump_stride:.0f} Hz)",
+                flush=True,
+            )
+            _navprof = os.environ.get("TINKER_SIM_PROFILE") == "1"
+            _np = {"spin": 0.0, "step": 0.0, "publish": 0.0, "wall": 0.0, "n": 0}
+            _np_mark = time.monotonic()
             while (
                 running
                 and app.is_running()
                 and not (streaming_lifecycle is not None and streaming_lifecycle.ended)
                 and (args.duration <= 0.0 or backend.simulation_time < args.duration)
             ):
+                _np_t0 = time.monotonic() if _navprof else 0.0
                 if gateway is not None:
                     gateway.spin_once()
+                if _navprof:
+                    _np["spin"] += time.monotonic() - _np_t0
                 import omni.timeline
 
                 if (
@@ -1262,16 +1298,49 @@ def main() -> int:
                     next_collision_heartbeat = time.monotonic()
 
                 if omni.timeline.get_timeline_interface().is_playing():
+                    _np_t1 = time.monotonic() if _navprof else 0.0
                     backend.step()
+                    if _navprof:
+                        _np["step"] += time.monotonic() - _np_t1
                     if gateway is not None:
                         if not running:
                             break
+                        _np_t2 = time.monotonic() if _navprof else 0.0
                         try:
                             gateway.publish()
                         except BaseException:
                             if running:
                                 raise
                             break
+                        if _navprof:
+                            now = time.monotonic()
+                            _np["publish"] += now - _np_t2
+                            _np["wall"] += now - _np_mark
+                            _np_mark = now
+                            _np["n"] += 1
+                            if _np["n"] >= 600:
+                                n = _np["n"]
+                                other = _np["wall"] - (
+                                    _np["spin"] + _np["step"] + _np["publish"]
+                                )
+                                print(
+                                    "[tinker-sim] nav_loop_profile "
+                                    + json.dumps(
+                                        {
+                                            "calls": n,
+                                            "spin_ms": round(1000 * _np["spin"] / n, 3),
+                                            "step_ms": round(1000 * _np["step"] / n, 3),
+                                            "publish_ms": round(1000 * _np["publish"] / n, 3),
+                                            "other_ms": round(1000 * other / n, 3),
+                                            "wall_ms": round(1000 * _np["wall"] / n, 3),
+                                        },
+                                        sort_keys=True,
+                                    ),
+                                    flush=True,
+                                )
+                                for k in ("spin", "step", "publish", "wall"):
+                                    _np[k] = 0.0
+                                _np["n"] = 0
                         if not running:
                             break
                     if args.livestream:
@@ -1283,9 +1352,28 @@ def main() -> int:
                     elif gateway is not None:
                         # SimulationContext performs a direct headless PhysX
                         # step.  NVIDIA's simulation-control callbacks run on
-                        # Kit's asyncio loop, so pump one Kit update per ROS
-                        # frame to execute standard service/action handlers.
-                        app.update()
+                        # Kit's asyncio loop, so Kit must be pumped for
+                        # standard service/action handlers to execute.
+                        #
+                        # This used to pump ONCE PER CONTROL STEP, i.e. 120 Hz
+                        # at the default rate. Measured 2026-09-11 in
+                        # navigation-parity on arena rcw2026, a Kit update
+                        # costs ~30 ms even with no camera and no render, so
+                        # that alone was 3.65 s of wall per SIMULATED second --
+                        # the single largest term in the whole loop (60% of it)
+                        # and the bulk of why an attached ROS bridge dropped
+                        # RTF from 1.04 to 0.165.
+                        #
+                        # Nothing needs 120 Hz here. These are ROS service and
+                        # action handlers (/spawn_entity, reset, lifecycle);
+                        # pumping at TINKER_SIM_KIT_PUMP_HZ bounds their
+                        # latency to one pump period while returning the rest
+                        # of the budget to physics. The pump is never skipped
+                        # entirely -- a stride of 0 would strand every service
+                        # call forever.
+                        kit_pump_step += 1
+                        if kit_pump_step % kit_pump_stride == 0:
+                            app.update()
                     # DDS consumers and the wall-clock command watchdog are
                     # hardware-parity processes.  Keep ROS-integrated physics
                     # at real time so their queues and TF caches remain valid.
@@ -1733,6 +1821,39 @@ def main() -> int:
             next_step_wall = time.monotonic()
             next_collision_heartbeat = time.monotonic()
             collision_heartbeat_period_s = 0.1
+            # Section timing for the CAMERA-LESS loop. _emit_step_profile only
+            # runs from the camera cycle, so navigation-parity -- the profile
+            # whose ROS bridge turned out to cost 84% of wall time -- had no
+            # attribution at all. publish()'s own laps account for just 0.93 of
+            # the 5.10 s/sim-s the bridge costs, so the rest is in spin_once(),
+            # backend.step() under a live bridge, or the loop around them. This
+            # says which, instead of inviting another guess.
+            # How often to pump Kit for ROS service/action handlers.
+            # Measured live (navigation-parity, arena rcw2026, quiet box):
+            #
+            #   pump every step (old)  RTF 0.146    other 33-35 ms/iter
+            #   pump 30 Hz             RTF 0.309    other  8.5-9.9
+            #   pump 10 Hz             RTF 0.438    other  2.7
+            #
+            # 10 Hz bounds service/action handler latency at ~100 ms, which is
+            # well inside what a /spawn_entity, reset or lifecycle transition
+            # needs, and is what makes the RTF budget work. Raise it if a
+            # handler ever needs to be more responsive than that;
+            # TINKER_SIM_KIT_PUMP_HZ=0 restores the old every-step pump.
+            _kit_pump_hz = float(os.environ.get("TINKER_SIM_KIT_PUMP_HZ", "10") or 10)
+            if _kit_pump_hz <= 0.0:
+                kit_pump_stride = 1
+            else:
+                kit_pump_stride = max(1, int(round(backend.control_hz / _kit_pump_hz)))
+            kit_pump_step = 0
+            print(
+                f"[run_sim] kit pump: every {kit_pump_stride} control step(s) "
+                f"(~{backend.control_hz / kit_pump_stride:.0f} Hz)",
+                flush=True,
+            )
+            _navprof = os.environ.get("TINKER_SIM_PROFILE") == "1"
+            _np = {"spin": 0.0, "step": 0.0, "publish": 0.0, "wall": 0.0, "n": 0}
+            _np_mark = time.monotonic()
             while (
                 running
                 and app.is_running()
