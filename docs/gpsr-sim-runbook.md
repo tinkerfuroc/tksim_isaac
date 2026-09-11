@@ -348,8 +348,12 @@ group.
 
 **Which map AMCL gets.** With `map_yaml` blank, `gpsr.launch.py` resolves the
 map from the scenario's `world.arena` (`artifacts/arena/<arena>/current.json`
-→ that artifact's `map.yaml`) — the same map the simulator raycasts its
-synthetic lidar against. Only a scenario with no arena falls back to the
+→ that artifact's `map.yaml`). Getting this right matters more since the
+lidar became a live PhysX sensor: it now scans the physics scene rather than
+the map, so a wrong map no longer hides inside a scan derived from that same
+map — it shows up as AMCL failing to converge. (Pass `--map-lidar` and the old
+map-raycast behaviour, and that circularity, come back.) Only a scenario with
+no arena falls back to the
 robot artifact's colocated `map.yaml`, which is the **hardware** arena
 (`0701_robocup_arena3`) and shares no occupied cell with `rcw2026`.
 `navigation.launch.py` has no scenario, so pass `arena:=rcw2026` (or an

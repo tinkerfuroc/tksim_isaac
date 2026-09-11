@@ -618,9 +618,13 @@ def gateway_lidar_enabled(sensor_profile: str, qualification: bool) -> bool:
 
 
 def raycast_lidar_enabled(
-    sensor_profile: str, qualification: bool, raycast_lidar: bool
+    sensor_profile: str, qualification: bool, map_lidar: bool
 ) -> bool:
     """Whether to build the live PhysX raycast lidar for this run.
+
+    DEFAULT ON since 2026-09-11. The third argument is the OPT-OUT
+    (``--map-lidar``), not the opt-in it used to be -- the flags traded
+    places, so read the call sites rather than assuming the old sense.
 
     The raycast sensor is the better source -- it casts against the physics
     scene, so it sees spawned objects and the person capsule, which the
@@ -644,8 +648,21 @@ def raycast_lidar_enabled(
 
     It is otherwise keyed to the same predicate as the development lidar, so
     exactly one source feeds ``/livox/lidar`` in every profile.
+
+    Why it is now the default: the occupancy raycast reads the arena PGM, so
+    it structurally cannot see a spawned object or a person, and a navigation
+    run against it is validating Nav2 against Nav2's own static_layer. The
+    live sensor was kept opt-in only because it published empty clouds, and
+    that cause is fixed.
+
+    On cost, measured and NOT what was assumed: at the validated 120 Hz the
+    simulator already runs at RTF 0.246 with the cheap occupancy lidar and no
+    raycast sensor at all, and 0.164 with the live one. The project's 0.5 floor
+    is a RATE question, not a lidar question -- no ray budget reaches it from
+    0.246. At 40 Hz physics / 40 Hz control the shipped default measures 0.578.
+    See DEFAULT_LIDAR_CHANNELS in lidar_rig for how that budget was chosen.
     """
-    if not raycast_lidar:
+    if map_lidar:
         return False
     return gateway_lidar_enabled(sensor_profile, qualification)
 
@@ -945,21 +962,22 @@ def main() -> int:
         "--map-lidar",
         action="store_true",
         help=(
-            "Deprecated no-op: the occupancy-map lidar is the default again "
-            "(see --raycast-lidar). Accepted so existing scripts keep working."
+            "Opt OUT of the live sensor: publish /livox/lidar by raycasting "
+            "the arena occupancy map, as the simulator did before the PhysX "
+            "sensor existed. The map raycast reads map.yaml, so it cannot see "
+            "ANYTHING absent from it -- no spawned object, no person, no "
+            "moved furniture -- and it re-publishes what Nav2 already holds "
+            "as static_layer. It is a speed trade, never a parity option. It "
+            "also leaves PhysX scene queries off, which is cheaper again."
         ),
     )
     parser.add_argument(
         "--raycast-lidar",
         action="store_true",
         help=(
-            "Publish /livox/lidar from the live PhysX raycast sensor instead "
-            "of the arena occupancy map. Unlike the occupancy raycast, this "
-            "casts against the physics scene, so it sees spawned objects and "
-            "the person capsule. Passing this also switches PhysX scene "
-            "queries on for the run (SimulationCfg.enable_scene_query_support), "
-            "which IsaacLab defaults OFF and without which every ray silently "
-            "misses -- that is what made the sensor publish empty clouds."
+            "Deprecated no-op: the live PhysX raycast lidar is now the "
+            "default. Accepted so existing scripts keep working; pass "
+            "--map-lidar to opt out."
         ),
     )
     parser.add_argument("--arena-colors", action="store_true")
@@ -1120,7 +1138,7 @@ def main() -> int:
             # query manager if SimulationCfg asks at construction time, and
             # the raycast lidar is nothing but scene queries.
             raycast_lidar = raycast_lidar_enabled(
-                args.sensor_profile, args.qualification, args.raycast_lidar
+                args.sensor_profile, args.qualification, args.map_lidar
             )
             backend = IsaacNavigationBackend(
                 usd_path=args.artifact, map_yaml=args.map_yaml, seed=args.seed,
@@ -1310,7 +1328,7 @@ def main() -> int:
 
             # See the navigation-parity site: settable only at construction.
             raycast_lidar = raycast_lidar_enabled(
-                args.sensor_profile, args.qualification, args.raycast_lidar
+                args.sensor_profile, args.qualification, args.map_lidar
             )
             backend = IsaacWholeRobotBackend(
                 usd_path=args.artifact,
@@ -1641,7 +1659,7 @@ def main() -> int:
 
             # See the navigation-parity site: settable only at construction.
             raycast_lidar = raycast_lidar_enabled(
-                args.sensor_profile, args.qualification, args.raycast_lidar
+                args.sensor_profile, args.qualification, args.map_lidar
             )
             backend = IsaacWholeRobotBackend(
                 usd_path=artifact,

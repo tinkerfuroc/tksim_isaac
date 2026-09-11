@@ -25,14 +25,15 @@ established by measurement (see ``isaac-raycast-sensor-api-gotchas``):
   whole pattern every physics step: 4.47 vs 27.89 ms/step at Mid-360 scale in
   an empty room. Without the sweep, full scale is unaffordable.
 
-  Measured WITH the real robot on the stage and against a no-sensor baseline
-  in the SAME scene -- which is the number that matters, because the robot's
-  ~200 convex-decomposition collision shapes make every scene query dearer and
-  dominate the absolute figure -- the marginal cost of the full 19,893-ray
-  pattern is ~0.75 s of compute per simulated second, ~0.50 at 32x360 and
-  ~0.25 at 16x360. Below 16x360 the curve is nearly flat, so trimming further
-  buys little. Drop `channels`/`columns` in the contract if a live nav run
-  needs the RTF back.
+  THE PER-RAY COSTS THAT USED TO BE QUOTED HERE WERE VOID and have been
+  removed. They were taken before the scene-query fix, i.e. with the query
+  manager absent and EVERY RAY MISSING, so they timed rays that never resolved
+  a hit and never touched a collision shape. They understated the real cost by
+  roughly 7x: the figure given for the full pattern was ~0.75 s of compute per
+  simulated second, and the true marginal cost measured after the fix is ~2.6 s
+  per simulated second at 120 Hz. Treat any raycast sizing number dated before
+  2026-09-09 the same way. See :func:`resolve_lidar_scale` for the measured
+  RTF table that replaces them.
 * Because rays fire on their own step, the reading buffer holds ONLY that
   step's rays and is CLEARED each step. A frame must therefore be ACCUMULATED
   across the sweep window (12 physics steps at 120 Hz / 10 Hz). The union over
@@ -172,12 +173,46 @@ MINIMUM_LIDAR_CHANNELS = 8
 MINIMUM_LIDAR_COLUMNS = 90
 
 
+#: What an unset ``TINKER_SIM_LIDAR_CHANNELS`` resolves to now that the live
+#: sensor is the DEFAULT source rather than an opt-in.
+#:
+#: This is not a guess and not an extrapolation: 44 x 349 is the exact
+#: configuration that passed the live Nav2 battery on 2026-09-10 -- RTF 0.521
+#: with the whole tinker_sim_bridge stack attached, AMCL converged, and a
+#: completed ``navigate_to_pose``. The contract's own 57 channels was never
+#: measured with the stack attached; bare-sim it ran 0.514, which leaves no
+#: room once Nav2 is also on the box. Defaulting to the validated number keeps
+#: an out-of-the-box navigation run above the 0.5 RTF floor the project holds
+#: itself to, instead of just below it.
+#:
+#: Elevation is the right axis to spend, because it is the one navigation does
+#: not read. ``pointcloud_to_laserscan`` flattens the cloud to 2-D, and its
+#: 0..2.0 m height band at the 8 m ``range_max`` only ever uses elevations of
+#: roughly 0..14 deg -- a small slice of the contract's -7..+52 deg fan. Cutting
+#: COLUMNS instead would be the wrong trade: at 349 the azimuth step is already
+#: 1.03 deg, coarser than the scan's own 0.008 rad (0.458 deg) increment, so
+#: every column removed is directly visible in ``/scan``.
+#:
+#: Raise it to the contract with ``TINKER_SIM_LIDAR_CHANNELS=57`` for a parity
+#: run that wants the full fan and can pay for it.
+DEFAULT_LIDAR_CHANNELS = 44
+#: Azimuth is what navigation actually consumes, so the default is the
+#: contract and the override exists only to go lower deliberately.
+DEFAULT_LIDAR_COLUMNS = 349
+
+
 def _resolve_axis(
-    contract: int, override: str | None, name: str, floor: int
+    contract: int, override: str | None, name: str, floor: int, default: int
 ) -> int:
-    """One axis of :func:`resolve_lidar_scale`."""
+    """One axis of :func:`resolve_lidar_scale`.
+
+    ``default`` is what an unset override resolves to. It is NOT necessarily
+    the contract: the sensor is on by default now, and the default has to be
+    affordable at the validated 120 Hz physics rate. The contract remains the
+    ceiling an explicit override may not exceed.
+    """
     if override is None or not str(override).strip():
-        return int(contract)
+        return min(int(default), int(contract))
     text = str(override).strip()
     try:
         value = int(text)
@@ -211,25 +246,43 @@ def resolve_lidar_scale(
 
     Every ray is a PhysX scene query paid ``physics_hz`` times per simulated
     second, so ray count is the dominant term in the sensor's wall-clock cost
-    -- and the only effective one. Measured live in navigation-parity at 60 Hz
-    physics / 30 Hz control: the occupancy lidar runs at RTF 0.927 and the full
-    19,893-ray raycast at 0.483, i.e. the sensor costs ~0.99 s per simulated
-    second. ``max_range`` and ``min_range`` were both measured worth under 4%,
-    because the expense is TESTING each ray against the robot's ~200 convex
-    collision hulls rather than hitting anything.
+    -- and the only effective one. ``max_range`` and ``min_range`` were both
+    measured worth under 4%, because the expense is TESTING each ray against
+    the robot's ~200 convex collision hulls rather than hitting anything.
 
-    Unset, the contract is returned unchanged. Lowering is a deliberate
-    fidelity-for-speed trade; raising is refused, because the contract file is
-    the hardware's own specification.
+    Because the cost is paid per PHYSICS step, the physics rate multiplies it.
+    Measured live in navigation-parity, arena rcw2026 (RTF, higher is better):
+
+        rate        occupancy   44x349 (default)   full 57x349
+        120 / 120     0.248 / 0.246      0.164            0.151
+         60 /  30           0.927          --             0.483
+         40 /  40             --           0.578          0.514
+
+    (The two occupancy figures at 120 Hz are independent measurements taken
+    an hour apart -- 0.248 as a bare baseline, 0.246 via ``--map-lidar`` --
+    which is the reproducibility these numbers carry.)
+
+    Read the top row before sizing anything: at the validated 120 Hz default
+    the simulator is already at RTF 0.248 with the CHEAP occupancy lidar and no
+    raycast sensor at all. No ray budget recovers that -- the rate does. Runs
+    that need RTF >= 0.5 lower the rate (TINKER_SIM_PHYSICS_HZ /
+    TINKER_SIM_CONTROL_HZ), and at 40/40 even the full contract fan clears it.
+
+    Unset, :data:`DEFAULT_LIDAR_CHANNELS` x :data:`DEFAULT_LIDAR_COLUMNS` is
+    returned -- the live-battery-validated 44 x 349, not the contract, now that
+    the sensor is on by default. Lowering further is a deliberate
+    fidelity-for-speed trade; raising above the CONTRACT is refused, because
+    that file is the hardware's own specification. Raising from the default up
+    to the contract is allowed and is how a parity run asks for the full fan.
     """
     return (
         _resolve_axis(
             channels, channels_override, "TINKER_SIM_LIDAR_CHANNELS",
-            MINIMUM_LIDAR_CHANNELS,
+            MINIMUM_LIDAR_CHANNELS, DEFAULT_LIDAR_CHANNELS,
         ),
         _resolve_axis(
             columns, columns_override, "TINKER_SIM_LIDAR_COLUMNS",
-            MINIMUM_LIDAR_COLUMNS,
+            MINIMUM_LIDAR_COLUMNS, DEFAULT_LIDAR_COLUMNS,
         ),
     )
 

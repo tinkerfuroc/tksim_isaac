@@ -13,6 +13,12 @@ default. Reproduced exactly:
     parse_known_args(["--", "--raycast-lidar"])  -> raycast_lidar=False
     parse_known_args(["--raycast-lidar"])        -> raycast_lidar=True
 
+(Historical note: the examples here show the bug as it was found, when
+``--raycast-lidar`` was the opt-IN. The flags have since traded places -- the
+live sensor is the default and ``--map-lidar`` is the opt-out -- so these tests
+now use ``--map-lidar`` as the fixture. A dropped ``--raycast-lidar`` would no
+longer be observable, and the test would pass while pinning nothing.)
+
 So ``tinker-sim launch ... -- --raycast-lidar`` silently ran the OCCUPANCY
 lidar: ``/sim/status/isaac`` reported ``lidar_source: "occupancy"`` and
 ``lidar: null``, with no error and no warning. This is the same class of
@@ -59,12 +65,12 @@ def _command(extra: list[str]) -> list[str]:
 class LaunchSeparatorTest(unittest.TestCase):
     def test_separator_form_delivers_the_flag(self) -> None:
         """The documented way to pass a run_sim-only flag must work."""
-        command = _command(["--", "--raycast-lidar"])
-        self.assertIn("--raycast-lidar", command)
+        command = _command(["--", "--map-lidar"])
+        self.assertIn("--map-lidar", command)
 
     def test_separator_token_is_not_forwarded(self) -> None:
         """A forwarded '--' silently demotes every flag after it."""
-        command = _command(["--", "--raycast-lidar"])
+        command = _command(["--", "--map-lidar"])
         self.assertNotIn(
             "--",
             command,
@@ -82,7 +88,7 @@ class LaunchSeparatorTest(unittest.TestCase):
         sys.path.insert(0, str(ROOT / "validation"))
         import argparse
 
-        command = _command(["--", "--raycast-lidar"])
+        command = _command(["--", "--map-lidar"])
         # Everything from run_sim.py onward is what run_sim's parser sees.
         index = next(
             i for i, token in enumerate(command) if token.endswith("run_sim.py")
@@ -90,17 +96,18 @@ class LaunchSeparatorTest(unittest.TestCase):
         forwarded = command[index + 1 :]
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--raycast-lidar", action="store_true")
+        parser.add_argument("--map-lidar", action="store_true")
         parsed, _unknown = parser.parse_known_args(forwarded)
         self.assertTrue(
-            parsed.raycast_lidar,
-            f"run_sim would receive {forwarded!r} and leave raycast_lidar "
-            "False, silently falling back to the occupancy lidar",
+            parsed.map_lidar,
+            f"run_sim would receive {forwarded!r} and leave map_lidar "
+            "False, silently running the LIVE sensor when the run asked for "
+            "the cheap occupancy one",
         )
 
     def test_multiple_trailing_flags_all_survive(self) -> None:
-        command = _command(["--", "--raycast-lidar", "--camera-pointcloud"])
-        self.assertIn("--raycast-lidar", command)
+        command = _command(["--", "--map-lidar", "--camera-pointcloud"])
+        self.assertIn("--map-lidar", command)
         self.assertIn("--camera-pointcloud", command)
 
     def test_no_extra_args_is_unchanged(self) -> None:
