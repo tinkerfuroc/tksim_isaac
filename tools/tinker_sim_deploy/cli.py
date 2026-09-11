@@ -199,7 +199,19 @@ def _launch_command(args: argparse.Namespace) -> list[str]:
         command.extend(_camera_stream_arguments(args))
         if args.livestream:
             command.append("--livestream")
-    command.extend(args.isaac_args)
+    # `argparse.REMAINDER` keeps the literal "--" separator as the first
+    # element of the remainder, and the separator is REQUIRED to get a
+    # run_sim-only flag past this wrapper's own parser. Forwarding it is
+    # silently destructive: run_sim parses with `parse_known_args`, where a
+    # leading "--" means "everything after this is positional", so the flag
+    # is demoted to an ignored positional and its destination keeps its
+    # default. `tinker-sim launch ... -- --raycast-lidar` therefore booted the
+    # OCCUPANCY lidar with no error -- a healthy-looking run measuring the
+    # wrong thing, which cost a GPU run to notice.
+    passthrough = list(args.isaac_args)
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+    command.extend(passthrough)
     return command
 
 

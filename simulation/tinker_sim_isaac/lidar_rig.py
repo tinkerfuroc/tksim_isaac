@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -163,6 +164,76 @@ def _positive_int(raw: Mapping[str, Any], key: str, where: str) -> int:
     return value
 
 
+#: Below this the vertical fan is too sparse to put more than a stripe or two
+#: on a person-sized obstacle at room range.
+MINIMUM_LIDAR_CHANNELS = 8
+#: Below this the azimuth spacing gets wide enough that a person can fall
+#: BETWEEN two beams -- see test_the_floors_still_see_a_dynamic_obstacle.
+MINIMUM_LIDAR_COLUMNS = 90
+
+
+def _resolve_axis(
+    contract: int, override: str | None, name: str, floor: int
+) -> int:
+    """One axis of :func:`resolve_lidar_scale`."""
+    if override is None or not str(override).strip():
+        return int(contract)
+    text = str(override).strip()
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{name} must be a whole number, got {override!r}"
+        ) from None
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {override!r}")
+    if value > int(contract):
+        raise ValueError(
+            f"{name}={value} exceeds the hardware contract's {contract}; the "
+            "contract is what the Mid-360 actually does, and a run claiming "
+            "more would invalidate parity results measured against it"
+        )
+    if value < floor:
+        raise ValueError(
+            f"{name}={value} is below the {floor} floor; past it the scan can "
+            "no longer be relied on to see a person-sized dynamic obstacle"
+        )
+    return value
+
+
+def resolve_lidar_scale(
+    channels: int,
+    columns: int,
+    channels_override: str | None,
+    columns_override: str | None,
+) -> tuple[int, int]:
+    """Resolve the ray grid, honouring explicit opt-in overrides.
+
+    Every ray is a PhysX scene query paid ``physics_hz`` times per simulated
+    second, so ray count is the dominant term in the sensor's wall-clock cost
+    -- and the only effective one. Measured live in navigation-parity at 60 Hz
+    physics / 30 Hz control: the occupancy lidar runs at RTF 0.927 and the full
+    19,893-ray raycast at 0.483, i.e. the sensor costs ~0.99 s per simulated
+    second. ``max_range`` and ``min_range`` were both measured worth under 4%,
+    because the expense is TESTING each ray against the robot's ~200 convex
+    collision hulls rather than hitting anything.
+
+    Unset, the contract is returned unchanged. Lowering is a deliberate
+    fidelity-for-speed trade; raising is refused, because the contract file is
+    the hardware's own specification.
+    """
+    return (
+        _resolve_axis(
+            channels, channels_override, "TINKER_SIM_LIDAR_CHANNELS",
+            MINIMUM_LIDAR_CHANNELS,
+        ),
+        _resolve_axis(
+            columns, columns_override, "TINKER_SIM_LIDAR_COLUMNS",
+            MINIMUM_LIDAR_COLUMNS,
+        ),
+    )
+
+
 def load_lidar_spec(path: Path | str) -> LidarSpec:
     """Load the lidar contract; malformed declarations raise, never guess.
 
@@ -204,14 +275,22 @@ def load_lidar_spec(path: Path | str) -> LidarSpec:
     if not isinstance(self_filter, bool):
         raise LidarSpecError("lidar.raycast.self_filter must be a boolean")
 
+    # Opt-in fidelity-for-RTF trade; unset, the contract is used as written.
+    channels, columns = resolve_lidar_scale(
+        _positive_int(geometry, "channels", "lidar.raycast"),
+        _positive_int(geometry, "columns", "lidar.raycast"),
+        os.environ.get("TINKER_SIM_LIDAR_CHANNELS"),
+        os.environ.get("TINKER_SIM_LIDAR_COLUMNS"),
+    )
+
     return LidarSpec(
         pointcloud_topic=_string(lidar, "pointcloud_topic", "lidar"),
         scan_topic=_string(lidar, "scan_topic", "lidar"),
         frame_id=_string(lidar, "frame_id", "lidar"),
         tick_rate_hz=_positive(lidar, "tick_rate_hz", "lidar"),
         mount_prim=_string(geometry, "mount_prim", "lidar.raycast"),
-        channels=_positive_int(geometry, "channels", "lidar.raycast"),
-        columns=_positive_int(geometry, "columns", "lidar.raycast"),
+        channels=channels,
+        columns=columns,
         elevation_min_deg=elevation_min,
         elevation_max_deg=elevation_max,
         min_range_m=min_range,
@@ -377,6 +456,9 @@ class RaycastLidar:
         self.robot_prim_path = robot_prim_path
         self.sensor: Any = None
         self.sensor_path: str | None = None
+        #: The authoring object from `author_prim`, consumed by `bind`.
+        self._authoring: Any = None
+        self._offsets: np.ndarray | None = None
         #: Static offset from the rigid body the sensor is parented to.
         self.mount_translation: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._accumulator: FrameAccumulator | None = None
@@ -384,14 +466,34 @@ class RaycastLidar:
         self._pending: tuple[np.ndarray, np.ndarray] | None = None
         self._frame_ready = False
         self._reported_failures: set[str] = set()
+        #: Physics step of the last reading folded in. The accumulator is
+        #: driven from two places (see ``accumulate``), so folding is keyed on
+        #: the sensor's own step counter rather than on call count: being
+        #: called twice for one physics step must not consume two window slots.
+        self._last_physics_step: int | None = None
+        self._callback_folds = 0
+        self._poll_folds = 0
+        self._last_reading_len = -1
+        self._last_points = -1
+        self._last_raw_hits = -1
+        self._last_self_hits = -1
+        self._last_path_table_len = -1
+        #: First hit prim path seen, kept once so the status heartbeat can show
+        #: WHAT the sensor is actually hitting without streaming every path.
+        self._last_sample_path = ""
 
     # -- lifecycle ------------------------------------------------------
 
     def initialize(self, app: Any) -> None:
-        """Create the sensor prim and subscribe to physics steps."""
+        """Create the sensor prim and attach the runtime reader.
+
+        Authoring order was investigated and ruled out: creating the prim
+        BEFORE ``sim.reset()`` (via a backend pre-reset hook) produced results
+        identical to creating it after -- same ray geometry, same zero hits --
+        so the simpler post-reset construction is kept.
+        """
         import omni.usd
-        from isaacsim.core.simulation_manager import SimulationEvent, SimulationManager
-        from isaacsim.sensors.experimental.physics import Raycast, RaycastSensor
+        from isaacsim.sensors.experimental.physics import Raycast
 
         stage = omni.usd.get_context().get_stage()
         parent_path, translation = self._resolve_mount(stage)
@@ -418,6 +520,9 @@ class RaycastLidar:
         if self.spec.sweep:
             create_kwargs["ray_time_offsets"] = offsets
 
+        from isaacsim.core.simulation_manager import SimulationEvent, SimulationManager
+        from isaacsim.sensors.experimental.physics import RaycastSensor
+
         self.sensor = RaycastSensor(Raycast.create(self.sensor_path, **create_kwargs))
         app.update()
 
@@ -436,6 +541,15 @@ class RaycastLidar:
         # must run after it or we would read the previous step's slice; a
         # positive order guarantees that rather than relying on registration
         # sequence.
+        #
+        # Measured caveat: in the production loop this callback is never
+        # dispatched at all (`callback_folds` stayed 0 across a full run while
+        # `poll_folds` reached 1261), because physics is stepped through
+        # IsaacLab's SimulationContext rather than SimulationManager. The
+        # gateway's publish-path poll is what actually drives the accumulator;
+        # this subscription is kept for loops that DO step through
+        # SimulationManager, and double-driving is safe because folding is
+        # deduplicated by physics step.
         self._callback_uid = SimulationManager.register_callback(
             self._on_physics_step,
             event=SimulationEvent.PHYSICS_POST_STEP,
@@ -470,10 +584,19 @@ class RaycastLidar:
         signature raises TypeError inside the message bus, which swallows it:
         the callback simply never appears to run, and every frame comes back
         empty with nothing logged.
-        """
-        self.accumulate()
 
-    def accumulate(self) -> None:
+        This is a best-effort driver, NOT the only one. It fires when physics
+        is stepped through ``SimulationManager``, but the production loop steps
+        through IsaacLab's ``SimulationContext``, where the event is not
+        guaranteed to be dispatched -- which is exactly how the first live nav
+        battery produced a sensor that cast rays (GPU busy, no errors logged)
+        while ``/livox/lidar`` stayed silent for the entire run. The gateway
+        therefore also polls ``accumulate()`` on its publish path, and folding
+        is deduplicated by physics step so both drivers together stay correct.
+        """
+        self.accumulate(source="callback")
+
+    def accumulate(self, *, source: str = "poll") -> None:
         """Fold the current reading into the frame under construction.
 
         A read failure must not kill the simulation loop, but it must not be
@@ -485,12 +608,25 @@ class RaycastLidar:
             return
         try:
             data = self.sensor.get_data()
+            step = data.get("physics_step")
+            if step is not None and step == self._last_physics_step:
+                # This physics step was already folded by the other driver.
+                return
+            self._last_physics_step = step
             hits = data["hit_positions"]
             if self.spec.self_filter:
                 hits = self._drop_self_hits(hits, data.get("hit_prim_paths"))
         except Exception as exc:  # noqa: BLE001
             self._report_once("read", exc)
             return
+        if source == "callback":
+            self._callback_folds += 1
+        else:
+            self._poll_folds += 1
+        try:
+            self._last_reading_len = int(np.asarray(hits).reshape(-1, 3).shape[0])
+        except Exception:  # noqa: BLE001 - diagnostics must never raise
+            self._last_reading_len = -1
         try:
             complete = self._accumulator.add_reading(hits)
         except ValueError as exc:
@@ -498,6 +634,7 @@ class RaycastLidar:
             return
         if complete:
             self._pending = self._accumulator.take_frame()
+            self._last_points = int(self._pending[0].shape[0])
             self._frame_ready = True
 
     def _drop_self_hits(self, hit_positions: Any, hit_prim_paths: Any) -> np.ndarray:
@@ -508,12 +645,22 @@ class RaycastLidar:
         accumulator -- the same representation a miss uses.
         """
         hits = np.array(hit_positions, dtype=np.float32, copy=True).reshape(-1, 3)
+        # Counted BEFORE filtering, so "every ray missed" is distinguishable
+        # from "the self-filter ate the whole frame". Both end as zero points.
+        self._last_raw_hits = int(
+            (np.linalg.norm(hits, axis=1) > _ZERO_HIT_EPSILON_M).sum()
+        )
         if hit_prim_paths is None or len(hit_prim_paths) != hits.shape[0]:
+            self._last_path_table_len = -1 if hit_prim_paths is None else len(hit_prim_paths)
             # No usable path table (sensor still initialising, or the option
             # was off): publish the frame unfiltered rather than dropping it.
             return hits
+        self._last_path_table_len = len(hit_prim_paths)
         live_indices = np.flatnonzero(np.linalg.norm(hits, axis=1) > _ZERO_HIT_EPSILON_M)
         mask = self_hit_mask(hit_prim_paths, live_indices, self.robot_prim_path)
+        self._last_self_hits = int(mask.sum())
+        if len(live_indices) and self._last_sample_path == "":
+            self._last_sample_path = str(hit_prim_paths[live_indices[0]])
         if mask.any():
             hits[live_indices[mask]] = 0.0
         return hits
@@ -530,6 +677,57 @@ class RaycastLidar:
     @property
     def frame_ready(self) -> bool:
         return self._frame_ready
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Counters for the status heartbeat.
+
+        ``callback_folds`` vs ``poll_folds`` says WHICH driver is actually
+        feeding the accumulator in a given profile; ``frames`` staying at 0
+        while folds climb means the window never closes. None of this was
+        observable during the first live nav battery, which is why a silent
+        ``/livox/lidar`` cost a whole run to localise.
+        """
+        accumulator = self._accumulator
+        report = {
+            "frames": accumulator.frames_completed if accumulator else 0,
+            "steps_in_window": accumulator.steps_in_window if accumulator else 0,
+            "window_steps": accumulator.window_steps if accumulator else 0,
+            "callback_folds": self._callback_folds,
+            "poll_folds": self._poll_folds,
+            # Length of the last reading and the sensor's own validity flag.
+            # A sensor that constructs cleanly but is never EVALUATED returns a
+            # zero-length reading forever; the accumulator tolerates that (an
+            # empty buffer is indistinguishable from an all-miss frame), so
+            # windows still close on time and publish empty clouds. Without
+            # these two fields that looks identical to a working sensor
+            # scanning an empty room.
+            "last_reading_len": self._last_reading_len,
+            "last_points": self._last_points,
+            "raw_hits": self._last_raw_hits,
+            "self_hits": self._last_self_hits,
+            "path_table_len": self._last_path_table_len,
+            "sample_path": self._last_sample_path,
+        }
+        if self.sensor is not None:
+            try:
+                reading = self.sensor.get_sensor_reading()
+                report["is_valid"] = bool(reading.is_valid)
+                # WHERE the rays actually start in world coordinates. A sensor
+                # whose rays all miss is either somewhere with no geometry or
+                # buried inside it, and nothing else in the reading can tell
+                # those apart.
+                origins = np.asarray(reading.ray_origins_world).reshape(-1, 3)
+                ends = np.asarray(reading.ray_end_points_world).reshape(-1, 3)
+                if origins.shape[0]:
+                    report["ray_origin_world"] = [
+                        round(float(v), 4) for v in origins[0]
+                    ]
+                if ends.shape[0]:
+                    report["ray_end_world"] = [round(float(v), 4) for v in ends[0]]
+            except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
+                report["is_valid"] = None
+                report["reading_error"] = repr(exc)[:120]
+        return report
 
     def take_frame(self) -> tuple[np.ndarray, np.ndarray] | None:
         """The most recent complete frame, or ``None`` if one is not ready."""
