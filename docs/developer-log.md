@@ -4,6 +4,105 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-11 — the sim was never slow: Kit was pumped 120x a second for ROS services
+
+RTF at the shipped default went 0.146 -> 0.530 with the live lidar on, 0.930
+with `--map-lidar`. One root cause, found by instrumenting rather than guessing.
+
+### The measurement that reframed it
+
+Duration-slope (wall at 40 sim-s minus wall at 20 sim-s, so boot cancels and no
+`/clock` is needed), navigation-parity on arena rcw2026 with the full 44x349
+raycast lidar:
+
+| config | wall per sim-second | RTF |
+|---|---|---|
+| no `--ros` | 0.962 s | **1.04** |
+| with `--ros` | 6.061 s | 0.165 |
+
+The simulator runs FASTER THAN REAL TIME with the lidar on. The ROS bridge was
+5.10 s/sim-s — 84% of all wall time. Physics was not the problem, the arena was
+not, the lidar was not.
+
+### Root cause
+
+Per-loop section timing:
+
+    wall     50.2 ms/iter
+      other  30.3 ms   <- 60% of the loop
+      step   12.0
+      publish 7.8
+      spin    0.2
+
+`other` was one line: `app.update()`, a full Kit update pumped ONCE PER CONTROL
+STEP — 120 a second at ~30 ms each, headless, no camera, no render. Kit is
+pumped so NVIDIA's simulation-control service/action handlers run on its asyncio
+loop. Nothing there needs 120 Hz.
+
+### Fix
+
+`TINKER_SIM_KIT_PUMP_HZ` (default 10) strides the pump; handler latency is
+bounded at ~100 ms. And `resolve_control_hz` now defaults to
+`DEFAULT_CONTROL_HZ = 60` rather than the physics rate — the old default was a
+cadence nothing was validated at, since every RTF figure in this project's
+history was taken at 60.
+
+**Contact fidelity is unchanged.** PhysX still steps at the validated
+`1/physics_hz`; a control step runs whole substeps of that same length.
+Lowering PHYSICS rate is what alters contact behaviour (5 mm trajectory drift
+after 10 s vs <0.5 mm) and is deliberately not done.
+
+| config | RTF |
+|---|---|
+| pump every step (old) | 0.146 |
+| pump 30 Hz | 0.309 |
+| pump 10 Hz, control 120 | 0.438 |
+| pump 10 Hz, control 60 | 0.543 |
+| **shipped defaults, raycast** | **0.530** |
+| shipped defaults, `--map-lidar` | 0.930 |
+
+### Two hypotheses falsified first, both mine
+
+1. *Lower the control rate.* The fitted model predicted c60 = 0.268 and it
+   measured 0.268 — so the model held, and it said reaching 0.5 that way needs
+   15.4 Hz, below the floor.
+2. *Subscriber-gate the expensive grasp-bench publishes.* A/B in one build
+   showed no RTF change: `publish()` is only 0.93 of the 5.10 s/sim-s, and the
+   physics_truth JSON is 0.35 of that. The gate was kept anyway (it is free to
+   skip work nothing consumes, and it does cut publish() 7.9 -> 5.0 ms/call,
+   which at control 60 is the difference between RTF 0.53 and ~0.49) but it is
+   NOT the root cause.
+
+### Why the guessing was possible at all
+
+`_emit_step_profile` only ever ran from the camera cycle — it is documented as
+"where SENSOR-RICH wall time goes" — so navigation-parity, the profile whose
+bridge cost turned out to be 84% of wall time, produced no attribution
+whatsoever. Two instruments now emit for every profile: `publish_profile`
+(per-lap ms of `publish()`) and `nav_loop_profile` (spin/step/publish/other/
+wall), and it was the `other` residual that caught this.
+
+### Measurement hygiene, learned the hard way
+
+Three separate contaminations produced numbers that were discarded:
+
+* a run started at loadavg 8.4 while a peer stack came up and load hit 15.5;
+* a peer's ORPHANED `truth_evaluator` was alive on the same ROS domain and
+  subscribed to `/sim/internal/physics_truth`, so the subscriber gate under
+  test correctly did nothing — the fix looked like a regression;
+* a naive "load rose during the run" DIRTY heuristic false-positives, because
+  the sim's own ~700% CPU raises loadavg by itself.
+
+The usable rule: both arms of a comparison must START at the same load, on a
+domain nothing else is on, from a tree that is not being edited mid-run.
+
+### Known consequences, neither hidden
+
+* **IMU cadence.** `hardware-parity.json` declares 200 Hz; the stride
+  `round((1/200)/dt)` already floored to 1, so it published at the control rate
+  — 120 before, 60 now. robot_localization's EKF consumes it.
+* `/spawn_entity` worst-case latency ~8 ms -> ~100 ms.
+
 ## 2026-09-11 — the live raycast lidar becomes the DEFAULT, and the RTF floor turns out not to be about the lidar
 
 `--raycast-lidar` and `--map-lidar` trade places. The live PhysX sensor is now
@@ -33,6 +132,11 @@ existing RTF matrix was taken at a LOWERED rate; the widely-quoted 0.927 is a
 | 120 / 120 | **0.248** / 0.246 | 0.164 | 0.151 |
 | 60 / 30 | 0.927 | — | 0.483 |
 | 40 / 40 | — | **0.578** | 0.514 |
+
+> **Superseded the same day** — the entry above this one found WHY, and fixed
+> it: a Kit update was being pumped every control step. The RTF figures in
+> this entry are all PRE-FIX. Post-fix the shipped default is 0.530 with the
+> raycast lidar and 0.930 with `--map-lidar`.
 
 **At the validated 120 Hz default the simulator is already at RTF 0.248 with the
 CHEAP map lidar and no raycast sensor at all.** The project's >= 0.5 floor is
