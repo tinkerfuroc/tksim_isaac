@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 
 from tinker_sim_isaac.lidar_rig import (  # noqa: E402
+    DEFAULT_LIDAR_CHANNELS,
+    DEFAULT_LIDAR_COLUMNS,
     MINIMUM_LIDAR_CHANNELS,
     MINIMUM_LIDAR_COLUMNS,
     resolve_lidar_scale,
@@ -36,14 +38,52 @@ from tinker_sim_isaac.lidar_rig import (  # noqa: E402
 
 
 class ResolveLidarScaleTest(unittest.TestCase):
-    def test_unset_returns_the_contract_unchanged(self) -> None:
-        self.assertEqual(resolve_lidar_scale(57, 349, None, None), (57, 349))
-        self.assertEqual(resolve_lidar_scale(57, 349, "", "  "), (57, 349))
+    def test_unset_returns_the_validated_default(self) -> None:
+        """Unset is the DEFAULT, which is no longer the contract.
+
+        The live sensor is on by default now, so an unset override has to
+        resolve to something affordable with the whole stack attached. That is
+        the 44 x 349 the live Nav2 battery actually passed at RTF 0.521, not
+        the contract's 57 channels, which was never measured with Nav2 on the
+        box and left no margin bare-sim.
+        """
+        self.assertEqual(
+            resolve_lidar_scale(57, 349, None, None),
+            (DEFAULT_LIDAR_CHANNELS, DEFAULT_LIDAR_COLUMNS),
+        )
+        self.assertEqual(
+            resolve_lidar_scale(57, 349, "", "  "),
+            (DEFAULT_LIDAR_CHANNELS, DEFAULT_LIDAR_COLUMNS),
+        )
+
+    def test_the_default_never_exceeds_a_smaller_contract(self) -> None:
+        """A contract below the default must still cap it.
+
+        The default is a budget, not a licence: if hardware-parity.json ever
+        declares fewer channels than the default budget, the contract wins.
+        """
+        self.assertEqual(resolve_lidar_scale(16, 120, None, None), (16, 120))
 
     def test_lowering_is_allowed(self) -> None:
-        self.assertEqual(resolve_lidar_scale(57, 349, "32", None), (32, 349))
-        self.assertEqual(resolve_lidar_scale(57, 349, None, "180"), (57, 180))
+        self.assertEqual(
+            resolve_lidar_scale(57, 349, "32", None),
+            (32, DEFAULT_LIDAR_COLUMNS),
+        )
+        self.assertEqual(
+            resolve_lidar_scale(57, 349, None, "180"),
+            (DEFAULT_LIDAR_CHANNELS, 180),
+        )
         self.assertEqual(resolve_lidar_scale(57, 349, "32", "180"), (32, 180))
+
+    def test_raising_from_the_default_up_to_the_contract_is_allowed(self) -> None:
+        """How a parity run asks for the full fan back.
+
+        The refusal is about the CONTRACT ceiling, not the default budget --
+        otherwise flipping the default would have quietly made full-resolution
+        parity runs impossible.
+        """
+        self.assertEqual(resolve_lidar_scale(57, 349, "57", None), (57, 349))
+        self.assertGreater(57, DEFAULT_LIDAR_CHANNELS)
 
     def test_raising_is_refused(self) -> None:
         """A run must never claim more than the hardware contract."""

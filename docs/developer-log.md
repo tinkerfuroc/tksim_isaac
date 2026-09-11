@@ -4,6 +4,107 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-09-11 — the live raycast lidar becomes the DEFAULT, and the RTF floor turns out not to be about the lidar
+
+`--raycast-lidar` and `--map-lidar` trade places. The live PhysX sensor is now
+the source for `/livox/lidar` in every profile that publishes one, and
+`--map-lidar` is the opt-out. `--raycast-lidar` survives as an accepted no-op so
+existing scripts keep working.
+
+**Why.** The occupancy raycast reads the arena PGM, so it can only ever report
+what `map.yaml` already says: no spawned object, no person, no moved furniture.
+A navigation run against it is largely validating Nav2 against Nav2's own
+`static_layer`, and an AMCL bias number taken against it is partly circular —
+the scan is derived from the map it is being localized against. The live sensor
+was held opt-in for exactly one reason, that it published empty clouds, and that
+cause (IsaacLab's `enable_scene_query_support` defaulting False) was fixed on
+2026-09-09 and has since passed a live Nav2 battery including a completed
+`navigate_to_pose`.
+
+### The measurement that reframed the job
+
+Sizing a default meant measuring the occupancy baseline at the *validated
+default* rate — which, it turned out, nobody had ever done. Every figure in the
+existing RTF matrix was taken at a LOWERED rate; the widely-quoted 0.927 is a
+60/30 number. Measured live, navigation-parity, arena rcw2026:
+
+| rate | occupancy | 44x349 (new default) | full 57x349 |
+|---|---|---|---|
+| 120 / 120 | **0.248** / 0.246 | 0.164 | 0.151 |
+| 60 / 30 | 0.927 | — | 0.483 |
+| 40 / 40 | — | **0.578** | 0.514 |
+
+**At the validated 120 Hz default the simulator is already at RTF 0.248 with the
+CHEAP map lidar and no raycast sensor at all.** The project's >= 0.5 floor is
+therefore a *rate* question, not a lidar question, and no ray budget reaches it
+from 0.248. The lidar was never what put a default run under the floor.
+
+The two 120 Hz occupancy figures are independent measurements an hour apart —
+0.248 as a bare baseline, 0.246 through `--map-lidar` — which is the
+reproducibility these numbers carry.
+
+### The default budget, and why it is not the contract
+
+`DEFAULT_LIDAR_CHANNELS = 44`, columns left at the contract's 349. Not an
+extrapolation: 44 x 349 is the exact configuration that passed the live Nav2
+battery at RTF 0.521 with the whole `tinker_sim_bridge` stack attached. The
+contract's 57 channels was never measured with Nav2 on the box, and bare-sim it
+runs 0.514 — nothing left once Nav2 is also running.
+
+Elevation is the right axis to spend because it is the one navigation does not
+read. `pointcloud_to_laserscan` flattens to 2-D, and its 0..2.0 m height band at
+the 8 m `range_max` only uses elevations of roughly 0..14 deg out of the
+contract's -7..+52 deg fan. Cutting COLUMNS would be the wrong trade: at 349 the
+azimuth step is already 1.03 deg, coarser than the scan's own 0.008 rad
+(0.458 deg) increment, so every column removed is directly visible in `/scan`.
+
+The contract file stays the ceiling. What changed is what "unset" means —
+previously the contract, now the validated budget. Raising an override above the
+CONTRACT is still refused; raising from the default up to the contract is
+allowed, and `TINKER_SIM_LIDAR_CHANNELS=57` is how a parity run asks for the
+full fan back.
+
+### Verified live, with no lidar flag passed at all
+
+    A  no flags, 120/120   live raycast lidar: 44ch x 349col = 15356 rays
+                           lidar_source "raycast"      RTF 0.164
+    B  no flags,  40/40    same rig, 3749 pts/frame
+                           lidar_source "raycast"      RTF 0.578   <- clears 0.5
+    C  --map-lidar         NO RIG (occupancy path)
+                           lidar_source "occupancy", lidar null    RTF 0.246
+
+B's cloud (3749 points) matches the validated battery's 3686-3738, and the
+accumulation window tracks the rate correctly: 12 physics steps per frame at
+120 Hz, 4 at 40 Hz.
+
+### Void numbers corrected, again
+
+`lidar_rig`'s module docstring and `hardware-parity.json`'s `raycast.rationale`
+both still quoted per-scale costs (+0.75 s/sim-s at full scale, +0.50 at 32x360,
+"nearly flat below 16x360"). Those were measured before the scene-query fix —
+with every ray missing, so they timed rays that never resolved a hit or touched
+a collision shape. They understate the real cost by roughly 7x: the true
+marginal cost at full scale is ~2.6 s per simulated second at 120 Hz. Both are
+corrected. Treat any raycast sizing figure dated before 2026-09-09 the same way.
+
+### A measurement mistake worth not repeating
+
+The first channel sweep was run against the working tree WHILE that tree was
+being edited. One run launched in the window where the gate's third argument had
+flipped meaning (opt-in -> opt-out) but the call sites had not yet been updated,
+so it read `--raycast-lidar` as an opt-OUT and quietly measured the occupancy
+path under a label saying "raycast". Nothing errored; the giveaway was the
+absence of the `live raycast lidar:` line. Only the pre-edit baseline survived,
+and the sweep was re-run after freezing the tree. Freeze before measuring, and
+check the rig line rather than trusting the flag you passed.
+
+### Open, and deliberately not decided here
+
+Making 40/40 the navigation-parity default would put an out-of-the-box nav run
+above the 0.5 floor. It is not done here: lowering the physics rate changes
+PhysX contact behaviour, and every manipulation result was validated at 120 Hz.
+That is a user decision, not a drive-by.
+
 ## 2026-09-10 — live Nav2 battery: the lidar chain works end to end, and it sees a person
 
 Run live: navigation-parity, arena `rcw2026`, headless, `--ros`, `--raycast-lidar`,

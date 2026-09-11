@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulation"))
 
 from tinker_sim_isaac.lidar_rig import (  # noqa: E402
+    DEFAULT_LIDAR_CHANNELS,
     FrameAccumulator,
     self_hit_mask,
     LidarSpec,
@@ -71,18 +72,80 @@ class TestLoadLidarSpec(unittest.TestCase):
         self.assertEqual((spec.elevation_min_deg, spec.elevation_max_deg), (-7.0, 52.0))
         self.assertTrue(spec.sweep)
 
+    @staticmethod
+    def _declared() -> dict:
+        """The contract as WRITTEN, before any runtime budget is applied.
+
+        ``load_lidar_spec`` no longer returns this: since the live sensor
+        became the default source it resolves the default ray budget
+        (:data:`DEFAULT_LIDAR_CHANNELS`), which is deliberately below the
+        contract. These two tests are about the hardware declaration, so they
+        read the file.
+        """
+        raw = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        return raw["lidar"]["raycast"]
+
     def test_shipped_contract_is_mid360_scale(self) -> None:
         """198,930 points/s against the Mid-360's 200,000."""
-        spec = load_lidar_spec(CONTRACT)
-        self.assertEqual(spec.num_rays, 19893)
-        self.assertAlmostEqual(spec.points_per_second, 198930.0)
-        self.assertLess(abs(spec.points_per_second - 200_000.0) / 200_000.0, 0.01)
+        declared = self._declared()
+        num_rays = declared["channels"] * declared["columns"]
+        points_per_second = num_rays * 10
+        self.assertEqual(num_rays, 19893)
+        self.assertAlmostEqual(points_per_second, 198930.0)
+        self.assertLess(abs(points_per_second - 200_000.0) / 200_000.0, 0.01)
 
     def test_shipped_contract_spacing_is_isotropic(self) -> None:
-        spec = load_lidar_spec(CONTRACT)
-        vertical = (spec.elevation_max_deg - spec.elevation_min_deg) / (spec.channels - 1)
-        horizontal = 360.0 / spec.columns
+        declared = self._declared()
+        lo, hi = declared["elevation_range_deg"]
+        vertical = (hi - lo) / (declared["channels"] - 1)
+        horizontal = 360.0 / declared["columns"]
         self.assertLess(abs(vertical - horizontal), 0.05)
+
+    def test_the_default_budget_trades_elevation_and_keeps_azimuth(self) -> None:
+        """The shipped DEFAULT is anisotropic on purpose. Say so out loud.
+
+        The contract's ~1.03 deg isotropic spacing is a real Mid-360 property,
+        and the default budget gives part of it up: 44 channels over the same
+        -7..+52 deg fan is ~1.37 deg vertically, about a third coarser than the
+        1.03 deg azimuth step it keeps.
+
+        That asymmetry is the point rather than a defect.
+        ``pointcloud_to_laserscan`` flattens the cloud to 2-D, so azimuth is
+        what navigation consumes and elevation is what it does not -- and at
+        349 columns the azimuth step is ALREADY coarser than the scan's own
+        0.008 rad (0.458 deg) increment, so columns cannot be spent at all.
+        A parity run that needs the true isotropic fan sets
+        TINKER_SIM_LIDAR_CHANNELS=57.
+        """
+        spec = load_lidar_spec(CONTRACT)
+        declared = self._declared()
+        self.assertEqual(spec.channels, DEFAULT_LIDAR_CHANNELS)
+        self.assertEqual(
+            spec.columns,
+            declared["columns"],
+            "azimuth must not be spent: it is already coarser than /scan asks",
+        )
+        self.assertLess(
+            spec.channels,
+            declared["channels"],
+            "the default budget is below the contract, or it buys nothing",
+        )
+        vertical = (spec.elevation_max_deg - spec.elevation_min_deg) / (
+            spec.channels - 1
+        )
+        horizontal = 360.0 / spec.columns
+        self.assertGreater(
+            vertical,
+            horizontal,
+            "if the default ever became isotropic again this test is stale",
+        )
+        self.assertLess(
+            vertical,
+            2.0 * horizontal,
+            "elevation may be coarser than azimuth, but not by more than 2x: "
+            "past that a person-sized obstacle at room range starts falling "
+            "between rings",
+        )
 
     def _write(self, mutate) -> Path:
         raw = json.loads(CONTRACT.read_text(encoding="utf-8"))
