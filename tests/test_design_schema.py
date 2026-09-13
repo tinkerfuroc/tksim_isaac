@@ -89,6 +89,21 @@ class DesignSchemaTest(unittest.TestCase):
             with self.assertRaisesRegex(DesignError, "exactly one"):
                 load_design(design_dir)
 
+    def test_malformed_sensors_is_rejected(self) -> None:
+        raw = dict(MINIMAL, sensors=5)
+        with self.assertRaisesRegex(DesignError, "sensors"):
+            design_from_mapping(raw, source="robot.urdf")
+
+    def test_malformed_pan_tilt_is_rejected(self) -> None:
+        raw = dict(MINIMAL, pan_tilt="oops")
+        with self.assertRaisesRegex(DesignError, "pan_tilt"):
+            design_from_mapping(raw, source="robot.urdf")
+
+    def test_missing_base_frame_is_rejected(self) -> None:
+        raw = {key: value for key, value in MINIMAL.items() if key != "base_frame"}
+        with self.assertRaisesRegex(DesignError, "base_frame"):
+            design_from_mapping(raw, source="robot.urdf")
+
     def test_name_must_match_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             design_dir = Path(temporary) / "other"

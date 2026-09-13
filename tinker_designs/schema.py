@@ -127,9 +127,9 @@ def design_from_mapping(raw: Mapping, *, source: str) -> Design:
     kinematics = raw.get("kinematics")
     if kinematics not in KINEMATICS:
         raise DesignError(f"kinematics must be one of {KINEMATICS}, got {kinematics!r}")
-    base_frame = raw.get("base_frame", "base_link")
-    if not isinstance(base_frame, str):
-        raise DesignError("base_frame must be a string")
+    base_frame = raw.get("base_frame")
+    if not isinstance(base_frame, str) or not base_frame:
+        raise DesignError("base_frame is required")
     wheels_raw = raw.get("wheels")
     if not isinstance(wheels_raw, Mapping):
         raise DesignError("wheels is required")
@@ -149,8 +149,15 @@ def design_from_mapping(raw: Mapping, *, source: str) -> Design:
     if len({arm.name for arm in arms}) != len(arms):
         raise DesignError("arm names must be unique")
     pan_tilt_raw = raw.get("pan_tilt")
-    pan_tilt = () if pan_tilt_raw is None else _names(pan_tilt_raw.get("joints") if isinstance(pan_tilt_raw, Mapping) else None, "pan_tilt.joints")
+    if pan_tilt_raw is None:
+        pan_tilt: tuple[str, ...] = ()
+    elif isinstance(pan_tilt_raw, Mapping):
+        pan_tilt = _names(pan_tilt_raw.get("joints"), "pan_tilt.joints")
+    else:
+        raise DesignError("pan_tilt must be a mapping with a joints list")
     sensors_raw = raw.get("sensors") or []
+    if not isinstance(sensors_raw, Sequence) or isinstance(sensors_raw, str):
+        raise DesignError("sensors must be a list")
     sensors = []
     for item in sensors_raw:
         if not isinstance(item, Mapping) or not isinstance(item.get("type"), str) or not isinstance(item.get("frame"), str):
