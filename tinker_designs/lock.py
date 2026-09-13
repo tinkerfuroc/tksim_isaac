@@ -23,16 +23,25 @@ def _label(path: Path, repo_root: Path) -> str:
 
 
 def design_records(design_dir: Path, repo_root: Path, extra_files: Sequence[Path]) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
+    by_label: dict[str, dict[str, object]] = {}
+
+    def _add(path: Path, label: str) -> None:
+        record = _record(path, label)
+        existing = by_label.get(label)
+        if existing is not None:
+            if existing["sha256"] != record["sha256"]:
+                raise UnsafePathError(f"design source path collision with mismatched content: {label}")
+            return
+        by_label[label] = record
+
     for path in sorted(Path(design_dir).rglob("*")):
         if path.is_symlink():
             raise UnsafePathError(f"design source is a symlink: {path}")
         if path.is_file():
-            records.append(_record(path, _label(path, repo_root)))
+            _add(path, _label(path, repo_root))
     for path in extra_files:
-        records.append(_record(Path(path), _label(Path(path), repo_root)))
-    records.sort(key=lambda item: str(item["path"]))
-    return records
+        _add(Path(path), _label(Path(path), repo_root))
+    return sorted(by_label.values(), key=lambda item: str(item["path"]))
 
 
 def design_source_lock(design_dir: Path, repo_root: Path, extra_files: Sequence[Path]) -> bytes:

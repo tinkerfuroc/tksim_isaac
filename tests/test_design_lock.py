@@ -37,6 +37,21 @@ class DesignLockTest(unittest.TestCase):
             self.assertEqual(lock["schema_version"], 3)
             self.assertEqual(len(lock["files"]), 4)
 
+    def test_extra_file_already_under_design_dir_is_not_duplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            design_dir = repo / "designs" / "demo"
+            (design_dir / "meshes").mkdir(parents=True)
+            (design_dir / "robot.urdf").write_bytes(b"<robot/>")
+            (design_dir / "design.yaml").write_bytes(b"name: demo\n")
+            (design_dir / "meshes" / "a.stl").write_bytes(b"solid")
+            records = design_records(design_dir, repo, [design_dir / "meshes" / "a.stl"])
+            paths = [r["path"] for r in records]
+            self.assertEqual(len(records), 3)
+            self.assertEqual(len(set(paths)), 3)
+            lock = json.loads(design_source_lock(design_dir, repo, [design_dir / "meshes" / "a.stl"]))
+            self.assertEqual(len(lock["files"]), 3)
+
     def test_symlinks_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
