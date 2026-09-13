@@ -1,0 +1,25 @@
+# designs/tinker2_ref/design.yaml
+# The current Tinker 2 as a design: the parity gate for the design pipeline.
+# robot.urdf is the canonical tinker2 artifact URDF (artifact 347aef74…, 2026-09-13).
+name: tinker2_ref
+kinematics: diff_drive
+base_frame: base_link
+wheels:
+  driven: [front_left_wheel_joint, front_right_wheel_joint]
+  caster_swivel: [rear_left_swivel_joint, rear_right_swivel_joint]
+  caster_wheel: [rear_left_wheel_joint, rear_right_wheel_joint]
+arms:
+  - name: xarm
+    mount: link_base
+    joints: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+    gripper:
+      drive: drive_joint
+      mimics: [left_finger_joint, left_inner_knuckle_joint, right_outer_knuckle_joint, right_finger_joint, right_inner_knuckle_joint]
+    drive: {stiffness: 400.0, damping: 40.0}
+pan_tilt: {joints: [pan_joint, tilt_joint]}
+sensors:
+  - {type: livox_mid360, frame: livox_frame}
+  - {type: head_camera, frame: head_camera_link}
+# base_link's collision is the tracer_mini STL, so the footprint cannot be
+# derived from primitives; this is the value workspace.py types today.
+footprint: [[0.15, 0.25], [0.15, -0.25], [-0.35, -0.25], [-0.35, 0.25]]
