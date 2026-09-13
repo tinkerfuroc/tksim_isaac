@@ -178,14 +178,11 @@ def write_init(design_dir: Path, name: str) -> Path:
     return target
 
 
-def _parse_package_roots(items: list[str]) -> dict[str, Path]:
-    result: dict[str, Path] = {}
-    for item in items:
-        package, _, path = item.partition("=")
-        if not package or not path:
-            raise argparse.ArgumentTypeError(f"--package-root expects PKG=PATH, got {item!r}")
-        result[package] = Path(path)
-    return result
+def _package_root_pair(item: str) -> tuple[str, Path]:
+    package, _, path = item.partition("=")
+    if not package or not path:
+        raise argparse.ArgumentTypeError(f"--package-root expects PKG=PATH, got {item!r}")
+    return package, Path(path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -195,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-import", action="store_true", help="stop after render + contract + derive")
     parser.add_argument("--stub-converter", action="store_true", help="skip Isaac; write a placeholder USD")
     parser.add_argument("--artifacts", type=Path, default=REPO_ROOT / "artifacts")
-    parser.add_argument("--package-root", action="append", default=[], metavar="PKG=PATH")
+    parser.add_argument("--package-root", action="append", default=[], metavar="PKG=PATH", type=_package_root_pair)
     args = parser.parse_args(argv)
 
     design_dir = args.design.resolve()
@@ -208,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_RENDER
 
     packages = dict(package_share_dirs())
-    packages.update(_parse_package_roots(args.package_root))
+    packages.update(dict(args.package_root))
 
     def _run(hooks) -> int:
         try:

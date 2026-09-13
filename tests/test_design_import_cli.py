@@ -5,7 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import yaml
@@ -135,6 +135,15 @@ class RunImportTest(unittest.TestCase):
                 write_init(design_dir, "two_arm_fixture")
             code = main(["--design", str(design_dir), "--init"])
             self.assertNotEqual(code, 0)
+
+    def test_malformed_package_root_is_a_usage_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            design_dir = _make_design(repo)
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    main(["--design", str(design_dir), "--no-import", "--package-root", "nope"])
+            self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":
