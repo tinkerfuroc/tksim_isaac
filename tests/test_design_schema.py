@@ -94,6 +94,13 @@ class DesignSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(DesignError, "sensors"):
             design_from_mapping(raw, source="robot.urdf")
 
+    def test_falsy_non_list_sensors_and_arms_are_rejected_not_masked_to_empty(self) -> None:
+        for key, value in (("sensors", 0), ("sensors", False), ("arms", 0), ("arms", False)):
+            with self.subTest(key=key, value=value):
+                raw = dict(MINIMAL, **{key: value})
+                with self.assertRaisesRegex(DesignError, key):
+                    design_from_mapping(raw, source="robot.urdf")
+
     def test_malformed_pan_tilt_is_rejected(self) -> None:
         raw = dict(MINIMAL, pan_tilt="oops")
         with self.assertRaisesRegex(DesignError, "pan_tilt"):

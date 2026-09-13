@@ -137,8 +137,10 @@ def design_from_mapping(raw: Mapping, *, source: str) -> Design:
         raise DesignError("diff_drive needs exactly two wheels.driven joints")
     if len(wheels.caster_swivel) != len(wheels.caster_wheel):
         raise DesignError("wheels.caster_swivel and wheels.caster_wheel must pair up")
-    arms_raw = raw.get("arms") or []
-    if not isinstance(arms_raw, Sequence) or isinstance(arms_raw, str):
+    arms_raw = raw.get("arms")
+    if arms_raw is None:
+        arms_raw = []
+    elif not isinstance(arms_raw, Sequence) or isinstance(arms_raw, str):
         raise DesignError("arms must be a list")
     arms = tuple(_arm(item, index) for index, item in enumerate(arms_raw))
     if len({arm.name for arm in arms}) != len(arms):
@@ -150,8 +152,10 @@ def design_from_mapping(raw: Mapping, *, source: str) -> Design:
         pan_tilt = _names(pan_tilt_raw.get("joints"), "pan_tilt.joints")
     else:
         raise DesignError("pan_tilt must be a mapping with a joints list")
-    sensors_raw = raw.get("sensors") or []
-    if not isinstance(sensors_raw, Sequence) or isinstance(sensors_raw, str):
+    sensors_raw = raw.get("sensors")
+    if sensors_raw is None:
+        sensors_raw = []
+    elif not isinstance(sensors_raw, Sequence) or isinstance(sensors_raw, str):
         raise DesignError("sensors must be a list")
     sensors = []
     for item in sensors_raw:
