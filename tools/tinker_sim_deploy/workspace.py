@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -230,10 +231,10 @@ def _validate_lock_records(raw: object) -> list[dict[str, object]]:
     return records
 
 
-def _normalized_source_lock(records: list[dict[str, object]]) -> bytes:
+def _normalized_source_lock(records: list[dict[str, object]], *, robot: str = "tinker2") -> bytes:
     payload = {
         "schema_version": SOURCE_LOCK_SCHEMA,
-        "robot": "tinker2",
+        "robot": robot,
         "source_identity": _source_identity(records),
         "files": records,
     }
@@ -318,12 +319,19 @@ def _origin_matches(joint: ET.Element, expected_xyz: tuple[float, float, float],
     return all(math.isclose(actual, wanted, rel_tol=0.0, abs_tol=1e-12) for actual, wanted in (*zip(xyz, expected_xyz), *zip(rpy, expected_rpy)))
 
 
+def _format_number(value: float) -> str:
+    text = repr(float(value))
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
 def _set_origin(joint: ET.Element, xyz: tuple[float, float, float], rpy: tuple[float, float, float]) -> None:
     origin = joint.find("origin")
     if origin is None:
         origin = ET.Element("origin")
         joint.insert(0, origin)
-    origin.set("xyz", "-0.03 0 0.527" if xyz == _ARM_MOUNT_ORIGIN else "0 0 0")
+    origin.set("xyz", " ".join(_format_number(value) for value in xyz))
     origin.set("rpy", "0 0 0")
 
 
@@ -463,7 +471,7 @@ def _validate_ros2_control(root: ET.Element, *, require_drive: bool) -> None:
             raise CanonicalizationError("ros2_control contains gripper command provider metadata")
 
 
-def _ensure_mount_topology(root: ET.Element) -> None:
+def _ensure_mount_topology(root: ET.Element, mount_origin: tuple[float, float, float] = _ARM_MOUNT_ORIGIN) -> None:
     worlds = [link for link in root.findall("link") if link.get("name") == "world"]
     if len(worlds) > 1:
         raise CanonicalizationError("duplicate world link definitions")
@@ -479,19 +487,19 @@ def _ensure_mount_topology(root: ET.Element) -> None:
         child = world_joint.find("child")
         if world_joint.get("type") == "fixed" and parent is not None and parent.get("link") == "world" and child is not None and child.get("link") == "base_link" and _origin_matches(world_joint, _ZERO_ORIGIN, _ZERO_ORIGIN):
             pass
-        elif world_joint.get("type") == "fixed" and parent is not None and parent.get("link") == "base_link" and child is not None and child.get("link") == "link_base" and _origin_matches(world_joint, _ARM_MOUNT_ORIGIN, _ZERO_ORIGIN):
+        elif world_joint.get("type") == "fixed" and parent is not None and parent.get("link") == "base_link" and child is not None and child.get("link") == "link_base" and _origin_matches(world_joint, mount_origin, _ZERO_ORIGIN):
             legacy_mount = world_joint
         else:
             raise CanonicalizationError("world_joint has an unsupported parent, child, type, or origin")
-    if base_to_arm is not None and not (base_to_arm.get("type") == "fixed" and base_to_arm.find("parent") is not None and base_to_arm.find("parent").get("link") == "base_link" and base_to_arm.find("child") is not None and base_to_arm.find("child").get("link") == "link_base" and _origin_matches(base_to_arm, _ARM_MOUNT_ORIGIN, _ZERO_ORIGIN)):
+    if base_to_arm is not None and not (base_to_arm.get("type") == "fixed" and base_to_arm.find("parent") is not None and base_to_arm.find("parent").get("link") == "base_link" and base_to_arm.find("child") is not None and base_to_arm.find("child").get("link") == "link_base" and _origin_matches(base_to_arm, mount_origin, _ZERO_ORIGIN)):
         raise CanonicalizationError("base_to_arm_joint does not match the required arm mount")
     if legacy_mount is not None and base_to_arm is not None:
         raise CanonicalizationError("duplicate base_to_arm_joint mount definitions")
     if legacy_mount is not None:
         legacy_mount.set("name", "base_to_arm_joint")
-        _set_origin(legacy_mount, _ARM_MOUNT_ORIGIN, _ZERO_ORIGIN)
+        _set_origin(legacy_mount, mount_origin, _ZERO_ORIGIN)
     elif base_to_arm is not None:
-        _set_origin(base_to_arm, _ARM_MOUNT_ORIGIN, _ZERO_ORIGIN)
+        _set_origin(base_to_arm, mount_origin, _ZERO_ORIGIN)
     else:
         raise CanonicalizationError("source graph has no unambiguous base_link to link_base arm mount")
     if not worlds:
@@ -523,7 +531,7 @@ def _ensure_drive_control(root: ET.Element) -> None:
         ET.SubElement(drive, "state_interface", {"name": name})
 
 
-def _validate_canonical_root(root: ET.Element) -> None:
+def _validate_canonical_root(root: ET.Element, mount_origin: tuple[float, float, float] = _ARM_MOUNT_ORIGIN) -> None:
     _validate_graph(root)
     _validate_physical_arm(root)
     _validate_physical_drive(root)
@@ -539,7 +547,7 @@ def _validate_canonical_root(root: ET.Element) -> None:
     if len(mounts) != 1:
         raise CanonicalizationError("canonical URDF must contain exactly one base_to_arm_joint")
     mount = mounts[0]
-    if mount.get("type") != "fixed" or mount.find("parent").get("link") != "base_link" or mount.find("child").get("link") != "link_base" or not _origin_matches(mount, _ARM_MOUNT_ORIGIN, _ZERO_ORIGIN):
+    if mount.get("type") != "fixed" or mount.find("parent").get("link") != "base_link" or mount.find("child").get("link") != "link_base" or not _origin_matches(mount, mount_origin, _ZERO_ORIGIN):
         raise CanonicalizationError("base_to_arm_joint must preserve the exact arm mount transform")
     if len([joint for joint in root.findall("joint") if joint.get("name") == "drive_joint"]) != 1:
         raise CanonicalizationError("canonical URDF must contain exactly one physical drive_joint")
@@ -566,16 +574,16 @@ def _validate_canonical_root(root: ET.Element) -> None:
         raise CanonicalizationError("canonical URDF graph contains disconnected links")
 
 
-def canonicalize_urdf(data: bytes) -> bytes:
+def canonicalize_urdf(data: bytes, *, mount_origin: tuple[float, float, float] = _ARM_MOUNT_ORIGIN) -> bytes:
     root = _parse_urdf(data)
     for control in root.findall("ros2_control"):
         for parameter in control.findall("hardware/param"):
             if (parameter.get("name") or "").lower() in {"add_gripper", "add_bio_gripper"}:
                 parameter.text = "False"
     _validate_graph(root)
-    _ensure_mount_topology(root)
+    _ensure_mount_topology(root, mount_origin)
     _ensure_drive_control(root)
-    _validate_canonical_root(root)
+    _validate_canonical_root(root, mount_origin)
     xml = ET.tostring(root, encoding="unicode")
     canonical = ET.canonicalize(xml_data=xml, with_comments=False, strip_text=False)
     return (canonical.rstrip("\n") + "\n").encode("utf-8")
@@ -600,7 +608,11 @@ def _same_directory(left: Path, right: Path) -> bool:
     def regular_entries(root: Path) -> list[Path] | None:
         entries: list[Path] = []
         for candidate in root.rglob("*"):
-            if candidate.is_symlink() or not candidate.is_file():
+            if candidate.is_symlink():
+                return None
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file():
                 return None
             entries.append(candidate.relative_to(root))
         return sorted(entries)
@@ -650,6 +662,116 @@ def _recover_staging(artifact_root: Path) -> None:
     _fsync_directory(artifact_root)
 
 
+_ROBOT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
+def publish_robot_artifact(
+    artifacts: Path,
+    *,
+    robot: str,
+    file_bytes: dict[str, bytes],
+    canonical_urdf: bytes,
+    source_lock_bytes: bytes,
+    canonicalizer: str,
+    manifest_extra: dict[str, object],
+    source_path: str,
+    source_sha256: str,
+    locked: bool = False,
+) -> ExportResult:
+    if not _ROBOT_NAME.fullmatch(robot):
+        raise ArtifactPublicationError(f"invalid robot name: {robot!r}")
+    artifacts = _safe_dir(artifacts, "artifacts root", create=True)
+    artifact_root = artifacts / "robot" / robot
+    _safe_dir(artifact_root, "artifact root", create=True)
+    for name in file_bytes:
+        _safe_relative(name, "artifact payload name")
+
+    def _publish_locked() -> ExportResult:
+        payload_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in file_bytes.items()}
+        digest = artifact_identity(payload_hashes, canonical_urdf, source_lock_bytes, canonicalizer)
+        _recover_staging(artifact_root)
+        destination = artifact_root / digest
+        if destination.exists() and (destination.is_symlink() or not destination.is_dir()):
+            raise ArtifactPublicationError(f"content-addressed artifact path is unsafe: {destination}")
+
+        extra = dict(manifest_extra)
+        manifest: dict[str, object] = {
+            "schema_version": PUBLICATION_SCHEMA,
+            "robot": robot,
+            "artifact_id": digest,
+            "source_lock": f"artifacts/robot/{robot}/{digest}/source-lock.json",
+            "qualification": extra.pop("qualification", "blocked_calibration_missing"),
+            "files": [{"path": f"artifacts/robot/{robot}/{digest}/{name}", "sha256": payload_hashes[name]} for name in file_bytes],
+            "canonicalization": {
+                "algorithm": canonicalizer,
+                "source_path": source_path,
+                "source_sha256": source_sha256,
+                "output_sha256": payload_hashes["robot.urdf"],
+            },
+        }
+        manifest.update(extra)
+        source_lock_snapshot = source_lock_bytes
+        manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        current_payload = {
+            "schema_version": PUBLICATION_SCHEMA,
+            "robot": robot,
+            "artifact_id": digest,
+            "artifact_dir": f"artifacts/robot/{robot}/{digest}",
+            "manifest": f"artifacts/robot/{robot}/{digest}/manifest.json",
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "source_lock": f"artifacts/robot/{robot}/{digest}/source-lock.json",
+            "source_lock_sha256": hashlib.sha256(source_lock_snapshot).hexdigest(),
+            "robot_urdf_sha256": payload_hashes["robot.urdf"],
+            "robot_usd_sha256": payload_hashes["robot.usd"],
+        }
+        current_bytes = (json.dumps(current_payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+        stage = Path(tempfile.mkdtemp(prefix=".artifact-stage-", dir=str(artifact_root)))
+        try:
+            for name, data in file_bytes.items():
+                target = stage / name
+                _path_parts_are_safe(target, "artifact payload name")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+                with target.open("rb") as stream:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            (stage / "source-lock.json").write_bytes(source_lock_snapshot)
+            with (stage / "source-lock.json").open("rb") as stream:
+                stream.flush()
+                os.fsync(stream.fileno())
+            (stage / "manifest.json").write_bytes(manifest_bytes)
+            with (stage / "manifest.json").open("rb") as stream:
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(stage)
+            if destination.exists():
+                if not _same_directory(destination, stage):
+                    raise ArtifactPublicationError(f"content-addressed artifact already exists with different bytes: {destination}")
+                shutil.rmtree(stage)
+            else:
+                try:
+                    os.rename(stage, destination)
+                except FileExistsError:
+                    if not _same_directory(destination, stage):
+                        raise ArtifactPublicationError(f"concurrent artifact collision at {destination}")
+                    shutil.rmtree(stage)
+                _fsync_directory(artifact_root)
+        except BaseException:
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
+            raise
+
+        current = artifact_root / "current.json"
+        _atomic_write(current, current_bytes)
+        return ExportResult(destination, manifest)
+
+    if locked:
+        return _publish_locked()
+    with _publication_lock(artifact_root):
+        return _publish_locked()
+
+
 def export_tinker2(workspace: Path, artifacts: Path, lock_path: Path) -> ExportResult:
     artifacts = _safe_dir(artifacts, "artifacts root", create=True)
     artifact_root = artifacts / "robot" / "tinker2"
@@ -690,28 +812,14 @@ def _export_tinker2_locked(workspace: Path, artifacts: Path, lock_path: Path) ->
             lines = data.decode("utf-8").splitlines()
             data = ("\n".join("image: map.pgm" if line.strip().startswith("image:") else line for line in lines) + "\n").encode("utf-8")
         file_bytes[name] = data
-    payload_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in file_bytes.items()}
-    digest = artifact_identity(payload_hashes, canonical_urdf, source_lock_bytes, CANONICALIZER_ALGORITHM)
-    artifact_root = artifacts / "robot" / "tinker2"
-    _safe_dir(artifact_root, "artifact root", create=True)
-    _recover_staging(artifact_root)
-    destination = artifact_root / digest
-    if destination.exists() and (destination.is_symlink() or not destination.is_dir()):
-        raise ArtifactPublicationError(f"content-addressed artifact path is unsafe: {destination}")
 
-    manifest: dict[str, object] = {
-        "schema_version": PUBLICATION_SCHEMA,
-        "robot": "tinker2",
-        "artifact_id": digest,
-        "source_lock": f"artifacts/robot/tinker2/{digest}/source-lock.json",
-        "qualification": "blocked_calibration_missing",
-        "files": [{"path": f"artifacts/robot/tinker2/{digest}/{name}", "sha256": payload_hashes[name]} for name in ARTIFACT_FILES],
+    extra: dict[str, object] = {
         "canonicalization": {
             "algorithm": CANONICALIZER_ALGORITHM,
             "source_path": source_paths["robot.urdf"],
             "source_sha256": hashlib.sha256(source_data["robot.urdf"]).hexdigest(),
             "source_lock_record": next(record for record in current_records if record["path"] == source_paths["robot.urdf"]),
-            "output_sha256": payload_hashes["robot.urdf"],
+            "output_sha256": hashlib.sha256(canonical_urdf).hexdigest(),
         },
         "provenance": {
             "source_lock_sha256": hashlib.sha256(source_lock_bytes).hexdigest(),
@@ -726,56 +834,15 @@ def _export_tinker2_locked(workspace: Path, artifacts: Path, lock_path: Path) ->
             "footprint": [[0.15, 0.25], [0.15, -0.25], [-0.35, -0.25], [-0.35, 0.25]],
         },
     }
-    source_lock_snapshot = source_lock_bytes
-    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    current_payload = {
-        "schema_version": PUBLICATION_SCHEMA,
-        "robot": "tinker2",
-        "artifact_id": digest,
-        "artifact_dir": f"artifacts/robot/tinker2/{digest}",
-        "manifest": f"artifacts/robot/tinker2/{digest}/manifest.json",
-        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        "source_lock": f"artifacts/robot/tinker2/{digest}/source-lock.json",
-        "source_lock_sha256": hashlib.sha256(source_lock_snapshot).hexdigest(),
-        "robot_urdf_sha256": payload_hashes["robot.urdf"],
-        "robot_usd_sha256": payload_hashes["robot.usd"],
-    }
-    current_bytes = (json.dumps(current_payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-
-    stage = Path(tempfile.mkdtemp(prefix=".artifact-stage-", dir=str(artifact_root)))
-    try:
-        for name, data in file_bytes.items():
-            target = stage / name
-            target.write_bytes(data)
-            with target.open("rb") as stream:
-                stream.flush()
-                os.fsync(stream.fileno())
-        (stage / "source-lock.json").write_bytes(source_lock_snapshot)
-        with (stage / "source-lock.json").open("rb") as stream:
-            stream.flush()
-            os.fsync(stream.fileno())
-        (stage / "manifest.json").write_bytes(manifest_bytes)
-        with (stage / "manifest.json").open("rb") as stream:
-            stream.flush()
-            os.fsync(stream.fileno())
-        _fsync_directory(stage)
-        if destination.exists():
-            if not _same_directory(destination, stage):
-                raise ArtifactPublicationError(f"content-addressed artifact already exists with different bytes: {destination}")
-            shutil.rmtree(stage)
-        else:
-            try:
-                os.rename(stage, destination)
-            except FileExistsError:
-                if not _same_directory(destination, stage):
-                    raise ArtifactPublicationError(f"concurrent artifact collision at {destination}")
-                shutil.rmtree(stage)
-            _fsync_directory(artifact_root)
-    except BaseException:
-        if stage.exists():
-            shutil.rmtree(stage, ignore_errors=True)
-        raise
-
-    current = artifact_root / "current.json"
-    _atomic_write(current, current_bytes)
-    return ExportResult(destination, manifest)
+    return publish_robot_artifact(
+        artifacts,
+        robot="tinker2",
+        file_bytes=file_bytes,
+        canonical_urdf=canonical_urdf,
+        source_lock_bytes=source_lock_bytes,
+        canonicalizer=CANONICALIZER_ALGORITHM,
+        manifest_extra=extra,
+        source_path=source_paths["robot.urdf"],
+        source_sha256=hashlib.sha256(source_data["robot.urdf"]).hexdigest(),
+        locked=True,
+    )
