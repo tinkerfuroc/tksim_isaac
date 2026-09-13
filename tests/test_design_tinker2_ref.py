@@ -1,6 +1,7 @@
 # tests/test_design_tinker2_ref.py
 from __future__ import annotations
 
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -16,10 +17,16 @@ from tinker_designs.model import parse_urdf
 
 DESIGN = ROOT / "designs" / "tinker2_ref"
 
+# sha256sum designs/tinker2_ref/robot.urdf, copied verbatim from the tinker2 artifact
+# artifacts/robot/tinker2/347aef74…/robot.urdf (2026-09-13). Pins that the checked-in
+# reference URDF has not drifted from the artifact it was copied from.
+TINKER2_ARTIFACT_URDF_SHA256 = "e94dc5f1ca625f2a8621bc9f154e4a89f9a92451efae7bb5076f96c0820f40b3"
+
 
 class Tinker2RefParityTest(unittest.TestCase):
     def test_reference_urdf_is_canonical_and_pipeline_preserves_it(self) -> None:
         source = (DESIGN / "robot.urdf").read_bytes()
+        self.assertEqual(hashlib.sha256(source).hexdigest(), TINKER2_ARTIFACT_URDF_SHA256, "designs/tinker2_ref/robot.urdf has drifted from the tinker2 artifact it was copied from")
         self.assertEqual(canonical_bytes(parse_urdf(source)), source, "reference URDF must already be in canonical form")
         with tempfile.TemporaryDirectory() as temporary:
             result = run_import(DESIGN, ROOT, None, no_import=True, packages={}, work_dir=Path(temporary))

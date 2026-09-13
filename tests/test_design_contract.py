@@ -11,7 +11,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from design_fixtures import two_arm_design, two_arm_urdf
-from tinker_designs.contract import ContractError, check_contract, require_contract
+from tinker_designs.contract import ContractError, check_contract, check_footprint, require_contract
+from tinker_designs.derive import derive_profile
 from tinker_designs.model import parse_urdf
 from tinker_designs.schema import design_from_mapping
 
@@ -106,6 +107,20 @@ class ContractTest(unittest.TestCase):
         ET.SubElement(joint, "child", {"link": "base_link"})
         ET.SubElement(joint, "origin", {"xyz": "0 0 0", "rpy": "0 0 0"})
         self.assertEqual(check_contract(root, _design()), [])
+
+    def test_footprint_fixture_design_has_no_violation(self) -> None:
+        profile = derive_profile(parse_urdf(two_arm_urdf()), _design())
+        self.assertEqual(check_footprint(profile), [])
+
+    def test_footprint_bow_tie_polygon_is_a_violation(self) -> None:
+        profile = {"footprint": [[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]], "cog_base_link": [0.5, 0.5, 0.1]}
+        violations = check_footprint(profile)
+        self.assertTrue(any("simple" in item for item in violations), violations)
+
+    def test_footprint_square_not_containing_cog_is_a_violation(self) -> None:
+        profile = {"footprint": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], "cog_base_link": [5.0, 5.0, 0.1]}
+        violations = check_footprint(profile)
+        self.assertTrue(any("CoG" in item for item in violations), violations)
 
     def test_require_contract_raises_with_all_violations(self) -> None:
         raw = two_arm_design()

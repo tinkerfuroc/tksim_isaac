@@ -34,7 +34,7 @@ if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 from tinker_designs.clean import CleanError, canonical_bytes, expand_xacro, package_share_dirs, resolve_mesh_uris, strip_gazebo
-from tinker_designs.contract import ContractError, require_contract
+from tinker_designs.contract import ContractError, require_contract, require_footprint
 from tinker_designs.derive import DeriveError, derive_profile
 from tinker_designs.heuristics import draft_design
 from tinker_designs.lock import design_source_lock
@@ -117,6 +117,7 @@ def run_import(design_dir: Path, repo_root: Path, hooks: ConverterHooks | None, 
         root, isaac_path, resolved = render(design_dir, design, packages=packages, work_dir=work_dir, resolve=not no_import)
         require_contract(root, design)
         profile = derive_profile(root, design)
+        require_footprint(profile)
         canonical = canonical_bytes(root)
         if no_import:
             return ImportResult(None, None, profile, canonical)
@@ -206,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             print(write_init(design_dir, design_dir.name))
             return 0
-        except (FileExistsError, DesignError, CleanError) as error:
+        except (FileExistsError, DesignError, CleanError, ET.ParseError, yaml.YAMLError) as error:
             print(f"design_import: {error}")
             return EXIT_RENDER
 
@@ -219,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         except (ContractError, DeriveError) as error:
             print(f"design_import: contract failed\n{error}")
             return EXIT_CONTRACT
-        except (DesignError, CleanError, ValueError) as error:
+        except (DesignError, CleanError, ValueError, ET.ParseError, yaml.YAMLError) as error:
             print(f"design_import: render failed\n{error}")
             return EXIT_RENDER
         except ImportStageError as error:

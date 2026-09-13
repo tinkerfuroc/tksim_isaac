@@ -169,7 +169,9 @@ Mirrors `arena_import.py`. Stages, each a pure function with a file in/out:
 2. **contract**: structural check (§5) plus inertia sanity: every link has
    mass > 0 and a positive-definite inertia tensor; every wheel/caster ground
    contact is at the same z; the footprint polygon is simple and contains
-   the projected CoG.
+   the projected CoG. The CoG checked here is the arms-at-zero `cog_base_link`;
+   `cog_arms_extended` is not gated at import time -- it feeds M2's
+   `tipover_margin_m` tip-over metric instead.
 3. **import**: headless `SimulationApp`, `isaacsim.asset.importer.urdf`
    `ImportConfig` with `fix_base=False`, `merge_fixed_joints=False`, mimic
    parsing ON (matches the tinker2 artifact), convex decomposition OFF for

@@ -110,6 +110,19 @@ class RunImportTest(unittest.TestCase):
             self.assertIn("tilt_joint", err.getvalue())
             self.assertFalse((repo / "artifacts").exists())
 
+    def test_footprint_override_excluding_cog_exits_3(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            raw = two_arm_design()
+            raw["footprint"] = [[10.0, 10.0], [10.0, 10.1], [10.1, 10.1], [10.1, 10.0]]
+            design_dir = _make_design(repo, design=raw)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main(["--design", str(design_dir), "--stub-converter", "--artifacts", str(repo / "artifacts")])
+            self.assertEqual(code, EXIT_CONTRACT)
+            self.assertIn("CoG", out.getvalue())
+            self.assertFalse((repo / "artifacts").exists())
+
     def test_unresolved_mesh_exits_2(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
@@ -152,6 +165,29 @@ class RunImportTest(unittest.TestCase):
                 write_init(design_dir, "two_arm_fixture")
             code = main(["--design", str(design_dir), "--init"])
             self.assertNotEqual(code, 0)
+
+    def test_malformed_urdf_exits_2_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            design_dir = _make_design(repo, urdf=b"<robot name='x'><link name='a'></robot>")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["--design", str(design_dir), "--stub-converter", "--artifacts", str(repo / "artifacts")])
+            self.assertEqual(code, EXIT_RENDER)
+            self.assertNotIn("Traceback", out.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_malformed_design_yaml_exits_2_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            design_dir = _make_design(repo)
+            (design_dir / "design.yaml").write_text("name: [unterminated\n", encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(["--design", str(design_dir), "--stub-converter", "--artifacts", str(repo / "artifacts")])
+            self.assertEqual(code, EXIT_RENDER)
+            self.assertNotIn("Traceback", out.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
     def test_malformed_package_root_is_a_usage_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

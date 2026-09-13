@@ -177,3 +177,86 @@ def require_contract(root: ET.Element, design: Design) -> None:
     violations = check_contract(root, design)
     if violations:
         raise ContractError(violations)
+
+
+def _orientation(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> int:
+    """0 = collinear, 1 = clockwise, 2 = counter-clockwise."""
+    value = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    if abs(value) < 1e-12:
+        return 0
+    return 1 if value > 0 else 2
+
+
+def _on_segment(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> bool:
+    """True when collinear point `c` lies within segment `a`-`b`'s bounding box."""
+    return min(a[0], b[0]) - 1e-12 <= c[0] <= max(a[0], b[0]) + 1e-12 and min(a[1], b[1]) - 1e-12 <= c[1] <= max(a[1], b[1]) + 1e-12
+
+
+def _segments_intersect(a1: tuple[float, float], a2: tuple[float, float], b1: tuple[float, float], b2: tuple[float, float]) -> bool:
+    o1, o2 = _orientation(a1, a2, b1), _orientation(a1, a2, b2)
+    o3, o4 = _orientation(b1, b2, a1), _orientation(b1, b2, a2)
+    if o1 != o2 and o3 != o4:
+        return True
+    if o1 == 0 and _on_segment(a1, a2, b1):
+        return True
+    if o2 == 0 and _on_segment(a1, a2, b2):
+        return True
+    if o3 == 0 and _on_segment(b1, b2, a1):
+        return True
+    if o4 == 0 and _on_segment(b1, b2, a2):
+        return True
+    return False
+
+
+def _polygon_is_simple(points: list[tuple[float, float]]) -> bool:
+    """No two non-adjacent edges intersect (stdlib segment-intersection test)."""
+    n = len(points)
+    edges = [(points[i], points[(i + 1) % n]) for i in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if j == i + 1 or (i == 0 and j == n - 1):
+                continue  # adjacent edges share a vertex; not a self-intersection
+            a1, a2 = edges[i]
+            b1, b2 = edges[j]
+            if _segments_intersect(a1, a2, b1, b2):
+                return False
+    return True
+
+
+def _point_in_polygon(point: tuple[float, float], polygon: list[tuple[float, float]]) -> bool:
+    """Ray casting; a point exactly on the boundary counts as inside."""
+    x, y = point
+    n = len(polygon)
+    inside = False
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        if _orientation((x1, y1), (x2, y2), (x, y)) == 0 and _on_segment((x1, y1), (x2, y2), (x, y)):
+            return True
+        if (y1 > y) != (y2 > y):
+            x_intersect = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < x_intersect:
+                inside = not inside
+    return inside
+
+
+def check_footprint(profile: dict) -> list[str]:
+    """Spec §3B stage 2: the footprint polygon must be simple and contain the arms-at-zero CoG.
+
+    ``cog_arms_extended`` is deliberately not checked here -- that is M2's tip-over metric
+    (ruling recorded in the spec).
+    """
+    violations: list[str] = []
+    polygon = [(float(x), float(y)) for x, y in profile["footprint"]]
+    if not _polygon_is_simple(polygon):
+        violations.append("footprint polygon is not simple: two non-adjacent edges intersect")
+    cog = (float(profile["cog_base_link"][0]), float(profile["cog_base_link"][1]))
+    if not _point_in_polygon(cog, polygon):
+        violations.append(f"footprint does not contain the base-pose CoG {cog}")
+    return violations
+
+
+def require_footprint(profile: dict) -> None:
+    violations = check_footprint(profile)
+    if violations:
+        raise ContractError(violations)
