@@ -146,5 +146,14 @@ class RunImportTest(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
 
 
+class DesignConvertImportTest(unittest.TestCase):
+    def test_module_imports_without_isaac(self) -> None:
+        before = {name for name in sys.modules if name.startswith(("isaacsim", "omni", "pxr"))}
+        import design_convert
+        after = {name for name in sys.modules if name.startswith(("isaacsim", "omni", "pxr"))}
+        self.assertTrue(hasattr(design_convert, "IsaacHooks"))
+        self.assertEqual(after, before, "design_convert must import Isaac only inside IsaacHooks.import_urdf")
+
+
 if __name__ == "__main__":
     unittest.main()
