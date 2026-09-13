@@ -159,9 +159,13 @@ consumes URDF.
 Mirrors `arena_import.py`. Stages, each a pure function with a file in/out:
 
 1. **render/clean**: if the source is xacro, expand it under the sourced ROS
-   env; strip `<gazebo>`; resolve `package://` via `ament_index_python` and
-   relative `meshes/` paths to `file://`; xmllint. Ported from
-   `render_for_isaac.sh`.
+   env, then canonicalise — that canonical form, with `<gazebo>` blocks and
+   `package://` URIs intact, is the published `robot.urdf` (the tinker2
+   artifact keeps both, and the parity gate is byte-exact). A separate,
+   transient copy for the importer has `<gazebo>` stripped and `package://`
+   / relative `meshes/` paths resolved to `file://` (via `AMENT_PREFIX_PATH`
+   share directories). Ported from `render_for_isaac.sh`, whose strip and
+   resolve stages likewise only ever fed Isaac.
 2. **contract**: structural check (§5) plus inertia sanity: every link has
    mass > 0 and a positive-definite inertia tensor; every wheel/caster ground
    contact is at the same z; the footprint polygon is simple and contains
