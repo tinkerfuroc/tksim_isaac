@@ -174,11 +174,20 @@ Mirrors `arena_import.py`. Stages, each a pure function with a file in/out:
    system Python.
 4. **derive** (`tinker_designs/derive.py`): from the clean URDF + roles
    compute the profile — wheel radius from the driven-wheel cylinder, track
-   from the driven-wheel origins, footprint as the convex hull of chassis +
-   wheel envelopes projected to the ground plane, total mass and CoG, per-arm
-   reach (max distance from mount to last link origin over the joint limits'
-   corner set) and stowed/extended CoG. Nothing in the profile is typed by
-   hand except `design.yaml` roles and drive gains.
+   from the driven-wheel origins, footprint as the convex hull of every
+   primitive (box/cylinder) collision under `base_frame`'s fixed subtree plus
+   the wheel envelopes, projected to the ground plane, total mass and CoG,
+   per-arm reach (max distance from mount to last link origin over the joint
+   limits' corner set) and CoG with every arm at its reach pose. Nothing in
+   the profile is typed by hand except `design.yaml` roles and drive gains,
+   with one exception: a chassis whose collision is a mesh (tinker2's is)
+   has no primitive to derive a footprint from, so `design.yaml` may carry a
+   `footprint:` override; deriving is an error when neither exists.
+
+   The published `robot.urdf` keeps `package://` mesh URIs exactly as the
+   tinker2 artifact does; the `file://`-resolved copy is a transient input
+   to stage 3 only. This is what lets the `tinker2_ref` parity test be
+   byte-exact.
 5. **publish**: content-addressed `artifacts/robot/<name>/<hash>/` with the
    tinker2 file set (`robot.urdf`, `robot.usd`, `robot-profile.yaml`,
    `manifest.json`, `source-lock.json`, plus `meshes/` when present) and
@@ -283,8 +292,14 @@ so `tipover_margin_m` is exercised on every design.
 
 ## 5. Structural contract (what a design must satisfy in M1/M2)
 
-Shared by the tinker2 canonicalizer and `tinker_designs/contract.py` — one
-implementation, tinker2's literals become its `design.yaml`:
+Implemented once, in `tinker_designs/contract.py`, as a role-driven check.
+The tinker2 canonicalizer in `workspace.py` is a different thing — an
+xArm-specific *canonical form* step (ros2_control munging, `world` link
+insertion, `drive_joint` provider rules) — and stays; its only change is
+that the arm-mount origin literal becomes a `mount_origin` parameter. The
+tinker2 export additionally runs the generic contract with
+`designs/tinker2_ref/design.yaml`, so tinker2 is checked by the same rules
+as every candidate. Rules:
 
 * root link is `base_frame`; every arm's `mount` link is connected to
   `base_frame` by fixed joints only;
