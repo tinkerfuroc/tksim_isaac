@@ -101,8 +101,6 @@ def _footprint(root: ET.Element, design: Design, link_index: dict[str, Link], by
         for origin, geometry in link_index[child].collisions:
             for corner in _primitive_corners(compose(pose, origin), geometry):
                 points.append((corner[0], corner[1]))
-    if not points:
-        raise DeriveError("no primitive collision geometry to derive a footprint from; add `footprint:` to design.yaml")
     hull = convex_hull(points)
     if len(hull) < 3:
         raise DeriveError("derived footprint is degenerate; add `footprint:` to design.yaml")

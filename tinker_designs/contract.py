@@ -30,7 +30,7 @@ def _positive_definite(inertial: Inertial) -> bool:
     return a > 0 and minor2 > 0 and det > 0
 
 
-def _link_origin_in_base(root_map: dict[str, Joint], link: str, base: str, angle_zero: bool = True) -> tuple[float, float, float] | None:
+def _link_origin_in_base(root_map: dict[str, Joint], link: str, base: str) -> tuple[float, float, float] | None:
     """Position of `link`'s frame origin in `base`'s frame at zero joint angles."""
     point = (0.0, 0.0, 0.0)
     current = link

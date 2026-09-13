@@ -297,6 +297,10 @@ source /opt/ros/humble/setup.bash && source $TINKER_WS/install/setup.bash       
 `designs/tinker2_ref` is the current robot as a design and must reproduce the tinker2 artifact URDF
 (`tests/test_design_tinker2_ref.py`). Spec: `docs/superpowers/specs/2026-09-13-tinker-designs-chassis-exploration-design.md`.
 
+A mesh-chassis design (no primitive box/cylinder/sphere collision on `base_frame`) needs a
+`footprint:` override in `design.yaml` -- `--init` cannot infer one from a mesh; the contract then
+checks that polygon is simple (no self-intersecting edges) and contains the robot's CoG.
+
 `config/arena-import.json` carries the pin, the furniture allowlist, a
 `model_skiplist` for benign non-furniture includes, `bounds_check_exceptions`
 for the two models whose upstream SDF deliberately under-sizes the collision

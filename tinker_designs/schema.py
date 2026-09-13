@@ -31,11 +31,6 @@ class Arm:
     damping: float
     estimated: bool
 
-    def claimed_joints(self) -> tuple[str, ...]:
-        if self.gripper is None:
-            return self.joints
-        return self.joints + (self.gripper.drive,) + self.gripper.mimics
-
 
 @dataclass(frozen=True)
 class Wheels:

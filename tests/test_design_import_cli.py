@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from design_fixtures import two_arm_design, two_arm_urdf
 import design_import
-from design_import import EXIT_CONTRACT, EXIT_IMPORT, EXIT_RENDER, ImportResult, main, run_import, write_init
+from design_import import EXIT_CONTRACT, EXIT_RENDER, ImportResult, main, run_import, write_init
 
 
 class StubHooks:
