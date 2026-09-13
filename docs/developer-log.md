@@ -4972,12 +4972,7 @@ delete `_patch_dae_material_ids` once `urdf_usd_converter` ships a version
 > 0.1.3 that gives an unnamed DAE material a name without needing a
 duplicate to trigger it; re-test against
 `realsense2_description/meshes/d435.dae` (tinker2_ref) when that happens.**
-Not re-verified live in review round 1 (no Kit boot performed this round,
-per the review's instruction) -- the change only adds a `None`-only
-backfill using data already available inside the original, previously
-live-proven `store_dae_material_data` call, so it is expected to behave
-identically to the live-tested `store_safe_names`-level patch it replaces,
-but that expectation itself is unverified until the next live run.
+Live re-verified in the final fix round, see the closing paragraph below.
 
 **Defect 3 -- `package://isaac_bringup/meshes/mid_360.stl` does not exist.**
 `tinker2_ref`'s `livox_frame` visual references this mesh; `package_share_
@@ -5048,3 +5043,21 @@ valid default prim. Also: `designs/two_arm_demo/robot.urdf` was a single
 equivalence against `tests/design_fixtures.py::two_arm_urdf()` plus a
 `load_design` two-arm check). 13-file design suite plus the new test file:
 **102 passed, 2 skipped, 3 subtests passed**.
+
+**Final fix round (same day, live re-verification at `8eb6feb`, GPU 0, 27
+s)**: `tinker2_ref` imported clean -- `design_convert: imported
+/tinker_full (27 joints) -> .../robot.usd`, the `urdf_usd_converter.__version__
+== "0.1.3"` guard passed (no "skipped" line, so `_patch_dae_material_ids`
+actually ran, not just imported), no traceback, and no `MaterialCache`/
+`getPrimNames` warning -- confirming Defect 2's fix holds against the real
+`realsense2_description/meshes/d435.dae` mesh with the reverted
+`_default_missing_materials` band-aid gone. `robot.usd` came out at
+1,756,053 bytes (was 1,756,332 bytes before the material-stub revert, a
+-279 byte delta consistent with removing the synthesized placeholder
+material prim), publishing under a new artifact id `16580a5a…`. This
+confirms the `store_dae_material_data` wrap itself (Defect 2's original
+fix) end to end; it does not by itself exercise this round's C1 change
+(also setting `material_data.use_material_id = True` on backfill) -- that
+change is code-reasoned from reading `conversion_collada.py`'s bind-time
+lookup, not from a live run, and remains unverified live until the next
+Kit boot.
