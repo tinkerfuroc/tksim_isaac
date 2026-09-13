@@ -76,6 +76,5 @@ def resolve_mesh_uris(root: ET.Element, *, design_dir: Path, packages: Mapping[s
 
 
 def canonical_bytes(root: ET.Element) -> bytes:
-    xml = ET.tostring(root, encoding="unicode")
-    canonical = ET.canonicalize(xml_data=xml, with_comments=False, strip_text=False)
-    return (canonical.rstrip("\n") + "\n").encode("utf-8")
+    """Byte-identical to the tinker2 canonicalizer's finalisation (one shared helper)."""
+    return finalize_canonical(root)
