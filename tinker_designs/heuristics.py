@@ -48,17 +48,33 @@ def draft_design(root: ET.Element, name: str) -> dict:
     for mount in sorted(chassis):
         if mount == base_frame:
             continue
-        mount_subtree = fixed_subtree(root, mount)
-        revolute_children = [j for j in joint_index.values() if j.type == "revolute" and j.parent in mount_subtree]
+        revolute_children = [j for j in by_parent.get(mount, []) if j.type == "revolute" and j.mimic is None]
         if len(revolute_children) != 1:
             continue
         chain = [revolute_children[0]]
         while True:
-            subtree = fixed_subtree(root, chain[-1].child)
-            nxt = [j for j in joint_index.values() if j.type == "revolute" and j.mimic is None and j.parent in subtree]
-            if len(nxt) != 1:
-                break
-            chain.append(nxt[0])
+            nxt = [j for j in by_parent.get(chain[-1].child, []) if j.type == "revolute" and j.mimic is None]
+            if len(nxt) == 1:
+                chain.append(nxt[0])
+                continue
+            if not nxt:
+                # No direct revolute continuation: look for a gripper reachable through
+                # fixed pass-throughs only (never an unrelated actuated sibling branch).
+                subtree = fixed_subtree(root, chain[-1].child)
+                candidates = [
+                    j
+                    for j in joint_index.values()
+                    if j.type == "revolute"
+                    and j.mimic is None
+                    and j.parent in subtree
+                    and (
+                        any(m.mimic == j.name for m in joint_index.values())
+                        or any(token in j.name for token in ("grip", "finger", "hand"))
+                    )
+                ]
+                if len(candidates) == 1:
+                    chain.append(candidates[0])
+            break
         if len(chain) < 3:
             continue
         # Split the gripper off: the last revolute whose child has a mimic sibling, or the last joint if ≥4 and named like a gripper.
