@@ -88,13 +88,14 @@ def _patch_dae_material_ids() -> None:
     module docstring's removal trigger.
     """
     import urdf_usd_converter
-    from urdf_usd_converter._impl import conversion_collada, material
 
     if getattr(urdf_usd_converter, "__version__", None) != "0.1.3":
         print(f"design_convert: skipped the urdf_usd_converter DAE-material-name patch "
               f"(installed version {getattr(urdf_usd_converter, '__version__', None)!r} != '0.1.3'; "
               f"see tools/design_convert.py's module docstring)", flush=True)
         return
+
+    from urdf_usd_converter._impl import conversion_collada, material
 
     original = material.store_dae_material_data
     if getattr(original, "_design_import_patched", False):

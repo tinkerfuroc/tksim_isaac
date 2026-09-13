@@ -166,18 +166,25 @@ Mirrors `arena_import.py`. Stages, each a pure function with a file in/out:
    / relative `meshes/` paths resolved to `file://` (via `AMENT_PREFIX_PATH`
    share directories). Ported from `render_for_isaac.sh`, whose strip and
    resolve stages likewise only ever fed Isaac.
-2. **contract**: structural check (§5) plus inertia sanity: every link has
-   mass > 0 and a positive-definite inertia tensor; every wheel/caster ground
-   contact is at the same z; the footprint polygon is simple and contains
+2. **contract**: structural check (§5) plus inertia sanity: every link that
+   declares `<inertial>` has mass > 0 and a positive-definite inertia tensor
+   (massless frame links are allowed; the Isaac importer ghosts them, see
+   the developer log); every wheel/caster ground contact is at the same z;
+   the footprint polygon is simple and contains
    the projected CoG. The CoG checked here is the arms-at-zero `cog_base_link`;
    `cog_arms_extended` is not gated at import time -- it feeds M2's
    `tipover_margin_m` tip-over metric instead.
-3. **import**: headless `SimulationApp`, `isaacsim.asset.importer.urdf`
-   `ImportConfig` with `fix_base=False`, `merge_fixed_joints=False`, mimic
-   parsing ON (matches the tinker2 artifact), convex decomposition OFF for
-   primitives, ON for mesh links; export USD. Behind a `ConverterHooks`
-   protocol; a stub hook writes a marker file so everything else tests on
-   system Python.
+3. **import**: headless `SimulationApp`, Isaac Sim 6.0.1's
+   `isaacsim.asset.importer.urdf` `URDFImporter`/`URDFImporterConfig` (the
+   old `_urdf.ImportConfig` binding is removed on this version) with
+   `fix_base=False`, `merge_fixed_joints=False`; the bundled
+   `urdf_usd_converter` 0.1.3 assigns convex-hull approximation to every
+   mesh collider unconditionally (`_impl/geometry.py`), with no config knob
+   for anything else on this importer version; massless fixed-joint "ghost"
+   links (mount/sensor frames with no inertial/visual/collision) are kept as
+   plain `Xform` prims, not `RigidBodyAPI`/`Joint` prims; export USD. Behind
+   a `ConverterHooks` protocol; a stub hook writes a marker file so
+   everything else tests on system Python.
 4. **derive** (`tinker_designs/derive.py`): from the clean URDF + roles
    compute the profile — wheel radius from the driven-wheel cylinder, track
    from the driven-wheel origins, footprint as the convex hull of every
