@@ -671,6 +671,8 @@ def _recover_staging(artifact_root: Path) -> None:
 
 
 _ROBOT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_RESERVED_MANIFEST_EXTRA_KEYS = ("schema_version", "robot", "artifact_id", "files")
+_REQUIRED_ARTIFACT_FILES = ("robot.usd", "robot.urdf")
 
 
 def publish_robot_artifact(
@@ -688,8 +690,14 @@ def publish_robot_artifact(
 ) -> ExportResult:
     if not _ROBOT_NAME.fullmatch(robot):
         raise ArtifactPublicationError(f"invalid robot name: {robot!r}")
+    reserved = [key for key in _RESERVED_MANIFEST_EXTRA_KEYS if key in manifest_extra]
+    if reserved:
+        raise ValueError(f"manifest_extra must not set reserved keys: {reserved}")
     for name in file_bytes:
         _safe_relative(name, "artifact payload name")
+    for required in _REQUIRED_ARTIFACT_FILES:
+        if required not in file_bytes:
+            raise ValueError(f"file_bytes is missing required file: {required}")
     artifacts = _safe_dir(artifacts, "artifacts root", create=True)
     artifact_root = artifacts / "robot" / robot
     _safe_dir(artifact_root, "artifact root", create=True)

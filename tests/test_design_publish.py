@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from tinker_sim_deploy.workspace import (
-    ARTIFACT_FILES, PUBLICATION_SCHEMA, ArtifactPublicationError, UnsafePathError, _normalized_source_lock,
-    artifact_identity, canonicalize_urdf, publish_robot_artifact,
+    PUBLICATION_SCHEMA, ArtifactPublicationError, UnsafePathError, _normalized_source_lock,
+    canonicalize_urdf, publish_robot_artifact,
 )
 
 
@@ -80,10 +80,28 @@ class PublishRobotArtifactTest(unittest.TestCase):
                     source_path="p", source_sha256="0" * 64,
                 )
             self.assertFalse((artifacts / "robot").exists())
-            self.assertEqual(
-                list((artifacts / "robot" / "demo").glob(".artifact-stage-*")) if (artifacts / "robot" / "demo").exists() else [],
-                [],
-            )
+
+    def test_manifest_extra_reserved_key_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary) / "artifacts"
+            lock = _normalized_source_lock([], robot="demo")
+            with self.assertRaisesRegex(ValueError, "schema_version"):
+                publish_robot_artifact(
+                    artifacts, robot="demo", file_bytes={"robot.urdf": b"<robot/>", "robot.usd": b"usd"},
+                    canonical_urdf=b"<robot/>", source_lock_bytes=lock, canonicalizer="c",
+                    manifest_extra={"schema_version": 99}, source_path="p", source_sha256="0" * 64,
+                )
+
+    def test_missing_required_file_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary) / "artifacts"
+            lock = _normalized_source_lock([], robot="demo")
+            with self.assertRaisesRegex(ValueError, "robot.usd"):
+                publish_robot_artifact(
+                    artifacts, robot="demo", file_bytes={"robot.urdf": b"<robot/>"},
+                    canonical_urdf=b"<robot/>", source_lock_bytes=lock, canonicalizer="c",
+                    manifest_extra={}, source_path="p", source_sha256="0" * 64,
+                )
 
     def test_source_lock_carries_robot(self) -> None:
         lock = json.loads(_normalized_source_lock([], robot="demo"))
