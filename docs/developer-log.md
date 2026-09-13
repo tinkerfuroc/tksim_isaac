@@ -4868,13 +4868,51 @@ the main checkout's `artifacts/` stayed untouched by M1):
   kg, track 0.4 m)`.
 
 Both produced a valid `current.json` + non-empty `robot.usd` under their
-artifact directory. `collision_type="Convex Hull"` (the new importer's
-default, equivalent to the old `convex_decomp=False`) reproduces the
-upstream tinker2 convention; whether the chassis primitives and the floor
-plane actually collide correctly is not checked by this task and is
-deferred to M2's live smoke, same as runtime robot selection
-(`TINKER_SIM_ROBOT`) -- M1 only proves the artifact gets produced, not that
-a sim boots on it.
+artifact directory. Whether the chassis primitives and the floor plane
+actually collide correctly is not checked by this task and is deferred to
+M2's live smoke, same as runtime robot selection (`TINKER_SIM_ROBOT`) -- M1
+only proves the artifact gets produced, not that a sim boots on it. Mesh
+collision on tinker2_ref's arm links comes out as a convex hull the same
+way it always has, but **not** because of anything this hook configures:
+`collision_type` (set to `"Convex Hull"` in the first version of this
+config) is read by `URDFImporter` only when `collision_from_visuals=True`
+(`isaacsim/asset/importer/urdf/impl/converter.py` ~line 211), which we
+never set, so that field was dead and has been removed from the config;
+the actual convex-hull outcome is `urdf_usd_converter/_impl/geometry.py`
+hard-coding `UsdPhysics.Tokens.convexHull` for every mesh collider it
+builds, unconditionally, with no config path to anything else on this
+importer version.
+
+**Structural difference (not a defect in our code, but real, and not
+reproducible on this Isaac Sim version): the importer drops most fixed-
+joint "ghost" links regardless of `merge_fixed_joints`.** `tinker2_ref`'s
+source URDF has 47 joints (26 fixed, 21 movable). The tinker2 artifact's
+own `robot.usd` (built by the pre-6.0.1 importer this branch's design
+pipeline is supposed to reproduce) keeps 46 of them: 25 fixed + 21 movable.
+This hook's import of the exact same URDF keeps only 27: 6 fixed + 21
+movable -- 19 fewer fixed joints than the shipped baseline, with
+`merge_fixed_joints=False` set both times. Root cause, read from
+`urdf_usd_converter/_impl/link_hierarchy.py` (`LinkHierarchy.
+_ghost_links_chain`/`_check_remove_rigid_body_flag`) and `_impl/link.py`
+(`convert_link`): any link with no inertial, no visual, and no collision,
+reached only through a chain of fixed joints, is a "ghost link" and the
+importer skips `RigidBodyAPI` for the whole chain -- unconditionally.
+Checked both config surfaces this hook touches (`URDFImporterConfig` in
+`isaacsim.asset.importer.urdf` and `Converter.Params` in
+`urdf_usd_converter._impl.convert`, which only has `layer_structure`,
+`scene`, `comment`, `ros_packages`): neither has a ghost-link,
+rigid-body-retention, or fixed-joint field. There is nothing to flip. The
+19 dropped links are pure massless mount/sensor frames with no geometry;
+they are retained as plain `Xform` prims (no `RigidBodyAPI`, no `Joint`
+prim), so nothing is silently missing from the USD, only the *joint* count
+differs from the old importer's output. **Do not read "matches the tinker2
+artifact" as USD structural parity anywhere in this repo's docs** -- the
+design-pipeline's parity claim is specifically about the *URDF* (byte-
+identical to the tinker2 artifact's source URDF, checked by
+`tests/test_design_tinker2_ref.py`), never about the imported USD's joint
+structure. Whether the missing 19 fixed joints matter to anything (Fabric
+frame lookups, TF, controller reconciliation) is explicitly deferred to
+M2's tinker2-vs-tinker2_ref live smoke, not decided here.
 
 **Defect 1 -- `isaacsim.asset.importer.urdf._urdf.ImportConfig` no longer
 exists.** Task 10's `IsaacHooks` (ported from `tk26_sim/.../
@@ -4885,8 +4923,9 @@ verify_in_isaac.py`) called `omni.kit.commands.execute
 no `ImportConfig` attribute, so the first live boot failed immediately with
 `cannot import name '_urdf'`. Fixed `tools/design_convert.py::IsaacHooks`
 to build `URDFImporterConfig(urdf_path=..., usd_path=..., merge_fixed_joints
-=False, fix_base=False, collision_type="Convex Hull")` and call
-`URDFImporter(config).import_urdf()`; since that call returns a USD file
+=False, fix_base=False)` and call `URDFImporter(config).import_urdf()`
+(an earlier version of this also set `collision_type="Convex Hull"`; removed
+in review round 1 as dead config -- see below); since that call returns a USD file
 path rather than a live stage/prim path, joints and the root prim are now
 read back by opening the returned file (`Usd.Stage.Open`, then
 `stage.GetDefaultPrim()`), and the caller's exact `usd_path` is produced by
@@ -4901,23 +4940,44 @@ mixed into the batch of material names the new, stricter pybind11 signature
 rejects outright. First hypothesis (a `<visual>` on `xarm_camera_link` with
 no `<material>` element at all) was wrong: patching it in did add a named
 material to the list, but the `None` was still there on the next boot --
-falsified, not fixed. Traced the real source by reading
-`urdf_usd_converter/_impl/material.py::store_dae_material_data` (readable
-pip-installed Python, not compiled): a DAE mesh's embedded `<material>`
-always has a Collada `id` but its `name` is optional, and the converter
-only falls back to `id` when duplicate names force disambiguation
-(`use_material_id`) -- a single unnamed embedded material is never given a
-name at all. `realsense2_description/meshes/d435.dae` (referenced by
-`tinker2_ref`) has exactly one such material, so `material_data.name` stays
-`None` and crashes `MaterialCache.store_safe_names` -> `NameCache
-.getPrimNames()`. Worked around with `design_convert.py::
-_patch_none_material_names`, a runtime monkeypatch of `MaterialCache.
-store_safe_names` that synthesizes a name for any `None` entry before the
-real implementation runs (idempotent, applied once per `IsaacHooks.
-import_urdf` call). The unrelated, genuine gap that prompted the false
-first hypothesis (`xarm_camera_link`'s visual has no `<material>` at all)
-is still patched separately and harmlessly (`_default_missing_materials`,
-applied to the transient Isaac-only URDF copy, never the published one).
+falsified, not fixed (and, on review, correctly identified as a band-aid:
+it mutated the Isaac-bound URDF and added a material prim to the published
+asset for no benefit -- **reverted entirely** in review round 1;
+`import_urdf` no longer mutates its input file).
+
+Traced the real source by reading `urdf_usd_converter/_impl/material.py::
+store_dae_material_data` (readable pip-installed Python, not compiled): a
+DAE mesh's embedded `<material>` always has a Collada `id` but its `name`
+is optional, and the converter only falls back to `id` when duplicate
+names force disambiguation (`use_material_id`) -- a single unnamed embedded
+material is never given a name at all (line 362:
+`material_data.name = material.id if use_material_id else material.name`).
+`realsense2_description/meshes/d435.dae` (referenced by `tinker2_ref`) has
+exactly one such material, so `material_data.name` stays `None` and
+crashes `MaterialCache.store_safe_names` -> `NameCache.getPrimNames()`.
+
+Fixed (review round 1) with `design_convert.py::_patch_dae_material_ids`,
+which wraps `store_dae_material_data` at its one call site
+(`conversion_collada.py`) to backfill any `None` name from that same
+material's Collada `.id` -- i.e. do exactly what the converter's own
+`use_material_id` branch already does, for the one case it misses, rather
+than synthesizing an arbitrary placeholder downstream at the crash site
+(the first version of this fix, `_patch_none_material_names`, monkeypatched
+`MaterialCache.store_safe_names` instead and used a synthesized
+`unnamed_material_{index}` name; replaced in review round 1 to match the
+converter's actual intent and move the patch to the true source). Guarded
+on `urdf_usd_converter.__version__ == "0.1.3"` (skips with one log line
+otherwise) since this is someone else's bug, not ours. **Removal trigger:
+delete `_patch_dae_material_ids` once `urdf_usd_converter` ships a version
+> 0.1.3 that gives an unnamed DAE material a name without needing a
+duplicate to trigger it; re-test against
+`realsense2_description/meshes/d435.dae` (tinker2_ref) when that happens.**
+Not re-verified live in review round 1 (no Kit boot performed this round,
+per the review's instruction) -- the change only adds a `None`-only
+backfill using data already available inside the original, previously
+live-proven `store_dae_material_data` call, so it is expected to behave
+identically to the live-tested `store_safe_names`-level patch it replaces,
+but that expectation itself is unverified until the next live run.
 
 **Defect 3 -- `package://isaac_bringup/meshes/mid_360.stl` does not exist.**
 `tinker2_ref`'s `livox_frame` visual references this mesh; `package_share_
@@ -4934,14 +4994,57 @@ committed to the repo or to `tk25_ws`. Follow-up needed outside this task:
 either restore the real `mid_360.stl` to `isaac_bringup`'s meshes or point
 the URDF at wherever the Livox visual mesh actually lives now.
 
+**Two untriaged live-log warnings** (both runs, neither fatal):
+- `Robot name 'robot.isaac' ... contains '.' characters` -- the importer
+  derives the robot name from the transient input filename
+  (`robot.isaac.urdf`, written by `design_import.py::render`), whose stem
+  has a `.` in it. Cosmetic (affects only internal USD prim/file naming
+  inside the importer's scratch dir, not the published artifact); renaming
+  that transient file to avoid the dot is deferred, not required for M1.
+- `Stiffness and damping not available ... actuator will be created
+  without gain parameters` (once per movable joint, both designs) -- comes
+  from `run_multi_physics_conversion=True` (the `URDFImporterConfig`
+  default; the old `_urdf`-API path had no equivalent step), which builds a
+  PhysX actuator per joint without reading URDF `<dynamics>`/drive
+  parameters. Not a regression to fix here: the sim backend's actuator
+  groups set stiffness/damping at runtime independently of whatever the
+  importer wrote, per the existing `effort_limit_sim`/drive-override
+  convention -- confirming that still holds against this importer's output
+  is M2 work, not M1's.
+
 **Tests**: `tests/test_design_import_cli.py` unaffected by the
 `design_convert.py` changes (11 passed both before and after; it only
 checks `IsaacHooks` exists and that `design_convert` imports no Isaac
-module at top level -- both hold). Full suite (`scripts/pytest-clean
-tests/test_design_schema.py tests/test_design_model.py tests/
-test_design_clean.py tests/test_design_contract.py tests/
-test_design_derive.py tests/test_design_heuristics.py tests/
-test_design_publish.py tests/test_design_lock.py tests/
-test_design_import_cli.py tests/test_design_tinker2_ref.py tests/
-test_artifact_export.py tests/test_workspace.py tests/test_provenance.py
-tests/test_current_artifact.py -q`), run without ROS sourced: all green.
+module at top level -- both hold). Ran the 14-file command from the task
+brief (`scripts/pytest-clean tests/test_design_schema.py tests/
+test_design_model.py tests/test_design_clean.py tests/
+test_design_contract.py tests/test_design_derive.py tests/
+test_design_heuristics.py tests/test_design_publish.py tests/
+test_design_lock.py tests/test_design_import_cli.py tests/
+test_design_tinker2_ref.py tests/test_artifact_export.py tests/
+test_workspace.py tests/test_provenance.py tests/test_current_artifact.py
+-q`), without ROS sourced: **19 failed, 144 passed, 4 skipped, 3 subtests
+passed** -- not all green. Every one of the 19 failures is in
+`tests/test_provenance.py` (`Task8OMPLOverlayProvenanceTest`), and every
+traceback is either "Isaac Lab checkout is missing" or `git show
+<pinned-sha>:<path>` failing because this `tk25_ws` checkout's pinned
+commits aren't present locally -- confirmed to fail identically (19) on an
+untouched checkout of this branch's base, so this is a pre-existing
+environmental gap (missing Isaac Lab checkout, stale local pinned-commit
+mirrors), not something this task's changes caused. Re-running the same
+command minus `test_provenance.py` (the actual design-pipeline suite, 13
+files): **100 passed, 2 skipped, 3 subtests passed** -- fully green.
+
+**Review round 1 (same day)**: five Important findings from spec review,
+fixed without a Kit boot (all verifiable by reading the installed
+`isaacsim`/`urdf_usd_converter` source, no GPU needed) -- the ghost-link
+parity fact above, the DAE-material-id fix above, reverting
+`_default_missing_materials` entirely, correcting this Tests paragraph
+(previously and wrongly said "all green"), and `IsaacHooks.import_urdf`
+now raises instead of defaulting to `"/"` when the imported stage has no
+valid default prim. Also: `designs/two_arm_demo/robot.urdf` was a single
+6 KB line with no dedicated test; regenerated pretty-printed
+(`ET.indent`) and added `tests/test_design_two_arm_demo.py` (structural
+equivalence against `tests/design_fixtures.py::two_arm_urdf()` plus a
+`load_design` two-arm check). 13-file design suite plus the new test file:
+**102 passed, 2 skipped, 3 subtests passed**.
