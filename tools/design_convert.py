@@ -2,13 +2,19 @@
 
 Ported from tk26_sim/src/isaac_bringup/scripts/verify_in_isaac.py. Import
 config matches the tinker2 artifact: no merged fixed joints, free base,
-URDF inertia honoured, mimics parsed. Convex decomposition is off for
-primitives (the box/cylinder chassis) — meshes get the importer's default
-convex hull, which is what tinker2's arm links use today.
+URDF inertia honoured, mimic tags are left to the importer's default
+handling. Convex decomposition is off for primitives (the box/cylinder
+chassis) — meshes get the importer's default convex hull, which is what
+tinker2's arm links use today.
 """
 from __future__ import annotations
 
 from pathlib import Path
+
+
+def _under(prim_path: str, candidate: str) -> bool:
+    """True when candidate is prim_path itself or a descendant (segment-aware, not a string prefix)."""
+    return candidate == prim_path or candidate.startswith(prim_path.rstrip("/") + "/")
 
 
 class IsaacHooks:
@@ -34,7 +40,7 @@ class IsaacHooks:
         if not status or not prim_path:
             raise RuntimeError(f"URDFParseAndImportFile returned status={status!r} prim_path={prim_path!r}")
         stage = omni.usd.get_context().get_stage()
-        joints = sum(1 for prim in stage.Traverse() if str(prim.GetPath()).startswith(prim_path) and "Joint" in (prim.GetTypeName() or ""))
+        joints = sum(1 for prim in stage.Traverse() if _under(prim_path, str(prim.GetPath())) and "Joint" in (prim.GetTypeName() or ""))
         if joints == 0:
             raise RuntimeError(f"imported {prim_path} has no joints")
         usd_path.parent.mkdir(parents=True, exist_ok=True)

@@ -154,6 +154,13 @@ class DesignConvertImportTest(unittest.TestCase):
         self.assertTrue(hasattr(design_convert, "IsaacHooks"))
         self.assertEqual(after, before, "design_convert must import Isaac only inside IsaacHooks.import_urdf")
 
+    def test_under_is_segment_aware(self) -> None:
+        import design_convert
+        self.assertTrue(design_convert._under("/World/robot", "/World/robot"))
+        self.assertTrue(design_convert._under("/World/robot", "/World/robot/joints/j1"))
+        self.assertFalse(design_convert._under("/World/robot", "/World/robot2/joints/j1"))
+        self.assertFalse(design_convert._under("/World/robot", "/World"))
+
 
 if __name__ == "__main__":
     unittest.main()
