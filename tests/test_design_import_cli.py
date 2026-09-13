@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -188,6 +189,22 @@ class RunImportTest(unittest.TestCase):
             self.assertEqual(code, EXIT_RENDER)
             self.assertNotIn("Traceback", out.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
+
+    def test_init_emits_a_todo_comment_for_a_caster_swivel_without_a_wheel(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            design_dir = Path(temporary) / "two_arm_fixture"
+            design_dir.mkdir()
+            root = ET.fromstring(two_arm_urdf())
+            for element in root.findall("joint"):
+                if element.get("name") == "rear_left_wheel_joint":
+                    element.set("type", "fixed")
+            (design_dir / "robot.urdf").write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
+            path = write_init(design_dir, "two_arm_fixture")
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("# TODO: no wheel joint found under rear_left_swivel_joint", text)
+            self.assertNotIn('""', text)
+            raw = yaml.safe_load(text)
+            self.assertNotIn("caster_wheel_todo", raw)
 
     def test_malformed_package_root_is_a_usage_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

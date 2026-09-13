@@ -169,6 +169,17 @@ class HeuristicsTest(unittest.TestCase):
         violations = check_contract(root, design)
         self.assertTrue(any("wrist_cam_tilt_joint" in item and "unclaimed" in item for item in violations), violations)
 
+    def test_caster_swivel_without_a_wheel_is_omitted_not_emitted_as_empty_string(self) -> None:
+        root = parse_urdf(two_arm_urdf())
+        for element in root.findall("joint"):
+            if element.get("name") == "rear_left_wheel_joint":
+                element.set("type", "fixed")
+        draft = draft_design(root, "two_arm_fixture")
+        self.assertNotIn("", draft["wheels"]["caster_wheel"])
+        self.assertEqual(draft["wheels"]["caster_swivel"], ["rear_right_swivel_joint"])
+        self.assertEqual(draft["wheels"]["caster_wheel"], ["rear_right_wheel_joint"])
+        self.assertEqual(draft["caster_wheel_todo"], ["rear_left_swivel_joint"])
+
     def test_arm_name_strips_suffixes(self) -> None:
         self.assertEqual(_arm_name("link_base"), "arm")
         self.assertEqual(_arm_name("arm_base"), "arm")

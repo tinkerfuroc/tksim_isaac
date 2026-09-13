@@ -37,12 +37,20 @@ def draft_design(root: ET.Element, name: str) -> dict:
         (j.name for j in joint_index.values() if j.type == "continuous" and _axis_is(j, 1) and j.parent in chassis),
         key=lambda n: (0 if "front" in n else 1, n),
     )[:2]
-    swivels = sorted(j.name for j in joint_index.values() if j.type == "continuous" and _axis_is(j, 2) and j.parent in chassis)
+    all_swivels = sorted(j.name for j in joint_index.values() if j.type == "continuous" and _axis_is(j, 2) and j.parent in chassis)
+    swivels = []
     caster_wheels = []
-    for swivel_name in swivels:
+    caster_wheel_todo: list[str] = []
+    for swivel_name in all_swivels:
         child = joint_index[swivel_name].child
         wheel = next((j.name for j in by_parent.get(child, []) if j.type == "continuous" and _axis_is(j, 1)), None)
-        caster_wheels.append(wheel or "")
+        if wheel is None:
+            # Never emit caster_wheel: "" -- omit the pair and flag it for the human
+            # editing this draft instead (see design_import.py::write_init).
+            caster_wheel_todo.append(swivel_name)
+            continue
+        swivels.append(swivel_name)
+        caster_wheels.append(wheel)
 
     arms = []
     for mount in sorted(chassis):
@@ -100,7 +108,7 @@ def draft_design(root: ET.Element, name: str) -> dict:
             sensors.append({"type": "livox_mid360", "frame": link_name})
         elif link_name == "head_camera_link":
             sensors.append({"type": "head_camera", "frame": link_name})
-    return {
+    draft = {
         "name": name,
         "kinematics": "diff_drive",
         "base_frame": base_frame,
@@ -109,3 +117,8 @@ def draft_design(root: ET.Element, name: str) -> dict:
         "pan_tilt": pan_tilt,
         "sensors": sensors,
     }
+    if caster_wheel_todo:
+        # Not a design.yaml field -- design_import.py::write_init pops this and turns it
+        # into a "# TODO" comment in the emitted YAML text instead.
+        draft["caster_wheel_todo"] = caster_wheel_todo
+    return draft

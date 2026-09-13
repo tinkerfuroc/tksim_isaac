@@ -181,7 +181,12 @@ def write_init(design_dir: Path, name: str) -> Path:
         raise DesignError(f"{design_dir} has no robot.urdf or robot.urdf.xacro")
     data = expand_xacro(source) if source.suffix == ".xacro" else source.read_bytes()
     draft = draft_design(parse_urdf(data), name)
-    target.write_text(yaml.safe_dump(draft, sort_keys=False), encoding="utf-8")
+    caster_wheel_todo = draft.pop("caster_wheel_todo", [])
+    text = yaml.safe_dump(draft, sort_keys=False)
+    if caster_wheel_todo:
+        comments = "".join(f"# TODO: no wheel joint found under {swivel}\n" for swivel in caster_wheel_todo)
+        text = comments + text
+    target.write_text(text, encoding="utf-8")
     return target
 
 
