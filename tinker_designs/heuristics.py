@@ -13,10 +13,12 @@ def _axis_is(joint: Joint, index: int) -> bool:
 
 
 def _arm_name(mount: str) -> str:
-    for suffix in ("_arm_base_link", "_arm_base", "_base_link", "_base", "link_base"):
-        if mount.endswith(suffix) and mount != suffix:
+    if mount in ("link_base", "arm_base", "base"):
+        return "arm"
+    for suffix in ("_arm_base_link", "_arm_base", "_base_link", "_base"):
+        if mount.endswith(suffix) and len(mount) > len(suffix):
             return mount[: -len(suffix)]
-    return "arm" if mount in ("link_base", "arm_base") else mount
+    return mount
 
 
 def draft_design(root: ET.Element, name: str) -> dict:
@@ -46,12 +48,14 @@ def draft_design(root: ET.Element, name: str) -> dict:
     for mount in sorted(chassis):
         if mount == base_frame:
             continue
-        revolute_children = [j for j in by_parent.get(mount, []) if j.type == "revolute"]
+        mount_subtree = fixed_subtree(root, mount)
+        revolute_children = [j for j in joint_index.values() if j.type == "revolute" and j.parent in mount_subtree]
         if len(revolute_children) != 1:
             continue
         chain = [revolute_children[0]]
         while True:
-            nxt = [j for j in by_parent.get(chain[-1].child, []) if j.type == "revolute" and j.mimic is None]
+            subtree = fixed_subtree(root, chain[-1].child)
+            nxt = [j for j in joint_index.values() if j.type == "revolute" and j.mimic is None and j.parent in subtree]
             if len(nxt) != 1:
                 break
             chain.append(nxt[0])
