@@ -4840,3 +4840,108 @@ baseline + 3 new).
 vendored `isaacsim.ros2.sim_control` extension's `/get_entity_state` handler
 -- an out-of-tree call site this repo does not own and has no fix point
 for; left open.
+
+## 2026-09-13 — M1 candidate-design pipeline: first live Isaac import, two real importer defects found and fixed
+
+Tasks 1-11 built the candidate-design pipeline (`designs/<name>/{robot.urdf,
+design.yaml}` -> `tools/design_import.py` -> `render` (canonicalize, strip
+`<gazebo>`, resolve `package://`) -> contract check -> profile derive ->
+Isaac URDF->USD -> `artifacts/robot/<name>/`) against a stub converter, 67
+tests green, no GPU touched. Task 12 ran it live for the first time: two
+Kit boots, `designs/tinker2_ref` (the current tinker2 robot re-expressed as
+a design -- the pipeline's parity gate) and a new `designs/two_arm_demo`
+fixture (the diff-drive/two-arm/pan-tilt primitive robot `tests/
+design_fixtures.py` already used for every unit test, materialized to disk
+as the first non-xArm candidate).
+
+**Live results** (`.venv` Isaac Sim 6.0.1, `CUDA_VISIBLE_DEVICES=1`, GPU
+otherwise idle, artifacts published to a scratch dir outside the repo so
+the main checkout's `artifacts/` stayed untouched by M1):
+
+- `tinker2_ref`: `design_convert: imported /tinker_full (27 joints) ->
+  .../robot.usd`, `robot.usd` 1,756,332 bytes, wall time ~28s (Kit boot
+  ~15s of it). `--no-import` alone reproduces the tinker2 artifact URDF
+  parity check (`tests/test_design_tinker2_ref.py`).
+- `two_arm_demo`: `design_convert: imported /two_arm_fixture (19 joints) ->
+  .../robot.usd`, `robot.usd` 8,010 bytes, wall time ~22s. `--no-import`
+  prints `design_import: two_arm_demo passes render + contract (mass 32.05
+  kg, track 0.4 m)`.
+
+Both produced a valid `current.json` + non-empty `robot.usd` under their
+artifact directory. `collision_type="Convex Hull"` (the new importer's
+default, equivalent to the old `convex_decomp=False`) reproduces the
+upstream tinker2 convention; whether the chassis primitives and the floor
+plane actually collide correctly is not checked by this task and is
+deferred to M2's live smoke, same as runtime robot selection
+(`TINKER_SIM_ROBOT`) -- M1 only proves the artifact gets produced, not that
+a sim boots on it.
+
+**Defect 1 -- `isaacsim.asset.importer.urdf._urdf.ImportConfig` no longer
+exists.** Task 10's `IsaacHooks` (ported from `tk26_sim/.../
+verify_in_isaac.py`) called `omni.kit.commands.execute
+("URDFParseAndImportFile", import_config=_urdf.ImportConfig())`. Isaac Sim
+6.0.1 replaced that whole path with a native Python `URDFImporter`/
+`URDFImporterConfig` API; `_urdf` survives only as a deprecated shim with
+no `ImportConfig` attribute, so the first live boot failed immediately with
+`cannot import name '_urdf'`. Fixed `tools/design_convert.py::IsaacHooks`
+to build `URDFImporterConfig(urdf_path=..., usd_path=..., merge_fixed_joints
+=False, fix_base=False, collision_type="Convex Hull")` and call
+`URDFImporter(config).import_urdf()`; since that call returns a USD file
+path rather than a live stage/prim path, joints and the root prim are now
+read back by opening the returned file (`Usd.Stage.Open`, then
+`stage.GetDefaultPrim()`), and the caller's exact `usd_path` is produced by
+exporting that opened stage, matching the old `stage.Export()` step.
+
+**Defect 2 -- upstream `urdf_usd_converter` 0.1.3 (Isaac Sim 6.0.1's
+bundled pip package, not our code) crashes on one specific mesh shape.**
+Second boot got past import and failed inside material handling:
+`getPrimNames(): incompatible function arguments ... Invoked with: ...
+Usd.Prim(</Materials>), [None, 'black', 'blue', ...]` -- a bare `None`
+mixed into the batch of material names the new, stricter pybind11 signature
+rejects outright. First hypothesis (a `<visual>` on `xarm_camera_link` with
+no `<material>` element at all) was wrong: patching it in did add a named
+material to the list, but the `None` was still there on the next boot --
+falsified, not fixed. Traced the real source by reading
+`urdf_usd_converter/_impl/material.py::store_dae_material_data` (readable
+pip-installed Python, not compiled): a DAE mesh's embedded `<material>`
+always has a Collada `id` but its `name` is optional, and the converter
+only falls back to `id` when duplicate names force disambiguation
+(`use_material_id`) -- a single unnamed embedded material is never given a
+name at all. `realsense2_description/meshes/d435.dae` (referenced by
+`tinker2_ref`) has exactly one such material, so `material_data.name` stays
+`None` and crashes `MaterialCache.store_safe_names` -> `NameCache
+.getPrimNames()`. Worked around with `design_convert.py::
+_patch_none_material_names`, a runtime monkeypatch of `MaterialCache.
+store_safe_names` that synthesizes a name for any `None` entry before the
+real implementation runs (idempotent, applied once per `IsaacHooks.
+import_urdf` call). The unrelated, genuine gap that prompted the false
+first hypothesis (`xarm_camera_link`'s visual has no `<material>` at all)
+is still patched separately and harmlessly (`_default_missing_materials`,
+applied to the transient Isaac-only URDF copy, never the published one).
+
+**Defect 3 -- `package://isaac_bringup/meshes/mid_360.stl` does not exist.**
+`tinker2_ref`'s `livox_frame` visual references this mesh; `package_share_
+dirs()` resolved `isaac_bringup`'s share directory correctly (`/home/
+tinker/tk25_ws/install/isaac_bringup/share/isaac_bringup`), so **this is
+not a `package_share_dirs` defect** -- the file itself is missing from
+`tk25_ws` (confirmed: absent from the install tree, the `tk26_sim` source
+tree, and its git history; also absent from the whole `tinker-sim` repo and
+the Isaac Sim install). The mesh is visual-only (`livox_frame`'s collision
+is already a box primitive), so this is cosmetic, not a physics gap. Worked
+around live with `--package-root isaac_bringup=<scratch dir with a
+placeholder mid_360.stl>` -- a job-scratch-only substitution, nothing
+committed to the repo or to `tk25_ws`. Follow-up needed outside this task:
+either restore the real `mid_360.stl` to `isaac_bringup`'s meshes or point
+the URDF at wherever the Livox visual mesh actually lives now.
+
+**Tests**: `tests/test_design_import_cli.py` unaffected by the
+`design_convert.py` changes (11 passed both before and after; it only
+checks `IsaacHooks` exists and that `design_convert` imports no Isaac
+module at top level -- both hold). Full suite (`scripts/pytest-clean
+tests/test_design_schema.py tests/test_design_model.py tests/
+test_design_clean.py tests/test_design_contract.py tests/
+test_design_derive.py tests/test_design_heuristics.py tests/
+test_design_publish.py tests/test_design_lock.py tests/
+test_design_import_cli.py tests/test_design_tinker2_ref.py tests/
+test_artifact_export.py tests/test_workspace.py tests/test_provenance.py
+tests/test_current_artifact.py -q`), run without ROS sourced: all green.

@@ -282,6 +282,21 @@ export ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES  # only after TINKER_ACCEPT_OMNIVE
 ./.venv/bin/python tools/ycb_import.py --config config/ycb-import.json
 ```
 
+### Candidate robot designs
+
+Design a robot in URDF Studio (or any tool), export it to `designs/<name>/robot.urdf`,
+draft the role sidecar, iterate without Isaac, then import:
+
+```bash
+./.venv/bin/python tools/design_import.py --design designs/<name> --init        # writes design.yaml
+./.venv/bin/python tools/design_import.py --design designs/<name> --no-import   # render + contract + derive (seconds)
+source /opt/ros/humble/setup.bash && source $TINKER_WS/install/setup.bash        # only if the URDF uses package://
+./.venv/bin/python tools/design_import.py --design designs/<name>               # Isaac URDF->USD, publishes artifacts/robot/<name>/
+```
+
+`designs/tinker2_ref` is the current robot as a design and must reproduce the tinker2 artifact URDF
+(`tests/test_design_tinker2_ref.py`). Spec: `docs/superpowers/specs/2026-09-13-tinker-designs-chassis-exploration-design.md`.
+
 `config/arena-import.json` carries the pin, the furniture allowlist, a
 `model_skiplist` for benign non-furniture includes, `bounds_check_exceptions`
 for the two models whose upstream SDF deliberately under-sizes the collision
