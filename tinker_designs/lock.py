@@ -1,11 +1,16 @@
-"""Source lock for a design: every file under designs/<name>/ plus resolved upstream inputs."""
+"""Source lock for a design: every file under designs/<name>/ plus resolved upstream inputs.
+
+`_label` records an upstream file outside `repo_root` (e.g. a `package://`-resolved mesh) by
+its absolute path -- these design source-locks are record-only provenance, never validated by
+`tinker_sim_deploy.workspace._validate_lock_records` (which rejects absolute paths; it only
+validates the tinker2 export's source lock)."""
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
 from pathlib import Path
 
-from tinker_sim_deploy.workspace import UnsafePathError, _normalized_source_lock
+from tinker_sim_deploy.workspace import UnsafePathError, normalized_source_lock
 
 
 def _record(path: Path, label: str) -> dict[str, object]:
@@ -45,4 +50,4 @@ def design_records(design_dir: Path, repo_root: Path, extra_files: Sequence[Path
 
 
 def design_source_lock(design_dir: Path, repo_root: Path, extra_files: Sequence[Path]) -> bytes:
-    return _normalized_source_lock(design_records(design_dir, repo_root, extra_files), robot=Path(design_dir).name)
+    return normalized_source_lock(design_records(design_dir, repo_root, extra_files), robot=Path(design_dir).name)

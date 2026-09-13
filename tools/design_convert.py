@@ -102,12 +102,16 @@ def _patch_dae_material_ids() -> None:
         return
 
     def _patched(mesh_file_path, _collada, data):
+        # Without also setting use_material_id, the backfilled name never reaches the
+        # bind-time lookup (conversion_collada.py:128 -> material.name), so the mesh's
+        # material would still be silently left unbound.
         before = len(data.material_data_list)
         original(mesh_file_path, _collada, data)
         appended = data.material_data_list[before:]
         for material_data, dae_material in zip(appended, _collada.materials):
             if material_data.name is None:
                 material_data.name = dae_material.id
+                material_data.use_material_id = True
 
     _patched._design_import_patched = True
     material.store_dae_material_data = _patched

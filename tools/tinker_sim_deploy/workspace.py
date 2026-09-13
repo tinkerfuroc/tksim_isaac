@@ -231,7 +231,7 @@ def _validate_lock_records(raw: object) -> list[dict[str, object]]:
     return records
 
 
-def _normalized_source_lock(records: list[dict[str, object]], *, robot: str = "tinker2") -> bytes:
+def normalized_source_lock(records: list[dict[str, object]], *, robot: str = "tinker2") -> bytes:
     payload = {
         "schema_version": SOURCE_LOCK_SCHEMA,
         "robot": robot,
@@ -239,6 +239,9 @@ def _normalized_source_lock(records: list[dict[str, object]], *, robot: str = "t
         "files": records,
     }
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+_normalized_source_lock = normalized_source_lock
 
 
 def _validate_source_lock(raw: object, expected_records: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
@@ -574,6 +577,13 @@ def _validate_canonical_root(root: ET.Element, mount_origin: tuple[float, float,
         raise CanonicalizationError("canonical URDF graph contains disconnected links")
 
 
+def finalize_canonical(root: ET.Element) -> bytes:
+    """Canonical XML serialization shared by every canonicalizer (tinker2's and design_import's)."""
+    xml = ET.tostring(root, encoding="unicode")
+    canonical = ET.canonicalize(xml_data=xml, with_comments=False, strip_text=False)
+    return (canonical.rstrip("\n") + "\n").encode("utf-8")
+
+
 def canonicalize_urdf(data: bytes, *, mount_origin: tuple[float, float, float] = _ARM_MOUNT_ORIGIN) -> bytes:
     root = _parse_urdf(data)
     for control in root.findall("ros2_control"):
@@ -584,9 +594,7 @@ def canonicalize_urdf(data: bytes, *, mount_origin: tuple[float, float, float] =
     _ensure_mount_topology(root, mount_origin)
     _ensure_drive_control(root)
     _validate_canonical_root(root, mount_origin)
-    xml = ET.tostring(root, encoding="unicode")
-    canonical = ET.canonicalize(xml_data=xml, with_comments=False, strip_text=False)
-    return (canonical.rstrip("\n") + "\n").encode("utf-8")
+    return finalize_canonical(root)
 
 
 def validate_canonical_urdf(data: bytes) -> None:

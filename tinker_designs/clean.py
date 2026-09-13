@@ -12,6 +12,8 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+from tinker_sim_deploy.workspace import finalize_canonical
+
 
 class CleanError(RuntimeError):
     """A render/clean stage failed; the message lists every problem found."""
