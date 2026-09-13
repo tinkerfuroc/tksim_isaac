@@ -680,11 +680,11 @@ def publish_robot_artifact(
 ) -> ExportResult:
     if not _ROBOT_NAME.fullmatch(robot):
         raise ArtifactPublicationError(f"invalid robot name: {robot!r}")
+    for name in file_bytes:
+        _safe_relative(name, "artifact payload name")
     artifacts = _safe_dir(artifacts, "artifacts root", create=True)
     artifact_root = artifacts / "robot" / robot
     _safe_dir(artifact_root, "artifact root", create=True)
-    for name in file_bytes:
-        _safe_relative(name, "artifact payload name")
 
     def _publish_locked() -> ExportResult:
         payload_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in file_bytes.items()}

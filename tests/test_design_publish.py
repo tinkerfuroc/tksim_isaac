@@ -69,6 +69,22 @@ class PublishRobotArtifactTest(unittest.TestCase):
                     source_path="p", source_sha256="0" * 64,
                 )
 
+    def test_absolute_file_key_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary) / "artifacts"
+            lock = _normalized_source_lock([], robot="demo")
+            with self.assertRaises(UnsafePathError):
+                publish_robot_artifact(
+                    artifacts, robot="demo", file_bytes={"/etc/passwd": b"x", "robot.urdf": b"<robot/>"},
+                    canonical_urdf=b"<robot/>", source_lock_bytes=lock, canonicalizer="c", manifest_extra={},
+                    source_path="p", source_sha256="0" * 64,
+                )
+            self.assertFalse((artifacts / "robot").exists())
+            self.assertEqual(
+                list((artifacts / "robot" / "demo").glob(".artifact-stage-*")) if (artifacts / "robot" / "demo").exists() else [],
+                [],
+            )
+
     def test_source_lock_carries_robot(self) -> None:
         lock = json.loads(_normalized_source_lock([], robot="demo"))
         self.assertEqual(lock["robot"], "demo")
