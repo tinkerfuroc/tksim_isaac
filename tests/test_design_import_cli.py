@@ -79,6 +79,23 @@ class RunImportTest(unittest.TestCase):
             self.assertEqual(hooks.calls, [])
             self.assertAlmostEqual(result.profile["mass_kg"], 32.05)
 
+    def test_published_urdf_keeps_gazebo_but_isaac_copy_does_not(self) -> None:
+        class RecordingStubHooks(StubHooks):
+            def import_urdf(self, urdf_path: Path, usd_path: Path) -> None:
+                self.isaac_bytes = urdf_path.read_bytes()
+                super().import_urdf(urdf_path, usd_path)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            urdf = two_arm_urdf().replace(
+                b"</robot>", b'<gazebo reference="base_link"><material>x</material></gazebo></robot>'
+            )
+            design_dir = _make_design(repo, urdf=urdf)
+            hooks = RecordingStubHooks()
+            result = run_import(design_dir, repo, hooks, packages={})
+            self.assertIn(b"<gazebo", (result.artifact_dir / "robot.urdf").read_bytes())
+            self.assertNotIn(b"<gazebo", hooks.isaac_bytes)
+
     def test_contract_failure_exits_3_listing_all_violations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)

@@ -71,19 +71,25 @@ class ImportResult:
 
 def render(design_dir: Path, design: Design, *, packages: Mapping[str, Path], work_dir: Path,
            resolve: bool = True, xacro_runner=subprocess.run) -> tuple[ET.Element, Path | None, list[Path]]:
-    """Clean the source into (canonical root with package:// intact, Isaac input path, resolved upstream files).
+    """Clean the source into (canonical root, Isaac input path, resolved upstream files).
 
-    With ``resolve=False`` (the --no-import loop) no mesh URI is touched, so the
-    fast loop never needs a sourced ROS environment; the Isaac path is None.
+    The published URDF is the source canonicalised as-is (gazebo blocks and
+    package:// intact, like the tinker2 artifact); the Isaac copy is
+    gazebo-stripped and file://-resolved. ``<gazebo>`` stripping and
+    ``package://`` resolution are both Isaac-importer concerns, applied only
+    to the transient ``robot.isaac.urdf``. With ``resolve=False`` (the
+    --no-import loop) no mesh URI is touched and no gazebo block is stripped,
+    so the fast loop never needs a sourced ROS environment; the Isaac path is
+    None.
     """
     source = design_dir / design.source
     data = expand_xacro(source, runner=xacro_runner) if source.suffix == ".xacro" else source.read_bytes()
     root = parse_urdf(data)
-    strip_gazebo(root)
     canonical_root = ET.fromstring(canonical_bytes(root))
     if not resolve:
         return canonical_root, None, []
     isaac_root = ET.fromstring(canonical_bytes(root))
+    strip_gazebo(isaac_root)
     resolved = resolve_mesh_uris(isaac_root, design_dir=design_dir, packages=packages)
     isaac_path = work_dir / "robot.isaac.urdf"
     isaac_path.write_bytes(ET.tostring(isaac_root, encoding="utf-8", xml_declaration=True))
