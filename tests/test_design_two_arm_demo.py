@@ -51,6 +51,11 @@ class TwoArmDemoDesignTest(unittest.TestCase):
         self.assertEqual(len(design.arms), 2)
         self.assertEqual({arm.name for arm in design.arms}, {"left", "right"})
 
+    def test_both_arms_are_flagged_estimated(self) -> None:
+        """Both arms are sketched primitives (spec §3A), so estimated: true on each."""
+        design = load_design(DESIGN)
+        self.assertTrue(all(arm.estimated for arm in design.arms), [(arm.name, arm.estimated) for arm in design.arms])
+
 
 if __name__ == "__main__":
     unittest.main()

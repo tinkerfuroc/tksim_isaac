@@ -25,6 +25,7 @@ arms:
   drive:
     stiffness: 400.0
     damping: 40.0
+  estimated: true
 - name: right
   mount: right_arm_base
   joints:
@@ -35,6 +36,7 @@ arms:
   drive:
     stiffness: 400.0
     damping: 40.0
+  estimated: true
 pan_tilt:
   joints:
   - pan_joint
