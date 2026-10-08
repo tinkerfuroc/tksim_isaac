@@ -146,3 +146,33 @@ backend property. Native07's failed attempt is preserved; this fix still
 requires a new live reset.
 Follow-up CPU verification passed 182 runtime tests plus 7 subtests and 26
 scoped-reset tests. No simulator was launched for those checks.
+
+## Live GPSR composite, 2026-10-08
+
+These are the first live STATE (scope 2) resets on the full GPSR composite:
+sim, bridge with Nav2, vision and mock manipulation, on GPU 0 with
+`ROS_DOMAIN_ID=215`. They ran with the uncommitted working-tree changes
+that release the referee hold before a restore.
+
+- **Probe, stack `gpsr_stack_logs/20261008T094508`.**
+  - All 3 direct `/reset_simulation {scope: 2}` calls returned RESULT_OK in
+    6.5–11.5 s.
+  - Each started from a base Nav2 had driven to about (−0.9, −2.8). Each
+    restored the base to (−2.00004, −2.00000) with yaw about 0. That is the
+    stack-up baseline, which equals the scenario spawn pose.
+  - `/clock` kept advancing, and the safety stop released after each reset
+    (2.4–3.0 s stop window).
+  - The arm controller came back active.
+  - After an `/initialpose` re-seed, AMCL applied the pose and sat
+    0.10–0.12 m from truth. That is the sim's normal AMCL error with the
+    front-only scan.
+  - One Nav2 goal was dropped by a DDS race on a newly created client
+    (`Failed to send goal response (timeout)`). The same race also occurs
+    without any reset.
+- **Battery, `tk25_decision/.../gpsr_runs/bench/t2-five-diverse-reset-20261008`.**
+  - Five tier-2 trials, each preceded by `scripts/gpsr-run-reset`.
+  - All 5 resets succeeded. Pre-reset poses were up to 5.3 m from spawn,
+    e.g. (1.31, −2.36) and (−2.84, 3.33).
+  - Every trial started at (−2.0002, −2.0000, −0.08°), a spread of 0.000 m /
+    0.00°, with AMCL within 6 mm of truth.
+  - No reset ERRORs.

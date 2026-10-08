@@ -564,6 +564,43 @@ To drive a single command instead of the interactive REPL, also export
 `BT_GPSR_CMD="<command text>"` and `BT_GPSR_NUM_COMMANDS=1` before the
 `ros2 run` above.
 
+### Per-trial reset (`scripts/gpsr-run-reset`)
+
+Tier-2 batteries pass `--reset-cmd scripts/gpsr-run-reset`, which runs
+`tools/gpsr_run_reset.py` before every trial. In order, it:
+
+1. Cancels every goal on every action server on the graph. That includes
+   `/navigate_to_pose`, `/go_to_approach`, the arm and gripper actions and
+   the arm_api servers. A TIMEOUT-killed orchestrator otherwise leaves its
+   last goal driving the robot. Lost cancels are re-sent. A goal that
+   ignores its cancel (arm_api `start_grasp`) fails the reset *before* the
+   sim is touched.
+2. Waits for the base to stop.
+3. Calls `/reset_simulation` with scope 2 (STATE). The sim writes the
+   robot root pose, the joints and every free body back to their stack-up
+   state through the live PhysX views (`docs/native-scoped-reset.md`).
+4. Checks the base against `/sim/truth/robot_state`, re-seeds AMCL there,
+   and clears both costmaps. Wheel odometry does not jump, so only
+   `map→odom` moves.
+5. Zeroes the arm and re-homes pan/tilt, settles 9 s, and checks the
+   settled pose against the first reset of the same stack. The tolerance
+   is 0.05 m / 2°.
+
+Each success appends one JSON line to `$GPSR_RESET_RECORD` (default
+`gpsr_stack_logs/run-reset.jsonl`). Point it at the batch dir and check the
+batch with
+`python3 tools/gpsr_run_reset.py --summarize <batch>/run-reset.jsonl`.
+Failures exit 1 with the reason on stderr, which tier2 puts in the trial's
+ERROR detail.
+
+If the error says **"reset stop remains asserted"**, the sim is paused
+with its reset stop held, and every later reset will fail too. Restart
+the stack (`scripts/gpsr-stack down`, then `up`).
+
+`IdleReset` requires publishers on both the arm and the gripper action
+status topics. A stack without the gripper action server therefore cannot
+reset (`missing action publishers=[...]`); it is not skipped.
+
 ---
 
 ## Teardown discipline (verbatim)
