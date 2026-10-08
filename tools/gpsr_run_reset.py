@@ -303,7 +303,6 @@ class RosResetClient:
         from rclpy.node import Node
         from rclpy.parameter import Parameter
         from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-        from std_msgs.msg import String
         from tinker_sim_interfaces.msg import RobotTruth
 
         self._rclpy = rclpy
@@ -319,8 +318,6 @@ class RosResetClient:
         self._cancel_clients: dict[str, object] = {}
         for action in NAV_ACTIONS + ARM_ACTIONS:
             self._watch(action)
-        self._session: Optional[str] = None
-        self.node.create_subscription(String, "/sim/status/isaac", self._on_status, 10)
         self._truth = None
         self._truth_count = 0
         self.node.create_subscription(RobotTruth, "/sim/truth/robot_state", self._on_truth, 10)
@@ -352,14 +349,6 @@ class RosResetClient:
         self._cancel_clients[action] = self.node.create_client(
             CancelGoal, f"{action}/_action/cancel_goal")
 
-    def _on_status(self, message) -> None:
-        try:
-            since = json.loads(message.data).get("services_ready_since")
-        except (ValueError, AttributeError):
-            return
-        if since is not None:
-            self._session = str(since)
-
     def list_actions(self) -> list[str]:
         suffix = "/_action/status"
         names = sorted(name[: -len(suffix)] for name, _ in self.node.get_topic_names_and_types()
@@ -372,10 +361,15 @@ class RosResetClient:
         return names
 
     def stack_session(self) -> Optional[str]:
-        """The sim's services-ready time: one value per stack bring-up."""
-        if not self._spin_until(lambda: self._session is not None, 5.0):
-            _log("/sim/status/isaac: no services_ready_since; trial-start reference check skipped")
-        return self._session
+        """The sim gateway's /sim/status/isaac publisher GID: unique per sim
+        process, so one value per stack bring-up. (services_ready_since is
+        sim time and reads 0.0 on every stack.)"""
+        topic = "/sim/status/isaac"
+        if not self._spin_until(lambda: self.node.get_publishers_info_by_topic(topic), 5.0):
+            _log(f"{topic}: no publisher; trial-start reference check skipped")
+            return None
+        info = self.node.get_publishers_info_by_topic(topic)[0]
+        return bytes(info.endpoint_gid).hex()
 
     def _on_truth(self, message) -> None:
         self._truth = message
