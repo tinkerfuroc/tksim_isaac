@@ -28,27 +28,46 @@ TRUE_SPAWN = Pose2D(-1.93, -2.00, math.radians(-1.3))
 
 
 class FakeClient:
-    def __init__(self, *, truth=TRUE_SPAWN, active=None, moving_polls=0,
+    def __init__(self, *, truth=TRUE_SPAWN, truths=None, active=None, moving_polls=0,
                  reset_result=(True, ""), amcl=None, amcl_times_out=False,
-                 servers=None):
+                 servers=None, discovered=(), rejects=(), slow_cancel=(),
+                 session="stack-1"):
         self.calls = []
         self.t = 0.0
-        self._truth = truth
+        # truth_pose() returns these in turn (before, after reset, after
+        # settle); the last one repeats.
+        self._truths = list(truths) if truths is not None else [truth]
         self._active = dict(active or {})
         self._moving_polls = moving_polls
         self._reset_result = reset_result
-        self._amcl = truth if amcl is None else amcl
+        self._amcl = self._truths[-1] if amcl is None else amcl
         self._amcl_times_out = amcl_times_out
-        self._servers = set(NAV_ACTIONS + ARM_ACTIONS) if servers is None else set(servers)
+        self._discovered = list(discovered)
+        self._servers = (set(NAV_ACTIONS + ARM_ACTIONS) | set(discovered)
+                         if servers is None else set(servers))
+        # Acknowledges the cancel but keeps executing (arm_api start_grasp).
+        self._rejects = set(rejects)
+        # The first cancel is lost (discovery race); a resend lands.
+        self._slow_cancel = set(slow_cancel)
+        self._session = session
 
     def names(self):
         return [call[0] for call in self.calls]
+
+    def list_actions(self):
+        return list(self._discovered)
+
+    def stack_session(self):
+        return self._session
 
     def cancel_all_goals(self, action):
         self.calls.append(("cancel", action))
         if action not in self._servers:
             return False
-        self._active[action] = 0
+        if action in self._slow_cancel:
+            self._slow_cancel.discard(action)
+        elif action not in self._rejects:
+            self._active[action] = 0
         return True
 
     def active_goals(self, action):
@@ -62,7 +81,7 @@ class FakeClient:
 
     def truth_pose(self):
         self.calls.append(("truth",))
-        return self._truth
+        return self._truths.pop(0) if len(self._truths) > 1 else self._truths[0]
 
     def reset_state(self):
         self.calls.append(("reset",))
@@ -116,7 +135,8 @@ def test_steps_run_in_order():
     client = FakeClient(active={"/navigate_to_pose": 1})
     outcome = run_reset(client, SPAWN, log=quiet)
     names = [n for n in client.names() if n != "cancel"]
-    assert names == ["reset", "truth", "seed", "clear", "home"]
+    # truth before the reset, right after it, and after the settle.
+    assert names == ["truth", "reset", "truth", "seed", "clear", "home", "truth"]
     assert client.names()[: len(NAV_ACTIONS + ARM_ACTIONS)] == ["cancel"] * len(NAV_ACTIONS + ARM_ACTIONS)
     assert outcome.truth == TRUE_SPAWN
     assert outcome.error_m == pytest.approx(0.07, abs=1e-6)
@@ -262,3 +282,95 @@ def test_summarize_passes_inside_tolerance(tmp_path):
             for p in (Pose2D(-1.93, -2.0, 0.0), Pose2D(-1.93, -2.01, math.radians(1)))]
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     assert main(["--summarize", str(path)]) == 0
+
+
+def test_cancels_every_action_on_the_graph():
+    client = FakeClient(discovered=["/start_grasp", "/follow_path"])
+    run_reset(client, SPAWN, log=quiet)
+    cancelled = {call[1] for call in client.calls if call[0] == "cancel"}
+    assert {"/start_grasp", "/follow_path"} <= cancelled
+
+
+def test_upstream_goal_that_ignores_cancel_blocks_the_reset():
+    client = FakeClient(discovered=["/start_grasp"], active={"/start_grasp": 1},
+                        rejects=["/start_grasp"])
+    with pytest.raises(ResetError, match="/start_grasp"):
+        run_reset(client, SPAWN, idle_timeout_s=2.0, log=quiet)
+    assert "reset" not in client.names()
+
+
+def test_lost_cancel_is_resent():
+    client = FakeClient(active={"/navigate_to_pose": 1}, slow_cancel=["/navigate_to_pose"])
+    run_reset(client, SPAWN, log=quiet)
+    assert client.calls.count(("cancel", "/navigate_to_pose")) >= 2
+    assert "reset" in client.names()
+
+
+def test_goal_accepted_just_before_reset_is_not_reset_through():
+    class LateArmGoal(FakeClient):
+        def truth_pose(self):
+            if "truth" not in self.names():
+                self._active["/xarm7_traj_controller/follow_joint_trajectory"] = 1
+            return super().truth_pose()
+    client = LateArmGoal()
+    with pytest.raises(ResetError, match="before the STATE reset"):
+        run_reset(client, SPAWN, log=quiet)
+    assert "reset" not in client.names()
+
+
+def test_outcome_records_the_settled_pose_and_the_pose_before():
+    far = Pose2D(1.49, -3.72, 0.4)
+    settled = Pose2D(-1.94, -2.00, 0.0)
+    client = FakeClient(truths=[far, TRUE_SPAWN, settled])
+    outcome = run_reset(client, SPAWN, log=quiet)
+    assert outcome.before == far
+    assert outcome.truth == settled
+
+
+def test_start_off_this_sessions_reference_fails():
+    # 0.14 m from the scenario pose passes the coarse dead-write bound but
+    # is 0.07 m from where this stack's first reset put the base.
+    client = FakeClient(truths=[Pose2D(1.0, -3.0, 0.0), Pose2D(-1.86, -2.0, 0.0)])
+    with pytest.raises(ResetError, match="first reset"):
+        run_reset(client, SPAWN, reference=Pose2D(-1.93, -2.0, 0.0), log=quiet)
+
+
+def test_start_within_this_sessions_reference_passes():
+    client = FakeClient(truths=[Pose2D(1.0, -3.0, 0.0), Pose2D(-1.93, -2.01, math.radians(1))])
+    run_reset(client, SPAWN, reference=Pose2D(-1.93, -2.0, 0.0), log=quiet)
+
+
+def _write_records(path, rows):
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_main_checks_against_first_record_of_the_same_session(tmp_path, capsys):
+    record = tmp_path / "r.jsonl"
+    first = outcome_record(ResetOutcome(Pose2D(-1.80, -2.0, 0.0), Pose2D(-1.80, -2.0, 0.0), 0.0, 0.0,
+                                        session="stack-1"), SPAWN)
+    _write_records(record, [first])
+    code = main(["--scenario", BENCH, "--record", str(record)],
+                client_factory=lambda: ClosingClient(session="stack-1"))
+    assert code == 1
+    assert "first reset" in capsys.readouterr().err
+
+
+def test_main_ignores_records_from_another_session(tmp_path):
+    record = tmp_path / "r.jsonl"
+    old = outcome_record(ResetOutcome(Pose2D(-1.80, -2.0, 0.0), Pose2D(-1.80, -2.0, 0.0), 0.0, 0.0,
+                                      session="stack-0"), SPAWN)
+    _write_records(record, [old])
+    code = main(["--scenario", BENCH, "--record", str(record)],
+                client_factory=lambda: ClosingClient(session="stack-1"))
+    assert code == 0
+    last = json.loads(record.read_text().splitlines()[-1])
+    assert last["session"] == "stack-1"
+
+
+def test_summarize_compares_within_each_session(tmp_path):
+    record = tmp_path / "r.jsonl"
+    rows = [outcome_record(ResetOutcome(p, p, 0.0, 0.0, session=s), SPAWN)
+            for p, s in ((Pose2D(-1.93, -2.0, 0.0), "a"), (Pose2D(-1.83, -2.0, 0.0), "b"),
+                         (Pose2D(-1.83, -2.01, 0.0), "b"))]
+    _write_records(record, rows)
+    assert main(["--summarize", str(record)]) == 0

@@ -16,7 +16,7 @@ import math
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
@@ -29,8 +29,9 @@ ARM_ACTIONS = (
 ACTIVE_GOAL_STATUSES = (1, 2, 3)  # ACCEPTED, EXECUTING, CANCELING
 SCOPE_STATE = 2
 # The scenario pose is the spawn *request*; the settled spawn sits ~0.07 m /
-# 1.3 deg from it. This bound catches a dead write; the 0.05 m / 2 deg
-# trial-to-trial bound is checked across a batch with --summarize.
+# 1.3 deg from it. This coarse bound catches a gross dead write; the
+# 0.05 m / 2 deg trial-start bound is checked against the stack session's
+# first reset (--tolerance-m / --tolerance-deg).
 SPAWN_TOLERANCE_M = 0.15
 SPAWN_TOLERANCE_DEG = 5.0
 AMCL_TOLERANCE_M = 0.15
@@ -38,6 +39,8 @@ AMCL_TOLERANCE_DEG = 5.0
 STATIONARY_LINEAR_M_S = 0.01
 STATIONARY_ANGULAR_RAD_S = 0.02
 STATIONARY_HOLD_S = 1.0
+# Endpoint discovery on a graph with dozens of participants takes seconds.
+DISCOVERY_S = 3.0
 
 
 class ResetError(RuntimeError):
@@ -53,13 +56,17 @@ class Pose2D:
 
 @dataclass(frozen=True)
 class ResetOutcome:
-    truth: Pose2D
+    truth: Pose2D  # settled trial-start pose, read after the arm swing
     amcl: Pose2D
-    error_m: float
+    error_m: float  # truth vs scenario spawn
     error_deg: float
+    before: Optional[Pose2D] = None
+    session: Optional[str] = None
 
 
 class ResetClient(Protocol):
+    def list_actions(self) -> list[str]: ...
+    def stack_session(self) -> Optional[str]: ...
     def cancel_all_goals(self, action: str) -> bool: ...
     def active_goals(self, action: str) -> int: ...
     def base_speed(self) -> tuple[float, float]: ...
@@ -125,20 +132,50 @@ def _fmt(pose: Pose2D) -> str:
     return f"({pose.x:.3f}, {pose.y:.3f}, {math.degrees(pose.yaw):.1f} deg)"
 
 
-def run_reset(client: ResetClient, spawn: Pose2D, *, idle_timeout_s: float = 20.0,
-              poll_s: float = 0.2, settle_s: float = 9.0,
+def _check_spawn(pose: Pose2D, spawn: Pose2D, when: str) -> tuple[float, float]:
+    error_m, error_deg = pose_error(pose, spawn)
+    if error_m > SPAWN_TOLERANCE_M or error_deg > SPAWN_TOLERANCE_DEG:
+        raise ResetError(
+            f"base at {_fmt(pose)} {when}, {error_m:.2f} m / {error_deg:.1f} deg"
+            f" from spawn {_fmt(spawn)}: the root write did not reach physics"
+        )
+    return error_m, error_deg
+
+
+def run_reset(client: ResetClient, spawn: Pose2D, *, reference: Optional[Pose2D] = None,
+              tolerance_m: float = 0.05, tolerance_deg: float = 2.0,
+              idle_timeout_s: float = 20.0, poll_s: float = 0.2, settle_s: float = 9.0,
               log: Callable[[str], None] = _log) -> ResetOutcome:
-    actions = NAV_ACTIONS + ARM_ACTIONS
+    # Every action on the graph, not only the known ones: in live
+    # manipulation the arm_api servers (start_grasp, ...) keep sending arm
+    # goals after a TIMEOUT-killed orchestrator.
+    actions = tuple(dict.fromkeys(NAV_ACTIONS + ARM_ACTIONS + tuple(client.list_actions())))
     # A TIMEOUT-killed orchestrator leaves its last goal driving the robot.
     for action in actions:
         if not client.cancel_all_goals(action):
             log(f"{action}: no action server, nothing to cancel")
-    _wait_until(client, lambda: not _active(client, actions), idle_timeout_s, poll_s,
-                lambda: f"goals still active after cancel: {_active(client, actions)}")
-    # IdleReset needs a stationary robot and only waits 12 s for one.
-    _wait_until(client, lambda: _stationary(client.base_speed()), idle_timeout_s, poll_s,
-                lambda: "base still moving after goals were cancelled",
-                hold_s=STATIONARY_HOLD_S)
+
+    def idle() -> bool:
+        active = _active(client, actions)
+        # A cancel can be lost to discovery lag; resend while goals remain.
+        for action in active:
+            client.cancel_all_goals(action)
+        # IdleReset needs a stationary robot and only waits 12 s for one.
+        return not active and _stationary(client.base_speed())
+
+    def not_idle() -> str:
+        active = _active(client, actions)
+        if active:
+            return f"goals still active after cancel: {active}"
+        return "base still moving after goals were cancelled"
+
+    _wait_until(client, idle, idle_timeout_s, poll_s, not_idle, hold_s=STATIONARY_HOLD_S)
+    before = client.truth_pose()
+    # IdleReset fails *after* asserting its stop if an action starts inside
+    # its window, which leaves the sim paused; never start one in that state.
+    active = _active(client, actions)
+    if active:
+        raise ResetError(f"goal became active just before the STATE reset, not resetting: {active}")
 
     ok, detail = client.reset_state()
     if not ok:
@@ -148,23 +185,20 @@ def run_reset(client: ResetClient, spawn: Pose2D, *, idle_timeout_s: float = 20.
                     " restart the stack (scripts/gpsr-stack down, then up)")
         raise ResetError(f"STATE reset failed: {detail}{hint}")
 
-    truth = client.truth_pose()
-    error_m, error_deg = pose_error(truth, spawn)
-    if error_m > SPAWN_TOLERANCE_M or error_deg > SPAWN_TOLERANCE_DEG:
-        raise ResetError(
-            f"base at {_fmt(truth)} after STATE reset, {error_m:.2f} m / {error_deg:.1f} deg"
-            f" from spawn {_fmt(spawn)}: the root write did not reach physics"
-        )
+    restored = client.truth_pose()
+    _check_spawn(restored, spawn, "after STATE reset")
+    moved_m, _ = pose_error(restored, before)
+    log(f"STATE reset moved the base {moved_m:.3f} m from {_fmt(before)}")
 
     # Odom integrates wheel velocities, which the reset zeroes, so only
     # map->odom moved. Seed AMCL with the truth pose (world == map).
-    amcl = client.seed_localization(truth)
+    amcl = client.seed_localization(restored)
     if amcl is None:
         raise ResetError("AMCL did not publish a pose after /initialpose")
-    amcl_m, amcl_deg = pose_error(amcl, truth)
+    amcl_m, amcl_deg = pose_error(amcl, restored)
     if amcl_m > AMCL_TOLERANCE_M or amcl_deg > AMCL_TOLERANCE_DEG:
         raise ResetError(
-            f"AMCL settled at {_fmt(amcl)}, {amcl_m:.2f} m / {amcl_deg:.1f} deg from truth {_fmt(truth)}"
+            f"AMCL settled at {_fmt(amcl)}, {amcl_m:.2f} m / {amcl_deg:.1f} deg from truth {_fmt(restored)}"
         )
 
     client.clear_costmaps()
@@ -172,12 +206,23 @@ def run_reset(client: ResetClient, spawn: Pose2D, *, idle_timeout_s: float = 20.
     client.home_arm_and_head()
     client.sleep(settle_s)
 
-    leftover = _active(client, NAV_ACTIONS)
+    leftover = _active(client, actions)
     if leftover:
         raise ResetError(f"a Nav2 goal started during reset: {leftover}")
+    truth = client.truth_pose()
+    error_m, error_deg = _check_spawn(truth, spawn, "after the settle")
+    if reference is not None:
+        ref_m, ref_deg = pose_error(truth, reference)
+        if ref_m > tolerance_m or ref_deg > tolerance_deg:
+            raise ResetError(
+                f"trial start {_fmt(truth)} is {ref_m:.3f} m / {ref_deg:.1f} deg from this stack"
+                f" session's first reset {_fmt(reference)} (tolerance {tolerance_m} m /"
+                f" {tolerance_deg} deg)"
+            )
     log(f"base at {_fmt(truth)} ({error_m:.3f} m / {error_deg:.1f} deg from scenario spawn),"
         f" AMCL {_fmt(amcl)}")
-    return ResetOutcome(truth=truth, amcl=amcl, error_m=error_m, error_deg=error_deg)
+    return ResetOutcome(truth=truth, amcl=amcl, error_m=error_m, error_deg=error_deg,
+                        before=before)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -192,20 +237,49 @@ def outcome_record(outcome: ResetOutcome, spawn: Pose2D) -> dict:
         "spawn": [spawn.x, spawn.y, spawn.yaw],
         "error_m": outcome.error_m,
         "error_deg": outcome.error_deg,
+        "before": (None if outcome.before is None
+                   else [outcome.before.x, outcome.before.y, outcome.before.yaw]),
+        "session": outcome.session,
     }
 
 
+def read_records(path: Path) -> list[dict]:
+    if not Path(path).exists():
+        return []
+    records = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a torn write from a killed reset
+    return records
+
+
+def session_reference(records: list[dict], session: Optional[str]) -> Optional[Pose2D]:
+    """Where this stack session's first reset put the base: every later
+    trial start must match it. A new stack captures a new baseline."""
+    if session is None:
+        return None
+    for record in records:
+        if record.get("session") == session:
+            return Pose2D(*record["truth"])
+    return None
+
+
 def start_pose_spread(records: list[dict]) -> tuple[float, float]:
-    first = Pose2D(*records[0]["truth"])
+    """Worst trial start against the first reset of the same stack session."""
+    firsts: dict = {}
     worst_m = worst_deg = 0.0
-    for record in records[1:]:
-        distance, degrees = pose_error(Pose2D(*record["truth"]), first)
+    for record in records:
+        pose = Pose2D(*record["truth"])
+        first = firsts.setdefault(record.get("session"), pose)
+        distance, degrees = pose_error(pose, first)
         worst_m, worst_deg = max(worst_m, distance), max(worst_deg, degrees)
     return worst_m, worst_deg
 
 
 def _summarize(path: Path, tolerance_m: float, tolerance_deg: float) -> int:
-    records = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+    records = read_records(path)
     if not records:
         print(f"{path}: no reset records")
         return 1
@@ -227,6 +301,7 @@ class RosResetClient:
         from rclpy.node import Node
         from rclpy.parameter import Parameter
         from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+        from std_msgs.msg import String
         from tinker_sim_interfaces.msg import RobotTruth
 
         self._rclpy = rclpy
@@ -236,11 +311,14 @@ class RosResetClient:
                          parameter_overrides=[Parameter("use_sim_time", value=True)])
         latched = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self._GoalStatusArray = GoalStatusArray
+        self._latched = latched
         self._status: dict[str, object] = {}
+        self._cancel_clients: dict[str, object] = {}
         for action in NAV_ACTIONS + ARM_ACTIONS:
-            self.node.create_subscription(
-                GoalStatusArray, f"{action}/_action/status",
-                lambda message, key=action: self._status.__setitem__(key, message), latched)
+            self._watch(action)
+        self._session: Optional[str] = None
+        self.node.create_subscription(String, "/sim/status/isaac", self._on_status, 10)
         self._truth = None
         self._truth_count = 0
         self.node.create_subscription(RobotTruth, "/sim/truth/robot_state", self._on_truth, 10)
@@ -250,6 +328,44 @@ class RosResetClient:
         self._initial_pose_pub = self.node.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", latched)
         self._PoseWithCovarianceStamped = PoseWithCovarianceStamped
+        # A cancel sent before discovery completes is lost, and a status
+        # topic that has not arrived yet reads as idle.
+        self._spin_until(lambda: False, DISCOVERY_S)
+
+    def _watch(self, action: str) -> None:
+        if action in self._cancel_clients:
+            return
+        from action_msgs.srv import CancelGoal
+        self.node.create_subscription(
+            self._GoalStatusArray, f"{action}/_action/status",
+            lambda message, key=action: self._status.__setitem__(key, message), self._latched)
+        self._cancel_clients[action] = self.node.create_client(
+            CancelGoal, f"{action}/_action/cancel_goal")
+
+    def _on_status(self, message) -> None:
+        try:
+            since = json.loads(message.data).get("services_ready_since")
+        except (ValueError, AttributeError):
+            return
+        if since is not None:
+            self._session = str(since)
+
+    def list_actions(self) -> list[str]:
+        suffix = "/_action/status"
+        names = sorted(name[: -len(suffix)] for name, _ in self.node.get_topic_names_and_types()
+                       if name.endswith(suffix))
+        new = [name for name in names if name not in self._cancel_clients]
+        for name in new:
+            self._watch(name)
+        if new:
+            self._spin_until(lambda: False, 0.5)  # latched status for the new subscriptions
+        return names
+
+    def stack_session(self) -> Optional[str]:
+        """The sim's services-ready time: one value per stack bring-up."""
+        if not self._spin_until(lambda: self._session is not None, 5.0):
+            _log("/sim/status/isaac: no services_ready_since; trial-start reference check skipped")
+        return self._session
 
     def _on_truth(self, message) -> None:
         self._truth = message
@@ -287,9 +403,17 @@ class RosResetClient:
 
     def cancel_all_goals(self, action: str) -> bool:
         from action_msgs.srv import CancelGoal
+        self._watch(action)
+        client = self._cancel_clients[action]
+        if not client.wait_for_service(timeout_sec=1.0):
+            return False
         # An all-zero goal id and stamp cancels every goal on the server.
-        return self._call(CancelGoal, f"{action}/_action/cancel_goal", CancelGoal.Request(),
-                          wait_s=2.0, call_s=5.0) is not None
+        future = client.call_async(CancelGoal.Request())
+        if not self._spin_until(future.done, 5.0):
+            raise ResetError(f"{action}: cancel got no response after 5s")
+        if future.result().return_code == CancelGoal.Response.ERROR_REJECTED:
+            _log(f"{action}: server rejected the cancel")
+        return True
 
     def active_goals(self, action: str) -> int:
         self._rclpy.spin_once(self.node, timeout_sec=0.05)
@@ -426,7 +550,11 @@ def main(argv: Optional[list[str]] = None,
     try:
         spawn = scenario_spawn(args.scenario)
         client = (client_factory or RosResetClient)()
-        outcome = run_reset(client, spawn)
+        session = client.stack_session()
+        reference = session_reference(read_records(args.record), session)
+        outcome = replace(run_reset(client, spawn, reference=reference,
+                                    tolerance_m=args.tolerance_m,
+                                    tolerance_deg=args.tolerance_deg), session=session)
     except ResetError as error:
         _log(str(error))
         return 1
