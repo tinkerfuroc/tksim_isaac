@@ -13,11 +13,16 @@ from tools.gpsr_run_reset import (  # noqa: E402
     NAV_ACTIONS,
     Pose2D,
     ResetError,
+    ResetOutcome,
+    main,
+    outcome_record,
     pose_error,
     run_reset,
     scenario_spawn,
+    start_pose_spread,
 )
 
+BENCH = str(ROOT / "simulation/scenarios/gpsr-rcw2026-bench.json")
 SPAWN = Pose2D(-2.0, -2.0, 0.0)
 TRUE_SPAWN = Pose2D(-1.93, -2.00, math.radians(-1.3))
 
@@ -194,3 +199,66 @@ def test_goal_that_appears_during_reset_fails():
             self._active["/navigate_to_pose"] = 1
     with pytest.raises(ResetError, match="started during reset"):
         run_reset(LateGoal(), SPAWN, log=quiet)
+
+
+
+class ClosingClient(FakeClient):
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_main_success_appends_record(tmp_path):
+    client = ClosingClient()
+    record = tmp_path / "r.jsonl"
+    code = main(["--scenario", BENCH, "--record", str(record)], client_factory=lambda: client)
+    assert code == 0
+    assert client.closed
+    (line,) = record.read_text().splitlines()
+    data = json.loads(line)
+    assert data["truth"][:2] == pytest.approx([-1.93, -2.00])
+    assert data["spawn"] == [-2.0, -2.0, 0.0]
+
+
+def test_main_failure_exits_1_with_reason_and_closes(tmp_path, capsys):
+    client = ClosingClient(truth=Pose2D(1.49, -3.72, 0.4))
+    code = main(["--scenario", BENCH, "--record", str(tmp_path / "r.jsonl")],
+                client_factory=lambda: client)
+    assert code == 1
+    assert client.closed
+    assert "did not reach physics" in capsys.readouterr().err
+    assert not (tmp_path / "r.jsonl").exists()
+
+
+def test_main_client_construction_failure_exits_1(tmp_path, capsys):
+    def broken():
+        raise ResetError("/reset_simulation not available")
+    code = main(["--scenario", BENCH, "--record", str(tmp_path / "r.jsonl")], client_factory=broken)
+    assert code == 1
+    assert "/reset_simulation not available" in capsys.readouterr().err
+
+
+def test_start_pose_spread_is_worst_against_first():
+    outcomes = [Pose2D(-1.93, -2.00, 0.0), Pose2D(-1.93, -2.03, 0.0), Pose2D(-1.90, -2.00, math.radians(3))]
+    records = [outcome_record(ResetOutcome(p, p, 0.0, 0.0), SPAWN) for p in outcomes]
+    distance, degrees = start_pose_spread(records)
+    assert distance == pytest.approx(0.03)
+    assert degrees == pytest.approx(3.0)
+
+
+def test_summarize_fails_outside_tolerance(tmp_path, capsys):
+    path = tmp_path / "r.jsonl"
+    rows = [outcome_record(ResetOutcome(p, p, 0.0, 0.0), SPAWN)
+            for p in (Pose2D(-1.93, -2.0, 0.0), Pose2D(-1.80, -2.0, 0.0))]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert main(["--summarize", str(path)]) == 1
+    assert "0.130 m" in capsys.readouterr().out
+
+
+def test_summarize_passes_inside_tolerance(tmp_path):
+    path = tmp_path / "r.jsonl"
+    rows = [outcome_record(ResetOutcome(p, p, 0.0, 0.0), SPAWN)
+            for p in (Pose2D(-1.93, -2.0, 0.0), Pose2D(-1.93, -2.01, math.radians(1)))]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert main(["--summarize", str(path)]) == 0

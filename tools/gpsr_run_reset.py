@@ -10,9 +10,12 @@ never reads back (commit 5fa9186).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Protocol
@@ -175,3 +178,267 @@ def run_reset(client: ResetClient, spawn: Pose2D, *, idle_timeout_s: float = 20.
     log(f"base at {_fmt(truth)} ({error_m:.3f} m / {error_deg:.1f} deg from scenario spawn),"
         f" AMCL {_fmt(amcl)}")
     return ResetOutcome(truth=truth, amcl=amcl, error_m=error_m, error_deg=error_deg)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RECORD = ROOT / "gpsr_stack_logs" / "run-reset.jsonl"
+
+
+def outcome_record(outcome: ResetOutcome, spawn: Pose2D) -> dict:
+    return {
+        "wall_time": time.time(),
+        "truth": [outcome.truth.x, outcome.truth.y, outcome.truth.yaw],
+        "amcl": [outcome.amcl.x, outcome.amcl.y, outcome.amcl.yaw],
+        "spawn": [spawn.x, spawn.y, spawn.yaw],
+        "error_m": outcome.error_m,
+        "error_deg": outcome.error_deg,
+    }
+
+
+def start_pose_spread(records: list[dict]) -> tuple[float, float]:
+    first = Pose2D(*records[0]["truth"])
+    worst_m = worst_deg = 0.0
+    for record in records[1:]:
+        distance, degrees = pose_error(Pose2D(*record["truth"]), first)
+        worst_m, worst_deg = max(worst_m, distance), max(worst_deg, degrees)
+    return worst_m, worst_deg
+
+
+def _summarize(path: Path, tolerance_m: float, tolerance_deg: float) -> int:
+    records = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+    if not records:
+        print(f"{path}: no reset records")
+        return 1
+    distance, degrees = start_pose_spread(records)
+    ok = distance <= tolerance_m and degrees <= tolerance_deg
+    print(f"{len(records)} resets; worst start vs first: {distance:.3f} m / {degrees:.2f} deg"
+          f" (tolerance {tolerance_m} m / {tolerance_deg} deg): {'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
+class RosResetClient:
+    """The only place this module imports rclpy, constructed lazily so every
+    test runs without ROS (same pattern as tools/gpsr_spawn.py)."""
+
+    def __init__(self) -> None:
+        import rclpy
+        from action_msgs.msg import GoalStatusArray
+        from geometry_msgs.msg import PoseWithCovarianceStamped
+        from rclpy.node import Node
+        from rclpy.parameter import Parameter
+        from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+        from tinker_sim_interfaces.msg import RobotTruth
+
+        self._rclpy = rclpy
+        rclpy.init(args=None)
+        # Sim time so the /initialpose stamp matches the TF AMCL looks up.
+        self.node = Node("gpsr_run_reset",
+                         parameter_overrides=[Parameter("use_sim_time", value=True)])
+        latched = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
+                             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self._status: dict[str, object] = {}
+        for action in NAV_ACTIONS + ARM_ACTIONS:
+            self.node.create_subscription(
+                GoalStatusArray, f"{action}/_action/status",
+                lambda message, key=action: self._status.__setitem__(key, message), latched)
+        self._truth = None
+        self._truth_count = 0
+        self.node.create_subscription(RobotTruth, "/sim/truth/robot_state", self._on_truth, 10)
+        self._amcl = None
+        self._amcl_count = 0
+        self.node.create_subscription(PoseWithCovarianceStamped, "/amcl_pose", self._on_amcl, latched)
+        self._initial_pose_pub = self.node.create_publisher(
+            PoseWithCovarianceStamped, "/initialpose", latched)
+        self._PoseWithCovarianceStamped = PoseWithCovarianceStamped
+
+    def _on_truth(self, message) -> None:
+        self._truth = message
+        self._truth_count += 1
+
+    def _on_amcl(self, message) -> None:
+        self._amcl = message
+        self._amcl_count += 1
+
+    def _spin_until(self, predicate: Callable[[], bool], timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            self._rclpy.spin_once(self.node, timeout_sec=0.05)
+        return predicate()
+
+    def _call(self, service_type, name: str, request, *, wait_s: float, call_s: float):
+        client = self.node.create_client(service_type, name)
+        try:
+            if not client.wait_for_service(timeout_sec=wait_s):
+                return None
+            future = client.call_async(request)
+            if not self._spin_until(future.done, call_s):
+                raise ResetError(f"{name}: no response after {call_s:.0f}s")
+            return future.result()
+        finally:
+            self.node.destroy_client(client)
+
+    def _fresh_truth(self, timeout_s: float = 5.0):
+        seen = self._truth_count
+        if not self._spin_until(lambda: self._truth_count > seen, timeout_s):
+            raise ResetError("/sim/truth/robot_state: no message (is truth_evaluator running?)")
+        return self._truth
+
+    def cancel_all_goals(self, action: str) -> bool:
+        from action_msgs.srv import CancelGoal
+        # An all-zero goal id and stamp cancels every goal on the server.
+        return self._call(CancelGoal, f"{action}/_action/cancel_goal", CancelGoal.Request(),
+                          wait_s=2.0, call_s=5.0) is not None
+
+    def active_goals(self, action: str) -> int:
+        self._rclpy.spin_once(self.node, timeout_sec=0.05)
+        message = self._status.get(action)
+        if message is None:
+            return 0
+        return sum(1 for item in message.status_list if item.status in ACTIVE_GOAL_STATUSES)
+
+    def base_speed(self) -> tuple[float, float]:
+        twist = self._fresh_truth().base_twist
+        return math.hypot(twist.linear.x, twist.linear.y), abs(twist.angular.z)
+
+    def truth_pose(self) -> Pose2D:
+        pose = self._fresh_truth().base_pose
+        q = pose.orientation
+        return Pose2D(pose.position.x, pose.position.y, yaw_from_quaternion(q.x, q.y, q.z, q.w))
+
+    def reset_state(self) -> tuple[bool, str]:
+        from simulation_interfaces.msg import Result
+        from simulation_interfaces.srv import ResetSimulation
+        request = ResetSimulation.Request()
+        request.scope = SCOPE_STATE
+        response = self._call(ResetSimulation, "/reset_simulation", request,
+                              wait_s=10.0, call_s=90.0)
+        if response is None:
+            return False, "/reset_simulation not available"
+        return response.result.result == Result.RESULT_OK, response.result.error_message
+
+    def seed_localization(self, pose: Pose2D) -> Optional[Pose2D]:
+        if not self._spin_until(lambda: self.node.get_clock().now().nanoseconds > 0, 5.0):
+            raise ResetError("/clock not received")
+        message = self._PoseWithCovarianceStamped()
+        message.header.frame_id = "map"
+        message.header.stamp = self.node.get_clock().now().to_msg()
+        message.pose.pose.position.x = pose.x
+        message.pose.pose.position.y = pose.y
+        message.pose.pose.orientation.z = math.sin(pose.yaw / 2.0)
+        message.pose.pose.orientation.w = math.cos(pose.yaw / 2.0)
+        # Truth is known: 5 cm and ~2 deg standard deviation.
+        message.pose.covariance[0] = 0.0025
+        message.pose.covariance[7] = 0.0025
+        message.pose.covariance[35] = 0.0012
+        seed_ns = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
+        seen = self._amcl_count
+
+        def answered() -> bool:
+            if self._amcl_count <= seen:
+                return False
+            stamp = self._amcl.header.stamp
+            return stamp.sec * 10**9 + stamp.nanosec >= seed_ns
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            self._initial_pose_pub.publish(message)
+            if self._spin_until(answered, 0.5):
+                amcl = self._amcl.pose.pose
+                q = amcl.orientation
+                return Pose2D(amcl.position.x, amcl.position.y,
+                              yaw_from_quaternion(q.x, q.y, q.z, q.w))
+        return None
+
+    def clear_costmaps(self) -> None:
+        from nav2_msgs.srv import ClearEntireCostmap
+        for name in ("/global_costmap/clear_entirely_global_costmap",
+                     "/local_costmap/clear_entirely_local_costmap"):
+            if self._call(ClearEntireCostmap, name, ClearEntireCostmap.Request(),
+                          wait_s=2.0, call_s=5.0) is None:
+                _log(f"{name}: not available, skipped")
+
+    def home_arm_and_head(self) -> None:
+        from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+        from tinker_vision_msgs_26.msg import PanTiltCommand
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+        # Volatile to match the facade and ros2_control subscriptions during
+        # graph churn; wait for both endpoints so a missing head facade
+        # cannot leave the arm half-reset.
+        qos = QoSProfile(depth=20, reliability=QoSReliabilityPolicy.RELIABLE,
+                         durability=QoSDurabilityPolicy.VOLATILE)
+        arm_pub = self.node.create_publisher(
+            JointTrajectory, "/xarm7_traj_controller/joint_trajectory", qos)
+        head_pub = self.node.create_publisher(PanTiltCommand, "/pan_tilt_controller/cmd", qos)
+        endpoints = [("arm reset (/xarm7_traj_controller/joint_trajectory)", arm_pub),
+                     ("head reset (/pan_tilt_controller/cmd)", head_pub)]
+        if not self._spin_until(
+                lambda: all(p.get_subscription_count() > 0 for _, p in endpoints), 30.0):
+            missing = [label for label, p in endpoints if p.get_subscription_count() < 1]
+            raise ResetError(f"no matching subscriber after 30s: {', '.join(missing)}")
+        trajectory = JointTrajectory()
+        trajectory.joint_names = [f"joint{i}" for i in range(1, 8)]
+        point = JointTrajectoryPoint()
+        point.positions = [0.0] * 7
+        # 8 s: a 2 s swing trips the controller's 1.0 rad state tolerance.
+        point.time_from_start.sec = 8
+        trajectory.points = [point]
+        head = PanTiltCommand()
+        head.mode = 0
+        head.pan_rad = 0.0
+        head.tilt_rad = 0.0
+        arm_pub.publish(trajectory)
+        head_pub.publish(head)
+        self._spin_until(lambda: False, 0.5)  # bounded chance for DDS delivery
+
+    def sleep(self, seconds: float) -> None:
+        self._spin_until(lambda: False, seconds)
+
+    def now(self) -> float:
+        return time.monotonic()
+
+    def close(self) -> None:
+        self.node.destroy_node()
+        self._rclpy.try_shutdown()
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--scenario", type=Path,
+                        default=ROOT / "simulation/scenarios/gpsr-rcw2026-bench.json")
+    parser.add_argument("--record", type=Path,
+                        default=Path(os.environ.get("GPSR_RESET_RECORD", DEFAULT_RECORD)))
+    parser.add_argument("--summarize", type=Path, metavar="RECORD",
+                        help="check a batch's reset records instead of resetting")
+    parser.add_argument("--tolerance-m", type=float, default=0.05)
+    parser.add_argument("--tolerance-deg", type=float, default=2.0)
+    return parser
+
+
+def main(argv: Optional[list[str]] = None,
+         client_factory: Optional[Callable[[], ResetClient]] = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    if args.summarize is not None:
+        return _summarize(args.summarize, args.tolerance_m, args.tolerance_deg)
+    client = None
+    try:
+        spawn = scenario_spawn(args.scenario)
+        client = (client_factory or RosResetClient)()
+        outcome = run_reset(client, spawn)
+    except ResetError as error:
+        _log(str(error))
+        return 1
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
+    args.record.parent.mkdir(parents=True, exist_ok=True)
+    with args.record.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(outcome_record(outcome, spawn)) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
