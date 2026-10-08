@@ -374,3 +374,10 @@ def test_summarize_compares_within_each_session(tmp_path):
                          (Pose2D(-1.83, -2.01, 0.0), "b"))]
     _write_records(record, rows)
     assert main(["--summarize", str(record)]) == 0
+
+
+def test_amcl_inherent_error_is_not_a_failure():
+    # Live sim AMCL sits 7-17 cm off truth at spawn (front-only +/-82.5 deg
+    # scan); only a re-seed that did not take (the base moved metres) fails.
+    client = FakeClient(amcl=Pose2D(-1.93 + 0.2, -2.00, 0.0))
+    run_reset(client, SPAWN, log=quiet)

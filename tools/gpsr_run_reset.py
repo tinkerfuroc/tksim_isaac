@@ -34,7 +34,9 @@ SCOPE_STATE = 2
 # first reset (--tolerance-m / --tolerance-deg).
 SPAWN_TOLERANCE_M = 0.15
 SPAWN_TOLERANCE_DEG = 5.0
-AMCL_TOLERANCE_M = 0.15
+# Live sim AMCL sits 7-17 cm off truth at spawn (front-only +/-82.5 deg
+# scan, 2026-10-08); this catches a re-seed that did not take, not that.
+AMCL_TOLERANCE_M = 0.25
 AMCL_TOLERANCE_DEG = 5.0
 STATIONARY_LINEAR_M_S = 0.01
 STATIONARY_ANGULAR_RAD_S = 0.02
@@ -328,7 +330,15 @@ class RosResetClient:
         self._initial_pose_pub = self.node.create_publisher(
             PoseWithCovarianceStamped, "/initialpose", latched)
         self._PoseWithCovarianceStamped = PoseWithCovarianceStamped
-        # A cancel sent before discovery completes is lost, and a status
+        from nav2_msgs.srv import ClearEntireCostmap
+        from simulation_interfaces.srv import ResetSimulation
+        self._reset_client = self.node.create_client(ResetSimulation, "/reset_simulation")
+        self._costmap_clients = [
+            (name, self.node.create_client(ClearEntireCostmap, name))
+            for name in ("/global_costmap/clear_entirely_global_costmap",
+                         "/local_costmap/clear_entirely_local_costmap")]
+        # A request sent before discovery completes is lost (the server's
+        # response writer has not matched a brand-new client), and a status
         # topic that has not arrived yet reads as idle.
         self._spin_until(lambda: False, DISCOVERY_S)
 
@@ -358,7 +368,7 @@ class RosResetClient:
         for name in new:
             self._watch(name)
         if new:
-            self._spin_until(lambda: False, 0.5)  # latched status for the new subscriptions
+            self._spin_until(lambda: False, DISCOVERY_S)  # match the new cancel clients
         return names
 
     def stack_session(self) -> Optional[str]:
@@ -383,17 +393,13 @@ class RosResetClient:
             self._rclpy.spin_once(self.node, timeout_sec=0.05)
         return predicate()
 
-    def _call(self, service_type, name: str, request, *, wait_s: float, call_s: float):
-        client = self.node.create_client(service_type, name)
-        try:
-            if not client.wait_for_service(timeout_sec=wait_s):
-                return None
-            future = client.call_async(request)
-            if not self._spin_until(future.done, call_s):
-                raise ResetError(f"{name}: no response after {call_s:.0f}s")
-            return future.result()
-        finally:
-            self.node.destroy_client(client)
+    def _call(self, client, name: str, request, *, wait_s: float, call_s: float):
+        if not client.wait_for_service(timeout_sec=wait_s):
+            return None
+        future = client.call_async(request)
+        if not self._spin_until(future.done, call_s):
+            raise ResetError(f"{name}: no response after {call_s:.0f}s")
+        return future.result()
 
     def _fresh_truth(self, timeout_s: float = 5.0):
         seen = self._truth_count
@@ -436,7 +442,7 @@ class RosResetClient:
         from simulation_interfaces.srv import ResetSimulation
         request = ResetSimulation.Request()
         request.scope = SCOPE_STATE
-        response = self._call(ResetSimulation, "/reset_simulation", request,
+        response = self._call(self._reset_client, "/reset_simulation", request,
                               wait_s=10.0, call_s=90.0)
         if response is None:
             return False, "/reset_simulation not available"
@@ -477,9 +483,8 @@ class RosResetClient:
 
     def clear_costmaps(self) -> None:
         from nav2_msgs.srv import ClearEntireCostmap
-        for name in ("/global_costmap/clear_entirely_global_costmap",
-                     "/local_costmap/clear_entirely_local_costmap"):
-            if self._call(ClearEntireCostmap, name, ClearEntireCostmap.Request(),
+        for name, client in self._costmap_clients:
+            if self._call(client, name, ClearEntireCostmap.Request(),
                           wait_s=2.0, call_s=5.0) is None:
                 _log(f"{name}: not available, skipped")
 
