@@ -86,8 +86,22 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(planner, dict):
         planner["tolerance"] = 0.6
 
+    # AMCL odometry noise: the upstream alphas (0.2-0.3) model the real
+    # tracer's wheel odometry. The sim base's odometry tracks Isaac ground
+    # truth to 0.4% in rotation and millimetres in translation, so those
+    # alphas only scatter the particles -- ~2.6 deg of heading spread per
+    # filter update -- and the last update before the robot stops leaves
+    # that scatter frozen in the estimate (AMCL does not update at rest).
+    # Live vs ground truth, 2026-10-10, surface-only map, 4-stop route x 5
+    # headings: alphas 0.2-0.3 -> mean 0.094 m, max 0.180 m; 0.1 -> 0.062 m;
+    # 0.05 -> 0.057 m, max 0.109 m, yaw 1.6 -> 0.8 deg. (A 2026-09-11 trial
+    # of 0.05 on the solid map was worse, 0.52 m vs 0.18 m, as particles
+    # could not recover from scan/map mismatch; the surface-only map
+    # removed that mismatch.)
     amcl = result.get("amcl", {}).get("ros__parameters")
     if isinstance(amcl, dict):
+        for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
+            amcl[alpha] = 0.05
         # AMCL localizes on a surface-only copy of the arena map, served by
         # its own map_server on this topic (see amcl_map.py); the costmaps
         # keep the solid map on /map.

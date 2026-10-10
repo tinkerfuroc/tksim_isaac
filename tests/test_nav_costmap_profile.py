@@ -242,6 +242,16 @@ class UpstreamParamsTest(unittest.TestCase):
         deadband = result["velocity_smoother"]["ros__parameters"]["deadband_velocity"][0]
         self.assertGreater(fp["min_approach_linear_velocity"], deadband)
 
+    def test_amcl_odometry_noise_matches_the_sim_base(self):
+        # The sim base's odometry tracks ground truth to 0.4% in rotation;
+        # the upstream tracer alphas (0.2-0.3) scatter heading ~2.6 deg per
+        # AMCL update and that scatter freezes at rest. Live route vs ground
+        # truth 2026-10-10: 0.2-0.3 -> mean 0.094 m; 0.1 -> 0.062 m;
+        # 0.05 -> 0.057 m.
+        amcl = prior_map_costmap_overlay(self.params)["amcl"]["ros__parameters"]
+        for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
+            self.assertEqual(amcl[alpha], 0.05, alpha)
+
     def test_footprint_is_sim_parity_not_hardware_envelope(self):
         # The upstream 0.95 m footprint models the REAL robot's rear
         # overhang; the sim body spans x [-0.38, +0.13] (robot.urdf base
