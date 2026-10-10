@@ -176,3 +176,16 @@ that release the referee hold before a restore.
   - Every trial started at (−2.0002, −2.0000, −0.08°), a spread of 0.000 m /
     0.00°, with AMCL within 6 mm of truth.
   - No reset ERRORs.
+- **Orphaned goal, stack `gpsr_stack_logs/20261010T081701`, 2026-10-10.**
+  - Each of the 2 cycles started a long Nav2 goal and ran
+    `scripts/gpsr-run-reset` 15 s later, while the goal was executing.
+  - Both resets exited 0, in 26.9 s and 25.3 s.
+  - The resets cancelled the goals, which ended with status 5 (CANCELED).
+    No goal was left active.
+  - The base moved 2.97 m and 3.21 m back to (−2.0002, −2.0000, −0.07°).
+  - AMCL ended within 4 mm of truth, and the arm joints were back at about 0.
+  - A fresh Nav2 goal succeeded and moved the base after each reset.
+  - Both records carry the same stack-session key (the status publisher's
+    GID).
+  - This run used other in-progress, uncommitted working-tree changes: the
+    `tinker2_sim` robot profile, `amcl_map_server`, and the RPP speed floor.
