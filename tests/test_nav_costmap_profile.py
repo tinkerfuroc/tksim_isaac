@@ -229,6 +229,19 @@ class UpstreamParamsTest(unittest.TestCase):
         xy_tol = cs["general_goal_checker"]["xy_goal_tolerance"]
         self.assertGreater(fp["min_lookahead_dist"], xy_tol)
 
+    def test_near_goal_speed_floor_clears_the_smoother_deadband(self):
+        # Inside approach_velocity_scaling_dist RPP scales linear speed down
+        # to min_approach_linear_velocity; velocity_smoother then zeroes any
+        # |v| below deadband_velocity[0]. A floor under the deadband leaves
+        # the robot parked just outside the goal tolerance, turning in place
+        # while AMCL's heading-dependent estimate swings it across the
+        # boundary (live A/B 2026-10-10: floor 0.05 -> median 74 s, ~2000
+        # deg per goal; floor 0.10 -> 16 s, ~480 deg, no command zeroed).
+        result = prior_map_costmap_overlay(self.params)
+        fp = result["controller_server"]["ros__parameters"]["FollowPath"]
+        deadband = result["velocity_smoother"]["ros__parameters"]["deadband_velocity"][0]
+        self.assertGreater(fp["min_approach_linear_velocity"], deadband)
+
     def test_footprint_is_sim_parity_not_hardware_envelope(self):
         # The upstream 0.95 m footprint models the REAL robot's rear
         # overhang; the sim body spans x [-0.38, +0.13] (robot.urdf base

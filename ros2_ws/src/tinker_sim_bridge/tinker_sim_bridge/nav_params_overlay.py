@@ -86,6 +86,13 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(planner, dict):
         planner["tolerance"] = 0.6
 
+    amcl = result.get("amcl", {}).get("ros__parameters")
+    if isinstance(amcl, dict):
+        # AMCL localizes on a surface-only copy of the arena map, served by
+        # its own map_server on this topic (see amcl_map.py); the costmaps
+        # keep the solid map on /map.
+        amcl["map_topic"] = "amcl_map"
+
     # Inflation, split by costmap (2026-08-28 doorway-wedge debug):
     #
     # GLOBAL 0.22: at 0.30/0.35 m (inscribed radius 0.26) a robot parked
@@ -127,6 +134,10 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # fix), while the actual sim body passes easily. Overlay a sim-true
     # envelope with margin (0.65 x 0.54): rear -0.45, front +0.20, half-
     # width 0.27 (covers wheels). Upstream file stays hardware's.
+    # NOTE: navigation_dwb_launch.py then overwrites every footprint key from
+    # the robot profile (RobotField('base.footprint')), so the value that
+    # actually reaches the costmaps is tinker_robot_config's tinker2_sim
+    # profile -- keep the two equal (tests/test_sim_robot_profile.py).
     sim_footprint = "[ [0.20, 0.27], [0.20, -0.27], [-0.45, -0.27], [-0.45, 0.27] ]"
     for costmap in ("local_costmap", "global_costmap"):
         node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
@@ -209,7 +220,14 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
             # velocity, so the pivot actually executes.
             "rotate_to_heading_angular_vel": 0.6,
             "max_angular_vel": 0.6,
-            "min_approach_linear_velocity": 0.05,
+            # Must exceed velocity_smoother's deadband_velocity (0.08):
+            # near the goal RPP scales linear down to this floor, and a
+            # command under the deadband is zeroed, so the base parks just
+            # outside the tolerance and spins while AMCL's heading-
+            # dependent estimate drags it back and forth across the
+            # boundary (2026-10-10 live A/B: 0.05 -> median 74 s and
+            # ~2000 deg per goal; 0.10 -> 16 s, ~480 deg).
+            "min_approach_linear_velocity": 0.10,
             "approach_velocity_scaling_dist": 0.6,
             "max_robot_pose_search_dist": 10.0,
             "allow_reversing": False,
