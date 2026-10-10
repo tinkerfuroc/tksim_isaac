@@ -19,15 +19,15 @@
       "asset_uri": "artifacts/people/sobits/d29ee5ef3b71bcbf7013ec61785a584b162bfda83a322ecce0a6a481180e531a/person_standing/person.usd",
       "pose": {
         "xyz": [
-          1.8,
-          -3.85,
+          1.52,
+          -4.0,
           0.0
         ],
         "quaternion_xyzw": [
           0.0,
           0.0,
-          -0.381912,
-          0.924199
+          0.916742,
+          0.39948
         ]
       }
     }

@@ -45,6 +45,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -62,6 +63,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: Wrist camera render + TF pose preset, shared by the sim and bridge
 #: stages (see tinker_sim_isaac.head_camera_aim, cam-stand section).
 WRIST_CAMERA_AIM = "cam-stand"
+# Head camera: level-forward render correction (tinker_sim_isaac.head_camera_aim).
+# The bridge stage gets the same value so the camera_color_optical_frame alias
+# TF carries the same rotation as the pixels (2026-10-01: without it every
+# map-frame head detection projected UP -- persons at z = 2-5 m, the approach
+# target at the robot's own position).
+HEAD_CAMERA_AIM = "level-forward"
 TINKER_WS = "/home/tinker/tk25_ws"
 CENSUS_SCRIPT = str(REPO_ROOT / "tools" / "gpsr_interface_census.py")
 
@@ -260,7 +267,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
         "CUDA_VISIBLE_DEVICES": str(cfg.sim_gpu),
         "TINKER_SIM_CAMERA_HZ": "12",
         "TINKER_SIM_CONTROL_HZ": "60",
-        "TINKER_SIM_HEAD_CAMERA_AIM": "level-forward",
+        "TINKER_SIM_HEAD_CAMERA_AIM": HEAD_CAMERA_AIM,
         # Same defect class as the head aim, same sanctioned parity break:
         # the description mounts the wrist camera at a placeholder flange
         # origin -- 90 deg off the tool approach axis (ceiling frames at
@@ -344,6 +351,8 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             # The bridge launches rewrite the wrist camera joint in
             # robot_description under cam-stand; must match the sim stage.
             "TINKER_SIM_WRIST_CAMERA_AIM": WRIST_CAMERA_AIM,
+            # ... and the head camera's optical alias TF (gpsr.launch.py).
+            "TINKER_SIM_HEAD_CAMERA_AIM": HEAD_CAMERA_AIM,
         }),
         "cwd": REPO_ROOT,
         "gate": "bridge",
@@ -382,6 +391,31 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                     # detector downstream fails. 1.5s pairs the newest color
                     # with a slightly older depth — fine for static-scene
                     # detection, and sim-only.
+                    "-p", "sync_slop_sec:=1.5",
+                ],
+            ),
+            # The arm-mounted RealSense. Every RealSense-path consumer
+            # (generalist_node / yolo_seg_node "camera: realsense", the
+            # camera_compat_bridge's wrist leg) reads frames through the
+            # SERVICE endpoint '/wrist_camera_server', exactly like the head
+            # camera goes through '/head_camera_server' -- the sim's
+            # /camera/xarm_camera/* topics alone are never subscribed by
+            # them. Without this second server every table-grasp detection
+            # failed with "No realsense camera data within sync threshold"
+            # and the grasp always fell to the referee handoff (5-run sim
+            # battery, 2026-09-25). Topic names are the sim's wrist_camera
+            # spec (simulation/sensors/hardware-parity.json), which mirrors
+            # the real D435 driver's names.
+            _ros_argv(
+                sources=vision_sources,
+                argv=[
+                    "ros2", "run", "camera_server", "camera_server_node", "--ros-args",
+                    "-r", "__node:=wrist_camera_server",
+                    "-p", "use_sim_time:=true",
+                    "-p", "color_topic:=/camera/xarm_camera/color/image_raw",
+                    "-p", "depth_topic:=/camera/xarm_camera/aligned_depth_to_color/image_raw",
+                    "-p", "color_info_topic:=/camera/xarm_camera/color/camera_info",
+                    "-p", "depth_info_topic:=/camera/xarm_camera/aligned_depth_to_color/camera_info",
                     "-p", "sync_slop_sec:=1.5",
                 ],
             ),
@@ -537,12 +571,25 @@ def _census_argv() -> list[str]:
     return _ros_argv(sources=CENSUS_SOURCES, argv=[sys.executable, CENSUS_SCRIPT])
 
 
+#: One census probe may not outlive this. 2026-09-30: with DDS discovery
+#: broken by stale Fast-DDS shared-memory files a census hung for 30+ min,
+#: so _wait_for_gate never reached its own STAGE_READY_TIMEOUT_S deadline and
+#: the half-up stack held the GPU indefinitely.
+CENSUS_TIMEOUT_S = 120.0
+
+
 def _run_census() -> tuple[int, str]:
-    proc = subprocess.run(
-        _census_argv(),
-        capture_output=True, text=True, cwd=REPO_ROOT,
-        env=_full_env(_preamble_env({})),
-    )
+    try:
+        proc = subprocess.run(
+            _census_argv(),
+            capture_output=True, text=True, cwd=REPO_ROOT,
+            env=_full_env(_preamble_env({})),
+            timeout=CENSUS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = (exc.stdout or b"")
+        out = out.decode(errors="replace") if isinstance(out, bytes) else str(out)
+        return 124, out + f"\ncensus timed out after {CENSUS_TIMEOUT_S:.0f}s"
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -562,6 +609,27 @@ def _wait_for_gate(gate: str) -> None:
     raise RuntimeError(
         f"gate {gate!r} not ready after {STAGE_READY_TIMEOUT_S:.0f}s; census output:\n{last_output}"
     )
+
+
+_DIED_RE = re.compile(r"\[([^\]]+)\]: process has died \[pid \d+, exit code (-?\d+)")
+
+
+def _check_stage_deaths(run_dir: Path, prefix: str) -> None:
+    """Fail the stage if a launched child process already died.
+
+    The census can report a gate ready while one of the stage's ros2-launch
+    children is dead (2026-09-30/10-01: generalist_node exited 1 on
+    "No module named 'torch'" yet gate 'vision' passed, so every GPSR run
+    hung in the BT's wait_for_service). Teardown has not started at gate
+    time, so any "process has died" line in the stage's logs is a failure.
+    """
+    dead = []
+    for log_path in sorted(run_dir.glob(f"{prefix}*.log")):
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        for match in _DIED_RE.finditer(text):
+            dead.append(f"{match.group(1)} (exit code {match.group(2)}) in {log_path.name}")
+    if dead:
+        raise RuntimeError("stage process died during bring-up: " + "; ".join(dead))
 
 
 def _stage_procs(cmd) -> list[list[str]]:
@@ -608,6 +676,7 @@ def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
                 pgid_path.write_text(str(os.getpgid(proc.pid)) + "\n", encoding="utf-8")
             print(f"stage {stage['name']} launched; waiting on gate {stage['gate']!r}...")
             _wait_for_gate(stage["gate"])
+            _check_stage_deaths(run_dir, f"{idx:02d}-{stage['name']}")
             print(f"stage {stage['name']} ready")
     except BaseException as exc:
         # Any failure mid bring-up (a gate timeout's RuntimeError, a Popen

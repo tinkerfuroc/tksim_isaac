@@ -111,6 +111,11 @@ class RosStandardGateway:
     API. All actuator commands arrive through one JointState topic.
     """
 
+    #: Referee actuation topics; must match the decision tree's
+    #: BtNode_RefereeHandObject (tk25_decision GPSR/small_trees.py).
+    REFEREE_HAND_OBJECT_TOPIC = "/sim/referee/hand_object"
+    REFEREE_HAND_OBJECT_RESULT_TOPIC = "/sim/referee/hand_object_result"
+
     def __init__(
         self,
         backend: Any,
@@ -349,6 +354,19 @@ class RosStandardGateway:
         safety_subscription = self.node.create_subscription(
             Bool, "/sim/hardware/safety_stop", self._safety_stop, safety_qos
         )
+        # Referee actuation (GPSR ex_machina handover): the decision tree's
+        # BtNode_RefereeHandObject publishes the target object's SEMANTIC name
+        # here right before its close-gripper step; the backend teleports the
+        # (physical, rendered) object between the fingers so the close grips a
+        # real body and placed()/delivered() gates verify honestly. The result
+        # is acked as a JSON String on the _result topic (reliable, like the
+        # decision side's QoS).
+        self.referee_result_pub = self.node.create_publisher(
+            String, self.REFEREE_HAND_OBJECT_RESULT_TOPIC, reliable
+        )
+        referee_subscription = self.node.create_subscription(
+            String, self.REFEREE_HAND_OBJECT_TOPIC, self._referee_hand_object, reliable
+        )
         # Inbound messages are taken on the simulation thread, inside
         # spin_once(), straight from the DDS readers (see _take_pending).  A
         # private executor thread used to do this, but it could only take one
@@ -361,6 +379,7 @@ class RosStandardGateway:
         self._intake_subscriptions = (
             (command_subscription, self._joint_command),
             (safety_subscription, self._safety_stop),
+            (referee_subscription, self._referee_hand_object),
         )
         self._executor = None
         self._executor_thread = None
@@ -496,6 +515,34 @@ class RosStandardGateway:
         except Exception as error:
             self._last_command_error = str(error)
             self.node.get_logger().error(f"rejected joint command: {error}")
+
+    def _referee_hand_object(self, message) -> None:
+        """Queue a handover request; applied on the simulation thread in
+        spin_once() (same FIFO as commands/safety, so it can never interleave
+        with a physics step)."""
+        try:
+            entity = str(getattr(message, "data", "")).strip()
+            self._incoming_events.put(("hand_object", entity))
+        except Exception as error:
+            self._last_command_error = str(error)
+            self.node.get_logger().error(f"rejected hand_object request: {error}")
+
+    def _handle_hand_object(self, entity: str) -> dict:
+        """Run the backend teleport and publish the JSON ack. Never raises:
+        a broken handover must not kill the sim loop -- it acks ok:false and
+        the decision node falls through to close-on-air."""
+        result: dict = {"ok": False, "entity": str(entity), "error": "empty entity"}
+        if entity:
+            try:
+                result = dict(self.backend.hand_object_to_gripper(str(entity)))
+            except Exception as error:  # noqa: BLE001 - never kill the sim loop
+                result = {"ok": False, "entity": str(entity), "error": str(error)}
+        ack = self._String()
+        ack.data = json.dumps(result, sort_keys=True)
+        self.referee_result_pub.publish(ack)
+        if not result.get("ok"):
+            self.node.get_logger().error(f"hand_object failed: {result}")
+        return result
 
     def _safety_stop(self, message) -> None:
         try:
@@ -1024,6 +1071,9 @@ class RosStandardGateway:
                     self.node.get_logger().error(
                         f"failed to apply safety-stop: {error}"
                     )
+                continue
+            if event_type == "hand_object":
+                self._handle_hand_object(str(payload or ""))
                 continue
             command, epoch, snapshot, received_at = payload
             _st = self._spin_stats()

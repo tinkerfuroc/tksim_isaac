@@ -338,6 +338,184 @@ def resolve_use_fabric(
     return use_fabric
 
 
+SCENARIO_SCOPE = "/World/Scenario"
+
+
+def normalize_handover_name(name: str) -> str:
+    """Semantic object name -> bench object key: lower-case, spaces/hyphens
+    collapsed to single underscores ("Sugar Box" / "sugar-box" -> "sugar_box")."""
+    return "_".join(str(name).strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def resolve_handover_entity(
+    request: str,
+    scenario_children: Iterable[str],
+    *,
+    scenario_present: bool = True,
+) -> dict[str, str]:
+    """Resolve a referee handover request to ONE /World/Scenario prim path.
+
+    Pure (no stage access) so it is unit-testable: ``scenario_children`` are the
+    prim paths directly under ``/World/Scenario``. Accepts, in order:
+
+    * a full prim path (``/World/Scenario/cmd_spam_0``) -- taken verbatim;
+    * a bare entity id (``cmd_spam_0``) -- must be an existing scenario child;
+    * a SEMANTIC object name (``spam``, ``sugar box``, ``Sugar_Box``) -- must
+      match exactly one bench entity ``cmd_<key>_<n>`` whose ``<key>`` equals
+      the normalised name (``tools/gpsr_spawn.py`` ids are
+      ``cmd_{object_key}_{index}``). The match is on the WHOLE key, never a
+      prefix, so ``soup`` cannot pick ``cmd_soup_can_0``.
+
+    Resolution order per candidate (fix4b run 003: "soup" used to hit the
+    BASE-scenario child ``/World/Scenario/soup`` on the kitchen table instead
+    of the bench-spawned ``cmd_soup_0`` in front of the robot): the semantic
+    match against bench entities ``cmd_<key>_<n>`` comes FIRST; only when no
+    bench entity carries the key is a bare id / base-scenario child with that
+    exact name used.
+
+    ``request`` may be a ``'|'``-separated candidate list
+    (``"pudding_box|banana|sugar_box"``, fix4b run 004: the tree guessed one
+    category member that was not on the table): candidates are resolved in
+    order and the first that exists wins; the result then also carries
+    ``"name"`` (which candidate it was).
+
+    Returns ``{"path": ..., "name": ...}`` or ``{"error": ...}`` --
+    ``ambiguous: ...`` when two or more bench entities carry the key (never
+    pick one silently; with a candidate list the next candidate is tried),
+    ``no entity ...`` when none does. The decision tree only knows semantic
+    names; entity ids stay a sim/bench detail.
+    """
+    import re
+
+    candidates = parse_handover_candidates(request)
+    if not candidates:
+        return {"error": "empty entity"}
+    by_name = {path.rsplit("/", 1)[-1]: path for path in scenario_children}
+    pattern = re.compile(r"^cmd_(?P<key>.+)_(?P<index>\d+)$")
+
+    def _one(candidate: str) -> dict[str, str]:
+        if candidate.startswith("/"):
+            return {"path": candidate}
+        if not scenario_present:
+            return {"error": f"no {SCENARIO_SCOPE} scope in stage"}
+        key = normalize_handover_name(candidate)
+        matches = sorted(
+            path
+            for name, path in by_name.items()
+            if (m := pattern.match(name)) is not None and m.group("key") == key
+        )
+        if len(matches) == 1:
+            return {"path": matches[0]}
+        if len(matches) > 1:
+            return {"error": f"ambiguous: {len(matches)} entities match '{key}' ({matches})"}
+        if candidate in by_name:
+            return {"path": by_name[candidate]}
+        return {"error": f"no entity for '{candidate}' under {SCENARIO_SCOPE}"}
+
+    errors: list[str] = []
+    for candidate in candidates:
+        resolved = _one(candidate)
+        if "path" in resolved:
+            return {"path": resolved["path"], "name": candidate}
+        errors.append(resolved["error"])
+    if len(candidates) == 1:
+        return {"error": errors[0]}
+    return {"error": "no candidate resolved: " + "; ".join(errors)}
+
+
+def parse_handover_candidates(request: object) -> list[str]:
+    """Split a ``/sim/referee/hand_object`` payload into ordered, non-empty
+    candidates (``"a|b|c"`` -> ``["a", "b", "c"]``; a plain name is one)."""
+    return [part.strip() for part in str(request or "").split("|") if part.strip()]
+
+
+class RefereeHold:
+    """Pure state machine for the referee hand-off hold (unit-tested, no ROS/USD).
+
+    After ``attach(path, drive_target)`` the object is welded to the gripper
+    by a per-physics-step KINEMATIC FOLLOW (``follow_pose``: TCP pose (+) the
+    offset captured at hand-off, velocity zeroed; the backend writes it in
+    ``_referee_hold_follow`` before every physics step). A runtime PhysX
+    FixedJoint was rejected: link_tcp is a fabric-simulated articulation link
+    whose USD transform is stale under fabric-on, so joint local frames
+    authored from USD would be wrong, and adding a joint mid-simulation
+    re-parses the scene under a live tensor SimulationView. The weld is released when the commanded
+    ``drive_joint`` target drops by at least ``OPEN_DELTA_RAD`` below the most
+    closed target commanded since the attach (larger = more closed on this
+    gripper): the tree's close right after the hand-off only raises that peak,
+    a keepalive re-sending the same target changes nothing, and the later
+    open (place / deliver) crosses the delta. Works whether the hand-off
+    happened with the gripper open or already closed. ``clear()`` is the
+    deleted-object / explicit-release path.
+    """
+
+    OPEN_DELTA_RAD = 0.05
+
+    def __init__(self) -> None:
+        self.path: str | None = None
+        self.peak: float | None = None
+        # Object pose in the TCP frame captured at attach (kinematic follow).
+        self.local_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.local_quaternion_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+
+    @property
+    def held(self) -> bool:
+        return self.path is not None
+
+    def attach(
+        self,
+        path: str,
+        drive_target: float | None,
+        *,
+        tcp_pose: tuple[Iterable[float], Iterable[float]] | None = None,
+        object_pose: tuple[Iterable[float], Iterable[float]] | None = None,
+    ) -> None:
+        """Start holding *path*. With both ``tcp_pose`` and ``object_pose``
+        (``(xyz, quat_xyzw)`` world poses at hand-off) the object's pose in
+        the TCP frame is captured for ``follow_pose``; otherwise the object
+        rides exactly at the TCP origin with the TCP's orientation."""
+        self.path = str(path)
+        self.peak = None if drive_target is None else float(drive_target)
+        self.local_position = (0.0, 0.0, 0.0)
+        self.local_quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)
+        if tcp_pose is not None and object_pose is not None:
+            local_position, local_quaternion = pose_in_frame(
+                tuple(float(v) for v in tcp_pose[0]),
+                tuple(float(v) for v in tcp_pose[1]),
+                tuple(float(v) for v in object_pose[0]),
+                tuple(float(v) for v in object_pose[1]),
+            )
+            self.local_position = tuple(float(v) for v in local_position)  # type: ignore[assignment]
+            self.local_quaternion_xyzw = tuple(float(v) for v in local_quaternion)  # type: ignore[arg-type,assignment]
+
+    def follow_pose(
+        self, tcp_position: Iterable[float], tcp_quaternion_xyzw: Iterable[float]
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """World pose the held object must take for the current TCP pose
+        (TCP pose (+) the offset captured at attach); None when not held."""
+        if not self.held:
+            return None
+        return pose_from_frame(
+            tcp_position, tcp_quaternion_xyzw, self.local_position, self.local_quaternion_xyzw
+        )
+
+    def on_drive_target(self, target: float) -> bool:
+        """Feed a commanded drive_joint target; True when the hold must be released."""
+        if not self.held:
+            return False
+        target = float(target)
+        if self.peak is None or target > self.peak:
+            self.peak = target
+            return False
+        return target < self.peak - self.OPEN_DELTA_RAD
+
+    def clear(self) -> str | None:
+        path, self.path, self.peak = self.path, None, None
+        self.local_position = (0.0, 0.0, 0.0)
+        self.local_quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)
+        return path
+
+
 # Task #20 (gripper creep/retention): the hardware-scale torque-cap bracket
 # (validation/gripper_close_probe.py --drive-effort-limit/--follower-effort-
 # limit, $TMP/hwcap-result.md + hwcap2-result.md) swept drive+follower joint
@@ -802,6 +980,31 @@ def pose_in_frame(
     return local_position, local_quaternion
 
 
+def pose_from_frame(
+    frame_position: Iterable[float],
+    frame_quaternion_xyzw: Iterable[float],
+    local_position: Iterable[float],
+    local_quaternion_xyzw: Iterable[float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Inverse of ``pose_in_frame``: world pose of a child whose pose in
+    *frame* is ``(local_position, local_quaternion_xyzw)`` (``frame (+) local``).
+    The quaternion is renormalized so a per-step follow never drifts."""
+    frame_position = tuple(float(value) for value in frame_position)
+    frame_quaternion = tuple(float(value) for value in frame_quaternion_xyzw)
+    offset = rotate_vector_xyzw(
+        frame_quaternion, tuple(float(value) for value in local_position)
+    )
+    world_position = tuple(f + o for f, o in zip(frame_position, offset))
+    world_quaternion = _quaternion_multiply_xyzw(
+        frame_quaternion, tuple(float(value) for value in local_quaternion_xyzw)
+    )
+    norm = math.sqrt(sum(value * value for value in world_quaternion)) or 1.0
+    return (
+        world_position,  # type: ignore[return-value]
+        tuple(value / norm for value in world_quaternion),  # type: ignore[return-value]
+    )
+
+
 class IsaacWholeRobotBackend:
     """CPU-PhysX articulation controlled only by standard JointState commands."""
 
@@ -1196,6 +1399,9 @@ class IsaacWholeRobotBackend:
             ),
             flush=True,
         )
+        # Kept for the referee handover write path: a USD xform write is
+        # physics-effective only under fabric-off (see hand_object_to_gripper).
+        self._use_fabric = _use_fabric
         if _spawn_yaw_set:
             # Boot marker so a live GPU run can tell, without reading source,
             # which spawn-yaw authoring path ran and what fabric state it ran
@@ -3183,6 +3389,9 @@ class IsaacWholeRobotBackend:
                     old_drive_target = getattr(self, "_drive_command_target", None)
                     new_drive_target = float(command.positions[offset])
                     self._drive_command_target = new_drive_target
+                    # Every packet (repeats included) feeds the referee hold;
+                    # a commanded open releases the kinematic follow.
+                    self._referee_hold_on_drive_target(new_drive_target)
                     if new_drive_target != old_drive_target:
                         self._log_gripper_command_target(
                             old_drive_target,
@@ -3983,6 +4192,10 @@ class IsaacWholeRobotBackend:
         if _t is not None:
             _sp["write_data"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
+        # Referee hand-off retention: pin the held object to the TCP right
+        # before the solver runs (no-op unless a hand-off is being held).
+        if getattr(self, "_referee_hold", None) is not None:
+            self._referee_hold_follow()
         self._step_simulation()
         if _t is not None:
             _sp["physx"] += _t() - _sp["_mark"]
@@ -4681,6 +4894,410 @@ class IsaacWholeRobotBackend:
         # singular `object` field are unchanged for existing consumers.
         states.extend(self._spawned_object_states())
         return states
+
+    # ------------------------------------------------------------------
+    # Referee actuation (GPSR ex_machina handover)
+    # ------------------------------------------------------------------
+
+    def _resolve_handover_entity(self, entity: str) -> dict[str, str]:
+        """Stage-backed wrapper around ``resolve_handover_entity``."""
+        request = str(entity or "").strip()
+        if not request or request.startswith("/"):
+            return resolve_handover_entity(request, ())
+        try:
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+            scenario = stage.GetPrimAtPath(SCENARIO_SCOPE)
+            present = bool(scenario) and scenario.IsValid()
+            children = (
+                [child.GetPath().pathString for child in scenario.GetChildren()]
+                if present
+                else []
+            )
+        except (AttributeError, ImportError, RuntimeError, TypeError) as error:
+            return {"error": f"stage unavailable: {error}"}
+        return resolve_handover_entity(request, children, scenario_present=present)
+
+    def _tcp_world_position(self) -> list[float] | None:
+        """World xyz of the ``link_tcp`` articulation body (the frame the
+        manipulation stack's TF ``link_tcp`` and ``_robot_truth_state``'s
+        ``tcp_pose`` both report), or None when the robot has no such body."""
+        data = self._robot.data
+        body_names = tuple(getattr(data, "body_names", ()))
+        if "link_tcp" not in body_names:
+            return None
+        index = body_names.index("link_tcp")
+        values = self._torch_value(data.body_pos_w)[0, index].detach().cpu().tolist()
+        return [float(value) for value in values[:3]]
+
+    def _teleport_rigid_body(self, path: str, position: Iterable[float]) -> str:
+        """Move a free rigid body to ``position`` (orientation kept, velocity
+        zeroed) WITHOUT leaving a tensor view behind. Returns the write method.
+
+        1. USD authoring (always): set the prim's ``xformOp:translate`` and the
+           ``UsdPhysics.RigidBodyAPI`` velocity attributes. Under fabric-OFF
+           (``TINKER_SIM_USE_FABRIC=0`` / non-zero ``TINKER_SIM_SPAWN_YAW``) PhysX
+           picks the change up on the next step -- view-free, so a later
+           ``/delete_entity`` of this spawn cannot invalidate the shared
+           SimulationView (the 2026-08-31 clear-crash class that
+           ``_heal_detached_scenario_bodies`` / ``_maybe_recover_simulation_view``
+           document).
+        2. Tensor-view write (fabric-ON only): the USD write is a physics no-op
+           for a body already bound to PhysX under fabric (the
+           ``/set_entity_state`` defect run_sim patches), so the pose is ALSO
+           pushed through a create-use-drop rigid-body view, exactly like the
+           original f0dff4c/06d59c7 referee path. A dropped view can still leave
+           a backend registration behind (measured), so this branch relies on
+           ``_maybe_recover_simulation_view`` if the spawn is deleted later;
+           it is the documented fallback, not the preferred path.
+        """
+        import omni.usd
+        from pxr import Gf, UsdGeom, UsdPhysics
+
+        xyz = [float(value) for value in tuple(position)[:3]]
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            raise RuntimeError(f"no prim at {path}")
+        xformable = UsdGeom.Xformable(prim)
+        translate_op = None
+        for op in xformable.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+        if translate_op is not None:
+            if translate_op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                translate_op.Set(Gf.Vec3f(*xyz))
+            else:
+                translate_op.Set(Gf.Vec3d(*xyz))
+        else:
+            # physicsUtils inserts the translate FIRST in xformOpOrder, keeping
+            # the orient/scale composition a plain AddTranslateOp would break.
+            from omni.physx.scripts import physicsUtils
+
+            physicsUtils.set_or_add_translate_op(xformable, Gf.Vec3f(*xyz))
+        rigid_body = UsdPhysics.RigidBodyAPI(prim)
+        for attr in (rigid_body.GetVelocityAttr(), rigid_body.GetAngularVelocityAttr()):
+            try:
+                attr.Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            except (AttributeError, RuntimeError, TypeError):
+                pass  # attribute absent on this asset; PhysX keeps its own zero
+        if not getattr(self, "_use_fabric", True):
+            return "usd"
+
+        from isaaclab_physx.physics import PhysxManager
+        import numpy as _np
+        import warp as _wp
+
+        quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)
+        try:
+            from omni.physx import get_physx_interface
+
+            result = get_physx_interface().get_rigidbody_transformation(path)
+            current = (
+                self._quaternion_xyzw_from_physx(result.get("rotation"))
+                if result.get("ret_val")
+                else None
+            )
+            if current is not None:
+                quaternion_xyzw = current
+        except (AttributeError, ImportError, RuntimeError, TypeError):
+            pass
+        view = PhysxManager.get_physics_sim_view().create_rigid_body_view(path)
+        if view is None or int(view.count) == 0:
+            raise RuntimeError("no rigid-body view for entity")
+        try:
+            device = getattr(view.get_transforms(), "device", "cpu")
+            transforms = _wp.array(
+                _np.asarray([[*xyz, *quaternion_xyzw]], dtype=_np.float32),
+                dtype=_wp.float32,
+                device=device,
+            )
+            velocities = _wp.array(
+                _np.zeros((1, 6), dtype=_np.float32), dtype=_wp.float32, device=device
+            )
+            indices = _wp.array(
+                _np.asarray([0], dtype=_np.uint32), dtype=_wp.uint32, device=device
+            )
+            view.set_transforms(transforms, indices)
+            view.set_velocities(velocities, indices)
+        finally:
+            del view  # create-use-drop: never cache a view on a deletable spawn
+        return "usd+view"
+
+    def hand_object_to_gripper(self, entity: str) -> dict[str, object]:
+        """Referee actuation: teleport a spawned object between the gripper
+        fingers (``link_tcp`` world position), orientation kept, velocity zeroed.
+
+        Models real-robot referee semantics: when the GPSR referee flow's
+        close-gripper step runs, a human has placed a REAL object in the
+        gripper -- so the sim places the real (physical, rendered) object there
+        and lets the actual gripper close on it, and the later placed()/
+        delivered() gates verify honestly. ``entity`` is whatever the decision
+        tree publishes on ``/sim/referee/hand_object`` (semantic name, bare id
+        or prim path; see ``resolve_handover_entity``).
+
+        Returns the ack payload the gateway publishes as JSON on
+        ``/sim/referee/hand_object_result``: ``{"ok": true, "entity": <prim
+        path>, "xyz": [x, y, z]}`` or ``{"ok": false, "entity": <request or
+        path>, "error": <reason>}``. Never raises. Called on the simulation
+        thread (gateway ``spin_once``), same thread as stepping, so the pose
+        write cannot race the solver; the truth stream (``_iter_spawned_bodies``,
+        IPhysx) sees the new pose on the next frame.
+        """
+        request = str(entity or "").strip()
+        resolved = self._resolve_handover_entity(request)
+        if "error" in resolved:
+            return {"ok": False, "entity": request, "error": resolved["error"]}
+        path = resolved["path"]
+        tcp = self._tcp_world_position()
+        if tcp is None:
+            return {"ok": False, "entity": path, "error": "robot has no link_tcp body"}
+        try:
+            method = self._teleport_rigid_body(path, tcp)
+        except (AttributeError, ImportError, RuntimeError, TypeError, ValueError) as error:
+            return {"ok": False, "entity": path, "error": f"pose write failed: {error}"}
+        xyz = [round(float(value), 4) for value in tcp[:3]]
+        # Retention (2026-09-30 fix5 runs 003/004: the handed banana fell as
+        # soon as the arm lifted): weld the object to the TCP until the tree
+        # commands the gripper open. Never fails the ack.
+        self._referee_hold_attach(path, tcp)
+        now = self._referee_hold_now()
+        print(
+            json.dumps(
+                {"referee_hand_object": path, "xyz": xyz, "method": method, "t": now},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return {"ok": True, "entity": path, "xyz": xyz}
+
+    # ------------------------------------------------ referee hand-off hold
+
+    def _referee_hold_now(self) -> float | None:
+        try:
+            return round(float(self.simulation_time), 3)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def _log_referee_hold(self, event: str, path: str | None, **extra: object) -> None:
+        payload: dict[str, object] = {
+            "referee_hold": event,
+            "path": path,
+            "t": self._referee_hold_now(),
+        }
+        payload.update(extra)
+        print(json.dumps(payload, sort_keys=True), flush=True)
+
+    def _tcp_world_pose(
+        self,
+    ) -> tuple[list[float], list[float]] | None:
+        """``([x, y, z], [qx, qy, qz, qw])`` of the ``link_tcp`` body, or None."""
+        try:
+            data = self._robot.data
+            body_names = tuple(getattr(data, "body_names", ()))
+            if "link_tcp" not in body_names:
+                return None
+            index = body_names.index("link_tcp")
+            position = self._torch_value(data.body_pos_w)[0, index].detach().cpu().tolist()
+            quaternion = self._torch_value(data.body_quat_w)[0, index].detach().cpu().tolist()
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            return None
+        if len(position) < 3 or len(quaternion) != 4:
+            return None
+        return [float(v) for v in position[:3]], [float(v) for v in quaternion]
+
+    def _rigid_body_world_pose(
+        self, path: str
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """View-free IPhysx read of a rigid body's world pose, or None."""
+        try:
+            from omni.physx import get_physx_interface
+
+            result = get_physx_interface().get_rigidbody_transformation(path)
+        except (AttributeError, ImportError, RuntimeError, TypeError):
+            return None
+        if not result or not result.get("ret_val"):
+            return None
+        position = tuple(float(v) for v in tuple(result.get("position", ()))[:3])
+        quaternion = self._quaternion_xyzw_from_physx(result.get("rotation"))
+        if len(position) != 3 or quaternion is None:
+            return None
+        return position, quaternion  # type: ignore[return-value]
+
+    def _referee_hold_attach(self, path: str, tcp_position: Iterable[float]) -> bool:
+        """Start the kinematic follow of *path* (just teleported to the TCP).
+
+        The offset is captured from the TCP pose and the object's orientation
+        (kept by the teleport) so the object keeps its hand-off pose relative
+        to the gripper. Never raises: a failed attach logs and leaves the
+        object free (the old fall-through behavior)."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None:
+            hold = self._referee_hold = RefereeHold()
+        if hold.held:
+            self.release_referee_hold("re_handoff")
+        tcp_pose = self._tcp_world_pose()
+        if tcp_pose is None:
+            self._log_referee_hold("attach_failed", path, error="no link_tcp pose")
+            return False
+        body_pose = self._rigid_body_world_pose(path)
+        object_quaternion = body_pose[1] if body_pose is not None else tuple(tcp_pose[1])
+        object_pose = (tuple(float(v) for v in tuple(tcp_position)[:3]), object_quaternion)
+        drive_target = getattr(self, "_drive_command_target", None)
+        hold.attach(path, drive_target, tcp_pose=tcp_pose, object_pose=object_pose)
+        self._referee_hold_view = None
+        self._referee_hold_failures = 0
+        self._log_referee_hold(
+            "attach",
+            path,
+            drive_target=drive_target,
+            offset_xyz=[round(v, 4) for v in hold.local_position],
+            orientation_source="physx" if body_pose is not None else "tcp",
+        )
+        return True
+
+    def _referee_hold_on_drive_target(self, target: float) -> None:
+        """Feed one commanded drive_joint target (every packet, including
+        repeats); release the hold when the gripper is commanded open."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is not None and hold.held and hold.on_drive_target(target):
+            self.release_referee_hold("gripper_open", drive_target=float(target))
+
+    def release_referee_hold(self, reason: str, **extra: object) -> str | None:
+        """Stop following (gripper opened, object deleted, scoped reset):
+        zero the body's velocity once so it drops/settles from rest, drop the
+        cached write view, log one release line. Returns the released path."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None or not hold.held:
+            return None
+        path = hold.clear()
+        if reason not in ("deleted", "prim_gone"):
+            try:
+                self._write_held_body_pose(path, None, None)
+            except Exception:  # noqa: BLE001 - release must never fail
+                pass
+        self._referee_hold_view = None
+        self._log_referee_hold("release", path, reason=reason, **extra)
+        return path
+
+    def release_referee_hold_for(self, entity: object) -> str | None:
+        """Release when *entity* (prim path or bare name, as a
+        ``/delete_entity`` request carries it) names the held object."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None or not hold.held:
+            return None
+        name = str(entity or "").strip()
+        if name and (name == hold.path or name == str(hold.path).rsplit("/", 1)[-1]):
+            return self.release_referee_hold("deleted")
+        return None
+
+    def _write_held_body_pose(
+        self,
+        path: str,
+        position: Iterable[float] | None,
+        quaternion_xyzw: Iterable[float] | None,
+    ) -> None:
+        """Pose + zero-velocity write for the held body (pose None = velocity
+        only). Fabric-OFF: USD translate/orient + RigidBodyAPI velocity attrs
+        (PhysX ingests them next step; view-free, like _teleport_rigid_body).
+        Fabric-ON: USD writes are physics no-ops for a bound body, so a single
+        rigid-body view is created at the first follow step and REUSED for the
+        whole hold (never one view per step: every created view leaves a
+        backend registration behind), then dropped at release."""
+        import omni.usd
+
+        prim = omni.usd.get_context().get_stage().GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            raise RuntimeError(f"no prim at {path}")
+        if not getattr(self, "_use_fabric", True):
+            from pxr import Gf, UsdGeom, UsdPhysics
+
+            if position is not None:
+                xyz = [float(v) for v in tuple(position)[:3]]
+                qx, qy, qz, qw = (float(v) for v in quaternion_xyzw)  # type: ignore[union-attr]
+                xformable = UsdGeom.Xformable(prim)
+                ops = {op.GetOpType(): op for op in xformable.GetOrderedXformOps()}
+                translate_op = ops.get(UsdGeom.XformOp.TypeTranslate)
+                orient_op = ops.get(UsdGeom.XformOp.TypeOrient)
+                if translate_op is None or orient_op is None:
+                    from omni.physx.scripts import physicsUtils
+
+                    if translate_op is None:
+                        physicsUtils.set_or_add_translate_op(xformable, Gf.Vec3f(*xyz))
+                    if orient_op is None:
+                        physicsUtils.set_or_add_orient_op(xformable, Gf.Quatf(qw, qx, qy, qz))
+                if translate_op is not None:
+                    if translate_op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                        translate_op.Set(Gf.Vec3f(*xyz))
+                    else:
+                        translate_op.Set(Gf.Vec3d(*xyz))
+                if orient_op is not None:
+                    if orient_op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                        orient_op.Set(Gf.Quatf(qw, qx, qy, qz))
+                    else:
+                        orient_op.Set(Gf.Quatd(qw, qx, qy, qz))
+            rigid_body = UsdPhysics.RigidBodyAPI(prim)
+            for attr in (rigid_body.GetVelocityAttr(), rigid_body.GetAngularVelocityAttr()):
+                try:
+                    attr.Set(Gf.Vec3f(0.0, 0.0, 0.0))
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+            return
+
+        import numpy as _np
+        import warp as _wp
+
+        view = getattr(self, "_referee_hold_view", None)
+        if view is None:
+            from isaaclab_physx.physics import PhysxManager
+
+            view = PhysxManager.get_physics_sim_view().create_rigid_body_view(path)
+            if view is None or int(view.count) == 0:
+                raise RuntimeError("no rigid-body view for held entity")
+            self._referee_hold_view = view
+            self._referee_hold_device = getattr(view.get_transforms(), "device", "cpu")
+        device = getattr(self, "_referee_hold_device", "cpu")
+        indices = _wp.array(_np.asarray([0], dtype=_np.uint32), dtype=_wp.uint32, device=device)
+        if position is not None:
+            row = [*(float(v) for v in tuple(position)[:3]), *(float(v) for v in quaternion_xyzw)]  # type: ignore[union-attr]
+            view.set_transforms(
+                _wp.array(_np.asarray([row], dtype=_np.float32), dtype=_wp.float32, device=device),
+                indices,
+            )
+        view.set_velocities(
+            _wp.array(_np.zeros((1, 6), dtype=_np.float32), dtype=_wp.float32, device=device),
+            indices,
+        )
+
+    REFEREE_HOLD_MAX_WRITE_FAILURES = 5
+
+    def _referee_hold_follow(self) -> None:
+        """Per physics step (called in step() before the solver runs): pin the
+        held object to TCP (+) offset with zero velocity. Releases on a vanished
+        prim or repeated write failures so a broken hold can never wedge the
+        sim loop."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None or not hold.held:
+            return
+        tcp_pose = self._tcp_world_pose()
+        if tcp_pose is None:
+            return
+        path = hold.path
+        target = hold.follow_pose(*tcp_pose)
+        if target is None or path is None:
+            return
+        try:
+            self._write_held_body_pose(path, target[0], target[1])
+            self._referee_hold_failures = 0
+        except Exception as error:  # noqa: BLE001 - never kill the sim loop
+            failures = getattr(self, "_referee_hold_failures", 0) + 1
+            self._referee_hold_failures = failures
+            if "no prim" in str(error):
+                self.release_referee_hold("prim_gone")
+            elif failures >= self.REFEREE_HOLD_MAX_WRITE_FAILURES:
+                self.release_referee_hold("write_failed", error=str(error))
 
     def _spawned_object_states(self) -> list[dict[str, object]]:
         """Pose truth for harness-spawned /World/Scenario rigid bodies that are

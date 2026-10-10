@@ -45,15 +45,33 @@ differences, both forced by upstream:
   and ``person_sitting`` ships a ``.glb``), so the SDF is the only honest
   source for it -- and reading it also lets this module check the pose below.
 
-**The dropped visual pose.** ``person_standing``'s SDF declares its visual
-and collision at ``0 0 0.02 0.04 0 0`` -- 2 cm up, rolled 2.3 deg, a
-MakeHuman export artifact rather than anything meaningful. Folding it into
-the converted USD would mean new ``arena_convert`` code that no test can
-reach without a GPU, for an offset far below what a person-detection fixture
-can notice, so this importer drops it and stands the figure upright. That
-trade is only defensible while the offset stays small, so it is measured
-against ``_MAX_UNFOLDED_*`` on every import and anything larger is refused
-rather than silently misplaced.
+**SDF poses and scale.** The person models do not agree on a frame either.
+``person_standing``'s SDF declares its visual at ``0 0 0.02 0.04 0 0`` -- 2 cm
+up, rolled 2.3 deg, a MakeHuman export artifact rather than anything
+meaningful -- and this importer drops it and stands the figure upright, as it
+always has (``_MAX_UNFOLDED_*`` bound what counts as negligible). The glTF
+figures (``person_sitting``, ``owada_*``, ``standing_man_casual``,
+``sitting_woman``) are the opposite case: each ``.glb`` is Y-up and
+unit-normalised (1 m tall, hip at the origin -- measured with trimesh against
+the pinned checkout) and Gazebo only shows a life-size upright person because
+the SDF declares a ``<link><pose>`` of roll 90 deg plus a yaw, sometimes a
+``<visual><pose>`` offset, and a ``<mesh><scale>`` of 0.69-1.8. Dropping
+*those* would publish a metre-tall figure lying on its side, so any pose
+beyond the negligible bound is folded in, together with the scale, as one
+4x4 matrix (Gazebo semantics: ``model = link_pose * visual_pose * scale *
+mesh``) handed to the converter as ``visual_transform``.
+``arena_convert._compose_object`` authors it on the visual wrapper only, so
+``collision_box_m`` is always expressed in the *model* frame -- Z-up metres,
+what an operator measures from Gazebo or from ``trimesh`` with the same
+matrix applied -- and the bounds guard compares visual and box in that one
+frame. ``_compose_object`` then recentres both on the box (XY centroid at
+the origin, base at z=0), which is why the SDF translations only matter
+relative to the box, never absolutely.
+
+``person_walking`` is not importable at all: upstream ships it as a Gazebo
+``<actor>`` whose skin/animation is a remote Fuel URL (``walk.dae`` is not
+in the checkout), so there is no static mesh to convert; ``_parse_visual``
+names that case explicitly rather than reporting a missing ``<visual>``.
 
 Like ``ycb_import``, every Kit/pxr call is isolated behind ``ConverterHooks``
 -- this module imports only the stdlib, so ``run_import``/``main`` run under
@@ -90,20 +108,37 @@ ROOT = Path(__file__).resolve().parents[1]
 # tmc_wrs_gz's "LICENSE.txt" -- see ycb_import's note).
 _LICENSE_PATH = "LICENSE"
 
-# How much SDF-declared visual pose this importer is willing to drop. Sized
-# to accept upstream's 2 cm / 0.04 rad and little else; see the module
-# docstring.
+# How much SDF-declared pose this importer treats as export noise and drops.
+# Sized to accept person_standing's 2 cm / 0.04 rad and little else; a pose
+# beyond either bound is folded into the conversion instead (see the module
+# docstring).
 _MAX_UNFOLDED_TRANSLATION_M = 0.05
 _MAX_UNFOLDED_ROTATION_RAD = 0.10
+
+_IDENTITY_POSE = (0.0,) * 6
+
+Matrix4 = tuple[tuple[float, float, float, float], ...]
 
 
 class ConverterHooks(Protocol):
     """The one Kit operation ``run_import`` needs, injectable so this
     orchestration runs without a GPU. ``arena_convert`` satisfies it
     structurally, exactly as it does for ``ycb_import``.
+
+    ``visual_transform`` is ``None`` when the SDF declares nothing worth
+    folding (``person_standing``), otherwise the 4x4 column-vector matrix
+    from ``_model_transform``; ``arena_convert.convert_object_to_usd``
+    documents the contract on its side.
     """
 
-    def convert_object_to_usd(self, dae_path: Path, stl_path: Path, usd_path: Path) -> None: ...
+    def convert_object_to_usd(
+        self,
+        dae_path: Path,
+        stl_path: Path,
+        usd_path: Path,
+        *,
+        visual_transform: Matrix4 | None = None,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -113,6 +148,19 @@ class _PersonConversion:
     source_records: tuple[dict[str, object], ...]
 
 
+@dataclass(frozen=True)
+class _VisualSpec:
+    """What one model SDF declares about its visual: the mesh file relative
+    to the model directory, the enclosing link's pose, the visual's own pose
+    (both Gazebo ``x y z roll pitch yaw``) and the uniform mesh scale.
+    """
+
+    mesh_relative: str
+    link_pose: tuple[float, ...]
+    visual_pose: tuple[float, ...]
+    scale: float
+
+
 # --------------------------------------------------------------------------- #
 # model SDF
 # --------------------------------------------------------------------------- #
@@ -120,18 +168,48 @@ def _model_sdf_path(checkout: Path, models_root: str, person_id: str) -> Path:
     return checkout / models_root / person_id / "model.sdf"
 
 
-def _parse_visual(sdf_bytes: bytes, person_id: str) -> tuple[str, tuple[float, ...]]:
-    """Return the visual's mesh filename and its declared 6-DoF pose."""
+def _parse_pose(element, person_id: str, label: str) -> tuple[float, ...]:
+    pose_element = element.find("./pose") if element is not None else None
+    pose_text = (pose_element.text or "") if pose_element is not None else ""
+    if not pose_text.strip():
+        return _IDENTITY_POSE
     try:
-        root = ElementTree.fromstring(sdf_bytes.decode("utf-8", errors="replace"))
+        values = tuple(float(item) for item in pose_text.split())
+    except ValueError:
+        values = ()
+    if len(values) != 6:
+        raise AssetArtifactError(f"{person_id}: <{label}><pose> is not 6 numbers: {pose_text!r}")
+    return values
+
+
+def _parse_visual(sdf_bytes: bytes, person_id: str) -> _VisualSpec:
+    """Return the visual's mesh filename and everything the SDF says about
+    where it goes: link pose, visual pose and mesh scale.
+    """
+    # Four of the glTF models' SDFs open with a blank line ahead of the
+    # <?xml ?> declaration. Gazebo's tinyxml2 shrugs; ElementTree refuses
+    # ("XML or text declaration not at start of entity"), so strip the
+    # leading whitespace -- the only leniency, everything else must parse.
+    try:
+        root = ElementTree.fromstring(sdf_bytes.decode("utf-8", errors="replace").lstrip())
     except ElementTree.ParseError as error:
         raise AssetArtifactError(f"{person_id}: model.sdf is not parseable: {error}") from error
 
+    if root.find(".//actor") is not None and root.find(".//model") is None:
+        # person_walking: a Gazebo <actor> with a skin/animation fetched
+        # from Fuel at runtime. Nothing static to convert.
+        raise AssetArtifactError(
+            f"{person_id}: model.sdf declares a Gazebo <actor> (animated skin), not a "
+            "static <model> with a <link><visual> mesh; this importer cannot convert it"
+        )
+
+    link = root.find(".//link")
     visual = root.find(".//link/visual")
     if visual is None:
         raise AssetArtifactError(f"{person_id}: model.sdf declares no <visual>")
 
-    uri = visual.find("./geometry/mesh/uri")
+    mesh = visual.find("./geometry/mesh")
+    uri = mesh.find("./uri") if mesh is not None else None
     if uri is None or not (uri.text or "").strip():
         raise AssetArtifactError(f"{person_id}: model.sdf declares no <visual> mesh <uri>")
     # "model://person_standing/meshes/standing.dae" -> "meshes/standing.dae"
@@ -143,24 +221,92 @@ def _parse_visual(sdf_bytes: bytes, person_id: str) -> tuple[str, tuple[float, .
         )
     mesh_relative = relative[len(prefix):]
 
-    pose_element = visual.find("./pose")
-    pose_text = (pose_element.text or "") if pose_element is not None else ""
-    values = tuple(float(item) for item in pose_text.split()) if pose_text.strip() else (0.0,) * 6
-    if len(values) != 6:
-        raise AssetArtifactError(f"{person_id}: <visual><pose> is not 6 numbers: {pose_text!r}")
-    return mesh_relative, values
+    scale_element = mesh.find("./scale")
+    scale_text = (scale_element.text or "") if scale_element is not None else ""
+    if scale_text.strip():
+        try:
+            scale_values = tuple(float(item) for item in scale_text.split())
+        except ValueError:
+            scale_values = ()
+        if len(scale_values) != 3 or any(value <= 0.0 for value in scale_values):
+            raise AssetArtifactError(
+                f"{person_id}: <mesh><scale> is not 3 positive numbers: {scale_text!r}"
+            )
+        if max(scale_values) - min(scale_values) > 1e-9:
+            # A single xformOp:transform could carry it, but no upstream
+            # person model is non-uniform and a squashed person is more
+            # likely a typo than intent.
+            raise AssetArtifactError(
+                f"{person_id}: <mesh><scale> is non-uniform ({scale_text.strip()!r}); "
+                "only uniform person scales are folded in"
+            )
+        scale = scale_values[0]
+    else:
+        scale = 1.0
+
+    return _VisualSpec(
+        mesh_relative=mesh_relative,
+        link_pose=_parse_pose(link, person_id, "link"),
+        visual_pose=_parse_pose(visual, person_id, "visual"),
+        scale=scale,
+    )
 
 
-def _check_unfolded_pose(person_id: str, pose: Sequence[float]) -> None:
+# --------------------------------------------------------------------------- #
+# SDF pose -> visual transform
+# --------------------------------------------------------------------------- #
+def _pose_is_negligible(pose: Sequence[float]) -> bool:
+    """MakeHuman-export noise (person_standing's 2 cm / 0.04 rad) is dropped
+    so the figure stands exactly upright; anything larger is real placement
+    and gets folded in.
+    """
     translation = math.dist((0.0, 0.0, 0.0), tuple(pose[:3]))
     rotation = max(abs(angle) for angle in pose[3:])
-    if translation > _MAX_UNFOLDED_TRANSLATION_M or rotation > _MAX_UNFOLDED_ROTATION_RAD:
-        raise AssetArtifactError(
-            f"{person_id}: upstream declares a visual pose this importer does not fold in "
-            f"({translation:.3f} m, {rotation:.3f} rad), beyond the "
-            f"{_MAX_UNFOLDED_TRANSLATION_M} m / {_MAX_UNFOLDED_ROTATION_RAD} rad it may drop. "
-            "Fold the pose into the conversion instead of shipping a misplaced person."
-        )
+    return translation <= _MAX_UNFOLDED_TRANSLATION_M and rotation <= _MAX_UNFOLDED_ROTATION_RAD
+
+
+def _pose_matrix(pose: Sequence[float]) -> Matrix4:
+    """Gazebo ``x y z roll pitch yaw`` as a column-vector 4x4: R = Rz * Ry * Rx."""
+    x, y, z, roll, pitch, yaw = (float(value) for value in pose)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr, x),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr, y),
+        (-sp, cp * sr, cp * cr, z),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def _scale_matrix(scale: float) -> Matrix4:
+    return (
+        (scale, 0.0, 0.0, 0.0),
+        (0.0, scale, 0.0, 0.0),
+        (0.0, 0.0, scale, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def _matmul(a: Matrix4, b: Matrix4) -> Matrix4:
+    return tuple(
+        tuple(sum(a[row][k] * b[k][column] for k in range(4)) for column in range(4))
+        for row in range(4)
+    )
+
+
+def _model_transform(spec: _VisualSpec) -> Matrix4 | None:
+    """The matrix that takes raw mesh coordinates (metres) to Gazebo's model
+    frame, ``link_pose * visual_pose * scale``, or ``None`` when there is
+    nothing to fold: identity scale and both poses negligible. ``None``
+    rather than an identity matrix so the person_standing conversion stays
+    byte-identical to the artifact already in the tree.
+    """
+    link_pose = _IDENTITY_POSE if _pose_is_negligible(spec.link_pose) else spec.link_pose
+    visual_pose = _IDENTITY_POSE if _pose_is_negligible(spec.visual_pose) else spec.visual_pose
+    if link_pose == _IDENTITY_POSE and visual_pose == _IDENTITY_POSE and abs(spec.scale - 1.0) <= 1e-9:
+        return None
+    return _matmul(_matmul(_pose_matrix(link_pose), _pose_matrix(visual_pose)), _scale_matrix(spec.scale))
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +325,18 @@ _BOX_FACES = (
 
 
 def _collision_box(config: Mapping[str, object], person_id: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """The configured box, in the *model* frame: Z-up metres after the SDF
+    link pose, visual pose and scale have been applied to the mesh (the
+    frame Gazebo shows the model in, and what ``trimesh`` measures with
+    ``_model_transform``'s matrix applied). Its size is validated against
+    the converted visual by ``arena_convert._check_bounds_overlap``; its
+    *position* is not (that guard is size-only by design), and
+    ``_compose_object`` then recentres visual and box together on the box,
+    so a box placed where the mesh is not would silently offset the
+    collider from the figure. Measure the mesh, do not guess -- e.g.
+    ``standing_man_casual``'s SDF sinks its figure 0.5 m into the floor, so
+    its box spans z [-0.5, 1.3], not [0, 1.8].
+    """
     boxes = config.get("collision_box_m")
     entry = boxes.get(person_id) if isinstance(boxes, Mapping) else None
     if entry is None:
@@ -290,11 +448,11 @@ def convert_person(
         raise AssetArtifactError(f"{person_id}: missing model SDF {sdf_path}")
     sdf_bytes = sdf_path.read_bytes()
 
-    mesh_relative, visual_pose = _parse_visual(sdf_bytes, person_id)
-    _check_unfolded_pose(person_id, visual_pose)
+    spec = _parse_visual(sdf_bytes, person_id)
+    visual_transform = _model_transform(spec)
 
     model_dir = checkout / models_root / person_id
-    mesh_path = model_dir / mesh_relative
+    mesh_path = model_dir / spec.mesh_relative
     if not mesh_path.is_file():
         raise AssetArtifactError(f"{person_id}: missing visual mesh {mesh_path}")
 
@@ -303,13 +461,19 @@ def convert_person(
     collision_path = scratch / person_id / "collision.stl"
     collision_path.parent.mkdir(parents=True, exist_ok=True)
     collision_path.write_text(_collision_box_stl(minimum, maximum), encoding="utf-8")
-    converter.convert_object_to_usd(mesh_path, collision_path, usd_path)
+    converter.convert_object_to_usd(
+        mesh_path, collision_path, usd_path, visual_transform=visual_transform
+    )
 
     records = [
         _source_record(_relative_record_path(checkout, sdf_path), sdf_bytes),
         _source_record(_relative_record_path(checkout, mesh_path), mesh_path.read_bytes()),
         *_texture_records(checkout, model_dir),
     ]
+    config_path = model_dir / "model.config"
+    if config_path.is_file():
+        # Read for the attribution's author line, so it is a genuine input.
+        records.append(_source_record(_relative_record_path(checkout, config_path), config_path.read_bytes()))
     return _PersonConversion(
         person_id=person_id,
         payload=_person_payload(usd_path, person_id),
@@ -318,39 +482,97 @@ def convert_person(
 
 
 # --------------------------------------------------------------------------- #
+# model.config
+# --------------------------------------------------------------------------- #
+def _model_config_author(checkout: Path, models_root: str, person_id: str) -> tuple[str, str]:
+    """``(author name, description)`` from the model's ``model.config``,
+    empty strings when absent or unparseable. Upstream fills the glTF
+    figures' metadata with the SDF template's placeholders ("Author Name",
+    "A description of the ... model."), and the attribution reproduces
+    those verbatim rather than inventing a provenance the repository does
+    not record.
+    """
+    config_path = checkout / models_root / person_id / "model.config"
+    if not config_path.is_file():
+        return "", ""
+    try:
+        # Same leading blank line as the SDFs (see _parse_visual).
+        root = ElementTree.fromstring(config_path.read_bytes().decode("utf-8", errors="replace").lstrip())
+    except ElementTree.ParseError:
+        return "", ""
+    author = root.find("./author/name")
+    description = root.find("./description")
+    return (
+        " ".join(((author.text or "") if author is not None else "").split()),
+        " ".join(((description.text or "") if description is not None else "").split()),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # attribution
 # --------------------------------------------------------------------------- #
+_PERSON_STANDING_CREDIT = (
+    "The `person_standing` figure was created with MakeHuman "
+    "(http://www.makehuman.org/) by Marina Kollmitz "
+    "<kollmitz@cs.uni-freiburg.de>, University of Freiburg."
+)
+
+
 def _attribution(
-    config: Mapping[str, object], license_bytes: bytes, records: Sequence[Mapping[str, object]]
+    config: Mapping[str, object],
+    license_bytes: bytes,
+    records: Sequence[Mapping[str, object]],
+    authors: Mapping[str, tuple[str, str]],
 ) -> bytes:
+    """One section per imported figure, then the upstream licence.
+
+    ``authors`` maps person_id to what its ``model.config`` says
+    (``_model_config_author``). The MakeHuman credit for ``person_standing``
+    is the one piece of provenance not recorded in upstream metadata (it
+    comes from the model's own description and the original import's
+    research), so it is kept here verbatim; every other figure gets exactly
+    the author/description upstream ships, placeholders included.
+    """
     license_text = license_bytes.decode("utf-8", errors="replace")
     header = (
         f"Repository: {config['repository']}\n"
         f"Branch: {config['branch']}\n"
         f"Commit: {config['commit']}\n\n"
     )
-    per_file = "\n".join(
-        f"- `{record['path']}` (sha256 `{record['sha256']}`, {record['size']} bytes)"
-        for record in sorted(records, key=lambda item: str(item["path"]))
-        if str(record["path"]) != _LICENSE_PATH
-    )
-    body = (
-        header
-        + "The `person_standing` figure was created with MakeHuman "
-        "(http://www.makehuman.org/) by Marina Kollmitz "
-        "<kollmitz@cs.uni-freiburg.de>, University of Freiburg, and is "
-        "redistributed here under the upstream repository's BSD 3-Clause "
-        "licence reproduced below -- the same repository and pinned commit "
-        "the rcw2026 arena furniture comes from.\n\n"
-        "Upstream source files:\n\n"
-        + per_file
-    )
-    return attribution_markdown(
-        [
-            ("person_standing — MakeHuman figure by Marina Kollmitz", body),
-            ("sobits_gazebo_worlds — BSD 3-Clause", license_text),
-        ]
-    )
+    sections: list[tuple[str, str]] = []
+    for person_id in sorted(authors):
+        author, description = authors[person_id]
+        lines = [header]
+        if person_id == "person_standing":
+            lines.append(_PERSON_STANDING_CREDIT)
+        else:
+            lines.append(
+                f"Upstream `model.config` author: {author or '(none)'}; "
+                f"description: {description or '(none)'} -- no further provenance is "
+                "recorded in the upstream repository."
+            )
+        lines.append(
+            "\n\nRedistributed here under the upstream repository's BSD 3-Clause "
+            "licence reproduced below -- the same repository and pinned commit "
+            "the rcw2026 arena furniture comes from.\n\n"
+            "Upstream source files:\n\n"
+        )
+        prefix = f"{config['models_root']}/{person_id}/"
+        lines.append(
+            "\n".join(
+                f"- `{record['path']}` (sha256 `{record['sha256']}`, {record['size']} bytes)"
+                for record in sorted(records, key=lambda item: str(item["path"]))
+                if str(record["path"]).startswith(prefix)
+            )
+        )
+        title = (
+            "person_standing — MakeHuman figure by Marina Kollmitz"
+            if person_id == "person_standing"
+            else f"{person_id} — sobits_gazebo_worlds figure"
+        )
+        sections.append((title, "".join(lines)))
+    sections.append(("sobits_gazebo_worlds — BSD 3-Clause", license_text))
+    return attribution_markdown(sections)
 
 
 # --------------------------------------------------------------------------- #
@@ -372,15 +594,17 @@ def run_import(
         scratch = Path(scratch_dir)
         payload: dict[str, bytes] = {}
         records: list[dict[str, object]] = []
+        authors: dict[str, tuple[str, str]] = {}
 
         for person_id in allowlist:
             conversion = convert_person(checkout, scratch, config, person_id, converter)
             payload.update(conversion.payload)
             records.extend(conversion.source_records)
+            authors[person_id] = _model_config_author(checkout, str(config["models_root"]), person_id)
 
         license_bytes = _read_upstream(checkout, _LICENSE_PATH)
         records.append(_source_record(_LICENSE_PATH, license_bytes))
-        payload["ATTRIBUTION.md"] = _attribution(config, license_bytes, records)
+        payload["ATTRIBUTION.md"] = _attribution(config, license_bytes, records, authors)
 
         records.sort(key=lambda item: str(item["path"]))
         source_lock = {

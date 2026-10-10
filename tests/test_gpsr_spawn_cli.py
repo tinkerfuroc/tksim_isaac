@@ -369,14 +369,22 @@ def test_apply_plan_count_aware_dedupe_spawns_remainder_and_slots_past_a_differe
     assert client.spawned == ["cmd_pudding_box_0", "cmd_pudding_box_1", "cmd_pudding_box_2"]
     assert len(manifest["entities"]) == 3
     kitchen_table = PLACEMENTS["spots"]["kitchen_table"]
-    surface_xyz, dx, dy = kitchen_table["surface_xyz"], kitchen_table["grid_dx"], kitchen_table["grid_dy"]
-    expected_slots = [1, 2, 3]
-    for entity, k in zip(manifest["entities"], expected_slots):
+    surface_xyz = kitchen_table["surface_xyz"]
+    (bx0, by0), (bx1, by1) = kitchen_table["surface_bbox_xy"]
+    seen = set()
+    for entity in manifest["entities"]:
         assert entity["ok"] is True
-        assert entity["xyz"] == pytest.approx(
-            [surface_xyz[0] + (k % 3) * dx, surface_xyz[1] + (k // 3) * dy, surface_xyz[2]]
-        )
-        # slot 0 (the pre-existing mug's spot) is never reused
+        x, y, z = entity["xyz"]
+        # packed inside the measured table top (4 cm margin, 0.138 x 0.129 pudding box)
+        assert bx0 + 0.04 <= x - 0.069 and x + 0.069 <= bx1 - 0.04
+        assert by0 + 0.04 <= y - 0.0645 and y + 0.0645 <= by1 - 0.04
+        assert z == pytest.approx(surface_xyz[2])
+        # clear of the pre-existing mug (0.117 x 0.093 at surface_xyz) and of each other
+        assert abs(x - surface_xyz[0]) >= (0.138 + 0.117) / 2 + 0.02 - 1e-9 or \
+            abs(y - surface_xyz[1]) >= (0.129 + 0.093) / 2 + 0.02 - 1e-9
+        assert (x, y) not in seen
+        seen.add((x, y))
+        # the pre-existing mug's spot is never reused
         assert entity["xyz"] != pytest.approx(list(surface_xyz))
 
 

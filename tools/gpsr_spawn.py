@@ -41,6 +41,8 @@ from tools.gpsr_scene import (
     REPO_ROOT,
     ScenePlan,
     SpawnItem,
+    SurfaceLayout,
+    object_footprint_xy,
     plan_scene,
     scene_plan_from_json,
     scene_plan_to_json,
@@ -181,6 +183,45 @@ def _base_scenario_counts(base_scenario: dict, placements: dict) -> tuple[Counte
     return key_counts, spot_counts
 
 
+def _base_objects_by_spot(base_scenario: dict, placements: dict) -> dict[str, list[tuple[tuple[float, float], tuple[float, float]]]]:
+    """{spot: [((x, y), footprint_xy), ...]} for every base-scenario OBJECT
+    that resolves to a placement spot -- what `SurfaceLayout` must treat as
+    already occupied so a spawn never lands on (or overlaps) a base object."""
+    spots = placements.get("spots", {})
+    out: dict[str, list[tuple[tuple[float, float], tuple[float, float]]]] = {}
+    for record in base_scenario.get("objects", []):
+        xyz = record.get("pose", {}).get("xyz", [0.0, 0.0, 0.0])
+        where = _nearest_spot_or_room(xyz, placements)
+        if where in spots:
+            footprint = object_footprint_xy(_asset_key(record.get("asset_uri", "")))
+            out.setdefault(where, []).append(((float(xyz[0]), float(xyz[1])), footprint))
+    return out
+
+
+def _spot_layouts(base_scenario: dict, placements: dict,
+                  previous_entities: Sequence[dict] = ()) -> Callable[[str], SurfaceLayout]:
+    """Lazy per-spot `SurfaceLayout` factory seeded with the base-scenario
+    objects and the ok previous-manifest entities (those carry the xyz they
+    were spawned at) on that spot."""
+    spots = placements.get("spots", {})
+    base_by_spot = _base_objects_by_spot(base_scenario, placements)
+    layouts: dict[str, SurfaceLayout] = {}
+
+    def _get(where: str) -> SurfaceLayout:
+        layout = layouts.get(where)
+        if layout is None:
+            layout = SurfaceLayout(where, spots[where])
+            for xy, footprint in base_by_spot.get(where, []):
+                layout.occupy(xy, footprint)
+            for e in previous_entities:
+                if e.get("ok") and e.get("where") == where and e.get("xyz"):
+                    layout.occupy((e["xyz"][0], e["xyz"][1]), object_footprint_xy(e.get("asset_key", "")))
+            layouts[where] = layout
+        return layout
+
+    return _get
+
+
 def base_scenario_keys(base_scenario: dict, placements: dict) -> set[tuple[str, str]]:
     """(asset_key, spot-or-room) already present in the base scenario,
     derived by matching each spawned pose against the placement table
@@ -191,11 +232,10 @@ def base_scenario_keys(base_scenario: dict, placements: dict) -> set[tuple[str, 
 
 
 def _grid_slot_xyz(where: str, k: int, placements: dict) -> Optional[tuple[float, float, float]]:
-    """The kth grid slot's xyz on placement spot `where` (`plan_scene`'s
-    own (i % 3, i // 3) * (grid_dx, grid_dy) formula, so re-sloted items
-    land on the same grid a fresh plan would have used). None if `where`
-    is not a known placement spot (e.g. it's a person room, or unknown --
-    callers keep the item's original xyz in that case).
+    """LEGACY (no longer used by apply_plan/emit_scenario, which pack on the
+    measured surface via `gpsr_scene.SurfaceLayout`): the kth slot of the
+    historical (i % 3, i // 3) * (grid_dx, grid_dy) grid on spot `where`.
+    None if `where` is not a known placement spot.
     """
     spot_info = placements.get("spots", {}).get(where)
     if spot_info is None:
@@ -234,17 +274,20 @@ def apply_plan(
     since a retried item may be replanned under a different id) is
     replaced by the fresh attempt's result.
 
-    Every item actually spawned (not skipped) is re-sloted onto a grid
-    cell of its placement spot before being handed to `client.spawn`: slot
-    index `k = (# base-scenario objects, any asset, at that spot) + (# ok
-    previous-manifest entities, any asset, at that spot) + (# items
-    already spawned at that spot earlier in *this* apply_plan call)`,
-    `xyz = surface_xyz + ((k % 3) * grid_dx, (k // 3) * grid_dy, 0)`. This
-    overrides the plan's own xyz (the planner's default slot, which does
-    not know about the base scenario or other items sharing its spot) so
-    a spawned item never overlaps a pre-existing base object or another
-    item spawned earlier in the same call. Persons (room keys, not
-    placement spots) are never re-sloted. The re-sloted xyz is what's
+    Every item actually spawned (not skipped) is re-placed on its spot's
+    measured surface before being handed to `client.spawn`
+    (`gpsr_scene.SurfaceLayout`, seeded with the base-scenario objects and
+    the ok previous-manifest entities at that spot): the batch of items
+    bound for one spot is packed as one block around `surface_xyz` with
+    every footprint (YCB bbox, 0.10 m default) inside `surface_bbox_xy`
+    minus a 4 cm margin and >= PLACEMENT_GAP_M (8 cm, palm clearance) from every other footprint. This
+    overrides the plan's own xyz (the planner's provisional slot, which
+    does not know about the base scenario) so a spawned item never
+    overlaps a pre-existing base object or another item, and never hangs
+    over the edge. An item that cannot fit is NOT spawned: it is recorded
+    in `"not_attempted"` with a "no room on ..." reason (fix4 run 3 spawned
+    a soup past side_table_02 onto the floor). Persons (room keys, not
+    placement spots) are never re-placed. The re-placed xyz is what's
     recorded in the manifest entity and what actually gets spawned.
 
     Never raises for an ordinary per-item spawn failure -- it is recorded
@@ -259,26 +302,47 @@ def apply_plan(
     can rewrite the manifest file incrementally, leaving a usable on-disk
     manifest even if the run is killed mid-plan.
     """
-    base_key_counts, base_spot_counts = _base_scenario_counts(base_scenario, placements)
+    base_key_counts, _base_spot_counts = _base_scenario_counts(base_scenario, placements)
     entities: list[dict] = []
     prev_ok_key_counts: Counter = Counter()
-    prev_ok_spot_counts: Counter = Counter()
     prev_failed_by_key: dict[tuple, list] = defaultdict(list)
     if previous_manifest:
         for e in previous_manifest.get("entities", []):
             key = (e.get("asset_key"), e.get("where"))
             if e.get("ok"):
                 prev_ok_key_counts[key] += 1
-                if e.get("where") in placements.get("spots", {}):
-                    prev_ok_spot_counts[e.get("where")] += 1
             else:
                 prev_failed_by_key[key].append(e)
             entities.append(e)
 
     existing_key_counts: Counter = Counter(base_key_counts)
     existing_key_counts.update(prev_ok_key_counts)
-    spot_counts_so_far: Counter = Counter(base_spot_counts)
-    spot_counts_so_far.update(prev_ok_spot_counts)
+    # Surface packing per spot, seeded with the base-scenario objects and the
+    # ok previous-manifest entities (at the xyz they were spawned at), so a
+    # spawn never overlaps anything already on the surface. The items that
+    # will actually be spawned at each spot are packed together up front
+    # (`SurfaceLayout.place_all`) so N objects share one block that fits;
+    # `planned_xy[i]` is None for an item that cannot fit and is refused.
+    layout_for = _spot_layouts(base_scenario, placements, list(entities))
+    spots = placements.get("spots", {})
+    planned_xy: dict[int, Optional[tuple[float, float]]] = {}
+    _pre_seen: Counter = Counter()
+    _per_spot: dict[str, list[int]] = {}
+    for i, item in enumerate(plan.items):
+        where = item.spot if item.spot else item.room
+        key = (_asset_key(item.asset_uri), where)
+        idx_in_key = _pre_seen[key]
+        _pre_seen[key] += 1
+        if idx_in_key < existing_key_counts.get(key, 0):
+            continue  # skipped as already present below; occupies nothing new
+        if item.spot and item.spot in spots:
+            _per_spot.setdefault(where, []).append(i)
+    for where, indices in _per_spot.items():
+        xys = layout_for(where).place_all(
+            [object_footprint_xy(_asset_key(plan.items[i].asset_uri)) for i in indices]
+        )
+        for i, xy in zip(indices, xys):
+            planned_xy[i] = xy
 
     def _replace_stale(key: tuple[str, str]) -> None:
         # Pop (at most) one stale FAILED previous-manifest record for this
@@ -307,7 +371,7 @@ def apply_plan(
                         "not_attempted": list(not_attempted)})
 
     service_down = False
-    for item in plan.items:
+    for item_index, item in enumerate(plan.items):
         where = item.spot if item.spot else item.room
         asset_key = _asset_key(item.asset_uri)
         key = (asset_key, where)
@@ -327,12 +391,21 @@ def apply_plan(
             continue
 
         spawn_item = item
-        if item.spot and item.spot in placements.get("spots", {}):
-            k = spot_counts_so_far[where]
-            spot_counts_so_far[where] += 1
-            new_xyz = _grid_slot_xyz(where, k, placements)
-            if new_xyz is not None:
-                spawn_item = dataclasses.replace(item, xyz=new_xyz)
+        if item.spot and item.spot in spots:
+            layout = layout_for(where)
+            footprint = object_footprint_xy(asset_key)
+            xy = planned_xy.get(item_index)
+            if xy is None:
+                # Fail loudly rather than place it off the edge (fix4 run 3:
+                # cmd_soup_0 spawned past side_table_02 and lay on the floor).
+                not_attempted.append(
+                    {"id": item.id, "ok": False, "where": where,
+                     "error": f"not attempted: no room on {layout.describe()} for "
+                              f"{asset_key or item.name} footprint {footprint[0]:.3f} x {footprint[1]:.3f} m"}
+                )
+                _report()
+                continue
+            spawn_item = dataclasses.replace(item, xyz=(xy[0], xy[1], layout.z))
 
         entity_name = f"/World/Scenario/{item.id}"
         pose_fields = {"xyz": list(spawn_item.xyz), "quaternion_xyzw": list(spawn_item.quaternion_xyzw)}
@@ -466,22 +539,32 @@ def emit_scenario(plans: Sequence[ScenePlan], base_scenario: dict, placements: d
             if key not in best or len(group) > len(best[key]):
                 best[key] = group
 
-    spot_counts_so_far: Counter = Counter(base_spot_counts)
+    layout_for = _spot_layouts(base_scenario, placements)
     for key, group in best.items():
-        _asset_key_value, where = key
+        asset_key_value, where = key
         existing_count = existing_key_counts.get(key, 0)
         to_add = group[existing_count:]
         if not to_add:
             continue
         target_list = merged["actors"] if group[0].kind == "person" else merged["objects"]
-        for item in to_add:
+        on_spot = bool(to_add[0].spot) and to_add[0].spot in placements.get("spots", {})
+        footprint = object_footprint_xy(asset_key_value)
+        group_xys = layout_for(where).place_all([footprint] * len(to_add)) if on_spot else []
+        for j, item in enumerate(to_add):
             spawn_item = item
-            if item.spot and item.spot in placements.get("spots", {}):
-                k = spot_counts_so_far[where]
-                spot_counts_so_far[where] += 1
-                new_xyz = _grid_slot_xyz(where, k, placements)
-                if new_xyz is not None:
-                    spawn_item = dataclasses.replace(item, xyz=new_xyz)
+            if on_spot:
+                layout = layout_for(where)
+                xy = group_xys[j]
+                if xy is None:
+                    # No manifest here to record a refusal in; the merged
+                    # scenario simply omits the item and says so loudly.
+                    print(
+                        f"[gpsr_spawn] emit-scenario: no room on {layout.describe()} for "
+                        f"{item.id} ({asset_key_value} footprint {footprint[0]:.3f} x {footprint[1]:.3f} m); omitted",
+                        file=sys.stderr, flush=True,
+                    )
+                    continue
+                spawn_item = dataclasses.replace(item, xyz=(xy[0], xy[1], layout.z))
             target_list.append(
                 {
                     # Suffixed by `where` so two different (asset, where)

@@ -1,0 +1,1333 @@
+{
+  "schema_version": 1,
+  "arena_usd": "artifacts/arena/rcw2026/d4ecac294baad21fbea6dac0fef9164fbb92055c3caf869772dc11b207d68019/arena.usd",
+  "standoff_m": 0.55,
+  "clearance_m": 0.3,
+  "furniture": {
+    "door": {
+      "min": [
+        -4.5088,
+        -2.6381,
+        -0.0002
+      ],
+      "max": [
+        -4.3436,
+        -1.7105,
+        1.9998
+      ],
+      "centre": [
+        -4.4262,
+        -2.1743,
+        0.9998
+      ],
+      "half_extent_xy": [
+        0.0826,
+        0.4638
+      ]
+    },
+    "door_02": {
+      "min": [
+        -4.5064,
+        2.6563,
+        -0.0002
+      ],
+      "max": [
+        -4.3412,
+        3.5839,
+        1.9998
+      ],
+      "centre": [
+        -4.4238,
+        3.1201,
+        0.9998
+      ],
+      "half_extent_xy": [
+        0.0826,
+        0.4638
+      ]
+    },
+    "chair": {
+      "min": [
+        2.3628,
+        -2.6311,
+        -0.0
+      ],
+      "max": [
+        2.8829,
+        -2.0092,
+        0.8997
+      ],
+      "centre": [
+        2.6228,
+        -2.3202,
+        0.4498
+      ],
+      "half_extent_xy": [
+        0.26,
+        0.3109
+      ]
+    },
+    "chair_02": {
+      "min": [
+        2.3131,
+        -4.0068,
+        -0.0
+      ],
+      "max": [
+        2.8332,
+        -3.3849,
+        0.8997
+      ],
+      "centre": [
+        2.5732,
+        -3.6958,
+        0.4498
+      ],
+      "half_extent_xy": [
+        0.2601,
+        0.3109
+      ]
+    },
+    "chair_03": {
+      "min": [
+        2.9219,
+        -3.3009,
+        -0.0
+      ],
+      "max": [
+        3.5438,
+        -2.7808,
+        0.8997
+      ],
+      "centre": [
+        3.2328,
+        -3.0408,
+        0.4498
+      ],
+      "half_extent_xy": [
+        0.3109,
+        0.2601
+      ]
+    },
+    "chair_04": {
+      "min": [
+        1.5852,
+        -3.3292,
+        -0.0
+      ],
+      "max": [
+        2.2071,
+        -2.8091,
+        0.8997
+      ],
+      "centre": [
+        1.8962,
+        -3.0692,
+        0.4498
+      ],
+      "half_extent_xy": [
+        0.3109,
+        0.2601
+      ]
+    },
+    "sink": {
+      "min": [
+        0.4412,
+        -5.287,
+        0.0033
+      ],
+      "max": [
+        1.881,
+        -4.7533,
+        0.7533
+      ],
+      "centre": [
+        1.1611,
+        -5.0201,
+        0.3783
+      ],
+      "half_extent_xy": [
+        0.7199,
+        0.2669
+      ]
+    },
+    "sofa": {
+      "min": [
+        -3.2354,
+        -5.286,
+        0.0029
+      ],
+      "max": [
+        -1.1326,
+        -4.3869,
+        0.6529
+      ],
+      "centre": [
+        -2.184,
+        -4.8365,
+        0.3279
+      ],
+      "half_extent_xy": [
+        1.0514,
+        0.4496
+      ]
+    },
+    "side_table": {
+      "min": [
+        -0.5381,
+        -5.2367,
+        0.0024
+      ],
+      "max": [
+        -0.1542,
+        -4.8537,
+        0.6025
+      ],
+      "centre": [
+        -0.3462,
+        -5.0452,
+        0.3025
+      ],
+      "half_extent_xy": [
+        0.1919,
+        0.1915
+      ]
+    },
+    "bed": {
+      "min": [
+        0.1066,
+        0.1048,
+        -0.0064
+      ],
+      "max": [
+        2.2416,
+        1.183,
+        0.4936
+      ],
+      "centre": [
+        1.1741,
+        0.6439,
+        0.2436
+      ],
+      "half_extent_xy": [
+        1.0675,
+        0.5391
+      ]
+    },
+    "side_table_02": {
+      "min": [
+        0.2379,
+        1.5633,
+        0.0024
+      ],
+      "max": [
+        0.6218,
+        1.9463,
+        0.6025
+      ],
+      "centre": [
+        0.4298,
+        1.7548,
+        0.3025
+      ],
+      "half_extent_xy": [
+        0.1919,
+        0.1915
+      ]
+    },
+    "refrigerator": {
+      "min": [
+        3.6682,
+        -0.9655,
+        -0.0001
+      ],
+      "max": [
+        4.2783,
+        -0.3519,
+        1.8648
+      ],
+      "centre": [
+        3.9733,
+        -0.6587,
+        0.9324
+      ],
+      "half_extent_xy": [
+        0.3051,
+        0.3068
+      ]
+    },
+    "kitchen_table": {
+      "min": [
+        2.1505,
+        -3.4891,
+        0.0038
+      ],
+      "max": [
+        3.0236,
+        -2.6271,
+        0.7238
+      ],
+      "centre": [
+        2.587,
+        -3.0581,
+        0.3638
+      ],
+      "half_extent_xy": [
+        0.4366,
+        0.431
+      ]
+    },
+    "dishwasher_close": {
+      "min": [
+        2.5243,
+        -5.2497,
+        -0.001
+      ],
+      "max": [
+        2.9577,
+        -4.8354,
+        0.5992
+      ],
+      "centre": [
+        2.741,
+        -5.0426,
+        0.2991
+      ],
+      "half_extent_xy": [
+        0.2167,
+        0.2071
+      ]
+    },
+    "tv_stand": {
+      "min": [
+        -3.8724,
+        -0.4323,
+        -0.0014
+      ],
+      "max": [
+        -2.5135,
+        -0.0798,
+        0.5437
+      ],
+      "centre": [
+        -3.193,
+        -0.256,
+        0.2711
+      ],
+      "half_extent_xy": [
+        0.6794,
+        0.1763
+      ]
+    },
+    "washing_machine": {
+      "min": [
+        -2.0098,
+        4.2147,
+        0.0004
+      ],
+      "max": [
+        -1.4067,
+        4.8329,
+        0.8504
+      ],
+      "centre": [
+        -1.7083,
+        4.5238,
+        0.4254
+      ],
+      "half_extent_xy": [
+        0.3015,
+        0.3091
+      ]
+    },
+    "laundry_basket": {
+      "min": [
+        -0.9988,
+        4.3774,
+        0.0003
+      ],
+      "max": [
+        -0.5314,
+        4.6918,
+        0.3603
+      ],
+      "centre": [
+        -0.7651,
+        4.5346,
+        0.1803
+      ],
+      "half_extent_xy": [
+        0.2337,
+        0.1572
+      ]
+    },
+    "laundry_desk": {
+      "min": [
+        -3.5627,
+        4.2267,
+        -0.0014
+      ],
+      "max": [
+        -2.4135,
+        4.8223,
+        0.7337
+      ],
+      "centre": [
+        -2.9881,
+        4.5245,
+        0.3662
+      ],
+      "half_extent_xy": [
+        0.5746,
+        0.2978
+      ]
+    },
+    "trashbin": {
+      "min": [
+        -3.1237,
+        0.1935,
+        -0.0
+      ],
+      "max": [
+        -2.815,
+        0.4531,
+        0.4
+      ],
+      "centre": [
+        -2.9693,
+        0.3233,
+        0.2
+      ],
+      "half_extent_xy": [
+        0.1543,
+        0.1298
+      ]
+    },
+    "shelf": {
+      "min": [
+        -4.1147,
+        0.1583,
+        -0.0003
+      ],
+      "max": [
+        -3.2596,
+        0.4553,
+        2.0196
+      ],
+      "centre": [
+        -3.6872,
+        0.3068,
+        1.0097
+      ],
+      "half_extent_xy": [
+        0.4276,
+        0.1485
+      ]
+    },
+    "shelf_02": {
+      "min": [
+        0.1613,
+        -0.9974,
+        -0.0003
+      ],
+      "max": [
+        0.4583,
+        -0.1423,
+        2.0196
+      ],
+      "centre": [
+        0.3098,
+        -0.5698,
+        1.0097
+      ],
+      "half_extent_xy": [
+        0.1485,
+        0.4276
+      ]
+    },
+    "trashbin_02": {
+      "min": [
+        3.7823,
+        -5.0815,
+        -0.0
+      ],
+      "max": [
+        4.091,
+        -4.8219,
+        0.4
+      ],
+      "centre": [
+        3.9367,
+        -4.9517,
+        0.2
+      ],
+      "half_extent_xy": [
+        0.1543,
+        0.1298
+      ]
+    },
+    "tv": {
+      "min": [
+        -3.7089,
+        -0.4293,
+        0.5421
+      ],
+      "max": [
+        -2.6769,
+        -0.0955,
+        1.2421
+      ],
+      "centre": [
+        -3.1929,
+        -0.2624,
+        0.8921
+      ],
+      "half_extent_xy": [
+        0.516,
+        0.1669
+      ]
+    },
+    "plant_tall": {
+      "min": [
+        -4.1004,
+        -5.105,
+        -0.0001
+      ],
+      "max": [
+        -3.9,
+        -4.8534,
+        0.6299
+      ],
+      "centre": [
+        -4.0002,
+        -4.9792,
+        0.3149
+      ],
+      "half_extent_xy": [
+        0.1002,
+        0.1258
+      ]
+    },
+    "plant_mid": {
+      "min": [
+        3.779,
+        0.1348,
+        -0.0063
+      ],
+      "max": [
+        4.2685,
+        0.5496,
+        0.7437
+      ],
+      "centre": [
+        4.0238,
+        0.3422,
+        0.3687
+      ],
+      "half_extent_xy": [
+        0.2447,
+        0.2074
+      ]
+    },
+    "stand": {
+      "min": [
+        3.6946,
+        4.2541,
+        -0.0007
+      ],
+      "max": [
+        4.2283,
+        4.7959,
+        1.7193
+      ],
+      "centre": [
+        3.9614,
+        4.525,
+        0.8593
+      ],
+      "half_extent_xy": [
+        0.2669,
+        0.2709
+      ]
+    },
+    "cushion": {
+      "min": [
+        0.5026,
+        0.3465,
+        0.4726
+      ],
+      "max": [
+        1.2348,
+        0.9646,
+        0.7695
+      ],
+      "centre": [
+        0.8687,
+        0.6555,
+        0.621
+      ],
+      "half_extent_xy": [
+        0.3661,
+        0.3091
+      ]
+    }
+  },
+  "walls": {
+    "wall_0000": {
+      "min": [
+        -4.5,
+        4.85,
+        0.0
+      ],
+      "max": [
+        4.5,
+        5.0,
+        1.25
+      ],
+      "centre": [
+        0.0,
+        4.925,
+        0.625
+      ],
+      "half_extent_xy": [
+        4.5,
+        0.075
+      ]
+    },
+    "wall_0001": {
+      "min": [
+        -4.5,
+        -5.5,
+        0.0
+      ],
+      "max": [
+        4.5,
+        -5.35,
+        1.25
+      ],
+      "centre": [
+        0.0,
+        -5.425,
+        0.625
+      ],
+      "half_extent_xy": [
+        4.5,
+        0.075
+      ]
+    },
+    "wall_0002": {
+      "min": [
+        4.35,
+        -5.35,
+        0.0
+      ],
+      "max": [
+        4.5,
+        4.85,
+        1.25
+      ],
+      "centre": [
+        4.425,
+        -0.25,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.075,
+        5.1
+      ]
+    },
+    "wall_0003": {
+      "min": [
+        -4.5,
+        -5.35,
+        0.0
+      ],
+      "max": [
+        -4.35,
+        -2.65,
+        1.25
+      ],
+      "centre": [
+        -4.425,
+        -4.0,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.075,
+        1.35
+      ]
+    },
+    "wall_0004": {
+      "min": [
+        -4.5,
+        -1.7,
+        0.0
+      ],
+      "max": [
+        -4.35,
+        2.6458,
+        1.25
+      ],
+      "centre": [
+        -4.425,
+        0.4729,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.075,
+        2.1729
+      ]
+    },
+    "wall_0005": {
+      "min": [
+        -4.5,
+        3.5958,
+        0.0
+      ],
+      "max": [
+        -4.35,
+        4.85,
+        1.25
+      ],
+      "centre": [
+        -4.425,
+        4.2229,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.075,
+        0.6271
+      ]
+    },
+    "wall_0006": {
+      "min": [
+        -0.075,
+        -5.35,
+        0.0
+      ],
+      "max": [
+        0.075,
+        -3.4366,
+        1.25
+      ],
+      "centre": [
+        0.0,
+        -4.3933,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.075,
+        0.9567
+      ]
+    },
+    "wall_0007": {
+      "min": [
+        -0.075,
+        -2.4866,
+        0.0
+      ],
+      "max": [
+        0.075,
+        3.5088,
+        1.25
+      ],
+      "centre": [
+        0.0,
+        0.5111,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.075,
+        2.9977
+      ]
+    },
+    "wall_0008": {
+      "min": [
+        -0.075,
+        4.4588,
+        0.0
+      ],
+      "max": [
+        0.075,
+        4.85,
+        1.25
+      ],
+      "centre": [
+        0.0,
+        4.6544,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.075,
+        0.1956
+      ]
+    },
+    "wall_0009": {
+      "min": [
+        0.075,
+        -0.075,
+        0.0
+      ],
+      "max": [
+        2.715,
+        0.075,
+        1.25
+      ],
+      "centre": [
+        1.395,
+        0.0,
+        0.625
+      ],
+      "half_extent_xy": [
+        1.32,
+        0.075
+      ]
+    },
+    "wall_0010": {
+      "min": [
+        3.665,
+        -0.075,
+        0.0
+      ],
+      "max": [
+        4.35,
+        0.075,
+        1.25
+      ],
+      "centre": [
+        4.0075,
+        0.0,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.3425,
+        0.075
+      ]
+    },
+    "wall_0011": {
+      "min": [
+        -1.116,
+        -0.075,
+        0.0
+      ],
+      "max": [
+        -0.075,
+        0.075,
+        1.25
+      ],
+      "centre": [
+        -0.5955,
+        0.0,
+        0.625
+      ],
+      "half_extent_xy": [
+        0.5205,
+        0.075
+      ]
+    },
+    "wall_0012": {
+      "min": [
+        -4.35,
+        -0.075,
+        0.0
+      ],
+      "max": [
+        -2.066,
+        0.075,
+        1.25
+      ],
+      "centre": [
+        -3.208,
+        0.0,
+        0.625
+      ],
+      "half_extent_xy": [
+        1.142,
+        0.075
+      ]
+    }
+  },
+  "poses": {
+    "kitchen_table": {
+      "pose": {
+        "x": 3.294,
+        "y": -2.351,
+        "yaw_deg": -135.0
+      },
+      "furniture_prim": "/World/Arena/Furniture/rcw26_kitchen_table",
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "rcw26_chair",
+        "distance_m": 0.411
+      },
+      "furniture_bbox": {
+        "min": [
+          2.1505,
+          -3.4891,
+          0.0038
+        ],
+        "max": [
+          3.0236,
+          -2.6271,
+          0.7238
+        ],
+        "centre": [
+          2.587,
+          -3.0581,
+          0.3638
+        ],
+        "half_extent_xy": [
+          0.4366,
+          0.431
+        ]
+      },
+      "approached_face": "north-east",
+      "axis_face": "east",
+      "distance_to_nearest_face_m": 0.386,
+      "angle_to_centre_deg": 0.0,
+      "approach_off_axis_deg": 45.0,
+      "lateral_offset_m": 0.707,
+      "forward_ray_hits_furniture": true,
+      "free_faces": [],
+      "surface": {
+        "surface_xyz": [
+          2.5,
+          -3.0,
+          0.734
+        ],
+        "inside_furniture_bbox_xy": true,
+        "z_vs_bbox_top_m": 0.01,
+        "distance_from_pose_m": 1.025
+      },
+      "verdict": "ok",
+      "reasons": [
+        "corner approach (north-east); no face is free (boxed in)",
+        "close: 0.39 m from the face"
+      ],
+      "recommended": {
+        "x": 3.412,
+        "y": -2.238,
+        "yaw_deg": -135.0,
+        "face": "north-east",
+        "note": "no free face; diagonal corner approach",
+        "move_from_current_m": 0.164
+      }
+    },
+    "laundry_desk": {
+      "pose": {
+        "x": -2.988,
+        "y": 3.677,
+        "yaw_deg": 90.0
+      },
+      "furniture_prim": "/World/Arena/Furniture/rcw26_laundry_desk",
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "rcw26_washing_machine",
+        "distance_m": 1.116
+      },
+      "furniture_bbox": {
+        "min": [
+          -3.5627,
+          4.2267,
+          -0.0014
+        ],
+        "max": [
+          -2.4135,
+          4.8223,
+          0.7337
+        ],
+        "centre": [
+          -2.9881,
+          4.5245,
+          0.3662
+        ],
+        "half_extent_xy": [
+          0.5746,
+          0.2978
+        ]
+      },
+      "approached_face": "south",
+      "axis_face": "south",
+      "distance_to_nearest_face_m": 0.55,
+      "angle_to_centre_deg": 0.0,
+      "approach_off_axis_deg": 0.0,
+      "lateral_offset_m": 0.0,
+      "forward_ray_hits_furniture": true,
+      "free_faces": [
+        "north",
+        "south"
+      ],
+      "surface": {
+        "surface_xyz": [
+          -2.988,
+          4.525,
+          0.734
+        ],
+        "inside_furniture_bbox_xy": true,
+        "z_vs_bbox_top_m": 0.0,
+        "distance_from_pose_m": 0.848
+      },
+      "verdict": "ok",
+      "reasons": [],
+      "recommended": {
+        "x": -2.988,
+        "y": 3.677,
+        "yaw_deg": 90.0,
+        "face": "south",
+        "note": "centred",
+        "move_from_current_m": 0.0
+      }
+    },
+    "shelf": {
+      "pose": {
+        "x": -3.687,
+        "y": 1.005,
+        "yaw_deg": -90.0
+      },
+      "furniture_prim": "/World/Arena/Furniture/rcw26_shelf",
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "wall_0004",
+        "distance_m": 0.663
+      },
+      "furniture_bbox": {
+        "min": [
+          -4.1147,
+          0.1583,
+          -0.0003
+        ],
+        "max": [
+          -3.2596,
+          0.4553,
+          2.0196
+        ],
+        "centre": [
+          -3.6872,
+          0.3068,
+          1.0097
+        ],
+        "half_extent_xy": [
+          0.4276,
+          0.1485
+        ]
+      },
+      "approached_face": "north",
+      "axis_face": "north",
+      "distance_to_nearest_face_m": 0.55,
+      "angle_to_centre_deg": 0.0,
+      "approach_off_axis_deg": 0.0,
+      "lateral_offset_m": 0.0,
+      "forward_ray_hits_furniture": true,
+      "free_faces": [
+        "north"
+      ],
+      "surface": {
+        "surface_xyz": [
+          -3.687,
+          0.309,
+          1.07
+        ],
+        "inside_furniture_bbox_xy": true,
+        "z_vs_bbox_top_m": -0.95,
+        "distance_from_pose_m": 0.696
+      },
+      "verdict": "ok",
+      "reasons": [],
+      "recommended": {
+        "x": -3.687,
+        "y": 1.005,
+        "yaw_deg": -90.0,
+        "face": "north",
+        "note": "centred",
+        "move_from_current_m": 0.0
+      }
+    },
+    "shelf_02": {
+      "pose": {
+        "x": 0.962,
+        "y": -0.57,
+        "yaw_deg": -180.0
+      },
+      "furniture_prim": "/World/Arena/Furniture/rcw26_shelf_02",
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "wall_0009",
+        "distance_m": 0.495
+      },
+      "furniture_bbox": {
+        "min": [
+          0.1613,
+          -0.9974,
+          -0.0003
+        ],
+        "max": [
+          0.4583,
+          -0.1423,
+          2.0196
+        ],
+        "centre": [
+          0.3098,
+          -0.5698,
+          1.0097
+        ],
+        "half_extent_xy": [
+          0.1485,
+          0.4276
+        ]
+      },
+      "approached_face": "east",
+      "axis_face": "east",
+      "distance_to_nearest_face_m": 0.504,
+      "angle_to_centre_deg": 0.0,
+      "approach_off_axis_deg": 0.0,
+      "lateral_offset_m": 0.0,
+      "forward_ray_hits_furniture": true,
+      "free_faces": [
+        "south",
+        "east",
+        "west"
+      ],
+      "surface": {
+        "surface_xyz": [
+          0.312,
+          -0.57,
+          1.07
+        ],
+        "inside_furniture_bbox_xy": true,
+        "z_vs_bbox_top_m": -0.95,
+        "distance_from_pose_m": 0.65
+      },
+      "verdict": "ok",
+      "reasons": [],
+      "recommended": {
+        "x": 1.008,
+        "y": -0.57,
+        "yaw_deg": -180.0,
+        "face": "east",
+        "note": "centred",
+        "move_from_current_m": 0.046
+      }
+    },
+    "side_table": {
+      "pose": {
+        "x": -0.595,
+        "y": -4.444,
+        "yaw_deg": -67.49
+      },
+      "furniture_prim": "/World/Arena/Furniture/rcw26_side_table",
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "wall_0006",
+        "distance_m": 0.52
+      },
+      "furniture_bbox": {
+        "min": [
+          -0.5381,
+          -5.2367,
+          0.0024
+        ],
+        "max": [
+          -0.1542,
+          -4.8537,
+          0.6025
+        ],
+        "centre": [
+          -0.3462,
+          -5.0452,
+          0.3025
+        ],
+        "half_extent_xy": [
+          0.1919,
+          0.1915
+        ]
+      },
+      "approached_face": "north-west",
+      "axis_face": "north",
+      "distance_to_nearest_face_m": 0.414,
+      "angle_to_centre_deg": 0.0,
+      "approach_off_axis_deg": 22.5,
+      "lateral_offset_m": 0.249,
+      "forward_ray_hits_furniture": true,
+      "free_faces": [
+        "north"
+      ],
+      "surface": {
+        "surface_xyz": [
+          -0.346,
+          -5.045,
+          0.612
+        ],
+        "inside_furniture_bbox_xy": true,
+        "z_vs_bbox_top_m": 0.01,
+        "distance_from_pose_m": 0.651
+      },
+      "verdict": "ok",
+      "reasons": [],
+      "recommended": {
+        "x": -0.396,
+        "y": -4.304,
+        "yaw_deg": -90.0,
+        "face": "north",
+        "note": "shifted +0.05 m along face",
+        "move_from_current_m": 0.243
+      }
+    },
+    "side_table_02": {
+      "pose": {
+        "x": 1.08,
+        "y": 1.755,
+        "yaw_deg": -180.0
+      },
+      "furniture_prim": "/World/Arena/Furniture/rcw26_side_table_02",
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "rcw26_bed",
+        "distance_m": 0.572
+      },
+      "furniture_bbox": {
+        "min": [
+          0.2379,
+          1.5633,
+          0.0024
+        ],
+        "max": [
+          0.6218,
+          1.9463,
+          0.6025
+        ],
+        "centre": [
+          0.4298,
+          1.7548,
+          0.3025
+        ],
+        "half_extent_xy": [
+          0.1919,
+          0.1915
+        ]
+      },
+      "approached_face": "east",
+      "axis_face": "east",
+      "distance_to_nearest_face_m": 0.458,
+      "angle_to_centre_deg": 0.0,
+      "approach_off_axis_deg": 0.0,
+      "lateral_offset_m": 0.0,
+      "forward_ray_hits_furniture": true,
+      "free_faces": [
+        "north",
+        "east"
+      ],
+      "surface": {
+        "surface_xyz": [
+          0.43,
+          1.755,
+          0.612
+        ],
+        "inside_furniture_bbox_xy": true,
+        "z_vs_bbox_top_m": 0.01,
+        "distance_from_pose_m": 0.65
+      },
+      "verdict": "ok",
+      "reasons": [],
+      "recommended": {
+        "x": 1.172,
+        "y": 1.755,
+        "yaw_deg": -180.0,
+        "face": "east",
+        "note": "centred",
+        "move_from_current_m": 0.092
+      }
+    },
+    "sofa": {
+      "pose": {
+        "x": -2.184,
+        "y": -3.837,
+        "yaw_deg": -90.0
+      },
+      "furniture_prim": "/World/Arena/Furniture/rcw26_sofa",
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "wall_0001",
+        "distance_m": 1.513
+      },
+      "furniture_bbox": {
+        "min": [
+          -3.2354,
+          -5.286,
+          0.0029
+        ],
+        "max": [
+          -1.1326,
+          -4.3869,
+          0.6529
+        ],
+        "centre": [
+          -2.184,
+          -4.8365,
+          0.3279
+        ],
+        "half_extent_xy": [
+          1.0514,
+          0.4496
+        ]
+      },
+      "approached_face": "north",
+      "axis_face": "north",
+      "distance_to_nearest_face_m": 0.55,
+      "angle_to_centre_deg": 0.0,
+      "approach_off_axis_deg": 0.0,
+      "lateral_offset_m": 0.0,
+      "forward_ray_hits_furniture": true,
+      "free_faces": [
+        "north",
+        "south",
+        "east",
+        "west"
+      ],
+      "surface": {
+        "surface_xyz": [
+          -2.184,
+          -4.839,
+          0.45
+        ],
+        "inside_furniture_bbox_xy": true,
+        "z_vs_bbox_top_m": -0.203,
+        "distance_from_pose_m": 1.002
+      },
+      "verdict": "ok",
+      "reasons": [],
+      "recommended": {
+        "x": -2.184,
+        "y": -3.837,
+        "yaw_deg": -90.0,
+        "face": "north",
+        "note": "centred",
+        "move_from_current_m": 0.0
+      }
+    },
+    "command_point": {
+      "pose": {
+        "x": -2.0,
+        "y": -2.0,
+        "yaw_deg": 0.0
+      },
+      "furniture_prim": null,
+      "inside_obstacle": null,
+      "nearest_obstacle": {
+        "name": "rcw26_tv_stand",
+        "distance_m": 1.65
+      },
+      "verdict": "ok",
+      "reasons": [
+        "no furniture for this pose; free-space check only"
+      ],
+      "recommended": {
+        "x": -2.0,
+        "y": -2.0,
+        "yaw_deg": 0.0,
+        "face": null,
+        "note": "keep",
+        "move_from_current_m": 0.0
+      }
+    }
+  }
+}

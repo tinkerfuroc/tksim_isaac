@@ -179,6 +179,12 @@ def test_vision_stage_has_four_popens_including_named_camera_server_and_pan_tilt
     flat = [" ".join(c) for c in cmd]
     assert any("vision_bringup" in c for c in flat)
     assert any("__node:=head_camera_server" in c for c in flat)
+    # The RealSense is read through its own service endpoint; the sim's
+    # /camera/xarm_camera topics must be bridged by a second camera server.
+    wrist = [c for c in flat if "__node:=wrist_camera_server" in c]
+    assert len(wrist) == 1
+    assert "color_topic:=/camera/xarm_camera/color/image_raw" in wrist[0]
+    assert "depth_topic:=/camera/xarm_camera/aligned_depth_to_color/image_raw" in wrist[0]
     assert any("pan_tilt" in c and "state_publisher" in c for c in flat)
     assert any("pan_tilt_tf_publisher.py" in c for c in flat)
 
@@ -316,6 +322,21 @@ def test_census_argv_uses_the_same_ros_sourcing_wrapper_as_stages():
     assert "source /opt/ros/humble/setup.bash" in script
     assert f"source {mod.TINKER_WS}/install/setup.bash" in script
     assert "gpsr_interface_census.py" in script
+
+
+def test_run_census_times_out_instead_of_hanging_bring_up(monkeypatch):
+    # 2026-09-30: a census hung 30+ min on broken DDS discovery and bring-up
+    # never reached its own gate deadline.
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise mod.subprocess.TimeoutExpired(argv, kwargs.get("timeout"), output=b"partial\n")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    rc, output = mod._run_census()
+    assert seen["timeout"] == mod.CENSUS_TIMEOUT_S
+    assert rc == 124 and "partial" in output and "timed out" in output
 
 
 def test_run_census_runs_sourced_argv_with_full_env(monkeypatch):
@@ -585,3 +606,32 @@ def test_live_manipulation_stage_includes_model_bundle_manifest():
     script = manip["cmd"][0][2]  # ["bash", "-lc", script]
     assert "model_bundle_manifest:=" in script
     assert script.endswith("model-bundle.json")
+
+
+# --- a stage child that died before its gate passed fails the bring-up ---
+
+def test_check_stage_deaths_raises_on_child_died_at_startup(tmp_path):
+    import pytest
+
+    (tmp_path / "03-vision-0.log").write_text(
+        "[generalist_node-1] ModuleNotFoundError: No module named 'torch'\n"
+        "[ERROR] [generalist_node-1]: process has died [pid 1893676, exit code 1, cmd 'x'].\n")
+    (tmp_path / "03-vision-1.log").write_text("[INFO] camera server ready\n")
+    with pytest.raises(RuntimeError, match=r"generalist_node-1 \(exit code 1\)"):
+        mod._check_stage_deaths(tmp_path, "03-vision")
+
+
+def test_check_stage_deaths_ignores_other_stages_and_healthy_logs(tmp_path):
+    (tmp_path / "03-vision-0.log").write_text("[INFO] Generalist detection node ready\n")
+    (tmp_path / "04-manipulation-0.log").write_text(
+        "[ERROR] [move_group-1]: process has died [pid 1, exit code -11, cmd 'x'].\n")
+    mod._check_stage_deaths(tmp_path, "03-vision")  # no raise
+
+
+def test_bridge_stage_gets_the_head_camera_aim_like_the_sim_stage():
+    # 2026-10-01: only the sim stage had TINKER_SIM_HEAD_CAMERA_AIM, so the
+    # bridge's camera_color_optical_frame alias stayed identity and every
+    # map-frame head detection projected upward.
+    stages = {s["name"]: s for s in mod.stage_commands(_cfg())}
+    assert stages["sim"]["env"]["TINKER_SIM_HEAD_CAMERA_AIM"] == mod.HEAD_CAMERA_AIM
+    assert stages["bridge"]["env"]["TINKER_SIM_HEAD_CAMERA_AIM"] == mod.HEAD_CAMERA_AIM

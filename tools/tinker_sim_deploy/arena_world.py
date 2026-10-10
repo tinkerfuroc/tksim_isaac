@@ -44,6 +44,113 @@ class MeshCollider:
     uri: str                             # mesh URI as written in the SDF
 
 
+# Collision overrides (config/arena-import.json "collision_overrides").
+#
+# Collider choice is otherwise driven entirely by the upstream model SDF:
+# parse_model_colliders turns each <collision> into a BoxCollider (<box>,
+# <cylinder>) or a MeshCollider (<mesh>), and author_model_colliders makes a
+# MeshCollider a convexHull MeshCollisionAPI on the visual mesh -- which for
+# an open bookshelf is one solid block from the floor to the top board, so an
+# object spawned on a middle board starts INSIDE the hull and is ejected.
+# An override replaces a model's SDF colliders with an explicit, model-local
+# box set; the "open_shelf" kind expands a compact board/panel description
+# into thin boxes so shelf levels are real, separate surfaces.
+_OPEN_SHELF_KIND = "open_shelf"
+
+
+def _pair(value: object, label: str) -> tuple[float, float]:
+    try:
+        lo, hi = (float(part) for part in value)  # type: ignore[union-attr]
+    except (TypeError, ValueError) as error:
+        raise ArenaWorldError(f"{label}: expected [lo, hi], got {value!r}") from error
+    if not hi > lo:
+        raise ArenaWorldError(f"{label}: expected lo < hi, got {value!r}")
+    return lo, hi
+
+
+def _slab(x: tuple[float, float], y: tuple[float, float], z: tuple[float, float]) -> BoxCollider:
+    return BoxCollider(
+        size=(x[1] - x[0], y[1] - y[0], z[1] - z[0]),
+        center=((x[0] + x[1]) / 2.0, (y[0] + y[1]) / 2.0, (z[0] + z[1]) / 2.0),
+        yaw=0.0,
+    )
+
+
+def expand_collision_override(spec: object, label: str = "collision override") -> tuple[BoxCollider, ...]:
+    """Expand one ``collision_overrides`` entry into model-local BoxColliders.
+
+    ``kind: "open_shelf"``::
+
+        {"kind": "open_shelf",
+         "footprint_x": [x_min, x_max],      # shelf bbox, model-local metres
+         "footprint_y": [y_min, y_max],
+         "footprint_z": [z_min, z_max],      # panel height (floor .. top)
+         "boards_z": [[z_bottom, z_top], ...],  # one thin box per board
+         "side_panel_thickness": 0.04,       # optional: boxes at both x edges
+         "back_panel": {"side": "+y"|"-y"|"+x"|"-x", "thickness": 0.045}}  # optional
+
+    Boards span the full x/y footprint; side panels are full-height, full-y
+    boxes hugging ``footprint_x``'s edges; the back panel is a full-height,
+    full-length box on the named side. Order: boards (ascending z), then side
+    panels (-x, +x), then the back panel -- ``author_model_colliders`` names
+    them ``box_00``.. in that order. Fails closed on a malformed spec.
+    """
+    if not isinstance(spec, dict):
+        raise ArenaWorldError(f"{label}: expected an object, got {spec!r}")
+    kind = spec.get("kind")
+    if kind != _OPEN_SHELF_KIND:
+        raise ArenaWorldError(f"{label}: unsupported kind {kind!r} (supported: {_OPEN_SHELF_KIND!r})")
+    fx = _pair(spec.get("footprint_x"), f"{label}.footprint_x")
+    fy = _pair(spec.get("footprint_y"), f"{label}.footprint_y")
+    fz = _pair(spec.get("footprint_z"), f"{label}.footprint_z")
+    boards_raw = spec.get("boards_z")
+    if not isinstance(boards_raw, (list, tuple)) or not boards_raw:
+        raise ArenaWorldError(f"{label}.boards_z: expected a non-empty list of [z_bottom, z_top]")
+    boards = sorted(_pair(item, f"{label}.boards_z[{index}]") for index, item in enumerate(boards_raw))
+    for lo, hi in boards:
+        if lo < fz[0] - _POSE_EPSILON or hi > fz[1] + _POSE_EPSILON:
+            raise ArenaWorldError(f"{label}.boards_z: board [{lo}, {hi}] outside footprint_z {list(fz)}")
+    colliders = [_slab(fx, fy, board) for board in boards]
+    side = spec.get("side_panel_thickness")
+    if side is not None:
+        thickness = float(side)
+        if not 0.0 < thickness < (fx[1] - fx[0]) / 2.0:
+            raise ArenaWorldError(f"{label}.side_panel_thickness: {side!r} not in (0, half width)")
+        colliders.append(_slab((fx[0], fx[0] + thickness), fy, fz))
+        colliders.append(_slab((fx[1] - thickness, fx[1]), fy, fz))
+    back = spec.get("back_panel")
+    if back is not None:
+        if not isinstance(back, dict):
+            raise ArenaWorldError(f"{label}.back_panel: expected an object")
+        thickness = float(back.get("thickness", 0.0))
+        panel_side = str(back.get("side", ""))
+        axis_extent = fy if panel_side.endswith("y") else fx
+        if panel_side not in ("+x", "-x", "+y", "-y") or not 0.0 < thickness < (axis_extent[1] - axis_extent[0]):
+            raise ArenaWorldError(f"{label}.back_panel: bad side {panel_side!r} / thickness {thickness!r}")
+        lo, hi = axis_extent
+        span = (hi - thickness, hi) if panel_side.startswith("+") else (lo, lo + thickness)
+        if panel_side.endswith("y"):
+            colliders.append(_slab(fx, span, fz))
+        else:
+            colliders.append(_slab(span, fy, fz))
+    return tuple(colliders)
+
+
+def collision_overrides_from_config(config: object) -> dict[str, tuple[BoxCollider, ...]]:
+    """``config["collision_overrides"]`` ({model_id: spec}) expanded per model;
+    an absent/empty key yields ``{}``. Fails closed on any malformed entry."""
+    raw = config.get("collision_overrides", {}) if isinstance(config, dict) else {}
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ArenaWorldError("collision_overrides: expected an object keyed by model_id")
+    return {
+        str(model_id): expand_collision_override(spec, label=f"collision_overrides[{model_id}]")
+        for model_id, spec in raw.items()
+        if not str(model_id).startswith("_")  # "_comment" and friends
+    }
+
+
 @dataclass(frozen=True)
 class ArenaLayout:
     walls: tuple[WallBox, ...]

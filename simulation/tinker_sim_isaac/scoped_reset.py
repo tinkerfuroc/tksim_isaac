@@ -140,7 +140,7 @@ def bind_provider(provider_type, reset):
         if original is None:
             continue
 
-        async def guarded(self, request, response, _original=original):
+        async def guarded(self, request, response, _original=original, _name=name):
             if reset.busy:
                 response.result = Result(
                     result=Result.RESULT_OPERATION_FAILED,
@@ -149,10 +149,25 @@ def bind_provider(provider_type, reset):
                 return response
             reset.mutations_inflight += 1
             try:
+                if _name == "_handle_delete_entity":
+                    release_referee_hold_for_delete(reset, request)
                 return await _original(self, request, response)
             finally:
                 reset.mutations_inflight -= 1
         setattr(provider_type, name, guarded)
+
+
+def release_referee_hold_for_delete(reset, request) -> None:
+    """Stop the referee hand-off kinematic follow BEFORE its object is
+    deleted (a follow write to a deleted prim would fail every step)."""
+    backend = getattr(getattr(reset, "gateway", None), "backend", None)
+    release = getattr(backend, "release_referee_hold_for", None)
+    if release is None:
+        return
+    try:
+        release(getattr(request, "entity", ""))
+    except Exception:  # noqa: BLE001 - a hold release never blocks a delete
+        pass
 
 
 class PhysicsBaseline:
@@ -216,6 +231,11 @@ class PhysicsBaseline:
         backend = self.backend
         if not backend._safety_stopped:
             raise ResetFailure("backend hold is not active")
+        # A referee hand-off hold must not keep pinning its object to the
+        # TCP across the reset (it would drag the restored body back).
+        release_hold = getattr(backend, "release_referee_hold", None)
+        if release_hold is not None:
+            release_hold("scoped_reset")
         robot = backend._robot
         # Articulation.reset clears actuator delays, external wrenches and
         # controller memory; the direct writers preserve the live PhysX view.

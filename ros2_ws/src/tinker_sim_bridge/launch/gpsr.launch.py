@@ -11,6 +11,7 @@ if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
 from tinker_sim_deploy.runtime import (
+    _head_camera_aim,
     resolve_arena_map_yaml,
     resolve_current_artifact,
     scenario_arena_id,
@@ -117,6 +118,10 @@ def _resolve(context):
     # cam-stand TF rewrite, keyed on TINKER_SIM_WRIST_CAMERA_AIM (the frame the
     # wrist images advertise must be the one they were rendered from).
     robot_description = sim_robot_description(resolved_artifact.robot_urdf)
+    # Same idea for the head camera: the image frame alias carries the
+    # level-forward render correction (keyed on TINKER_SIM_HEAD_CAMERA_AIM).
+    _HEAD_ALIAS_XYZ, _HEAD_ALIAS_Q = _head_camera_aim().head_camera_optical_alias(
+        os.environ.get("TINKER_SIM_HEAD_CAMERA_AIM"))
 
     calibration = root / "simulation/calibration/tinker2-missing.json"
     # AMCL must localize on the arena the simulator raycasts its lidar
@@ -408,13 +413,18 @@ def _resolve(context):
         # images advertise does not exist in TF, and a consumer that asks for
         # a detection in map silently drops it -- GPSR run16 detected the
         # person at conf 1.0 and returned zero objects for exactly that
-        # reason. Identity: the URDF link already is the optical frame.
+        # reason. Identity under hardware parity (the URDF link already is the
+        # optical frame); under TINKER_SIM_HEAD_CAMERA_AIM it carries the same
+        # correction the sim renders the head camera with
+        # (head_camera_aim.head_camera_optical_alias).
         Node(
             package="tf2_ros", executable="static_transform_publisher",
             name="head_camera_optical_alias_tf",
             arguments=[
-                "--x", "0", "--y", "0", "--z", "0",
-                "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
+                "--x", repr(_HEAD_ALIAS_XYZ[0]), "--y", repr(_HEAD_ALIAS_XYZ[1]),
+                "--z", repr(_HEAD_ALIAS_XYZ[2]),
+                "--qx", repr(_HEAD_ALIAS_Q[0]), "--qy", repr(_HEAD_ALIAS_Q[1]),
+                "--qz", repr(_HEAD_ALIAS_Q[2]), "--qw", repr(_HEAD_ALIAS_Q[3]),
                 "--frame-id", "head_camera_color_optical_frame",
                 "--child-frame-id", "camera_color_optical_frame",
             ],

@@ -378,7 +378,28 @@ ros2 run camera_server camera_server_node --ros-args \
   -p depth_topic:=/camera/depth/image_raw \
   -p color_info_topic:=/camera/color/camera_info \
   -p depth_info_topic:=/camera/color/camera_info
+
+# The arm RealSense needs its OWN server under this exact name: generalist_node
+# and yolo_seg_node read "camera: realsense" frames through the
+# /wrist_camera_server service endpoint, never straight off the topics.
+ros2 run camera_server camera_server_node --ros-args \
+  -r __node:=wrist_camera_server \
+  -p use_sim_time:=true \
+  -p color_topic:=/camera/xarm_camera/color/image_raw \
+  -p depth_topic:=/camera/xarm_camera/aligned_depth_to_color/image_raw \
+  -p color_info_topic:=/camera/xarm_camera/color/camera_info \
+  -p depth_info_topic:=/camera/xarm_camera/aligned_depth_to_color/camera_info
 ```
+
+**Run the wrist camera server too.** The sim already publishes the
+`/camera/xarm_camera/*` topics (hardware-parity names of the D435), but every
+RealSense-path detection (`generalist_node` `camera: realsense`,
+`yolo_seg_node`, the `camera_compat_bridge` wrist leg) fetches frames from the
+`/wrist_camera_server` *service*, exactly as head-camera consumers use
+`/head_camera_server`. Without it every table-grasp detection fails with
+`No realsense camera data within sync threshold` and `grasp` always falls to
+the referee handoff (5-run sim battery, 2026-09-25). `scripts/gpsr-stack`
+launches it and the census requires `wrist_camera_server/get_snapshot`.
 
 **Point the head before expecting anything from vision.** From a pristine
 spawn the head camera looks at the robot's own deck, so `door_detection_srv`
