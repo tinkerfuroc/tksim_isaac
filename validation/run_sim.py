@@ -79,6 +79,7 @@ def _emit_step_profile(
     publish_breakdown: dict | None = None,
     camera_breakdown: dict | None = None,
     spin_breakdown: dict | None = None,
+    lidar_breakdown: dict | None = None,
     sim_time: float | None = None,
 ) -> None:
     """Print where sensor-rich wall time actually goes, then reset the window.
@@ -135,6 +136,8 @@ def _emit_step_profile(
         payload["step_profile"]["camera_breakdown_ms"] = camera_breakdown
     if spin_breakdown is not None:
         payload["step_profile"]["spin_breakdown"] = spin_breakdown
+    if lidar_breakdown is not None:
+        payload["step_profile"]["lidar_breakdown_ms"] = lidar_breakdown
     print(json.dumps(payload, sort_keys=True), flush=True)
     sys.stdout.flush()
     for key in ("physics", "publish", "kit_pump", "cameras", "spin", "wall"):
@@ -1606,6 +1609,11 @@ def main() -> int:
                                         spin_breakdown=(
                                             gateway.spin_profile_snapshot()
                                             if hasattr(gateway, "spin_profile_snapshot")
+                                            else None
+                                        ),
+                                        lidar_breakdown=(
+                                            gateway.lidar_profile_snapshot()
+                                            if hasattr(gateway, "lidar_profile_snapshot")
                                             else None
                                         ),
                                         sim_time=getattr(backend, "simulation_time", None),

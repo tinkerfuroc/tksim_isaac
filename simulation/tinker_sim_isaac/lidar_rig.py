@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -482,6 +483,10 @@ class RaycastLidar:
         #: First hit prim path seen, kept once so the status heartbeat can show
         #: WHAT the sensor is actually hitting without streaming every path.
         self._last_sample_path = ""
+        #: Opt-in wall-time attribution (TINKER_SIM_PROFILE=1), read like the
+        #: backend's step profile: where the lidar's Python cost per fold goes.
+        self.profile_enabled = os.environ.get("TINKER_SIM_PROFILE") == "1"
+        self._profile = {"get_data": 0.0, "self_mask": 0.0, "fold": 0.0, "calls": 0}
 
     # -- lifecycle ------------------------------------------------------
 
@@ -607,6 +612,8 @@ class RaycastLidar:
         """
         if self.sensor is None or self._accumulator is None:
             return
+        clock = time.perf_counter if self.profile_enabled else None
+        t0 = clock() if clock else 0.0
         try:
             data = self.sensor.get_data()
             step = data.get("physics_step")
@@ -615,8 +622,10 @@ class RaycastLidar:
                 return
             self._last_physics_step = step
             hits = data["hit_positions"]
+            t1 = clock() if clock else 0.0
             if self.spec.self_filter:
                 hits = self._drop_self_hits(hits, data.get("hit_prim_paths"))
+            t2 = clock() if clock else 0.0
         except Exception as exc:  # noqa: BLE001
             self._report_once("read", exc)
             return
@@ -639,6 +648,13 @@ class RaycastLidar:
             self._pending = self._accumulator.take_frame()
             self._last_points = int(self._pending[0].shape[0])
             self._frame_ready = True
+        if clock:
+            t3 = clock()
+            prof = self._profile
+            prof["get_data"] += t1 - t0
+            prof["self_mask"] += t2 - t1
+            prof["fold"] += t3 - t2
+            prof["calls"] += 1
 
     def _drop_self_hits(self, hit_positions: Any, hit_prim_paths: Any) -> np.ndarray:
         """Zero out returns that landed on the robot.
@@ -732,6 +748,20 @@ class RaycastLidar:
                 report["is_valid"] = None
                 report["reading_error"] = repr(exc)[:120]
         return report
+
+    def profile_snapshot(self) -> dict[str, float | int]:
+        """Per-fold ms attribution since the last snapshot; resets the window."""
+        prof = self._profile
+        calls = prof["calls"]
+        n = max(1, calls)
+        out: dict[str, float | int] = {
+            key: round(1000.0 * prof[key] / n, 3) for key in ("get_data", "self_mask", "fold")
+        }
+        out["calls"] = calls
+        for key in ("get_data", "self_mask", "fold"):
+            prof[key] = 0.0
+        prof["calls"] = 0
+        return out
 
     def take_frame(self) -> tuple[np.ndarray, np.ndarray] | None:
         """The most recent complete frame, or ``None`` if one is not ready."""

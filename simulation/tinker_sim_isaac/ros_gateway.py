@@ -1393,6 +1393,12 @@ class RosStandardGateway:
         prof["n"] = 0
         return out
 
+    def lidar_profile_snapshot(self) -> dict | None:
+        """Per-fold ms attribution of the raycast lidar, or None without one."""
+        rig = getattr(self, "lidar_rig", None)
+        reader = getattr(rig, "profile_snapshot", None)
+        return None if reader is None else reader()
+
     def camera_profile_snapshot(self) -> dict:
         """Per-call ms attribution of publish_cameras(); resets the window."""
         prof = self._camera_profile
