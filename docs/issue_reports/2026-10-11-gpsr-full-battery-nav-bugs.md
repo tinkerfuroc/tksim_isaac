@@ -78,6 +78,39 @@ Long goals across open floor had none.
    - The approach planner checks only the footprint at the final yaw (the 0.15 m preferred / 0.05 m fallback clearance). It does not check whether the robot can turn there, or turn from its arrival heading into the final yaw. Both kitchen_table approach poses were 0.05 m-fallback poses with 30–35 of 72 headings blocked.
    - The decision's fixed nav poses (kitchen_table about (3.41, −2.24), side_table_02 x = 1.172) are also inside 0.53 m of furniture or chairs.
 
+### Live diagnosis and fix (2026-10-11, debug-gpsr-nav-issue, tinker-sim `d30439d`)
+
+This section supersedes parts of the root cause above. It comes from a live repro with truth, AMCL and `/cmd_vel` recorded at 10 Hz.
+
+- **Main driver: a near-goal pivot limit cycle. The collision checks are a symptom of it.**
+  1. RPP stops translating as soon as the AMCL estimate is inside `xy_goal_tolerance`, so the robot parks at the boundary (0.195 m measured against 0.2).
+  2. It then pivots to the goal yaw. The true base_link stayed fixed to 1 mm, but each AMCL update during the pivot (`update_min_a` 0.1 rad) moved the estimate 1–1.5 cm with heading. That put the estimate back outside the tolerance.
+  3. Outside the tolerance, RPP pivots about 140° to the path heading. Back inside, it pivots back again.
+  4. On the 0.25 m side_table_02 goal (1.02, 2.12) → (1.17, 1.75, 180°), the robot rotated 446°, 697°, 562° and 199° in four runs, and three of the four looped. The rotation sweep next to the table produces the "collision ahead" warnings.
+  5. The 11:53 battery case (98 warnings) is this loop: the robot sat 0.206 m from the goal against a 0.2 tolerance.
+- **Fix `d30439d`: AMCL `update_min_a` 0.1 → 3.0** in `nav_params_overlay.py`, plus a test.
+  - This is safe in the sim because odometry is exact in pure rotation, and 5 cm of travel still triggers updates.
+  - On the same repro: 208° and 192° of rotation, 8.4 s and 7.3 s, no loop (2 of 2).
+  - The remaining 19–34 warnings per goal come from the one necessary pivot.
+  - Open: small N, and the AMCL route-accuracy dataset has not been re-run with this setting. Check it in the next battery.
+- **Corrections to points 3–4 and the table:**
+  - The BT recovery round-robin barely ran in the battery. The whole log has 5 `Controller patience exceeded`, 1 `Failed to make progress`, 1 spin and 0 backups. "Recovery doesn't break the loop" (point 4) was inferred and is not supported by the log.
+  - The 11:51 goal (−1.99, −2.00) → (1.17, 1.75) was cancelled at 120 s with zero collision warnings. This is the wall-clock goto timeout described in the correction under Symptom, not Nav2.
+- **Footprint:** the measured body is x [−0.38, 0.13], y ±0.205, radius 0.43, against the footprint's 0.525.
+  - A static check with the body plus 3 cm cuts blocked headings at the battery poses: kitchen (3.37, −2.13) 19 → 6, (3.85, −3.60) 31 → 8, (−0.56, −4.28) 10 → 0.
+  - The live test was inconclusive because `set_parameters` on the local_costmap footprint timed out.
+  - Not done: this needs the tinker2_sim profile in tk25_basic (`feat/tinker2-sim-profile`), and merging that is the user's call.
+- **Approach planner footprint mismatch:** its startup log shows it checks stand poses with `[(0.25,±0.25),(−0.3,±0.25)]`, while Nav2 enforces tinker2_sim `[(0.20,±0.27),(−0.45,±0.27)]`. Its rear is 15 cm short. Forwarded to gpsr-issue-2-approach-planner (PR #11).
+- **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the working tree carries an uncommitted 0.2 from another session, and stacks run with 0.2. `d30439d` doesn't depend on either value.
+
+### Related: wheels kept driving after `/cmd_vel` went to zero (sim base drive, open)
+
+- **What happened:** in about 1 of 4 route runs (kitchen approach near (3.3, 0.15)), RPP correctly detected a collision ahead and `/cmd_vel` went to 0. The wheels (`/isaac_joint_states` → odom) kept 0.35 m/s for 3.4 sim-s, and the robot drove into furniture: centre 0.21 m from the obstacle, body radius 0.43.
+- **Effects:** truth spun +70°, and AMCL lost 0.6 m and 60°. The BT spin and backup recoveries then failed with "Collision Ahead".
+- **Probe so far:** a per-layer probe (`cmd_vel` → facade wheel command → `/isaac_joint_commands` → measured) over two later route runs saw no recurrence.
+- **Logs:** `gpsr_stack_logs/20261011T081535`, and `/tmp/claude-1002/bugA/base.jsonl` at sim t+64 s.
+- **Owner:** sim gateway / base drive. No session owns it yet.
+
 ### Suggested fixes (pick per owner)
 
 - **Approach planner:**
