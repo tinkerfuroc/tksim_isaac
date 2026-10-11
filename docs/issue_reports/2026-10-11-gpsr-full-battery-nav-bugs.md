@@ -118,7 +118,7 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
 - **Collision-ahead warnings:** 0 inside any GoToApproach window. There were 121 on the plain NavigateToPose legs to the decision's fixed nav poses: S1 34, K2b (side table → kitchen) 85, S2 2.
 - **Remaining issue 1:** the decision's fixed nav pose at the kitchen_table is still tight.
 - **Remaining issue 2:** with the chairs, every kitchen_table stand pose sits at the 1.0 m stand-off maximum (1.10–1.19 m from the target, vs about 0.95 m before the PR). Manipulation should check whether that is within grasp reach.
-- **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN.
+- **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN. Reworded in PR #11 `054d8a7` to "chosen pose (x, y) has only 0.05 m footprint clearance (preferred 0.15 m): …"; grep for "has only" in future logs.
 
 ### Related: wheels kept driving after `/cmd_vel` went to zero (sim base drive, open)
 
