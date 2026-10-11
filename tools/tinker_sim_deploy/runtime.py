@@ -315,7 +315,94 @@ def sim_robot_description(
     aim = _head_camera_aim()
     if aim.resolve_wrist_aim_correction(env.get(aim.WRIST_AIM_ENV)) == aim.CAM_STAND_CORRECTION_WXYZ:
         description = aim.cam_stand_robot_description(description)
+    description = with_base_footprint(description)
     return description
+
+
+def with_base_footprint(description: str) -> str:
+    """Add ``base_footprint``, a fixed child of ``base_link`` on the floor.
+
+    base_link is the xArm mount on the chassis, not the floor (0.0775 m up in
+    sim), and the 2-D EKF publishes odom -> base_link with z = 0, so map-frame
+    z is a height above the base_link plane. Localization and Nav2 keep
+    running on base_link; anything comparing heights with the floor (surface
+    heights, object z, barrier heights) looks up base_footprint instead of
+    carrying its own offset. The height comes from the wheels in the same
+    URDF: the lowest point of every ``*_wheel`` link's collision, which must
+    agree. A description without wheels, or that already has
+    base_footprint, is returned unchanged.
+    """
+    root = ET.fromstring(description)
+    # Top-level elements only: <ros2_control> nests its own <joint> tags.
+    if any(link.get("name") == "base_footprint" for link in root.findall("link")):
+        return description
+    parent_joint = {joint.find("child").get("link"): joint for joint in root.findall("joint")}
+    bottoms: dict[str, float] = {}
+    for link in root.findall("link"):
+        name = link.get("name", "")
+        if not name.endswith("_wheel"):
+            continue
+        for collision in link.findall("collision"):
+            bottom = _wheel_collision_bottom(collision)
+            if bottom is None:
+                continue
+            frame, z = name, bottom
+            while frame != "base_link":
+                joint = parent_joint.get(frame)
+                if joint is None:
+                    break
+                xyz, rpy = _origin(joint)
+                if any(abs(angle) > 1e-6 for angle in rpy):
+                    raise ValueError(f"{joint.get('name')}: rotated wheel mount is not supported")
+                z += xyz[2]
+                frame = joint.find("parent").get("link")
+            if frame == "base_link":
+                bottoms[name] = min(z, bottoms.get(name, z))
+    if not bottoms:
+        return description
+    if max(bottoms.values()) - min(bottoms.values()) > 0.001:
+        raise ValueError(f"wheel bottoms disagree on the floor height: {bottoms}")
+    floor = min(bottoms.values())
+    addition = (
+        '  <link name="base_footprint"/>\n'
+        '  <joint name="base_footprint_joint" type="fixed">\n'
+        '    <parent link="base_link"/>\n'
+        '    <child link="base_footprint"/>\n'
+        f'    <origin xyz="0 0 {floor:.6g}" rpy="0 0 0"/>\n'
+        "  </joint>\n"
+    )
+    end = description.rindex("</robot>")
+    return description[:end] + addition + description[end:]
+
+
+def _origin(element: ET.Element) -> tuple[list[float], list[float]]:
+    origin = element.find("origin")
+    if origin is None:
+        return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    xyz = [float(v) for v in origin.get("xyz", "0 0 0").split()]
+    rpy = [float(v) for v in origin.get("rpy", "0 0 0").split()]
+    return xyz, rpy
+
+
+def _wheel_collision_bottom(collision: ET.Element) -> float | None:
+    """Lowest z of a wheel's cylinder/sphere collision in its link frame."""
+    geometry = collision.find("geometry")
+    if geometry is None:
+        return None
+    xyz, rpy = _origin(collision)
+    sphere = geometry.find("sphere")
+    if sphere is not None:
+        return xyz[2] - float(sphere.get("radius"))
+    cylinder = geometry.find("cylinder")
+    if cylinder is None:
+        return None
+    radius, length = float(cylinder.get("radius")), float(cylinder.get("length"))
+    roll, pitch = abs(rpy[0]), abs(rpy[1])
+    if abs(roll - 1.5708) < 0.01 or abs(pitch - 1.5708) < 0.01:  # axle horizontal
+        return xyz[2] - radius
+    if roll < 0.01 and pitch < 0.01:  # axle vertical
+        return xyz[2] - length / 2.0
+    return None
 
 
 def _head_camera_aim():

@@ -10,7 +10,7 @@ _tools = _project_root / "tools"
 if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
-from tinker_sim_deploy.runtime import resolve_arena_map_yaml, resolve_current_artifact
+from tinker_sim_deploy.runtime import resolve_arena_map_yaml, resolve_current_artifact, with_base_footprint
 
 from tinker_sim_bridge.amcl_map import default_amcl_map_dir, write_amcl_map
 from tinker_sim_bridge.nav_params_overlay import (
@@ -121,7 +121,10 @@ def _resolve(context):
         ),
         Node(
             package="robot_state_publisher", executable="robot_state_publisher", output="screen",
-            parameters=[{"use_sim_time": True, "robot_description": (artifact / "robot.urdf").read_text(encoding="utf-8")}],
+            # with_base_footprint: base_footprint on the floor, for heights
+            # measured from the floor (base_link rests 0.0775 m up).
+            parameters=[{"use_sim_time": True, "robot_description": with_base_footprint(
+                (artifact / "robot.urdf").read_text(encoding="utf-8"))}],
         ),
         # Match the physical Livox driver contract.  The robot URDF's visual
         # sensor link is named livox_frame, while hardware messages and Nav2
