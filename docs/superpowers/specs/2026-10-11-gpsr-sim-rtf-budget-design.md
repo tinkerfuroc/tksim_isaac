@@ -131,8 +131,10 @@ be the plugin resolving prim paths, or `get_data()` materialising a
 19,893-entry Python list per step. So:
 
 1. Add lidar sub-laps to the existing `TINKER_SIM_PROFILE=1` breakdown:
-   `lidar_get_data`, `lidar_self_mask`, `lidar_fold`, plus the plugin cost
-   inferred from the A/B of `report_hit_prim_paths` on/off.
+   `lidar_get_data`, `lidar_self_mask`, `lidar_fold`. The plugin's own cost
+   (scene queries + hit-path resolution) lands in the profile's `physics`
+   bucket; it is inferred from that bucket's growth across the Unit E A/B
+   cells, since toggling `report_hit_prim_paths` would need a contract edit.
 2. Optimise **only** the term that measures ≥ 0.05 s/sim-s at the battery
    preset. Candidate fixes, chosen by the measurement:
    - mask dominates → vectorise (`np.char.startswith` over the live subset,
