@@ -102,6 +102,16 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(amcl, dict):
         for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
             amcl[alpha] = 0.05
+        # Hold the estimate through in-place pivots (Bug A, 2026-10-11):
+        # pure rotation about base_link is exact in sim odometry, but every
+        # AMCL update during a pivot (one per 0.1 rad upstream) moved the
+        # estimate 1-1.5 cm with heading. RPP parks right at
+        # xy_goal_tolerance and pivots to the goal yaw; those centimetres
+        # put it back outside, where it pivots to the path heading instead
+        # -- 446-697 deg of back-and-forth for a 0.25 m goal next to
+        # side_table_02, with collision-ahead warnings from the sweep.
+        # 3.0 rad: 192-208 deg, no loop. Any 5 cm of travel still updates.
+        amcl["update_min_a"] = 3.0
         # AMCL localizes on a surface-only copy of the arena map, served by
         # its own map_server on this topic (see amcl_map.py); the costmaps
         # keep the solid map on /map.

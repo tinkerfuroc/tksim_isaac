@@ -252,6 +252,20 @@ class UpstreamParamsTest(unittest.TestCase):
         for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
             self.assertEqual(amcl[alpha], 0.05, alpha)
 
+    def test_amcl_holds_its_estimate_through_in_place_pivots(self):
+        # RPP stops translating as soon as the estimate is inside
+        # xy_goal_tolerance, so the robot parks AT that boundary, then pivots
+        # to the goal yaw. Pivots leave the true base_link fixed to 1 mm, but
+        # each AMCL update (every update_min_a of rotation) moved the estimate
+        # 1-1.5 cm with heading -- back out of the tolerance, where RPP pivots
+        # to the path heading instead: an endless back-and-forth next to
+        # furniture (Bug A, 2026-10-11 live: 446-697 deg of pivoting for a
+        # 0.25 m goal). update_min_a 3.0: 192-208 deg, no loop.
+        amcl = prior_map_costmap_overlay(self.params)["amcl"]["ros__parameters"]
+        self.assertGreaterEqual(amcl["update_min_a"], 3.0)
+        # Translation still triggers updates as before.
+        self.assertEqual(amcl["update_min_d"], 0.05)
+
     def test_footprint_is_sim_parity_not_hardware_envelope(self):
         # The upstream 0.95 m footprint models the REAL robot's rear
         # overhang; the sim body spans x [-0.38, +0.13] (robot.urdf base
