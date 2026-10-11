@@ -473,6 +473,7 @@ class RaycastLidar:
         self._last_physics_step: int | None = None
         self._callback_folds = 0
         self._poll_folds = 0
+        self._substep_folds = 0
         self._last_reading_len = -1
         self._last_points = -1
         self._last_raw_hits = -1
@@ -621,6 +622,8 @@ class RaycastLidar:
             return
         if source == "callback":
             self._callback_folds += 1
+        elif source == "substep":
+            self._substep_folds += 1
         else:
             self._poll_folds += 1
         try:
@@ -694,6 +697,7 @@ class RaycastLidar:
             "window_steps": accumulator.window_steps if accumulator else 0,
             "callback_folds": self._callback_folds,
             "poll_folds": self._poll_folds,
+            "substep_folds": self._substep_folds,
             # Length of the last reading and the sensor's own validity flag.
             # A sensor that constructs cleanly but is never EVALUATED returns a
             # zero-length reading forever; the accumulator tolerates that (an
