@@ -183,11 +183,27 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
     - A settled tilt sweep from 0° to 45° gave the same floor z at every tilt, so there is no tilt-dependent render-vs-TF mismatch either.
   - **Part of the error is now explained: sim base_link height (section-4 vision session, 2026-10-11).**
     - In physics, `base_link` rests 0.0775 m above the floor. The wheel bottoms are at z = −0.0775 in `base_link` (artifact `robot.urdf`; `tk26_sim` `tinker_full.urdf.xacro` says so explicitly).
-    - But `tinker_sim_bridge/base_facade.py` publishes odom → `base_link` with only x, y and yaw (z = 0), and localization is 2D.
-    - So every map-frame point from the head camera is 7.75 cm too low. The measured floor read −0.075 to −0.076 at every tilt.
+    - Odom → `base_link` has z = 0, and localization is 2D. So every map-frame z is measured from the `base_link` plane, not the floor, and every map-frame point from the head camera reads 7.75 cm too low. The measured floor read −0.075 to −0.076 at every tilt.
     - Corrected for this, the mug reads 0.54 vs 0.72 (**about 18 cm still unexplained**) and the bowl 0.56 vs 0.60 (about 4 cm left).
-    - **Fix (sim owner):** publish odom → `base_link` z = 0.0775, or add a `base_footprint` frame with `base_footprint` → `base_link` z = 0.0775.
-    - **Real robot:** the tk25_basic xacros have no wheels, so whoever owns the robot description must check whether the real `base_link` sits at floor level before any map-z consumer (surface heights, barrier rule, z clamps) relies on it.
+    - **Correction (debug-gpsr-nav-issue, 2026-10-11): the odom → `base_link` TF does not come from `base_facade.py`**, which publishes only the `/tracer/odom` message. The TF comes from robot_localization's `ekf_filter_node` (`navigation_bringup/params/ekf.yaml`: `two_d_mode: true`, `publish_tf: true`), which zeroes z whatever the input says. So "publish z = 0.0775 in base_facade" would not work.
+    - **This is hardware parity, not a sim-only bug.** The real robot runs the same EKF with `two_d_mode`, and its `base_link` is also the xArm mount point on the chassis, not the floor. Its height there is not in any file. A sim-only fix would make sim and hardware diverge.
+    - **Affected:** anything that compares map-frame z with floor-referenced heights.
+      - Bug B object z
+      - `placement.json` surface heights (kitchen_table top 0.724, …)
+      - truth_evaluator and spawned-object z
+      - the approach planner's barrier heights (`max_height` 0.64 m)
+    - **Not affected:**
+      - pointcloud_to_laserscan (livox frame)
+      - AMCL (2D)
+      - MoveIt (base_link-relative)
+      - the voxel layer (obstacles shift 7.75 cm down; no practical effect)
+    - **Options (the user's call; option a touches hardware):**
+      - a) Robot-wide: add a `base_footprint` frame on the floor, joined to `base_link` at z = h (0.0775 in sim; hardware needs measuring). Point the EKF's `base_link_frame` and AMCL `base_frame_id` at `base_footprint`. Map z is then floor height on both platforms.
+      - b) Consumer-side: keep the TF tree and add a per-robot h wherever map z is compared with floor heights (placement surfaces, truth evaluator, Bug B check, barrier heights).
+    - **Related latent bug (lidar slice height):** `arena_map.livox_scan_height()` slices the static map at the livox joint's 0.195 m, but the real scan plane is 0.195 + 0.0775 = 0.2725 m above the floor.
+      - No collider in the rcw2026 `arena.usd` (60 prims checked) changes coverage between those heights, so the current map is unaffected.
+      - The correct form is joint z + rest height, or better, the union of footprints over [sensor z, sensor z + 2.0] to match pointcloud_to_laserscan.
+      - debug-gpsr-nav-issue offers to implement this in `tools/tinker_sim_deploy/arena_map.py` if the user wants it.
   - **Ruled out: the objects had moved.** The truth probe sampled the mug about 25,700 times in s70718-004, with 0.00 m displacement. It stayed at (2.70, −3.15, 0.72) throughout.
   - **Still to check under battery conditions** (live manipulation on both GPUs, arm in the "orbbec look" pose, after a corrective drive or collision):
     - whether the head's actual (rendered) pitch differs from the joint state used for TF while under load
