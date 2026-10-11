@@ -200,6 +200,13 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
     - **Options (the user's call; option a touches hardware):**
       - a) Robot-wide: add a `base_footprint` frame on the floor, joined to `base_link` at z = h (0.0775 in sim; hardware needs measuring). Point the EKF's `base_link_frame` and AMCL `base_frame_id` at `base_footprint`. Map z is then floor height on both platforms.
       - b) Consumer-side: keep the TF tree and add a per-robot h wherever map z is compared with floor heights (placement surfaces, truth evaluator, Bug B check, barrier heights).
+    - **Decision and fix (2026-10-11): the user chose a floor-level child link. tinker-sim `c6cb3d6` (debug-gpsr-nav-issue).**
+      - Every sim robot_description has a fixed joint `base_link` → `base_footprint` at z = −0.0775. The value is derived from the URDF's wheel collision bottoms, and all wheels must agree within 1 mm.
+      - Unchanged: EKF, AMCL, Nav2, physics and the robot artifact. Map z is still measured from the `base_link` plane.
+      - Verified: robot_state_publisher publishes (0, 0, −0.0775), and the livox comes out 0.2725 m above the floor.
+      - Still to do:
+        - Consumers that need floor height (Bug B object z, placement surfaces, truth evaluator, barrier heights) should look up `base_footprint` in the map frame instead of using a constant. None of them has been changed yet.
+        - Hardware needs the same joint in tk25_basic `tinker_urdf`, with the real `base_link` height measured.
     - **Related latent bug (lidar slice height):** `arena_map.livox_scan_height()` slices the static map at the livox joint's 0.195 m, but the real scan plane is 0.195 + 0.0775 = 0.2725 m above the floor.
       - No collider in the rcw2026 `arena.usd` (60 prims checked) changes coverage between those heights, so the current map is unaffected.
       - The correct form is joint z + rest height, or better, the union of footprints over [sensor z, sensor z + 2.0] to match pointcloud_to_laserscan.
