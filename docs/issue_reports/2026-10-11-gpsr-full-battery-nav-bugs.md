@@ -101,7 +101,7 @@ Long goals across open floor had none.
 
 ## Bug B: approach "barrier seen" abort caused by a mis-estimated target (wrong object, z 0.26 m too low)
 
-**Owners:** approach planner barrier rule (gpsr-issue-2-approach-planner). Sim head-camera stamp timing (tinker-sim). Vision logging and frame freshness (section-4 session / tk26_vision). Decision: settle wait and the surface-height sanity check (a new GPSR session, to be started by the user).
+**Owners:** approach planner barrier rule (gpsr-issue-2-approach-planner). Root cause of the low z still open (sim/perception). Vision logging and frame freshness (section-4 session / tk26_vision). Decision: settle wait and the surface-height sanity check (a new GPSR session, to be started by the user).
 
 ### Symptom
 
@@ -138,17 +138,24 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
   - Or ignore barrier points lower than the surface top: here 0.56–0.64 < 0.734.
   - Or require barrier points to be higher than the target **and** farther than about 0.4 m from it.
   - Log the clamp.
-- **Sim / timing (likely root cause of the low z; analysis by the section-4 vision session, 2026-10-11):**
-  - The SAM masks sit tightly on the mug and the bowl in the overlays. The bad estimates are not a mask problem.
+- **Sim / perception: root cause of the low z still OPEN.**
+  - The SAM masks sit tightly on the mug and the bowl, so this is not a mask problem.
   - Both low-z detections came right after the head settled at tilt +45°:
-    - mug: z 0.46, about 10° off at 1.69 m (`s70718-004` orchestrator, around lines 495–510)
-    - bowl: z 0.48 vs 0.612, about 8.5° off at 1.35 m (`s20261002-002`, around line 365)
-  - The good mug detection (z 0.70) came when the tilt did *not* settle (`tilt_err=25.04°`), so the head never moved.
-  - An older person scan (10-04 rerun57) showed the same thing: 0.47 m off right after a +45 settle, within about 0.1 m long after.
-  - Hypothesis: right after a head move, the rendered head image carries a stamp later than the head pose it actually shows. camera_server looks up TF at the image stamp, gets the settled +45° pose, and deprojects the points about 10° too far down: low and far.
-  - **Sim owner:** measure the render-to-stamp latency of the head colour/depth against `/isaac_joint_states` during a tilt move.
-  - **Vision mitigation (after the sim check):** accept only frames stamped after the detect request (tighten `captured_after`).
-  - **Not recommended:** a confidence floor. The mug scored 0.236 as "red tomato soup can", but the real soup can scored 0.095 in the good frame, so any floor that rejects the mug also loses true hits.
+    - mug: z 0.46, about 10° low at 1.69 m (`s70718-004` orchestrator, around lines 495–510)
+    - bowl: z 0.48 vs actual 0.60, at 1.35 m (`s20261002-002`, around line 365)
+  - The good mug detection (z 0.70) came when the tilt did not settle (`tilt_err=25.04°`).
+  - **Head-move stamp-latency hypothesis: refuted** by the section-4 vision session's live test (2026-10-11; GPU 1, domain 219, RTF about 0.2, robot at spawn, tilt 20 → 45):
+    - Floor z in the map frame right after the move: −0.097 / −0.08 at 0–0.5 s, −0.076 from 1 s on. The transient is about 2 cm (about 0.6°) and gone within 2–3 frames.
+    - The generalist's post-move error on a chair was at most about 0.2 m at 0 s, under 1 cm from 2 s, and in the opposite direction (higher and closer).
+    - A settled tilt sweep from 0° to 45° gave the same floor z at every tilt, so there is no tilt-dependent render-vs-TF mismatch either.
+  - **New small finding:** a constant −7.5 cm floor bias in the head chain at every tilt (possibly the tinker2 calibration offsets applied in sim). The section-4 vision session is looking at it.
+  - **Ruled out: the objects had moved.** The truth probe sampled the mug about 25,700 times in s70718-004, with 0.00 m displacement. It stayed at (2.70, −3.15, 0.72) throughout.
+  - **Still to check under battery conditions** (live manipulation on both GPUs, arm in the "orbbec look" pose, after a corrective drive or collision):
+    - whether the head's actual (rendered) pitch differs from the joint state used for TF while under load
+    - base pitch or tilt in physics
+    - AMCL pose at that moment
+  - Reproducing it needs the battery-like setup, not the spawn test.
+  - **Not recommended:** a confidence floor. The mug scored 0.236 as "red tomato soup can", but the real soup can scored 0.095 in the good frame.
 - **Decision:**
   - Reject detections whose z is below the target surface height, and re-look instead of driving up to them.
   - After a pan/tilt settles, wait a couple of frames before scanning.
