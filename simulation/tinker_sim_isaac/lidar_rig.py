@@ -444,6 +444,13 @@ def window_steps_for(spec: LidarSpec, physics_dt: float) -> int:
     return max(1, int(round(spec.frame_period_s / physics_dt)))
 
 
+def _physics_step_count() -> int:
+    """The step counter `RaycastSensor.get_data()` stamps its frames with."""
+    from isaacsim.core.simulation_manager import SimulationManager
+
+    return int(SimulationManager.get_num_physics_steps())
+
+
 class RaycastLidar:
     """Owns the sensor prim and turns per-step readings into whole frames.
 
@@ -487,6 +494,8 @@ class RaycastLidar:
         #: backend's step profile: where the lidar's Python cost per fold goes.
         self.profile_enabled = os.environ.get("TINKER_SIM_PROFILE") == "1"
         self._profile = {"get_data": 0.0, "self_mask": 0.0, "fold": 0.0, "calls": 0}
+        #: Physics-step counter the de-dup keys on; injectable for tests.
+        self._step_counter = _physics_step_count
 
     # -- lifecycle ------------------------------------------------------
 
@@ -615,16 +624,14 @@ class RaycastLidar:
         clock = time.perf_counter if self.profile_enabled else None
         t0 = clock() if clock else 0.0
         try:
-            data = self.sensor.get_data()
-            step = data.get("physics_step")
+            step, hits, paths = self._read()
             if step is not None and step == self._last_physics_step:
                 # This physics step was already folded by the other driver.
                 return
             self._last_physics_step = step
-            hits = data["hit_positions"]
             t1 = clock() if clock else 0.0
             if self.spec.self_filter:
-                hits = self._drop_self_hits(hits, data.get("hit_prim_paths"))
+                hits = self._drop_self_hits(hits, paths)
             t2 = clock() if clock else 0.0
         except Exception as exc:  # noqa: BLE001
             self._report_once("read", exc)
@@ -655,6 +662,20 @@ class RaycastLidar:
             prof["self_mask"] += t2 - t1
             prof["fold"] += t3 - t2
             prof["calls"] += 1
+
+    def _read(self) -> tuple[int | None, Any, Any]:
+        """``(physics_step, hit_positions, hit_prim_paths)`` from the raw reading.
+
+        `RaycastSensor.get_data()` converts every field of the C++ reading to
+        Python on each call -- depths, normals and one path string per ray --
+        while the rig uses only positions and (for the self-filter) paths.
+        Reading the struct directly skips the rest.
+        """
+        reading = self.sensor.get_sensor_reading()
+        if not reading.is_valid:
+            return self._step_counter(), np.zeros((0, 3), dtype=np.float32), None
+        paths = reading.hit_prim_paths if self.spec.self_filter else None
+        return self._step_counter(), reading.hit_positions, paths
 
     def _drop_self_hits(self, hit_positions: Any, hit_prim_paths: Any) -> np.ndarray:
         """Zero out returns that landed on the robot.

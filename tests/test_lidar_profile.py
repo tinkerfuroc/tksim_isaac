@@ -77,3 +77,27 @@ def test_gateway_snapshot_passthrough():
     assert gateway.lidar_profile_snapshot()["calls"] == 1
     gateway.lidar_rig = None
     assert gateway.lidar_profile_snapshot() is None
+
+
+def test_reads_only_positions_and_paths_from_the_raw_reading():
+    rig = _rig(profile=False)
+    touched = []
+
+    class _Reading:
+        is_valid = True
+
+        def __getattr__(self, name):
+            touched.append(name)
+            if name == "hit_positions":
+                hits = np.zeros((12, 3), dtype=np.float32)
+                hits[0] = (1.0, 0.0, 0.0)
+                return hits
+            if name == "hit_prim_paths":
+                return ["/World/Arena/wall"] * 12
+            raise AssertionError(f"unexpected field read: {name}")
+
+    rig.sensor = SimpleNamespace(get_sensor_reading=lambda: _Reading())
+    rig._step_counter = lambda: 7
+    rig.accumulate(source="substep")
+    assert sorted(set(touched)) == ["hit_positions", "hit_prim_paths"]
+    assert rig.diagnostics()["substep_folds"] == 1
