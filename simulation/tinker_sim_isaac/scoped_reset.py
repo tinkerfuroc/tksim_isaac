@@ -176,6 +176,7 @@ class PhysicsBaseline:
     def __init__(self, backend, *, read_bodies=None):
         self.backend = backend
         self._read_bodies = read_bodies or self._native_bodies
+        self._read_spawn_bodies = read_bodies or self._authored_spawn_bodies
         data = backend._robot.data
         self.root_pose = backend._torch_value(data.root_link_pose_w).clone()
         self.root_velocity = backend._torch_value(data.root_com_vel_w).clone()
@@ -214,10 +215,42 @@ class PhysicsBaseline:
             bodies[path] = (pose, velocity)
         return bodies
 
+    def _authored_spawn_bodies(self):
+        """Read new spawn baselines before STOP/PLAY binds their PhysX views."""
+        import math
+        import omni.usd
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage=omni.usd.get_context().get_stage()
+        if stage is None:
+            raise ResetFailure("stage unavailable while registering spawned state")
+        cache=UsdGeom.XformCache(Usd.TimeCode.Default())
+        bodies={}
+        for prim in stage.Traverse():
+            path=str(prim.GetPath())
+            if path in self.bodies or path=="/World/Tinker" or path.startswith("/World/Tinker/"):
+                continue
+            if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+                raise ResetFailure(f"initial state of additional articulation is unsupported: {path}")
+            if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                continue
+            transform=cache.GetLocalToWorldTransform(prim)
+            position=transform.ExtractTranslation()
+            quaternion=transform.ExtractRotationQuat().GetNormalized()
+            pose=tuple(float(v) for v in position)+tuple(float(v) for v in quaternion.GetImaginary())+(float(quaternion.GetReal()),)
+            rigid=UsdPhysics.RigidBodyAPI(prim)
+            velocity=None
+            if not rigid.GetKinematicEnabledAttr().Get():
+                linear=rigid.GetVelocityAttr().Get() or (0.,0.,0.)
+                angular=rigid.GetAngularVelocityAttr().Get() or (0.,0.,0.)
+                velocity=tuple(float(v) for v in linear)+tuple(math.radians(float(v)) for v in angular)
+            bodies[path]=(pose,velocity)
+        return bodies
+
     def register_spawn(self):
         # Existing bodies keep their original baseline even if they moved
         # before another entity was spawned.
-        for path, state in self._read_bodies().items():
+        for path, state in self._read_spawn_bodies().items():
             self.bodies.setdefault(path, state)
 
     def prepare(self):

@@ -2438,7 +2438,10 @@ class IsaacWholeRobotBackend:
             count_now = self._sim.get_physics_step_count()
             self._clock_step_origin = count_now - self._clock_elapsed_steps
             self._object_views.clear()
+            if hasattr(self, "_park_views"):
+                self._park_views.clear()
             self._contact_pairs_by_key.clear()
+            self._contact_trace_pairs_by_key.clear()
             # Task #30 trace: a genuine rebind just fired -- either the
             # scenario's own STOP -> spawn_entity(s) -> PLAY cycle
             # (reapply_spawn_yaw=True, the interesting case for #30: physics
