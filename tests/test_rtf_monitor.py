@@ -89,3 +89,45 @@ def test_summarise_cli(tmp_path, capsys):
     assert rtf.main(["--summarise", str(path), "--from", "0", "--to", "10"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out == {"mean": 0.5, "min_30s": 0.5, "samples": 2}
+
+
+def test_summarise_cli_skips_bad_lines(tmp_path, capsys):
+    path = tmp_path / "rtf.jsonl"
+    path.write_text("\n".join([
+        json.dumps({"wall": 0.0, "sim": 0.0, "rtf_10s": None, "rtf_30s": None}),
+        json.dumps({"wall": 10.0, "sim": 5.0, "rtf_10s": 0.5, "rtf_30s": 0.5}),
+        '{"wall": 20.0, "si',                                        # truncated mid-write
+        json.dumps({"wall": 30.0, "rtf_10s": 0.5, "rtf_30s": 0.5}),  # no "sim"
+    ]) + "\n")
+    assert rtf.main(["--summarise", str(path), "--from", "0", "--to", "40"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"mean": 0.5, "min_30s": 0.5, "samples": 2}
+    assert "skipped 2" in captured.err
+
+
+def test_summarise_cli_missing_file(tmp_path, capsys):
+    assert rtf.main(["--summarise", str(tmp_path / "nope.jsonl"), "--from", "0", "--to", "10"]) == 1
+    assert "cannot read" in capsys.readouterr().err
+
+
+def test_load_records_counts_only_unusable_lines():
+    lines = ['{"wall": 0.0, "sim": 0.0}', "", '{"wall": 10.0, "si', "[1, 2]",
+             '{"wall": 1.0}', '{"wall": "x", "sim": 1.0}']
+    records, skipped = rtf.load_records(lines)
+    assert records == [{"wall": 0.0, "sim": 0.0}]
+    assert skipped == 4
+
+
+def test_append_record_creates_nested_dir_and_appends(tmp_path):
+    out = tmp_path / "a" / "b" / "rtf.jsonl"
+    assert rtf.append_record(out, {"wall": 1.0, "sim": 2.0}) is None
+    assert rtf.append_record(out, {"wall": 3.0, "sim": 4.0}) is None
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line) for line in lines] == [{"wall": 1.0, "sim": 2.0}, {"wall": 3.0, "sim": 4.0}]
+
+
+def test_append_record_reports_unwritable_target(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x", encoding="utf-8")
+    err = rtf.append_record(blocker / "rtf.jsonl", {"wall": 1.0, "sim": 2.0})
+    assert isinstance(err, str) and err

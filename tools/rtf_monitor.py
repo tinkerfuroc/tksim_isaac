@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -97,6 +98,42 @@ def summarise(records: Iterable[Mapping], t_from: float, t_to: float) -> dict:
     }
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def load_records(lines: Iterable[str]) -> tuple[list[dict], int]:
+    """Parse jsonl lines, skipping blanks silently and counting unusable ones."""
+    records: list[dict] = []
+    skipped = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            skipped += 1
+            continue
+        if not isinstance(record, dict) or not (
+            _is_number(record.get("wall")) and _is_number(record.get("sim"))
+        ):
+            skipped += 1
+            continue
+        records.append(record)
+    return records, skipped
+
+
+def append_record(out: Path, record: dict) -> str | None:
+    """Append one JSON line, creating the directory. Returns an error message or None."""
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 def default_out_path(env: Mapping[str, str]) -> Path:
     run_dir = env.get("GPSR_RUN_DIR", "").strip()
     return Path(run_dir) / "rtf.jsonl" if run_dir else Path("rtf.jsonl")
@@ -108,10 +145,16 @@ def _run(out: Path) -> int:  # pragma: no cover - needs a live ROS graph
     from rclpy.qos import qos_profile_sensor_data
     from rosgraph_msgs.msg import Clock
 
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[rtf_monitor] cannot create {out.parent}: {exc}", flush=True)
+
     rclpy.init()
     node = Node("rtf_monitor")
     samples: deque[tuple[float, float]] = deque()
     warn = WarnState()
+    last_write_error: str | None = None
 
     def on_clock(msg) -> None:
         now = time.time()
@@ -120,6 +163,7 @@ def _run(out: Path) -> int:  # pragma: no cover - needs a live ROS graph
             samples.popleft()
 
     def on_timer() -> None:
+        nonlocal last_write_error
         now = time.time()
         if not samples:
             return
@@ -128,8 +172,10 @@ def _run(out: Path) -> int:  # pragma: no cover - needs a live ROS graph
         record = {"wall": round(now, 3), "sim": round(samples[-1][1], 3),
                   "rtf_10s": None if r10 is None else round(r10, 4),
                   "rtf_30s": None if r30 is None else round(r30, 4)}
-        with open(out, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
+        error = append_record(out, record)
+        if error is not None and error != last_write_error:
+            print(f"[rtf_monitor] write failed: {error}", flush=True)
+        last_write_error = error
         line = warn.update(r30, now)
         if line:
             print(f"[rtf_monitor] {line}", flush=True)
@@ -157,8 +203,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.summarise is not None:
         if args.t_from is None or args.t_to is None:
             parser.error("--summarise needs --from and --to (unix wall seconds)")
-        lines = args.summarise.read_text(encoding="utf-8").splitlines()
-        records = [json.loads(line) for line in lines if line.strip()]
+        try:
+            lines = args.summarise.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"[rtf_monitor] cannot read {args.summarise}: {exc}", file=sys.stderr)
+            return 1
+        records, skipped = load_records(lines)
+        if skipped:
+            print(f"[rtf_monitor] skipped {skipped} malformed line(s)", file=sys.stderr)
         print(json.dumps(summarise(records, args.t_from, args.t_to)))
         return 0
     return _run(args.out or default_out_path(os.environ))
