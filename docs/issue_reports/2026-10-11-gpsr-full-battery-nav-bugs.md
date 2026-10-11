@@ -116,7 +116,15 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
 | S2 | same | (1.08, 1.70), turn ok, 49/72 free | SUCCEEDED attempt 1, 0.59 m |
 
 - **Collision-ahead warnings:** 0 inside any GoToApproach window. There were 121 on the plain NavigateToPose legs to the decision's fixed nav poses: S1 34, K2b (side table → kitchen) 85, S2 2.
-- **Remaining issue 1:** the decision's fixed nav pose at the kitchen_table is still tight.
+- **Remaining issue 1, corrected (debug-gpsr-nav-issue, log analysis):** the 85 K2b warnings came from one blocked *departure* pivot at side_table_02, not from the kitchen pose or a leftover limit cycle.
+  - All 85 fall in the leg's first ~40 s and end with `Controller patience exceeded` plus a local costmap clear. The arrival at the kitchen_table had 0 warnings.
+  - Start pose (1.06, 1.75), facing the table, 0.50 m away: 22/72 headings are blocked (lethal arcs 5–55° and 305–355°).
+  - RPP pivots counter-clockwise toward about 285°, the point within 45° of the path heading. Its 1.0 s rotation projection (about 34°) reaches the lethal arc from about 271° on, so it deadlocks until the patience abort.
+  - The costmap clear then wipes the table cells behind the robot, which the front-only lidar cannot re-mark, and the pivot completes.
+  - Physically it was safe: body radius 0.43 m against 0.50 m of clearance.
+  - Levers:
+    - Trim the footprint to the body + 3 cm: 10/72 blocked and the projection clears. Body + 2 cm: 0/72. Needs the tk25_basic tinker2_sim profile.
+    - Or lower `max_allowed_time_to_collision_up_to_carrot`. Humble shares that value with forward motion.
 - **Remaining issue 2:** with the chairs, every kitchen_table stand pose sits at the 1.0 m stand-off maximum (1.10–1.19 m from the target, vs about 0.95 m before the PR). Manipulation should check whether that is within grasp reach.
 - **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN. Reworded in PR #11 `054d8a7` to "chosen pose (x, y) has only 0.05 m footprint clearance (preferred 0.15 m): …"; grep for "has only" in future logs.
 
