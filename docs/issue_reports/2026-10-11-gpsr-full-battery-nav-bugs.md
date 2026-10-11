@@ -103,6 +103,23 @@ This section supersedes parts of the root cause above. It comes from a live repr
 - **Approach planner footprint: withdrawn, not a problem.** The startup line `[(0.25,±0.25),(−0.3,±0.25)]` is only the YAML fallback, which is the hardware footprint. With `use_published_footprint: true`, the planner switches to `/global_costmap/published_footprint` about 2.4 s after startup and logs `adopted live footprint ... [(0.21, ±0.28), (−0.46, ±0.28)]`. That is tinker2_sim plus about 1 cm of costmap padding, adopted long before the first goal in both the d217 battery and the d219 run (verified in `05-nav_extras-0.log` and `04-nav_extras-0.log`).
 - **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the working tree carries an uncommitted 0.2 from another session, and stacks run with 0.2. `d30439d` doesn't depend on either value.
 
+### Live check of the approach-planner fix (2026-10-11, tk26_navigation PR #11, not merged)
+
+Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulation, the PR #11 overlay build, and the dev tree including `d30439d` (the bridge is a develop install, so the overlay is loaded from source). Logs: `gpsr_stack_logs_d219/20261011T094019/` (planner `04-nav_extras-0-pr11.log`, Nav2 `02-bridge.log`).
+
+| Trial | Target | Chosen stand pose | Outcome |
+|---|---|---|---|
+| K1 | kitchen_table (2.83, −3.11) | (3.44, −2.32), turn ok, 39/72 free, gap 0.26 m, clr 0.15 | SUCCEEDED attempt 1, 1.10 m from target |
+| K2 | kitchen_table (2.70, −3.15) | (3.31, −2.36), turn ok, 29/72 free, gap 0.37 m, clr 0.05 | SUCCEEDED attempt 1, 1.19 m |
+| K2b | same, after a full nav leg from side_table_02 | same | SUCCEEDED attempt 1, 1.17 m |
+| S1 | side_table_02 (0.48, 1.65) | (1.08, 1.73), turn ok, 59/72 free | SUCCEEDED attempt 1, 0.60 m |
+| S2 | same | (1.08, 1.70), turn ok, 49/72 free | SUCCEEDED attempt 1, 0.59 m |
+
+- **Collision-ahead warnings:** 0 inside any GoToApproach window. There were 121 on the plain NavigateToPose legs to the decision's fixed nav poses: S1 34, K2b (side table → kitchen) 85, S2 2.
+- **Remaining issue 1:** the decision's fixed nav pose at the kitchen_table is still tight.
+- **Remaining issue 2:** with the chairs, every kitchen_table stand pose sits at the 1.0 m stand-off maximum (1.10–1.19 m from the target, vs about 0.95 m before the PR). Manipulation should check whether that is within grasp reach.
+- **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN.
+
 ### Related: wheels kept driving after `/cmd_vel` went to zero (sim base drive, open)
 
 - **What happened:** in about 1 of 4 route runs (kitchen approach near (3.3, 0.15)), RPP correctly detected a collision ahead and `/cmd_vel` went to 0. The wheels (`/isaac_joint_states` → odom) kept 0.35 m/s for 3.4 sim-s, and the robot drove into furniture: centre 0.21 m from the obstacle, body radius 0.43.
