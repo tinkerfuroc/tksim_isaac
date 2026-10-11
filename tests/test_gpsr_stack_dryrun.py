@@ -29,7 +29,7 @@ def _cfg(**kw):
 
 def test_mock_skips_stage4():
     names = [s["name"] for s in mod.stage_commands(_cfg())]
-    assert names == ["sim", "bridge", "vision", "nav_extras"]
+    assert names == ["sim", "bridge", "vision", "nav_extras", "rtf_monitor"]
 
 
 def test_live_includes_stage4_with_gpu():
@@ -155,7 +155,7 @@ def test_live_requires_manip_gpu():
 
 def test_stage_order_live():
     names = [s["name"] for s in mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))]
-    assert names == ["sim", "bridge", "vision", "manipulation", "nav_extras"]
+    assert names == ["sim", "bridge", "vision", "manipulation", "nav_extras", "rtf_monitor"]
 
 
 def test_gates_present_and_known():
@@ -169,6 +169,7 @@ def test_gates_present_and_known():
     assert by_name["vision"] == "vision"
     assert by_name["manipulation"] == "manipulation"
     assert by_name["nav_extras"] == "nav"
+    assert by_name["rtf_monitor"] == "nav"
 
 
 def test_vision_stage_has_four_popens_including_named_camera_server_and_pan_tilt():
@@ -686,3 +687,49 @@ def test_cli_lidar_flag_reaches_config_and_banner(capsys):
     out = capsys.readouterr().out
     assert "lidar preset: planar" in out
     assert "--raycast-lidar" not in out
+
+
+# --- RTF monitor stage, run dir, private domain, vision GPU ---
+
+def test_rtf_monitor_stage_runs_the_tool_under_ros():
+    stage = mod.stage_commands(_cfg())[-1]
+    assert stage["name"] == "rtf_monitor"
+    script = stage["cmd"][-1]
+    assert stage["cmd"][:2] == ["bash", "-lc"]
+    assert "source /opt/ros/humble/setup.bash" in script
+    assert "exec python3 tools/rtf_monitor.py" in script
+
+
+def test_domain_override(monkeypatch):
+    monkeypatch.setenv("GPSR_ROS_DOMAIN_ID", "219")
+    for stage in mod.stage_commands(_cfg()):
+        assert stage["env"]["ROS_DOMAIN_ID"] == "219"
+    monkeypatch.delenv("GPSR_ROS_DOMAIN_ID")
+    assert mod.stage_commands(_cfg())[0]["env"]["ROS_DOMAIN_ID"] == "42"
+
+
+def test_vision_gpu_override(monkeypatch):
+    monkeypatch.delenv("GPSR_VISION_GPU", raising=False)
+    vision = [s for s in mod.stage_commands(_cfg()) if s["name"] == "vision"][0]
+    assert "CUDA_VISIBLE_DEVICES" not in vision["env"]
+    monkeypatch.setenv("GPSR_VISION_GPU", "1")
+    vision = [s for s in mod.stage_commands(_cfg()) if s["name"] == "vision"][0]
+    assert vision["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert vision["env"]["QT_QPA_PLATFORM"] == "offscreen"
+
+
+def test_run_up_passes_run_dir_to_every_stage(tmp_path, monkeypatch):
+    import os
+    envs = []
+
+    def _popen(argv, **kw):
+        envs.append(kw["env"])
+        return _FakePopenProc(os.getpid())
+
+    monkeypatch.setattr(mod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(mod, "_wait_for_gate", lambda gate: None)
+    assert mod._run_up(_cfg(log_dir=str(tmp_path)), dry_run=False) == 0
+    run_dirs = {e["GPSR_RUN_DIR"] for e in envs}
+    assert len(run_dirs) == 1
+    run_dir = Path(run_dirs.pop())
+    assert run_dir.is_absolute() and run_dir.parent == tmp_path.resolve()

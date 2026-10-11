@@ -248,7 +248,9 @@ def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
     (see ``_full_env``); this dict alone is what stage_commands() exposes so
     it stays plain-data and testable.
     """
-    env = {"ROS_DOMAIN_ID": "42"}
+    # Keep the runbook default, but allow an isolated run to select a
+    # private DDS domain when another simulator stack is already running.
+    env = {"ROS_DOMAIN_ID": os.environ.get("GPSR_ROS_DOMAIN_ID", "42")}
     env.update(extra)
     return env
 
@@ -384,6 +386,16 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
 
     # --- Stage 3: tk26_vision (plus the two manual runbook gaps) -----------
     vision_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+    vision_env = _preamble_env({
+        # waving_person_server defaults to show_window:=true and needs a
+        # display; this keeps a headless bring-up from aborting on it.
+        "QT_QPA_PLATFORM": "offscreen",
+    })
+    # Vision inference shares the sim's GPU by default. An isolated run may
+    # place it on another device (RTF A/B, docs/developer-log.md 2026-10).
+    vision_gpu = os.environ.get("GPSR_VISION_GPU", "").strip()
+    if vision_gpu:
+        vision_env["CUDA_VISIBLE_DEVICES"] = vision_gpu
     stages.append({
         "name": "vision",
         "cmd": [
@@ -465,11 +477,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                       "-p", "joint_state_topic:=/pan_tilt/joint_states"],
             ),
         ],
-        "env": _preamble_env({
-            # waving_person_server defaults to show_window:=true and needs a
-            # display; this keeps a headless bring-up from aborting on it.
-            "QT_QPA_PLATFORM": "offscreen",
-        }),
+        "env": vision_env,
         "cwd": REPO_ROOT,
         "gate": "vision",
     })
@@ -515,6 +523,20 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                 argv=["ros2", "run", "orientation_angle_service", "orientation_angle_server"],
             ),
         ],
+        "env": _preamble_env({}),
+        "cwd": REPO_ROOT,
+        "gate": "nav",
+    })
+
+    # --- Stage 6: RTF monitor ---------------------------------------------
+    # Samples /clock for the whole run: $GPSR_RUN_DIR/rtf.jsonl every 10 s and
+    # a WARN line in its log below RTF 0.5. Never stops anything.
+    stages.append({
+        "name": "rtf_monitor",
+        "cmd": _ros_argv(
+            sources=("/opt/ros/humble/setup.bash",),
+            argv=["python3", "tools/rtf_monitor.py"],
+        ),
         "env": _preamble_env({}),
         "cwd": REPO_ROOT,
         "gate": "nav",
@@ -689,6 +711,7 @@ def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
     try:
         for idx, stage in enumerate(stages, start=1):
             env = _full_env(stage["env"])
+            env["GPSR_RUN_DIR"] = str(run_dir.resolve())
             procs = _stage_procs(stage["cmd"])
             for p_idx, argv in enumerate(procs):
                 suffix = "" if len(procs) == 1 else f"-{p_idx}"
