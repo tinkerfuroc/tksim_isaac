@@ -148,7 +148,13 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
     - Floor z in the map frame right after the move: −0.097 / −0.08 at 0–0.5 s, −0.076 from 1 s on. The transient is about 2 cm (about 0.6°) and gone within 2–3 frames.
     - The generalist's post-move error on a chair was at most about 0.2 m at 0 s, under 1 cm from 2 s, and in the opposite direction (higher and closer).
     - A settled tilt sweep from 0° to 45° gave the same floor z at every tilt, so there is no tilt-dependent render-vs-TF mismatch either.
-  - **New small finding:** a constant −7.5 cm floor bias in the head chain at every tilt (possibly the tinker2 calibration offsets applied in sim). The section-4 vision session is looking at it.
+  - **Part of the error is now explained: sim base_link height (section-4 vision session, 2026-10-11).**
+    - In physics, `base_link` rests 0.0775 m above the floor. The wheel bottoms are at z = −0.0775 in `base_link` (artifact `robot.urdf`; `tk26_sim` `tinker_full.urdf.xacro` says so explicitly).
+    - But `tinker_sim_bridge/base_facade.py` publishes odom → `base_link` with only x, y and yaw (z = 0), and localization is 2D.
+    - So every map-frame point from the head camera is 7.75 cm too low. The measured floor read −0.075 to −0.076 at every tilt.
+    - Corrected for this, the mug reads 0.54 vs 0.72 (**about 18 cm still unexplained**) and the bowl 0.56 vs 0.60 (about 4 cm left).
+    - **Fix (sim owner):** publish odom → `base_link` z = 0.0775, or add a `base_footprint` frame with `base_footprint` → `base_link` z = 0.0775.
+    - **Real robot:** the tk25_basic xacros have no wheels, so whoever owns the robot description must check whether the real `base_link` sits at floor level before any map-z consumer (surface heights, barrier rule, z clamps) relies on it.
   - **Ruled out: the objects had moved.** The truth probe sampled the mug about 25,700 times in s70718-004, with 0.00 m displacement. It stayed at (2.70, −3.15, 0.72) throughout.
   - **Still to check under battery conditions** (live manipulation on both GPUs, arm in the "orbbec look" pose, after a corrective drive or collision):
     - whether the head's actual (rendered) pitch differs from the joint state used for TF while under load
