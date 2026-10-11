@@ -35,6 +35,14 @@ Nav2 goals with collision-ahead warnings in the battery (from `02-bridge.log`):
 
 The 11:53 row is a 0.2 m move that could not be completed in 120 s. In the last trial, that cost the trip to side_table_02 about 260 s, and the trial timed out.
 
+**Correction (2026-10-11, found by gpsr-bug-a-bug-b): the 11:53 retry only existed because the decision cancelled a robot that was still moving.**
+- The goal before it, (−2, −2) → (1.17, 1.75), had zero controller warnings, and the robot was still moving in the arena frames.
+- The decision's `BtNode_GotoAction` cancelled it at 120.5 s mid-approach, at (1.04, 1.91), 0.45 m from the table and facing away.
+- The cause: the 120 s timeout is measured in **wall-clock** time (`time.monotonic`, `TemplateNodes/Navigation.py`), and the sim ran at RTF about 0.3 (about 40 sim-s per 127 wall-s). So 120 s of wall time is about 36 s of sim time.
+- Three goals in the battery were cancelled this way at about 120 s, and every bedroom trip took 110–120 s of wall time.
+- The pivot and collision-ahead mechanism below is still what made the *retry* loop. The trigger was the premature cancel.
+- Fix (decision): budget the goto on Nav2's feedback `navigation_time` (sim time), plus a wall-clock no-feedback stall check and a wall backstop.
+
 Long goals across open floor had none.
 
 ### Root cause (strongly supported; the rotation itself was not observed because cmd_vel was not recorded)
