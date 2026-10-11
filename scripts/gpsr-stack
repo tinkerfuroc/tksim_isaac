@@ -218,6 +218,16 @@ TEARDOWN_GRACE_S = 10.0
 SURVIVOR_POLL_TIMEOUT_S = 10.0
 SURVIVOR_POLL_INTERVAL_S = 1.0
 
+#: Lidar presets for the sim stage (docs/gpsr-sim-runbook.md, "Lidar presets").
+#: battery: live raycast lidar at BATTERY_LIDAR_CHANNELS x the contract's 349
+#:   columns -- Nav2 consumes azimuth resolution, vertical channels are the
+#:   RTF lever. parity: the contract's full pattern (~0.3 RTF on this host).
+#:   planar: the occupancy-map lidar (no heights, no dynamic obstacles).
+LIDAR_PRESETS = ("battery", "parity", "planar")
+#: Set from the live A/B matrix (docs/developer-log.md, 2026-10 RTF budget):
+#: the largest channel count holding RTF >= 0.55 with the full stack attached.
+BATTERY_LIDAR_CHANNELS = 24
+
 
 @dataclasses.dataclass
 class StackConfig:
@@ -228,6 +238,7 @@ class StackConfig:
     sim_gpu: int  # GPU device index for the simulator
     log_dir: str
     evidence: bool = False  # arena observer camera on: contact-sheet evidence runs
+    lidar: str = "battery"  # one of LIDAR_PRESETS
 
 
 def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
@@ -302,6 +313,18 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
         # it and keep their 600 s wall cap.
         sim_env["TINKER_SIM_ARENA_CAMERA"] = "1"
         sim_env["TINKER_SIM_ARENA_CAMERA_HZ"] = "2"
+    if cfg.lidar not in LIDAR_PRESETS:
+        raise ValueError(f"unknown lidar preset {cfg.lidar!r}; expected one of {LIDAR_PRESETS}")
+    sim_lidar_args: list[str] = []
+    if cfg.lidar != "planar":
+        # Passthrough to the sim app (tinker-sim launch strips the "--").
+        sim_lidar_args = ["--", "--raycast-lidar"]
+    if cfg.lidar == "battery":
+        # A caller's explicit export wins, so A/Bs need no code change.
+        sim_env["TINKER_SIM_LIDAR_CHANNELS"] = (
+            os.environ.get("TINKER_SIM_LIDAR_CHANNELS", "").strip()
+            or str(BATTERY_LIDAR_CHANNELS)
+        )
     stages.append({
         "name": "sim",
         "cmd": [
@@ -313,6 +336,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             "--spawn-xy=-2.0,-2.0",
             "--ros",
             "--headless",
+            *sim_lidar_args,
         ],
         "env": _preamble_env(sim_env),
         "cwd": REPO_ROOT,
@@ -641,6 +665,10 @@ def _stage_procs(cmd) -> list[list[str]]:
 
 def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
     stages = stage_commands(cfg)
+    banner = f"lidar preset: {cfg.lidar}"
+    if cfg.lidar == "battery":
+        banner += f" (channels={stages[0]['env']['TINKER_SIM_LIDAR_CHANNELS']})"
+    print(banner)
 
     global _ACTIVE_GATE_CENSUS_STACKS
     _ACTIVE_GATE_CENSUS_STACKS = _gate_census_stacks(cfg)
@@ -841,6 +869,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evidence", action="store_true",
         help="enable the arena observer camera (contact-sheet evidence runs; costs RTF)")
+    parser.add_argument(
+        "--lidar", choices=LIDAR_PRESETS, default="battery",
+        help="lidar preset: battery (reduced raycast, default), parity (full "
+             "contract raycast, ~0.3 RTF), planar (occupancy-map lidar)")
     return parser
 
 
@@ -854,6 +886,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         sim_gpu=args.sim_gpu,
         log_dir=args.log_dir,
         evidence=args.evidence,
+        lidar=args.lidar,
     )
 
     if args.subcommand == "up":

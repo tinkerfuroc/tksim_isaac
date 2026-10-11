@@ -635,3 +635,54 @@ def test_bridge_stage_gets_the_head_camera_aim_like_the_sim_stage():
     stages = {s["name"]: s for s in mod.stage_commands(_cfg())}
     assert stages["sim"]["env"]["TINKER_SIM_HEAD_CAMERA_AIM"] == mod.HEAD_CAMERA_AIM
     assert stages["bridge"]["env"]["TINKER_SIM_HEAD_CAMERA_AIM"] == mod.HEAD_CAMERA_AIM
+
+
+# --- Lidar presets (RTF budget, docs/superpowers/specs/2026-10-11-gpsr-sim-rtf-budget-design.md) ---
+
+def _sim_stage(**kw):
+    return [s for s in mod.stage_commands(_cfg(**kw)) if s["name"] == "sim"][0]
+
+
+def test_default_preset_is_battery_raycast_with_reduced_channels(monkeypatch):
+    monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
+    sim = _sim_stage()
+    assert sim["cmd"][-2:] == ["--", "--raycast-lidar"]
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == str(mod.BATTERY_LIDAR_CHANNELS)
+    assert "TINKER_SIM_LIDAR_COLUMNS" not in sim["env"]
+
+
+def test_parity_preset_uses_contract_scale(monkeypatch):
+    monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
+    sim = _sim_stage(lidar="parity")
+    assert sim["cmd"][-2:] == ["--", "--raycast-lidar"]
+    assert "TINKER_SIM_LIDAR_CHANNELS" not in sim["env"]
+
+
+def test_planar_preset_has_no_raycast():
+    sim = _sim_stage(lidar="planar")
+    assert "--raycast-lidar" not in sim["cmd"]
+    assert "TINKER_SIM_LIDAR_CHANNELS" not in sim["env"]
+
+
+def test_battery_preset_respects_caller_channel_export(monkeypatch):
+    monkeypatch.setenv("TINKER_SIM_LIDAR_CHANNELS", "32")
+    assert _sim_stage()["env"]["TINKER_SIM_LIDAR_CHANNELS"] == "32"
+
+
+def test_unknown_preset_is_refused():
+    import pytest
+    with pytest.raises(ValueError, match="lidar preset"):
+        mod.stage_commands(_cfg(lidar="fast"))
+
+
+def test_physics_rate_is_never_set_by_the_stack():
+    for preset in mod.LIDAR_PRESETS:
+        assert "TINKER_SIM_PHYSICS_HZ" not in _sim_stage(lidar=preset)["env"]
+
+
+def test_cli_lidar_flag_reaches_config_and_banner(capsys):
+    rc = mod.main(["up", "--manipulation", "mock", "--dry-run", "--lidar", "planar"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "lidar preset: planar" in out
+    assert "--raycast-lidar" not in out
