@@ -16,7 +16,7 @@ Timestamps below are epoch seconds minus 1791640000.
 
 ## Bug A: RPP "collision ahead" loops at stand poses next to furniture
 
-**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-lsc) for the fixed furniture nav poses.
+**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (a new GPSR session, to be started by the user) for the fixed furniture nav poses.
 
 ### Symptom
 
@@ -93,7 +93,7 @@ Long goals across open floor had none.
 
 ## Bug B: approach "barrier seen" abort caused by a mis-estimated target (wrong object, z 0.26 m too low)
 
-**Owners:** approach planner barrier rule (gpsr-issue-2-approach-planner). Detection 3D estimate and class (vision: the section-4 session / tk26_vision). The decision accepting a non-food object (gpsr-lsc).
+**Owners:** approach planner barrier rule (gpsr-issue-2-approach-planner). Sim head-camera stamp timing (tinker-sim). Vision logging and frame freshness (section-4 session / tk26_vision). Decision: settle wait and the surface-height sanity check (a new GPSR session, to be started by the user).
 
 ### Symptom
 
@@ -116,8 +116,8 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
    - `03-vision-0.log` 6068.7: YOLO-World returned 1 box (conf **0.236**) for the six-food prompt, giving `nearest at (2.83, -3.11, 0.46)`.
    - The overlay `vision_log/20260822_081720/generalist_detection_node_yolo_world_overlay_20261010_112748_734.jpg` shows the box on the **orange mug**, which is not a food.
    - Truth: mug at (2.70, −3.15, **0.72**). The estimate is 0.14 m off in xy and **0.26 m low in z**: below the 0.734 m table top, which is physically impossible for an object resting on it.
-   - `cls_name` in the request JSON is the whole prompt string, not a per-class label, so the decision cannot tell which class matched.
-   - Native RealSense depth was in use (`FFS depth unavailable; falling back to native realsense depth`).
+   - All three detections discussed here (mug 6068.5 and 7065.2, bowl 7786.1) used `camera=orbbec` (the head) with `depth_source=native`. (Corrected 2026-10-11: an earlier version blamed the RealSense fallback; that log line belongs to a different call.)
+   - The BT did get a per-class label (`['red tomato soup can']` in the orchestrator log). Only the vision-log JSON writes the whole prompt as `cls_name`, which is a logging bug in the generalist's `_log_debug` for the yolo_world branch. The section-4 vision session is fixing it.
 2. **The barrier rule depends on target z.** In `barrier_check.py`, `min_height = target_z + height_margin_m` (0.10). With z = 0.46 that gives min_height = 0.56 m. The chairs around the round table (seat about 0.45 m, backs and edges at 0.56–0.64 m in the cloud: `max_height=0.64m`, 0.30–0.33 m from the target) then count as a barrier from both sides of the table.
 3. **The same table with a correct z passed.**
    - Later in the same trial (`03-vision-0.log` 7065.2), a detection at (2.67, −3.18, **0.70**) gave min_height 0.80.
@@ -130,12 +130,20 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
   - Or ignore barrier points lower than the surface top: here 0.56–0.64 < 0.734.
   - Or require barrier points to be higher than the target **and** farther than about 0.4 m from it.
   - Log the clamp.
-- **Vision:**
-  - The 3D centroid of small objects comes out too low. One other battery detection shows the same: the side_table_02 bowl at z 0.48 vs truth 0.612 (`03-vision-0.log` 7786.1).
-  - Check the mask→depth sampling: SAM mask bleeding or picking up background pixels. This is the same family as the section-4 person fix, which replaced SAM masks with YOLO-seg masks.
-  - Emit per-class labels: `cls_name` is the full prompt.
-  - Consider a confidence floor: 0.24 accepted a mug as "food".
-- **Decision:** reject detections whose z is below the target surface height, and re-look instead of driving up to them.
+- **Sim / timing (likely root cause of the low z; analysis by the section-4 vision session, 2026-10-11):**
+  - The SAM masks sit tightly on the mug and the bowl in the overlays. The bad estimates are not a mask problem.
+  - Both low-z detections came right after the head settled at tilt +45°:
+    - mug: z 0.46, about 10° off at 1.69 m (`s70718-004` orchestrator, around lines 495–510)
+    - bowl: z 0.48 vs 0.612, about 8.5° off at 1.35 m (`s20261002-002`, around line 365)
+  - The good mug detection (z 0.70) came when the tilt did *not* settle (`tilt_err=25.04°`), so the head never moved.
+  - An older person scan (10-04 rerun57) showed the same thing: 0.47 m off right after a +45 settle, within about 0.1 m long after.
+  - Hypothesis: right after a head move, the rendered head image carries a stamp later than the head pose it actually shows. camera_server looks up TF at the image stamp, gets the settled +45° pose, and deprojects the points about 10° too far down: low and far.
+  - **Sim owner:** measure the render-to-stamp latency of the head colour/depth against `/isaac_joint_states` during a tilt move.
+  - **Vision mitigation (after the sim check):** accept only frames stamped after the detect request (tighten `captured_after`).
+  - **Not recommended:** a confidence floor. The mug scored 0.236 as "red tomato soup can", but the real soup can scored 0.095 in the good frame, so any floor that rejects the mug also loses true hits.
+- **Decision:**
+  - Reject detections whose z is below the target surface height, and re-look instead of driving up to them.
+  - After a pan/tilt settles, wait a couple of frames before scanning.
 
 ### How to reproduce or check
 
