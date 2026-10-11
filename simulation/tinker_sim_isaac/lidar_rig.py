@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -444,13 +445,6 @@ def window_steps_for(spec: LidarSpec, physics_dt: float) -> int:
     return max(1, int(round(spec.frame_period_s / physics_dt)))
 
 
-def _physics_step_count() -> int:
-    """The step counter `RaycastSensor.get_data()` stamps its frames with."""
-    from isaacsim.core.simulation_manager import SimulationManager
-
-    return int(SimulationManager.get_num_physics_steps())
-
-
 class RaycastLidar:
     """Owns the sensor prim and turns per-step readings into whole frames.
 
@@ -495,7 +489,7 @@ class RaycastLidar:
         self.profile_enabled = os.environ.get("TINKER_SIM_PROFILE") == "1"
         self._profile = {"get_data": 0.0, "self_mask": 0.0, "fold": 0.0, "calls": 0}
         #: Physics-step counter the de-dup keys on; injectable for tests.
-        self._step_counter = _physics_step_count
+        self._step_counter = self._sensor_module_step_count
 
     # -- lifecycle ------------------------------------------------------
 
@@ -662,6 +656,17 @@ class RaycastLidar:
             prof["self_mask"] += t2 - t1
             prof["fold"] += t3 - t2
             prof["calls"] += 1
+
+    def _sensor_module_step_count(self) -> int:
+        """The step counter `RaycastSensor.get_data()` stamps its frames with.
+
+        Isaac Lab rebinds ``isaacsim.core.simulation_manager.SimulationManager``
+        after the sensor module has bound it; use the sensor module's own
+        binding, exactly what get_data() uses. Resolved at call time because
+        ``self.sensor`` only exists after initialize().
+        """
+        module = sys.modules[type(self.sensor).__module__]
+        return int(module.SimulationManager.get_num_physics_steps())
 
     def _read(self) -> tuple[int | None, Any, Any]:
         """``(physics_step, hit_positions, hit_prim_paths)`` from the raw reading.

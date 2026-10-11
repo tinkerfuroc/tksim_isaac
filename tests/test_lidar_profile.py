@@ -101,3 +101,38 @@ def test_reads_only_positions_and_paths_from_the_raw_reading():
     rig.accumulate(source="substep")
     assert sorted(set(touched)) == ["hit_positions", "hit_prim_paths"]
     assert rig.diagnostics()["substep_folds"] == 1
+
+
+def test_default_step_counter_uses_the_sensor_modules_simulation_manager(monkeypatch):
+    import types
+
+    sensor_mod = types.ModuleType("fake_raycast_sensor_mod")
+
+    class _Manager:
+        @staticmethod
+        def get_num_physics_steps():
+            return 41
+
+    sensor_mod.SimulationManager = _Manager
+
+    class _Sensor:
+        def get_sensor_reading(self):
+            hits = np.zeros((12, 3), dtype=np.float32)
+            hits[0] = (1.0, 0.0, 0.0)
+            return SimpleNamespace(is_valid=True, hit_positions=hits,
+                                   hit_prim_paths=["/World/Arena/wall"] * 12)
+
+    _Sensor.__module__ = "fake_raycast_sensor_mod"
+    # Isaac Lab rebinds the global name to a class without the method.
+    global_mod = types.ModuleType("isaacsim.core.simulation_manager")
+    global_mod.SimulationManager = type("PhysxManager", (), {})
+    monkeypatch.setitem(sys.modules, "fake_raycast_sensor_mod", sensor_mod)
+    monkeypatch.setitem(sys.modules, "isaacsim.core.simulation_manager", global_mod)
+
+    rig = _rig(profile=False)
+    rig._step_counter = rig._sensor_module_step_count  # the production default, un-faked
+    rig.sensor = _Sensor()
+    rig.accumulate(source="substep")
+    assert rig.diagnostics()["substep_folds"] == 1
+    assert rig._last_physics_step == 41
+    assert "read" not in rig._reported_failures
