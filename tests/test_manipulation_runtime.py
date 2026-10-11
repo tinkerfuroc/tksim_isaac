@@ -2274,7 +2274,12 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway.spin_once()
 
         self.assertIn("non-contiguous", gateway._last_command_error)
-        self.assertAlmostEqual(float(gateway.backend._position_targets[0, 1]), 0.2)
+        # The skipped snapshot is never applied, and the gap stops the robot
+        # (measured-pose hold) instead of leaving the 0.2 command executing --
+        # see tests/test_command_gap_failsafe.py.
+        self.assertTrue(gateway._command_stream_lost)
+        self.assertTrue(gateway.backend._safety_stopped)
+        self.assertAlmostEqual(float(gateway.backend._position_targets[0, 1]), -0.4)
 
     def test_gateway_only_timeout_adopts_newer_generation_after_fresh_false(self) -> None:
         gateway = _protocol_gateway()
