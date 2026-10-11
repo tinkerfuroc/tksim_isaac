@@ -134,7 +134,16 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
 - **Effects:** truth spun +70°, and AMCL lost 0.6 m and 60°. The BT spin and backup recoveries then failed with "Collision Ahead".
 - **Probe so far:** a per-layer probe (`cmd_vel` → facade wheel command → `/isaac_joint_commands` → measured) over two later route runs saw no recurrence.
 - **Logs:** `gpsr_stack_logs/20261011T081535`, and `/tmp/claude-1002/bugA/base.jsonl` at sim t+64 s.
-- **Owner:** sim gateway / base drive. No session owns it yet.
+- **Owner:** stop-command-wheels-sim.
+- **Root cause (stop-command-wheels-sim, 2026-10-11):** the zero `/cmd_vel` never reached the wheels.
+  - The wheels froze at v = 0.350, wz = +0.145 from sim t+62.6, about 1.7 s *before* the zero `/cmd_vel`, right after a ~1 wall-s sim stall.
+  - The stall overflowed the depth-50 `/isaac_joint_commands` reader. The Isaac gateway's strict snapshot contiguity then rejected every later packet.
+  - The backend held its last wheel velocity until the 5 s command-stream timeout fired (`command_stream_lost` in `01-sim.log`, wall_age 19.47 s). That matches odom dropping to 0 at t+67.60.
+  - Separately, the wheel slew wrote its slewed value back into the command buffer, so a zero command braked by only one slew step per packet.
+- **Fix:** branch `fix/wheel-overrun-command-gap` (`b284a7e`, not merged).
+  - A forward snapshot gap now stops the robot immediately; it recovers on the next 0.25 s safety heartbeat.
+  - The slew no longer overwrites the command buffer.
+  - 7 new unit tests. Not yet re-run live.
 
 ### Suggested fixes (pick per owner)
 
