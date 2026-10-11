@@ -100,7 +100,7 @@ This section supersedes parts of the root cause above. It comes from a live repr
   - A static check with the body plus 3 cm cuts blocked headings at the battery poses: kitchen (3.37, −2.13) 19 → 6, (3.85, −3.60) 31 → 8, (−0.56, −4.28) 10 → 0.
   - The live test was inconclusive because `set_parameters` on the local_costmap footprint timed out.
   - Not done: this needs the tinker2_sim profile in tk25_basic (`feat/tinker2-sim-profile`), and merging that is the user's call.
-- **Approach planner footprint mismatch:** its startup log shows it checks stand poses with `[(0.25,±0.25),(−0.3,±0.25)]`, while Nav2 enforces tinker2_sim `[(0.20,±0.27),(−0.45,±0.27)]`. Its rear is 15 cm short. Forwarded to gpsr-issue-2-approach-planner (PR #11).
+- **Approach planner footprint: withdrawn, not a problem.** The startup line `[(0.25,±0.25),(−0.3,±0.25)]` is only the YAML fallback, which is the hardware footprint. With `use_published_footprint: true`, the planner switches to `/global_costmap/published_footprint` about 2.4 s after startup and logs `adopted live footprint ... [(0.21, ±0.28), (−0.46, ±0.28)]`. That is tinker2_sim plus about 1 cm of costmap padding, adopted long before the first goal in both the d217 battery and the d219 run (verified in `05-nav_extras-0.log` and `04-nav_extras-0.log`).
 - **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the working tree carries an uncommitted 0.2 from another session, and stacks run with 0.2. `d30439d` doesn't depend on either value.
 
 ### Related: wheels kept driving after `/cmd_vel` went to zero (sim base drive, open)
