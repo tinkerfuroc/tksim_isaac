@@ -656,7 +656,28 @@ def test_parity_preset_uses_contract_scale(monkeypatch):
     monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
     sim = _sim_stage(lidar="parity")
     assert sim["cmd"][-2:] == ["--", "--raycast-lidar"]
-    assert "TINKER_SIM_LIDAR_CHANNELS" not in sim["env"]
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == ""
+    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == ""
+
+
+def test_parity_preset_isolates_exported_scale_vars(monkeypatch):
+    monkeypatch.setenv("TINKER_SIM_LIDAR_CHANNELS", "16")
+    monkeypatch.setenv("TINKER_SIM_LIDAR_COLUMNS", "100")
+    sim = _sim_stage(lidar="parity")
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == ""
+    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == ""
+    assert sim["cmd"][-2:] == ["--", "--raycast-lidar"]
+
+
+def test_battery_blank_channel_export_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("TINKER_SIM_LIDAR_CHANNELS", "  ")
+    assert _sim_stage()["env"]["TINKER_SIM_LIDAR_CHANNELS"] == str(mod.BATTERY_LIDAR_CHANNELS)
+
+
+def test_default_banner_shows_battery_channels(monkeypatch, capsys):
+    monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
+    assert mod.main(["up", "--manipulation", "mock", "--dry-run"]) == 0
+    assert "lidar preset: battery (channels=24)" in capsys.readouterr().out
 
 
 def test_planar_preset_has_no_raycast():
@@ -705,6 +726,8 @@ def test_domain_override(monkeypatch):
     for stage in mod.stage_commands(_cfg()):
         assert stage["env"]["ROS_DOMAIN_ID"] == "219"
     monkeypatch.delenv("GPSR_ROS_DOMAIN_ID")
+    assert mod.stage_commands(_cfg())[0]["env"]["ROS_DOMAIN_ID"] == "42"
+    monkeypatch.setenv("GPSR_ROS_DOMAIN_ID", "  ")
     assert mod.stage_commands(_cfg())[0]["env"]["ROS_DOMAIN_ID"] == "42"
 
 

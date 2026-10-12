@@ -599,9 +599,10 @@ class RaycastLidar:
         through IsaacLab's ``SimulationContext``, where the event is not
         guaranteed to be dispatched -- which is exactly how the first live nav
         battery produced a sensor that cast rays (GPU busy, no errors logged)
-        while ``/livox/lidar`` stayed silent for the entire run. The gateway
-        therefore also polls ``accumulate()`` on its publish path, and folding
-        is deduplicated by physics step so both drivers together stay correct.
+        while ``/livox/lidar`` stayed silent for the entire run. The backend's
+        post-substep hook drives ``accumulate()`` in production; the gateway's
+        publish-path poll is only a fallback, and folding is deduplicated by
+        physics step so both drivers together stay correct.
         """
         self.accumulate(source="callback")
 

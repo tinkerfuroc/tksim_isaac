@@ -23,9 +23,21 @@ def test_window_rtf_only_uses_the_window():
     assert abs(rtf.window_rtf(s, now_wall=s[-1][0], window_s=10.0) - 0.2) < 1e-9
 
 
-def test_window_rtf_needs_two_samples():
+def test_window_rtf_needs_one_sample_and_positive_wall_span():
     assert rtf.window_rtf([], now_wall=5.0, window_s=10.0) is None
-    assert rtf.window_rtf([(1.0, 1.0)], now_wall=5.0, window_s=10.0) is None
+    assert rtf.window_rtf([(5.0, 1.0)], now_wall=5.0, window_s=10.0) is None  # zero span
+
+
+def test_window_rtf_sees_a_stalled_clock():
+    # 5 s of samples at RTF 0.5, then /clock goes silent for 25 s (now = last sample + 25).
+    s = [(1000.0 + i * 0.5, i * 0.5 * 0.5) for i in range(11)]  # wall 1000..1005, sim 0..2.5
+    got = rtf.window_rtf(s, now_wall=1030.0, window_s=30.0)
+    assert abs(got - 2.5 / 30.0) < 1e-9
+    assert got < rtf.RTF_WARN_THRESHOLD
+
+
+def test_window_rtf_single_sample_with_elapsed_wall_is_zero():
+    assert rtf.window_rtf([(1000.0, 7.0)], now_wall=1010.0, window_s=10.0) == 0.0
 
 
 def test_window_rtf_restarts_after_clock_rewind():

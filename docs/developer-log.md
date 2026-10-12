@@ -72,10 +72,14 @@ geometric self-filter, and `planar` as the default. A vision-on-another-GPU
 probe was skipped (GPU 0 belonged to another session). No bench battery was
 run, so RTF over a full battery is unmeasured.
 
-**Fidelity** (battery 24 ch, domain 227). Dynamic obstacle: a box placed in
-the lidar's view went from 319 to 499 box counts (6/6 trials) and back to 319 as it
-was added and removed (PASS). Doorway: `command_point` -> `laundry_desk`
-SUCCEEDED in 61 s with 0 "collision ahead"; drive RTF 0.345 / 0.341.
+**Fidelity** (battery 24 ch, domain 227). A standing person was spawned 1.5 m
+ahead of the robot (world -0.5,-2.0; robot at -2,-2). The probe counted
+`/livox/lidar` points inside a 1x1x2 m sensor-frame region ahead (1.0<x<2.0,
+|y|<0.5, 0<z<2.0): 319 at baseline, 499 with the person and 319 after deletion,
+in 6 of 6 frames of one trial. Caveat: the probe's console output was not
+saved; the method is in the probe script, and the numbers come from the run
+agent's report. Doorway: `command_point` -> `laundry_desk` SUCCEEDED in ~61 s
+(60.9 s from the goal timestamps) with 0 "collision ahead"; drive RTF ~0.34.
 
 ## 2026-09-10 — live Nav2 battery: the lidar chain works end to end, and it sees a person
 

@@ -70,7 +70,8 @@ This **MUST be empty**. If it is not, wait — do not contend for the GPU.
 
 ## Conventions used in every stage below
 
-- All six stacks share `ROS_DOMAIN_ID=42` (the plan's live-run domain; the
+- Every stack stage (sim, bridge, vision, manipulation, nav_extras,
+  rtf_monitor) shares `ROS_DOMAIN_ID=42` (the plan's live-run domain; the
   repo's own `deployment.env.example` default of `25` is for other
   workflows — override it here).
 - `TINKER_WS=/home/tinker/tk25_ws` is the external Humble workspace; it holds
@@ -227,7 +228,7 @@ Nav2 goals. Run-to-run noise is about ±0.04.
 | `--lidar` preset | RTF while driving |
 |---|---|
 | `planar` (no raycast) | 0.478 |
-| `battery`, 24 ch (default) | 0.381 |
+| `battery`, 24 ch (default) | 0.381 (one of 4 goals hit its 150 s timeout) |
 | `battery`, 16 ch (`TINKER_SIM_LIDAR_CHANNELS=16`) | 0.373 |
 | `battery`, 32 ch | 0.317 |
 | `parity` (contract 57 ch) | 0.255 |
@@ -240,15 +241,19 @@ stack (0.342 vs 0.381) and is not a default; the 24-channel default stays.
 
 Per-run RTF: the `rtf_monitor` stage appends 30 s-window RTF samples to
 `$GPSR_RUN_DIR/rtf.jsonl` and logs a WARN line (`05-rtf_monitor.log` in mock
-mode) whenever RTF is below 0.5. Per-trial RTF:
+mode): once when `rtf_30s` crosses below 0.5, then a reminder every 60 s
+while it stays below, plus an OK line on recovery. Per-trial RTF:
 `python3 tools/rtf_monitor.py --summarise <rtf.jsonl> --from <wall> --to <wall>`.
 
 `GPSR_ROS_DOMAIN_ID` puts every stage on a private DDS domain (pick one no
-other session uses). `GPSR_VISION_GPU=<n>` runs vision on another GPU than the
+other session uses). Export the same `ROS_DOMAIN_ID` for your own CLI
+commands and for `scripts/kill-domain-nodes <id>`, or they will look at
+domain 42. `GPSR_VISION_GPU=<n>` runs vision on another GPU than the
 sim (opt-in; its RTF gain is unmeasured).
 
-Adding `TINKER_SIM_CPU_THREADS=16` (Kit's worker pool; default 32 on this
-host) is worth ~0.03-0.05 on every bridge-attached figure and is safe.
+`TINKER_SIM_CPU_THREADS=16` (Kit's worker pool; default 32 on this host) gave
+no gain on the full stack (0.342 vs 0.381, see the table above); it is safe
+but not a default.
 
 What bounds RTF at control 60 is the PhysX solve (~9 ms per control step)
 and Kit's render pump for both RTX cameras (~30 ms per camera frame, scaling

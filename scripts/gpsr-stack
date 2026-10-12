@@ -224,8 +224,10 @@ SURVIVOR_POLL_INTERVAL_S = 1.0
 #:   RTF lever. parity: the contract's full pattern (~0.3 RTF on this host).
 #:   planar: the occupancy-map lidar (no heights, no dynamic obstacles).
 LIDAR_PRESETS = ("battery", "parity", "planar")
-#: Set from the live A/B matrix (docs/developer-log.md, 2026-10 RTF budget):
-#: the largest channel count holding RTF >= 0.55 with the full stack attached.
+#: Starting value. The 2026-10-11 matrix (docs/developer-log.md) measured
+#: 16/24/32 ch drive RTF at 0.373/0.381/0.317 (planar 0.478) on a loaded
+#: shared host; no cell reached 0.55. 24 was kept because 16 is not measurably
+#: faster (+-0.04 noise) and 32 is slower.
 BATTERY_LIDAR_CHANNELS = 24
 
 
@@ -250,7 +252,7 @@ def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
     """
     # Keep the runbook default, but allow an isolated run to select a
     # private DDS domain when another simulator stack is already running.
-    env = {"ROS_DOMAIN_ID": os.environ.get("GPSR_ROS_DOMAIN_ID", "42")}
+    env = {"ROS_DOMAIN_ID": os.environ.get("GPSR_ROS_DOMAIN_ID", "").strip() or "42"}
     env.update(extra)
     return env
 
@@ -321,6 +323,11 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     if cfg.lidar != "planar":
         # Passthrough to the sim app (tinker-sim launch strips the "--").
         sim_lidar_args = ["--", "--raycast-lidar"]
+    if cfg.lidar == "parity":
+        # Contract scale: blank the overrides so exported shell values cannot
+        # leak in (lidar_rig._resolve_axis treats blank as "use the contract").
+        sim_env["TINKER_SIM_LIDAR_CHANNELS"] = ""
+        sim_env["TINKER_SIM_LIDAR_COLUMNS"] = ""
     if cfg.lidar == "battery":
         # A caller's explicit export wins, so A/Bs need no code change.
         sim_env["TINKER_SIM_LIDAR_CHANNELS"] = (
@@ -529,7 +536,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     })
 
     # --- Stage 6: RTF monitor ---------------------------------------------
-    # Samples /clock for the whole run: $GPSR_RUN_DIR/rtf.jsonl every 10 s and
+    # Starts after all bring-up gates, then samples /clock: $GPSR_RUN_DIR/rtf.jsonl every 10 s and
     # a WARN line in its log below RTF 0.5. Never stops anything.
     stages.append({
         "name": "rtf_monitor",

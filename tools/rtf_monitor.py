@@ -46,15 +46,23 @@ def _after_last_rewind(samples: Sequence[tuple[float, float]]) -> Sequence[tuple
 def window_rtf(
     samples: Sequence[tuple[float, float]], now_wall: float, window_s: float
 ) -> float | None:
-    """RTF over the last *window_s* wall seconds of ``(wall, sim)`` samples."""
-    recent = [s for s in samples if now_wall - window_s <= s[0] <= now_wall]
-    recent = list(_after_last_rewind(recent))
-    if len(recent) < 2:
+    """RTF over the last *window_s* wall seconds of ``(wall, sim)`` samples.
+
+    Measured up to *now_wall*, not up to the last sample, so a stalled /clock
+    decays toward 0 instead of going silent. The anchor is the last sample at
+    or before the window start (else the first sample in the window); samples
+    before the last backward sim jump (a reset) are never used.
+    """
+    usable = list(_after_last_rewind([s for s in samples if s[0] <= now_wall]))
+    if not usable:
         return None
-    wall = recent[-1][0] - recent[0][0]
+    window_start = now_wall - window_s
+    older = [s for s in usable if s[0] <= window_start]
+    anchor = older[-1] if older else usable[0]
+    wall = now_wall - anchor[0]
     if wall <= 0.0:
         return None
-    return (recent[-1][1] - recent[0][1]) / wall
+    return (usable[-1][1] - anchor[1]) / wall
 
 
 class WarnState:
@@ -159,7 +167,8 @@ def _run(out: Path) -> int:  # pragma: no cover - needs a live ROS graph
     def on_clock(msg) -> None:
         now = time.time()
         samples.append((now, msg.clock.sec + msg.clock.nanosec * 1e-9))
-        while samples and now - samples[0][0] > KEEP_S:
+        # Never empty the deque: a stalled /clock still needs its anchor.
+        while len(samples) > 1 and now - samples[0][0] > KEEP_S:
             samples.popleft()
 
     def on_timer() -> None:
