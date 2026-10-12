@@ -151,7 +151,7 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
   - The stall overflowed the depth-50 `/isaac_joint_commands` reader. The Isaac gateway's strict snapshot contiguity then rejected every later packet.
   - The backend held its last wheel velocity until the 5 s command-stream timeout fired (`command_stream_lost` in `01-sim.log`, wall_age 19.47 s). That matches odom dropping to 0 at t+67.60.
   - Separately, the wheel slew wrote its slewed value back into the command buffer, so a zero command braked by only one slew step per packet.
-- **Fix:** branch `fix/wheel-overrun-command-gap` (`b284a7e`, not merged).
+- **Fix:** merged to dev as PR #30 (`76414f4`, merge `9915150`); originally branch `fix/wheel-overrun-command-gap` (`b284a7e`).
   - A forward snapshot gap now stops the robot immediately; it recovers on the next 0.25 s safety heartbeat.
   - The slew no longer overwrites the command buffer.
   - 7 new unit tests. Not yet re-run live.
