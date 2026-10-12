@@ -31,7 +31,8 @@ from PIL import Image
 from scipy.ndimage import distance_transform_edt
 
 HW = [(0.25, 0.25), (0.25, -0.25), (-0.7, -0.25), (-0.7, 0.25)]          # tinker_robot_config _common
-SIM = [(0.20, 0.27), (0.20, -0.27), (-0.45, -0.27), (-0.45, 0.27)]       # nav_params_overlay.py
+SIM = [(0.16, 0.235), (0.16, -0.235), (-0.41, -0.235), (-0.41, 0.235)]  # nav_params_overlay.py, body + 3 cm (5329467)
+SIM_OLD = [(0.20, 0.27), (0.20, -0.27), (-0.45, -0.27), (-0.45, 0.27)]   # before 5329467; numbers in the 2026-10-11 report
 DEFAULT_MAP = sorted(glob.glob("/home/tinker/tinker-sim/6.0.1/artifacts/arena/rcw2026/*/map.yaml"))
 
 
@@ -111,8 +112,9 @@ def main() -> None:
     if not args.map:
         raise SystemExit("pass --map")
     g = Grid(args.map)
-    maps = {name: (fp, costmap(g, fp, args.scaling, args.inflation)) for name, fp in (("HW", HW), ("SIM", SIM))}
-    print(f"map {args.map}\ninscribed radius HW {inscribed(HW):.2f} m, SIM {inscribed(SIM):.2f} m; "
+    maps = {name: (fp, costmap(g, fp, args.scaling, args.inflation)) for name, fp in (("HW", HW), ("SIM", SIM), ("SIM_OLD", SIM_OLD))}
+    print(f"map {args.map}\ninscribed radius HW {inscribed(HW):.2f} m, SIM {inscribed(SIM):.2f} m, "
+          f"SIM_OLD {inscribed(SIM_OLD):.2f} m; "
           f"inflation {args.inflation}, scaling {args.scaling}")
 
     for spec in args.pose:

@@ -125,6 +125,11 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
   - Levers:
     - Trim the footprint to the body + 3 cm: 10/72 blocked and the projection clears. Body + 2 cm: 0/72. Needs the tk25_basic tinker2_sim profile.
     - Or lower `max_allowed_time_to_collision_up_to_carrot`. Humble shares that value with forward motion.
+  - **Done (user chose body + 3 cm):** footprint `[[0.16,±0.235],[-0.41,±0.235]]`, radius 0.473 (was 0.525).
+    - tinker-sim `5329467`; tk25_basic `f381bc5` on `feat/tinker2-sim-profile`, not pushed. `tinker_robot_config` is rebuilt in `~/tk25_ws/install`, so new stacks get it.
+    - The approach planner adopts the live footprint, so it follows automatically.
+    - `costmap_check.py` now checks `SIM` (new) and `SIM_OLD` (the numbers in this report). Static: departure pose (1.06, 1.75) 22 → 10/72 lethal; PR #11 stand pose (1.08, 1.73) 18 → 0/72; kitchen_table nav pose (3.56, −2.14) 0/72.
+    - Live check pending.
 - **Remaining issue 2:** with the chairs, every kitchen_table stand pose sits at the 1.0 m stand-off maximum (1.10–1.19 m from the target, vs about 0.95 m before the PR). Manipulation should check whether that is within grasp reach.
 - **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN. Reworded in PR #11 `054d8a7` to "chosen pose (x, y) has only 0.05 m footprint clearance (preferred 0.15 m): …"; grep for "has only" in future logs.
 
