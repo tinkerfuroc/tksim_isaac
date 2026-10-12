@@ -103,7 +103,7 @@ This section supersedes parts of the root cause above. It comes from a live repr
 - **Approach planner footprint: withdrawn, not a problem.** The startup line `[(0.25,±0.25),(−0.3,±0.25)]` is only the YAML fallback, which is the hardware footprint. With `use_published_footprint: true`, the planner switches to `/global_costmap/published_footprint` about 2.4 s after startup and logs `adopted live footprint ... [(0.21, ±0.28), (−0.46, ±0.28)]`. That is tinker2_sim plus about 1 cm of costmap padding, adopted long before the first goal in both the d217 battery and the d219 run (verified in `05-nav_extras-0.log` and `04-nav_extras-0.log`).
 - **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the working tree carries an uncommitted 0.2 from another session, and stacks run with 0.2. `d30439d` doesn't depend on either value.
 
-### Live check of the approach-planner fix (2026-10-11, tk26_navigation PR #11, not merged)
+### Live check of the approach-planner fix (2026-10-11, tk26_navigation PR #11, merged as `f82e397` and installed in `~/tk25_ws/install`)
 
 Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulation, the PR #11 overlay build, and the dev tree including `d30439d` (the bridge is a develop install, so the overlay is loaded from source). Logs: `gpsr_stack_logs_d219/20261011T094019/` (planner `04-nav_extras-0-pr11.log`, Nav2 `02-bridge.log`).
 
