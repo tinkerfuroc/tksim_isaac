@@ -218,6 +218,37 @@ TEARDOWN_GRACE_S = 10.0
 SURVIVOR_POLL_TIMEOUT_S = 10.0
 SURVIVOR_POLL_INTERVAL_S = 1.0
 
+#: Lidar presets for the sim stage (docs/gpsr-sim-runbook.md, "Lidar presets").
+#: The live raycast lidar is run_sim's DEFAULT (PR #29), so battery and parity
+#: pass no lidar flag; planar passes dev's opt-out `--map-lidar`.
+#: battery: raycast at BATTERY_LIDAR_CHANNELS x the contract's 349 columns --
+#:   Nav2 consumes azimuth resolution, vertical channels are the RTF lever.
+#:   parity: the contract's full pattern (read from hardware-parity.json and
+#:   set explicitly; ~0.3 RTF on this host).
+#:   planar: the occupancy-map lidar (no heights, no dynamic obstacles).
+LIDAR_PRESETS = ("battery", "parity", "planar")
+#: Battery's pinned channel count. NOTE run_sim's own default with the var
+#: UNSET is 44 channels (lidar_rig.DEFAULT_LIDAR_CHANNELS); this preset pins 24
+#: on purpose, so `gpsr-stack` without --lidar is NOT run_sim's default scale.
+#: Starting value. The 2026-10-11 matrix (docs/developer-log.md) measured
+#: 16/24/32 ch drive RTF at 0.373/0.381/0.317 (planar 0.478) on a loaded
+#: shared host; no cell reached 0.55. 24 was kept because 16 is not measurably
+#: faster (+-0.04 noise) and 32 is slower.
+BATTERY_LIDAR_CHANNELS = 24
+
+
+def _lidar_contract_scale() -> tuple[str, str]:
+    """(channels, columns) of the raycast lidar contract, as env strings."""
+    path = REPO_ROOT / "simulation" / "sensors" / "hardware-parity.json"
+    try:
+        ray = json.loads(path.read_text(encoding="utf-8"))["lidar"]["raycast"]
+        return str(int(ray["channels"])), str(int(ray["columns"]))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"cannot read the lidar contract scale from {path} "
+            f"(hardware-parity.json lidar.raycast.channels/columns): {exc!r}"
+        ) from exc
+
 
 @dataclasses.dataclass
 class StackConfig:
@@ -228,6 +259,7 @@ class StackConfig:
     sim_gpu: int  # GPU device index for the simulator
     log_dir: str
     evidence: bool = False  # arena observer camera on: contact-sheet evidence runs
+    lidar: str = "battery"  # one of LIDAR_PRESETS
 
 
 def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
@@ -237,7 +269,9 @@ def _preamble_env(extra: dict[str, str]) -> dict[str, str]:
     (see ``_full_env``); this dict alone is what stage_commands() exposes so
     it stays plain-data and testable.
     """
-    env = {"ROS_DOMAIN_ID": "42"}
+    # Keep the runbook default, but allow an isolated run to select a
+    # private DDS domain when another simulator stack is already running.
+    env = {"ROS_DOMAIN_ID": os.environ.get("GPSR_ROS_DOMAIN_ID", "").strip() or "42"}
     env.update(extra)
     return env
 
@@ -302,6 +336,26 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
         # it and keep their 600 s wall cap.
         sim_env["TINKER_SIM_ARENA_CAMERA"] = "1"
         sim_env["TINKER_SIM_ARENA_CAMERA_HZ"] = "2"
+    if cfg.lidar not in LIDAR_PRESETS:
+        raise ValueError(f"unknown lidar preset {cfg.lidar!r}; expected one of {LIDAR_PRESETS}")
+    sim_lidar_args: list[str] = []
+    if cfg.lidar == "planar":
+        # Opt out of run_sim's raycast default (PR #29). Passthrough to the sim
+        # app; tinker-sim launch strips the leading "--".
+        sim_lidar_args = ["--", "--map-lidar"]
+    if cfg.lidar == "parity":
+        # Contract scale, set explicitly from hardware-parity.json so exported
+        # shell values cannot leak in and a future run_sim default change
+        # cannot silently alter the preset.
+        sim_env["TINKER_SIM_LIDAR_CHANNELS"], sim_env["TINKER_SIM_LIDAR_COLUMNS"] = (
+            _lidar_contract_scale()
+        )
+    if cfg.lidar == "battery":
+        # A caller's explicit export wins, so A/Bs need no code change.
+        sim_env["TINKER_SIM_LIDAR_CHANNELS"] = (
+            os.environ.get("TINKER_SIM_LIDAR_CHANNELS", "").strip()
+            or str(BATTERY_LIDAR_CHANNELS)
+        )
     stages.append({
         "name": "sim",
         "cmd": [
@@ -313,6 +367,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
             "--spawn-xy=-2.0,-2.0",
             "--ros",
             "--headless",
+            *sim_lidar_args,
         ],
         "env": _preamble_env(sim_env),
         "cwd": REPO_ROOT,
@@ -360,6 +415,16 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
 
     # --- Stage 3: tk26_vision (plus the two manual runbook gaps) -----------
     vision_sources = ("/opt/ros/humble/setup.bash", f"{TINKER_WS}/install/setup.bash")
+    vision_env = _preamble_env({
+        # waving_person_server defaults to show_window:=true and needs a
+        # display; this keeps a headless bring-up from aborting on it.
+        "QT_QPA_PLATFORM": "offscreen",
+    })
+    # Vision inference shares the sim's GPU by default. An isolated run may
+    # place it on another device (RTF A/B, docs/developer-log.md 2026-10).
+    vision_gpu = os.environ.get("GPSR_VISION_GPU", "").strip()
+    if vision_gpu:
+        vision_env["CUDA_VISIBLE_DEVICES"] = vision_gpu
     stages.append({
         "name": "vision",
         "cmd": [
@@ -441,11 +506,7 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                       "-p", "joint_state_topic:=/pan_tilt/joint_states"],
             ),
         ],
-        "env": _preamble_env({
-            # waving_person_server defaults to show_window:=true and needs a
-            # display; this keeps a headless bring-up from aborting on it.
-            "QT_QPA_PLATFORM": "offscreen",
-        }),
+        "env": vision_env,
         "cwd": REPO_ROOT,
         "gate": "vision",
     })
@@ -491,6 +552,20 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
                 argv=["ros2", "run", "orientation_angle_service", "orientation_angle_server"],
             ),
         ],
+        "env": _preamble_env({}),
+        "cwd": REPO_ROOT,
+        "gate": "nav",
+    })
+
+    # --- Stage 6: RTF monitor ---------------------------------------------
+    # Starts after all bring-up gates, then samples /clock: $GPSR_RUN_DIR/rtf.jsonl every 10 s and
+    # a WARN line in its log below RTF 0.5. Never stops anything.
+    stages.append({
+        "name": "rtf_monitor",
+        "cmd": _ros_argv(
+            sources=("/opt/ros/humble/setup.bash",),
+            argv=["python3", "tools/rtf_monitor.py"],
+        ),
         "env": _preamble_env({}),
         "cwd": REPO_ROOT,
         "gate": "nav",
@@ -641,6 +716,10 @@ def _stage_procs(cmd) -> list[list[str]]:
 
 def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
     stages = stage_commands(cfg)
+    banner = f"lidar preset: {cfg.lidar}"
+    if cfg.lidar == "battery":
+        banner += f" (channels={stages[0]['env']['TINKER_SIM_LIDAR_CHANNELS']})"
+    print(banner)
 
     global _ACTIVE_GATE_CENSUS_STACKS
     _ACTIVE_GATE_CENSUS_STACKS = _gate_census_stacks(cfg)
@@ -661,6 +740,7 @@ def _run_up(cfg: StackConfig, *, dry_run: bool) -> int:
     try:
         for idx, stage in enumerate(stages, start=1):
             env = _full_env(stage["env"])
+            env["GPSR_RUN_DIR"] = str(run_dir.resolve())
             procs = _stage_procs(stage["cmd"])
             for p_idx, argv in enumerate(procs):
                 suffix = "" if len(procs) == 1 else f"-{p_idx}"
@@ -841,6 +921,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evidence", action="store_true",
         help="enable the arena observer camera (contact-sheet evidence runs; costs RTF)")
+    parser.add_argument(
+        "--lidar", choices=LIDAR_PRESETS, default="battery",
+        help="lidar preset: battery (raycast pinned to 24 channels, default; "
+             "run_sim's own unset default is 44), parity (full contract "
+             "raycast set explicitly, ~0.3 RTF), planar (occupancy-map lidar "
+             "via --map-lidar)")
     return parser
 
 
@@ -854,6 +940,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         sim_gpu=args.sim_gpu,
         log_dir=args.log_dir,
         evidence=args.evidence,
+        lidar=args.lidar,
     )
 
     if args.subcommand == "up":
