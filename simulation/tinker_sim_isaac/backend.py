@@ -1993,16 +1993,35 @@ class IsaacWholeRobotBackend:
                 flush=True,
             )
 
+    def add_post_substep_hook(self, hook: Callable[[], None]) -> None:
+        """Run *hook* after every PhysX substep of every control step.
+
+        For consumers whose data changes per SOLVER step rather than per
+        control step. The raycast lidar's sweep fires one slice per physics
+        step and the plugin clears its reading each step, so reading it once
+        per control step at 120/60 dropped every other slice (5 Hz frames
+        with permanently empty wedges, measured 2026-10-11). Hooks must not
+        raise: they run inside the stepping loop.
+        """
+        hooks = self.__dict__.get("_post_substep_hooks")
+        if hooks is None:
+            hooks = self._post_substep_hooks = []
+        hooks.append(hook)
+
     def _step_simulation(self) -> None:
         """One control step: ``physics_substeps`` solver steps of ``physics_dt``.
 
         Each Isaac Lab ``step()`` is one ``IPhysxSimulation.simulate(dt)`` +
         ``fetch_results()`` at the validated solver dt; Kit is rendered (when
-        enabled) only after the last substep.
+        enabled) only after the last substep. Post-substep hooks run after
+        every solver step.
         """
         last = self.physics_substeps - 1
+        hooks = self.__dict__.get("_post_substep_hooks", ())
         for index in range(self.physics_substeps):
             self._sim.step(render=self.render and index == last)
+            for hook in hooks:
+                hook()
 
     def _apply_two_tone_paint(self) -> None:
         """Two-tone the robot so the arm reads apart from the chassis on camera.

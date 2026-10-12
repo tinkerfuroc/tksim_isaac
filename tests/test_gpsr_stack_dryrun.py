@@ -29,7 +29,7 @@ def _cfg(**kw):
 
 def test_mock_skips_stage4():
     names = [s["name"] for s in mod.stage_commands(_cfg())]
-    assert names == ["sim", "bridge", "vision", "nav_extras"]
+    assert names == ["sim", "bridge", "vision", "nav_extras", "rtf_monitor"]
 
 
 def test_live_includes_stage4_with_gpu():
@@ -155,7 +155,7 @@ def test_live_requires_manip_gpu():
 
 def test_stage_order_live():
     names = [s["name"] for s in mod.stage_commands(_cfg(manipulation="live", manip_gpu=1))]
-    assert names == ["sim", "bridge", "vision", "manipulation", "nav_extras"]
+    assert names == ["sim", "bridge", "vision", "manipulation", "nav_extras", "rtf_monitor"]
 
 
 def test_gates_present_and_known():
@@ -169,6 +169,7 @@ def test_gates_present_and_known():
     assert by_name["vision"] == "vision"
     assert by_name["manipulation"] == "manipulation"
     assert by_name["nav_extras"] == "nav"
+    assert by_name["rtf_monitor"] == "nav"
 
 
 def test_vision_stage_has_four_popens_including_named_camera_server_and_pan_tilt():
@@ -635,3 +636,149 @@ def test_bridge_stage_gets_the_head_camera_aim_like_the_sim_stage():
     stages = {s["name"]: s for s in mod.stage_commands(_cfg())}
     assert stages["sim"]["env"]["TINKER_SIM_HEAD_CAMERA_AIM"] == mod.HEAD_CAMERA_AIM
     assert stages["bridge"]["env"]["TINKER_SIM_HEAD_CAMERA_AIM"] == mod.HEAD_CAMERA_AIM
+
+
+# --- Lidar presets (RTF budget, docs/superpowers/specs/2026-10-11-gpsr-sim-rtf-budget-design.md) ---
+
+def _sim_stage(**kw):
+    return [s for s in mod.stage_commands(_cfg(**kw)) if s["name"] == "sim"][0]
+
+
+def _contract_scale():
+    import json
+    raw = json.loads((mod.REPO_ROOT / "simulation" / "sensors" / "hardware-parity.json").read_text())
+    ray = raw["lidar"]["raycast"]
+    return str(ray["channels"]), str(ray["columns"])
+
+
+def test_default_preset_is_battery_with_pinned_channels_not_devs_default(monkeypatch):
+    # dev's run_sim default (unset) is 44 ch; the battery preset pins 24.
+    monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
+    sim = _sim_stage()
+    assert "--raycast-lidar" not in sim["cmd"]
+    assert "--map-lidar" not in sim["cmd"]
+    assert sim["cmd"][-1] == "--headless"
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == "24"
+    assert "TINKER_SIM_LIDAR_COLUMNS" not in sim["env"]
+
+
+def test_parity_preset_sets_contract_scale_explicitly(monkeypatch):
+    monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
+    monkeypatch.delenv("TINKER_SIM_LIDAR_COLUMNS", raising=False)
+    sim = _sim_stage(lidar="parity")
+    channels, columns = _contract_scale()
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == channels
+    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == columns
+    assert "--raycast-lidar" not in sim["cmd"]
+    assert "--map-lidar" not in sim["cmd"]
+
+
+def test_parity_preset_isolates_exported_scale_vars(monkeypatch):
+    monkeypatch.setenv("TINKER_SIM_LIDAR_CHANNELS", "16")
+    monkeypatch.setenv("TINKER_SIM_LIDAR_COLUMNS", "100")
+    sim = _sim_stage(lidar="parity")
+    channels, columns = _contract_scale()
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == channels
+    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == columns
+
+
+def test_parity_preset_errors_clearly_when_contract_missing(monkeypatch, tmp_path):
+    import pytest
+    monkeypatch.setattr(mod, "REPO_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="hardware-parity.json"):
+        mod.stage_commands(_cfg(lidar="parity"))
+
+
+def test_no_preset_passes_raycast_lidar_flag():
+    for preset in mod.LIDAR_PRESETS:
+        assert "--raycast-lidar" not in _sim_stage(lidar=preset)["cmd"]
+
+
+def test_battery_blank_channel_export_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("TINKER_SIM_LIDAR_CHANNELS", "  ")
+    assert _sim_stage()["env"]["TINKER_SIM_LIDAR_CHANNELS"] == str(mod.BATTERY_LIDAR_CHANNELS)
+
+
+def test_default_banner_shows_battery_channels(monkeypatch, capsys):
+    monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
+    assert mod.main(["up", "--manipulation", "mock", "--dry-run"]) == 0
+    assert "lidar preset: battery (channels=24)" in capsys.readouterr().out
+
+
+def test_planar_preset_opts_out_with_map_lidar():
+    sim = _sim_stage(lidar="planar")
+    assert "--raycast-lidar" not in sim["cmd"]
+    assert sim["cmd"][-2:] == ["--", "--map-lidar"]
+    assert "TINKER_SIM_LIDAR_CHANNELS" not in sim["env"]
+
+
+def test_battery_preset_respects_caller_channel_export(monkeypatch):
+    monkeypatch.setenv("TINKER_SIM_LIDAR_CHANNELS", "32")
+    assert _sim_stage()["env"]["TINKER_SIM_LIDAR_CHANNELS"] == "32"
+
+
+def test_unknown_preset_is_refused():
+    import pytest
+    with pytest.raises(ValueError, match="lidar preset"):
+        mod.stage_commands(_cfg(lidar="fast"))
+
+
+def test_physics_rate_is_never_set_by_the_stack():
+    for preset in mod.LIDAR_PRESETS:
+        assert "TINKER_SIM_PHYSICS_HZ" not in _sim_stage(lidar=preset)["env"]
+
+
+def test_cli_lidar_flag_reaches_config_and_banner(capsys):
+    rc = mod.main(["up", "--manipulation", "mock", "--dry-run", "--lidar", "planar"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "lidar preset: planar" in out
+    assert "--raycast-lidar" not in out
+
+
+# --- RTF monitor stage, run dir, private domain, vision GPU ---
+
+def test_rtf_monitor_stage_runs_the_tool_under_ros():
+    stage = mod.stage_commands(_cfg())[-1]
+    assert stage["name"] == "rtf_monitor"
+    script = stage["cmd"][-1]
+    assert stage["cmd"][:2] == ["bash", "-lc"]
+    assert "source /opt/ros/humble/setup.bash" in script
+    assert "exec python3 tools/rtf_monitor.py" in script
+
+
+def test_domain_override(monkeypatch):
+    monkeypatch.setenv("GPSR_ROS_DOMAIN_ID", "219")
+    for stage in mod.stage_commands(_cfg()):
+        assert stage["env"]["ROS_DOMAIN_ID"] == "219"
+    monkeypatch.delenv("GPSR_ROS_DOMAIN_ID")
+    assert mod.stage_commands(_cfg())[0]["env"]["ROS_DOMAIN_ID"] == "42"
+    monkeypatch.setenv("GPSR_ROS_DOMAIN_ID", "  ")
+    assert mod.stage_commands(_cfg())[0]["env"]["ROS_DOMAIN_ID"] == "42"
+
+
+def test_vision_gpu_override(monkeypatch):
+    monkeypatch.delenv("GPSR_VISION_GPU", raising=False)
+    vision = [s for s in mod.stage_commands(_cfg()) if s["name"] == "vision"][0]
+    assert "CUDA_VISIBLE_DEVICES" not in vision["env"]
+    monkeypatch.setenv("GPSR_VISION_GPU", "1")
+    vision = [s for s in mod.stage_commands(_cfg()) if s["name"] == "vision"][0]
+    assert vision["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert vision["env"]["QT_QPA_PLATFORM"] == "offscreen"
+
+
+def test_run_up_passes_run_dir_to_every_stage(tmp_path, monkeypatch):
+    import os
+    envs = []
+
+    def _popen(argv, **kw):
+        envs.append(kw["env"])
+        return _FakePopenProc(os.getpid())
+
+    monkeypatch.setattr(mod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(mod, "_wait_for_gate", lambda gate: None)
+    assert mod._run_up(_cfg(log_dir=str(tmp_path)), dry_run=False) == 0
+    run_dirs = {e["GPSR_RUN_DIR"] for e in envs}
+    assert len(run_dirs) == 1
+    run_dir = Path(run_dirs.pop())
+    assert run_dir.is_absolute() and run_dir.parent == tmp_path.resolve()
