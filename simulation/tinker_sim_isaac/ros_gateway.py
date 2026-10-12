@@ -841,6 +841,24 @@ class RosStandardGateway:
         self.backend.set_safety_stop(True, reason="command_stream_lost")
         self._last_command_error = "command stream expired"
 
+    def _stop_on_command_gap(self, error: str) -> None:
+        """Stop the robot when a forward gap shows command packets were lost.
+
+        Strict contiguity rejects every later snapshot until a new baseline,
+        so rejecting alone left the backend executing the last applied
+        targets -- wheel velocities included -- until the command-stream
+        deadline (5 sim-s under gpsr-stack).  A sim-loop stall that overflows
+        the depth-50 command reader did exactly that on 2026-10-11 and drove
+        the base ~1 m past a zero /cmd_vel.  Entering the lost-stream state
+        stops now; the next fresh safety-clear heartbeat and a newer
+        packet-one snapshot recover through the ordinary baseline path.
+        """
+        self._enter_command_stream_lost(time.monotonic())
+        self._last_command_error = f"{error}; command stream stopped"
+        node = getattr(self, "node", None)
+        if node is not None:
+            node.get_logger().warning(f"command_gap {error}; stopping until resync")
+
     def _sim_receipt_time(self) -> float | None:
         """Backend simulation time for stamping a message receipt, or None."""
         try:
@@ -1261,16 +1279,28 @@ class RosStandardGateway:
                     continue
                 if logical_snapshot == self._last_logical_snapshot_id:
                     if (
-                        packet_count != self._last_snapshot_packet_count
-                        or packet_index != self._last_snapshot_packet_index + 1
+                        packet_count == self._last_snapshot_packet_count
+                        and packet_index <= self._last_snapshot_packet_index
                     ):
                         self._last_command_error = "rejected duplicate or out-of-order snapshot packet"
                         continue
+                    if packet_index != self._last_snapshot_packet_index + 1 or (
+                        packet_count != self._last_snapshot_packet_count
+                    ):
+                        self._stop_on_command_gap(
+                            "rejected out-of-order snapshot packet "
+                            f"{packet_index}/{packet_count} after "
+                            f"{self._last_snapshot_packet_index}/"
+                            f"{self._last_snapshot_packet_count}"
+                        )
+                        continue
                 elif packet_index != 1:
-                    self._last_command_error = "rejected snapshot that does not start at packet one"
+                    self._stop_on_command_gap(
+                        "rejected snapshot that does not start at packet one"
+                    )
                     continue
                 elif logical_snapshot != self._last_logical_snapshot_id + 1:
-                    self._last_command_error = (
+                    self._stop_on_command_gap(
                         f"rejected non-contiguous command snapshot {logical_snapshot}; "
                         f"expected {self._last_logical_snapshot_id + 1}"
                     )
