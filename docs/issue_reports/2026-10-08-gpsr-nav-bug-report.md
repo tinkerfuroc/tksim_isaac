@@ -243,6 +243,14 @@ The true spawn is the scenario pose (−2.000, −2.000, ~0°), not the (−1.93
 
 ## 4. Person detection position
 
+**Status (2026-10-11): fixed and verified end to end.**
+- The fix is tk26_vision PR #8: person boxes use the YOLO-seg person mask instead of SAM, and boxes with no matching YOLO person are dropped.
+- Sim check `t2-sec4-person-20261011` (tk25_decision `gpsr_runs/bench/`):
+  - The BT approached the living-room person at (−3.66, −3.94), 0.14 m from the spawned (−3.8, −3.95), and SUCCEEDED.
+  - The count trial counted 1 of 1.
+  - Every box was `yolo_person`.
+- Known gap: in a downward-looking head frame, YOLO-seg can label the robot's own arm as a person.
+
 **Symptom.** Deliver-to-person trials in the living room (batches `t2-20-live-rerun57`, `59`, `64`, `68`, `79`, `92`):
 - The person is spawned at (−3.8, −3.95) (`spawned.json`: `cmd_person_living_room`, pose `pointing_left`).
 - The BT's picked detection drifts across retries: (−3.7, −4.3), (−4.0, −4.4), then (−4.23…−4.43, −5.16…−5.32), inside or against the south-west walls.

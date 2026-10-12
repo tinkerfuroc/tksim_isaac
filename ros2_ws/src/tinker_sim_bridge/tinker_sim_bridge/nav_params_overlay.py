@@ -102,6 +102,16 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(amcl, dict):
         for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
             amcl[alpha] = 0.05
+        # Hold the estimate through in-place pivots (Bug A, 2026-10-11):
+        # pure rotation about base_link is exact in sim odometry, but every
+        # AMCL update during a pivot (one per 0.1 rad upstream) moved the
+        # estimate 1-1.5 cm with heading. RPP parks right at
+        # xy_goal_tolerance and pivots to the goal yaw; those centimetres
+        # put it back outside, where it pivots to the path heading instead
+        # -- 446-697 deg of back-and-forth for a 0.25 m goal next to
+        # side_table_02, with collision-ahead warnings from the sweep.
+        # 3.0 rad: 192-208 deg, no loop. Any 5 cm of travel still updates.
+        amcl["update_min_a"] = 3.0
         # AMCL localizes on a surface-only copy of the arena map, served by
         # its own map_server on this topic (see amcl_map.py); the costmaps
         # keep the solid map on /map.
@@ -145,14 +155,19 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # 90-degree turn INTO a 0.95 m doorway has no collision-free DWB
     # trajectory (validated: robot stalled at the north door mouth at
     # (-0.5, 3.66) with 32 progress-failures after the ObstacleFootprint
-    # fix), while the actual sim body passes easily. Overlay a sim-true
-    # envelope with margin (0.65 x 0.54): rear -0.45, front +0.20, half-
-    # width 0.27 (covers wheels). Upstream file stays hardware's.
+    # fix), while the actual sim body passes easily. Overlay the sim body
+    # plus 3 cm (0.57 x 0.47): rear -0.41, front +0.16, half-width 0.235
+    # (wheels sit inside |y| 0.157); circumscribed radius 0.473 m.
+    # Upstream file stays hardware's. (The first sim envelope carried 7 cm,
+    # radius 0.525: next to furniture it blocked in-place pivots the body
+    # clears -- at the side_table_02 departure pose 22 of 72 headings hit
+    # lethal and RPP's 1 s pivot projection deadlocked until a patience
+    # abort, 2026-10-11. With 3 cm: 10 of 72, and that pivot clears.)
     # NOTE: navigation_dwb_launch.py then overwrites every footprint key from
     # the robot profile (RobotField('base.footprint')), so the value that
     # actually reaches the costmaps is tinker_robot_config's tinker2_sim
     # profile -- keep the two equal (tests/test_sim_robot_profile.py).
-    sim_footprint = "[ [0.20, 0.27], [0.20, -0.27], [-0.45, -0.27], [-0.45, 0.27] ]"
+    sim_footprint = "[ [0.16, 0.235], [0.16, -0.235], [-0.41, -0.235], [-0.41, 0.235] ]"
     for costmap in ("local_costmap", "global_costmap"):
         node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
         if "footprint" in node:

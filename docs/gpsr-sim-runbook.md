@@ -26,7 +26,7 @@ by hand unless you're debugging a specific stage.
   --manipulation mock --sim-gpu 0                 # hybrid: manipulation mocked
 ./scripts/gpsr-stack up --scenario gpsr-rcw2026-bench --seed 0 \
   --manipulation live --sim-gpu 0 --manip-gpu 1    # live manipulation, separate GPU
-./scripts/gpsr-stack up ... --lidar battery|parity|planar   # lidar preset (default battery: raycast at 24 channels)
+./scripts/gpsr-stack up ... --lidar battery|parity|planar   # lidar preset (default battery: raycast pinned to 24 channels)
 ./scripts/gpsr-stack status                        # one-shot interface census
 ./scripts/gpsr-stack down                          # tears down the newest run dir
 ./scripts/gpsr-stack up ... --evidence              # arena observer camera on (contact sheets); costs RTF, off for batteries
@@ -225,9 +225,17 @@ Full GPSR stack (`--manipulation mock --sim-gpu 1`), GPU 1 shared by the sim
 and vision, loadavg 13-23 (shared host), RTF = `rtf_monitor` mean over four
 Nav2 goals. Run-to-run noise is about ±0.04.
 
+Preset mechanics: the raycast lidar is `run_sim`'s default (PR #29; unset scale
+is 44 channels), so `battery` and `parity` pass no lidar flag. `battery` pins
+`TINKER_SIM_LIDAR_CHANNELS` to 24 (a caller export wins). `parity` sets
+`TINKER_SIM_LIDAR_CHANNELS`/`_COLUMNS` explicitly to the contract values read
+from `simulation/sensors/hardware-parity.json` (exported shell values do not
+leak in; a missing contract file is an error). `planar` passes `--map-lidar`,
+the opt-out.
+
 | `--lidar` preset | RTF while driving |
 |---|---|
-| `planar` (no raycast) | 0.478 |
+| `planar` (`--map-lidar`, no raycast) | 0.478 |
 | `battery`, 24 ch (default) | 0.381 (one of 4 goals hit its 150 s timeout) |
 | `battery`, 16 ch (`TINKER_SIM_LIDAR_CHANNELS=16`) | 0.373 |
 | `battery`, 32 ch | 0.317 |
@@ -383,8 +391,12 @@ group.
 
 **Which map AMCL gets.** With `map_yaml` blank, `gpsr.launch.py` resolves the
 map from the scenario's `world.arena` (`artifacts/arena/<arena>/current.json`
-→ that artifact's `map.yaml`) — the same map the simulator raycasts its
-synthetic lidar against. Only a scenario with no arena falls back to the
+→ that artifact's `map.yaml`). Getting this right matters more since the
+lidar became a live PhysX sensor: it now scans the physics scene rather than
+the map, so a wrong map no longer hides inside a scan derived from that same
+map — it shows up as AMCL failing to converge. (Pass `--map-lidar` and the old
+map-raycast behaviour, and that circularity, come back.) Only a scenario with
+no arena falls back to the
 robot artifact's colocated `map.yaml`, which is the **hardware** arena
 (`0701_robocup_arena3`) and shares no occupied cell with `rcw2026`.
 `navigation.launch.py` has no scenario, so pass `arena:=rcw2026` (or an

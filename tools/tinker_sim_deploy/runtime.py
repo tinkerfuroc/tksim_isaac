@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from .robot_geometry import origin, wheel_floor_z
 from .workspace import (
     ARM_JOINTS,
     ARTIFACT_FILES,
@@ -315,7 +316,50 @@ def sim_robot_description(
     aim = _head_camera_aim()
     if aim.resolve_wrist_aim_correction(env.get(aim.WRIST_AIM_ENV)) == aim.CAM_STAND_CORRECTION_WXYZ:
         description = aim.cam_stand_robot_description(description)
+    description = with_base_footprint(description)
     return description
+
+
+def with_base_footprint(description: str) -> str:
+    """Add ``base_footprint``, a fixed child of ``base_link`` on the floor.
+
+    base_link is the xArm mount on the chassis, not the floor (0.0775 m up in
+    sim), and the 2-D EKF publishes odom -> base_link with z = 0, so map-frame
+    z is a height above the base_link plane. Localization and Nav2 keep
+    running on base_link; anything comparing heights with the floor (surface
+    heights, object z, barrier heights) looks up base_footprint instead of
+    carrying its own offset. The height comes from the wheels in the same
+    URDF: the lowest point of every ``*_wheel`` link's collision, which must
+    agree. A description without wheels is returned unchanged. One that
+    already has base_footprint -- the hardware xacro, which the sim's
+    tinker_full includes, places it at a fixed hardware value -- has that
+    joint moved to the derived height.
+    """
+    root = ET.fromstring(description)
+    floor = wheel_floor_z(root)
+    if floor is None:
+        return description
+    parent_joint = {joint.find("child").get("link"): joint for joint in root.findall("joint")}
+    existing = parent_joint.get("base_footprint")
+    if existing is not None:
+        xyz, _ = origin(existing)
+        if abs(xyz[2] - floor) < 1e-9:
+            return description
+        element = existing.find("origin")
+        if element is None:
+            element = ET.SubElement(existing, "origin")
+        element.set("xyz", f"{xyz[0]:.6g} {xyz[1]:.6g} {floor:.6g}")
+        return ET.tostring(root, encoding="unicode")
+    addition = (
+        '  <link name="base_footprint"/>\n'
+        '  <joint name="base_footprint_joint" type="fixed">\n'
+        '    <parent link="base_link"/>\n'
+        '    <child link="base_footprint"/>\n'
+        f'    <origin xyz="0 0 {floor:.6g}" rpy="0 0 0"/>\n'
+        "  </joint>\n"
+    )
+    end = description.rindex("</robot>")
+    return description[:end] + addition + description[end:]
 
 
 def _head_camera_aim():

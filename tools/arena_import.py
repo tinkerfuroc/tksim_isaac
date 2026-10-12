@@ -31,7 +31,7 @@ from tinker_sim_deploy.arena_artifact import (
     attribution_markdown,
     publish_asset_artifact,
 )
-from tinker_sim_deploy.arena_map import livox_scan_height, rasterize
+from tinker_sim_deploy.arena_map import livox_scan_band, rasterize
 from tinker_sim_deploy.arena_surfaces import PlacementSurface, placement_json, world_surface
 from tinker_sim_deploy.arena_world import (
     ArenaLayout,
@@ -425,8 +425,8 @@ def run_import(
         converter.compose_arena(arena_usd_path, layout, furniture_dir_name="furniture")
         payload["arena.usd"] = arena_usd_path.read_bytes()
 
-        scan_height = livox_scan_height(_read_robot_urdf(repo_root))
-        pgm_bytes, map_yaml_bytes = rasterize(layout, map_colliders, scan_height=scan_height)
+        scan_band = livox_scan_band(_read_robot_urdf(repo_root))
+        pgm_bytes, map_yaml_bytes = rasterize(layout, map_colliders, scan_band=scan_band)
         payload["map.pgm"] = pgm_bytes
         payload["map.yaml"] = map_yaml_bytes
 

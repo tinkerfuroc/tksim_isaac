@@ -219,16 +219,35 @@ SURVIVOR_POLL_TIMEOUT_S = 10.0
 SURVIVOR_POLL_INTERVAL_S = 1.0
 
 #: Lidar presets for the sim stage (docs/gpsr-sim-runbook.md, "Lidar presets").
-#: battery: live raycast lidar at BATTERY_LIDAR_CHANNELS x the contract's 349
-#:   columns -- Nav2 consumes azimuth resolution, vertical channels are the
-#:   RTF lever. parity: the contract's full pattern (~0.3 RTF on this host).
+#: The live raycast lidar is run_sim's DEFAULT (PR #29), so battery and parity
+#: pass no lidar flag; planar passes dev's opt-out `--map-lidar`.
+#: battery: raycast at BATTERY_LIDAR_CHANNELS x the contract's 349 columns --
+#:   Nav2 consumes azimuth resolution, vertical channels are the RTF lever.
+#:   parity: the contract's full pattern (read from hardware-parity.json and
+#:   set explicitly; ~0.3 RTF on this host).
 #:   planar: the occupancy-map lidar (no heights, no dynamic obstacles).
 LIDAR_PRESETS = ("battery", "parity", "planar")
+#: Battery's pinned channel count. NOTE run_sim's own default with the var
+#: UNSET is 44 channels (lidar_rig.DEFAULT_LIDAR_CHANNELS); this preset pins 24
+#: on purpose, so `gpsr-stack` without --lidar is NOT run_sim's default scale.
 #: Starting value. The 2026-10-11 matrix (docs/developer-log.md) measured
 #: 16/24/32 ch drive RTF at 0.373/0.381/0.317 (planar 0.478) on a loaded
 #: shared host; no cell reached 0.55. 24 was kept because 16 is not measurably
 #: faster (+-0.04 noise) and 32 is slower.
 BATTERY_LIDAR_CHANNELS = 24
+
+
+def _lidar_contract_scale() -> tuple[str, str]:
+    """(channels, columns) of the raycast lidar contract, as env strings."""
+    path = REPO_ROOT / "simulation" / "sensors" / "hardware-parity.json"
+    try:
+        ray = json.loads(path.read_text(encoding="utf-8"))["lidar"]["raycast"]
+        return str(int(ray["channels"])), str(int(ray["columns"]))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"cannot read the lidar contract scale from {path} "
+            f"(hardware-parity.json lidar.raycast.channels/columns): {exc!r}"
+        ) from exc
 
 
 @dataclasses.dataclass
@@ -320,14 +339,17 @@ def stage_commands(cfg: StackConfig) -> list[dict]:
     if cfg.lidar not in LIDAR_PRESETS:
         raise ValueError(f"unknown lidar preset {cfg.lidar!r}; expected one of {LIDAR_PRESETS}")
     sim_lidar_args: list[str] = []
-    if cfg.lidar != "planar":
-        # Passthrough to the sim app (tinker-sim launch strips the "--").
-        sim_lidar_args = ["--", "--raycast-lidar"]
+    if cfg.lidar == "planar":
+        # Opt out of run_sim's raycast default (PR #29). Passthrough to the sim
+        # app; tinker-sim launch strips the leading "--".
+        sim_lidar_args = ["--", "--map-lidar"]
     if cfg.lidar == "parity":
-        # Contract scale: blank the overrides so exported shell values cannot
-        # leak in (lidar_rig._resolve_axis treats blank as "use the contract").
-        sim_env["TINKER_SIM_LIDAR_CHANNELS"] = ""
-        sim_env["TINKER_SIM_LIDAR_COLUMNS"] = ""
+        # Contract scale, set explicitly from hardware-parity.json so exported
+        # shell values cannot leak in and a future run_sim default change
+        # cannot silently alter the preset.
+        sim_env["TINKER_SIM_LIDAR_CHANNELS"], sim_env["TINKER_SIM_LIDAR_COLUMNS"] = (
+            _lidar_contract_scale()
+        )
     if cfg.lidar == "battery":
         # A caller's explicit export wins, so A/Bs need no code change.
         sim_env["TINKER_SIM_LIDAR_CHANNELS"] = (
@@ -901,8 +923,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="enable the arena observer camera (contact-sheet evidence runs; costs RTF)")
     parser.add_argument(
         "--lidar", choices=LIDAR_PRESETS, default="battery",
-        help="lidar preset: battery (reduced raycast, default), parity (full "
-             "contract raycast, ~0.3 RTF), planar (occupancy-map lidar)")
+        help="lidar preset: battery (raycast pinned to 24 channels, default; "
+             "run_sim's own unset default is 44), parity (full contract "
+             "raycast set explicitly, ~0.3 RTF), planar (occupancy-map lidar "
+             "via --map-lidar)")
     return parser
 
 

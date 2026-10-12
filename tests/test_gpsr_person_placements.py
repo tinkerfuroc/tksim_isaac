@@ -55,9 +55,9 @@ OBSTACLES = {
 # Facts pinned from constants.rcw2026.json so this test runs even without the
 # decision checkout; test_spot_poses_match_the_decision_constants re-reads it.
 SPOT_POSES = {
-    "kitchen_table": ((3.294, -2.351), -135.0),
+    "kitchen_table": ((3.56, -2.14), -135.0),
     "sofa": ((-2.184, -3.837), -90.0),
-    "side_table_02": ((1.08, 1.755), 180.0),
+    "side_table_02": ((1.172, 1.755), 180.0),
     "laundry_desk": ((-2.988, 3.677), 90.0),
 }
 ROOM_SPOT = {"kitchen": "kitchen_table", "living_room": "sofa",

@@ -644,29 +644,54 @@ def _sim_stage(**kw):
     return [s for s in mod.stage_commands(_cfg(**kw)) if s["name"] == "sim"][0]
 
 
-def test_default_preset_is_battery_raycast_with_reduced_channels(monkeypatch):
+def _contract_scale():
+    import json
+    raw = json.loads((mod.REPO_ROOT / "simulation" / "sensors" / "hardware-parity.json").read_text())
+    ray = raw["lidar"]["raycast"]
+    return str(ray["channels"]), str(ray["columns"])
+
+
+def test_default_preset_is_battery_with_pinned_channels_not_devs_default(monkeypatch):
+    # dev's run_sim default (unset) is 44 ch; the battery preset pins 24.
     monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
     sim = _sim_stage()
-    assert sim["cmd"][-2:] == ["--", "--raycast-lidar"]
-    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == str(mod.BATTERY_LIDAR_CHANNELS)
+    assert "--raycast-lidar" not in sim["cmd"]
+    assert "--map-lidar" not in sim["cmd"]
+    assert sim["cmd"][-1] == "--headless"
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == "24"
     assert "TINKER_SIM_LIDAR_COLUMNS" not in sim["env"]
 
 
-def test_parity_preset_uses_contract_scale(monkeypatch):
+def test_parity_preset_sets_contract_scale_explicitly(monkeypatch):
     monkeypatch.delenv("TINKER_SIM_LIDAR_CHANNELS", raising=False)
+    monkeypatch.delenv("TINKER_SIM_LIDAR_COLUMNS", raising=False)
     sim = _sim_stage(lidar="parity")
-    assert sim["cmd"][-2:] == ["--", "--raycast-lidar"]
-    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == ""
-    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == ""
+    channels, columns = _contract_scale()
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == channels
+    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == columns
+    assert "--raycast-lidar" not in sim["cmd"]
+    assert "--map-lidar" not in sim["cmd"]
 
 
 def test_parity_preset_isolates_exported_scale_vars(monkeypatch):
     monkeypatch.setenv("TINKER_SIM_LIDAR_CHANNELS", "16")
     monkeypatch.setenv("TINKER_SIM_LIDAR_COLUMNS", "100")
     sim = _sim_stage(lidar="parity")
-    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == ""
-    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == ""
-    assert sim["cmd"][-2:] == ["--", "--raycast-lidar"]
+    channels, columns = _contract_scale()
+    assert sim["env"]["TINKER_SIM_LIDAR_CHANNELS"] == channels
+    assert sim["env"]["TINKER_SIM_LIDAR_COLUMNS"] == columns
+
+
+def test_parity_preset_errors_clearly_when_contract_missing(monkeypatch, tmp_path):
+    import pytest
+    monkeypatch.setattr(mod, "REPO_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="hardware-parity.json"):
+        mod.stage_commands(_cfg(lidar="parity"))
+
+
+def test_no_preset_passes_raycast_lidar_flag():
+    for preset in mod.LIDAR_PRESETS:
+        assert "--raycast-lidar" not in _sim_stage(lidar=preset)["cmd"]
 
 
 def test_battery_blank_channel_export_falls_back_to_default(monkeypatch):
@@ -680,9 +705,10 @@ def test_default_banner_shows_battery_channels(monkeypatch, capsys):
     assert "lidar preset: battery (channels=24)" in capsys.readouterr().out
 
 
-def test_planar_preset_has_no_raycast():
+def test_planar_preset_opts_out_with_map_lidar():
     sim = _sim_stage(lidar="planar")
     assert "--raycast-lidar" not in sim["cmd"]
+    assert sim["cmd"][-2:] == ["--", "--map-lidar"]
     assert "TINKER_SIM_LIDAR_CHANNELS" not in sim["env"]
 
 
