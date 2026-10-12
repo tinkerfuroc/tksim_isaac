@@ -219,32 +219,38 @@ class PhysicsBaseline:
         """Read new spawn baselines before STOP/PLAY binds their PhysX views."""
         import math
         import omni.usd
-        from pxr import Usd, UsdGeom, UsdPhysics
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
-        stage=omni.usd.get_context().get_stage()
+        stage = omni.usd.get_context().get_stage()
         if stage is None:
             raise ResetFailure("stage unavailable while registering spawned state")
-        cache=UsdGeom.XformCache(Usd.TimeCode.Default())
-        bodies={}
+        cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+        bodies = {}
         for prim in stage.Traverse():
-            path=str(prim.GetPath())
-            if path in self.bodies or path=="/World/Tinker" or path.startswith("/World/Tinker/"):
+            path = str(prim.GetPath())
+            if path in self.bodies or path == "/World/Tinker" or path.startswith("/World/Tinker/"):
                 continue
             if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
                 raise ResetFailure(f"initial state of additional articulation is unsupported: {path}")
             if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
                 continue
-            transform=cache.GetLocalToWorldTransform(prim)
-            position=transform.ExtractTranslation()
-            quaternion=transform.ExtractRotationQuat().GetNormalized()
-            pose=tuple(float(v) for v in position)+tuple(float(v) for v in quaternion.GetImaginary())+(float(quaternion.GetReal()),)
-            rigid=UsdPhysics.RigidBodyAPI(prim)
-            velocity=None
+            # Gf.Transform factors out scale/shear; ExtractRotationQuat on a
+            # scaled matrix returns a wrong rotation.
+            transform = Gf.Transform(cache.GetLocalToWorldTransform(prim))
+            position = transform.GetTranslation()
+            quaternion = transform.GetRotation().GetQuat().GetNormalized()
+            pose = (
+                tuple(float(v) for v in position)
+                + tuple(float(v) for v in quaternion.GetImaginary())
+                + (float(quaternion.GetReal()),)
+            )
+            rigid = UsdPhysics.RigidBodyAPI(prim)
+            velocity = None
             if not rigid.GetKinematicEnabledAttr().Get():
-                linear=rigid.GetVelocityAttr().Get() or (0.,0.,0.)
-                angular=rigid.GetAngularVelocityAttr().Get() or (0.,0.,0.)
-                velocity=tuple(float(v) for v in linear)+tuple(math.radians(float(v)) for v in angular)
-            bodies[path]=(pose,velocity)
+                linear = rigid.GetVelocityAttr().Get() or (0.0, 0.0, 0.0)
+                angular = rigid.GetAngularVelocityAttr().Get() or (0.0, 0.0, 0.0)
+                velocity = tuple(float(v) for v in linear) + tuple(math.radians(float(v)) for v in angular)
+            bodies[path] = (pose, velocity)
         return bodies
 
     def register_spawn(self):
