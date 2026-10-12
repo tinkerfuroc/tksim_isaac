@@ -241,6 +241,10 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
       - Still to do:
         - Consumers that need floor height (Bug B object z, placement surfaces, truth evaluator, barrier heights) should look up `base_footprint` in the map frame instead of using a constant. None of them has been changed yet.
         - Hardware needs the same joint in tk25_basic `tinker_urdf`, with the real `base_link` height measured.
+      - Follow-up (user: "derived for sim, 30 cm for the real robot"):
+        - tinker-sim `8d49e0a`: `with_base_footprint` moves an existing `base_footprint` joint to the wheel-derived height, so the sim stays at −0.0775 even when the hardware xacro carries its own link.
+        - tk25_basic `597bcd7` on new branch `feat/base-footprint`, not pushed: `tracer_mini_manipulator.urdf.xacro` gains `base_footprint` at xacro arg `base_footprint_z`, default −0.30, a placeholder until the real height is measured.
+        - Whoever next re-renders the sim artifact will pull this massless link into `robot.usd`. The TF stays correct because of `8d49e0a`.
     - **Related latent bug (lidar slice height):** `arena_map.livox_scan_height()` slices the static map at the livox joint's 0.195 m, but the real scan plane is 0.195 + 0.0775 = 0.2725 m above the floor.
       - No collider in the rcw2026 `arena.usd` (60 prims checked) changes coverage between those heights, so the current map is unaffected.
       - The correct form is joint z + rest height, or better, the union of footprints over [sensor z, sensor z + 2.0] to match pointcloud_to_laserscan.
