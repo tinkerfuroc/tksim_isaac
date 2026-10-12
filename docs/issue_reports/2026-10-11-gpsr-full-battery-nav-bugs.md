@@ -16,7 +16,7 @@ Timestamps below are epoch seconds minus 1791640000.
 
 ## Bug A: RPP "collision ahead" loops at stand poses next to furniture
 
-**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-pos-time-fix) for the fixed furniture nav poses and the sim-time goto budget. Both decision items are implemented in tk25_decision `e4e8b5f` (dev-gpsr-2), pending live verification.
+**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-pos-time-fix) for the fixed furniture nav poses and the sim-time goto budget. Both decision items are implemented in tk25_decision `e4e8b5f` (dev-gpsr-2) and were **verified live on 2026-10-11** by gpsr-pos-time-fix (`bench/t2-navpose-20261011/RESULTS.md`). Furniture poses: 8/8 BT gotos SUCCESS with 0 collision-ahead, 0 patience aborts and 0 goto timeouts over 4 arrivals and 4 returns. Sim-time budget: a 20 s budget cancelled at 20.0 s of Nav2 time = 61.2 wall-s (RTF about 0.33), where the old code would have fired at 20 wall-s. No leg went past 120 wall-s at the default budget (longest 119 s).
 
 ### Symptom
 
