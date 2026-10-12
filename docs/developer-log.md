@@ -4,6 +4,79 @@ Dated engineering notes: what was measured, what was ruled out, why a fix
 took the shape it did. Operational instructions live in
 `docs/gpsr-sim-runbook.md`; this file is the history behind them.
 
+## 2026-10-11 — RTF budget: lidar presets, the 5 Hz half-sweep bug, measured matrix
+
+Goal was RTF >= 0.5 for the full GPSR stack with the raycast lidar. Outcome:
+**not reached on this host**; the user chose to finish as-is with the fixes
+and measured numbers below. Spec:
+`docs/superpowers/specs/2026-10-11-gpsr-sim-rtf-budget-design.md`.
+
+**Starting point.** The stack ran at RTF 0.28 (domain 211, run
+`20261011T081535`; 0.273 / 0.281 / 0.276 over three 5 s windows). Causes, by
+size: the full 57 ch x 349 col raycast lidar (19,893 rays at 120/60 Hz) had
+become the gpsr-stack default, and the host was contended (vision on the
+sim's GPU, loadavg ~22/32). The runbook's ~0.68 is the planar figure.
+
+**Half-sweep bug.** The physics-step callback is never dispatched in the
+production loop, so the only driver was the gateway poll, once per control
+step; at 120/60 (2 substeps per control step) every other slice was cast but
+never read. Live evidence: frame period 0.200 s sim time (5 Hz, not 10) and
+15-degree histogram bins alternating between 0 and populated frame to frame.
+Fix: a post-substep hook so the frame accumulator folds every physics
+substep. Live result (domain 227, 10 frames): period 0.100 s, all frames
+identical, `substep_folds` 12 per frame, `poll_folds` 0; bins 7-16 are always
+0 (robot body).
+
+**Lidar Python profile** (`TINKER_SIM_PROFILE=1`, battery 24 ch, while
+driving, medians): `get_data` 0.087, `self_mask` 0.221, `fold` 0.052 s per
+sim-second (~0.36 total); physics ~140 ms per cycle. The self-filter
+(`self_mask`) is the dominant Python term. Open option, not taken: a
+geometric self-filter. `get_data` was then trimmed to read only
+positions/paths (4e62218).
+
+**Isaac Lab gotcha.** `isaaclab_physx` rebinds
+`isaacsim.core.simulation_manager.SimulationManager` to `PhysxManager` at
+import. A lazy import of that name from our code gets the wrong class
+(`get_num_physics_steps` missing, every lidar read failed, no `/scan`, AMCL
+never localised). Read Isaac's step counter through the sensor module's own
+binding (`sys.modules[type(sensor).__module__]`), which is the counter
+`get_data()` itself used (4491b6f). The `gpsr-stack` gates still reported
+"stack up" with a dead lidar.
+
+**Base spawn bug.** The base branch's `scoped_reset.register_spawn()` built a
+PhysX rigid-body view while the timeline was stopped; the first spawned rigid
+body failed with "Simulation view object is invalidated ... getTransforms"
+and the scenario runner exited about 40 s in (any lidar preset, including
+planar). The fix existed uncommitted in the shared checkout; ec72eac ports it
+(spawn baselines read from USD, plus a `_park_views` /
+`_contact_trace_pairs_by_key` clear on rebind).
+
+**Measured matrix** (full stack, `--manipulation mock --sim-gpu 1`, GPU 1
+shared by sim and vision, loadavg 13-23, four Nav2 goals, HEAD 4491b6f):
+
+| preset | RTF mean | min_30s | get_data | self_mask | fold (s/sim-s) | physics ms/cycle |
+|---|---|---|---|---|---|---|
+| planar | 0.478 | 0.471 | n/a | n/a | n/a | 66.2 |
+| battery 16 ch | 0.373 | 0.366 | 0.059 | 0.164 | 0.040 | 115.8 |
+| battery 24 ch (default) | 0.381 | 0.340 | 0.075 | 0.204 | 0.052 | 111.0 |
+| battery 32 ch | 0.317 | 0.312 | 0.092 | 0.258 | 0.066 | 150.2 |
+| parity | 0.255 | 0.235 | 0.153 | 0.419 | 0.110 | 211.8 |
+| battery 24 + `TINKER_SIM_CPU_THREADS=16` | 0.342 | 0.336 | 0.078 | 0.217 | 0.053 | 131.9 |
+
+Run-to-run noise is about ±0.04. The 24 ch cell had one goal hit its 150 s
+timeout. 16 ch is not measurably faster than 24 (within noise), so
+`BATTERY_LIDAR_CHANNELS` stays 24; `TINKER_SIM_CPU_THREADS=16` gave no gain
+and is not a default. Even planar, with no raycast at all, measured 0.478 on
+this host, so G1 is not reachable by ray count here. Not pursued: the
+geometric self-filter, and `planar` as the default. A vision-on-another-GPU
+probe was skipped (GPU 0 belonged to another session). No bench battery was
+run, so RTF over a full battery is unmeasured.
+
+**Fidelity** (battery 24 ch, domain 227). Dynamic obstacle: a box placed in
+the lidar's view went from 319 to 499 box counts (6/6 trials) and back to 319 as it
+was added and removed (PASS). Doorway: `command_point` -> `laundry_desk`
+SUCCEEDED in 61 s with 0 "collision ahead"; drive RTF 0.345 / 0.341.
+
 ## 2026-09-10 — live Nav2 battery: the lidar chain works end to end, and it sees a person
 
 Run live: navigation-parity, arena `rcw2026`, headless, `--ros`, `--raycast-lidar`,

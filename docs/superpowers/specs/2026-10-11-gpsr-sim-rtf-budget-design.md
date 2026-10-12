@@ -1,6 +1,6 @@
 # GPSR sim RTF budget: ≥ 0.5 with the 3D raycast lidar (design)
 
-Date: 2026-10-11. Status: approved in conversation; awaiting written-spec review.
+Date: 2026-10-11. Status: implemented 2026-10-11; G1 (RTF ≥ 0.5) not met on this host — see docs/developer-log.md 2026-10-11; user chose to finish as-is.
 
 ## 1. Problem
 
