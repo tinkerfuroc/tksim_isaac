@@ -62,29 +62,33 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # (0.014-0.072 rad per joint; base tracking in the same family) park the
     # robot ~0.13 m from the goal, so goals never complete — follow_path
     # aborts and the goto retries forever. Relax on the sim copy only; the
-    # upstream file stays hardware's.
+    # upstream file stays hardware's. 0.2 m / 0.25 rad (was 0.3 / 0.4): every
+    # 2026-10-10/11 GPSR battery and Bug A check ran with these values; at
+    # 0.3 the robot parks 0.3 m short and the side_table_02 departure pivot
+    # still throws collision-ahead + a patience abort (2026-10-12 re-check).
     controller = (
         result.get("controller_server", {})
         .get("ros__parameters", {})
         .get("general_goal_checker")
     )
     if isinstance(controller, dict):
-        controller["xy_goal_tolerance"] = 0.3
-        controller["yaw_goal_tolerance"] = 0.4
+        controller["xy_goal_tolerance"] = 0.2
+        controller["yaw_goal_tolerance"] = 0.25
 
-    # Planner tolerance: with the relaxed 0.3 m goal tolerance the robot
-    # parks close to furniture, sometimes inside the inflation ring. At the
-    # upstream GridBased tolerance of 0.1 the global planner then refuses
-    # every subsequent goal ("failed to generate a valid path", observed 152x
-    # on a return-to-start leg) and the run burns its whole budget retrying.
-    # 0.6 lets the planner accept a nearby reachable cell instead.
+    # Planner tolerance: with a relaxed goal tolerance the robot parks close
+    # to furniture, sometimes inside the inflation ring. At the upstream
+    # GridBased tolerance of 0.1 the global planner then refuses every
+    # subsequent goal ("failed to generate a valid path", observed 152x on a
+    # return-to-start leg) and the run burns its whole budget retrying.
+    # 0.35 stays above the 0.2 m goal tolerance without the 0.6 m slop that
+    # let the robot park half a metre from the intended pose.
     planner = (
         result.get("planner_server", {})
         .get("ros__parameters", {})
         .get("GridBased")
     )
     if isinstance(planner, dict):
-        planner["tolerance"] = 0.6
+        planner["tolerance"] = 0.35
 
     # AMCL odometry noise: the upstream alphas (0.2-0.3) model the real
     # tracer's wheel odometry. The sim base's odometry tracks Isaac ground
@@ -225,15 +229,15 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
             "lookahead_dist": 0.5,
             # Humble RPP's shouldRotateToGoalHeading compares the CARROT
             # distance — not the true goal distance — against the goal
-            # checker's xy tolerance (0.3 here). At standstill the
+            # checker's xy tolerance (0.2 here). At standstill the
             # velocity-scaled lookahead clamps to min_lookahead_dist, so
-            # a min below 0.3 makes RPP believe it is AT the goal from
+            # a min below 0.2 makes RPP believe it is AT the goal from
             # the very first tick: linear stays 0.0 and it rotates to
             # the goal heading in place until the progress checker
-            # aborts (measured: carrot pinned at 0.25 m, v never above
-            # 0.000 for 900 s). Keep min_lookahead_dist strictly above
+            # aborts (measured at xy 0.3: carrot pinned at 0.25 m, v never
+            # above 0.000 for 900 s). Keep min_lookahead_dist strictly above
             # the xy goal tolerance.
-            "min_lookahead_dist": 0.35,
+            "min_lookahead_dist": 0.25,
             "max_lookahead_dist": 0.7,
             "use_velocity_scaled_lookahead_dist": True,
             "lookahead_time": 1.5,
