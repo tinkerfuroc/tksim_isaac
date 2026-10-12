@@ -101,7 +101,25 @@ This section supersedes parts of the root cause above. It comes from a live repr
   - The live test was inconclusive because `set_parameters` on the local_costmap footprint timed out.
   - Not done: this needs the tinker2_sim profile in tk25_basic (`feat/tinker2-sim-profile`), and merging that is the user's call.
 - **Approach planner footprint: withdrawn, not a problem.** The startup line `[(0.25,±0.25),(−0.3,±0.25)]` is only the YAML fallback, which is the hardware footprint. With `use_published_footprint: true`, the planner switches to `/global_costmap/published_footprint` about 2.4 s after startup and logs `adopted live footprint ... [(0.21, ±0.28), (−0.46, ±0.28)]`. That is tinker2_sim plus about 1 cm of costmap padding, adopted long before the first goal in both the d217 battery and the d219 run (verified in `05-nav_extras-0.log` and `04-nav_extras-0.log`).
-- **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the working tree carries an uncommitted 0.2 from another session, and stacks run with 0.2. `d30439d` doesn't depend on either value.
+- **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the shared working tree carries an uncommitted hunk in `nav_params_overlay.py`. Because the bridge is a develop install, every shared-tree stack runs that hunk.
+  - What it changes: xy 0.2, yaw 0.25, GridBased tolerance 0.35, AMCL `max_particles` 3000, `recovery_alpha_fast` 0.1, `recovery_alpha_slow` 0.001.
+  - Origin: an orphaned 2026-09-11 stash ("nav-tuning-v2"), applied and never committed. No session owns it.
+  - Every shared-tree live result on 2026-10-10/11 ran with it.
+- **Clean AMCL re-check (debug-gpsr-nav-issue, 2026-10-12):** run from an origin/dev `9eb4b8f` worktree with the fixed 10 Hz 24-channel scan and committed values. Pose error vs truth, 4 stops × 5 headings, mean / median / max:
+
+  | Setting | Error (m) |
+  |---|---|
+  | committed, `update_min_a` 3.0 | 0.055–0.076 / 0.044–0.060 / 0.080–0.252 |
+  | `update_min_a` 1.0 | 0.060 / 0.054 / 0.132 |
+  | `update_min_a` 0.1 | 0.042–0.049 / 0.038–0.039 / 0.079–0.104 |
+  | upstream alphas at 0.1 | 0.075 / 0.073 / 0.145 |
+  | stale hunk's AMCL and tolerance values | 0.061 / 0.065 / 0.094 |
+
+  - Alphas 0.05 (`37931d5`) hold.
+  - `update_min_a` 3.0 still prevents the side_table_02 pivot loop at xy 0.3 (158–165° of rotation). At 0.1 the loop returns: 381°, with the goal distance flip-flopping 0.28–0.31 m across the boundary.
+  - The cost of 3.0 is about 1–3 cm of stop accuracy, because AMCL can't refine during goal pivots. Getting both would need hysteresis on RPP's xy-tolerance pivot decision, which is a controller design call.
+  - The stale hunk's AMCL values show no measurable benefit.
+  - Still seen: the side_table_02 → home departure from a pose parked 0.3 m from the goal gave 28–30 collision-ahead warnings and 1 patience abort per run.
 
 ### Live check of the approach-planner fix (2026-10-11, tk26_navigation PR #11, merged as `f82e397` and installed in `~/tk25_ws/install`)
 
