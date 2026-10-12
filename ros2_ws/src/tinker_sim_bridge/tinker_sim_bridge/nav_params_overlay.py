@@ -155,14 +155,19 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # 90-degree turn INTO a 0.95 m doorway has no collision-free DWB
     # trajectory (validated: robot stalled at the north door mouth at
     # (-0.5, 3.66) with 32 progress-failures after the ObstacleFootprint
-    # fix), while the actual sim body passes easily. Overlay a sim-true
-    # envelope with margin (0.65 x 0.54): rear -0.45, front +0.20, half-
-    # width 0.27 (covers wheels). Upstream file stays hardware's.
+    # fix), while the actual sim body passes easily. Overlay the sim body
+    # plus 3 cm (0.57 x 0.47): rear -0.41, front +0.16, half-width 0.235
+    # (wheels sit inside |y| 0.157); circumscribed radius 0.473 m.
+    # Upstream file stays hardware's. (The first sim envelope carried 7 cm,
+    # radius 0.525: next to furniture it blocked in-place pivots the body
+    # clears -- at the side_table_02 departure pose 22 of 72 headings hit
+    # lethal and RPP's 1 s pivot projection deadlocked until a patience
+    # abort, 2026-10-11. With 3 cm: 10 of 72, and that pivot clears.)
     # NOTE: navigation_dwb_launch.py then overwrites every footprint key from
     # the robot profile (RobotField('base.footprint')), so the value that
     # actually reaches the costmaps is tinker_robot_config's tinker2_sim
     # profile -- keep the two equal (tests/test_sim_robot_profile.py).
-    sim_footprint = "[ [0.20, 0.27], [0.20, -0.27], [-0.45, -0.27], [-0.45, 0.27] ]"
+    sim_footprint = "[ [0.16, 0.235], [0.16, -0.235], [-0.41, -0.235], [-0.41, 0.235] ]"
     for costmap in ("local_costmap", "global_costmap"):
         node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
         if "footprint" in node:

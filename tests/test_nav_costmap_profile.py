@@ -274,8 +274,19 @@ class UpstreamParamsTest(unittest.TestCase):
         result = prior_map_costmap_overlay(self.params)
         for costmap in ("local_costmap", "global_costmap"):
             fp = result[costmap][costmap]["ros__parameters"]["footprint"]
-            self.assertIn("-0.45", fp)
             self.assertNotIn("-0.7", fp)
+
+    def test_footprint_is_the_sim_body_plus_three_centimetres(self):
+        # Body x [-0.38, +0.13], y [-0.205, +0.205] plus 3 cm: circumscribed
+        # radius 0.473 m (was 0.525 with 7 cm). Next to furniture the larger
+        # margin blocked in-place pivots the body clears: at the
+        # side_table_02 departure pose (1.06, 1.75), 22 of 72 headings hit
+        # lethal and RPP's 1 s pivot projection deadlocked until a patience
+        # abort; with this footprint 10 of 72, and that pivot clears.
+        result = prior_map_costmap_overlay(self.params)
+        for costmap in ("local_costmap", "global_costmap"):
+            fp = yaml.safe_load(result[costmap][costmap]["ros__parameters"]["footprint"])
+            self.assertEqual(fp, [[0.16, 0.235], [0.16, -0.235], [-0.41, -0.235], [-0.41, 0.235]])
 
 if __name__ == "__main__":
     unittest.main()
