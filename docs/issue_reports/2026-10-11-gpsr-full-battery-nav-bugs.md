@@ -105,6 +105,7 @@ This section supersedes parts of the root cause above. It comes from a live repr
   - What it changes: xy 0.2, yaw 0.25, GridBased tolerance 0.35, AMCL `max_particles` 3000, `recovery_alpha_fast` 0.1, `recovery_alpha_slow` 0.001.
   - Origin: an orphaned 2026-09-11 stash ("nav-tuning-v2"), applied and never committed. No session owns it.
   - Every shared-tree live result on 2026-10-10/11 ran with it.
+  - **Resolved 2026-10-12 (`e78863d`, user approved):** the tolerances were committed as they ran (xy 0.2, yaw 0.25, GridBased 0.35, RPP `min_lookahead_dist` 0.25). The AMCL `max_particles` and recovery alphas were dropped.
 - **Clean AMCL re-check (debug-gpsr-nav-issue, 2026-10-12):** run from an origin/dev `9eb4b8f` worktree with the fixed 10 Hz 24-channel scan and committed values. Pose error vs truth, 4 stops × 5 headings, mean / median / max:
 
   | Setting | Error (m) |
