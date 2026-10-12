@@ -329,13 +329,13 @@ def with_base_footprint(description: str) -> str:
     heights, object z, barrier heights) looks up base_footprint instead of
     carrying its own offset. The height comes from the wheels in the same
     URDF: the lowest point of every ``*_wheel`` link's collision, which must
-    agree. A description without wheels, or that already has
-    base_footprint, is returned unchanged.
+    agree. A description without wheels is returned unchanged. One that
+    already has base_footprint -- the hardware xacro, which the sim's
+    tinker_full includes, places it at a fixed hardware value -- has that
+    joint moved to the derived height.
     """
     root = ET.fromstring(description)
     # Top-level elements only: <ros2_control> nests its own <joint> tags.
-    if any(link.get("name") == "base_footprint" for link in root.findall("link")):
-        return description
     parent_joint = {joint.find("child").get("link"): joint for joint in root.findall("joint")}
     bottoms: dict[str, float] = {}
     for link in root.findall("link"):
@@ -363,6 +363,16 @@ def with_base_footprint(description: str) -> str:
     if max(bottoms.values()) - min(bottoms.values()) > 0.001:
         raise ValueError(f"wheel bottoms disagree on the floor height: {bottoms}")
     floor = min(bottoms.values())
+    existing = parent_joint.get("base_footprint")
+    if existing is not None:
+        xyz, _ = _origin(existing)
+        if abs(xyz[2] - floor) < 1e-9:
+            return description
+        origin = existing.find("origin")
+        if origin is None:
+            origin = ET.SubElement(existing, "origin")
+        origin.set("xyz", f"{xyz[0]:.6g} {xyz[1]:.6g} {floor:.6g}")
+        return ET.tostring(root, encoding="unicode")
     addition = (
         '  <link name="base_footprint"/>\n'
         '  <joint name="base_footprint_joint" type="fixed">\n'

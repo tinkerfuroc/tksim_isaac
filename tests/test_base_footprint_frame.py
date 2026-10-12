@@ -65,9 +65,20 @@ class WithBaseFootprintTest(unittest.TestCase):
         plain = '<robot name="x"><link name="base_link"/></robot>'
         self.assertEqual(with_base_footprint(plain), plain)
 
-    def test_an_existing_base_footprint_is_left_alone(self):
+    def test_an_existing_base_footprint_is_left_alone_when_already_derived(self):
         once = with_base_footprint(WHEELED)
         self.assertEqual(with_base_footprint(once), once)
+
+    def test_sim_moves_a_hardware_base_footprint_to_the_derived_height(self):
+        # The hardware xacro (shared with the sim's tinker_full) carries
+        # base_footprint at a placeholder -0.30; in sim the wheels decide.
+        hardware = WHEELED.replace("</robot>", (
+            '  <link name="base_footprint"/>\n'
+            '  <joint name="base_footprint_joint" type="fixed"><parent link="base_link"/>'
+            '<child link="base_footprint"/><origin xyz="0 0 -0.30" rpy="0 0 0"/></joint>\n'
+            "</robot>"))
+        joint = _footprint_joint(with_base_footprint(hardware))
+        self.assertAlmostEqual(float(joint.find("origin").get("xyz").split()[2]), -0.0775, places=6)
 
 
 class SimDescriptionsCarryTheFootprintTest(unittest.TestCase):
