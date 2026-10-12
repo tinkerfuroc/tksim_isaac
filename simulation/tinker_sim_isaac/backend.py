@@ -3297,8 +3297,10 @@ class IsaacWholeRobotBackend:
             )
         self._pending_snapshot_index = packet_index
 
-    def _slew_wheel_targets(self) -> None:
-        """Vectorised replacement for the former per-wheel scalar slew loop.
+    def _slew_wheel_targets(self):
+        """Return the velocity targets to write this step, wheels slewed.
+
+        Vectorised replacement for the former per-wheel scalar slew loop.
 
         Applies ``applied_next = applied + clip(target - applied, -max_delta,
         +max_delta)`` to every wheel joint in one torch expression instead of
@@ -3306,10 +3308,15 @@ class IsaacWholeRobotBackend:
         scalar back (the old loop paid that tensor<->float round trip four
         times per step). This is exactly `slew_velocity_target` per wheel --
         see tests/test_wheel_slew_vectorisation.py.
+
+        ``_velocity_targets`` stays the commanded value. The slewed wheels go
+        into a copy: writing them back made the next step slew toward its own
+        output, so a wheel advanced one slew step per received *packet* and a
+        zero /cmd_vel braked only as fast as keepalives arrived.
         """
         wheel_index = self._wheel_index_tensor
         if wheel_index.numel() == 0:
-            return
+            return self._velocity_targets
         max_delta = WHEEL_VELOCITY_SLEW_RAD_S2 * self.dt
         commanded = self._velocity_targets[0, wheel_index]
         if not bool(self._torch.isfinite(commanded).all()):
@@ -3320,9 +3327,11 @@ class IsaacWholeRobotBackend:
             device=commanded.device,
         )
         updated = applied + self._torch.clamp(commanded - applied, -max_delta, max_delta)
-        self._velocity_targets[0, wheel_index] = updated
+        output = self._velocity_targets.clone()
+        output[0, wheel_index] = updated
         for index, value in zip(self._wheel_indices, updated.tolist()):
             self._applied_wheel_velocities[index] = value
+        return output
 
     def _apply_spawn_yaw_via_view(self, spawn_yaw: float) -> None:
         """Write TINKER_SIM_SPAWN_YAW's heading through the root physics view.
@@ -3965,6 +3974,7 @@ class IsaacWholeRobotBackend:
                 self._robot.update(self.dt)
                 self._maybe_log_first_step_trace()
             return
+        velocity_targets = self._velocity_targets
         if self._safety_stopped:
             if self._safety_snapshot is None:
                 self._safety_snapshot = self._robot.data.joint_pos.clone()
@@ -4008,7 +4018,7 @@ class IsaacWholeRobotBackend:
                 except Exception:
                     pass
         else:
-            self._slew_wheel_targets()
+            velocity_targets = self._slew_wheel_targets()
             self._ramp_drive_target()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
@@ -4020,7 +4030,7 @@ class IsaacWholeRobotBackend:
         # actuators with no external wrenches, so skipping an unchanged write
         # is semantically identical -- and it was 6.8 ms of a 12.2 ms step.
         _write_targets = self._target_write_gate.should_write(
-            (self._position_targets, self._velocity_targets, self._effort_targets)
+            (self._position_targets, velocity_targets, self._effort_targets)
         )
         effort_writer = getattr(self._robot, "set_joint_effort_target", None)
         if effort_writer is None and self._safety_stopped:
@@ -4031,7 +4041,7 @@ class IsaacWholeRobotBackend:
             if self.step_profile["enabled"]:
                 self._profile_changed_targets()
             self._robot.set_joint_position_target(self._position_targets)
-            self._robot.set_joint_velocity_target(self._velocity_targets)
+            self._robot.set_joint_velocity_target(velocity_targets)
         _sp = self.step_profile
         _t = _sp["_clock"] if _sp["enabled"] else None
         if _t is not None:
@@ -4054,7 +4064,7 @@ class IsaacWholeRobotBackend:
             self._target_write_gate.note_written(
                 (
                     self._position_targets.clone(),
-                    self._velocity_targets.clone(),
+                    velocity_targets.clone(),
                     self._effort_targets.clone(),
                 )
             )
