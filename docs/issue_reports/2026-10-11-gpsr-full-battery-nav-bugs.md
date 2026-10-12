@@ -129,7 +129,13 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
     - tinker-sim `5329467`; tk25_basic `f381bc5` on `feat/tinker2-sim-profile`, not pushed. `tinker_robot_config` is rebuilt in `~/tk25_ws/install`, so new stacks get it.
     - The approach planner adopts the live footprint, so it follows automatically.
     - `costmap_check.py` now checks `SIM` (new) and `SIM_OLD` (the numbers in this report). Static: departure pose (1.06, 1.75) 22 → 10/72 lethal; PR #11 stand pose (1.08, 1.73) 18 → 0/72; kitchen_table nav pose (3.56, −2.14) 0/72.
-    - Live check pending.
+    - **Live check (debug-gpsr-nav-issue, 2026-10-11 22:26, plain NavigateToPose, RTF ~0.3):** the PR #11 departure deadlock did not reproduce.
+      - Like-for-like, robot placed at the PR #11 departure pose (AMCL (1.08, 1.73), facing ~175°): stand → kitchen nav pose had 0 warnings and 0 patience aborts in both of 2 runs, against 85 warnings and 1 patience abort in PR #11.
+      - Seven legs near side_table_02 had 0 patience aborts in total.
+      - The only warnings were 29 on one departure from a pose 0.2 m closer to the table, (1.10, 1.94). That departure still completed without a costmap clear.
+      - home → side_table_02 nav pose: 0 warnings, against 34 in PR #11.
+      - Small N.
+      - Logs: `/tmp/claude-1002/bugA/stack-d211/20261011T222630`.
 - **Remaining issue 2:** with the chairs, every kitchen_table stand pose sits at the 1.0 m stand-off maximum (1.10–1.19 m from the target, vs about 0.95 m before the PR). Manipulation should check whether that is within grasp reach.
 - **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN. Reworded in PR #11 `054d8a7` to "chosen pose (x, y) has only 0.05 m footprint clearance (preferred 0.15 m): …"; grep for "has only" in future logs.
 
