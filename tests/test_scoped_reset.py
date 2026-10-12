@@ -24,6 +24,18 @@ class Timeline:
         self.playing = True
 
 
+def test_spawn_registration_does_not_read_stopped_physics_or_replace_old_baseline():
+    baseline=object.__new__(PhysicsBaseline)
+    baseline.bodies={'/World/old':('original',None)}
+    def invalid_physics():
+        raise RuntimeError('Simulation view is invalidated while stopped')
+    baseline._read_bodies=invalid_physics
+    baseline._read_spawn_bodies=lambda:{'/World/old':('moved',None),
+                                        '/World/new':('authored',None)}
+    baseline.register_spawn()
+    assert baseline.bodies=={'/World/old':('original',None),'/World/new':('authored',None)}
+
+
 class Transport:
     def __init__(self, events):
         self.events = events
