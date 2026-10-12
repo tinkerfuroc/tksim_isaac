@@ -16,7 +16,7 @@ Timestamps below are epoch seconds minus 1791640000.
 
 ## Bug A: RPP "collision ahead" loops at stand poses next to furniture
 
-**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-pos-time-fix) for the fixed furniture nav poses and the sim-time goto budget. Both decision items are implemented in tk25_decision `e4e8b5f` (dev-gpsr-2) and were **verified live on 2026-10-11** by gpsr-pos-time-fix (`bench/t2-navpose-20261011/RESULTS.md`). Furniture poses: 8/8 BT gotos SUCCESS with 0 collision-ahead, 0 patience aborts and 0 goto timeouts over 4 arrivals and 4 returns. Sim-time budget: a 20 s budget cancelled at 20.0 s of Nav2 time = 61.2 wall-s (RTF about 0.33), where the old code would have fired at 20 wall-s. No leg went past 120 wall-s at the default budget (longest 119 s).
+**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-pos-time-fix) for the fixed furniture nav poses and the sim-time goto budget. Both decision items are implemented in tk25_decision `e4e8b5f` (dev-gpsr-2) and were **verified live on 2026-10-11** by gpsr-pos-time-fix (`bench/t2-navpose-20261011/RESULTS.md`), and merged to main as tk25_decision PR #16 (`7cddbf8`). Furniture poses: 8/8 BT gotos SUCCESS with 0 collision-ahead, 0 patience aborts and 0 goto timeouts over 4 arrivals and 4 returns. Sim-time budget: a 20 s budget cancelled at 20.0 s of Nav2 time = 61.2 wall-s (RTF about 0.33), where the old code would have fired at 20 wall-s. No leg went past 120 wall-s at the default budget (longest 119 s).
 
 ### Symptom
 
@@ -137,6 +137,7 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
       - Small N.
       - Logs: `/tmp/claude-1002/bugA/stack-d211/20261011T222630`.
 - **Remaining issue 2:** with the chairs, every kitchen_table stand pose sits at the 1.0 m stand-off maximum (1.10–1.19 m from the target, vs about 0.95 m before the PR). Manipulation should check whether that is within grasp reach.
+  - **Follow-up:** this is tracked as tk25_decision issue #17. The arm base is at x −0.03 from base_link, with about 0.62–0.70 m of reach. The decision asks for 0.75 m but passes no `max_distance`, so the planner returns its 1.0 m maximum, and RPP then parks 0.18–0.19 m short of that. A live-manip check has not been run yet.
 - **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN. Reworded in PR #11 `054d8a7` to "chosen pose (x, y) has only 0.05 m footprint clearance (preferred 0.15 m): …"; grep for "has only" in future logs.
 
 ### Related: wheels kept driving after `/cmd_vel` went to zero (sim base drive, open)
