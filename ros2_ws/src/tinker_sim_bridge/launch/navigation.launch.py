@@ -134,10 +134,11 @@ def _resolve(context):
             arguments=[
                 # Must match where the sim's raycast lidar prim actually
                 # sits: the URDF's livox_joint, base_link -> livox_frame at
-                # (0.09, 0, 0.195). It also has to match the height the AMCL
-                # map is rasterized at -- tools/tinker_sim_deploy/arena_map.py
-                # slices the arena colliders at livox_scan_height(), read from
-                # that same joint. The previous (0.12, 0, 0.25) predated any
+                # (0.09, 0, 0.195). The AMCL map is rasterized from that same
+                # joint too -- tools/tinker_sim_deploy/arena_map.py projects the
+                # arena colliders over livox_scan_band(): the joint height plus
+                # base_link's rest height, up 2 m, as pointcloud_to_laserscan
+                # keeps. The previous (0.12, 0, 0.25) predated any
                 # real sensor and agreed with neither.
                 "--x", "0.09", "--y", "0.0", "--z", "0.195",
                 "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",

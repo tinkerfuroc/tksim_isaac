@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from .robot_geometry import origin, wheel_floor_z
 from .workspace import (
     ARM_JOINTS,
     ARTIFACT_FILES,
@@ -335,43 +336,19 @@ def with_base_footprint(description: str) -> str:
     joint moved to the derived height.
     """
     root = ET.fromstring(description)
-    # Top-level elements only: <ros2_control> nests its own <joint> tags.
-    parent_joint = {joint.find("child").get("link"): joint for joint in root.findall("joint")}
-    bottoms: dict[str, float] = {}
-    for link in root.findall("link"):
-        name = link.get("name", "")
-        if not name.endswith("_wheel"):
-            continue
-        for collision in link.findall("collision"):
-            bottom = _wheel_collision_bottom(collision)
-            if bottom is None:
-                continue
-            frame, z = name, bottom
-            while frame != "base_link":
-                joint = parent_joint.get(frame)
-                if joint is None:
-                    break
-                xyz, rpy = _origin(joint)
-                if any(abs(angle) > 1e-6 for angle in rpy):
-                    raise ValueError(f"{joint.get('name')}: rotated wheel mount is not supported")
-                z += xyz[2]
-                frame = joint.find("parent").get("link")
-            if frame == "base_link":
-                bottoms[name] = min(z, bottoms.get(name, z))
-    if not bottoms:
+    floor = wheel_floor_z(root)
+    if floor is None:
         return description
-    if max(bottoms.values()) - min(bottoms.values()) > 0.001:
-        raise ValueError(f"wheel bottoms disagree on the floor height: {bottoms}")
-    floor = min(bottoms.values())
+    parent_joint = {joint.find("child").get("link"): joint for joint in root.findall("joint")}
     existing = parent_joint.get("base_footprint")
     if existing is not None:
-        xyz, _ = _origin(existing)
+        xyz, _ = origin(existing)
         if abs(xyz[2] - floor) < 1e-9:
             return description
-        origin = existing.find("origin")
-        if origin is None:
-            origin = ET.SubElement(existing, "origin")
-        origin.set("xyz", f"{xyz[0]:.6g} {xyz[1]:.6g} {floor:.6g}")
+        element = existing.find("origin")
+        if element is None:
+            element = ET.SubElement(existing, "origin")
+        element.set("xyz", f"{xyz[0]:.6g} {xyz[1]:.6g} {floor:.6g}")
         return ET.tostring(root, encoding="unicode")
     addition = (
         '  <link name="base_footprint"/>\n'
@@ -383,36 +360,6 @@ def with_base_footprint(description: str) -> str:
     )
     end = description.rindex("</robot>")
     return description[:end] + addition + description[end:]
-
-
-def _origin(element: ET.Element) -> tuple[list[float], list[float]]:
-    origin = element.find("origin")
-    if origin is None:
-        return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
-    xyz = [float(v) for v in origin.get("xyz", "0 0 0").split()]
-    rpy = [float(v) for v in origin.get("rpy", "0 0 0").split()]
-    return xyz, rpy
-
-
-def _wheel_collision_bottom(collision: ET.Element) -> float | None:
-    """Lowest z of a wheel's cylinder/sphere collision in its link frame."""
-    geometry = collision.find("geometry")
-    if geometry is None:
-        return None
-    xyz, rpy = _origin(collision)
-    sphere = geometry.find("sphere")
-    if sphere is not None:
-        return xyz[2] - float(sphere.get("radius"))
-    cylinder = geometry.find("cylinder")
-    if cylinder is None:
-        return None
-    radius, length = float(cylinder.get("radius")), float(cylinder.get("length"))
-    roll, pitch = abs(rpy[0]), abs(rpy[1])
-    if abs(roll - 1.5708) < 0.01 or abs(pitch - 1.5708) < 0.01:  # axle horizontal
-        return xyz[2] - radius
-    if roll < 0.01 and pitch < 0.01:  # axle vertical
-        return xyz[2] - length / 2.0
-    return None
 
 
 def _head_camera_aim():
