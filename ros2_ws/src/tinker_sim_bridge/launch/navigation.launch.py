@@ -10,8 +10,9 @@ _tools = _project_root / "tools"
 if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
-from tinker_sim_deploy.runtime import resolve_arena_map_yaml, resolve_current_artifact
+from tinker_sim_deploy.runtime import resolve_arena_map_yaml, resolve_current_artifact, with_base_footprint
 
+from tinker_sim_bridge.amcl_map import default_amcl_map_dir, write_amcl_map
 from tinker_sim_bridge.nav_params_overlay import (
     default_destination,
     write_prior_map_params,
@@ -92,6 +93,7 @@ def _resolve(context):
     nav_params = write_prior_map_params(
         upstream_nav_params, default_destination(upstream_nav_params)
     )
+    amcl_map_yaml = write_amcl_map(map_yaml, default_amcl_map_dir())
     return [
         Node(
             package="tinker_sim_bridge", executable="base_facade", output="screen",
@@ -119,7 +121,10 @@ def _resolve(context):
         ),
         Node(
             package="robot_state_publisher", executable="robot_state_publisher", output="screen",
-            parameters=[{"use_sim_time": True, "robot_description": (artifact / "robot.urdf").read_text(encoding="utf-8")}],
+            # with_base_footprint: base_footprint on the floor, for heights
+            # measured from the floor (base_link rests 0.0775 m up).
+            parameters=[{"use_sim_time": True, "robot_description": with_base_footprint(
+                (artifact / "robot.urdf").read_text(encoding="utf-8"))}],
         ),
         # Match the physical Livox driver contract.  The robot URDF's visual
         # sensor link is named livox_frame, while hardware messages and Nav2
@@ -129,10 +134,11 @@ def _resolve(context):
             arguments=[
                 # Must match where the sim's raycast lidar prim actually
                 # sits: the URDF's livox_joint, base_link -> livox_frame at
-                # (0.09, 0, 0.195). It also has to match the height the AMCL
-                # map is rasterized at -- tools/tinker_sim_deploy/arena_map.py
-                # slices the arena colliders at livox_scan_height(), read from
-                # that same joint. The previous (0.12, 0, 0.25) predated any
+                # (0.09, 0, 0.195). The AMCL map is rasterized from that same
+                # joint too -- tools/tinker_sim_deploy/arena_map.py projects the
+                # arena colliders over livox_scan_band(): the joint height plus
+                # base_link's rest height, up 2 m, as pointcloud_to_laserscan
+                # keeps. The previous (0.12, 0, 0.25) predated any
                 # real sensor and agreed with neither.
                 "--x", "0.09", "--y", "0.0", "--z", "0.195",
                 "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
@@ -156,6 +162,22 @@ def _resolve(context):
                 "params_file": str(nav_params),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
+        ),
+        # AMCL localizes on a surface-only copy of the map (amcl_map.py): its
+        # own map_server on /amcl_map. The costmaps keep the solid map that
+        # the localization launch's map_server serves on /map.
+        Node(
+            package="nav2_map_server", executable="map_server", name="amcl_map_server",
+            output="screen",
+            parameters=[{
+                "use_sim_time": True, "yaml_filename": str(amcl_map_yaml),
+                "topic_name": "amcl_map", "frame_id": "map",
+            }],
+        ),
+        Node(
+            package="nav2_lifecycle_manager", executable="lifecycle_manager",
+            name="lifecycle_manager_amcl_map", output="screen",
+            parameters=[{"use_sim_time": True, "autostart": True, "node_names": ["amcl_map_server"]}],
         ),
         # The hardware localization launch does not propagate use_sim_time to
         # robot_localization.  Launch the same EKF parameters here with the
@@ -186,6 +208,9 @@ def generate_launch_description():
         # Arena id the simulator was launched with (--arena); selects that
         # arena artifact's map.yaml unless map_yaml:= overrides it.
         DeclareLaunchArgument("arena", default_value=""),
-        SetEnvironmentVariable("ROBOT_NAME", "tinker2"),
+        # tinker2 with the SIM body's footprint: navigation_dwb_launch.py
+        # overwrites every costmap footprint from this profile, after
+        # nav_params_overlay has run.
+        SetEnvironmentVariable("ROBOT_NAME", "tinker2_sim"),
         OpaqueFunction(function=_resolve),
     ])

@@ -80,26 +80,34 @@ class FrameAliasTest(unittest.TestCase):
                     f"{name}: no static transform {mount} -> {frame_id}",
                 )
 
-    def test_the_alias_is_identity(self):
-        """The URDF link already carries the optical rotation.
+    def test_the_alias_follows_the_rendered_head_camera(self):
+        """Identity under hardware parity; the render's correction under the aim override.
 
-        head_camera_color_optical_frame is the optical frame, so the driver's
-        name for it is the same pose under a different label. A rotation here
-        would silently tilt every detection.
+        head_camera_color_optical_frame is the optical frame, so without
+        TINKER_SIM_HEAD_CAMERA_AIM the driver's name for it is the same pose
+        under a different label and a rotation here would tilt every
+        detection. With the override the sim RENDERS the head camera rotated
+        by the correction (head_camera_aim.apply_head_aim_correction), so the
+        alias must carry the same rotation -- 2026-10-01: an identity alias
+        under level-forward put the optical axis straight up in TF and every
+        map-frame person detection at z = 2-5 m.
         """
         head = self.cameras["head_camera"]
         flat = self.launch.replace("\n", " ")
-        start = flat.find(head["mount_prim"] + '", "--child-frame-id"')
-        if start == -1:
-            start = flat.find('"--frame-id", "' + head["mount_prim"])
+        start = flat.find('name="head_camera_optical_alias_tf"')
         self.assertNotEqual(start, -1, "alias node not found")
-        window = flat[max(0, start - 400):start + 200]
-        for axis in ("--x", "--y", "--z", "--qx", "--qy", "--qz"):
-            self.assertRegex(
-                window, re.escape(f'"{axis}", "0"'), f"{axis} must be zero in the alias"
-            )
-        self.assertRegex(window, re.escape('"--qw", "1"'))
+        window = flat[start:start + 600]
+        self.assertIn('"--frame-id", "' + head["mount_prim"] + '"', window)
+        for axis, src in (("--x", "_HEAD_ALIAS_XYZ[0]"), ("--y", "_HEAD_ALIAS_XYZ[1]"),
+                          ("--z", "_HEAD_ALIAS_XYZ[2]"), ("--qx", "_HEAD_ALIAS_Q[0]"),
+                          ("--qy", "_HEAD_ALIAS_Q[1]"), ("--qz", "_HEAD_ALIAS_Q[2]"),
+                          ("--qw", "_HEAD_ALIAS_Q[3]")):
+            self.assertIn(f'"{axis}", repr({src})', window)
+        self.assertIn("head_camera_optical_alias(", self.launch)
+        self.assertIn('os.environ.get("TINKER_SIM_HEAD_CAMERA_AIM")', self.launch)
 
+        from tinker_sim_isaac.head_camera_aim import head_camera_optical_alias
+        self.assertEqual(head_camera_optical_alias(None), ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
 
 if __name__ == "__main__":
     unittest.main()

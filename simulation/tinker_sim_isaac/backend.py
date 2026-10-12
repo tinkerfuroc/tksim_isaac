@@ -11,6 +11,7 @@ from tinker_sim_isaac.physics_rate import (
     physics_substeps,
     resolve_control_hz,
     resolve_physics_hz,
+    configure_scene_velocity_iterations,
     resolve_solver_iterations,
 )
 from tinker_sim_isaac.target_write_gate import TargetWriteGate
@@ -335,6 +336,184 @@ def resolve_use_fabric(
     elif use_fabric_env == "0":
         use_fabric = False
     return use_fabric
+
+
+SCENARIO_SCOPE = "/World/Scenario"
+
+
+def normalize_handover_name(name: str) -> str:
+    """Semantic object name -> bench object key: lower-case, spaces/hyphens
+    collapsed to single underscores ("Sugar Box" / "sugar-box" -> "sugar_box")."""
+    return "_".join(str(name).strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def resolve_handover_entity(
+    request: str,
+    scenario_children: Iterable[str],
+    *,
+    scenario_present: bool = True,
+) -> dict[str, str]:
+    """Resolve a referee handover request to ONE /World/Scenario prim path.
+
+    Pure (no stage access) so it is unit-testable: ``scenario_children`` are the
+    prim paths directly under ``/World/Scenario``. Accepts, in order:
+
+    * a full prim path (``/World/Scenario/cmd_spam_0``) -- taken verbatim;
+    * a bare entity id (``cmd_spam_0``) -- must be an existing scenario child;
+    * a SEMANTIC object name (``spam``, ``sugar box``, ``Sugar_Box``) -- must
+      match exactly one bench entity ``cmd_<key>_<n>`` whose ``<key>`` equals
+      the normalised name (``tools/gpsr_spawn.py`` ids are
+      ``cmd_{object_key}_{index}``). The match is on the WHOLE key, never a
+      prefix, so ``soup`` cannot pick ``cmd_soup_can_0``.
+
+    Resolution order per candidate (fix4b run 003: "soup" used to hit the
+    BASE-scenario child ``/World/Scenario/soup`` on the kitchen table instead
+    of the bench-spawned ``cmd_soup_0`` in front of the robot): the semantic
+    match against bench entities ``cmd_<key>_<n>`` comes FIRST; only when no
+    bench entity carries the key is a bare id / base-scenario child with that
+    exact name used.
+
+    ``request`` may be a ``'|'``-separated candidate list
+    (``"pudding_box|banana|sugar_box"``, fix4b run 004: the tree guessed one
+    category member that was not on the table): candidates are resolved in
+    order and the first that exists wins; the result then also carries
+    ``"name"`` (which candidate it was).
+
+    Returns ``{"path": ..., "name": ...}`` or ``{"error": ...}`` --
+    ``ambiguous: ...`` when two or more bench entities carry the key (never
+    pick one silently; with a candidate list the next candidate is tried),
+    ``no entity ...`` when none does. The decision tree only knows semantic
+    names; entity ids stay a sim/bench detail.
+    """
+    import re
+
+    candidates = parse_handover_candidates(request)
+    if not candidates:
+        return {"error": "empty entity"}
+    by_name = {path.rsplit("/", 1)[-1]: path for path in scenario_children}
+    pattern = re.compile(r"^cmd_(?P<key>.+)_(?P<index>\d+)$")
+
+    def _one(candidate: str) -> dict[str, str]:
+        if candidate.startswith("/"):
+            return {"path": candidate}
+        if not scenario_present:
+            return {"error": f"no {SCENARIO_SCOPE} scope in stage"}
+        key = normalize_handover_name(candidate)
+        matches = sorted(
+            path
+            for name, path in by_name.items()
+            if (m := pattern.match(name)) is not None and m.group("key") == key
+        )
+        if len(matches) == 1:
+            return {"path": matches[0]}
+        if len(matches) > 1:
+            return {"error": f"ambiguous: {len(matches)} entities match '{key}' ({matches})"}
+        if candidate in by_name:
+            return {"path": by_name[candidate]}
+        return {"error": f"no entity for '{candidate}' under {SCENARIO_SCOPE}"}
+
+    errors: list[str] = []
+    for candidate in candidates:
+        resolved = _one(candidate)
+        if "path" in resolved:
+            return {"path": resolved["path"], "name": candidate}
+        errors.append(resolved["error"])
+    if len(candidates) == 1:
+        return {"error": errors[0]}
+    return {"error": "no candidate resolved: " + "; ".join(errors)}
+
+
+def parse_handover_candidates(request: object) -> list[str]:
+    """Split a ``/sim/referee/hand_object`` payload into ordered, non-empty
+    candidates (``"a|b|c"`` -> ``["a", "b", "c"]``; a plain name is one)."""
+    return [part.strip() for part in str(request or "").split("|") if part.strip()]
+
+
+class RefereeHold:
+    """Pure state machine for the referee hand-off hold (unit-tested, no ROS/USD).
+
+    After ``attach(path, drive_target)`` the object is welded to the gripper
+    by a per-physics-step KINEMATIC FOLLOW (``follow_pose``: TCP pose (+) the
+    offset captured at hand-off, velocity zeroed; the backend writes it in
+    ``_referee_hold_follow`` before every physics step). A runtime PhysX
+    FixedJoint was rejected: link_tcp is a fabric-simulated articulation link
+    whose USD transform is stale under fabric-on, so joint local frames
+    authored from USD would be wrong, and adding a joint mid-simulation
+    re-parses the scene under a live tensor SimulationView. The weld is released when the commanded
+    ``drive_joint`` target drops by at least ``OPEN_DELTA_RAD`` below the most
+    closed target commanded since the attach (larger = more closed on this
+    gripper): the tree's close right after the hand-off only raises that peak,
+    a keepalive re-sending the same target changes nothing, and the later
+    open (place / deliver) crosses the delta. Works whether the hand-off
+    happened with the gripper open or already closed. ``clear()`` is the
+    deleted-object / explicit-release path.
+    """
+
+    OPEN_DELTA_RAD = 0.05
+
+    def __init__(self) -> None:
+        self.path: str | None = None
+        self.peak: float | None = None
+        # Object pose in the TCP frame captured at attach (kinematic follow).
+        self.local_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.local_quaternion_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+
+    @property
+    def held(self) -> bool:
+        return self.path is not None
+
+    def attach(
+        self,
+        path: str,
+        drive_target: float | None,
+        *,
+        tcp_pose: tuple[Iterable[float], Iterable[float]] | None = None,
+        object_pose: tuple[Iterable[float], Iterable[float]] | None = None,
+    ) -> None:
+        """Start holding *path*. With both ``tcp_pose`` and ``object_pose``
+        (``(xyz, quat_xyzw)`` world poses at hand-off) the object's pose in
+        the TCP frame is captured for ``follow_pose``; otherwise the object
+        rides exactly at the TCP origin with the TCP's orientation."""
+        self.path = str(path)
+        self.peak = None if drive_target is None else float(drive_target)
+        self.local_position = (0.0, 0.0, 0.0)
+        self.local_quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)
+        if tcp_pose is not None and object_pose is not None:
+            local_position, local_quaternion = pose_in_frame(
+                tuple(float(v) for v in tcp_pose[0]),
+                tuple(float(v) for v in tcp_pose[1]),
+                tuple(float(v) for v in object_pose[0]),
+                tuple(float(v) for v in object_pose[1]),
+            )
+            self.local_position = tuple(float(v) for v in local_position)  # type: ignore[assignment]
+            self.local_quaternion_xyzw = tuple(float(v) for v in local_quaternion)  # type: ignore[arg-type,assignment]
+
+    def follow_pose(
+        self, tcp_position: Iterable[float], tcp_quaternion_xyzw: Iterable[float]
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """World pose the held object must take for the current TCP pose
+        (TCP pose (+) the offset captured at attach); None when not held."""
+        if not self.held:
+            return None
+        return pose_from_frame(
+            tcp_position, tcp_quaternion_xyzw, self.local_position, self.local_quaternion_xyzw
+        )
+
+    def on_drive_target(self, target: float) -> bool:
+        """Feed a commanded drive_joint target; True when the hold must be released."""
+        if not self.held:
+            return False
+        target = float(target)
+        if self.peak is None or target > self.peak:
+            self.peak = target
+            return False
+        return target < self.peak - self.OPEN_DELTA_RAD
+
+    def clear(self) -> str | None:
+        path, self.path, self.peak = self.path, None, None
+        self.local_position = (0.0, 0.0, 0.0)
+        self.local_quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)
+        return path
 
 
 # Task #20 (gripper creep/retention): the hardware-scale torque-cap bracket
@@ -801,6 +980,31 @@ def pose_in_frame(
     return local_position, local_quaternion
 
 
+def pose_from_frame(
+    frame_position: Iterable[float],
+    frame_quaternion_xyzw: Iterable[float],
+    local_position: Iterable[float],
+    local_quaternion_xyzw: Iterable[float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Inverse of ``pose_in_frame``: world pose of a child whose pose in
+    *frame* is ``(local_position, local_quaternion_xyzw)`` (``frame (+) local``).
+    The quaternion is renormalized so a per-step follow never drifts."""
+    frame_position = tuple(float(value) for value in frame_position)
+    frame_quaternion = tuple(float(value) for value in frame_quaternion_xyzw)
+    offset = rotate_vector_xyzw(
+        frame_quaternion, tuple(float(value) for value in local_position)
+    )
+    world_position = tuple(f + o for f, o in zip(frame_position, offset))
+    world_quaternion = _quaternion_multiply_xyzw(
+        frame_quaternion, tuple(float(value) for value in local_quaternion_xyzw)
+    )
+    norm = math.sqrt(sum(value * value for value in world_quaternion)) or 1.0
+    return (
+        world_position,  # type: ignore[return-value]
+        tuple(value / norm for value in world_quaternion),  # type: ignore[return-value]
+    )
+
+
 class IsaacWholeRobotBackend:
     """CPU-PhysX articulation controlled only by standard JointState commands."""
 
@@ -1195,6 +1399,9 @@ class IsaacWholeRobotBackend:
             ),
             flush=True,
         )
+        # Kept for the referee handover write path: a USD xform write is
+        # physics-effective only under fabric-off (see hand_object_to_gripper).
+        self._use_fabric = _use_fabric
         if _spawn_yaw_set:
             # Boot marker so a live GPU run can tell, without reading source,
             # which spawn-yaw authoring path ran and what fabric state it ran
@@ -1292,6 +1499,13 @@ class IsaacWholeRobotBackend:
                         box,
                         translation=(x, y, 0.6),
                     )
+
+        scene_velocity = configure_scene_velocity_iterations(
+            self._sim.stage.GetPrimAtPath(self._sim.cfg.physics_prim_path),
+            _os.environ.get("TINKER_SIM_SCENE_VELOCITY_ITERATIONS"),
+        )
+        if scene_velocity is not None:
+            print(json.dumps({"scene_velocity_iterations": scene_velocity}), flush=True)
 
         # Opt-in articulation solver iteration override; unset, the USD's
         # authored counts (32 position / 1 velocity for tinker2) apply.
@@ -1541,50 +1755,15 @@ class IsaacWholeRobotBackend:
                     # the view rebuild).
                     effort_limit_sim=2.5,
                 ),
-                # The gripper is a mimic linkage: the URDF mimics all five
-                # finger/knuckle joints to drive_joint 1:1, but the URDF->USD
-                # import dropped every <mimic> (in robot.usd these joints carry
-                # no drive and no coupling), so closing drive_joint left the
-                # fingers passive and the jaw closed straight through. These
-                # gains actively drive the joints, and step() mirrors
-                # drive_joint's target into them each step
-                # (_mirror_gripper_mimic_targets) so the parallelogram tracks
-                # the master 1:1 and grip force transmits to the pads. The 180
-                # deg frame flips the importer baked for the URDF's negative
-                # axes make a uniform +1 mirror correct for all five.
-                #
-                # Stiffness sized from the measured yield: at k=200 the
-                # followers lag 0.13-0.17 rad under an ~11.7 N grip (physics
-                # probe), which lets the object extrude; k~=1500 (7-8x) pulls
-                # that toward <=0.02 rad for a firm hold, damping ~sqrt(k)-scaled
-                # from the 200/20 baseline (20*sqrt(1500/200)~=55). (The rigid
-                # PhysxMimicJoint constraint is a proven dead end on this
-                # warm-start/Fabric parse path, so this control mirror is the
-                # permanent coupling.)
-                #
-                # effort_limit_sim caps the follower reaction. This used to be
-                # sized at 180 purely to keep drive_joint's own limit
-                # enforceable (a follower pinned short of its target pushes
-                # k*error ~= 1500*0.56 ~= 840, which back-drove drive_joint
-                # past its 0 lower limit and dropped the object unless the
-                # follower cap stayed a few times below that). #20's
-                # hardware-scale torque-cap bracket ($TMP/hwcap-result.md,
-                # hwcap2-result.md) found that reasoning was solving the
-                # wrong problem: 180 (and even a much lower cap of 5) is still
-                # high enough that the PD keeps authority to tip the grasped
-                # object along the finger arc instead of stalling like the
-                # real position-controlled gripper does at its torque limit.
-                # 2.5 N*m is the highest cap in the bracket that holds --
-                # drive target flat, tilt decaying to ~0, retained on lift --
-                # while a real hardware gripper's own clamp is torque-limited
-                # the same way. Kept a literal (must equal the module constant
-                # GRIPPER_EFFORT_CEILING_NM) so the config construction test
-                # can read it via ast.literal_eval; followers are config-only
-                # here, no runtime effort-limit write targets them.
+                # Native mimic constraints transmit the master's effort through
+                # the linkage. Followers have no independent position/velocity
+                # motor; their reaction forces are internal constraint forces.
+                # The imported gearing and joint references are retained, with
+                # compliance removed before the initial PhysX parse.
                 "gripper_mimic": ImplicitActuatorCfg(
                     joint_names_expr=[".*finger.*", ".*knuckle.*"],
-                    stiffness=1500.0,
-                    damping=55.0,
+                    stiffness=0.0,
+                    damping=0.0,
                     effort_limit_sim=2.5,
                 ),
                 "casters": ImplicitActuatorCfg(
@@ -1717,6 +1896,12 @@ class IsaacWholeRobotBackend:
         self.arena_friction_bound = self._apply_arena_friction_material()
         self.arena_surface_boxes = self._apply_arena_support_surface_colliders()
         self.gripper_friction_bound = self._apply_gripper_friction_material()
+        from tinker_sim_isaac.gripper_mimic import configure_gripper_mimic_constraints
+        self.gripper_native_mimic_count = configure_gripper_mimic_constraints(self._sim.stage)
+        if self.gripper_native_mimic_count != 5:
+            raise RuntimeError("Expected five authored native gripper mimic constraints")
+        print(json.dumps({"gripper_native_mimic_constraints": self.gripper_native_mimic_count,
+                          "compliance": "rigid", "follower_drives": "passive"}), flush=True)
         omni.kit.app.get_app().update()
         self._sim.reset()
         # Task #30 trace: the truth root pose the moment sim.reset() returns,
@@ -2234,7 +2419,10 @@ class IsaacWholeRobotBackend:
             count_now = self._sim.get_physics_step_count()
             self._clock_step_origin = count_now - self._clock_elapsed_steps
             self._object_views.clear()
+            if hasattr(self, "_park_views"):
+                self._park_views.clear()
             self._contact_pairs_by_key.clear()
+            self._contact_trace_pairs_by_key.clear()
             # Task #30 trace: a genuine rebind just fired -- either the
             # scenario's own STOP -> spawn_entity(s) -> PLAY cycle
             # (reapply_spawn_yaw=True, the interesting case for #30: physics
@@ -2430,7 +2618,9 @@ class IsaacWholeRobotBackend:
         prior process's last published sample, matching hardware parity
         (real ROS time is wall-clock and never goes backward).
         """
-        return self.simulation_time + self._clock_epoch_s
+        return self.simulation_time + self._clock_epoch_s - getattr(
+            self, "_ros_reset_origin_s", 0.0
+        )
 
     @property
     def physics_frame_index(self) -> int:
@@ -3202,6 +3392,9 @@ class IsaacWholeRobotBackend:
                     old_drive_target = getattr(self, "_drive_command_target", None)
                     new_drive_target = float(command.positions[offset])
                     self._drive_command_target = new_drive_target
+                    # Every packet (repeats included) feeds the referee hold;
+                    # a commanded open releases the kinematic follow.
+                    self._referee_hold_on_drive_target(new_drive_target)
                     if new_drive_target != old_drive_target:
                         self._log_gripper_command_target(
                             old_drive_target,
@@ -3297,8 +3490,10 @@ class IsaacWholeRobotBackend:
             )
         self._pending_snapshot_index = packet_index
 
-    def _slew_wheel_targets(self) -> None:
-        """Vectorised replacement for the former per-wheel scalar slew loop.
+    def _slew_wheel_targets(self):
+        """Return the velocity targets to write this step, wheels slewed.
+
+        Vectorised replacement for the former per-wheel scalar slew loop.
 
         Applies ``applied_next = applied + clip(target - applied, -max_delta,
         +max_delta)`` to every wheel joint in one torch expression instead of
@@ -3306,10 +3501,15 @@ class IsaacWholeRobotBackend:
         scalar back (the old loop paid that tensor<->float round trip four
         times per step). This is exactly `slew_velocity_target` per wheel --
         see tests/test_wheel_slew_vectorisation.py.
+
+        ``_velocity_targets`` stays the commanded value. The slewed wheels go
+        into a copy: writing them back made the next step slew toward its own
+        output, so a wheel advanced one slew step per received *packet* and a
+        zero /cmd_vel braked only as fast as keepalives arrived.
         """
         wheel_index = self._wheel_index_tensor
         if wheel_index.numel() == 0:
-            return
+            return self._velocity_targets
         max_delta = WHEEL_VELOCITY_SLEW_RAD_S2 * self.dt
         commanded = self._velocity_targets[0, wheel_index]
         if not bool(self._torch.isfinite(commanded).all()):
@@ -3320,9 +3520,11 @@ class IsaacWholeRobotBackend:
             device=commanded.device,
         )
         updated = applied + self._torch.clamp(commanded - applied, -max_delta, max_delta)
-        self._velocity_targets[0, wheel_index] = updated
+        output = self._velocity_targets.clone()
+        output[0, wheel_index] = updated
         for index, value in zip(self._wheel_indices, updated.tolist()):
             self._applied_wheel_velocities[index] = value
+        return output
 
     def _apply_spawn_yaw_via_view(self, spawn_yaw: float) -> None:
         """Write TINKER_SIM_SPAWN_YAW's heading through the root physics view.
@@ -3880,68 +4082,6 @@ class IsaacWholeRobotBackend:
                 target = current  # optional hard cap: freeze on raw contact force
         self._position_targets[0, drive_index] = target
 
-    def _mirror_gripper_mimic_targets(self) -> None:
-        """Couple the five gripper mimic joints to drive_joint's MEASURED angle.
-
-        The xArm gripper is a single-DOF mechanism: one motor drives the left
-        outer knuckle; the right knuckle is gear-coupled to it, and each finger
-        rides a parallelogram (outer knuckle + inner knuckle) that keeps the pad
-        parallel. The URDF expresses this as ``<mimic joint="drive_joint"
-        multiplier="1">`` on all five follower joints (the finger joints on -x
-        axes, which the importer baked as 180 deg frame flips, so a uniform +1
-        mirror is kinematically right). Corrected 2026-09-07 (the prior
-        "robot.usd dropped every <mimic>" claim here was never actually
-        measured): robot.usd authors ``physxMimicJoint:rotX:*`` attribute
-        values (gearing -1.0, referenceJoint drive_joint) on the five
-        followers WITHOUT applying ``PhysxMimicJointAPI`` in apiSchemas; the
-        live Kit stage reports ``PhysxMimicJointAPI:rotX`` among the applied
-        schemas; in both readings PhysX creates NO constraint (measured
-        2026-09-07: followers held at 0 -> drive still closes; followers
-        driven -> drive does not move). The software mirror is the only
-        coupling.
-
-        URDF mimic semantics are ``q_follower = multiplier * q_drive`` -- the
-        driving joint's ACTUAL angle. Mirroring drive_joint's commanded TARGET
-        instead (the previous implementation) only agrees with that in free
-        motion; the moment the drive knuckle is blocked by an object the
-        followers keep chasing the far-away target as five independent
-        k=1500 motors: the right knuckle over-runs the stalled left one and
-        shoves the object into the weak pad, and the finger joints curl the
-        pads 0.2-0.4 rad about the finger axis (measured: 25 N vs 5 N pads,
-        12 deg bottle tilt; the bench's "pads close through to 0.728, 18 mm
-        past the knife" and the 200+ N first-contact spikes). Tracking the
-        measured angle makes a blocked knuckle stop the whole linkage, the
-        pinch symmetric, and drive_joint's actuator (its effort limit, i.e.
-        the facade's max_effort) the true grip-force bound. Measured on the
-        bench objects at the bench grasp poses: bottle 7/7 retained through
-        a lift (peak = hold ~20 N, tilt <= 6 deg) vs a hooked, tilted shove
-        before; the followers' 1500 gains now act as the linkage constraint,
-        not as motors.
-
-        A one-step velocity feed-forward (q + qdot*dt) removes the followers'
-        control-step lag in steady motion; at stall qdot ~ 0 so the followers
-        hold exactly the drive's angle. getattr guards keep step() test doubles
-        happy.
-        """
-        drive_index = getattr(self, "_drive_joint_index", None)
-        mimic_indices = getattr(self, "_gripper_mimic_indices", ())
-        if drive_index is None or not mimic_indices:
-            return
-        data = getattr(self._robot, "data", None)
-        joint_pos = getattr(data, "joint_pos", None)
-        if joint_pos is None:
-            return
-        try:
-            follower_target = float(self._torch_value(joint_pos)[0, drive_index])
-            joint_vel = getattr(data, "joint_vel", None)
-            if joint_vel is not None:
-                follower_target += float(self._torch_value(joint_vel)[0, drive_index]) * float(
-                    getattr(self, "dt", 0.0)
-                )
-        except (IndexError, TypeError, ValueError):
-            return
-        for index in mimic_indices:
-            self._position_targets[0, index] = follower_target
 
     def step(self) -> None:
         # Observability only (#33): published as "articulation/target_write"
@@ -3965,6 +4105,7 @@ class IsaacWholeRobotBackend:
                 self._robot.update(self.dt)
                 self._maybe_log_first_step_trace()
             return
+        velocity_targets = self._velocity_targets
         if self._safety_stopped:
             if self._safety_snapshot is None:
                 self._safety_snapshot = self._robot.data.joint_pos.clone()
@@ -4008,19 +4149,18 @@ class IsaacWholeRobotBackend:
                 except Exception:
                     pass
         else:
-            self._slew_wheel_targets()
+            velocity_targets = self._slew_wheel_targets()
             self._ramp_drive_target()
         if getattr(self, "base_fixed", False):
             self._apply_base_hold()
         self._maybe_check_spawn_pose()
-        self._mirror_gripper_mimic_targets()
         # Physics runs at 120 Hz while commands arrive far slower, so most
         # steps would re-send byte-identical targets. PhysX drive targets
         # persist until changed and this backend uses implicit (stateless)
         # actuators with no external wrenches, so skipping an unchanged write
         # is semantically identical -- and it was 6.8 ms of a 12.2 ms step.
         _write_targets = self._target_write_gate.should_write(
-            (self._position_targets, self._velocity_targets, self._effort_targets)
+            (self._position_targets, velocity_targets, self._effort_targets)
         )
         effort_writer = getattr(self._robot, "set_joint_effort_target", None)
         if effort_writer is None and self._safety_stopped:
@@ -4031,7 +4171,7 @@ class IsaacWholeRobotBackend:
             if self.step_profile["enabled"]:
                 self._profile_changed_targets()
             self._robot.set_joint_position_target(self._position_targets)
-            self._robot.set_joint_velocity_target(self._velocity_targets)
+            self._robot.set_joint_velocity_target(velocity_targets)
         _sp = self.step_profile
         _t = _sp["_clock"] if _sp["enabled"] else None
         if _t is not None:
@@ -4054,7 +4194,7 @@ class IsaacWholeRobotBackend:
             self._target_write_gate.note_written(
                 (
                     self._position_targets.clone(),
-                    self._velocity_targets.clone(),
+                    velocity_targets.clone(),
                     self._effort_targets.clone(),
                 )
             )
@@ -4065,6 +4205,10 @@ class IsaacWholeRobotBackend:
         if _t is not None:
             _sp["write_data"] += _t() - _sp["_mark"]
             _sp["_mark"] = _t()
+        # Referee hand-off retention: pin the held object to the TCP right
+        # before the solver runs (no-op unless a hand-off is being held).
+        if getattr(self, "_referee_hold", None) is not None:
+            self._referee_hold_follow()
         self._step_simulation()
         if _t is not None:
             _sp["physx"] += _t() - _sp["_mark"]
@@ -4764,6 +4908,410 @@ class IsaacWholeRobotBackend:
         states.extend(self._spawned_object_states())
         return states
 
+    # ------------------------------------------------------------------
+    # Referee actuation (GPSR ex_machina handover)
+    # ------------------------------------------------------------------
+
+    def _resolve_handover_entity(self, entity: str) -> dict[str, str]:
+        """Stage-backed wrapper around ``resolve_handover_entity``."""
+        request = str(entity or "").strip()
+        if not request or request.startswith("/"):
+            return resolve_handover_entity(request, ())
+        try:
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+            scenario = stage.GetPrimAtPath(SCENARIO_SCOPE)
+            present = bool(scenario) and scenario.IsValid()
+            children = (
+                [child.GetPath().pathString for child in scenario.GetChildren()]
+                if present
+                else []
+            )
+        except (AttributeError, ImportError, RuntimeError, TypeError) as error:
+            return {"error": f"stage unavailable: {error}"}
+        return resolve_handover_entity(request, children, scenario_present=present)
+
+    def _tcp_world_position(self) -> list[float] | None:
+        """World xyz of the ``link_tcp`` articulation body (the frame the
+        manipulation stack's TF ``link_tcp`` and ``_robot_truth_state``'s
+        ``tcp_pose`` both report), or None when the robot has no such body."""
+        data = self._robot.data
+        body_names = tuple(getattr(data, "body_names", ()))
+        if "link_tcp" not in body_names:
+            return None
+        index = body_names.index("link_tcp")
+        values = self._torch_value(data.body_pos_w)[0, index].detach().cpu().tolist()
+        return [float(value) for value in values[:3]]
+
+    def _teleport_rigid_body(self, path: str, position: Iterable[float]) -> str:
+        """Move a free rigid body to ``position`` (orientation kept, velocity
+        zeroed) WITHOUT leaving a tensor view behind. Returns the write method.
+
+        1. USD authoring (always): set the prim's ``xformOp:translate`` and the
+           ``UsdPhysics.RigidBodyAPI`` velocity attributes. Under fabric-OFF
+           (``TINKER_SIM_USE_FABRIC=0`` / non-zero ``TINKER_SIM_SPAWN_YAW``) PhysX
+           picks the change up on the next step -- view-free, so a later
+           ``/delete_entity`` of this spawn cannot invalidate the shared
+           SimulationView (the 2026-08-31 clear-crash class that
+           ``_heal_detached_scenario_bodies`` / ``_maybe_recover_simulation_view``
+           document).
+        2. Tensor-view write (fabric-ON only): the USD write is a physics no-op
+           for a body already bound to PhysX under fabric (the
+           ``/set_entity_state`` defect run_sim patches), so the pose is ALSO
+           pushed through a create-use-drop rigid-body view, exactly like the
+           original f0dff4c/06d59c7 referee path. A dropped view can still leave
+           a backend registration behind (measured), so this branch relies on
+           ``_maybe_recover_simulation_view`` if the spawn is deleted later;
+           it is the documented fallback, not the preferred path.
+        """
+        import omni.usd
+        from pxr import Gf, UsdGeom, UsdPhysics
+
+        xyz = [float(value) for value in tuple(position)[:3]]
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            raise RuntimeError(f"no prim at {path}")
+        xformable = UsdGeom.Xformable(prim)
+        translate_op = None
+        for op in xformable.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+        if translate_op is not None:
+            if translate_op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                translate_op.Set(Gf.Vec3f(*xyz))
+            else:
+                translate_op.Set(Gf.Vec3d(*xyz))
+        else:
+            # physicsUtils inserts the translate FIRST in xformOpOrder, keeping
+            # the orient/scale composition a plain AddTranslateOp would break.
+            from omni.physx.scripts import physicsUtils
+
+            physicsUtils.set_or_add_translate_op(xformable, Gf.Vec3f(*xyz))
+        rigid_body = UsdPhysics.RigidBodyAPI(prim)
+        for attr in (rigid_body.GetVelocityAttr(), rigid_body.GetAngularVelocityAttr()):
+            try:
+                attr.Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            except (AttributeError, RuntimeError, TypeError):
+                pass  # attribute absent on this asset; PhysX keeps its own zero
+        if not getattr(self, "_use_fabric", True):
+            return "usd"
+
+        from isaaclab_physx.physics import PhysxManager
+        import numpy as _np
+        import warp as _wp
+
+        quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)
+        try:
+            from omni.physx import get_physx_interface
+
+            result = get_physx_interface().get_rigidbody_transformation(path)
+            current = (
+                self._quaternion_xyzw_from_physx(result.get("rotation"))
+                if result.get("ret_val")
+                else None
+            )
+            if current is not None:
+                quaternion_xyzw = current
+        except (AttributeError, ImportError, RuntimeError, TypeError):
+            pass
+        view = PhysxManager.get_physics_sim_view().create_rigid_body_view(path)
+        if view is None or int(view.count) == 0:
+            raise RuntimeError("no rigid-body view for entity")
+        try:
+            device = getattr(view.get_transforms(), "device", "cpu")
+            transforms = _wp.array(
+                _np.asarray([[*xyz, *quaternion_xyzw]], dtype=_np.float32),
+                dtype=_wp.float32,
+                device=device,
+            )
+            velocities = _wp.array(
+                _np.zeros((1, 6), dtype=_np.float32), dtype=_wp.float32, device=device
+            )
+            indices = _wp.array(
+                _np.asarray([0], dtype=_np.uint32), dtype=_wp.uint32, device=device
+            )
+            view.set_transforms(transforms, indices)
+            view.set_velocities(velocities, indices)
+        finally:
+            del view  # create-use-drop: never cache a view on a deletable spawn
+        return "usd+view"
+
+    def hand_object_to_gripper(self, entity: str) -> dict[str, object]:
+        """Referee actuation: teleport a spawned object between the gripper
+        fingers (``link_tcp`` world position), orientation kept, velocity zeroed.
+
+        Models real-robot referee semantics: when the GPSR referee flow's
+        close-gripper step runs, a human has placed a REAL object in the
+        gripper -- so the sim places the real (physical, rendered) object there
+        and lets the actual gripper close on it, and the later placed()/
+        delivered() gates verify honestly. ``entity`` is whatever the decision
+        tree publishes on ``/sim/referee/hand_object`` (semantic name, bare id
+        or prim path; see ``resolve_handover_entity``).
+
+        Returns the ack payload the gateway publishes as JSON on
+        ``/sim/referee/hand_object_result``: ``{"ok": true, "entity": <prim
+        path>, "xyz": [x, y, z]}`` or ``{"ok": false, "entity": <request or
+        path>, "error": <reason>}``. Never raises. Called on the simulation
+        thread (gateway ``spin_once``), same thread as stepping, so the pose
+        write cannot race the solver; the truth stream (``_iter_spawned_bodies``,
+        IPhysx) sees the new pose on the next frame.
+        """
+        request = str(entity or "").strip()
+        resolved = self._resolve_handover_entity(request)
+        if "error" in resolved:
+            return {"ok": False, "entity": request, "error": resolved["error"]}
+        path = resolved["path"]
+        tcp = self._tcp_world_position()
+        if tcp is None:
+            return {"ok": False, "entity": path, "error": "robot has no link_tcp body"}
+        try:
+            method = self._teleport_rigid_body(path, tcp)
+        except (AttributeError, ImportError, RuntimeError, TypeError, ValueError) as error:
+            return {"ok": False, "entity": path, "error": f"pose write failed: {error}"}
+        xyz = [round(float(value), 4) for value in tcp[:3]]
+        # Retention (2026-09-30 fix5 runs 003/004: the handed banana fell as
+        # soon as the arm lifted): weld the object to the TCP until the tree
+        # commands the gripper open. Never fails the ack.
+        self._referee_hold_attach(path, tcp)
+        now = self._referee_hold_now()
+        print(
+            json.dumps(
+                {"referee_hand_object": path, "xyz": xyz, "method": method, "t": now},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return {"ok": True, "entity": path, "xyz": xyz}
+
+    # ------------------------------------------------ referee hand-off hold
+
+    def _referee_hold_now(self) -> float | None:
+        try:
+            return round(float(self.simulation_time), 3)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def _log_referee_hold(self, event: str, path: str | None, **extra: object) -> None:
+        payload: dict[str, object] = {
+            "referee_hold": event,
+            "path": path,
+            "t": self._referee_hold_now(),
+        }
+        payload.update(extra)
+        print(json.dumps(payload, sort_keys=True), flush=True)
+
+    def _tcp_world_pose(
+        self,
+    ) -> tuple[list[float], list[float]] | None:
+        """``([x, y, z], [qx, qy, qz, qw])`` of the ``link_tcp`` body, or None."""
+        try:
+            data = self._robot.data
+            body_names = tuple(getattr(data, "body_names", ()))
+            if "link_tcp" not in body_names:
+                return None
+            index = body_names.index("link_tcp")
+            position = self._torch_value(data.body_pos_w)[0, index].detach().cpu().tolist()
+            quaternion = self._torch_value(data.body_quat_w)[0, index].detach().cpu().tolist()
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            return None
+        if len(position) < 3 or len(quaternion) != 4:
+            return None
+        return [float(v) for v in position[:3]], [float(v) for v in quaternion]
+
+    def _rigid_body_world_pose(
+        self, path: str
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+        """View-free IPhysx read of a rigid body's world pose, or None."""
+        try:
+            from omni.physx import get_physx_interface
+
+            result = get_physx_interface().get_rigidbody_transformation(path)
+        except (AttributeError, ImportError, RuntimeError, TypeError):
+            return None
+        if not result or not result.get("ret_val"):
+            return None
+        position = tuple(float(v) for v in tuple(result.get("position", ()))[:3])
+        quaternion = self._quaternion_xyzw_from_physx(result.get("rotation"))
+        if len(position) != 3 or quaternion is None:
+            return None
+        return position, quaternion  # type: ignore[return-value]
+
+    def _referee_hold_attach(self, path: str, tcp_position: Iterable[float]) -> bool:
+        """Start the kinematic follow of *path* (just teleported to the TCP).
+
+        The offset is captured from the TCP pose and the object's orientation
+        (kept by the teleport) so the object keeps its hand-off pose relative
+        to the gripper. Never raises: a failed attach logs and leaves the
+        object free (the old fall-through behavior)."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None:
+            hold = self._referee_hold = RefereeHold()
+        if hold.held:
+            self.release_referee_hold("re_handoff")
+        tcp_pose = self._tcp_world_pose()
+        if tcp_pose is None:
+            self._log_referee_hold("attach_failed", path, error="no link_tcp pose")
+            return False
+        body_pose = self._rigid_body_world_pose(path)
+        object_quaternion = body_pose[1] if body_pose is not None else tuple(tcp_pose[1])
+        object_pose = (tuple(float(v) for v in tuple(tcp_position)[:3]), object_quaternion)
+        drive_target = getattr(self, "_drive_command_target", None)
+        hold.attach(path, drive_target, tcp_pose=tcp_pose, object_pose=object_pose)
+        self._referee_hold_view = None
+        self._referee_hold_failures = 0
+        self._log_referee_hold(
+            "attach",
+            path,
+            drive_target=drive_target,
+            offset_xyz=[round(v, 4) for v in hold.local_position],
+            orientation_source="physx" if body_pose is not None else "tcp",
+        )
+        return True
+
+    def _referee_hold_on_drive_target(self, target: float) -> None:
+        """Feed one commanded drive_joint target (every packet, including
+        repeats); release the hold when the gripper is commanded open."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is not None and hold.held and hold.on_drive_target(target):
+            self.release_referee_hold("gripper_open", drive_target=float(target))
+
+    def release_referee_hold(self, reason: str, **extra: object) -> str | None:
+        """Stop following (gripper opened, object deleted, scoped reset):
+        zero the body's velocity once so it drops/settles from rest, drop the
+        cached write view, log one release line. Returns the released path."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None or not hold.held:
+            return None
+        path = hold.clear()
+        if reason not in ("deleted", "prim_gone"):
+            try:
+                self._write_held_body_pose(path, None, None)
+            except Exception:  # noqa: BLE001 - release must never fail
+                pass
+        self._referee_hold_view = None
+        self._log_referee_hold("release", path, reason=reason, **extra)
+        return path
+
+    def release_referee_hold_for(self, entity: object) -> str | None:
+        """Release when *entity* (prim path or bare name, as a
+        ``/delete_entity`` request carries it) names the held object."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None or not hold.held:
+            return None
+        name = str(entity or "").strip()
+        if name and (name == hold.path or name == str(hold.path).rsplit("/", 1)[-1]):
+            return self.release_referee_hold("deleted")
+        return None
+
+    def _write_held_body_pose(
+        self,
+        path: str,
+        position: Iterable[float] | None,
+        quaternion_xyzw: Iterable[float] | None,
+    ) -> None:
+        """Pose + zero-velocity write for the held body (pose None = velocity
+        only). Fabric-OFF: USD translate/orient + RigidBodyAPI velocity attrs
+        (PhysX ingests them next step; view-free, like _teleport_rigid_body).
+        Fabric-ON: USD writes are physics no-ops for a bound body, so a single
+        rigid-body view is created at the first follow step and REUSED for the
+        whole hold (never one view per step: every created view leaves a
+        backend registration behind), then dropped at release."""
+        import omni.usd
+
+        prim = omni.usd.get_context().get_stage().GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            raise RuntimeError(f"no prim at {path}")
+        if not getattr(self, "_use_fabric", True):
+            from pxr import Gf, UsdGeom, UsdPhysics
+
+            if position is not None:
+                xyz = [float(v) for v in tuple(position)[:3]]
+                qx, qy, qz, qw = (float(v) for v in quaternion_xyzw)  # type: ignore[union-attr]
+                xformable = UsdGeom.Xformable(prim)
+                ops = {op.GetOpType(): op for op in xformable.GetOrderedXformOps()}
+                translate_op = ops.get(UsdGeom.XformOp.TypeTranslate)
+                orient_op = ops.get(UsdGeom.XformOp.TypeOrient)
+                if translate_op is None or orient_op is None:
+                    from omni.physx.scripts import physicsUtils
+
+                    if translate_op is None:
+                        physicsUtils.set_or_add_translate_op(xformable, Gf.Vec3f(*xyz))
+                    if orient_op is None:
+                        physicsUtils.set_or_add_orient_op(xformable, Gf.Quatf(qw, qx, qy, qz))
+                if translate_op is not None:
+                    if translate_op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                        translate_op.Set(Gf.Vec3f(*xyz))
+                    else:
+                        translate_op.Set(Gf.Vec3d(*xyz))
+                if orient_op is not None:
+                    if orient_op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                        orient_op.Set(Gf.Quatf(qw, qx, qy, qz))
+                    else:
+                        orient_op.Set(Gf.Quatd(qw, qx, qy, qz))
+            rigid_body = UsdPhysics.RigidBodyAPI(prim)
+            for attr in (rigid_body.GetVelocityAttr(), rigid_body.GetAngularVelocityAttr()):
+                try:
+                    attr.Set(Gf.Vec3f(0.0, 0.0, 0.0))
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
+            return
+
+        import numpy as _np
+        import warp as _wp
+
+        view = getattr(self, "_referee_hold_view", None)
+        if view is None:
+            from isaaclab_physx.physics import PhysxManager
+
+            view = PhysxManager.get_physics_sim_view().create_rigid_body_view(path)
+            if view is None or int(view.count) == 0:
+                raise RuntimeError("no rigid-body view for held entity")
+            self._referee_hold_view = view
+            self._referee_hold_device = getattr(view.get_transforms(), "device", "cpu")
+        device = getattr(self, "_referee_hold_device", "cpu")
+        indices = _wp.array(_np.asarray([0], dtype=_np.uint32), dtype=_wp.uint32, device=device)
+        if position is not None:
+            row = [*(float(v) for v in tuple(position)[:3]), *(float(v) for v in quaternion_xyzw)]  # type: ignore[union-attr]
+            view.set_transforms(
+                _wp.array(_np.asarray([row], dtype=_np.float32), dtype=_wp.float32, device=device),
+                indices,
+            )
+        view.set_velocities(
+            _wp.array(_np.zeros((1, 6), dtype=_np.float32), dtype=_wp.float32, device=device),
+            indices,
+        )
+
+    REFEREE_HOLD_MAX_WRITE_FAILURES = 5
+
+    def _referee_hold_follow(self) -> None:
+        """Per physics step (called in step() before the solver runs): pin the
+        held object to TCP (+) offset with zero velocity. Releases on a vanished
+        prim or repeated write failures so a broken hold can never wedge the
+        sim loop."""
+        hold = getattr(self, "_referee_hold", None)
+        if hold is None or not hold.held:
+            return
+        tcp_pose = self._tcp_world_pose()
+        if tcp_pose is None:
+            return
+        path = hold.path
+        target = hold.follow_pose(*tcp_pose)
+        if target is None or path is None:
+            return
+        try:
+            self._write_held_body_pose(path, target[0], target[1])
+            self._referee_hold_failures = 0
+        except Exception as error:  # noqa: BLE001 - never kill the sim loop
+            failures = getattr(self, "_referee_hold_failures", 0) + 1
+            self._referee_hold_failures = failures
+            if "no prim" in str(error):
+                self.release_referee_hold("prim_gone")
+            elif failures >= self.REFEREE_HOLD_MAX_WRITE_FAILURES:
+                self.release_referee_hold("write_failed", error=str(error))
+
     def _spawned_object_states(self) -> list[dict[str, object]]:
         """Pose truth for harness-spawned /World/Scenario rigid bodies that are
         not scenario-declared (Task #11): the grasp bench needs retention /
@@ -4882,8 +5430,8 @@ class IsaacWholeRobotBackend:
         prim_path: str,
         position: "list[float]",
         quaternion_xyzw: "list[float]",
-        linear_velocity: "list[float]" = (0.0, 0.0, 0.0),
-        angular_velocity: "list[float]" = (0.0, 0.0, 0.0),
+        linear_velocity: "list[float] | None" = (0.0, 0.0, 0.0),
+        angular_velocity: "list[float] | None" = (0.0, 0.0, 0.0),
     ) -> bool:
         """Move a rigid body to a world pose PHYSICS-EFFECTIVELY (tensor write).
 
@@ -4900,6 +5448,8 @@ class IsaacWholeRobotBackend:
 
         ``position`` is world xyz; ``quaternion_xyzw`` is [qx, qy, qz, qw]
         (scalar last), matching the tensor transform row exactly (no reorder).
+        Both velocity arguments may be None for a kinematic actor, whose pose
+        can be restored but whose velocity PhysX does not allow us to assign.
 
         The per-prim view is cached and NEVER released (these views have no
         release API). Holding a view on a prim that is later DELETED
@@ -4957,7 +5507,7 @@ class IsaacWholeRobotBackend:
                 dtype=_wp.float32,
                 device=device,
             )
-            velocities = _wp.array(
+            velocities = None if linear_velocity is None and angular_velocity is None else _wp.array(
                 _np.asarray(
                     [
                         [
@@ -4982,7 +5532,8 @@ class IsaacWholeRobotBackend:
         # Let a backend write failure raise: the caller wraps this and logs the
         # exact error, which is more useful than a silent False.
         view.set_transforms(transforms, indices)
-        view.set_velocities(velocities, indices)
+        if velocities is not None:
+            view.set_velocities(velocities, indices)
         return True
 
     def _robot_truth_state(self) -> dict[str, object]:

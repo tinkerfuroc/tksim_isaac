@@ -111,6 +111,11 @@ class RosStandardGateway:
     API. All actuator commands arrive through one JointState topic.
     """
 
+    #: Referee actuation topics; must match the decision tree's
+    #: BtNode_RefereeHandObject (tk25_decision GPSR/small_trees.py).
+    REFEREE_HAND_OBJECT_TOPIC = "/sim/referee/hand_object"
+    REFEREE_HAND_OBJECT_RESULT_TOPIC = "/sim/referee/hand_object_result"
+
     def __init__(
         self,
         backend: Any,
@@ -349,6 +354,19 @@ class RosStandardGateway:
         safety_subscription = self.node.create_subscription(
             Bool, "/sim/hardware/safety_stop", self._safety_stop, safety_qos
         )
+        # Referee actuation (GPSR ex_machina handover): the decision tree's
+        # BtNode_RefereeHandObject publishes the target object's SEMANTIC name
+        # here right before its close-gripper step; the backend teleports the
+        # (physical, rendered) object between the fingers so the close grips a
+        # real body and placed()/delivered() gates verify honestly. The result
+        # is acked as a JSON String on the _result topic (reliable, like the
+        # decision side's QoS).
+        self.referee_result_pub = self.node.create_publisher(
+            String, self.REFEREE_HAND_OBJECT_RESULT_TOPIC, reliable
+        )
+        referee_subscription = self.node.create_subscription(
+            String, self.REFEREE_HAND_OBJECT_TOPIC, self._referee_hand_object, reliable
+        )
         # Inbound messages are taken on the simulation thread, inside
         # spin_once(), straight from the DDS readers (see _take_pending).  A
         # private executor thread used to do this, but it could only take one
@@ -361,6 +379,7 @@ class RosStandardGateway:
         self._intake_subscriptions = (
             (command_subscription, self._joint_command),
             (safety_subscription, self._safety_stop),
+            (referee_subscription, self._referee_hand_object),
         )
         self._executor = None
         self._executor_thread = None
@@ -496,6 +515,34 @@ class RosStandardGateway:
         except Exception as error:
             self._last_command_error = str(error)
             self.node.get_logger().error(f"rejected joint command: {error}")
+
+    def _referee_hand_object(self, message) -> None:
+        """Queue a handover request; applied on the simulation thread in
+        spin_once() (same FIFO as commands/safety, so it can never interleave
+        with a physics step)."""
+        try:
+            entity = str(getattr(message, "data", "")).strip()
+            self._incoming_events.put(("hand_object", entity))
+        except Exception as error:
+            self._last_command_error = str(error)
+            self.node.get_logger().error(f"rejected hand_object request: {error}")
+
+    def _handle_hand_object(self, entity: str) -> dict:
+        """Run the backend teleport and publish the JSON ack. Never raises:
+        a broken handover must not kill the sim loop -- it acks ok:false and
+        the decision node falls through to close-on-air."""
+        result: dict = {"ok": False, "entity": str(entity), "error": "empty entity"}
+        if entity:
+            try:
+                result = dict(self.backend.hand_object_to_gripper(str(entity)))
+            except Exception as error:  # noqa: BLE001 - never kill the sim loop
+                result = {"ok": False, "entity": str(entity), "error": str(error)}
+        ack = self._String()
+        ack.data = json.dumps(result, sort_keys=True)
+        self.referee_result_pub.publish(ack)
+        if not result.get("ok"):
+            self.node.get_logger().error(f"hand_object failed: {result}")
+        return result
 
     def _safety_stop(self, message) -> None:
         try:
@@ -794,6 +841,24 @@ class RosStandardGateway:
         self.backend.set_safety_stop(True, reason="command_stream_lost")
         self._last_command_error = "command stream expired"
 
+    def _stop_on_command_gap(self, error: str) -> None:
+        """Stop the robot when a forward gap shows command packets were lost.
+
+        Strict contiguity rejects every later snapshot until a new baseline,
+        so rejecting alone left the backend executing the last applied
+        targets -- wheel velocities included -- until the command-stream
+        deadline (5 sim-s under gpsr-stack).  A sim-loop stall that overflows
+        the depth-50 command reader did exactly that on 2026-10-11 and drove
+        the base ~1 m past a zero /cmd_vel.  Entering the lost-stream state
+        stops now; the next fresh safety-clear heartbeat and a newer
+        packet-one snapshot recover through the ordinary baseline path.
+        """
+        self._enter_command_stream_lost(time.monotonic())
+        self._last_command_error = f"{error}; command stream stopped"
+        node = getattr(self, "node", None)
+        if node is not None:
+            node.get_logger().warning(f"command_gap {error}; stopping until resync")
+
     def _sim_receipt_time(self) -> float | None:
         """Backend simulation time for stamping a message receipt, or None."""
         try:
@@ -1025,6 +1090,9 @@ class RosStandardGateway:
                         f"failed to apply safety-stop: {error}"
                     )
                 continue
+            if event_type == "hand_object":
+                self._handle_hand_object(str(payload or ""))
+                continue
             command, epoch, snapshot, received_at = payload
             _st = self._spin_stats()
             _age = time.monotonic() - float(received_at)
@@ -1211,16 +1279,28 @@ class RosStandardGateway:
                     continue
                 if logical_snapshot == self._last_logical_snapshot_id:
                     if (
-                        packet_count != self._last_snapshot_packet_count
-                        or packet_index != self._last_snapshot_packet_index + 1
+                        packet_count == self._last_snapshot_packet_count
+                        and packet_index <= self._last_snapshot_packet_index
                     ):
                         self._last_command_error = "rejected duplicate or out-of-order snapshot packet"
                         continue
+                    if packet_index != self._last_snapshot_packet_index + 1 or (
+                        packet_count != self._last_snapshot_packet_count
+                    ):
+                        self._stop_on_command_gap(
+                            "rejected out-of-order snapshot packet "
+                            f"{packet_index}/{packet_count} after "
+                            f"{self._last_snapshot_packet_index}/"
+                            f"{self._last_snapshot_packet_count}"
+                        )
+                        continue
                 elif packet_index != 1:
-                    self._last_command_error = "rejected snapshot that does not start at packet one"
+                    self._stop_on_command_gap(
+                        "rejected snapshot that does not start at packet one"
+                    )
                     continue
                 elif logical_snapshot != self._last_logical_snapshot_id + 1:
-                    self._last_command_error = (
+                    self._stop_on_command_gap(
                         f"rejected non-contiguous command snapshot {logical_snapshot}; "
                         f"expected {self._last_logical_snapshot_id + 1}"
                     )
@@ -1633,13 +1713,28 @@ class RosStandardGateway:
             _prof["n"] += 1
         self._tick += 1
 
+    def publish_reset_boundary(self) -> None:
+        """Publish restored joints and the new epoch through their sole owners."""
+        stamp = self._stamp()
+        clock = self._Clock()
+        clock.clock = stamp
+        self.clock_pub.publish(clock)
+        names, positions, velocities, efforts = self.backend.joint_state()
+        message = self._JointState()
+        message.header.stamp = stamp
+        message.name = list(names)
+        message.position = positions
+        message.velocity = velocities
+        message.effort = efforts
+        self.joint_pub.publish(message)
+
     def publish_cameras(self) -> None:
         """Publish one same-stamp color+depth+info set per camera.
 
         A camera whose annotator has no frame this tick is skipped and counted
         rather than fabricated; the counter keeps stalls observable.
         """
-        if self._camera_rig is None:
+        if getattr(self, "_scoped_reset_publishing", False) or self._camera_rig is None:
             return
         _prof = self._camera_profile if self._publish_profile_enabled else None
         _t = time.monotonic if _prof is not None else None
@@ -2023,6 +2118,9 @@ class RosStandardGateway:
         return message
 
     def close(self) -> None:
+        reset = getattr(self, "_scoped_reset", None)
+        if reset is not None:
+            reset.transport.close()
         if self._executor is not None:
             self._executor.shutdown()
             self._executor_thread.join(timeout=2.0)

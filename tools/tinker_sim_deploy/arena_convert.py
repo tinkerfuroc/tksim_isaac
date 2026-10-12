@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import Sequence
 
 from .arena_artifact import AssetArtifactError
 from .arena_world import ArenaLayout, BoxCollider, MeshCollider
@@ -409,6 +410,37 @@ def author_model_colliders(
     _resave_fresh(stage, usd_path)
 
 
+def strip_model_colliders(usd_path: Path) -> None:
+    """Undo ``author_model_colliders`` on a converted furniture USD, in place.
+
+    Removes the ``<default prim>/Colliders`` scope and every
+    ``MeshCollisionAPI``/``CollisionAPI`` (plus their authored attributes)
+    from the mesh prims, leaving exactly the corrected visual mesh Kit's
+    conversion produced. Used by ``arena_import.ReuseFurnitureHooks`` to
+    re-collide a previously published artifact's furniture without Kit.
+    """
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    stage = Usd.Stage.Open(str(usd_path))
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError(f"{usd_path}: no default prim to strip colliders under")
+    colliders_path = default_prim.GetPath().AppendChild("Colliders")
+    if stage.GetPrimAtPath(colliders_path):
+        stage.RemovePrim(colliders_path)
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        if prim.HasAPI(UsdPhysics.MeshCollisionAPI):
+            prim.RemoveAPI(UsdPhysics.MeshCollisionAPI)
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            prim.RemoveAPI(UsdPhysics.CollisionAPI)
+        for name in ("physics:approximation", "physics:collisionEnabled"):
+            if prim.HasProperty(name):
+                prim.RemoveProperty(name)
+    _resave_fresh(stage, usd_path)
+
+
 def _bind_pbr_material(
     stage,
     prim,
@@ -784,9 +816,15 @@ def author_preview_surface_material(stage) -> int:
             continue
         texture = None
         for shader_prim in mdl_shaders:
-            attr = shader_prim.GetAttribute("inputs:diffuse_texture")
-            if attr and attr.Get():
-                texture = attr.Get()
+            # OmniPBR (COLLADA/YCB conversions) names it diffuse_texture;
+            # Kit's glTF importer binds gltf/pbr.mdl, whose equivalent is
+            # base_color_texture (the person GLBs). Either carries the one
+            # albedo map this rewrite preserves.
+            for input_name in ("inputs:diffuse_texture", "inputs:base_color_texture"):
+                attr = shader_prim.GetAttribute(input_name)
+                if attr and attr.Get():
+                    texture = attr.Get()
+                    break
         for child in list(prim.GetChildren()):
             stage.RemovePrim(child.GetPath())
         for output_name in (
@@ -920,7 +958,39 @@ def recenter_object_origin(stage) -> tuple[float, float, float]:
     return (float(offset[0]), float(offset[1]), float(offset[2]))
 
 
-def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: Path) -> None:
+def _author_visual_transform(xformable, matrix: Sequence[Sequence[float]]) -> None:
+    """Author ``matrix`` as a single ``xformOp:transform`` on ``xformable``.
+
+    Must be called *before* the wrapper's unit-scale op is added: per the
+    module docstring's convention the first-added op is outermost, so the
+    point transform becomes ``M * unit_scale * p`` -- Kit's raw conversion
+    is brought to metres first, then the SDF-declared pose/scale places it.
+
+    ``matrix`` is 4 rows of 4 in the column-vector convention (``p' = M p``,
+    translation in the last *column*) that ``person_import`` composes with
+    plain stdlib maths. ``Gf.Matrix4d`` is row-vector (``p' = p M``,
+    translation in the last *row*), so the matrix is transposed here, in the
+    one place that speaks pxr, rather than making every caller remember
+    which convention USD wants. Pure pxr, no Kit: unit-tested in
+    ``tests/test_person_import_transform.py`` against the world bound of a
+    known mesh, which pins the convention down end to end.
+    """
+    from pxr import Gf
+
+    rows = [[float(value) for value in row] for row in matrix]
+    if len(rows) != 4 or any(len(row) != 4 for row in rows):
+        raise AssetArtifactError(f"visual_transform must be a 4x4 matrix, got {matrix!r}")
+    transposed = [[rows[column][row] for column in range(4)] for row in range(4)]
+    xformable.AddTransformOp().Set(Gf.Matrix4d(*[tuple(row) for row in transposed]))
+
+
+def _compose_object(
+    raw_visual_path: Path,
+    raw_collision_path: Path,
+    usd_path: Path,
+    *,
+    visual_transform: Sequence[Sequence[float]] | None = None,
+) -> None:
     """Wrap the two independent raw conversions (DAE visual, STL collision)
     into one flattened ``usd_path``, structured per the collider-placement
     rule confirmed in Task 9 (Finding 2 -- USD reference composition only
@@ -931,6 +1001,9 @@ def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: P
                             file composes in both children below together.
         /World/geom         visual: per-source unit-scale correction op
                              (no rotation -- see ``_axis_correction``),
+                             optionally preceded by one ``visual_transform``
+                             op (person models only; see
+                             ``_author_visual_transform``),
                              referencing the raw DAE conversion on a child
                              (not itself, to avoid the "xformOp:translate
                              already exists" collision documented for
@@ -957,6 +1030,10 @@ def _compose_object(raw_visual_path: Path, raw_collision_path: Path, usd_path: P
 
     geom = UsdGeom.Xform.Define(wrapper, "/World/geom")
     geom_xform = UsdGeom.Xformable(geom.GetPrim())
+    if visual_transform is not None:
+        # Outermost (added first): SDF-declared pose/scale, applied after
+        # the unit-scale op below has brought the raw mesh to metres.
+        _author_visual_transform(geom_xform, visual_transform)
     geom_xform.AddScaleOp().Set(Gf.Vec3f(visual_scale, visual_scale, visual_scale))
     visual_ref = wrapper.DefinePrim("/World/geom/mesh")
     visual_ref.GetReferences().AddReference(str(raw_visual_path))
@@ -1075,7 +1152,14 @@ def _prepare_dae_input(dae_path: Path, scratch_dir: Path) -> Path:
     patched. The mirror lives outside both ``usd_path`` itself and the
     ``textures/`` directory ``_relocate_local_assets`` populates, so it is
     never swept into the published payload.
+
+    Only COLLADA files are inspected: the crash workaround is specific to
+    Kit's COLLADA importer, and a binary glTF (``.glb`` -- every
+    ``sobits_gazebo_worlds`` person model except ``person_standing``) is
+    neither UTF-8 nor XML, so it is handed to Kit's glTF importer untouched.
     """
+    if dae_path.suffix.lower() != ".dae":
+        return dae_path
     dae_bytes = dae_path.read_bytes()
     patched = _patch_dae_missing_unit(dae_bytes, str(dae_path))
     if patched is None:
@@ -1090,7 +1174,13 @@ def _prepare_dae_input(dae_path: Path, scratch_dir: Path) -> Path:
     return patched_path
 
 
-def convert_object_to_usd(dae_path: Path, stl_path: Path, usd_path: Path) -> None:
+def convert_object_to_usd(
+    dae_path: Path,
+    stl_path: Path,
+    usd_path: Path,
+    *,
+    visual_transform: Sequence[Sequence[float]] | None = None,
+) -> None:
     """Convert one YCB object's textured visual DAE and non-textured
     collision STL into a single composed ``usd_path``: visual mesh visible
     under ``<default prim>/geom``, collision mesh invisible under
@@ -1110,6 +1200,17 @@ def convert_object_to_usd(dae_path: Path, stl_path: Path, usd_path: Path) -> Non
     pinned checkout, so unlike furniture this importer never reads a model
     SDF at all). See ``_patch_dae_missing_unit`` for a live-discovered Kit
     crash workaround applied to the DAE input before conversion.
+
+    ``visual_transform`` is the person-model exception to "no SDF-declared
+    scale/pose": ``tools/person_import.py`` folds a model SDF's link pose,
+    visual pose and ``<mesh><scale>`` into one 4x4 matrix (column-vector
+    convention, ``p_model = M * p_mesh``, metres) so a unit-normalised Y-up
+    glTF figure is stood up and sized exactly as Gazebo would. It is
+    authored on the *visual* wrapper only (see ``_author_visual_transform``);
+    the collision source is already expressed in the model frame, so the
+    bounds guard in ``_compose_object`` compares both in that same frame.
+    ``None`` (the YCB path) authors nothing and leaves the composed file
+    byte-identical to before this parameter existed.
     """
     import asyncio
 
@@ -1134,7 +1235,7 @@ def convert_object_to_usd(dae_path: Path, stl_path: Path, usd_path: Path) -> Non
             )
 
     asyncio.get_event_loop().run_until_complete(_run())
-    _compose_object(raw_visual_path, raw_collision_path, usd_path)
+    _compose_object(raw_visual_path, raw_collision_path, usd_path, visual_transform=visual_transform)
     # object_id: usd_path is always scratch/<object_id>/object.usd (see
     # ycb_import.convert_ycb_object), so the parent directory name is the
     # object id -- namespaces any relocated texture files the same way

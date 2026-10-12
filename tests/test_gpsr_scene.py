@@ -53,8 +53,12 @@ def test_s2026_001_counts_three_kitchen_item_members_at_kitchen_table(knowledge,
     for it in plan.items:
         assert it.spot == "kitchen_table"
         assert it.room == "kitchen"
+    # One row packed around surface_xyz inside the measured table top (the
+    # old fixed 0.18 m grid is gone -- see gpsr_scene.SurfaceLayout).
     xs = [it.xyz[0] for it in plan.items]
-    assert xs == [pytest.approx(2.5), pytest.approx(2.68), pytest.approx(2.86)]
+    assert xs == sorted(xs) and len(set(xs)) == 3
+    (bx0, _), (bx1, _) = placements["spots"]["kitchen_table"]["surface_bbox_xy"]
+    assert all(bx0 + 0.04 < x < bx1 - 0.04 for x in xs)
     assert all(it.xyz[1] == pytest.approx(-3.0) for it in plan.items)
     assert all(it.xyz[2] == pytest.approx(0.734) for it in plan.items)
 
@@ -67,7 +71,7 @@ def test_s2026_002_counts_persons_spawns_no_objects_and_a_bedroom_person(knowled
     person = plan.items[0]
     assert person.room == "bedroom"
     assert person.id == "cmd_person_bedroom"
-    assert person.xyz == pytest.approx((0.28, 1.755, 0.0))
+    assert person.xyz == pytest.approx((0.77, 3.12, 0.0))
 
 
 def test_s2026_003_finds_kitchen_item_category_at_the_first_mentioned_room(knowledge, placements):
@@ -105,7 +109,7 @@ def test_s2026_005_named_person_at_the_named_room_no_objects(knowledge, placemen
 
     assert [it.kind for it in plan.items] == ["person"]
     assert plan.items[0].room == "living_room"
-    assert plan.items[0].xyz == pytest.approx((-4.684, -4.089, 0.0))
+    assert plan.items[0].xyz == pytest.approx((-3.8, -3.95, 0.0))
 
 
 def test_s2026_006_named_person_room_from_the_explicit_spot_not_the_later_room(knowledge, placements):
@@ -116,7 +120,7 @@ def test_s2026_006_named_person_room_from_the_explicit_spot_not_the_later_room(k
 
     assert [it.kind for it in plan.items] == ["person"]
     assert plan.items[0].room == "laundry_room"
-    assert plan.items[0].xyz == pytest.approx((-2.931, 4.663, 0.0))
+    assert plan.items[0].xyz == pytest.approx((-0.6, 3.72, 0.0))
 
 
 def test_s2026_007_named_person_at_laundry_room(knowledge, placements):
@@ -125,7 +129,7 @@ def test_s2026_007_named_person_at_laundry_room(knowledge, placements):
 
     assert [it.kind for it in plan.items] == ["person"]
     assert plan.items[0].room == "laundry_room"
-    assert plan.items[0].xyz == pytest.approx((-2.931, 4.663, 0.0))
+    assert plan.items[0].xyz == pytest.approx((-0.6, 3.72, 0.0))
 
 
 def test_s2026_016_delivery_person_goes_to_the_room_named_after_the_person(knowledge, placements):
@@ -262,8 +266,17 @@ def test_resolved_object_items_carry_a_nonempty_asset_uri(knowledge, placements)
 
 
 def test_person_items_use_the_bench_scenario_person_asset(knowledge, placements):
+    # A plain (no gesture/pose) mention is the standing person from the
+    # current people artifact -- the same model the bench scenario's own
+    # actors use, whichever artifact identity it currently lives under.
     plan = plan_scene("meet Liam in the laundry_room", knowledge, placements, seed=1)
-    assert plan.items[0].asset_uri == PERSON_ASSET_URI
+    assert plan.items[0].asset_key == "person_standing"
+    assert plan.items[0].asset_uri.endswith("/person_standing/person.usd")
+    assert plan.items[0].asset_uri.startswith("artifacts/people/sobits/")
+    assert PERSON_ASSET_URI.endswith("/person_standing/person.usd")
+    # With no readable people manifest at all, the legacy constant is used.
+    plan_legacy = plan_scene("meet Liam in the laundry_room", knowledge, placements, seed=1, person_assets={})
+    assert plan_legacy.items[0].asset_uri == PERSON_ASSET_URI
 
 
 # --- JSON round-trip ----------------------------------------------------------
@@ -349,8 +362,9 @@ def test_spot_only_text_is_unaffected_by_first_mention_change(knowledge, placeme
     text = "bring me a spam from the laundry_desk"
     plan = plan_scene(text, knowledge, placements, seed=1)
 
-    assert len(plan.items) == 1
-    item = plan.items[0]
+    objects = [it for it in plan.items if it.kind == "object"]  # + the operator ("bring me")
+    assert len(objects) == 1
+    item = objects[0]
     assert item.name == "spam"
     assert item.spot == "laundry_desk"
     assert item.room == "laundry_room"
@@ -368,3 +382,29 @@ def test_first_mentioned_spot_wins_over_a_later_mentioned_room(knowledge, placem
     assert item.name == "mug"
     assert item.spot == "kitchen_table"
     assert item.room == "kitchen"
+
+
+# --- the operator stands at the command point for delivery commands --------
+# (sim battery 2026-10-01 fix8 run s70718-000: nobody there for "bring me")
+
+@pytest.mark.parametrize("text", [
+    "bring me a soup from the shelf",
+    "give me the bowl from the kitchen_table",
+    "take the mug from the side_table and deliver it to me",
+])
+def test_delivery_to_me_spawns_the_operator(knowledge, placements, text):
+    plan = plan_scene(text, knowledge, placements, seed=2026)
+    ops = [it for it in plan.items if it.id == "cmd_person_operator"]
+    assert len(ops) == 1
+    assert ops[0].kind == "person" and ops[0].pose == "standing"
+    assert list(ops[0].xyz) == placements["operator"]["xyz"]
+
+
+@pytest.mark.parametrize("text", [
+    "tell me how many persons are in the living_room",
+    "tell me how many kitchen items there are on the side_table",
+    "bring the soup to the person waving in the kitchen",
+])
+def test_non_delivery_to_me_commands_do_not_spawn_the_operator(knowledge, placements, text):
+    plan = plan_scene(text, knowledge, placements, seed=2026)
+    assert "cmd_person_operator" not in _ids(plan.items)

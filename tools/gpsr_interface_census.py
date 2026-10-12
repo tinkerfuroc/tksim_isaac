@@ -16,6 +16,11 @@ SERVICES = {
         ("object_detection_generalist", "tinker_vision_msgs_26/srv/ObjectDetectionGeneralist"),
         ("object_detection_yolo", "tinker_vision_msgs_26/srv/ObjectDetection"),
         ("door_detection_srv", "tinker_vision_msgs_26/srv/DoorDetection"),
+        # The RealSense (arm camera) service endpoint the generalist /
+        # yolo_seg nodes read wrist frames through. Served by the second
+        # camera_server_node scripts/gpsr-stack launches in the vision
+        # stage; without it every "camera: realsense" detection fails.
+        ("wrist_camera_server/get_snapshot", "tinker_vision_msgs_26/srv/GetCameraSnapshot"),
     ],
     "tk26_navigation": [
         ("find_approach_pose", "tinker_nav_msgs/srv/FindApproachPose"),

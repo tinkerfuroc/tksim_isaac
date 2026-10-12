@@ -52,6 +52,26 @@ class SolverIterationOverrideTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"accepted {bad!r}"):
                 resolve("position", bad)
 
+    def test_scene_velocity_override_supports_zero_and_preserves_default(self):
+        from pxr import Sdf, Usd
+        stage = Usd.Stage.CreateInMemory()
+        prim = stage.DefinePrim("/physicsScene")
+        minimum = prim.CreateAttribute("physxScene:minVelocityIterationCount", Sdf.ValueTypeNames.Int)
+        maximum = prim.CreateAttribute("physxScene:maxVelocityIterationCount", Sdf.ValueTypeNames.Int)
+        minimum.Set(0)
+        maximum.Set(255)
+        configure = self.module.configure_scene_velocity_iterations
+        self.assertIsNone(configure(prim, None))
+        self.assertEqual((minimum.Get(), maximum.Get()), (0, 255))
+        self.assertEqual(configure(prim, "0"), 0)
+        self.assertEqual((minimum.Get(), maximum.Get()), (0, 0))
+        self.assertEqual(configure(prim, "8"), 8)
+        self.assertEqual((minimum.Get(), maximum.Get()), (8, 8))
+        for bad in ("-1", "256", "1.5", "nan"):
+            with self.assertRaises(ValueError):
+                configure(prim, bad)
+        self.assertEqual((minimum.Get(), maximum.Get()), (8, 8))
+
     def test_backend_applies_them_through_articulation_props(self):
         source = BACKEND.read_text(encoding="utf-8")
         self.assertIn("TINKER_SIM_SOLVER_POSITION_ITERATIONS", source)

@@ -348,8 +348,12 @@ group.
 
 **Which map AMCL gets.** With `map_yaml` blank, `gpsr.launch.py` resolves the
 map from the scenario's `world.arena` (`artifacts/arena/<arena>/current.json`
-→ that artifact's `map.yaml`) — the same map the simulator raycasts its
-synthetic lidar against. Only a scenario with no arena falls back to the
+→ that artifact's `map.yaml`). Getting this right matters more since the
+lidar became a live PhysX sensor: it now scans the physics scene rather than
+the map, so a wrong map no longer hides inside a scan derived from that same
+map — it shows up as AMCL failing to converge. (Pass `--map-lidar` and the old
+map-raycast behaviour, and that circularity, come back.) Only a scenario with
+no arena falls back to the
 robot artifact's colocated `map.yaml`, which is the **hardware** arena
 (`0701_robocup_arena3`) and shares no occupied cell with `rcw2026`.
 `navigation.launch.py` has no scenario, so pass `arena:=rcw2026` (or an
@@ -378,7 +382,28 @@ ros2 run camera_server camera_server_node --ros-args \
   -p depth_topic:=/camera/depth/image_raw \
   -p color_info_topic:=/camera/color/camera_info \
   -p depth_info_topic:=/camera/color/camera_info
+
+# The arm RealSense needs its OWN server under this exact name: generalist_node
+# and yolo_seg_node read "camera: realsense" frames through the
+# /wrist_camera_server service endpoint, never straight off the topics.
+ros2 run camera_server camera_server_node --ros-args \
+  -r __node:=wrist_camera_server \
+  -p use_sim_time:=true \
+  -p color_topic:=/camera/xarm_camera/color/image_raw \
+  -p depth_topic:=/camera/xarm_camera/aligned_depth_to_color/image_raw \
+  -p color_info_topic:=/camera/xarm_camera/color/camera_info \
+  -p depth_info_topic:=/camera/xarm_camera/aligned_depth_to_color/camera_info
 ```
+
+**Run the wrist camera server too.** The sim already publishes the
+`/camera/xarm_camera/*` topics (hardware-parity names of the D435), but every
+RealSense-path detection (`generalist_node` `camera: realsense`,
+`yolo_seg_node`, the `camera_compat_bridge` wrist leg) fetches frames from the
+`/wrist_camera_server` *service*, exactly as head-camera consumers use
+`/head_camera_server`. Without it every table-grasp detection fails with
+`No realsense camera data within sync threshold` and `grasp` always falls to
+the referee handoff (5-run sim battery, 2026-09-25). `scripts/gpsr-stack`
+launches it and the census requires `wrist_camera_server/get_snapshot`.
 
 **Point the head before expecting anything from vision.** From a pristine
 spawn the head camera looks at the robot's own deck, so `door_detection_srv`
@@ -563,6 +588,43 @@ are never read or printed here.
 To drive a single command instead of the interactive REPL, also export
 `BT_GPSR_CMD="<command text>"` and `BT_GPSR_NUM_COMMANDS=1` before the
 `ros2 run` above.
+
+### Per-trial reset (`scripts/gpsr-run-reset`)
+
+Tier-2 batteries pass `--reset-cmd scripts/gpsr-run-reset`, which runs
+`tools/gpsr_run_reset.py` before every trial. In order, it:
+
+1. Cancels every goal on every action server on the graph. That includes
+   `/navigate_to_pose`, `/go_to_approach`, the arm and gripper actions and
+   the arm_api servers. A TIMEOUT-killed orchestrator otherwise leaves its
+   last goal driving the robot. Lost cancels are re-sent. A goal that
+   ignores its cancel (arm_api `start_grasp`) fails the reset *before* the
+   sim is touched.
+2. Waits for the base to stop.
+3. Calls `/reset_simulation` with scope 2 (STATE). The sim writes the
+   robot root pose, the joints and every free body back to their stack-up
+   state through the live PhysX views (`docs/native-scoped-reset.md`).
+4. Checks the base against `/sim/truth/robot_state`, re-seeds AMCL there,
+   and clears both costmaps. Wheel odometry does not jump, so only
+   `map→odom` moves.
+5. Zeroes the arm and re-homes pan/tilt, settles 9 s, and checks the
+   settled pose against the first reset of the same stack. The tolerance
+   is 0.05 m / 2°.
+
+Each success appends one JSON line to `$GPSR_RESET_RECORD` (default
+`gpsr_stack_logs/run-reset.jsonl`). Point it at the batch dir and check the
+batch with
+`python3 tools/gpsr_run_reset.py --summarize <batch>/run-reset.jsonl`.
+Failures exit 1 with the reason on stderr, which tier2 puts in the trial's
+ERROR detail.
+
+If the error says **"reset stop remains asserted"**, the sim is paused
+with its reset stop held, and every later reset will fail too. Restart
+the stack (`scripts/gpsr-stack down`, then `up`).
+
+`IdleReset` requires publishers on both the arm and the gripper action
+status topics. A stack without the gripper action server therefore cannot
+reset (`missing action publishers=[...]`); it is not skipped.
 
 ---
 

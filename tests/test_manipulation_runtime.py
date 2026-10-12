@@ -961,6 +961,44 @@ class ManipulationRuntimeTest(unittest.TestCase):
         self.assertEqual(backend.gripper_effort_limit, 12.0)
         self.assertEqual(float(gripper.effort_limit[0, 0]), 12.0)
 
+    def test_scoped_reset_restores_readonly_gripper_limit_through_real_setter(self) -> None:
+        from tinker_sim_isaac.scoped_reset import PhysicsBaseline, ResetFailure
+
+        for failed_write in (False, True):
+            with self.subTest(failed_write=failed_write):
+                backend = _backend()
+                robot = backend._robot
+                backend._default_gripper_effort_limit = 2.5
+                backend._gripper_effort_full_scale_n = 10.0
+                backend._set_gripper_effort_limit(2.5)  # 2.5 N maps to 0.625 Nm.
+                self.assertEqual(backend.gripper_effort_limit, 0.625)
+                with self.assertRaises(AttributeError):
+                    backend.gripper_effort_limit = 0.625
+                robot.data.root_link_pose_w = torch.cat(
+                    (robot.data.root_pos_w, robot.data.root_quat_w), dim=-1
+                )
+                robot.data.root_com_vel_w = torch.zeros((1, 6))
+                robot.reset = lambda: None
+                robot.write_joint_state_to_sim_index = lambda **kwargs: None
+                backend._base_hold_pose = None
+                baseline = PhysicsBaseline(backend, read_bodies=lambda: {})
+                backend._set_gripper_effort_limit(10.0)
+                backend._safety_stopped = True
+                if failed_write:
+                    backend._write_gripper_drive_physx_max_force = lambda *args: ([], False)
+                    with self.assertRaisesRegex(ResetFailure, "gripper effort limit"):
+                        baseline.restore()
+                else:
+                    baseline.restore()
+                    self.assertEqual(backend.gripper_effort_limit, 0.625)
+                    self.assertEqual(robot.limit_calls[-1]["limits"].tolist(), [[0.625]])
+                    self.assertEqual(float(robot.actuators["gripper"].effort_limit[0, 0]), 0.625)
+                    self.assertEqual(robot.root_view.get_dof_max_forces()[0][0], 0.625)
+                    writes = len(robot.limit_calls)
+                    baseline.restore()
+                    self.assertEqual(len(robot.limit_calls), writes + 1)
+
+
     def test_repeated_identical_gripper_effort_limit_writes_once(self) -> None:
         """The bridge re-sends the gripper packet at 150 Hz; an unchanged ceiling
         must not reach the PhysX writer again (each write costs a physics step)."""
@@ -2236,7 +2274,12 @@ class ManipulationRuntimeTest(unittest.TestCase):
         gateway.spin_once()
 
         self.assertIn("non-contiguous", gateway._last_command_error)
-        self.assertAlmostEqual(float(gateway.backend._position_targets[0, 1]), 0.2)
+        # The skipped snapshot is never applied, and the gap stops the robot
+        # (measured-pose hold) instead of leaving the 0.2 command executing --
+        # see tests/test_command_gap_failsafe.py.
+        self.assertTrue(gateway._command_stream_lost)
+        self.assertTrue(gateway.backend._safety_stopped)
+        self.assertAlmostEqual(float(gateway.backend._position_targets[0, 1]), -0.4)
 
     def test_gateway_only_timeout_adopts_newer_generation_after_fresh_false(self) -> None:
         gateway = _protocol_gateway()
@@ -2743,7 +2786,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             sdfPathToInt=lambda path: resolved_sdf_calls.append(path) or 987
         )
 
-        with patch.dict(sys.modules, {"omni.usd": fake_usd}):
+        with patch.dict(sys.modules, {"omni": ModuleType("omni"), "omni.usd": fake_usd}):
             with patch("omni.usd", fake_usd, create=True):
                 with patch("pxr.PhysicsSchemaTools", fake_schema_tools, create=True):
                     resolved = backend._resolve_articulation_sleep_ids()
@@ -2769,7 +2812,7 @@ class ManipulationRuntimeTest(unittest.TestCase):
             sdfPathToInt=lambda path: omitted_sdf_calls.append(path) or 987
         )
 
-        with patch.dict(sys.modules, {"omni.usd": fake_usd2}):
+        with patch.dict(sys.modules, {"omni": ModuleType("omni"), "omni.usd": fake_usd2}):
             with patch("omni.usd", fake_usd2, create=True):
                 with patch("pxr.PhysicsSchemaTools", fake_schema_tools2, create=True):
                     omitted = backend._resolve_articulation_sleep_ids()
@@ -5396,23 +5439,8 @@ class ManipulationRuntimeTest(unittest.TestCase):
             "distal tiers (j3:30, j4:50, j5:30, j6-7:20)",
         )
 
-    def test_gripper_mimic_joints_driven_and_mirrored_to_drive_joint(self) -> None:
-        """Source contract: the gripper mimic joints are actively driven and
-        mirror drive_joint 1:1.
-
-        The tinker2 gripper is a mimic linkage -- the URDF mimics all five
-        finger/knuckle joints (left_finger_joint, left_inner_knuckle_joint,
-        right_inner_knuckle_joint, right_outer_knuckle_joint, right_finger_joint)
-        to drive_joint 1:1. But the URDF->USD import DROPPED every <mimic>: in
-        robot.usd those joints carry no drive and no coupling (proven), so the
-        earlier "leave them passive" contract let drive_joint close while the
-        fingers flopped and the jaw closed straight through the object. The
-        repair restores the coupling in software: the five mimics live in a
-        distinct 'gripper_mimic' group with NON-ZERO gains, and step() mirrors
-        drive_joint's target into them each step
-        (_mirror_gripper_mimic_targets). The 'gripper' actuator still scopes to
-        drive_joint only.
-        """
+    def test_gripper_mimic_joints_use_native_linkage_without_extra_motors(self) -> None:
+        """The master is driven; native mimic followers remain passive."""
         backend_source = (
             ROOT / "simulation/tinker_sim_isaac/backend.py"
         ).read_text(encoding="utf-8")
@@ -5514,89 +5542,10 @@ class ManipulationRuntimeTest(unittest.TestCase):
             f"{sorted(mimic_joints)}; they must live in a distinct group",
         )
         for name, cfg in driven:
-            self.assertNotEqual(
-                float(cfg.get("stiffness", 0.0)),  # type: ignore[arg-type]
-                0.0,
-                f"mimic group {name!r} must be actively driven (non-zero "
-                "stiffness): robot.usd dropped the URDF mimic coupling, so a "
-                "passive group leaves the fingers flopping and the jaw closes "
-                "through the object",
-            )
+            self.assertEqual(float(cfg.get("stiffness", -1.0)), 0.0)
+            self.assertEqual(float(cfg.get("damping", -1.0)), 0.0)
+        self.assertIn("configure_gripper_mimic_constraints(self._sim.stage)", backend_source)
 
-        # The coupling the USD dropped is restored in software: step() must
-        # mirror drive_joint's MEASURED angle into the five mimic joints so
-        # they track the master 1:1 (URDF mimic semantics; see the behavioral
-        # test below).
-        self.assertIn(
-            "_mirror_gripper_mimic_targets",
-            backend_source,
-            "backend must mirror drive_joint's measured angle into the mimic joints",
-        )
-        for joint in mimic_joints:
-            self.assertIn(
-                joint,
-                backend_source,
-                f"the gripper mimic mirror must reference {joint}",
-            )
-
-    def test_gripper_mimic_followers_track_measured_drive_angle(self) -> None:
-        """URDF ``<mimic joint="drive_joint" multiplier="1">`` means
-        ``q_follower = q_drive`` -- the driving joint's ACTUAL angle. The real
-        xArm gripper is one motor plus gear-coupled, parallelogram fingers, so
-        a blocked drive knuckle stops the whole linkage.
-
-        Mirroring the COMMANDED target instead breaks that the moment the
-        object blocks the drive: the five followers keep chasing the far
-        target as independent k=1500 motors -- the right knuckle over-runs
-        the stalled left one and shoves the object into the weak pad, and the
-        finger joints curl the pads about the finger axis (measured in-process:
-        drive stalled at 0.43 rad while the pads ran to 0.845, 25 N vs 5 N
-        pads, the object tilted 12 deg; the grasp bench's "pads close through
-        to 0.728, 18 mm past the knife"). With the measured-angle mirror the
-        same closes pinch symmetrically and retain through a lift.
-        """
-        names = (
-            "drive_joint",
-            "left_finger_joint",
-            "left_inner_knuckle_joint",
-            "right_outer_knuckle_joint",
-            "right_finger_joint",
-            "right_inner_knuckle_joint",
-            "joint1",
-        )
-        backend = object.__new__(IsaacWholeRobotBackend)
-        backend._torch = torch
-        backend.dt = 1.0 / 120.0
-        backend._drive_joint_index = 0
-        backend._gripper_mimic_indices = (1, 2, 3, 4, 5)
-        # Drive blocked by the object at 0.43 rad, still pushing at 1.2 rad/s
-        # commanded slew; the command target sits far ahead at 0.85.
-        backend._robot = SimpleNamespace(
-            data=SimpleNamespace(
-                joint_names=names,
-                joint_pos=torch.tensor([[0.43, 0.6, 0.6, 0.6, 0.6, 0.6, 0.0]], dtype=torch.float32),
-                joint_vel=torch.tensor([[1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
-            )
-        )
-        backend._position_targets = torch.tensor(
-            [[0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.0]], dtype=torch.float32
-        )
-        backend._mirror_gripper_mimic_targets()
-        expected = 0.43 + 1.2 / 120.0  # measured angle + one control step of feed-forward
-        for index in backend._gripper_mimic_indices:
-            self.assertAlmostEqual(
-                float(backend._position_targets[0, index]),
-                expected,
-                places=6,
-                msg=f"follower {names[index]} must track the drive's measured angle, not its 0.85 target",
-            )
-        # The drive's own target is untouched (the master keeps its command).
-        self.assertAlmostEqual(float(backend._position_targets[0, 0]), 0.85, places=6)
-        # At stall (zero drive velocity) the followers hold exactly the drive angle.
-        backend._robot.data.joint_vel[0, 0] = 0.0
-        backend._mirror_gripper_mimic_targets()
-        for index in backend._gripper_mimic_indices:
-            self.assertAlmostEqual(float(backend._position_targets[0, index]), 0.43, places=6)
 
     def test_gripper_lead_clamp_defaults_off_with_measured_mirror(self) -> None:
         """With mimic-correct followers the press is bounded by drive_joint's
@@ -5658,6 +5607,25 @@ class ManipulationRuntimeTest(unittest.TestCase):
         vel = view.velocities.numpy()[0].tolist()
         self.assertEqual([round(v, 4) for v in vel], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.assertIs(backend._park_views[path], view)
+
+    def test_set_entity_pose_physics_restores_kinematic_pose_without_velocity_write(self) -> None:
+        class KinematicView:
+            def get_transforms(self):
+                return SimpleNamespace(device="cpu")
+
+            def set_transforms(self, data, indices):
+                self.transforms = data.numpy()
+
+            def set_velocities(self, data, indices):
+                raise AssertionError("PhysX forbids velocity writes to kinematic actors")
+
+        backend = object.__new__(IsaacWholeRobotBackend)
+        view = KinematicView()
+        backend._park_views = {"/World/table": view}
+        self.assertTrue(backend.set_entity_pose_physics(
+            "/World/table", [1., 2., 3.], [0., 0., 0., 1.],
+            linear_velocity=None, angular_velocity=None))
+        self.assertEqual(view.transforms[0].tolist(), [1., 2., 3., 0., 0., 0., 1.])
 
     def test_set_entity_pose_physics_false_without_resolvable_view(self) -> None:
         """No cached view and no live PhysX (unit env) -> graceful False."""

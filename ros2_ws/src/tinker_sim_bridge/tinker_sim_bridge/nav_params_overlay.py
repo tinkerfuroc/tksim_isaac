@@ -86,6 +86,37 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(planner, dict):
         planner["tolerance"] = 0.6
 
+    # AMCL odometry noise: the upstream alphas (0.2-0.3) model the real
+    # tracer's wheel odometry. The sim base's odometry tracks Isaac ground
+    # truth to 0.4% in rotation and millimetres in translation, so those
+    # alphas only scatter the particles -- ~2.6 deg of heading spread per
+    # filter update -- and the last update before the robot stops leaves
+    # that scatter frozen in the estimate (AMCL does not update at rest).
+    # Live vs ground truth, 2026-10-10, surface-only map, 4-stop route x 5
+    # headings: alphas 0.2-0.3 -> mean 0.094 m, max 0.180 m; 0.1 -> 0.062 m;
+    # 0.05 -> 0.057 m, max 0.109 m, yaw 1.6 -> 0.8 deg. (A 2026-09-11 trial
+    # of 0.05 on the solid map was worse, 0.52 m vs 0.18 m, as particles
+    # could not recover from scan/map mismatch; the surface-only map
+    # removed that mismatch.)
+    amcl = result.get("amcl", {}).get("ros__parameters")
+    if isinstance(amcl, dict):
+        for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
+            amcl[alpha] = 0.05
+        # Hold the estimate through in-place pivots (Bug A, 2026-10-11):
+        # pure rotation about base_link is exact in sim odometry, but every
+        # AMCL update during a pivot (one per 0.1 rad upstream) moved the
+        # estimate 1-1.5 cm with heading. RPP parks right at
+        # xy_goal_tolerance and pivots to the goal yaw; those centimetres
+        # put it back outside, where it pivots to the path heading instead
+        # -- 446-697 deg of back-and-forth for a 0.25 m goal next to
+        # side_table_02, with collision-ahead warnings from the sweep.
+        # 3.0 rad: 192-208 deg, no loop. Any 5 cm of travel still updates.
+        amcl["update_min_a"] = 3.0
+        # AMCL localizes on a surface-only copy of the arena map, served by
+        # its own map_server on this topic (see amcl_map.py); the costmaps
+        # keep the solid map on /map.
+        amcl["map_topic"] = "amcl_map"
+
     # Inflation, split by costmap (2026-08-28 doorway-wedge debug):
     #
     # GLOBAL 0.22: at 0.30/0.35 m (inscribed radius 0.26) a robot parked
@@ -124,10 +155,19 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     # 90-degree turn INTO a 0.95 m doorway has no collision-free DWB
     # trajectory (validated: robot stalled at the north door mouth at
     # (-0.5, 3.66) with 32 progress-failures after the ObstacleFootprint
-    # fix), while the actual sim body passes easily. Overlay a sim-true
-    # envelope with margin (0.65 x 0.54): rear -0.45, front +0.20, half-
-    # width 0.27 (covers wheels). Upstream file stays hardware's.
-    sim_footprint = "[ [0.20, 0.27], [0.20, -0.27], [-0.45, -0.27], [-0.45, 0.27] ]"
+    # fix), while the actual sim body passes easily. Overlay the sim body
+    # plus 3 cm (0.57 x 0.47): rear -0.41, front +0.16, half-width 0.235
+    # (wheels sit inside |y| 0.157); circumscribed radius 0.473 m.
+    # Upstream file stays hardware's. (The first sim envelope carried 7 cm,
+    # radius 0.525: next to furniture it blocked in-place pivots the body
+    # clears -- at the side_table_02 departure pose 22 of 72 headings hit
+    # lethal and RPP's 1 s pivot projection deadlocked until a patience
+    # abort, 2026-10-11. With 3 cm: 10 of 72, and that pivot clears.)
+    # NOTE: navigation_dwb_launch.py then overwrites every footprint key from
+    # the robot profile (RobotField('base.footprint')), so the value that
+    # actually reaches the costmaps is tinker_robot_config's tinker2_sim
+    # profile -- keep the two equal (tests/test_sim_robot_profile.py).
+    sim_footprint = "[ [0.16, 0.235], [0.16, -0.235], [-0.41, -0.235], [-0.41, 0.235] ]"
     for costmap in ("local_costmap", "global_costmap"):
         node = result.get(costmap, {}).get(costmap, {}).get("ros__parameters", {})
         if "footprint" in node:
@@ -209,7 +249,14 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
             # velocity, so the pivot actually executes.
             "rotate_to_heading_angular_vel": 0.6,
             "max_angular_vel": 0.6,
-            "min_approach_linear_velocity": 0.05,
+            # Must exceed velocity_smoother's deadband_velocity (0.08):
+            # near the goal RPP scales linear down to this floor, and a
+            # command under the deadband is zeroed, so the base parks just
+            # outside the tolerance and spins while AMCL's heading-
+            # dependent estimate drags it back and forth across the
+            # boundary (2026-10-10 live A/B: 0.05 -> median 74 s and
+            # ~2000 deg per goal; 0.10 -> 16 s, ~480 deg).
+            "min_approach_linear_velocity": 0.10,
             "approach_velocity_scaling_dist": 0.6,
             "max_robot_pose_search_dist": 10.0,
             "allow_reversing": False,

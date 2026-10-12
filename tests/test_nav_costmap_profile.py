@@ -229,6 +229,43 @@ class UpstreamParamsTest(unittest.TestCase):
         xy_tol = cs["general_goal_checker"]["xy_goal_tolerance"]
         self.assertGreater(fp["min_lookahead_dist"], xy_tol)
 
+    def test_near_goal_speed_floor_clears_the_smoother_deadband(self):
+        # Inside approach_velocity_scaling_dist RPP scales linear speed down
+        # to min_approach_linear_velocity; velocity_smoother then zeroes any
+        # |v| below deadband_velocity[0]. A floor under the deadband leaves
+        # the robot parked just outside the goal tolerance, turning in place
+        # while AMCL's heading-dependent estimate swings it across the
+        # boundary (live A/B 2026-10-10: floor 0.05 -> median 74 s, ~2000
+        # deg per goal; floor 0.10 -> 16 s, ~480 deg, no command zeroed).
+        result = prior_map_costmap_overlay(self.params)
+        fp = result["controller_server"]["ros__parameters"]["FollowPath"]
+        deadband = result["velocity_smoother"]["ros__parameters"]["deadband_velocity"][0]
+        self.assertGreater(fp["min_approach_linear_velocity"], deadband)
+
+    def test_amcl_odometry_noise_matches_the_sim_base(self):
+        # The sim base's odometry tracks ground truth to 0.4% in rotation;
+        # the upstream tracer alphas (0.2-0.3) scatter heading ~2.6 deg per
+        # AMCL update and that scatter freezes at rest. Live route vs ground
+        # truth 2026-10-10: 0.2-0.3 -> mean 0.094 m; 0.1 -> 0.062 m;
+        # 0.05 -> 0.057 m.
+        amcl = prior_map_costmap_overlay(self.params)["amcl"]["ros__parameters"]
+        for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
+            self.assertEqual(amcl[alpha], 0.05, alpha)
+
+    def test_amcl_holds_its_estimate_through_in_place_pivots(self):
+        # RPP stops translating as soon as the estimate is inside
+        # xy_goal_tolerance, so the robot parks AT that boundary, then pivots
+        # to the goal yaw. Pivots leave the true base_link fixed to 1 mm, but
+        # each AMCL update (every update_min_a of rotation) moved the estimate
+        # 1-1.5 cm with heading -- back out of the tolerance, where RPP pivots
+        # to the path heading instead: an endless back-and-forth next to
+        # furniture (Bug A, 2026-10-11 live: 446-697 deg of pivoting for a
+        # 0.25 m goal). update_min_a 3.0: 192-208 deg, no loop.
+        amcl = prior_map_costmap_overlay(self.params)["amcl"]["ros__parameters"]
+        self.assertGreaterEqual(amcl["update_min_a"], 3.0)
+        # Translation still triggers updates as before.
+        self.assertEqual(amcl["update_min_d"], 0.05)
+
     def test_footprint_is_sim_parity_not_hardware_envelope(self):
         # The upstream 0.95 m footprint models the REAL robot's rear
         # overhang; the sim body spans x [-0.38, +0.13] (robot.urdf base
@@ -237,8 +274,19 @@ class UpstreamParamsTest(unittest.TestCase):
         result = prior_map_costmap_overlay(self.params)
         for costmap in ("local_costmap", "global_costmap"):
             fp = result[costmap][costmap]["ros__parameters"]["footprint"]
-            self.assertIn("-0.45", fp)
             self.assertNotIn("-0.7", fp)
+
+    def test_footprint_is_the_sim_body_plus_three_centimetres(self):
+        # Body x [-0.38, +0.13], y [-0.205, +0.205] plus 3 cm: circumscribed
+        # radius 0.473 m (was 0.525 with 7 cm). Next to furniture the larger
+        # margin blocked in-place pivots the body clears: at the
+        # side_table_02 departure pose (1.06, 1.75), 22 of 72 headings hit
+        # lethal and RPP's 1 s pivot projection deadlocked until a patience
+        # abort; with this footprint 10 of 72, and that pivot clears.
+        result = prior_map_costmap_overlay(self.params)
+        for costmap in ("local_costmap", "global_costmap"):
+            fp = yaml.safe_load(result[costmap][costmap]["ros__parameters"]["footprint"])
+            self.assertEqual(fp, [[0.16, 0.235], [0.16, -0.235], [-0.41, -0.235], [-0.41, 0.235]])
 
 if __name__ == "__main__":
     unittest.main()

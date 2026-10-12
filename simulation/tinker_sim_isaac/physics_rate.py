@@ -134,3 +134,25 @@ def resolve_solver_iterations(kind: str, override: str | None) -> int | None:
             f"{name}={value} is outside 1..{MAXIMUM_SOLVER_ITERATIONS}"
         )
     return value
+
+
+def configure_scene_velocity_iterations(scene_prim, override: str | None) -> int | None:
+    """Set an explicit scene-wide velocity count, including TGS position-only mode.
+
+    Scene bounds clamp the maximum requested by actors in each solver island.
+    Unset, preserve the scene and every actor's authored iteration policy.
+    """
+    if override is None or not str(override).strip():
+        return None
+    name = "TINKER_SIM_SCENE_VELOCITY_ITERATIONS"
+    try:
+        value = int(str(override).strip())
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number, got {override!r}") from None
+    if not 0 <= value <= MAXIMUM_SOLVER_ITERATIONS:
+        raise ValueError(f"{name}={value} is outside 0..{MAXIMUM_SOLVER_ITERATIONS}")
+    for suffix in ("minVelocityIterationCount", "maxVelocityIterationCount"):
+        attribute = scene_prim.GetAttribute("physxScene:" + suffix)
+        if not attribute or not attribute.Set(value):
+            raise RuntimeError(f"Cannot configure PhysX scene attribute {suffix}")
+    return value

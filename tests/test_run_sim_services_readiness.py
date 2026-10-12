@@ -105,14 +105,19 @@ class _FakeGateway:
         self._calls.append("gateway.mark_services_ready")
 
 
-def test_enable_sim_control_services_enables_then_updates_then_marks_ready() -> None:
+def test_enable_sim_control_services_enables_then_updates_then_marks_ready(monkeypatch) -> None:
     calls: list = []
     _install_fake_enable_extension(calls)
     run_sim = _load_run_sim()
+    monkeypatch.setattr(
+        "tinker_sim_isaac.scoped_reset.install_scoped_reset",
+        lambda gateway: calls.append("install_scoped_reset"),
+    )
 
     run_sim._enable_sim_control_services(_FakeApp(calls), _FakeGateway(calls))
 
     assert calls == [
+        "install_scoped_reset",
         ("enable_extension", "isaacsim.ros2.sim_control"),
         "app.update",
         "gateway.mark_services_ready",

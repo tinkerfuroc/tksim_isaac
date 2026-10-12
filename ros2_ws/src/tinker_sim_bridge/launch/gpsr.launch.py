@@ -11,6 +11,7 @@ if _tools.is_dir() and str(_tools) not in sys.path:
     sys.path.insert(0, str(_tools))
 
 from tinker_sim_deploy.runtime import (
+    _head_camera_aim,
     resolve_arena_map_yaml,
     resolve_current_artifact,
     scenario_arena_id,
@@ -18,6 +19,7 @@ from tinker_sim_deploy.runtime import (
     topic_control_description,
 )
 
+from tinker_sim_bridge.amcl_map import default_amcl_map_dir, write_amcl_map
 from tinker_sim_bridge.nav_params_overlay import (
     default_destination,
     write_prior_map_params,
@@ -117,6 +119,10 @@ def _resolve(context):
     # cam-stand TF rewrite, keyed on TINKER_SIM_WRIST_CAMERA_AIM (the frame the
     # wrist images advertise must be the one they were rendered from).
     robot_description = sim_robot_description(resolved_artifact.robot_urdf)
+    # Same idea for the head camera: the image frame alias carries the
+    # level-forward render correction (keyed on TINKER_SIM_HEAD_CAMERA_AIM).
+    _HEAD_ALIAS_XYZ, _HEAD_ALIAS_Q = _head_camera_aim().head_camera_optical_alias(
+        os.environ.get("TINKER_SIM_HEAD_CAMERA_AIM"))
 
     calibration = root / "simulation/calibration/tinker2-missing.json"
     # AMCL must localize on the arena the simulator raycasts its lidar
@@ -149,6 +155,7 @@ def _resolve(context):
     nav_params = write_prior_map_params(
         upstream_nav_params, default_destination(upstream_nav_params)
     )
+    amcl_map_yaml = write_amcl_map(map_yaml, default_amcl_map_dir())
 
     safety_source_deadline_s = float(
         LaunchConfiguration("safety_source_deadline_s").perform(context)
@@ -408,13 +415,18 @@ def _resolve(context):
         # images advertise does not exist in TF, and a consumer that asks for
         # a detection in map silently drops it -- GPSR run16 detected the
         # person at conf 1.0 and returned zero objects for exactly that
-        # reason. Identity: the URDF link already is the optical frame.
+        # reason. Identity under hardware parity (the URDF link already is the
+        # optical frame); under TINKER_SIM_HEAD_CAMERA_AIM it carries the same
+        # correction the sim renders the head camera with
+        # (head_camera_aim.head_camera_optical_alias).
         Node(
             package="tf2_ros", executable="static_transform_publisher",
             name="head_camera_optical_alias_tf",
             arguments=[
-                "--x", "0", "--y", "0", "--z", "0",
-                "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
+                "--x", repr(_HEAD_ALIAS_XYZ[0]), "--y", repr(_HEAD_ALIAS_XYZ[1]),
+                "--z", repr(_HEAD_ALIAS_XYZ[2]),
+                "--qx", repr(_HEAD_ALIAS_Q[0]), "--qy", repr(_HEAD_ALIAS_Q[1]),
+                "--qz", repr(_HEAD_ALIAS_Q[2]), "--qw", repr(_HEAD_ALIAS_Q[3]),
                 "--frame-id", "head_camera_color_optical_frame",
                 "--child-frame-id", "camera_color_optical_frame",
             ],
@@ -429,10 +441,11 @@ def _resolve(context):
             arguments=[
                 # Must match where the sim's raycast lidar prim actually
                 # sits: the URDF's livox_joint, base_link -> livox_frame at
-                # (0.09, 0, 0.195). It also has to match the height the AMCL
-                # map is rasterized at -- tools/tinker_sim_deploy/arena_map.py
-                # slices the arena colliders at livox_scan_height(), read from
-                # that same joint. The previous (0.12, 0, 0.25) predated any
+                # (0.09, 0, 0.195). The AMCL map is rasterized from that same
+                # joint too -- tools/tinker_sim_deploy/arena_map.py projects the
+                # arena colliders over livox_scan_band(): the joint height plus
+                # base_link's rest height, up 2 m, as pointcloud_to_laserscan
+                # keeps. The previous (0.12, 0, 0.25) predated any
                 # real sensor and agreed with neither.
                 "--x", "0.09", "--y", "0.0", "--z", "0.195",
                 "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
@@ -456,6 +469,22 @@ def _resolve(context):
                 "params_file": str(nav_params),
                 "autostart": "True", "use_composition": "False", "use_respawn": "False",
             }.items(),
+        ),
+        # AMCL localizes on a surface-only copy of the map (amcl_map.py): its
+        # own map_server on /amcl_map. The costmaps keep the solid map that
+        # the localization launch's map_server serves on /map.
+        Node(
+            package="nav2_map_server", executable="map_server", name="amcl_map_server",
+            output="screen",
+            parameters=[{
+                "use_sim_time": True, "yaml_filename": str(amcl_map_yaml),
+                "topic_name": "amcl_map", "frame_id": "map",
+            }],
+        ),
+        Node(
+            package="nav2_lifecycle_manager", executable="lifecycle_manager",
+            name="lifecycle_manager_amcl_map", output="screen",
+            parameters=[{"use_sim_time": True, "autostart": True, "node_names": ["amcl_map_server"]}],
         ),
         # The hardware localization launch does not propagate use_sim_time to
         # robot_localization. Launch the same EKF parameters here with the
@@ -504,7 +533,10 @@ def generate_launch_description():
                     "PATH_TOLERANCE_VIOLATED."
                 ),
             ),
-            SetEnvironmentVariable("ROBOT_NAME", "tinker2"),
+            # tinker2 with the SIM body's footprint: navigation_dwb_launch.py
+            # overwrites every costmap footprint from this profile, after
+            # nav_params_overlay has run.
+            SetEnvironmentVariable("ROBOT_NAME", "tinker2_sim"),
             OpaqueFunction(function=_resolve),
         ]
     )

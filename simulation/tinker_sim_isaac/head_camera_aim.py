@@ -356,6 +356,34 @@ def _multiply(
     )
 
 
+def head_camera_optical_alias(
+    value: str | None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """``(xyz, (qx, qy, qz, qw))`` for TF ``head_camera_color_optical_frame ->
+    camera_color_optical_frame`` (the frame the head images are stamped with).
+
+    ``apply_head_aim_correction`` renders the head camera at
+    ``R_mount . C . R_spec`` with the mount prim being
+    ``head_camera_color_optical_frame``, and (for the level-forward preset)
+    ``view_axis_forward_offset_m`` along the corrected view axis. The image
+    frame must carry the same ``C`` and offset or every deprojection is
+    rotated by it -- sim battery 2026-10-01: with an identity alias the head
+    camera's optical axis pointed straight UP in TF while the render looked
+    45 deg down, so persons resolved at z = 2-5 m and the GPSR person approach
+    drove to the robot's own position. ``None`` / unset keeps the identity
+    (hardware parity).
+    """
+    correction = resolve_head_aim_correction(value)
+    if correction is None:
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+    offset = LEVEL_FORWARD_VIEW_OFFSET_M if correction == LEVEL_FORWARD_CORRECTION_WXYZ else 0.0
+    w, x, y, z = correction
+    # C applied to the optical +Z (view) axis, scaled by the forward offset.
+    view = (2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y))
+    xyz = tuple(offset * v for v in view)
+    return xyz, (x, y, z, w)  # type: ignore[return-value]
+
+
 def apply_head_aim_correction(
     specs: Iterable, correction: Sequence[float], *, camera_name: str = HEAD_CAMERA_NAME
 ) -> tuple:

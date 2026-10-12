@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -30,12 +31,13 @@ from tinker_sim_deploy.arena_artifact import (
     attribution_markdown,
     publish_asset_artifact,
 )
-from tinker_sim_deploy.arena_map import livox_scan_height, rasterize
+from tinker_sim_deploy.arena_map import livox_scan_band, rasterize
 from tinker_sim_deploy.arena_surfaces import PlacementSurface, placement_json, world_surface
 from tinker_sim_deploy.arena_world import (
     ArenaLayout,
     BoxCollider,
     MeshCollider,
+    collision_overrides_from_config,
     parse_model_colliders,
     parse_world,
 )
@@ -228,10 +230,17 @@ def _check_bounds(
 # per-model conversion
 # --------------------------------------------------------------------------- #
 def _convert_model(
-    checkout: Path, scratch: Path, model_id: str, converter: ConverterHooks
+    checkout: Path,
+    scratch: Path,
+    model_id: str,
+    converter: ConverterHooks,
+    collider_override: tuple[BoxCollider, ...] | None = None,
 ) -> tuple[Path, bytes, tuple[BoxCollider | MeshCollider, ...], tuple[float, ...], tuple[float, ...]]:
     sdf_bytes = _read_upstream(checkout, f"models/{model_id}/model.sdf")
-    colliders = parse_model_colliders(sdf_bytes)
+    # A config "collision_overrides" entry replaces the SDF's own colliders
+    # (see arena_world.expand_collision_override): the open shelves' SDF
+    # <mesh> collision would otherwise become one solid convex hull.
+    colliders = collider_override if collider_override is not None else parse_model_colliders(sdf_bytes)
     uri, scale, pose = _visual_mesh_info(sdf_bytes)
     glb_path = _resolve_glb_path(checkout, model_id, uri)
 
@@ -257,8 +266,11 @@ def convert_furniture_model(
     converter: ConverterHooks,
     tolerance: float,
     bounds_check_exceptions: frozenset[str] = frozenset(),
+    collider_override: tuple[BoxCollider, ...] | None = None,
 ) -> _FurnitureConversion:
-    usd_path, sdf_bytes, colliders, uri, glb_path = _convert_model(checkout, scratch, model_id, converter)
+    usd_path, sdf_bytes, colliders, uri, glb_path = _convert_model(
+        checkout, scratch, model_id, converter, collider_override
+    )
     measured = converter.measure_bounds(usd_path)
 
     box_colliders = tuple(item for item in colliders if isinstance(item, BoxCollider))
@@ -391,6 +403,7 @@ def run_import(
     layout = parse_world(world_bytes, allowlist, model_skiplist=skiplist)
     tolerance = float(config.get("bounds_tolerance_m", 0.01))
     bounds_check_exceptions = frozenset(str(item) for item in config.get("bounds_check_exceptions", ()))
+    collider_overrides = collision_overrides_from_config(config)
     model_ids = sorted({item.model_id for item in layout.furniture})
 
     with tempfile.TemporaryDirectory(prefix="arena-import-scratch-") as scratch_dir:
@@ -401,7 +414,8 @@ def run_import(
 
         for model_id in model_ids:
             conversion = convert_furniture_model(
-                checkout, scratch, model_id, converter, tolerance, bounds_check_exceptions
+                checkout, scratch, model_id, converter, tolerance, bounds_check_exceptions,
+                collider_override=collider_overrides.get(model_id),
             )
             payload.update(conversion.payload)
             map_colliders[model_id] = conversion.map_colliders
@@ -411,8 +425,8 @@ def run_import(
         converter.compose_arena(arena_usd_path, layout, furniture_dir_name="furniture")
         payload["arena.usd"] = arena_usd_path.read_bytes()
 
-        scan_height = livox_scan_height(_read_robot_urdf(repo_root))
-        pgm_bytes, map_yaml_bytes = rasterize(layout, map_colliders, scan_height=scan_height)
+        scan_band = livox_scan_band(_read_robot_urdf(repo_root))
+        pgm_bytes, map_yaml_bytes = rasterize(layout, map_colliders, scan_band=scan_band)
         payload["map.pgm"] = pgm_bytes
         payload["map.yaml"] = map_yaml_bytes
 
@@ -455,14 +469,19 @@ def report_bounds(config: Mapping[str, object], checkout: Path, converter: Conve
     allowlist = frozenset(str(item) for item in config["model_allowlist"])
     skiplist = frozenset(str(item) for item in config.get("model_skiplist", ()))
     layout = parse_world(world_bytes, allowlist, model_skiplist=skiplist)
+    collider_overrides = collision_overrides_from_config(config)
     model_ids = sorted({item.model_id for item in layout.furniture})
 
     with tempfile.TemporaryDirectory(prefix="arena-import-report-") as scratch_dir:
         scratch = Path(scratch_dir)
         for model_id in model_ids:
-            usd_path, sdf_bytes, _colliders, _uri, _glb_path = _convert_model(checkout, scratch, model_id, converter)
+            usd_path, sdf_bytes, _colliders, _uri, _glb_path = _convert_model(
+                checkout, scratch, model_id, converter, collider_overrides.get(model_id)
+            )
             bounds = converter.measure_bounds(usd_path)
             kind = "non-box" if _has_non_box_collision(sdf_bytes) else "box"
+            if model_id in collider_overrides:
+                kind += f" (overridden: {len(collider_overrides[model_id])} boxes)"
             print(f"{model_id}: collision={kind} bounds={bounds}")
 
 
@@ -470,6 +489,56 @@ def _build_real_converter():
     from tinker_sim_deploy import arena_convert
 
     return arena_convert
+
+
+class ReuseFurnitureHooks:
+    """``ConverterHooks`` for a Kit-free re-collide/re-compose of an arena.
+
+    ``convert_glb_to_usd`` copies the already converted ``furniture/<model_id>
+    .usd`` (+ its ``textures/<model_id>`` directory) from a previously
+    published artifact and strips the colliders authored there
+    (``arena_convert.strip_model_colliders``), giving the same corrected mesh
+    Kit's converter would produce; collider authoring, composition and
+    measurement then run through the real pxr-only ``arena_convert``
+    functions. Use it when only collider/composition logic changed and the
+    GLB->USD conversion (which needs a running Kit / ``omni.kit.asset_converter``)
+    would be a no-op re-run. The source lock is still derived from the pinned
+    checkout's SDF/GLB bytes, exactly as in a full import.
+    """
+
+    def __init__(self, artifact_dir: Path, real: object | None = None) -> None:
+        self._artifact_dir = Path(artifact_dir)
+        self._real = real if real is not None else _build_real_converter()
+        if not (self._artifact_dir / "furniture").is_dir():
+            raise AssetArtifactError(f"{self._artifact_dir}: no furniture/ directory to reuse")
+
+    def convert_glb_to_usd(
+        self,
+        glb_path: Path,
+        usd_path: Path,
+        *,
+        mesh_scale: tuple[float, float, float] = _IDENTITY_SCALE,
+        mesh_pose: tuple[float, float, float, float, float, float] = _IDENTITY_POSE,
+    ) -> None:
+        model_id = usd_path.stem
+        source = self._artifact_dir / "furniture" / f"{model_id}.usd"
+        if not source.is_file():
+            raise AssetArtifactError(f"{self._artifact_dir}: no converted furniture USD for {model_id}")
+        usd_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, usd_path)
+        textures = self._artifact_dir / "furniture" / "textures" / model_id
+        if textures.is_dir():
+            shutil.copytree(textures, usd_path.parent / "textures" / model_id, dirs_exist_ok=True)
+        self._real.strip_model_colliders(usd_path)
+
+    def author_model_colliders(self, usd_path: Path, colliders) -> None:
+        self._real.author_model_colliders(usd_path, colliders)
+
+    def compose_arena(self, arena_usd: Path, layout: ArenaLayout, furniture_dir_name: str = "furniture") -> None:
+        self._real.compose_arena(arena_usd, layout, furniture_dir_name=furniture_dir_name)
+
+    def measure_bounds(self, usd_path: Path):
+        return self._real.measure_bounds(usd_path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -486,6 +555,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print per-model measured bounds and exit without publishing",
     )
+    parser.add_argument(
+        "--reuse-furniture-from",
+        type=Path,
+        default=None,
+        metavar="ARTIFACT_DIR",
+        help="Kit-free rebuild: reuse the converted furniture USDs of a previously "
+             "published arena artifact dir (re-authoring colliders with pxr) instead "
+             "of re-running the GLB conversion under a SimulationApp",
+    )
     args = parser.parse_args(argv)
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
@@ -498,6 +576,21 @@ def main(argv: list[str] | None = None) -> int:
         _verify_pin(checkout, str(config["commit"]))
     else:
         clone_pin(str(config["repository"]), str(config["commit"]), checkout)
+
+    if args.reuse_furniture_from is not None:
+        # pxr only (the repo venv has it): no SimulationApp, no GPU.
+        converter = ReuseFurnitureHooks(args.reuse_furniture_from)
+        print(
+            f"arena_import: reusing converted furniture from {args.reuse_furniture_from} "
+            "(no Kit; colliders re-authored with pxr)",
+            flush=True,
+        )
+        if args.report_bounds:
+            report_bounds(config, checkout, converter)
+        else:
+            run_import(config, repo_root, checkout, converter)
+        print("arena_import: pipeline finished", flush=True)
+        return 0
 
     # Kit conversion (arena_convert.convert_glb_to_usd/author_model_colliders
     # /compose_arena/measure_bounds) needs a running SimulationApp with

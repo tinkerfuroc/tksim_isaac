@@ -234,3 +234,33 @@ class AimGeometryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- TF for the image frame follows the render (sim battery 2026-10-01) ------
+
+def _rotate(q_xyzw, v):
+    x, y, z, w = q_xyzw
+    # q * v * q^-1
+    tx, ty, tz = 2 * (y * v[2] - z * v[1]), 2 * (z * v[0] - x * v[2]), 2 * (x * v[1] - y * v[0])
+    return (v[0] + w * tx + y * tz - z * ty, v[1] + w * ty + z * tx - x * tz, v[2] + w * tz + x * ty - y * tx)
+
+
+def test_head_optical_alias_is_identity_without_the_aim_override():
+    from tinker_sim_isaac.head_camera_aim import head_camera_optical_alias
+    assert head_camera_optical_alias(None) == ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    assert head_camera_optical_alias("") == ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+
+def test_head_optical_alias_carries_the_level_forward_correction_and_offset():
+    from tinker_sim_isaac.head_camera_aim import (
+        LEVEL_FORWARD_CORRECTION_WXYZ, LEVEL_FORWARD_VIEW_OFFSET_M, head_camera_optical_alias,
+    )
+    xyz, q = head_camera_optical_alias("level-forward")
+    w, x, y, z = LEVEL_FORWARD_CORRECTION_WXYZ
+    assert q == (x, y, z, w)
+    view = _rotate(q, (0.0, 0.0, 1.0))
+    assert math.dist(xyz, tuple(LEVEL_FORWARD_VIEW_OFFSET_M * v for v in view)) < 1e-9
+    # Live check 2026-10-01 (tilt 25.6, pan 0): head_camera_color_optical_frame
+    # in map had its +Z at (-0.10, 0.26, 0.96) -- straight up -- while the
+    # robot faced (0.39, -0.92); through the alias the view became
+    # (0.36, -0.82, -0.45): along the heading, 26.7 deg down.

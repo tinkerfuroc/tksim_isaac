@@ -163,10 +163,41 @@ class SceneQuerySupportContractTest(unittest.TestCase):
             "decision or the two can silently disagree",
         )
 
-    def test_gate_helper_still_defaults_off(self) -> None:
-        """Turning scene queries on must not turn the raycast lidar on."""
+    def test_one_predicate_decides_both(self) -> None:
+        """Scene queries and the rig are ONE decision, in both directions.
+
+        This used to assert the gate defaulted OFF. That was a statement about
+        the default, not about this file's invariant, and it went stale when
+        the live sensor became the default on 2026-09-11; the default itself is
+        owned by ``test_raycast_lidar_gate.py``.
+
+        What matters here is the coupling, and it is worth stating as a value
+        and not only as the AST shape checked above. Queries without a rig pay
+        PhysX for nothing; a rig without queries publishes empty clouds while
+        reporting ``is_valid`` -- the silent failure this whole contract exists
+        to prevent. So the same predicate must answer both questions, whatever
+        it currently returns.
+        """
         for profile in ("navigation-parity", "sensor-rich", "manipulation-core"):
-            self.assertFalse(rs.raycast_lidar_enabled(profile, False, False))
+            for qualification in (False, True):
+                for map_lidar in (False, True):
+                    decision = rs.raycast_lidar_enabled(
+                        profile, qualification, map_lidar
+                    )
+                    self.assertIsInstance(
+                        decision,
+                        bool,
+                        "the rig guard and the scene-query flag are handed "
+                        "this one value; it must be a plain bool so neither "
+                        "can coerce it differently",
+                    )
+                    if map_lidar:
+                        self.assertFalse(
+                            decision,
+                            "--map-lidar must leave scene queries off as well "
+                            "as the rig: paying for queries with no rig is "
+                            "pure cost",
+                        )
 
 
 if __name__ == "__main__":
