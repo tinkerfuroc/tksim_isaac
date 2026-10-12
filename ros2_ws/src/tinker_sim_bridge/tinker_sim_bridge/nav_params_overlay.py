@@ -74,6 +74,22 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(controller, dict):
         controller["xy_goal_tolerance"] = 0.2
         controller["yaw_goal_tolerance"] = 0.25
+        # Bug A pivot loop (2026-10-12): Humble RPP pivots to the goal yaw
+        # only while the carrot is inside the checker's xy tolerance, with no
+        # hysteresis, and controller_server resets SimpleGoalChecker's latch
+        # on every replan (~1 Hz). Parked at the boundary, 1-3 cm of AMCL
+        # jitter during the pivot flipped RPP between the goal-yaw and
+        # path-heading pivots (at xy 0.3: estimate 0.282-0.314 m, 381 deg,
+        # 5 reversals). The sticky checker keeps the latch for the goal
+        # across replans and reports xy + release_margin to RPP while
+        # latched; past that radius xy is required again. xy +
+        # release_margin must stay under FollowPath's min_lookahead_dist,
+        # or RPP's carrot-distance test reads "at goal" from any distance.
+        # At xy 0.2 the stock checker did not loop in the same repros (the
+        # robot coasts ~0.16-0.19 m in before pivoting), so this guards the
+        # stop-on-the-boundary case rather than fixing a measured 0.2 loop.
+        controller["plugin"] = "tinker_sim_nav_plugins::StickyGoalChecker"
+        controller["release_margin"] = 0.04
 
     # Planner tolerance: with a relaxed goal tolerance the robot parks close
     # to furniture, sometimes inside the inflation ring. At the upstream
@@ -106,16 +122,15 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
     if isinstance(amcl, dict):
         for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
             amcl[alpha] = 0.05
-        # Hold the estimate through in-place pivots (Bug A, 2026-10-11):
-        # pure rotation about base_link is exact in sim odometry, but every
-        # AMCL update during a pivot (one per 0.1 rad upstream) moved the
-        # estimate 1-1.5 cm with heading. RPP parks right at
-        # xy_goal_tolerance and pivots to the goal yaw; those centimetres
-        # put it back outside, where it pivots to the path heading instead
-        # -- 446-697 deg of back-and-forth for a 0.25 m goal next to
-        # side_table_02, with collision-ahead warnings from the sweep.
-        # 3.0 rad: 192-208 deg, no loop. Any 5 cm of travel still updates.
-        amcl["update_min_a"] = 3.0
+        # update_min_a stays at the upstream 0.1 rad. 3.0 (2026-10-11) held
+        # the estimate through goal pivots to stop the Bug A loop, but
+        # AMCL then cannot refine at a stop: route mean 0.055-0.076 m vs
+        # 0.042-0.049 m at 0.1 (2026-10-12, fixed 10 Hz scan). The loop is
+        # handled by the sticky goal checker instead (see
+        # general_goal_checker above); with it, 0.1 gave a route mean of
+        # 0.043 m, side_table_02 goals at 214-218 deg with no loop, and
+        # 8/8 clean 120 deg boundary pivots.
+        amcl["update_min_a"] = 0.1
         # AMCL localizes on a surface-only copy of the arena map, served by
         # its own map_server on this topic (see amcl_map.py); the costmaps
         # keep the solid map on /map.

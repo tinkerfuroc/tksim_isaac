@@ -24,6 +24,7 @@ configuration, never the other way around.
 from __future__ import annotations
 
 import copy
+import xml.etree.ElementTree as ET
 import sys
 import unittest
 from pathlib import Path
@@ -229,6 +230,32 @@ class UpstreamParamsTest(unittest.TestCase):
         xy_tol = cs["general_goal_checker"]["xy_goal_tolerance"]
         self.assertGreater(fp["min_lookahead_dist"], xy_tol)
 
+    def test_goal_checker_latch_survives_replans(self):
+        # Bug A pivot loop: controller_server resets SimpleGoalChecker's
+        # latch on every replan and RPP has no hysteresis at the xy
+        # tolerance, so AMCL jitter during the goal-yaw pivot flipped it
+        # between goal-yaw and path-heading pivots. The sim's checker keeps
+        # the latch for the goal and widens the tolerance RPP sees.
+        cs = prior_map_costmap_overlay(self.params)["controller_server"]["ros__parameters"]
+        checker = cs["general_goal_checker"]
+        self.assertEqual(checker["plugin"], "tinker_sim_nav_plugins::StickyGoalChecker")
+        self.assertGreater(checker["release_margin"], 0.0)
+        plugins = ET.parse(ROOT / "ros2_ws/src/tinker_sim_nav_plugins/plugins.xml")
+        self.assertIn(checker["plugin"], [c.get("type") for c in plugins.iter("class")])
+        build = (ROOT / "scripts/build-humble-overlay").read_text(encoding="utf-8")
+        self.assertIn("tinker_sim_nav_plugins", build)
+
+    def test_latched_tolerance_stays_under_min_lookahead(self):
+        # While latched RPP sees xy + release_margin. Its carrot is the goal
+        # only when the goal is nearer than the lookahead; farther away the
+        # carrot sits at >= min_lookahead_dist. Widened past that, RPP would
+        # pivot to the goal yaw from any distance and a real localization
+        # correction would never drive the robot back.
+        cs = prior_map_costmap_overlay(self.params)["controller_server"]["ros__parameters"]
+        checker = cs["general_goal_checker"]
+        widened = checker["xy_goal_tolerance"] + checker["release_margin"]
+        self.assertLess(widened, cs["FollowPath"]["min_lookahead_dist"])
+
     def test_near_goal_speed_floor_clears_the_smoother_deadband(self):
         # Inside approach_velocity_scaling_dist RPP scales linear speed down
         # to min_approach_linear_velocity; velocity_smoother then zeroes any
@@ -252,18 +279,16 @@ class UpstreamParamsTest(unittest.TestCase):
         for alpha in ("alpha1", "alpha2", "alpha3", "alpha4"):
             self.assertEqual(amcl[alpha], 0.05, alpha)
 
-    def test_amcl_holds_its_estimate_through_in_place_pivots(self):
-        # RPP stops translating as soon as the estimate is inside
-        # xy_goal_tolerance, so the robot parks AT that boundary, then pivots
-        # to the goal yaw. Pivots leave the true base_link fixed to 1 mm, but
-        # each AMCL update (every update_min_a of rotation) moved the estimate
-        # 1-1.5 cm with heading -- back out of the tolerance, where RPP pivots
-        # to the path heading instead: an endless back-and-forth next to
-        # furniture (Bug A, 2026-10-11 live: 446-697 deg of pivoting for a
-        # 0.25 m goal). update_min_a 3.0: 192-208 deg, no loop.
+    def test_amcl_refines_during_in_place_pivots(self):
+        # update_min_a 3.0 once held the estimate through goal pivots
+        # (Bug A), but then AMCL cannot refine at a stop: route mean
+        # 0.055-0.076 m vs 0.042-0.049 m at 0.1 (2026-10-12 live). The pivot
+        # loop is the sticky goal checker's job now, so updates stay on.
         amcl = prior_map_costmap_overlay(self.params)["amcl"]["ros__parameters"]
-        self.assertGreaterEqual(amcl["update_min_a"], 3.0)
-        # Translation still triggers updates as before.
+        cs = prior_map_costmap_overlay(self.params)["controller_server"]["ros__parameters"]
+        self.assertLessEqual(amcl["update_min_a"], 0.1)
+        self.assertEqual(
+            cs["general_goal_checker"]["plugin"], "tinker_sim_nav_plugins::StickyGoalChecker")
         self.assertEqual(amcl["update_min_d"], 0.05)
 
     def test_footprint_is_sim_parity_not_hardware_envelope(self):

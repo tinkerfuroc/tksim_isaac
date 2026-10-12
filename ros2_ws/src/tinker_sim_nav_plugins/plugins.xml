@@ -1,0 +1,7 @@
+<class_libraries>
+  <library path="sticky_goal_checker">
+    <class type="tinker_sim_nav_plugins::StickyGoalChecker" base_class_type="nav2_core::GoalChecker">
+      <description>SimpleGoalChecker whose xy latch is keyed to the goal pose, so replans do not clear it, and which reports a widened xy tolerance while latched.</description>
+    </class>
+  </library>
+</class_libraries>
