@@ -16,7 +16,7 @@ Timestamps below are epoch seconds minus 1791640000.
 
 ## Bug A: RPP "collision ahead" loops at stand poses next to furniture
 
-**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (a new GPSR session, to be started by the user) for the fixed furniture nav poses.
+**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-pos-time-fix) for the fixed furniture nav poses and the sim-time goto budget. Both decision items are implemented in tk25_decision `e4e8b5f` (dev-gpsr-2), pending live verification.
 
 ### Symptom
 
@@ -248,7 +248,10 @@ In trial s70718-004 ("navigate to the kitchen_table then look for a food and gra
     - **Related latent bug (lidar slice height):** `arena_map.livox_scan_height()` slices the static map at the livox joint's 0.195 m, but the real scan plane is 0.195 + 0.0775 = 0.2725 m above the floor.
       - No collider in the rcw2026 `arena.usd` (60 prims checked) changes coverage between those heights, so the current map is unaffected.
       - The correct form is joint z + rest height, or better, the union of footprints over [sensor z, sensor z + 2.0] to match pointcloud_to_laserscan.
-      - debug-gpsr-nav-issue offers to implement this in `tools/tinker_sim_deploy/arena_map.py` if the user wants it.
+      - **Fixed in tinker-sim `a7cc1e4`** (debug-gpsr-nav-issue, user approved).
+        - The map is now rasterized from every collider overlapping [sensor, sensor + 2.0 m], with sensor = livox joint z + rest height (0.2725 m in sim).
+        - The rest height comes from the shared `tools/tinker_sim_deploy/robot_geometry.py`, the same helper `with_base_footprint` uses.
+        - rcw2026 is unchanged, so no artifact rebuild is needed.
   - **Ruled out: the objects had moved.** The truth probe sampled the mug about 25,700 times in s70718-004, with 0.00 m displacement. It stayed at (2.70, −3.15, 0.72) throughout.
   - **Still to check under battery conditions** (live manipulation on both GPUs, arm in the "orbbec look" pose, after a corrective drive or collision):
     - whether the head's actual (rendered) pitch differs from the joint state used for TF while under load
