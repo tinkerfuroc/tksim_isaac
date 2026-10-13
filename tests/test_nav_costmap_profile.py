@@ -206,6 +206,19 @@ class UpstreamParamsTest(unittest.TestCase):
         self.assertTrue(fp["use_rotate_to_heading"])
         self.assertNotIn("critics", fp)
 
+    def test_collision_projection_does_not_overshoot_the_departure_turn(self):
+        # RPP holds the current (v, w) for the whole projection horizon. At
+        # the default 1.0 s the side_table_02 departure turn (w -0.58) is
+        # extrapolated past the path heading onto the table: 48 warnings and
+        # a patience abort in 4 departures while the executed motion kept
+        # >= 0.078 m. 0.5 s: none, and still ~3x the stopping distance at
+        # full speed (0.175 m vs ~0.06 m).
+        fp = prior_map_costmap_overlay(self.params)["controller_server"]["ros__parameters"]["FollowPath"]
+        horizon = fp["max_allowed_time_to_collision_up_to_carrot"]
+        self.assertLessEqual(horizon, 0.5)
+        stop = fp["desired_linear_vel"] ** 2 / (2 * 1.8) + fp["desired_linear_vel"] / 15.0
+        self.assertGreater(horizon * fp["desired_linear_vel"], 2 * stop)
+
     def test_controller_reads_the_robots_real_odometry(self):
         # Upstream leaves controller_server's odom_topic at the default
         # ``odom`` — a topic nothing publishes on this robot (odometry is

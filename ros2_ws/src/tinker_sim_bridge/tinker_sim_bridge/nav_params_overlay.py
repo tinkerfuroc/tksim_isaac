@@ -263,6 +263,20 @@ def prior_map_costmap_overlay(params: Mapping[str, Any]) -> dict:
             "regulated_linear_scaling_min_speed": 0.1,
             "use_rotate_to_heading": True,
             "rotate_to_heading_min_angle": 0.785,
+            # Collision projection horizon (default 1.0 s). RPP projects the
+            # CURRENT (v, w) unchanged for the whole horizon. Departing
+            # side_table_02 it starts driving 45 deg off the path at w -0.58
+            # (max turn, low speed); held for 0.75-1.0 s that turn runs past
+            # the path heading and swings the rear-left corner onto the
+            # table edge -> "collision ahead" (48 warnings + 1 patience
+            # abort in 4 departures, 2026-10-13). The executed motion eases
+            # off as it aligns and never came within 0.078 m of a lethal
+            # cell. 0.5 s: 0 warnings in 4 departures, same clearance
+            # (0.060-0.096 m). It still covers 0.175 m at 0.35 m/s against
+            # ~0.06 m to stop (smoother decel 1.8 m/s^2 + one control
+            # cycle). Pivoting earlier instead (rotate_to_heading_min_angle
+            # 0.35) also silenced it but brought a corner to 0.003 m.
+            "max_allowed_time_to_collision_up_to_carrot": 0.5,
             # Well above the sim base's measured angular deadband
             # (~0.1 rad/s); RPP ramps toward this from the last COMMANDED
             # velocity, so the pivot actually executes.
