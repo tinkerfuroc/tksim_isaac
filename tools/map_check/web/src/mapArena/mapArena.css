@@ -1,8 +1,10 @@
 /* Map → arena screen, after mockups/map-arena-v1.html. Scoped under .ma. */
 
-/* This screen fills the window below the header; the panes scroll inside. */
-.app:has(> main > .ma) { height: 100vh; display: grid; grid-template-rows: auto 1fr; }
-.app:has(> main > .ma) > main { min-height: 0; }
+/* While this tab is shown the screen fills the window below the header; the panes scroll inside.
+   (App keeps every tab mounted in its own panel and hides the inactive ones.) */
+.app:has(> main > :not([hidden]) > .ma) { height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+.app:has(> main > :not([hidden]) > .ma) > main { min-height: 0; }
+.app > main > :has(> .ma) { height: 100%; }
 
 .ma {
   /* --wall, --shape, --shape-off, --erase, --free come from palette.ts (set inline). */
@@ -17,6 +19,9 @@
 .ma-step h3 .count { text-transform: none; letter-spacing: 0; font-family: var(--mono); }
 .ma-step.off { opacity: .45; pointer-events: none; }
 .ma-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ma-row.ma-between { justify-content: space-between; }
+.ma-steps { display: contents; }
+.ma-step > [role=status]:empty { margin-top: -8px; } /* an idle live region takes no space */
 .ma-files { display: flex; gap: 6px; flex-wrap: wrap; }
 .ma-file { font: 12px var(--mono); background: var(--raise); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; overflow-wrap: anywhere; }
 .ma-meta { font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -37,13 +42,16 @@
 .ma .btn:hover:not(:disabled) { border-color: #3d4756; }
 .ma .btn:disabled { opacity: .45; cursor: default; }
 .ma .btn.on { background: var(--bad-soft); border-color: var(--erase); color: var(--erase); }
+.ma .btn.small { font-size: 12px; padding: 3px 10px; }
+.ma .btn.danger { background: var(--bad-soft); border-color: var(--erase); color: var(--erase); }
 .ma .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 
 .ma-msg { font-size: 12px; padding: 7px 9px; border-radius: 6px; display: grid; gap: 6px; overflow-wrap: anywhere; }
 .ma-msg.err { background: var(--bad-soft); color: var(--bad); }
 .ma-msg.ok { background: var(--ok-soft); color: var(--ok); }
 .ma-msg.note { background: var(--accent-soft); color: var(--ink); }
-.ma-msg.ok code, .ma-msg.note code { background: rgba(0, 0, 0, .25); }
+.ma-msg.warn { background: var(--warn-soft); color: var(--ink); border: 1px solid var(--warn); }
+.ma-msg.ok code, .ma-msg.note code, .ma-msg.warn code { background: rgba(0, 0, 0, .25); }
 .ma-msg .btn { justify-self: start; font-size: 12px; padding: 3px 10px; }
 .ma-dest { font: 11.5px var(--mono); color: var(--muted); display: grid; gap: 2px; overflow-wrap: anywhere; }
 
@@ -58,6 +66,8 @@
 .ma-shapes td.num { font-family: var(--mono); color: var(--muted); }
 .ma-shapes td.name { white-space: nowrap; }
 .ma-shapes .xy { font: 11px var(--mono); color: var(--muted); }
+.ma-shapes button.pick { all: unset; display: block; cursor: pointer; border-radius: 4px; padding: 1px 2px; margin: -1px -2px; }
+.ma-shapes button.pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ma-shapes .empty { padding: 10px; color: var(--muted); font-size: 12px; cursor: default; }
 
 /* 2D map and 3D preview */
@@ -67,7 +77,7 @@
 .ma-pane h2 { margin: 0; padding: 8px 14px; font-size: 13px; font-weight: 500; display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); background: var(--panel); white-space: nowrap; }
 .ma-pane h2 span { color: var(--muted); font-weight: 400; font-size: 12px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; }
 .ma-stage { position: relative; min-height: 0; overflow: hidden; }
-.ma-stage canvas.map2d { position: absolute; inset: 0; margin: auto; image-rendering: pixelated; cursor: pointer; touch-action: none; }
+.ma-stage canvas.map2d { position: absolute; image-rendering: pixelated; cursor: pointer; touch-action: none; }
 .ma-stage canvas.map2d.erasing { cursor: crosshair; }
 .ma-brush { position: absolute; border: 1.5px solid var(--erase); background: rgba(242, 119, 108, .15); pointer-events: none; border-radius: 2px; }
 .ma-view3d { position: absolute; inset: 0; }

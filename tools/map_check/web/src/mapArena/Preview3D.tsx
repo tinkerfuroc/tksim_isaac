@@ -18,6 +18,7 @@ interface Scene3D {
   render: () => void;
 }
 
+const MIN_ELEVATION_RAD = THREE.MathUtils.degToRad(5); // the camera stays this far above horizontal
 const shapeColor = new THREE.Color(PALETTE.shape);
 const selColor = new THREE.Color(PALETTE.selected);
 
@@ -89,8 +90,21 @@ export default function Preview3D({ grid, edit }: Props) {
     camera.position.set(cx - 0.7 * span, cy - 1.2 * span, 1.2 * span);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(cx, cy, 0);
-    controls.maxPolarAngle = Math.PI / 2 - 0.02; // stay above the floor
+    // Keep the view on the arena: never at or below the horizon, never inside a box or lost
+    // in the distance, and the orbit centre (moved by panning) on the arena, not under the floor.
+    controls.maxPolarAngle = Math.PI / 2 - MIN_ELEVATION_RAD;
+    controls.minDistance = Math.max(0.5, 0.05 * span);
+    controls.maxDistance = 3 * span;
     controls.update();
+    const lo = new THREE.Vector3(grid.ox - 1, grid.oy - 1, 0);
+    const hi = new THREE.Vector3(grid.ox + spanX + 1, grid.oy + spanY + 1, Math.max(3, 0.25 * span));
+    const shift = new THREE.Vector3();
+    const keepTargetOnArena = () => {
+      shift.copy(controls.target).clamp(lo, hi).sub(controls.target);
+      if (shift.lengthSq() === 0) return;
+      controls.target.add(shift);
+      camera.position.add(shift);
+    };
 
     // three r155+ lights are physical; ×π matches the mockup's legacy-light look.
     scene.add(new THREE.HemisphereLight(0xdfe8f5, 0x20242b, 0.75 * Math.PI));
@@ -119,7 +133,8 @@ export default function Preview3D({ grid, edit }: Props) {
     const shapeMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 });
 
     const render = () => renderer.render(scene, camera);
-    controls.addEventListener('change', render);
+    const onChange = () => { keepTargetOnArena(); render(); };
+    controls.addEventListener('change', onChange);
     const resize = () => {
       const w = el.clientWidth;
       const h = el.clientHeight;
@@ -136,7 +151,7 @@ export default function Preview3D({ grid, edit }: Props) {
 
     return () => {
       ro.disconnect();
-      controls.removeEventListener('change', render);
+      controls.removeEventListener('change', onChange);
       controls.dispose();
       clearGroup(group);
       box.dispose();
@@ -145,6 +160,7 @@ export default function Preview3D({ grid, edit }: Props) {
       floorGeo.dispose();
       floorMat.dispose();
       sun.shadow.map?.dispose();
+      renderer.forceContextLoss();
       renderer.dispose();
       renderer.domElement.remove();
       three.current = null;

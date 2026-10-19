@@ -31,7 +31,15 @@ export function App() {
           ))}
         </nav>
       </header>
-      <main>{hash === '#/poses' ? <CheckPoses /> : <MapArena />}</main>
+      {/* Both screens stay mounted so unsaved edits survive a tab switch; only one is shown. */}
+      <main>
+        <div role="tabpanel" aria-label="Map → arena" hidden={hash !== '#/arena'}>
+          <MapArena active={hash === '#/arena'} />
+        </div>
+        <div role="tabpanel" aria-label="Check poses" hidden={hash !== '#/poses'}>
+          <CheckPoses />
+        </div>
+      </main>
     </div>
   );
 }

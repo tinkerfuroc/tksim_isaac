@@ -12,10 +12,15 @@ interface Props {
   onToggle: (id: number) => void;
   onHeight: (id: number, h: number) => void;
   onSelect: (id: number | null) => void;
+  onValidity: (field: string, valid: boolean) => void;
 }
 
-/** Closed outlines with a fill checkbox and a height each. Click a row to highlight the shape. */
-export function ShapesList({ outlines, shapes, selected, onToggle, onHeight, onSelect }: Props) {
+/**
+ * Closed outlines with a fill checkbox and a height each. Each row's name is a toggle button
+ * (keyboard: Tab to it, Space/Enter) that highlights the shape; a click anywhere on the row
+ * does the same for the mouse.
+ */
+export function ShapesList({ outlines, shapes, selected, onToggle, onHeight, onSelect, onValidity }: Props) {
   const box = useRef<HTMLDivElement>(null);
 
   // A shape picked on the 2D map scrolls its row into view.
@@ -36,23 +41,29 @@ export function ShapesList({ outlines, shapes, selected, onToggle, onHeight, onS
           )}
           {outlines.map((o) => {
             const s = shapes[o.id];
+            const on = selected === o.id;
+            const pick = () => onSelect(on ? null : o.id);
             return (
-              <tr key={o.id} data-id={o.id} className={selected === o.id ? 'sel' : undefined}
-                  aria-selected={selected === o.id}
-                  onClick={() => onSelect(selected === o.id ? null : o.id)}>
+              <tr key={o.id} data-id={o.id} className={on ? 'sel' : undefined} onClick={pick}>
                 <td>
                   <input type="checkbox" checked={s.fill} aria-label={`Fill shape ${o.id}`}
                          onClick={(e) => e.stopPropagation()} onChange={() => onToggle(o.id)} />
                 </td>
-                <td className="name" title={`centre x ${o.cx.toFixed(2)}, y ${o.cy.toFixed(2)}`}>
-                  shape {o.id}<br />
-                  <span className="xy">{o.cx.toFixed(1)}, {o.cy.toFixed(1)}</span>
+                <td className="name">
+                  <button type="button" className="pick" aria-pressed={on}
+                          title={`centre x ${o.cx.toFixed(2)}, y ${o.cy.toFixed(2)}`}
+                          aria-label={`Highlight shape ${o.id} at x ${o.cx.toFixed(1)}, y ${o.cy.toFixed(1)}`}
+                          onClick={(e) => { e.stopPropagation(); pick(); }}>
+                    shape {o.id}<br />
+                    <span className="xy">{o.cx.toFixed(1)}, {o.cy.toFixed(1)}</span>
+                  </button>
                 </td>
                 <td className="num">{o.area_m2.toFixed(2)}</td>
                 <td>
                   <NumberField value={s.height} onChange={(h) => onHeight(o.id, h)}
                                min={MIN_HEIGHT_M} max={MAX_HEIGHT_M} step={0.05} digits={2}
-                               disabled={!s.fill} label={`Height of shape ${o.id}`} />
+                               disabled={!s.fill} label={`Height of shape ${o.id}`}
+                               field={`shape ${o.id} height`} onValidity={onValidity} />
                 </td>
               </tr>
             );

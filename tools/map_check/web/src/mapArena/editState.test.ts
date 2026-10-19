@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import golden from '../../../tests/fixtures/rects_golden.json';
 import type { Outline, WebGrid } from '../api';
 import {
-  applyFillRule, boxesFor, decodeGrid, eraseAt, eraseLine, initEdit, savePayload, selectShape,
-  setDefaultShapeHeight, setShapeHeight, setWallHeight, toggleShape, undoStroke,
+  applyFillRule, boxesFor, contentBounds, decodeGrid, eraseAt, eraseLine, initEdit, isDirty, markSaved,
+  savePayload, selectShape, setDefaultShapeHeight, setShapeHeight, setWallHeight, toggleShape, undoStroke,
   type Grid,
 } from './editState';
 
@@ -194,5 +194,55 @@ describe('savePayload', () => {
     });
     expect(p.erased.every(Number.isInteger)).toBe(true);
     expect(JSON.parse(JSON.stringify(p))).toEqual(p);
+  });
+});
+
+describe('unsaved changes', () => {
+  it('a fresh load is clean; any edit makes it dirty; selecting does not', () => {
+    const g = gridOf(ROWS);
+    const s0 = initEdit(g, OUTLINES, DEFAULTS);
+    expect(isDirty(s0)).toBe(false);
+    expect(isDirty(selectShape(s0, 1))).toBe(false);
+    expect(isDirty(setWallHeight(s0, 0.7))).toBe(true);
+    expect(isDirty(toggleShape(s0, 1))).toBe(true);
+    expect(isDirty(setShapeHeight(s0, 2, 0.9))).toBe(true);
+    expect(isDirty(setDefaultShapeHeight(s0, 0.9))).toBe(true);
+    expect(isDirty(applyFillRule(s0, 0.5))).toBe(true);
+    expect(isDirty(eraseAt(s0, g, 0, 0, 1))).toBe(true);
+  });
+  it('is judged against the last load or save, so going back is clean again', () => {
+    const g = gridOf(ROWS);
+    const s0 = initEdit(g, OUTLINES, DEFAULTS);
+    expect(isDirty(toggleShape(toggleShape(s0, 1), 1))).toBe(false);
+    expect(isDirty(undoStroke(eraseAt(s0, g, 0, 0, 1)))).toBe(false);
+    expect(isDirty(applyFillRule(s0, 100))).toBe(false); // every shape was already filled
+  });
+  it('markSaved makes the saved settings the new baseline', () => {
+    const g = gridOf(ROWS);
+    const sent = eraseAt(setWallHeight(initEdit(g, OUTLINES, DEFAULTS), 0.8), g, 0, 0, 1);
+    expect(isDirty(markSaved(sent))).toBe(false);
+    // an edit made while the save was in flight stays unsaved
+    const later = toggleShape(sent, 2);
+    const after = markSaved(later, sent);
+    expect(isDirty(after)).toBe(true);
+    expect(isDirty(toggleShape(after, 2))).toBe(false);
+  });
+});
+
+describe('contentBounds', () => {
+  it('is the box around every non-free cell, grown by a margin and clipped to the map', () => {
+    const g = gridOf([
+      [0, 0, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0],
+      [0, 0, 255, 3, 0, 0],
+      [0, 0, 0, 255, 0, 0],
+      [0, 0, 0, 0, 0, 0],
+    ]);
+    expect(contentBounds(g, 0)).toEqual([2, 2, 4, 4]); // [row0, col0, row1, col1)
+    expect(contentBounds(g, 1)).toEqual([1, 1, 5, 5]);
+    expect(contentBounds(g, 9)).toEqual([0, 0, 5, 6]);
+  });
+  it('is the whole map when nothing is occupied', () => {
+    expect(contentBounds(gridOf([[0, 0], [0, 0]]), 2)).toEqual([0, 0, 2, 2]);
   });
 });

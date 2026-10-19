@@ -18,6 +18,13 @@ export interface Grid {
   cells: Uint8Array; // row-major, H rows of W cells
 }
 
+/** The settings that get saved; edits are "unsaved" while they differ from the baseline. */
+interface Baseline {
+  wallHeight: number;
+  shapes: Record<number, ShapeSetting>;
+  erased: Set<number>;
+}
+
 export interface EditState {
   outlines: Outline[];
   wallHeight: number;
@@ -26,6 +33,7 @@ export interface EditState {
   erased: Set<number>; // flat indices r*W+c of occupied cells left out of the arena
   strokes: number[][]; // erased cells per brush drag, oldest first
   selected: number | null;
+  baseline: Baseline; // as last loaded or saved
 }
 
 export interface Boxes {
@@ -61,15 +69,62 @@ export function initEdit(_grid: Grid, outlines: Outline[], defaults: MapBody['de
     shapes[o.id] = { fill: d ? d.fill : false, height: d ? d.height : FALLBACK_SHAPE_HEIGHT };
   }
   const first = outlines.length ? shapes[outlines[0].id].height : FALLBACK_SHAPE_HEIGHT;
+  const erased = new Set<number>();
   return {
     outlines,
     wallHeight: defaults.wall_height,
     defaultShapeHeight: first,
     shapes,
-    erased: new Set(),
+    erased,
     strokes: [],
     selected: null,
+    baseline: { wallHeight: defaults.wall_height, shapes, erased },
   };
+}
+
+/**
+ * True while the settings that would be saved (wall height, each shape's fill and height,
+ * erased cells) differ from what was last loaded or saved. Selection is not an edit.
+ */
+export function isDirty(s: EditState): boolean {
+  const b = s.baseline;
+  if (s.wallHeight !== b.wallHeight) return true;
+  if (s.shapes !== b.shapes) {
+    for (const o of s.outlines) {
+      const x = s.shapes[o.id];
+      const y = b.shapes[o.id];
+      if (x.fill !== y.fill || x.height !== y.height) return true;
+    }
+  }
+  if (s.erased !== b.erased) {
+    if (s.erased.size !== b.erased.size) return true;
+    for (const i of s.erased) if (!b.erased.has(i)) return true;
+  }
+  return false;
+}
+
+/** After a save: the settings of `sent` (the state that was saved; default `s`) become the baseline. */
+export function markSaved(s: EditState, sent: EditState = s): EditState {
+  return { ...s, baseline: { wallHeight: sent.wallHeight, shapes: sent.shapes, erased: sent.erased } };
+}
+
+/**
+ * [row0, col0, row1, col1) around every non-free cell, grown by `margin` cells and clipped to
+ * the map; the whole map when nothing is occupied. The 2D view shows this part of the map.
+ */
+export function contentBounds(g: Grid, margin: number): [number, number, number, number] {
+  let r0 = g.H, c0 = g.W, r1 = 0, c1 = 0;
+  for (let r = 0; r < g.H; r++) {
+    for (let c = 0; c < g.W; c++) {
+      if (g.cells[r * g.W + c] === FREE) continue;
+      if (r < r0) r0 = r;
+      if (r >= r1) r1 = r + 1;
+      if (c < c0) c0 = c;
+      if (c >= c1) c1 = c + 1;
+    }
+  }
+  if (r1 === 0) return [0, 0, g.H, g.W];
+  return [Math.max(0, r0 - margin), Math.max(0, c0 - margin), Math.min(g.H, r1 + margin), Math.min(g.W, c1 + margin)];
 }
 
 function mapShapes(s: EditState, f: (id: number, v: ShapeSetting) => ShapeSetting): EditState {

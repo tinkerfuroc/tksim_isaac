@@ -1,6 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent } from 'react';
-import { FREE, WALL, cellCenter, type EditState, type Grid } from './editState';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
+import { FREE, WALL, cellCenter, contentBounds, type EditState, type Grid } from './editState';
 import { PALETTE, rgb } from './palette';
+import { fitView, pointToCell, type Fit } from './view2d';
+
+const PAD_PX = 16; // space between the map and the pane edges
+const MARGIN_CELLS = 4; // free cells kept around the occupied part of the map
 
 interface Props {
   grid: Grid;
@@ -33,63 +37,64 @@ function describeCell(g: Grid, edit: EditState, [r, c]: Cell): string {
   return `x ${x.toFixed(2)}  y ${y.toFixed(2)}  ·  ${kind}`;
 }
 
-/** The 2D map: one canvas pixel per cell, scaled up to fit with crisp edges. */
+/**
+ * The 2D map: one canvas pixel per cell, scaled up with crisp edges. It shows the occupied part
+ * of the map (plus a small free margin) as large as the pane allows.
+ */
 export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: Props) {
   const stage = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const [fit, setFit] = useState({ w: 0, h: 0, left: 0, top: 0 }); // canvas box in stage px
+  const view = useMemo(() => contentBounds(grid, MARGIN_CELLS), [grid]);
+  const [fit, setFit] = useState<Fit | null>(null); // canvas box in stage px; null while hidden
   const [hover, setHover] = useState<Cell | null>(null);
   const drag = useRef<Cell | null>(null); // last cell of the brush drag in progress
 
-  // Scale the canvas to fit the pane, keeping square cells.
+  // Fit the canvas to the pane on every resize (and when a hidden tab is shown again).
   useLayoutEffect(() => {
     const st = stage.current;
     if (!st) return;
-    const resize = () => {
-      const k = Math.min(st.clientWidth / grid.W, st.clientHeight / grid.H);
-      const w = Math.max(1, Math.floor(grid.W * k));
-      const h = Math.max(1, Math.floor(grid.H * k));
-      setFit({ w, h, left: (st.clientWidth - w) / 2, top: (st.clientHeight - h) / 2 });
-    };
+    const resize = () => setFit(fitView(st.clientWidth, st.clientHeight, view, PAD_PX));
     resize();
     const ro = new ResizeObserver(resize);
     ro.observe(st);
     return () => ro.disconnect();
-  }, [grid]);
+  }, [view]);
 
-  // Paint every cell; cheap enough (one ImageData) to redo on each edit.
+  // Paint the shown cells; cheap enough (one ImageData) to redo on each edit.
   useEffect(() => {
     const cv = canvas.current;
     const ctx = cv?.getContext('2d');
     if (!cv || !ctx) return;
-    cv.width = grid.W;
-    cv.height = grid.H;
-    const img = ctx.createImageData(grid.W, grid.H);
+    const [r0, c0, r1, c1] = view;
+    const w = c1 - c0;
+    cv.width = w;
+    cv.height = r1 - r0;
+    const img = ctx.createImageData(w, r1 - r0);
     const px = img.data;
-    for (let i = 0; i < grid.cells.length; i++) {
-      const v = grid.cells[i];
-      let col: readonly number[];
-      if (v === FREE) col = COLORS.free;
-      else if (v === WALL) col = edit.erased.has(i) ? COLORS.erase : COLORS.wall;
-      else if (edit.selected === v) col = COLORS.selected;
-      else col = edit.shapes[v]?.fill ? COLORS.shape : COLORS.shapeOff;
-      px[i * 4] = col[0]; px[i * 4 + 1] = col[1]; px[i * 4 + 2] = col[2]; px[i * 4 + 3] = 255;
+    for (let r = r0; r < r1; r++) {
+      for (let c = c0; c < c1; c++) {
+        const i = r * grid.W + c;
+        const v = grid.cells[i];
+        let col: readonly number[];
+        if (v === FREE) col = COLORS.free;
+        else if (v === WALL) col = edit.erased.has(i) ? COLORS.erase : COLORS.wall;
+        else if (edit.selected === v) col = COLORS.selected;
+        else col = edit.shapes[v]?.fill ? COLORS.shape : COLORS.shapeOff;
+        const o = ((r - r0) * w + (c - c0)) * 4;
+        px[o] = col[0]; px[o + 1] = col[1]; px[o + 2] = col[2]; px[o + 3] = 255;
+      }
     }
     ctx.putImageData(img, 0, 0);
-  }, [grid, edit.erased, edit.shapes, edit.selected]);
+  }, [grid, view, edit.erased, edit.shapes, edit.selected]);
 
-  const cellAt = (e: PointerEvent): Cell | null => {
-    const b = canvas.current!.getBoundingClientRect();
-    const r = Math.floor(((e.clientY - b.top) / b.height) * grid.H);
-    const c = Math.floor(((e.clientX - b.left) / b.width) * grid.W);
-    return r >= 0 && c >= 0 && r < grid.H && c < grid.W ? [r, c] : null;
+  // Pointer position -> map cell, through the same fit the canvas is placed with.
+  const toCell = (e: PointerEvent, clamp: boolean): Cell | null => {
+    if (!fit || !stage.current) return null;
+    const b = stage.current.getBoundingClientRect();
+    return pointToCell(fit, view, e.clientX - b.left, e.clientY - b.top, clamp);
   };
-  const clampCell = (e: PointerEvent): Cell => {
-    const b = canvas.current!.getBoundingClientRect();
-    const r = Math.floor(((e.clientY - b.top) / b.height) * grid.H);
-    const c = Math.floor(((e.clientX - b.left) / b.width) * grid.W);
-    return [Math.min(grid.H - 1, Math.max(0, r)), Math.min(grid.W - 1, Math.max(0, c))];
-  };
+  const cellAt = (e: PointerEvent) => toCell(e, false);
+  const clampCell = (e: PointerEvent) => toCell(e, true);
 
   const onPointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
@@ -109,6 +114,7 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
     setHover(cellAt(e));
     if (!drag.current) return;
     const cell = clampCell(e);
+    if (!cell) return;
     const [r0, c0] = drag.current;
     if (r0 === cell[0] && c0 === cell[1]) return;
     drag.current = cell;
@@ -116,10 +122,12 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
   };
   const endDrag = () => { drag.current = null; };
 
+  // A newly opened map has nothing under the pointer yet.
+  useEffect(() => { setHover(null); drag.current = null; }, [grid]);
+
   // Leaving erase mode mid-drag ends the drag.
   useEffect(() => { if (!erasing) drag.current = null; }, [erasing]);
 
-  const cellPx = fit.w / grid.W;
   const n = Math.max(1, Math.round(brush));
   const lo = Math.floor((n - 1) / 2);
 
@@ -130,7 +138,7 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
         <canvas
           ref={canvas}
           className={erasing ? 'map2d erasing' : 'map2d'}
-          style={{ width: fit.w, height: fit.h }}
+          style={fit ? { left: fit.left, top: fit.top, width: fit.w, height: fit.h } : { visibility: 'hidden' }}
           aria-label="2D map. Click a shape to highlight it; with the erase brush on, drag over specks."
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
@@ -139,12 +147,12 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
           onLostPointerCapture={endDrag}
           onPointerLeave={() => setHover(null)}
         />
-        {erasing && hover && (
+        {erasing && hover && fit && (
           <div className="ma-brush" style={{
-            left: fit.left + (hover[1] - lo) * cellPx,
-            top: fit.top + (hover[0] - lo) * cellPx,
-            width: n * cellPx,
-            height: n * cellPx,
+            left: fit.left + (hover[1] - lo - view[1]) * fit.cell,
+            top: fit.top + (hover[0] - lo - view[0]) * fit.cell,
+            width: n * fit.cell,
+            height: n * fit.cell,
           }} />
         )}
         <div className="ma-legend">

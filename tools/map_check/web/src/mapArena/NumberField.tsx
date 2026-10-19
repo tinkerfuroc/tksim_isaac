@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { parseInRange } from './fields';
 
 interface Props {
   value: number;
@@ -7,6 +8,10 @@ interface Props {
   max: number;
   step: number;
   digits: number;
+  /** What the teammate calls this field, e.g. "wall height"; used in "Fix the … before saving". */
+  field: string;
+  /** Told whenever the field turns valid or invalid, and that it is valid again on unmount. */
+  onValidity?: (field: string, valid: boolean) => void;
   id?: string;
   label?: string; // aria-label when there is no <label for>
   disabled?: boolean;
@@ -15,17 +20,24 @@ interface Props {
 
 /**
  * A number input that lets you type freely: the value is passed on only while the text is a
- * number within [min, max]. Anything else is outlined in red and snaps back on blur.
+ * number within [min, max]. Anything else stays as typed, outlined in red, and is reported
+ * through onValidity so Save can wait until it is fixed.
  */
-export function NumberField({ value, onChange, min, max, step, digits, id, label, disabled, onEnter }: Props) {
+export function NumberField({
+  value, onChange, min, max, step, digits, field, onValidity, id, label, disabled, onEnter,
+}: Props) {
   const [text, setText] = useState(value.toFixed(digits));
-  const parsed = text.trim() === '' ? NaN : Number(text);
-  const valid = Number.isFinite(parsed) && parsed >= min && parsed <= max;
+  const valid = parseInRange(text, min, max) !== null;
 
   // Follow outside changes (e.g. "default shape height" rewriting every row).
   useEffect(() => {
-    setText((t) => (Number(t) === value && t.trim() !== '' ? t : value.toFixed(digits)));
+    setText((t) => (parseInRange(t, -Infinity, Infinity) === value ? t : value.toFixed(digits)));
   }, [value, digits]);
+
+  useEffect(() => {
+    onValidity?.(field, valid);
+  }, [field, valid, onValidity]);
+  useEffect(() => () => onValidity?.(field, true), [field, onValidity]);
 
   return (
     <input
@@ -36,11 +48,11 @@ export function NumberField({ value, onChange, min, max, step, digits, id, label
       title={valid ? undefined : `Enter a number from ${min} to ${max}`}
       onChange={(e) => {
         setText(e.target.value);
-        const v = Number(e.target.value);
-        if (e.target.value.trim() !== '' && Number.isFinite(v) && v >= min && v <= max) onChange(v);
+        const v = parseInRange(e.target.value, min, max);
+        if (v !== null) onChange(v);
       }}
-      onBlur={() => setText(value.toFixed(digits))}
-      onKeyDown={(e) => { if (e.key === 'Enter' && onEnter) onEnter(); }}
+      onBlur={() => { if (valid) setText(value.toFixed(digits)); }}
+      onKeyDown={(e) => { if (e.key === 'Enter' && onEnter && valid) onEnter(); }}
       onClick={(e) => e.stopPropagation()}
     />
   );
