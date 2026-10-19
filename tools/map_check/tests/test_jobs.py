@@ -1,6 +1,7 @@
 """Render job queue and runner, driven by a fake render command (no Isaac, no GPU)."""
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -12,8 +13,11 @@ import pytest
 from map_check.bench import BenchStore, JobStatus
 from map_check.config import Settings
 from map_check.gpu import BusyReason, GpuStatus
-from map_check.jobs import GpuBusy, JobRunner, default_isaac_command
+from map_check.jobs import UNSET_ENV, GpuBusy, JobRunner, _proc_start, default_isaac_command
 from map_check.overlap import Flag
+from map_check.render.cameras import overview_top
+from map_check.render.isaac_render import overview_labels
+from map_check.render.jobfile import JobPose
 
 ARM = [-87.4, -58.8, -2.4, 8.0, 12.3, -68.5, -8.2]
 TERMINAL = ("done", "failed", "interrupted", "timeout")
@@ -237,23 +241,108 @@ def test_nothing_ticked_refused(tmp_path, settings, runners):
         r.submit("m1", override=False)
 
 
+def leftover_render(tmp_path, settings, server_pid, server_start):
+    """A render left running in its own session, with active.json naming its server.
+
+    Started through a parent that exits at once, so, like a real leftover, it is
+    an orphan that this process neither owns nor reaps.
+    """
+    jobs = settings.state_dir / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    jobfile = jobs / "leftover.json"
+    jobfile.write_text(json.dumps({"out_dir": str(tmp_path / "leftover"), "poses": []}))
+    pids_file = tmp_path / "leftover-pids.json"
+    cmd = fake_command(tmp_path, hang=True, pids=str(pids_file))(jobfile)
+    spawn = subprocess.run(
+        [sys.executable, "-c", "import subprocess, sys; "
+         "print(subprocess.Popen(sys.argv[1:], start_new_session=True, stdout=subprocess.DEVNULL, "
+         "stderr=subprocess.DEVNULL).pid)", *cmd],
+        capture_output=True, text=True, check=True, timeout=10)
+    pid = int(spawn.stdout)
+    (jobs / "active.json").write_text(json.dumps({
+        "pid": pid, "jobfile": str(jobfile), "map": "m1",
+        "server_pid": server_pid, "server_start": server_start}))
+    BenchStore(settings.state_dir).set_job(
+        "m1", JobStatus(id="left", map="m1", status="running", queued_at=1.0))
+    pids = wait_for(lambda: pids_file.exists() and json.loads(pids_file.read_text() or "null"))
+    return pid, pids
+
+
 def test_restart_marks_interrupted(tmp_path, settings, runners):
     # T8 store: a job stored as running reads back as interrupted
     BenchStore(settings.state_dir).set_job(
         "m2", JobStatus(id="old", map="m2", status="running", queued_at=1.0))
-    r = runner(runners, settings, BenchStore(settings.state_dir), fake_command(tmp_path))
-    assert r.status("m2").status == "interrupted"
+    old = JobRunner(settings, BenchStore(settings.state_dir), fake_command(tmp_path),
+                    gpu_probe=free_gpu, robot_model=FakeRobot())
+    assert old.status("m2").status == "interrupted"
+    old.shutdown()  # releases the state dir
 
-    # a server that died mid-job leaves its render running; the next one kills it
-    pids_file = tmp_path / "pids.json"
-    dead = runner(runners, settings, BenchStore(settings.state_dir),
-                  fake_command(tmp_path, hang=True, pids=str(pids_file)))
-    dead.submit("m1", override=False)
-    pids = wait_for(lambda: pids_file.exists() and json.loads(pids_file.read_text() or "null"))
+    # the server died mid-job: its render still runs and active.json names a dead server
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    pid, pids = leftover_render(tmp_path, settings, gone.pid, "1")
     assert all(alive(p) for p in pids)
     fresh = runner(runners, settings, BenchStore(settings.state_dir), fake_command(tmp_path))
     assert fresh.status("m1").status == "interrupted"
+    assert pids[0] == pid
     wait_for(lambda: not any(alive(p) for p in pids), timeout=15)
+    assert not (settings.state_dir / "jobs" / "active.json").exists()
+
+
+def test_leftover_of_live_server_untouched(tmp_path, settings, runners):
+    pid, pids = leftover_render(tmp_path, settings, os.getpid(), _proc_start(os.getpid()))
+    try:
+        runner(runners, settings, BenchStore(settings.state_dir), fake_command(tmp_path))
+        time.sleep(0.3)
+        assert all(alive(p) for p in pids)
+        assert (settings.state_dir / "jobs" / "active.json").exists()
+    finally:
+        os.killpg(pid, signal.SIGKILL)
+
+
+def test_second_runner_refused(tmp_path, settings, runners):
+    pids_file = tmp_path / "pids.json"
+    first = runner(runners, settings, BenchStore(settings.state_dir),
+                   fake_command(tmp_path, hang=True, pids=str(pids_file)))
+    first.submit("m1", override=False)
+    pids = wait_for(lambda: pids_file.exists() and json.loads(pids_file.read_text() or "null"))
+    with pytest.raises(RuntimeError, match="another Map Check server is using"):
+        JobRunner(settings, BenchStore(settings.state_dir), fake_command(tmp_path),
+                  gpu_probe=free_gpu, robot_model=FakeRobot())
+    assert all(alive(p) for p in pids)
+    assert first.status("m1").status == "running"
+    assert (settings.state_dir / "jobs" / "active.json").exists()
+
+
+def test_exception_after_start_kills_render(tmp_path, settings, runners, monkeypatch):
+    bench = BenchStore(settings.state_dir)
+    r = runner(runners, settings, bench, fake_command(tmp_path, sleep=0.3))
+    real, seen = r._write_active, []
+
+    def boom(pid, *args):
+        if not seen:
+            seen.append(pid)
+            raise RuntimeError("boom")
+        return real(pid, *args)
+
+    monkeypatch.setattr(r, "_write_active", boom)
+    first = r.submit("m1", override=False)
+    st = finished(r, "m1")
+    assert st.id == first.id and st.status == "failed" and "boom" in st.message
+    wait_for(lambda: not alive(seen[0]), timeout=5)
+    second = r.submit("m1", override=False)
+    wait_for(lambda: r.status("m1").id == second.id and r.status("m1").status == "done")
+
+
+def test_overview_labels_by_row_key():
+    poses = [JobPose("saved:a", "a", 1.0, 1.0, 0.0, ["behind"]),
+             JobPose("pasted:a", "a", 1.1, 1.0, 0.0, ["behind"])]
+    labs = overview_labels(overview_top((0.0, 5.0, 0.0, 5.0)), poses, {"pasted:a"},
+                           lambda t: (10 * len(t), 20))
+    assert [lab["key"] for lab in labs] == ["saved:a", "pasted:a"]
+    assert [lab["text"] for lab in labs] == ["a", "a (pasted)"]
+    assert [lab["flagged"] for lab in labs] == [False, True]
+    assert labs[0]["box"] != labs[1]["box"]
 
 
 def test_shutdown_kills_running_job(tmp_path, settings, runners):
@@ -274,7 +363,9 @@ def test_default_isaac_command(settings):
     assert cmd == [str(settings.isaac_python), "-m", "map_check.render.isaac_render", "/x/job.json"]
 
 
-def test_child_env(tmp_path, settings, runners):
+def test_child_env(tmp_path, settings, runners, monkeypatch):
+    for k in UNSET_ENV:
+        monkeypatch.setenv(k, "/opt/ros/humble/inherited")
     d = tmp_path / "envdump"
     d.mkdir()
     (d / "render.py").write_text(
@@ -288,6 +379,8 @@ def test_child_env(tmp_path, settings, runners):
     env = json.loads((tmp_path / "env.json").read_text())
     assert env["OMNI_KIT_ACCEPT_EULA"] == "YES"
     assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"].split(os.pathsep)
+    assert env["PYTHONPATH"] == str(Path(__file__).resolve().parents[1])
+    assert not any(k in env for k in UNSET_ENV if k != "PYTHONPATH")
     assert env.get("CUDA_VISIBLE_DEVICES") == os.environ.get("CUDA_VISIBLE_DEVICES")
 
 

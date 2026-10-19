@@ -9,6 +9,7 @@ goes to the shared bench, and a finished job replaces the map's last render.
 from __future__ import annotations
 
 import copy
+import fcntl
 import functools
 import json
 import os
@@ -38,6 +39,11 @@ TIMEOUT_BASE_S, TIMEOUT_PER_VIEW_S, TIMEOUT_MAX_S = 120, 20, 1800
 KILL_GRACE_S = 10.0  # SIGTERM to SIGKILL
 EXIT_GRACE_S = 30.0  # how long the render may take to exit after "done"
 ACTIVE = "active.json"  # the running job's pid, so a restarted server can stop it
+LOCK = "runner.lock"  # held by the one JobRunner using a state dir
+# Unset for the render, as scripts/gpsr-stack PREAMBLE_UNSET and
+# scripts/gripper-close-probe do before Isaac: ROS-sourced paths break it.
+UNSET_ENV = ("PYTHONPATH", "AMENT_PREFIX_PATH", "CMAKE_PREFIX_PATH", "COLCON_PREFIX_PATH",
+             "ROS_PACKAGE_PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH")
 CAPTIONS = {"behind": "behind-left", "top": "top-down"}
 
 
@@ -55,15 +61,23 @@ def default_isaac_command(jobfile: Path, settings: Settings | None = None) -> li
 
 
 def job_env() -> dict[str, str]:
-    """The server's environment plus the Kit EULA and map_check on the path; CUDA untouched.
+    """The server's environment minus ROS paths, plus the Kit EULA and map_check on the path.
 
-    PYTHONPATH is replaced, not extended: the server shell is usually
-    ROS-sourced, and ROS packages on the path break Isaac's own Python.
+    CUDA and everything else are untouched; the GPU goes in via the job file.
     """
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items() if k not in UNSET_ENV}
     env["OMNI_KIT_ACCEPT_EULA"] = "YES"
     env["PYTHONPATH"] = str(PACKAGE_ROOT)
     return env
+
+
+def _proc_start(pid: int) -> str | None:
+    """The process's start time (clock ticks since boot) from /proc, or None if it's gone."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="replace")
+        return stat[stat.rindex(")") + 2:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _caption(view: str, state: RowState) -> str:
@@ -129,7 +143,12 @@ class JobRunner:
         self._current: _Job | None = None
         self._finished: dict[str, _Job] = {}
         self._stopping = False
-        self._stop_leftover()
+        self._lock_fd = self._take_lock()
+        try:
+            self._stop_leftover()
+        except BaseException:
+            os.close(self._lock_fd)
+            raise
         self._worker = threading.Thread(target=self._work, name="map-check-render", daemon=True)
         self._worker.start()
 
@@ -198,6 +217,7 @@ class JobRunner:
         if proc is not None:
             _kill_group(proc.pid, self._grace, proc.poll)
         self._worker.join(timeout=self._grace + 5)
+        os.close(self._lock_fd)  # releases the state dir for the next server
 
     # -- queue (call with the lock held) --
     def _relevant_locked(self, map_name: str) -> JobStatus | None:
@@ -303,35 +323,39 @@ class JobRunner:
             proc = subprocess.Popen(self._command(jobfile), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=log, start_new_session=True,
                                     env=job_env())
-            started = time.monotonic()
-            with self._lock:
-                job.proc = proc
-                stopping = self._stopping
-            if stopping:
-                _kill_group(proc.pid, self._grace, proc.poll)
-                return "interrupted", "the server stopped"
-            self._write_active(proc.pid, jobfile, st.map)
-            reader = threading.Thread(target=self._read, args=(job, proc, log), daemon=True)
-            reader.start()
-            timed_out, done_at = False, None
-            while True:
-                try:
-                    proc.wait(timeout=0.1)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-                now = time.monotonic()
-                if job.done.is_set():  # finished; don't wait long for Isaac to exit
-                    done_at = done_at or now
-                    if now - done_at > EXIT_GRACE_S:
+            reader = None
+            try:
+                started = time.monotonic()
+                with self._lock:
+                    job.proc = proc
+                    stopping = self._stopping
+                if stopping:
+                    return "interrupted", "the server stopped"
+                self._write_active(proc.pid, jobfile, st.map)
+                reader = threading.Thread(target=self._read, args=(job, proc, log), daemon=True)
+                reader.start()
+                timed_out, done_at = False, None
+                while True:
+                    try:
+                        proc.wait(timeout=0.1)
                         break
-                elif now - started > timeout:
-                    timed_out = True
-                    break
-            _kill_group(proc.pid, self._grace, proc.poll)  # also any children left behind
-            proc.wait()
-            reader.join(timeout=5)
-            (self._jobs_dir / ACTIVE).unlink(missing_ok=True)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    now = time.monotonic()
+                    if job.done.is_set():  # finished; don't wait long for Isaac to exit
+                        done_at = done_at or now
+                        if now - done_at > EXIT_GRACE_S:
+                            break
+                    elif now - started > timeout:
+                        timed_out = True
+                        break
+            finally:  # on every path, exceptions included: nothing of the render keeps running
+                _kill_group(proc.pid, self._grace, proc.poll)
+                proc.wait()
+                if reader is not None:
+                    reader.join(timeout=5)
+                proc.stdout.close()
+                (self._jobs_dir / ACTIVE).unlink(missing_ok=True)
 
         if timed_out:
             return "timeout", f"no result after {timeout:g} s; the render was stopped"
@@ -379,16 +403,33 @@ class JobRunner:
     # -- a render left running by a server that died --
     def _write_active(self, pid: int, jobfile: Path, map_name: str) -> None:
         tmp = self._jobs_dir / f".{ACTIVE}.tmp"
-        tmp.write_text(json.dumps({"pid": pid, "jobfile": str(jobfile), "map": map_name}))
+        tmp.write_text(json.dumps({"pid": pid, "jobfile": str(jobfile), "map": map_name,
+                                   "server_pid": os.getpid(),
+                                   "server_start": _proc_start(os.getpid())}))
         os.replace(tmp, self._jobs_dir / ACTIVE)
 
+    def _take_lock(self) -> int:
+        self._jobs_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._jobs_dir / LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise RuntimeError(
+                f"another Map Check server is using {self.settings.state_dir}") from None
+        return fd
+
     def _stop_leftover(self) -> None:
+        """Kill the render a dead server left running (the lock holder only)."""
         path = self._jobs_dir / ACTIVE
         try:
             doc = json.loads(path.read_text())
             pid, jobfile, map_name = int(doc["pid"]), str(doc["jobfile"]), str(doc["map"])
+            server_pid, server_start = int(doc["server_pid"]), doc["server_start"]
         except (OSError, ValueError, KeyError, TypeError):
             return
+        if server_start is not None and _proc_start(server_pid) == str(server_start):
+            return  # its server still runs: not ours to stop
         try:
             self.bench.get(map_name)  # loading marks its running job interrupted
         except ValueError:

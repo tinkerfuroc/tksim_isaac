@@ -45,6 +45,28 @@ def emit(line: str) -> None:
     print(line, flush=True)
 
 
+def display_name(pose) -> str:
+    """The pose name as the teammate sees it; pasted rows can share a Map Studio name."""
+    return f"{pose.name} (pasted)" if pose.key.startswith("pasted:") else pose.name
+
+
+def overview_labels(spec: cameras.CameraSpec, poses, flagged, text_size) -> list[dict]:
+    """One label per row, keyed by row key: {key, text, box, anchor, flagged}.
+
+    text_size(text) -> (w, h) in pixels. Needs numpy only, so it is unit-tested.
+    """
+    anchors, sizes, facing, texts = {}, {}, {}, {}
+    for p in poses:
+        u, v = cameras.project(spec, (p.x, p.y, LABEL_Z))
+        fu, fv = cameras.project(spec, (p.x + math.cos(p.yaw), p.y + math.sin(p.yaw), LABEL_Z))
+        anchors[p.key], facing[p.key] = (u, v), math.atan2(fv - v, fu - u)
+        texts[p.key] = display_name(p)
+        sizes[p.key] = tuple(text_size(texts[p.key]))
+    placed = place_labels(anchors, sizes, facing, spec.width, spec.height, header_px=HEADER_PX)
+    return [{"key": p.key, "text": texts[p.key], "box": placed[p.key][0],
+             "anchor": placed[p.key][1], "flagged": p.key in flagged} for p in poses]
+
+
 def _file_stem(i: int, name: str) -> str:
     return f"{i:02d}_{re.sub(r'[^A-Za-z0-9_]', '_', name)}"
 
@@ -233,28 +255,21 @@ class Renderer:
         img = Image.fromarray(rgb)
         draw = ImageDraw.Draw(img)
         font = self.fonts["label"]
-        names = [p.name for p in self.job.poses]
-        anchors, sizes, facing = {}, {}, {}
-        for p in self.job.poses:
-            u, v = cameras.project(spec, (p.x, p.y, LABEL_Z))
-            fu, fv = cameras.project(spec, (p.x + math.cos(p.yaw), p.y + math.sin(p.yaw), LABEL_Z))
-            anchors[p.name], facing[p.name] = (u, v), math.atan2(fv - v, fu - u)
-            sizes[p.name] = tuple(draw.textbbox((0, 0), p.name, font=font)[2:])
-        placed = place_labels(anchors, sizes, facing, spec.width, spec.height, header_px=HEADER_PX)
-        flagged = {p.name for p in self.job.poses if p.key in self.flagged}
-        for name in names:
-            box, (u, v) = placed[name]
-            bad = name in flagged
+        labels = overview_labels(spec, self.job.poses, self.flagged,
+                                 lambda t: draw.textbbox((0, 0), t, font=font)[2:])
+        for lab in labels:
+            box, (u, v), bad = lab["box"], lab["anchor"], lab["flagged"]
             edge = (200, 40, 40) if bad else (40, 40, 48)
             draw.line((u, v, (box[0] + box[2]) / 2, (box[1] + box[3]) / 2), fill=edge, width=2)
             draw.ellipse((u - 5, v - 5, u + 5, v + 5), fill=edge)
             draw.rounded_rectangle(box, radius=6, fill=(255, 226, 226) if bad else (255, 255, 255),
                                    outline=edge, width=3 if bad else 2)
-            draw.text((box[0] + 6, box[1] + 4), name, fill=(30, 30, 34), font=font)
+            draw.text((box[0] + 6, box[1] + 4), lab["text"], fill=(30, 30, 34), font=font)
         draw.rectangle((0, 0, spec.width, HEADER_PX), fill=(20, 20, 24))
-        title = f"{self.job.map} · {len(names)} poses · top-down"
-        if flagged:
-            title += f" · {len(flagged)} flagged"
+        title = f"{self.job.map} · {len(labels)} poses · top-down"
+        n_flagged = sum(lab["flagged"] for lab in labels)
+        if n_flagged:
+            title += f" · {n_flagged} flagged"
         draw.text((16, 10), title, fill=(240, 240, 240), font=self.fonts["title"])
         img.save(self.out / "overview.png")
         emit(view_event(OVERVIEW, OVERVIEW, "overview.png"))
@@ -303,7 +318,7 @@ class Renderer:
         draw = ImageDraw.Draw(img)
         bad = p.key in self.flagged
         draw.rectangle((0, 0, img.width, CLOSEUP_HEADER_PX), fill=(150, 30, 30) if bad else (20, 20, 24))
-        text = f"{p.name} · {CAPTION[view]}"
+        text = f"{display_name(p)} · {CAPTION[view]}"
         if view == "head":
             text += f" · pan {p.pan_deg:g}° tilt {p.tilt_deg:g}°"
         draw.text((14, 8), text, fill=(240, 240, 240), font=self.fonts["closeup"])
