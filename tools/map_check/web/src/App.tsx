@@ -37,7 +37,7 @@ export function App() {
           <MapArena active={hash === '#/arena'} />
         </div>
         <div role="tabpanel" aria-label="Check poses" hidden={hash !== '#/poses'}>
-          <CheckPoses />
+          <CheckPoses active={hash === '#/poses'} />
         </div>
       </main>
     </div>

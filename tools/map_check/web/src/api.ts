@@ -51,8 +51,9 @@ export interface BenchRow {
   group: 'saved' | 'pasted';
   pose: Pose;
   state: RowState;
-  clash: string | null;
-  clash_m: string | null;
+  /** Metres to the same-name pose in the other group (pasted rows only); `clash` is the same number. */
+  clash: number | null;
+  clash_m: number | null;
   flags: Flag[];
 }
 export interface JobStatus {
