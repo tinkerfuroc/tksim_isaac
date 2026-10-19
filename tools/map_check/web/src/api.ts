@@ -16,7 +16,8 @@ export class ApiError extends Error {
 export interface MapsList { studio: string[]; arenas: string[] }
 
 export interface WebGrid { W: number; H: number; res: number; ox: number; oy: number; grid: string }
-export interface Outline { id: number; area_m2: number; [k: string]: unknown }
+/** A closed outline (occupancy.Outline): 1-based id, area in m², centre x/y in map metres. */
+export interface Outline { id: number; area_m2: number; cx: number; cy: number }
 export interface ShapeSetting { fill: boolean; height: number }
 export interface MapBody {
   token: string;
@@ -34,6 +35,7 @@ export interface SaveRequest {
   shapes: Record<string, ShapeSetting>;
   erased: number[];
 }
+/** `version_dir` is the absolute path of the new arena version directory. */
 export interface SaveResult { name: string; version_dir: string; boxes: number }
 
 export interface Pose { name: string; x: number; y: number; yaw: number }

@@ -1,0 +1,77 @@
+/* Map → arena screen, after mockups/map-arena-v1.html. Scoped under .ma. */
+
+/* This screen fills the window below the header; the panes scroll inside. */
+.app:has(> main > .ma) { height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+.app:has(> main > .ma) > main { min-height: 0; }
+
+.ma {
+  /* --wall, --shape, --shape-off, --erase, --free come from palette.ts (set inline). */
+  height: 100%; display: grid; grid-template-columns: 340px 1fr; min-height: 0; line-height: 1.45;
+}
+.ma :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* settings rail */
+.ma-rail { border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; }
+.ma-step { padding: 14px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 8px; }
+.ma-step h3 { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); font-weight: 500; display: flex; justify-content: space-between; gap: 8px; }
+.ma-step h3 .count { text-transform: none; letter-spacing: 0; font-family: var(--mono); }
+.ma-step.off { opacity: .45; pointer-events: none; }
+.ma-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ma-files { display: flex; gap: 6px; flex-wrap: wrap; }
+.ma-file { font: 12px var(--mono); background: var(--raise); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; overflow-wrap: anywhere; }
+.ma-meta { font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.ma-hint { font-size: 12px; color: var(--muted); }
+.ma-or { font-size: 12px; color: var(--muted); }
+.ma code { font: 12px var(--mono); background: var(--raise); border-radius: 4px; padding: 0 4px; }
+
+.ma select { flex: 1; min-width: 0; font: 13px var(--sans); padding: 5px 8px; background: var(--ground); }
+.ma input[type=number], .ma input[type=text] { font: 12px var(--mono); border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; background: var(--ground); color: var(--ink); }
+.ma input[type=number] { width: 66px; }
+.ma input[type=text] { flex: 1; min-width: 0; }
+.ma input[readonly] { color: var(--muted); }
+.ma input.bad { border-color: var(--bad); }
+.ma input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--shape); margin: 0; cursor: pointer; }
+.ma input:disabled { opacity: .45; }
+
+.ma .btn { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--raise); border-radius: 6px; padding: 5px 12px; cursor: pointer; color: var(--ink); }
+.ma .btn:hover:not(:disabled) { border-color: #3d4756; }
+.ma .btn:disabled { opacity: .45; cursor: default; }
+.ma .btn.on { background: var(--bad-soft); border-color: var(--erase); color: var(--erase); }
+.ma .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+
+.ma-msg { font-size: 12px; padding: 7px 9px; border-radius: 6px; display: grid; gap: 6px; overflow-wrap: anywhere; }
+.ma-msg.err { background: var(--bad-soft); color: var(--bad); }
+.ma-msg.ok { background: var(--ok-soft); color: var(--ok); }
+.ma-msg.note { background: var(--accent-soft); color: var(--ink); }
+.ma-msg.ok code, .ma-msg.note code { background: rgba(0, 0, 0, .25); }
+.ma-msg .btn { justify-self: start; font-size: 12px; padding: 3px 10px; }
+.ma-dest { font: 11.5px var(--mono); color: var(--muted); display: grid; gap: 2px; overflow-wrap: anywhere; }
+
+/* shapes list */
+.ma-shapes { max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.ma-shapes table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ma-shapes th { position: sticky; top: 0; z-index: 1; background: var(--raise); color: var(--muted); font-weight: 500; font-size: 11px; text-align: left; padding: 6px 8px; }
+.ma-shapes td { padding: 4px 8px; border-top: 1px solid #20262f; font-variant-numeric: tabular-nums; }
+.ma-shapes tr { cursor: pointer; }
+.ma-shapes tr:hover td { background: #1c222b; }
+.ma-shapes tr.sel td { background: var(--accent-soft); }
+.ma-shapes td.num { font-family: var(--mono); color: var(--muted); }
+.ma-shapes td.name { white-space: nowrap; }
+.ma-shapes .xy { font: 11px var(--mono); color: var(--muted); }
+.ma-shapes .empty { padding: 10px; color: var(--muted); font-size: 12px; cursor: default; }
+
+/* 2D map and 3D preview */
+.ma-views { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; min-width: 0; }
+@media (max-width: 1200px) { .ma-views { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+.ma-pane { background: var(--ground); display: grid; grid-template-rows: auto 1fr; min-height: 0; min-width: 0; }
+.ma-pane h2 { margin: 0; padding: 8px 14px; font-size: 13px; font-weight: 500; display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); background: var(--panel); white-space: nowrap; }
+.ma-pane h2 span { color: var(--muted); font-weight: 400; font-size: 12px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; }
+.ma-stage { position: relative; min-height: 0; overflow: hidden; }
+.ma-stage canvas.map2d { position: absolute; inset: 0; margin: auto; image-rendering: pixelated; cursor: pointer; touch-action: none; }
+.ma-stage canvas.map2d.erasing { cursor: crosshair; }
+.ma-brush { position: absolute; border: 1.5px solid var(--erase); background: rgba(242, 119, 108, .15); pointer-events: none; border-radius: 2px; }
+.ma-view3d { position: absolute; inset: 0; }
+.ma-view3d canvas { display: block; }
+.ma-legend { position: absolute; left: 10px; bottom: 10px; display: flex; gap: 12px; font-size: 11.5px; background: rgba(17, 21, 27, .85); padding: 5px 9px; border-radius: 6px; flex-wrap: wrap; pointer-events: none; }
+.ma-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.ma-center { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); text-align: center; padding: 20px; }
