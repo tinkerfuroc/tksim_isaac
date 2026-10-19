@@ -2,7 +2,10 @@
 import argparse
 import os
 
+import uvicorn
+
 from .config import Settings
+from .server import create_app
 
 
 def main(argv=None):
@@ -13,8 +16,7 @@ def main(argv=None):
     if args.port is not None:
         env['MAP_CHECK_PORT'] = str(args.port)
     settings = Settings.from_env(env)
-    # Serving (server.create_app(settings)) is wired up in a later task.
-    return settings
+    uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
 
 
 if __name__ == '__main__':

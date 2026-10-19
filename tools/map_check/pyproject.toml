@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest", "httpx"]
+dev = ["pytest", "httpx2"]
 
 [build-system]
 requires = ["hatchling"]
