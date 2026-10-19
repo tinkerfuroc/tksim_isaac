@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest", "httpx2"]
+dev = ["pytest", "httpx>=0.27,<1"]
 
 [build-system]
 requires = ["hatchling"]
@@ -26,3 +26,5 @@ packages = ["map_check"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Starlette prefers httpx2; the dev pin stays on the stable httpx 0.28 line.
+filterwarnings = ["ignore:Using .httpx. with .starlette.testclient. is deprecated"]
