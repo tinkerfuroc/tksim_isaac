@@ -21,12 +21,24 @@ HEAD_WIDTH, HEAD_HEIGHT = 1280, 720
 HEAD_HFOV_DEG = 90.0
 # Optical frame (+Z forward, +Y down) to USD camera (-Z forward, +Y up): 180 deg
 # about X, wxyz (0, 1, 0, 0) in simulation/sensors/hardware-parity.json.
-OPTICAL_TO_USD = np.diag([1.0, -1.0, -1.0, 1.0])
+OPTICAL_TO_USD_WXYZ = (0.0, 1.0, 0.0, 0.0)
+# The sim's level-forward head aim, as scripts/gpsr-stack runs it, so pan and
+# tilt mean what robot commands mean. Copied from
+# simulation/tinker_sim_isaac/head_camera_aim.py (a test checks they match):
+# the correction multiplies the mount rotation on the left, and the render
+# origin moves this far along the camera's own view axis.
+LEVEL_FORWARD_CORRECTION_WXYZ = (
+    0.008896540071759,
+    -0.009014044552286,
+    -0.915268373827568,
+    0.402645504689423,
+)
+LEVEL_FORWARD_VIEW_OFFSET_M = 0.03
 
-# +1 if raising tilt_joint turns the head camera down, -1 if up. From the URDF:
-# tilt_joint turns about +Y while the camera at pan 0 faces back and up, so
-# +tilt raises the view (test_tilt_down_sign checks this against FK).
-TILT_DOWN_SIGN = -1
+# +1 if raising tilt_joint turns the head camera down, -1 if up. With the
+# level-forward aim the camera at pan 0 looks along +x, and tilt_joint turns
+# about +Y, so +tilt lowers the view (test_tilt_down_sign checks this via FK).
+TILT_DOWN_SIGN = 1
 
 
 @dataclass(frozen=True)
@@ -40,6 +52,21 @@ class CameraSpec:
     height: int
     # Set for the head camera, where eye/target/up only describe it.
     world_from_cam: np.ndarray | None = field(default=None, compare=False)
+
+
+def _quat_mul(a: Sequence[float], b: Sequence[float]) -> tuple[float, float, float, float]:
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (aw * bw - ax * bx - ay * by - az * bz, aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw)
+
+
+def quat_matrix(wxyz: Sequence[float]) -> np.ndarray:
+    """3x3 rotation of a (normalized here) w, x, y, z quaternion."""
+    w, x, y, z = np.asarray(wxyz, float) / np.linalg.norm(wxyz)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                     [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
 
 
 def focal_from_fov(hfov_deg: float, aperture_mm: float = APERTURE_MM) -> float:
@@ -103,11 +130,13 @@ def top_down(pose, w: int = 1280, h: int = 800) -> CameraSpec:
 
 
 def head_cam(pose, fk: Mapping[str, np.ndarray], z0: float) -> CameraSpec:
-    """Tinker's head camera; fk from robot.link_transforms (relative to base_link)."""
+    """Tinker's head camera with the level-forward aim; fk from robot.link_transforms."""
     c, s = math.cos(pose.yaw), math.sin(pose.yaw)
     base = np.array([[c, -s, 0.0, pose.x], [s, c, 0.0, pose.y], [0.0, 0.0, 1.0, z0],
                      [0.0, 0.0, 0.0, 1.0]])
-    m = base @ fk[HEAD_FRAME] @ OPTICAL_TO_USD
+    m = base @ fk[HEAD_FRAME]
+    m[:3, :3] = m[:3, :3] @ quat_matrix(_quat_mul(LEVEL_FORWARD_CORRECTION_WXYZ, OPTICAL_TO_USD_WXYZ))
+    m[:3, 3] -= LEVEL_FORWARD_VIEW_OFFSET_M * m[:3, 2]  # dolly along the view axis (-Z)
     eye = m[:3, 3]
     return CameraSpec("head", tuple(float(v) for v in eye), tuple(float(v) for v in eye - m[:3, 2]),
                       tuple(float(v) for v in m[:3, 1]), focal_from_fov(HEAD_HFOV_DEG),

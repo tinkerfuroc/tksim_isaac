@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import math
 import subprocess
@@ -94,32 +95,47 @@ def _head_axes(urdf, pan, tilt, pose=Pose("p", 0.0, 0.0, 0.0), z0=0.0):
     return cam, fk, -m[:3, 2], m[:3, 1]  # forward (-Z), up (+Y)
 
 
+def _elev_az(fwd):
+    return math.degrees(math.asin(fwd[2])), math.degrees(math.atan2(fwd[1], fwd[0]))
+
+
+def test_head_aim_constants_match_sim():
+    path = Path(__file__).resolve().parents[3] / "simulation" / "tinker_sim_isaac" / "head_camera_aim.py"
+    spec = importlib.util.spec_from_file_location("_map_check_head_camera_aim", path)
+    sim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sim)
+    assert cameras.LEVEL_FORWARD_CORRECTION_WXYZ == sim.LEVEL_FORWARD_CORRECTION_WXYZ
+    assert cameras.LEVEL_FORWARD_VIEW_OFFSET_M == sim.LEVEL_FORWARD_VIEW_OFFSET_M
+
+
 def test_head_cam_looks_forward(robot_files):
+    """Level-forward aim, as gpsr-stack renders it (head_camera_aim.py's table)."""
     urdf = robot_files.urdf
     cam, fk, fwd, up = _head_axes(urdf, 0.0, 0.0)
     assert (cam.width, cam.height) == (1280, 720)
     assert cam.focal_mm == pytest.approx(18.0)  # 36 mm aperture, 90 deg HFOV
-    # USD -Z is the optical +Z and USD +Y the optical -Y.
-    opt = fk["head_camera_color_optical_frame"]
-    np.testing.assert_allclose(fwd, opt[:3, 2], atol=1e-12)
-    np.testing.assert_allclose(up, -opt[:3, 1], atol=1e-12)
-    # The URDF head looks back and up at pan 0 (simulation/tinker_sim_isaac/
-    # head_camera_aim.py: +47.5 deg elevation); pan 180 turns it to the front.
-    assert fwd[0] < 0
-    assert math.degrees(math.asin(fwd[2])) == pytest.approx(47.5, abs=0.5)
-    _, _, fwd180, _ = _head_axes(urdf, 180.0, 0.0)
-    assert fwd180[0] > 0
-    # The point one metre along the optical axis is the image centre.
+    elev, az = _elev_az(fwd)
+    assert elev == pytest.approx(0.0, abs=1.0) and az == pytest.approx(0.0, abs=1.0)
+    assert fwd[0] > 0
+    assert up[2] > 0.99  # level horizon, image-up is world-up
+    elev, _ = _elev_az(_head_axes(urdf, 0.0, 30.0)[2])
+    assert elev == pytest.approx(-30.0, abs=1.0)
+    elev, az = _elev_az(_head_axes(urdf, 45.0, 0.0)[2])
+    assert elev == pytest.approx(0.0, abs=1.0) and az == pytest.approx(-45.0, abs=1.0)
+    # The render origin sits 3 cm along the view axis from the optical frame.
+    np.testing.assert_allclose(np.asarray(cam.eye), fk["head_camera_color_optical_frame"][:3, 3] + 0.03 * fwd,
+                               atol=1e-12)
+    # Placed at the pose: base_link at (x, y, z0) turned by yaw.
     pose = Pose("p", 2.0, -1.0, 0.8)
-    cam, _, fwd, _ = _head_axes(urdf, 30.0, 10.0, pose, z0=0.0775)
+    cam, fk, fwd, _ = _head_axes(urdf, 30.0, 10.0, pose, z0=0.0775)
     eye = np.asarray(cam.eye)
-    assert project(cam, eye + fwd) == pytest.approx((640.0, 360.0))
-    assert cam.target == pytest.approx(tuple(eye + fwd))
-    fk = robot.link_transforms(urdf, robot.joint_values([0.0] * 7, 30.0, 10.0))
     c, s = math.cos(0.8), math.sin(0.8)
     local = fk["head_camera_color_optical_frame"][:3, 3]
-    expect = [2.0 + c * local[0] - s * local[1], -1.0 + s * local[0] + c * local[1], 0.0775 + local[2]]
-    np.testing.assert_allclose(eye, expect, atol=1e-12)
+    origin = [2.0 + c * local[0] - s * local[1], -1.0 + s * local[0] + c * local[1], 0.0775 + local[2]]
+    np.testing.assert_allclose(eye, np.asarray(origin) + 0.03 * fwd, atol=1e-12)
+    # The point one metre along the view axis is the image centre.
+    assert project(cam, eye + fwd) == pytest.approx((640.0, 360.0))
+    assert cam.target == pytest.approx(tuple(eye + fwd))
 
 
 def test_tilt_down_sign(robot_files):
@@ -130,7 +146,7 @@ def test_tilt_down_sign(robot_files):
     assert abs(dz) > 0.05
     assert cameras.TILT_DOWN_SIGN == (1 if dz < 0 else -1)
     # Same answer in image terms, at either pan: +tilt moves the view toward the
-    # image's top edge when TILT_DOWN_SIGN is -1.
+    # image's bottom edge when TILT_DOWN_SIGN is +1.
     for pan in (0.0, 180.0):
         _, _, a, up = _head_axes(robot_files.urdf, pan, 0.0)
         _, _, b, _ = _head_axes(robot_files.urdf, pan, 5.0)
