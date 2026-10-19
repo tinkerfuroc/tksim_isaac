@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Check poses · mockup v7</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: dark bench. Top = pose table (the job), under it = horizontal film strip of results with its own scroll bar, bottom = render bar. Click any image for a full-size viewer. */
+:root {
+  color-scheme: dark;
+  --ink: #e4e9f0;        /* text */
+  --muted: #8d99a9;      /* secondary text */
+  --line: #2a323d;       /* hairlines */
+  --ground: #11151b;     /* page */
+  --panel: #181d25;      /* surfaces */
+  --raise: #1f2630;      /* headers, hover */
+  --accent: #6aa5ec;     /* selection, primary action */
+  --accent-ink: #0d1520;
+  --accent-soft: #1d2d42;
+  --warn: #f0b04a; --warn-soft: #3a2c12;
+  --bad: #f2776c;  --bad-soft: #3d1c1a;
+  --ok: #67c993;   --ok-soft: #173326;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --shot-h: 230px;      /* every rendered view is this tall, whatever its shape */
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--ground); color: var(--ink); font: 14px/1.45 var(--sans); }
+.app { display: grid; grid-template-rows: auto auto auto 1fr auto; min-height: 100vh; }
+header { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header .brand { font-weight: 600; letter-spacing: .01em; }
+header nav { display: flex; gap: 4px; }
+header nav a { padding: 6px 12px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+header nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
+.ctx { display: flex; gap: 16px; margin-left: auto; align-items: center; flex-wrap: wrap; }
+.field { display: flex; flex-direction: column; gap: 2px; }
+.lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+select, input[type=number], input[type=search], textarea { font: inherit; border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; background: var(--ground); color: var(--ink); }
+input[type=number] { width: 58px; font-family: var(--mono); font-size: 12px; padding: 3px 6px; }
+.wrap { padding: 4px 20px 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.toolbar input[type=search] { flex: 1; min-width: 180px; }
+.hint { font-size: 12px; color: var(--muted); }
+.btn { font: inherit; border: 1px solid var(--line); background: var(--raise); border-radius: 6px; padding: 5px 12px; cursor: pointer; color: var(--ink); }
+.btn:hover { border-color: #3d4756; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.btn.primary.warnbtn { background: var(--warn); border-color: var(--warn); }
+.btn:disabled { opacity: .45; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.split { display: grid; grid-template-columns: 1fr 300px; }
+@media (max-width: 1000px) { .split { grid-template-columns: 1fr; } }
+.tablewrap { max-height: 420px; overflow: auto; border-right: 1px solid var(--line); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th { position: sticky; top: 0; background: var(--raise); z-index: 2; text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: bottom; }
+thead th.col { text-align: center; }
+.hcheck { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.hcheck span { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.setall { display: flex; gap: 4px; align-items: center; justify-content: center; margin-top: 4px; font-size: 11px; }
+td { padding: 6px 10px; border-bottom: 1px solid #20262f; vertical-align: middle; }
+td.c { text-align: center; }
+tr.group td { background: #151a21; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 500; padding-top: 10px; }
+tr.group a { color: var(--accent); text-transform: none; letter-spacing: 0; }
+.gcount { font-family: var(--mono); text-transform: none; letter-spacing: 0; }
+tr.off td:not(.inc) { opacity: .35; }
+tbody tr:not(.group):hover td { background: #1c222b; }
+.name { font-family: var(--mono); font-size: 12.5px; }
+.coords { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; margin-left: 6px; white-space: nowrap; font-family: var(--sans); }
+.chip.clash { background: var(--warn-soft); color: var(--warn); }
+.chip.bad { background: var(--bad-soft); color: var(--bad); }
+.chip.ex { background: var(--raise); color: var(--muted); }
+input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; margin: 0; }
+.pt { display: inline-flex; gap: 4px; align-items: center; }
+.pt[aria-disabled=true] { visibility: hidden; }
+.side { padding: 12px 14px; display: grid; gap: 10px; align-content: start; }
+.side textarea { width: 100%; height: 120px; font-family: var(--mono); font-size: 12px; resize: vertical; }
+/* results strip */
+.strip-head { display: flex; align-items: baseline; gap: 12px; padding: 14px 20px 8px; flex-wrap: wrap; }
+.strip-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.strip { display: flex; align-items: flex-start; gap: 12px; overflow-x: auto; overflow-y: hidden; padding: 0 20px 14px; scroll-snap-type: x proximity; scrollbar-color: #3d4756 transparent; }
+.strip::-webkit-scrollbar { height: 10px; }
+.strip::-webkit-scrollbar-thumb { background: #3d4756; border-radius: 6px; }
+.pose { flex: 0 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; scroll-snap-align: start; display: flex; flex-direction: column; }
+.pose h3 { margin: 0; padding: 8px 12px; font: 500 12.5px var(--mono); display: flex; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--line); background: var(--raise); }
+.pose h3 .st { font-family: var(--sans); font-size: 12px; color: var(--ok); }
+.pose.flagged { border-color: #6b302b; }
+.pose.flagged h3 { background: var(--bad-soft); }
+.pose.flagged h3 .st { color: var(--bad); }
+.views { display: flex; gap: 1px; background: var(--line); }
+figure { margin: 0; position: relative; height: var(--shot-h); width: auto; aspect-ratio: 16/10; background: #0c0f13; cursor: zoom-in; max-width: 100%; }
+.pose.wide figure { aspect-ratio: 14/10; }
+figure img { width: 100%; height: 100%; object-fit: cover; display: block; }
+figure .ph { width: 100%; height: 100%; background: repeating-linear-gradient(45deg, #161b22 0 10px, #1a2028 10px 20px); }
+figcaption { position: absolute; left: 6px; bottom: 6px; font-size: 11px; background: rgba(12,15,19,.82); color: var(--ink); padding: 2px 7px; border-radius: 4px; }
+figure:hover { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* viewer */
+.viewer { position: fixed; inset: 0; background: rgba(6,8,11,.92); display: grid; grid-template-rows: auto 1fr auto; z-index: 50; }
+.viewer[hidden] { display: none; }
+.vbar { display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; font: 500 13px var(--mono); gap: 12px; }
+.vimg { display: grid; place-items: center; padding: 0 64px; min-height: 0; }
+.vimg img, .vimg .ph { max-width: 100%; max-height: calc(100vh - 140px); border-radius: 6px; }
+.vimg .ph { width: min(1100px, 90vw); aspect-ratio: 16/10; background: repeating-linear-gradient(45deg, #161b22 0 14px, #1a2028 14px 28px); }
+.nav { position: fixed; top: 50%; transform: translateY(-50%); font-size: 26px; width: 44px; height: 64px; border-radius: 8px; border: 1px solid var(--line); background: rgba(24,29,37,.8); color: var(--ink); cursor: pointer; }
+.nav.prev { left: 12px; } .nav.next { right: 12px; }
+.vfoot { text-align: center; padding: 10px; color: var(--muted); font-size: 12px; }
+footer { position: sticky; bottom: 0; background: var(--panel); border-top: 1px solid var(--line); padding: 10px 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; z-index: 10; }
+.summary { font-variant-numeric: tabular-nums; }
+.summary b { font-weight: 600; }
+.gpu { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 12px; }
+.gpu.free { background: var(--ok-soft); color: var(--ok); }
+.gpu.busy { background: var(--warn-soft); color: var(--warn); }
+.gpu i { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; }
+.spacer { flex: 1; }
+.demo { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">Tinker Map Check</div>
+    <nav><a href="#">Map → arena</a><a href="#" class="on">Check poses</a></nav>
+    <div class="ctx">
+      <div class="field"><label class="lbl" for="map">Map</label>
+        <select id="map"><option>robocup_home_2026_measured_5cm</option><option>rcw2026</option></select></div>
+      <div class="field"><label class="lbl" for="arm">Arm pose (whole render)</label>
+        <select id="arm"><option>arm_pos_navigating</option><option>arm_pos_point_to</option><option>arm_pos_handover</option><option>arm_pos_drop</option></select></div>
+    </div>
+  </header>
+
+  <div class="strip-head">
+    <h2>Last render</h2>
+    <span class="hint">21:32 · arm_pos_navigating · 4 poses · scroll sideways, click an image to enlarge (← → to step, Esc to close)</span>
+  </div>
+  <div class="strip" id="strip" tabindex="0" aria-label="Rendered views"></div>
+
+  <div class="wrap">
+    <section class="card split" aria-label="Poses">
+      <div>
+        <div class="toolbar">
+          <input id="filter" type="search" placeholder="Filter poses, e.g. dining or table_1" aria-label="Filter poses">
+          <span class="hint">Column checkboxes act on the rows shown · shift-click for a range</span>
+          <button class="btn" id="exportBtn">Export list…</button>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="col"><div class="hcheck"><input type="checkbox" data-col="inc" aria-label="Render all shown"><span>Render</span></div></th>
+                <th>Pose</th>
+                <th>x, y, yaw</th>
+                <th class="col"><div class="hcheck"><input type="checkbox" data-col="behind" aria-label="Behind view for all shown"><span>Behind</span></div></th>
+                <th class="col"><div class="hcheck"><input type="checkbox" data-col="top" aria-label="Top view for all shown"><span>Top</span></div></th>
+                <th class="col"><div class="hcheck"><input type="checkbox" data-col="head" aria-label="Head camera for all shown"><span>Head cam</span></div>
+                  <div class="setall"><input type="number" id="panAll" value="0" aria-label="Pan for all shown">°
+                    <input type="number" id="tiltAll" value="20" aria-label="Tilt for all shown">°
+                    <button class="btn" id="applyPT" style="padding:1px 7px;font-size:11px">set</button></div></th>
+                <th class="col"><span class="hcheck"><span>Remove</span></span></th>
+              </tr>
+            </thead>
+            <tbody id="tb"></tbody>
+          </table>
+        </div>
+      </div>
+      <aside class="side">
+        <label class="lbl" for="pastebox">Paste from Map Studio on another machine</label>
+        <textarea id="pastebox" placeholder="POS_… = PoseStamped(…)">POS_DININGROOM_TABLE_2_0 = PoseStamped(header=Header(stamp=rclpy.time.Time().to_msg(), frame_id='map'),
+    pose=Pose(position=Point(x=12.95, y=5.45, z=0.0), …</textarea>
+        <div><button class="btn">Add to list</button></div>
+        <span class="hint">Reads x, y and yaw from each POS_… block. Pasted poses stay until you clear them.</span>
+      </aside>
+    </section>
+  </div>
+
+
+  <footer>
+    <div class="summary" id="sum"></div>
+    <span class="gpu free" id="gpu"><i></i>GPUs free</span>
+    <button class="btn" id="toggleGpu" title="mockup only">simulate busy GPU</button>
+    <span class="spacer"></span>
+    <button class="btn primary" id="render">Render</button>
+  </footer>
+</div>
+
+<div class="viewer" id="exporter" hidden role="dialog" aria-modal="true" aria-label="Export list">
+  <div class="vbar"><span>Export list · Map Studio format</span><button class="btn" id="xclose">Close · Esc</button></div>
+  <div style="display:grid; place-items:center; padding:0 24px; min-height:0">
+    <div class="card" style="width:min(900px, 100%); padding:14px; display:grid; gap:10px">
+      <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center">
+        <span class="lbl">Format</span>
+        <label><input type="radio" name="xf" value="code" checked> Code (same as "Copy all as code")</label>
+        <label><input type="radio" name="xf" value="yaml"> .poses.yaml file</label>
+      </div>
+      <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center">
+        <span class="lbl">Which poses</span>
+        <label><input type="radio" name="xw" value="all" checked> Everything listed</label>
+        <label><input type="radio" name="xw" value="ticked"> Only ticked for render</label>
+      </div>
+      <textarea id="xtext" readonly style="height:300px; font-family:var(--mono); font-size:12px; width:100%"></textarea>
+      <div style="display:flex; gap:8px; align-items:center"><button class="btn primary" id="xcopy">Copy</button><button class="btn" id="xdl">Download</button><span class="hint" id="xhint"></span></div>
+    </div>
+  </div>
+  <div class="vfoot">Pasted names are exported without the POS_ prefix, lowercased, so they paste back into Map Studio unchanged.</div>
+</div>
+
+<div class="viewer" id="viewer" hidden role="dialog" aria-modal="true" aria-label="Enlarged view">
+  <div class="vbar"><span id="vtitle"></span><button class="btn" id="vclose">Close · Esc</button></div>
+  <div class="vimg" id="vimg"></div>
+  <div class="vfoot" id="vfoot"></div>
+  <button class="nav prev" id="vprev" aria-label="Previous view">‹</button>
+  <button class="nav next" id="vnext" aria-label="Next view">›</button>
+</div>
+
+<script>
+const saved = [["livingroom_ground_0_0",1.566,1.063,-126.5],["livingroom_ground_1_0",6.287,1.122,-54.7],["diningroom_ground_0_0",9.514,5.306,-34.1],["kitchen_ground_0_0",9.663,3.722,134.0],["kitchen_ground_1_0",8.379,1.093,-120.7],["diningroom_ground_1_0",8.647,8.981,144.1],["bedroom_ground_0_0",5.241,7.846,56.3],["bedroom_table_0_0",3.418,6.55,-90.0],["bedroom_table_1_0",4.853,8.55,90.0],["diningroom_table_0_0",7.472,8.75,87.5],["diningroom_table_1_0",8.3,7.368,0.0],["diningroom_table1_1",11.0,7.397,180.0],["diningroom_table_1_2",9.604,8.25,-90.0],["diningroom_table_1_3",9.574,6.35,90.0],["livingroom_table_0_0",3.425,0.95,-91.6],["livingroom_table_0_1",4.527,0.95,-91.0],["kitchen_table_0_0",12.35,2.646,0.0],["kitchen_table_1_0",11.058,3.55,87.6],["kitchen_table_2_0",11.991,1.15,-89.3],["diningroom_table_2_0",12.835,5.45,-90.0],["livingroom_table_1_0",2.467,4.05,-90.0],["livingroom_table_1_1",3.449,4.05,-90.0],["livingroom_table_2_0",2.424,4.25,87.7],["livingroom_table_2_1",3.418,4.25,90.0],["livingroom_destination",1.215,1.052,-127.8],["diningroom_destination",11.314,8.556,49.2]];
+const pasted = [["POS_DININGROOM_TABLE_2_0",12.95,5.45,-90.0],["POS_REGISTER",0.852,0.703,49.8]];
+const rows = [];
+const mk = (g, [name, x, y, yaw]) => ({ g, name, x, y, yaw, inc: false, behind: true, top: false, head: false, pan: 0, tilt: 20 });
+saved.forEach(r => rows.push(mk("saved", r))); pasted.forEach(r => rows.push(mk("pasted", r)));
+rows.forEach(r => { if (/diningroom_(table_2_0|destination)|POS_/.test(r.name)) r.inc = true; });
+const R = n => rows.find(r => r.name === n);
+R("diningroom_destination").top = true; R("diningroom_destination").behind = false;
+R("POS_REGISTER").behind = false; R("POS_REGISTER").top = true;
+R("diningroom_table_2_0").head = true; R("diningroom_table_2_0").top = true;
+const key = n => n.replace(/^POS_/, "").toLowerCase();
+const clash = r => { const o = rows.find(s => s !== r && s.g !== r.g && key(s.name) === key(r.name)); return o ? Math.hypot(o.x - r.x, o.y - r.y) : null; };
+const flags = { "POS_REGISTER": "overlaps wall" };
+const tb = document.getElementById("tb"); let shown = [], lastIdx = null;
+function renderTable() {
+  const f = document.getElementById("filter").value.trim().toLowerCase();
+  shown = rows.filter(r => !f || r.name.toLowerCase().includes(f));
+  tb.innerHTML = "";
+  for (const g of ["saved", "pasted"]) {
+    const gr = shown.filter(r => r.g === g); if (!gr.length) continue;
+    const tr = document.createElement("tr"); tr.className = "group";
+    const hid = removed.filter(r => r.g === g).length;
+    tr.innerHTML = `<td colspan="7">${g === "saved" ? "From Map Studio" : "Pasted"} <span class="gcount">· ${gr.filter(r => r.inc).length} of ${gr.length} in render</span>${g === "pasted" ? ' · <a href="#">clear</a>' : ""}${hid ? ` · ${hid} removed · <a href="#" data-restore="${g}">restore</a>` : ""}</td>`;
+    tb.appendChild(tr);
+    for (const r of gr) {
+      const c = clash(r), fl = flags[r.name], id = rows.indexOf(r);
+      const t = document.createElement("tr"); if (!r.inc) t.className = "off";
+      t.innerHTML = `<td class="c inc"><input type="checkbox" data-i="${id}" data-k="inc" ${r.inc ? "checked" : ""} aria-label="Render ${r.name}"></td>
+        <td class="name">${r.name}${c !== null ? `<span class="chip clash">same name · ${(c * 100).toFixed(1)} cm apart</span>` : ""}${fl ? `<span class="chip bad">${fl}</span><span class="chip ex">example</span>` : ""}</td>
+        <td class="coords">${r.x.toFixed(3)}, ${r.y.toFixed(3)}, ${r.yaw.toFixed(1)}°</td>
+        <td class="c"><input type="checkbox" data-i="${id}" data-k="behind" ${r.behind ? "checked" : ""} ${r.inc ? "" : "disabled"} aria-label="Behind view"></td>
+        <td class="c"><input type="checkbox" data-i="${id}" data-k="top" ${r.top ? "checked" : ""} ${r.inc ? "" : "disabled"} aria-label="Top view"></td>
+        <td class="c"><input type="checkbox" data-i="${id}" data-k="head" ${r.head ? "checked" : ""} ${r.inc ? "" : "disabled"} aria-label="Head camera">
+          <span class="pt" aria-disabled="${!(r.head && r.inc)}"><input type="number" data-i="${id}" data-k="pan" value="${r.pan}" min="-180" max="180" aria-label="Pan">
+          <input type="number" data-i="${id}" data-k="tilt" value="${r.tilt}" min="-30" max="90" aria-label="Tilt"></span></td>
+        <td class="c"><button class="btn rm" data-rm="${id}" title="${r.g === "saved" ? "Remove from this list (Map Studio's file is not changed)" : "Delete this pasted pose"}" aria-label="Remove ${r.name}" style="padding:0 8px">✕</button></td>`;
+      tb.appendChild(t);
+    }
+  }
+  for (const h of document.querySelectorAll("thead input[data-col]")) {
+    const k = h.dataset.col, pool = k === "inc" ? shown : shown.filter(r => r.inc);
+    const n = pool.filter(r => r[k]).length;
+    h.checked = pool.length > 0 && n === pool.length; h.indeterminate = n > 0 && n < pool.length; h.disabled = !pool.length;
+  }
+  const inc = rows.filter(r => r.inc), views = inc.reduce((a, r) => a + r.behind + r.top + r.head, 0) + (inc.length ? 1 : 0);
+  document.getElementById("sum").innerHTML = inc.length
+    ? `Next render: <b>${inc.length}</b> poses · <b>${views}</b> views incl. overview · about ${40 + views * 3} s` : "Tick poses to render";
+  const btn = document.getElementById("render");
+  btn.disabled = !inc.length;
+  btn.textContent = !inc.length ? "Render" : busy ? "Render anyway…" : `Render ${inc.length} poses`;
+  btn.classList.toggle("warnbtn", busy);
+}
+const removed = [];
+tb.addEventListener("click", e => {
+  const el = e.target;
+  if (el.dataset.rm !== undefined) { const r = rows[+el.dataset.rm]; rows.splice(+el.dataset.rm, 1); removed.push(r); lastIdx = null; renderTable(); return; }
+  if (el.dataset.restore) { e.preventDefault(); for (let i = removed.length - 1; i >= 0; i--) if (removed[i].g === el.dataset.restore) rows.push(...removed.splice(i, 1)); rows.sort((a, b) => (a.g > b.g) - (a.g < b.g)); renderTable(); return; }
+  if (el.type !== "checkbox") return;
+  const i = +el.dataset.i, k = el.dataset.k;
+  if (k === "inc" && e.shiftKey && lastIdx !== null) {
+    const ids = shown.map(r => rows.indexOf(r)), a = ids.indexOf(lastIdx), b = ids.indexOf(i);
+    ids.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(j => rows[j].inc = el.checked);
+  } else rows[i][k] = el.checked;
+  if (k === "inc") lastIdx = i; renderTable();
+});
+tb.addEventListener("change", e => { const el = e.target; if (el.type === "number") rows[+el.dataset.i][el.dataset.k] = +el.value; });
+document.querySelectorAll("thead input[data-col]").forEach(h => h.addEventListener("click", () => {
+  const k = h.dataset.col, pool = k === "inc" ? shown : shown.filter(r => r.inc);
+  const val = !pool.every(r => r[k]); pool.forEach(r => r[k] = val); renderTable();
+}));
+document.getElementById("applyPT").onclick = () => { const p = +panAll.value, t = +tiltAll.value; shown.filter(r => r.inc && r.head).forEach(r => { r.pan = p; r.tilt = t; }); renderTable(); };
+document.getElementById("filter").oninput = renderTable;
+let busy = false;
+document.getElementById("toggleGpu").onclick = () => {
+  busy = !busy; const g = document.getElementById("gpu");
+  g.className = "gpu " + (busy ? "busy" : "free");
+  g.innerHTML = busy ? "<i></i>Sim run on GPU 0 (gpsr-stack): render not started" : "<i></i>GPUs free";
+  renderTable();
+};
+
+/* results strip: images from earlier renders where one exists; striped boxes are placeholders */
+const shots = [
+  { pose: "Overview", wide: true, views: [["top-down, rendered poses labeled", "m_overview.jpg"]] },
+  { pose: "diningroom_table_2_0", st: "no overlap", views: [["behind-left", "m_dt20_behind.jpg"], ["top-down", "m_dt20_top.jpg"], ["head cam · pan 0° tilt 20°", null]] },
+  { pose: "diningroom_destination", st: "no overlap", views: [["top-down", "m_dd_top.jpg"]] },
+  { pose: "POS_DININGROOM_TABLE_2_0", st: "no overlap", views: [["behind-left", null]] },
+  { pose: "POS_REGISTER", st: "base overlaps wall · example", bad: true, views: [["top-down", "m_reg_top.jpg"]] },
+];
+const flat = [];
+const strip = document.getElementById("strip");
+for (const s of shots) {
+  const el = document.createElement("article");
+  el.className = "pose" + (s.bad ? " flagged" : "") + (s.wide ? " wide" : "");
+  el.innerHTML = `<h3><span>${s.pose}</span>${s.st ? `<span class="st">${s.st}</span>` : ""}</h3><div class="views"></div>`;
+  for (const [cap, src] of s.views) {
+    const i = flat.length; flat.push({ pose: s.pose, cap, src });
+    const f = document.createElement("figure"); f.tabIndex = 0; f.setAttribute("role", "button"); f.setAttribute("aria-label", `Enlarge ${s.pose} ${cap}`);
+    f.innerHTML = (src ? `<img src="/files/${src}" alt="${s.pose}, ${cap}">` : `<div class="ph"></div>`) + `<figcaption>${cap}</figcaption>`;
+    f.onclick = () => openV(i); f.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openV(i); } };
+    el.querySelector(".views").appendChild(f);
+  }
+  strip.appendChild(el);
+}
+const V = document.getElementById("viewer"); let cur = 0;
+function openV(i) {
+  cur = (i + flat.length) % flat.length; const s = flat[cur];
+  document.getElementById("vtitle").textContent = `${s.pose} · ${s.cap}`;
+  document.getElementById("vimg").innerHTML = s.src ? `<img src="/files/${s.src}" alt="${s.pose}, ${s.cap}">` : `<div class="ph"></div>`;
+  document.getElementById("vfoot").textContent = `${cur + 1} of ${flat.length}`;
+  V.hidden = false; document.getElementById("vclose").focus();
+}
+const closeV = () => { V.hidden = true; };
+document.getElementById("vclose").onclick = closeV;
+document.getElementById("vprev").onclick = () => openV(cur - 1);
+document.getElementById("vnext").onclick = () => openV(cur + 1);
+V.addEventListener("click", e => { if (e.target === V || e.target.id === "vimg") closeV(); });
+document.addEventListener("keydown", e => {
+  if (V.hidden) return;
+  if (e.key === "Escape") closeV(); else if (e.key === "ArrowLeft") openV(cur - 1); else if (e.key === "ArrowRight") openV(cur + 1);
+});
+/* export */
+const X = document.getElementById("exporter");
+const xname = r => key(r.name);
+const q = d => { const h = d * Math.PI / 360; return [Math.sin(h), Math.cos(h)]; };
+function xbuild() {
+  const fmt = document.querySelector("input[name=xf]:checked").value, which = document.querySelector("input[name=xw]:checked").value;
+  const list = rows.filter(r => which === "all" || r.inc);
+  let out;
+  if (fmt === "yaml") {
+    out = `map: "${map.value}"\nframe_id: map\nposes:\n` + list.map(r => `  "${xname(r)}": {x: ${r.x.toFixed(4)}, y: ${r.y.toFixed(4)}, yaw: ${(r.yaw * Math.PI / 180).toFixed(4)}}`).join("\n") + "\n";
+  } else {
+    out = "from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion\nfrom std_msgs.msg import Header\nimport rclpy\n\n" + list.map(r => {
+      const v = `POS_${xname(r).toUpperCase()}`, pad = " ".repeat(v.length + 15), [z, w] = q(r.yaw);
+      return `${v} = PoseStamped(header=Header(stamp=rclpy.time.Time().to_msg(), frame_id='map'),\n${pad}pose=Pose(position=Point(x=${r.x}, y=${r.y}, z=0.0),\n${pad}          orientation=Quaternion(x=0.0, y=0.0, z=${z}, w=${w})))\n`;
+    }).join("");
+  }
+  const dupes = list.map(xname).filter((n, i, a) => a.indexOf(n) !== i);
+  document.getElementById("xtext").value = out;
+  document.getElementById("xhint").textContent = `${list.length} poses` + (dupes.length ? ` · ${dupes.length} name clash(es): rename before importing, or the later one wins` : "");
+}
+document.getElementById("exportBtn").onclick = () => { xbuild(); X.hidden = false; document.getElementById("xclose").focus(); };
+document.getElementById("xclose").onclick = () => { X.hidden = true; };
+X.addEventListener("change", xbuild);
+document.getElementById("xcopy").onclick = async () => { try { await navigator.clipboard.writeText(document.getElementById("xtext").value); document.getElementById("xhint").textContent = "Copied"; } catch { document.getElementById("xtext").select(); document.getElementById("xhint").textContent = "Press Ctrl+C to copy"; } };
+document.addEventListener("keydown", e => { if (!X.hidden && e.key === "Escape") X.hidden = true; });
+renderTable();
+</script>
+</body>
+</html>

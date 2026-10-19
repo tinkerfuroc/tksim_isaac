@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map → arena · mockup v1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: settings rail on the left (upload → walls → shapes → erase → save, in the order you use them); 2D map editor and live 3D preview side by side. */
+:root {
+  color-scheme: dark;
+  --ink: #e4e9f0; --muted: #8d99a9; --line: #2a323d;
+  --ground: #11151b; --panel: #181d25; --raise: #1f2630;
+  --accent: #6aa5ec; --accent-ink: #0d1520; --accent-soft: #1d2d42;
+  --wall: #7f9cc0; --shape: #d2a865; --shape-off: #4a3f2c; --erase: #f2776c;
+  --warn: #f0b04a; --warn-soft: #3a2c12; --bad: #f2776c; --bad-soft: #3d1c1a; --ok: #67c993; --ok-soft: #173326;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--ground); color: var(--ink); font: 14px/1.45 var(--sans); }
+.app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+header { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 600; }
+nav { display: flex; gap: 4px; }
+nav a { padding: 6px 12px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
+.body { display: grid; grid-template-columns: 340px 1fr; min-height: 0; }
+aside { border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; }
+.step { padding: 14px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 8px; }
+.step h3 { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); font-weight: 500; display: flex; justify-content: space-between; }
+.files { display: flex; gap: 6px; flex-wrap: wrap; }
+.file { font: 12px var(--mono); background: var(--raise); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; }
+.meta { font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+input[type=number], input[type=text] { font: 12px var(--mono); border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; background: var(--ground); color: var(--ink); }
+input[type=number] { width: 66px; }
+input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--shape); margin: 0; cursor: pointer; }
+.btn { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--raise); border-radius: 6px; padding: 5px 12px; cursor: pointer; color: var(--ink); }
+.btn:hover { border-color: #3d4756; }
+.btn.on { background: var(--bad-soft); border-color: var(--erase); color: var(--erase); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.shapes { max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.shapes table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.shapes th { position: sticky; top: 0; background: var(--raise); color: var(--muted); font-weight: 500; font-size: 11px; text-align: left; padding: 6px 8px; }
+.shapes td { padding: 4px 8px; border-top: 1px solid #20262f; font-variant-numeric: tabular-nums; }
+.shapes tr.sel td { background: var(--accent-soft); }
+.shapes tr:hover td { background: #1c222b; cursor: pointer; }
+.shapes td.num { font-family: var(--mono); color: var(--muted); }
+.hint { font-size: 12px; color: var(--muted); }
+.err { font-size: 12px; background: var(--bad-soft); color: var(--bad); padding: 6px 8px; border-radius: 6px; }
+.dest { font: 11.5px var(--mono); color: var(--muted); display: grid; gap: 2px; }
+main { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; }
+@media (max-width: 1200px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+.pane { background: var(--ground); display: grid; grid-template-rows: auto 1fr; min-height: 0; min-width: 0; }
+.pane h2 { margin: 0; padding: 8px 14px; font-size: 13px; font-weight: 500; display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.pane h2 span { color: var(--muted); font-weight: 400; font-size: 12px; }
+.stage { position: relative; min-height: 0; overflow: hidden; }
+#map2d { position: absolute; inset: 0; margin: auto; image-rendering: pixelated; cursor: pointer; max-width: 100%; max-height: 100%; }
+#map2d.erasing { cursor: crosshair; }
+#view3d { position: absolute; inset: 0; }
+.legend { position: absolute; left: 10px; bottom: 10px; display: flex; gap: 12px; font-size: 11.5px; background: rgba(17,21,27,.85); padding: 5px 9px; border-radius: 6px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.loading { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">Tinker Map Check</div>
+    <nav><a href="#" class="on">Map → arena</a><a href="#">Check poses</a></nav>
+  </header>
+  <div class="body">
+    <aside>
+      <section class="step">
+        <h3>1 · Upload map</h3>
+        <div class="files"><span class="file">robocup_home_2026_measured_5cm.yaml</span><span class="file">.pgm</span></div>
+        <div class="meta" id="meta"></div>
+        <div class="row"><button class="btn">Choose other files…</button><span class="hint">map .yaml + its image</span></div>
+      </section>
+      <section class="step">
+        <h3>2 · Walls</h3>
+        <div class="row"><label for="wallH">Height</label><input type="number" id="wallH" value="0.60" step="0.05" min="0.05" max="3"> m</div>
+        <span class="hint">Every occupied cell that isn't part of a filled shape.</span>
+      </section>
+      <section class="step">
+        <h3>3 · Filled shapes <span id="shapeCount"></span></h3>
+        <div class="row"><label for="autoArea">Fill closed outlines up to</label><input type="number" id="autoArea" value="4.0" step="0.5" min="0"> m² <button class="btn" id="applyAuto">apply</button></div>
+        <div class="row"><label for="defH">Default shape height</label><input type="number" id="defH" value="0.60" step="0.05" min="0.05"> m</div>
+        <div class="shapes"><table><thead><tr><th>fill</th><th>shape · x, y</th><th>m²</th><th>height m</th></tr></thead><tbody id="shapeRows"></tbody></table></div>
+        <span class="hint">Click a shape here or on the 2D map to highlight it.</span>
+      </section>
+      <section class="step">
+        <h3>4 · Erase noise <span id="eraseCount"></span></h3>
+        <div class="row"><button class="btn" id="eraseBtn">Erase brush</button><label for="brush">size</label><input type="number" id="brush" value="3" min="1" max="15"> cells <button class="btn" id="undoErase">undo</button></div>
+        <span class="hint">Paint over stray specks on the 2D map. Only the arena changes; the saved 2D map stays as uploaded. (Two fake specks were added in the living room for this mockup, around x 3.5, y 1.8 and x 7.5, y 4.5.)</span>
+      </section>
+      <section class="step">
+        <h3>5 · Save</h3>
+        <div class="row"><label for="nm">Name</label><input type="text" id="nm" value="robocup_home_2026_measured_5cm" style="flex:1; min-width:0"></div>
+        <div class="err">A map called robocup_home_2026_measured_5cm already exists in Map Studio. Pick another name.</div>
+        <div class="dest"><span>2D map → navigation_bringup/maps/&lt;name&gt;.yaml + .pgm</span><span>3D arena → artifacts/arena/&lt;name&gt;/ (sim: --arena &lt;name&gt;)</span></div>
+        <div><button class="btn primary" disabled style="opacity:.5">Save map + arena</button></div>
+      </section>
+    </aside>
+    <main>
+      <section class="pane">
+        <h2>2D map <span id="hover">hover a cell</span></h2>
+        <div class="stage" id="stage2d"><canvas id="map2d"></canvas>
+          <div class="legend"><span><i style="background:var(--wall)"></i>wall</span><span><i style="background:var(--shape)"></i>filled shape</span><span><i style="background:var(--shape-off)"></i>closed, not filled</span><span><i style="background:var(--erase)"></i>erased</span></div></div>
+      </section>
+      <section class="pane">
+        <h2>3D preview <span id="stats"></span></h2>
+        <div class="stage"><div id="view3d"></div><div class="loading" id="loading">Loading 3D…</div>
+          <div class="legend"><span>drag: orbit · right-drag: pan · wheel: zoom</span></div></div>
+      </section>
+    </main>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(async () => {
+  const d = await (await fetch("/files/mapdata.json")).json();
+  const { W, H, res, ox, oy } = d;
+  const raw = atob(d.grid), grid = new Uint8Array(W * H);
+  for (let i = 0; i < grid.length; i++) grid[i] = raw.charCodeAt(i);
+  // two fake specks for the erase demo
+  for (const [r, c] of [[205, 120], [206, 120], [205, 121], [150, 200]]) grid[r * W + c] = 255;
+  const erased = new Uint8Array(W * H); const eraseLog = [];
+  const regions = d.regions.map(r => ({ ...r, fill: r.area <= 4.0, h: 0.6 }));
+  // furniture-ish default heights for the demo
+  regions.forEach(r => { if (r.area > 1.2) r.h = 0.75; else if (r.area < 0.1) r.h = 0.45; });
+  let sel = null;
+  document.getElementById("meta").textContent = `${W} × ${H} cells · ${res * 100} cm · origin ${ox}, ${oy}`;
+  document.getElementById("shapeCount").textContent = `${regions.length} closed outlines`;
+
+  /* shapes list */
+  const tbody = document.getElementById("shapeRows");
+  function drawRows() {
+    tbody.innerHTML = "";
+    regions.forEach((r, i) => {
+      const tr = document.createElement("tr"); if (sel === i) tr.className = "sel";
+      tr.innerHTML = `<td><input type="checkbox" ${r.fill ? "checked" : ""} data-i="${i}" aria-label="Fill shape ${r.id}"></td>
+        <td style="white-space:nowrap" title="centre x ${r.x.toFixed(2)}, y ${r.y.toFixed(2)}">shape ${r.id}<br><span class="hint" style="font-family:var(--mono); font-size:11px">${r.x.toFixed(1)}, ${r.y.toFixed(1)}</span></td>
+        <td class="num">${r.area.toFixed(2)}</td>
+        <td><input type="number" value="${r.h.toFixed(2)}" step="0.05" min="0.05" data-h="${i}" ${r.fill ? "" : "disabled"} aria-label="Height of shape ${r.id}"></td>`;
+      tr.onclick = e => { if (e.target.tagName !== "INPUT") { sel = sel === i ? null : i; drawRows(); draw2d(); build3d(); } };
+      tbody.appendChild(tr);
+    });
+    const n = regions.filter(r => r.fill).length;
+    document.getElementById("shapeCount").textContent = `${n} of ${regions.length} filled`;
+  }
+  tbody.addEventListener("change", e => {
+    const el = e.target;
+    if (el.dataset.i !== undefined) regions[+el.dataset.i].fill = el.checked;
+    if (el.dataset.h !== undefined) regions[+el.dataset.h].h = Math.max(0.05, +el.value);
+    drawRows(); draw2d(); build3d();
+  });
+  document.getElementById("applyAuto").onclick = () => { const a = +autoArea.value; regions.forEach(r => r.fill = r.area <= a); drawRows(); draw2d(); build3d(); };
+  document.getElementById("defH").onchange = e => { regions.forEach(r => r.h = +e.target.value); drawRows(); build3d(); };
+  document.getElementById("wallH").oninput = () => build3d();
+
+  /* 2D map */
+  const cv = document.getElementById("map2d"), ctx = cv.getContext("2d");
+  const S = 3; cv.width = W * S; cv.height = H * S;
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  function fit() { const st = document.getElementById("stage2d"); const k = Math.min(st.clientWidth / cv.width, st.clientHeight / cv.height); cv.style.width = cv.width * k + "px"; cv.style.height = cv.height * k + "px"; }
+  function draw2d() {
+    ctx.fillStyle = "#0c0f13"; ctx.fillRect(0, 0, cv.width, cv.height);
+    const cw = css("--wall"), cs = css("--shape"), co = css("--shape-off"), ce = css("--erase"), ca = css("--accent");
+    for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
+      const i = r * W + c, g = grid[i];
+      if (g === 0) continue;
+      if (g === 255) ctx.fillStyle = erased[i] ? ce : cw;
+      else { const reg = regions[g - 1]; ctx.fillStyle = sel === g - 1 ? ca : reg.fill ? cs : co; }
+      ctx.fillRect(c * S, r * S, S, S);
+    }
+  }
+  const cellAt = e => { const b = cv.getBoundingClientRect(); return [Math.floor((e.clientY - b.top) / b.height * H), Math.floor((e.clientX - b.left) / b.width * W)]; };
+  let erasing = false, painting = false;
+  document.getElementById("eraseBtn").onclick = e => { erasing = !erasing; e.target.classList.toggle("on", erasing); cv.classList.toggle("erasing", erasing); };
+  function paint(e) {
+    const [r0, c0] = cellAt(e), b = +brush.value, h = Math.floor(b / 2), stroke = [];
+    for (let r = r0 - h; r <= r0 + h; r++) for (let c = c0 - h; c <= c0 + h; c++) {
+      if (r < 0 || c < 0 || r >= H || c >= W) continue; const i = r * W + c;
+      if (grid[i] === 255 && !erased[i]) { erased[i] = 1; stroke.push(i); }
+    }
+    if (stroke.length) { eraseLog.push(stroke); updateErase(); draw2d(); }
+  }
+  function updateErase() { const n = erased.reduce((a, v) => a + v, 0); document.getElementById("eraseCount").textContent = n ? `${n} cells erased` : ""; }
+  cv.onpointerdown = e => {
+    if (erasing) { painting = true; paint(e); return; }
+    const [r, c] = cellAt(e), g = grid[r * W + c];
+    if (g > 0 && g < 255) { sel = sel === g - 1 ? null : g - 1; drawRows(); draw2d(); build3d(); tbody.children[g - 1]?.scrollIntoView({ block: "nearest" }); }
+  };
+  cv.onpointermove = e => {
+    const [r, c] = cellAt(e); if (r < 0 || c < 0 || r >= H || c >= W) return;
+    const g = grid[r * W + c];
+    document.getElementById("hover").textContent = `x ${(ox + (c + .5) * res).toFixed(2)}  y ${(oy + (H - r - .5) * res).toFixed(2)}  ·  ${g === 0 ? "free" : g === 255 ? (erased[r * W + c] ? "erased" : "wall") : "shape " + g}`;
+    if (painting) paint(e);
+  };
+  window.addEventListener("pointerup", () => { if (painting) { painting = false; build3d(); } });
+  document.getElementById("undoErase").onclick = () => { const s = eraseLog.pop(); if (s) { s.forEach(i => erased[i] = 0); updateErase(); draw2d(); build3d(); } };
+
+  /* 3D */
+  const host = document.getElementById("view3d");
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(devicePixelRatio); host.appendChild(renderer.domElement);
+  renderer.shadowMap.enabled = true;
+  const scene = new THREE.Scene(); scene.background = new THREE.Color(0x11151b);
+  const cx = ox + W * res / 2, cy = oy + H * res / 2;
+  const cam = new THREE.PerspectiveCamera(40, 1, 0.05, 200); cam.up.set(0, 0, 1);
+  cam.position.set(cx - 10, cy - 17, 17);
+  const ctl = new THREE.OrbitControls(cam, renderer.domElement); ctl.target.set(cx, cy, 0); ctl.update();
+  scene.add(new THREE.HemisphereLight(0xdfe8f5, 0x20242b, 0.75));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.75); sun.position.set(cx - 8, cy - 5, 18); sun.target.position.set(cx, cy, 0);
+  sun.castShadow = true; Object.assign(sun.shadow.camera, { left: -12, right: 12, top: 12, bottom: -12 }); sun.shadow.mapSize.set(2048, 2048);
+  scene.add(sun, sun.target);
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(W * res + 2, H * res + 2), new THREE.MeshStandardMaterial({ color: 0x2a2f37, roughness: 1 }));
+  floor.position.set(cx, cy, 0); floor.receiveShadow = true; scene.add(floor);
+  const grp = new THREE.Group(); scene.add(grp);
+  const mats = { wall: new THREE.MeshStandardMaterial({ color: css("--wall"), roughness: .7 }), shape: new THREE.MeshStandardMaterial({ color: css("--shape"), roughness: .6 }), sel: new THREE.MeshStandardMaterial({ color: css("--accent"), roughness: .5, emissive: 0x10233a }) };
+  const box = new THREE.BoxGeometry(1, 1, 1);
+  function rects(test) { // merge row runs with identical column spans over consecutive rows
+    const out = [], open = new Map();
+    for (let r = 0; r <= H; r++) {
+      const runs = new Set();
+      if (r < H) { let c = 0; while (c < W) { if (test(r * W + c)) { const s = c; while (c < W && test(r * W + c)) c++; runs.add(s + ":" + c); } else c++; } }
+      for (const [k, r0] of open) if (!runs.has(k)) { open.delete(k); const [a, b] = k.split(":").map(Number); out.push([r0, a, r - r0, b - a]); }
+      for (const k of runs) if (!open.has(k)) open.set(k, r);
+    }
+    return out;
+  }
+  function add(rs, h, mat) {
+    for (const [r0, c0, nr, nc] of rs) {
+      const m = new THREE.Mesh(box, mat);
+      m.scale.set(nc * res, nr * res, h);
+      m.position.set(ox + (c0 + nc / 2) * res, oy + (H - r0 - nr / 2) * res, h / 2);
+      m.castShadow = m.receiveShadow = true; grp.add(m);
+    }
+    return rs.length;
+  }
+  function build3d() {
+    grp.clear();
+    const wh = Math.max(0.05, +wallH.value || 0.6);
+    let n = add(rects(i => grid[i] === 255 && !erased[i]), wh, mats.wall);
+    regions.forEach((r, k) => { if (r.fill) n += add(rects(i => grid[i] === k + 1), r.h, sel === k ? mats.sel : mats.shape); });
+    document.getElementById("stats").textContent = `${n} boxes · walls ${wh.toFixed(2)} m`;
+  }
+  function resize() { const w = host.clientWidth, h = host.clientHeight; renderer.setSize(w, h); cam.aspect = w / h; cam.updateProjectionMatrix(); fit(); }
+  new ResizeObserver(resize).observe(host); new ResizeObserver(fit).observe(document.getElementById("stage2d"));
+  (function loop() { requestAnimationFrame(loop); renderer.render(scene, cam); })();
+  drawRows(); draw2d(); build3d(); resize();
+  document.getElementById("loading").remove();
+})().catch(e => { document.getElementById("loading").textContent = "Couldn't load the 3D preview: " + e.message; });
+</script>
+</body>
+</html>
