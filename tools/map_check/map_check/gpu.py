@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PATTERNS = ("run_sim.py", "gpsr-stack", "isaac-sim", "omni.kit")
+SHELLS = ("bash", "sh", "zsh", "dash")
 CMD_MAX = 200
 SMI_TIMEOUT_S = 5
 
@@ -39,6 +40,24 @@ def _read_cmdline(proc_root: Path, pid: str, limit: int | None = None) -> str | 
     except OSError:
         return None
     return " ".join(p for p in raw.decode(errors="replace").split("\0") if p)[:limit]
+
+
+def _program(argv: list[str]) -> list[str]:
+    """The words naming what a process runs: argv[0], plus the script an interpreter runs.
+
+    Arguments that are only text (a grep pattern, a `sh -c` command string) are left
+    out, so a monitor that greps a log for "gpsr-stack" is not a sim.
+    """
+    words = argv[:1]
+    base = Path(argv[0]).name if argv else ""
+    if base.startswith("python") or base in SHELLS:
+        for a in argv[1:]:
+            if a == "-c":
+                break
+            if not a.startswith("-"):
+                words.append(a)
+                break
+    return words
 
 
 def _ppid(proc_root: Path, pid: str) -> int | None:
@@ -99,12 +118,17 @@ def gpu_status(run=subprocess.run, proc_root: Path = Path("/proc"),
         pid = int(p)
         if pid in skip or pid in seen:
             continue
-        cmd = _read_cmdline(proc_root, p)
-        if not cmd:
+        try:
+            raw = (proc_root / p / "cmdline").read_bytes()
+        except OSError:
             continue
+        argv = [a for a in raw.decode(errors="replace").split("\0") if a]
+        if not argv:
+            continue
+        words = _program(argv)
         for pat in PATTERNS:
-            if pat in cmd:
-                status.busy.append(BusyReason(None, pid, pat, cmd[:CMD_MAX]))
+            if any(pat in w for w in words):
+                status.busy.append(BusyReason(None, pid, pat, " ".join(argv)[:CMD_MAX]))
                 break
     return status
 

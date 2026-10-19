@@ -61,7 +61,7 @@ def test_own_job_ignored(tmp_path):
 
 
 def test_nvidia_smi_missing(tmp_path):
-    add_proc(tmp_path, 123, ["x", "run_sim.py"])
+    add_proc(tmp_path, 123, ["python", "run_sim.py"])
 
     def run(cmd, **kw):
         raise FileNotFoundError
@@ -81,7 +81,26 @@ def test_nvidia_smi_nonzero_and_timeout(tmp_path):
 
 
 def test_marker_past_truncation_limit(tmp_path):
-    add_proc(tmp_path, 321, ["python", "x" * 300, "run_sim.py"])
+    add_proc(tmp_path, 321, ["python", "/" + "x" * 300 + "/run_sim.py"])
     st = gpu_status(run=fake_run(), proc_root=tmp_path)
     assert [r.pid for r in st.busy] == [321]
     assert st.busy[0].name == "run_sim.py" and len(st.busy[0].cmd) == 200
+
+
+def test_sim_launch_forms_busy(tmp_path):
+    add_proc(tmp_path, 11, ["/usr/bin/python3", "-u", "/repo/validation/run_sim.py", "--headless"])
+    add_proc(tmp_path, 12, ["/bin/bash", "/repo/scripts/gpsr-stack", "up"])
+    add_proc(tmp_path, 13, ["/isaac-sim/kit/kit", "/isaac-sim/apps/isaacsim.exp.full.kit"])
+    st = gpu_status(run=fake_run(), proc_root=tmp_path)
+    assert [(r.pid, r.name) for r in st.busy] == [(11, "run_sim.py"), (12, "gpsr-stack"),
+                                                  (13, "isaac-sim")]
+
+
+def test_text_mentioning_marker_not_busy(tmp_path):
+    # An orphaned log monitor once blocked every render: its grep pattern and its
+    # `zsh -c` script both mention gpsr-stack, but neither runs a sim.
+    add_proc(tmp_path, 21, ["/usr/bin/zsh", "-c", "tail -F battery.log | grep 'gpsr-stack up rc'"])
+    add_proc(tmp_path, 22, ["ugrep", "-E", "--line-buffered", "PREFLIGHT|gpsr-stack up rc"])
+    add_proc(tmp_path, 23, ["tail", "-F", "/runs/run_sim.py.log"])
+    add_proc(tmp_path, 24, ["python3", "-c", "import run_sim.py"])
+    assert gpu_status(run=fake_run(), proc_root=tmp_path).busy == []
