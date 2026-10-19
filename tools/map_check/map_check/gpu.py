@@ -33,12 +33,12 @@ def _smi(run, query: str) -> list[list[str]] | None:
     return [[c.strip() for c in line.split(",")] for line in p.stdout.splitlines() if line.strip()]
 
 
-def _read_cmdline(proc_root: Path, pid: str) -> str | None:
+def _read_cmdline(proc_root: Path, pid: str, limit: int | None = None) -> str | None:
     try:
         raw = (proc_root / pid / "cmdline").read_bytes()
     except OSError:
         return None
-    return " ".join(p for p in raw.decode(errors="replace").split("\0") if p)[:CMD_MAX]
+    return " ".join(p for p in raw.decode(errors="replace").split("\0") if p)[:limit]
 
 
 def _ppid(proc_root: Path, pid: str) -> int | None:
@@ -92,7 +92,7 @@ def gpu_status(run=subprocess.run, proc_root: Path = Path("/proc"),
                 continue
             name = Path(row[2]).name if len(row) > 2 else ""
             status.busy.append(BusyReason(uuid_to_idx.get(row[0]), pid, name,
-                                          _read_cmdline(proc_root, str(pid)) or ""))
+                                          _read_cmdline(proc_root, str(pid), CMD_MAX) or ""))
 
     seen = {r.pid for r in status.busy}
     for p in sorted(pids, key=int):
@@ -104,13 +104,17 @@ def gpu_status(run=subprocess.run, proc_root: Path = Path("/proc"),
             continue
         for pat in PATTERNS:
             if pat in cmd:
-                status.busy.append(BusyReason(None, pid, pat, cmd))
+                status.busy.append(BusyReason(None, pid, pat, cmd[:CMD_MAX]))
                 break
     return status
 
 
 def choose_gpu(status: GpuStatus) -> int:
-    """First free GPU, preferring 1; if all are busy, the one with the fewest apps."""
+    """First free GPU, preferring 1; if all are busy, the one with the fewest apps.
+
+    status.gpus == [] means the GPU list is unknown (nvidia-smi unavailable); the
+    fallback to GPU 0 is then arbitrary.
+    """
     gpus = status.gpus or [0]
     count = {g: sum(1 for r in status.busy if r.gpu == g) for g in gpus}
     free = [g for g in gpus if count[g] == 0]

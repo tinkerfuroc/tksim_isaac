@@ -78,3 +78,10 @@ def test_nvidia_smi_nonzero_and_timeout(tmp_path):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     assert gpu_status(run=slow, proc_root=tmp_path).gpus == []
+
+
+def test_marker_past_truncation_limit(tmp_path):
+    add_proc(tmp_path, 321, ["python", "x" * 300, "run_sim.py"])
+    st = gpu_status(run=fake_run(), proc_root=tmp_path)
+    assert [r.pid for r in st.busy] == [321]
+    assert st.busy[0].name == "run_sim.py" and len(st.busy[0].cmd) == 200
