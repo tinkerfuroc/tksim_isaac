@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import dataclasses
 import json
+import io
 import re
 import secrets
 import threading
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -17,7 +20,9 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel
+import uvicorn
 
 from . import robot as robot_mod
 from .arena_build import BuildSettings, ShapeSetting, build_boxes, default_settings, web_grid
@@ -37,6 +42,8 @@ MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 MAX_HEIGHT_M = 10.0
 SSE_PING_S = 15.0
 FLAG_CACHE_MAX = 4096
+MAX_TOKENS = 16
+GRACEFUL_SHUTDOWN_S = 5
 
 
 def origin_allowed(origin, host):
@@ -119,6 +126,7 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
         runner = JobRunner(settings, bench, job_command_factory, gpu_probe=gpu_probe,
                            robot_model=robot_model)
         app.state.runner = runner
+        atexit.register(runner.shutdown)  # a forced exit skips the lifespan
         try:
             yield
         finally:
@@ -127,6 +135,7 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
 
     app = FastAPI(title='Map Check', lifespan=lifespan)
     app.state.bench = bench
+    app.state.stopping = stopping
 
     @app.middleware('http')
     async def same_origin_only(request, call_next):
@@ -156,7 +165,12 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
     def hold(entry: _Held) -> str:
         token = secrets.token_urlsafe(16)
         with held_lock:
-            entry.expires = clock() + TOKEN_TTL_S
+            now = clock()
+            for t in [t for t, h in held.items() if h.expires <= now]:
+                del held[t]
+            while len(held) >= MAX_TOKENS:
+                del held[next(iter(held))]  # oldest first
+            entry.expires = now + TOKEN_TTL_S
             held[token] = entry
         return token
 
@@ -192,6 +206,7 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
         image_bytes = image.file.read(MAX_UPLOAD_BYTES + 1)
         if len(yaml_bytes) > MAX_UPLOAD_BYTES or len(image_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, 'file too large')
+        _check_image_size(image_bytes)
         files = {Path((image.filename or '').replace('\\', '/')).name: image_bytes}
         m = parse_map(yaml_bytes, files)
         identical = store.identical_existing(yaml_bytes, files)
@@ -283,13 +298,17 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
             if model is not None:
                 s, p = r.state, r.pose
                 ck = (str(arena_dir), p.x, p.y, p.yaw, tuple(arms[st.arm_pose]), s.pan_deg, s.tilt_deg)
-                with model_lock:
-                    if ck not in flag_cache:
-                        if len(flag_cache) >= FLAG_CACHE_MAX:
-                            flag_cache.clear()
-                        flag_cache[ck] = model.flags(p, arms[st.arm_pose], s.pan_deg, s.tilt_deg,
-                                                     boxes, bounds)
-                    flags = flag_cache[ck]
+                try:
+                    with model_lock:
+                        if ck not in flag_cache:
+                            if len(flag_cache) >= FLAG_CACHE_MAX:
+                                flag_cache.clear()
+                            flag_cache[ck] = model.flags(p, arms[st.arm_pose], s.pan_deg,
+                                                         s.tilt_deg, boxes, bounds)
+                        flags = flag_cache[ck]
+                except Exception as e:  # noqa: BLE001 - report it, keep the rest of the bench
+                    errors.append(f'overlap check failed for {r.pose.name}: {type(e).__name__}: {e}')
+                    model = None
             rows.append({'key': r.key, 'group': r.group, 'pose': asdict(r.pose),
                          'state': asdict(r.state), 'clash': r.clash_m, 'clash_m': r.clash_m,
                          'flags': [asdict(f) for f in flags]})
@@ -351,7 +370,7 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
             sent, last_version, last_job = 0, None, None
             last_ping = time.monotonic()
             while not stopping.is_set():
-                st = bench.get(map)
+                st = await asyncio.to_thread(bench.get, map)
                 job = st.job.to_dict() if st.job else None
                 out = []
                 if st.version != last_version:
@@ -379,6 +398,50 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
     app.mount('/renders', StaticFiles(directory=renders_dir), name='renders')
     _mount_ui(app, web_dir if web_dir is not None else _default_web_dir())
     return app
+
+
+def _check_image_size(data: bytes) -> None:
+    """Refuse decompression bombs with a 400 before the image is decoded."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', Image.DecompressionBombWarning)
+            Image.open(io.BytesIO(data)).size
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as e:
+        raise HTTPException(400, f'map image is too large to open safely: {e}')
+    except Exception:  # noqa: BLE001 - other unreadable images are reported by parse_map
+        pass
+
+
+LOOPBACK_HOSTS = ('127.0.0.1', '::1', 'localhost')
+
+
+class _Server(uvicorn.Server):
+    """Ends the event streams and the render job as soon as the server is told to exit."""
+
+    def __init__(self, config, app):
+        super().__init__(config)
+        self._app = app
+
+    def handle_exit(self, sig, frame):
+        again = self.should_exit
+        self._app.state.stopping.set()  # open SSE streams would block uvicorn's shutdown
+        if again:
+            self.stop_runner()  # a second signal forces exit and skips the lifespan
+        super().handle_exit(sig, frame)
+
+    def stop_runner(self):
+        runner = getattr(self._app.state, 'runner', None)
+        if runner is not None:
+            runner.shutdown()
+
+
+def serve(app, host: str, port: int) -> None:
+    server = _Server(uvicorn.Config(app, host=host, port=port,
+                                    timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S), app)
+    try:
+        server.run()
+    finally:
+        server.stop_runner()  # idempotent; the lifespan normally did this already
 
 
 def _mount_ui(app, web_dir):

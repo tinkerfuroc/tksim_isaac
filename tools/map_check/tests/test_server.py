@@ -2,7 +2,12 @@
 import hashlib
 import io
 import json
+import os
+import signal
+import socket
+import subprocess
 import sys
+import time
 import textwrap
 import threading
 from pathlib import Path
@@ -81,6 +86,7 @@ def make_client(settings, tmp_path):
     made = []
 
     def make(gpu=free_gpu, **kw):
+        kw.setdefault("web_dir", tmp_path / "no-dist")  # the test owns its precondition
         c = TestClient(create_app(settings, fake_command(tmp_path), robot_model=StubRobot(),
                                   gpu_probe=gpu, poll_interval=0.02, **kw))
         c.__enter__()
@@ -356,3 +362,156 @@ def test_upload_token_expires(settings, tmp_path):
         assert save(c, up["token"], "bar").status_code == 200
         clock[0] += 3601
         assert save(c, up["token"], "bar2").status_code == 404
+
+
+def test_token_cap_drops_oldest(client):
+    first = upload(client)["token"]
+    others = [upload(client)["token"] for _ in range(16)]
+    assert save(client, first, "bar").status_code == 404  # the oldest was dropped
+    assert save(client, others[-1], "bar").status_code == 200
+
+
+def test_flag_errors_are_reported_not_500(settings, tmp_path):
+    class Broken:
+        def flags(self, *a):
+            raise RuntimeError("mesh missing")
+
+    with TestClient(create_app(settings, fake_command(tmp_path), robot_model=Broken(),
+                               gpu_probe=free_gpu, web_dir=tmp_path / "no-dist")) as c:
+        bench_ready(c, settings)
+        r = c.get("/api/bench/bar")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert "mesh missing" in d["flags_error"]
+        assert [x["pose"]["name"] for x in d["rows"]] == ["a", "b"]
+        assert all(x["flags"] == [] for x in d["rows"])
+
+
+def test_decompression_bomb_upload_400(client, monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)  # 24x24 = 576 px is > 2x the limit
+    yaml, img = map_files()
+    r = client.post("/api/map/upload", files={
+        "yaml": ("a.yaml", yaml, "text/yaml"), "image": ("m.png", img, "image/png")})
+    assert r.status_code == 400 and "too large" in r.json()["detail"]
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 500)  # over 1x: only a warning
+    r = client.post("/api/map/upload", files={
+        "yaml": ("a.yaml", yaml, "text/yaml"), "image": ("m.png", img, "image/png")})
+    assert r.status_code == 400 and isinstance(r.json()["detail"], str)
+
+
+def test_refuses_non_loopback_host(monkeypatch):
+    from map_check.__main__ import main
+    monkeypatch.setenv("MAP_CHECK_HOST", "0.0.0.0")
+    with pytest.raises(SystemExit) as e:
+        main([])
+    assert "loopback only" in str(e.value) and "ssh tunnel" in str(e.value)
+
+
+SERVER = textwrap.dedent("""
+    import json, sys
+    from pathlib import Path
+    from map_check.config import Settings
+    from map_check.gpu import GpuStatus
+    from map_check.server import create_app, serve
+    cfg = json.load(open(sys.argv[1]))
+    t = Path(cfg["tmp"])
+    s = Settings(maps_dir=t / "maps", arena_root=t / "arena", state_dir=t / "state",
+                 repo_root=t, arm_poses_json=t / "constants.json")
+    class Robot:
+        urdf = t / 'robot.urdf'
+        usd = t / 'robot.usd'
+        z0 = 0.0775
+        def flags(self, *a):
+            return []
+    fake = t / "render.py"
+    app = create_app(s, lambda jobfile: [sys.executable, str(fake), str(jobfile)],
+                     robot_model=Robot(), gpu_probe=lambda own_pids=frozenset(): GpuStatus([0, 1], []))
+    serve(app, "127.0.0.1", cfg["port"])
+""")
+
+SLEEPER = textwrap.dedent("""
+    import os, sys, time
+    open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.pid"), "w").write(str(os.getpid()))
+    time.sleep(1000)
+""")
+
+
+def pid_alive(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat[stat.rindex(")") + 2] != "Z"
+
+
+def test_sigint_with_open_event_stream_stops_server_and_render(settings, tmp_path):
+    import httpx
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+    (tmp_path / "server.py").write_text(SERVER)
+    (tmp_path / "render.py").write_text(SLEEPER)
+    (tmp_path / "cfg.json").write_text(json.dumps({"tmp": str(tmp_path), "port": port}))
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "AMENT_PREFIX_PATH")}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    proc = subprocess.Popen(
+        ["timeout", "-k", "5", "60", sys.executable, str(tmp_path / "server.py"),
+         str(tmp_path / "cfg.json")], env=env, start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    base = f"http://127.0.0.1:{port}"
+    stream = None
+    try:
+        end = time.monotonic() + 20
+        while True:
+            try:
+                httpx.get(base + "/api/maps", timeout=2)
+                break
+            except httpx.HTTPError:
+                assert proc.poll() is None and time.monotonic() < end, "server did not start"
+                time.sleep(0.1)
+        yaml, img = map_files()
+        up = httpx.post(base + "/api/map/upload", timeout=10, files={
+            "yaml": ("f.yaml", yaml), "image": ("m.png", img)}).json()
+        assert save_via(base, up["token"]).status_code == 200
+        (tmp_path / "maps" / "bar.poses.yaml").write_text(
+            "map: bar\nframe_id: map\nposes:\n  a: {x: 1.0, y: 1.0, yaw: 0.0}\n")
+        httpx.post(base + "/api/bench/bar/ops", timeout=10, json={"ops": [
+            {"op": "set_row", "row": "saved:a", "fields": {"included": True}}]})
+        assert httpx.post(base + "/api/bench/bar/render", json={"override": False},
+                          timeout=10).status_code == 200
+        pidfile = tmp_path / "render.pid"
+        end = time.monotonic() + 15
+        while not pidfile.exists() and time.monotonic() < end:
+            time.sleep(0.05)
+        assert pidfile.exists(), httpx.get(base + "/api/bench/bar").json()["job"]
+        render_pid = int(pidfile.read_text())
+        assert pid_alive(render_pid)
+        stream = httpx.stream("GET", base + "/api/events?map=bar", timeout=10)
+        resp = stream.__enter__()
+        assert next(resp.iter_lines()).startswith("event:")  # the stream is open
+        # signal the python process (timeout's child), as Ctrl+C reaches it
+        server_pid = int(subprocess.check_output(["pgrep", "-P", str(proc.pid)]).split()[0])
+        os.kill(server_pid, signal.SIGINT)
+        proc.wait(timeout=15)  # without the fix this hangs at "Waiting for connections to close"
+        end = time.monotonic() + 10
+        while pid_alive(render_pid) and time.monotonic() < end:
+            time.sleep(0.1)
+        assert not pid_alive(render_pid), "the render job survived the server"
+    finally:
+        if stream is not None:
+            try:
+                stream.__exit__(None, None, None)
+            except Exception:
+                pass
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        pf = tmp_path / "render.pid"
+        if pf.exists() and pid_alive(int(pf.read_text())):
+            os.kill(int(pf.read_text()), signal.SIGKILL)
+
+
+def save_via(base, token):
+    import httpx
+    return httpx.post(base + "/api/map/save", timeout=20, json={
+        "token": token, "name": "bar", "wall_height": 0.6, "shapes": {}, "erased": []})
