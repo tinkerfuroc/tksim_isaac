@@ -13,7 +13,8 @@ import pytest
 from map_check.bench import BenchStore, JobStatus
 from map_check.config import Settings
 from map_check.gpu import BusyReason, GpuStatus
-from map_check.jobs import UNSET_ENV, GpuBusy, JobRunner, _proc_start, default_isaac_command
+from map_check.jobs import (KIT_NO_GPU, UNSET_ENV, GpuBusy, JobRunner, _proc_start,
+                            default_isaac_command)
 from map_check.overlap import Flag
 from map_check.render.cameras import overview_top
 from map_check.render.isaac_render import overview_labels
@@ -28,6 +29,8 @@ FAKE = textwrap.dedent("""
     cfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cfg.json")))
     os.makedirs(job["out_dir"], exist_ok=True)
     print("Isaac noise line", flush=True)
+    for stream, line in cfg.get("kit_lines", []):
+        print(line, file=sys.stderr if stream == "err" else sys.stdout, flush=True)
     if cfg.get("hang"):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1000)"])
         with open(cfg["pids"], "w") as f:
@@ -427,3 +430,58 @@ def test_isaac_render_imports_without_isaac():
                         "print(callable(m.main))"],
                        capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1])
     assert p.stdout.strip() == "True", p.stderr
+
+
+# Verbatim from the failed 05:03:37 render's log (20261020T050337-cc14fb.log, line 66; that
+# file is gone): activeGpu=0 under CUDA_VISIBLE_DEVICES=1 left Kit with no device.
+KIT_FAILED_LINE = ("2026-10-20T09:03:41Z [3,107ms] [Error] [omni.gpu_foundation_factory.plugin] "
+                   "Failed to create any GPU devices, including an attempt with compatibility mode.")
+# Verbatim from the healthy 07:09:42 render's log (20261020T070942-bc6a8a.log): Kit warns
+# about the GPU it can't see, then renders on the one it can.
+KIT_HEALTHY_LINES = [
+    "[1.305s] [ext: omni.gpu_foundation-0.0.0] startup",
+    "2026-10-20T11:09:45Z [1,525ms] [Warning] [omni.rtx] CUDA_VISIBLE_DEVICES environment variable is set.",
+    "2026-10-20T11:09:46Z [2,438ms] [Warning] [omni.rtx] Skipping NVIDIA graphics device because "
+    "the matching CUDA device could not be found: NVIDIA GeForce RTX 2080 Ti",
+    "2026-10-20T11:09:46Z [2,439ms] [Warning] [omni.rtx] Skipping NVIDIA graphics device because "
+    "the matching CUDA device could not be found: NVIDIA GeForce RTX 2080 Ti",
+    "| 1   | NVIDIA GeForce RTX 2080 Ti       | Yes: 0 |     | 11510   MB | 10de      | 0          |",
+]
+
+
+def test_kit_line_matches_the_real_log():
+    assert KIT_NO_GPU in KIT_FAILED_LINE
+    assert not any(KIT_NO_GPU in line for line in KIT_HEALTHY_LINES)
+
+
+@pytest.mark.parametrize("stream", ["err", "out"])
+def test_kit_no_gpu_line_fails_job_fast_and_kills_group(tmp_path, settings, runners, stream):
+    pids_file = tmp_path / "pids.json"
+    bench = BenchStore(settings.state_dir)
+    cmd = fake_command(tmp_path, hang=True, pids=str(pids_file),
+                       kit_lines=[(stream, line) for line in KIT_HEALTHY_LINES[:3]]
+                       + [(stream, KIT_FAILED_LINE)])
+    r = runner(runners, settings, bench, cmd, timeout_s=120.0, kill_grace_s=2.0)
+    t0 = time.monotonic()
+    job = r.submit("m1", override=False)
+    st = finished(r, "m1")
+    assert time.monotonic() - t0 < 10  # not the 120 s timeout
+    assert st.status == "failed"
+    assert st.message == "Isaac could not create a GPU device on GPU 1 (see the job log)"
+    pids = json.loads(pids_file.read_text())
+    wait_for(lambda: not any(alive(p) for p in pids), timeout=5)
+    log = (settings.state_dir / "jobs" / f"{job.id}.log").read_text()
+    assert KIT_FAILED_LINE in log  # the reader still logs what Kit said
+
+
+def test_kit_gpu_warnings_alone_do_not_stop_render(tmp_path, settings, runners):
+    bench = BenchStore(settings.state_dir)
+    cmd = fake_command(tmp_path, sleep=0.2, kit_lines=[("err", line) for line in KIT_HEALTHY_LINES]
+                       + [("out", line) for line in KIT_HEALTHY_LINES[2:4]])
+    r = runner(runners, settings, bench, cmd)
+    job = r.submit("m1", override=False)
+    st = finished(r, "m1")
+    assert st.status == "done", st.message
+    assert st.done_views == 3
+    log = (settings.state_dir / "jobs" / f"{job.id}.log").read_text()
+    assert "Skipping NVIDIA graphics device" in log  # stderr reaches the log through the reader

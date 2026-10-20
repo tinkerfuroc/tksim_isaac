@@ -9,8 +9,8 @@ from pathlib import Path
 from map_check.render import isaac_render
 import pytest
 
-from map_check.render.isaac_render import (NO_GPU_EXIT, app_config, emit_view, first_image_budget,
-                                         no_device_message, slow_start_message)
+from map_check.render.isaac_render import (app_config, emit_view, first_image_budget,
+                                         slow_start_message)
 from map_check.render.jobfile import JobFile, JobPose
 
 PKG = Path(__file__).resolve().parents[1]
@@ -34,10 +34,10 @@ def test_gpu_settings_mirror_run_sim():
     assert [a for a in ours["extra_args"] if a.startswith("--/physics/")] == physics
 
 
-def test_no_device_message():
-    assert no_device_message(1, 0) == "Isaac could not create a GPU device on GPU 1 (see the job log)"
-    assert no_device_message(1, 1) is None
-    assert no_device_message(0, None) is None  # unknown: the first-image backstop decides
+def test_main_has_no_device_count_check():
+    """Ruling 12: get_device_count() read 0 on a healthy GPU; the runner watches Kit's log."""
+    src = Path(isaac_render.__file__).read_text()
+    assert "get_device_count" not in src and "gpu_foundation_factory" not in src
 
 
 def test_emit_view_runs_listeners(capsys, monkeypatch):
@@ -57,30 +57,17 @@ FAKE_ISAACSIM = textwrap.dedent("""
             pass
 """)
 
-FAKE_GFF = textwrap.dedent("""
-    import os
-    class _Factory:
-        def get_device_count(self):
-            return int(os.environ["FAKE_DEVICES"])
-    def get_gpu_foundation_factory_interface():
-        return _Factory()
-""")
-
-
-def _run_main(tmp_path, devices: int):
+def _run_main(tmp_path):
     fake = tmp_path / "fake"
     (fake / "isaacsim").mkdir(parents=True)
     (fake / "isaacsim" / "__init__.py").write_text(FAKE_ISAACSIM)
-    (fake / "omni" / "gpu_foundation_factory").mkdir(parents=True)
-    (fake / "omni" / "__init__.py").write_text("")
-    (fake / "omni" / "gpu_foundation_factory" / "__init__.py").write_text(FAKE_GFF)
     job = tmp_path / "job.json"
     JobFile(job_id="j", map="m", arena_usd="/a.usd", robot_usd="/r.usd", robot_urdf="/r.urdf",
             z0=0.08, gpu=1, out_dir=str(tmp_path / "out"), arm_deg=[0.0] * 7,
             poses=[JobPose(key="saved:a", name="a", x=0.0, y=0.0, yaw=0.0, views=["behind"])],
             overview=True, deadline=4_000_000_000.0).write(job)
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "AMENT_PREFIX_PATH")}
-    env.update(PYTHONPATH=os.pathsep.join([str(fake), str(PKG)]), FAKE_DEVICES=str(devices),
+    env.update(PYTHONPATH=os.pathsep.join([str(fake), str(PKG)]),
                FAKE_CONFIG_OUT=str(tmp_path / "config.json"))
     p = subprocess.run([sys.executable, "-m", "map_check.render.isaac_render", str(job)],
                        env=env, capture_output=True, text=True, timeout=60)
@@ -89,17 +76,11 @@ def _run_main(tmp_path, devices: int):
     return p, config, events
 
 
-def test_main_fails_fast_without_gpu_device(tmp_path):
-    p, config, events = _run_main(tmp_path, devices=0)
-    assert p.returncode == NO_GPU_EXIT, p.stderr
-    assert events == [{"event": "error",
-                       "message": "Isaac could not create a GPU device on GPU 1 (see the job log)"}]
+def test_main_starts_app_with_run_sim_config_and_goes_on(tmp_path):
+    """With a fake SimulationApp, main passes app_config() and goes on to the Renderer
+    (which needs real Isaac, so it ends in an error event, not a GPU-device verdict)."""
+    p, config, events = _run_main(tmp_path)
     assert config == app_config()
-
-
-def test_main_goes_on_with_a_gpu_device(tmp_path):
-    """With a device, main proceeds to the Renderer (which needs real Isaac: an error event)."""
-    p, _, events = _run_main(tmp_path, devices=1)
     assert p.returncode == 1, p.stderr
     assert events[-1]["event"] == "error" and "GPU device" not in events[-1]["message"]
 
@@ -127,5 +108,4 @@ def test_slow_start_message_is_not_the_no_device_message():
     msg = slow_start_message(1, 255.4)
     assert msg == ("No image after 255 s: Isaac may have no GPU device on GPU 1, or startup is "
                    "slow (see the job log)")
-    assert "could not create a GPU device" not in msg
-    assert "could not create a GPU device" in no_device_message(1, 0)
+    assert "could not create a GPU device" not in msg  # that verdict is the runner's (jobs.py)

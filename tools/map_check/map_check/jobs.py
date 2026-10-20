@@ -45,6 +45,10 @@ LOCK = "runner.lock"  # held by the one JobRunner using a state dir
 UNSET_ENV = ("PYTHONPATH", "AMENT_PREFIX_PATH", "CMAKE_PREFIX_PATH", "COLCON_PREFIX_PATH",
              "ROS_PACKAGE_PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH")
 CAPTIONS = {"behind": "behind-left", "top": "top-down"}
+# Kit's own log line when it starts with no usable GPU; the render would then hang until its
+# timeout, so the runner stops it as soon as the line appears (Ruling 12).
+KIT_NO_GPU = "[omni.gpu_foundation_factory.plugin] Failed to create any GPU devices"
+NO_GPU_TEXT = "Isaac could not create a GPU device on GPU {gpu} (see the job log)"
 
 
 class GpuBusy(Exception):
@@ -123,7 +127,9 @@ class _Job:
     files: dict[tuple[str, str], str] = field(default_factory=dict)  # (key, view) -> file
     flags: dict[str, list[Flag]] = field(default_factory=dict)
     error: str = ""
+    gpu: int | None = None
     done: threading.Event = field(default_factory=threading.Event)
+    no_gpu: threading.Event = field(default_factory=threading.Event)  # Kit said KIT_NO_GPU
 
 
 class JobRunner:
@@ -315,6 +321,7 @@ class JobRunner:
         out_dir.mkdir(parents=True, exist_ok=True)
         timeout = self._timeout_s or self.timeout_for(st.total_views)
         gpu = choose_gpu(gpus)
+        job.gpu = gpu
         jf = JobFile(
             job_id=st.id, map=st.map, arena_usd=str(job.arena_dir / "arena.usd"),
             robot_usd=str(model.usd), robot_urdf=str(model.urdf), z0=float(model.z0),
@@ -335,9 +342,11 @@ class JobRunner:
         log_path = self._jobs_dir / f"{st.id}.log"
 
         with open(log_path, "ab") as log:
+            # stderr joins stdout so the reader sees every Kit line (KIT_NO_GPU may come on
+            # either); the reader writes everything but progress events to the log.
             proc = subprocess.Popen(self._command(jobfile), stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=log, start_new_session=True,
-                                    env=job_env(gpu))
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True, env=job_env(gpu))
             reader = None
             try:
                 started = time.monotonic()
@@ -357,6 +366,8 @@ class JobRunner:
                     except subprocess.TimeoutExpired:
                         pass
                     now = time.monotonic()
+                    if job.no_gpu.is_set():  # Kit has no device: it won't render, stop it now
+                        break
                     if job.done.is_set():  # finished; don't wait long for Isaac to exit
                         done_at = done_at or now
                         if now - done_at > EXIT_GRACE_S:
@@ -372,6 +383,8 @@ class JobRunner:
                 proc.stdout.close()
                 (self._jobs_dir / ACTIVE).unlink(missing_ok=True)
 
+        if job.no_gpu.is_set():
+            return "failed", job.error
         if timed_out:
             return "timeout", f"no result after {timeout:g} s; the render was stopped"
         if not job.done.is_set():
@@ -381,14 +394,20 @@ class JobRunner:
 
     def _read(self, job: _Job, proc: subprocess.Popen, log) -> None:
         for raw in proc.stdout:
-            ev = parse_event(raw.decode(errors="replace"))
+            text = raw.decode(errors="replace")
+            ev = parse_event(text)
             if ev is None:
                 log.write(raw)
+                if KIT_NO_GPU in text and not job.no_gpu.is_set():
+                    log.flush()
+                    job.error = NO_GPU_TEXT.format(gpu=job.gpu)
+                    job.no_gpu.set()
                 continue
             if ev["event"] == "done":
                 job.done.set()
             elif ev["event"] == "error":
-                job.error = str(ev.get("message", ""))
+                if not job.no_gpu.is_set():  # keep the clearer cause
+                    job.error = str(ev.get("message", ""))
             else:
                 name = Path(str(ev.get("file", ""))).name
                 if not name:

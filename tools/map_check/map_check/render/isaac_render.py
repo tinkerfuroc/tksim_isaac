@@ -42,14 +42,14 @@ FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 HEADER_PX = 52  # overview title bar
 CLOSEUP_HEADER_PX = 40
 CAPTION = {"behind": "behind-left", "top": "top-down", "head": "head cam"}
-NO_GPU_EXIT = 4  # Isaac started without a usable GPU device
-# First-image backstop, for when the device check can't tell. A warm start shows its first
+NO_GPU_EXIT = 4  # no first image in time (perhaps no usable GPU device)
+# First-image backstop, for a startup that hangs without Kit's "Failed to create any GPU
+# devices" line (which the runner catches). A warm start shows its first
 # image ~35 s in; a cold RTX shader cache (after a driver or Isaac update) can take minutes,
 # so the budget is generous and scales with the job: see first_image_budget().
 FIRST_IMAGE_MIN_S = 300.0
 FIRST_IMAGE_SHARE = 0.5  # of the time left before the job's deadline
 FIRST_IMAGE_MARGIN_S = 15.0  # always fires this long before the job's own deadline
-NO_GPU_TEXT = "Isaac could not create a GPU device on GPU {gpu} (see the job log)"
 SLOW_TEXT = ("No image after {seconds:.0f} s: Isaac may have no GPU device on GPU {gpu}, "
              "or startup is slow (see the job log)")
 _on_view: list = []  # callbacks run after each view event (the first-image backstop)
@@ -95,21 +95,6 @@ def slow_start_message(gpu: int, seconds: float) -> str:
     return SLOW_TEXT.format(seconds=seconds, gpu=gpu)
 
 
-def no_device_message(gpu: int, device_count) -> str | None:
-    """The error when Kit created no GPU device; None when it did or the count is unknown."""
-    if device_count is not None and device_count < 1:
-        return NO_GPU_TEXT.format(gpu=gpu)
-    return None
-
-
-def _gpu_device_count() -> int | None:
-    """Devices omni.gpu_foundation created, or None if that can't be asked (Isaac only)."""
-    try:
-        import omni.gpu_foundation_factory as gff
-
-        return int(gff.get_gpu_foundation_factory_interface().get_device_count())
-    except Exception:  # noqa: BLE001 - unknown API or state: the first-image backstop decides
-        return None
 
 
 def display_name(pose) -> str:
@@ -408,8 +393,8 @@ def main(argv: list[str] | None = None) -> int:
     # Isaac can't hold the GPU after its server died without stopping it.
     guard(job.deadline, start_ppid, report=lambda why: emit(error_event(f"{why}; render stopped")))
 
-    # Fail fast without a GPU device rather than hang until the job timeout: the backstop
-    # covers the case the device count can't detect; the first image stands it down.
+    # A startup that never yields an image must not hold the GPU until the job timeout; the
+    # first image (or the job's end) stands this backstop down.
     now = time.time()
     budget = first_image_budget(job.deadline, now)
     first = None
@@ -423,11 +408,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from isaacsim import SimulationApp
 
+    # Kit's own "Failed to create any GPU devices" line is caught by the runner (jobs._read),
+    # which stops the render within seconds; a device count here proved unreliable (Ruling 12).
     app = SimulationApp(app_config())
-    msg = no_device_message(job.gpu, _gpu_device_count())
-    if msg:
-        emit(error_event(msg))
-        os._exit(NO_GPU_EXIT)  # app.close() may hang without a device; the server reaps us
     code = 0
     try:
         r = Renderer(app, job, extra)
