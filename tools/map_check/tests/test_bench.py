@@ -65,6 +65,14 @@ def test_field_validation(store):
     assert store.get("m1").version == 1  # failed batches did not bump
 
 
+@pytest.mark.parametrize("field", ["pan_deg", "tilt_deg"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_pan_tilt_rejected(store, field, value):
+    with pytest.raises(ValueError, match=f"{field}.*finite"):
+        store.apply("m1", [{"op": "set_row", "row": "saved:a", "fields": {field: value}}])
+    assert store.get("m1").version == 0
+
+
 def test_remove_and_restore_saved(store, maps_dir):
     assert len(store.view("m1", maps_dir).rows) == 3
     store.apply("m1", [{"op": "remove", "row": "saved:kitchen_a"}])

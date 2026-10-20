@@ -5,6 +5,7 @@ so the UI can tell when another tab changed something.
 """
 import copy
 import json
+import math
 import os
 import tempfile
 import threading
@@ -141,6 +142,8 @@ def _clean_fields(fields_: Any) -> dict:
             raise ValueError(f"unknown row field {name!r}")
         if not isinstance(v, want) or (want != bool and isinstance(v, bool)):
             raise ValueError(f"row field {name!r}: wrong type")
+        if want != bool and not math.isfinite(v):
+            raise ValueError(f"row field {name!r}: must be a finite number")
         if name == "pan_deg":
             v = min(max(float(v), PAN_RANGE[0]), PAN_RANGE[1])
         elif name == "tilt_deg":

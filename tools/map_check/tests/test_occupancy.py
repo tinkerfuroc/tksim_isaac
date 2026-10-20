@@ -100,3 +100,41 @@ def test_real_map():
     assert sorted(round(o.area_m2, 2) for o in outlines) == [
         0.06, 0.06, 0.06, 0.09, 0.12, 0.28, 0.35, 0.36, 0.36, 0.54, 0.54,
         0.75, 0.76, 1.28, 1.33, 1.53]
+
+
+_GOOD = {"resolution": "0.05", "origin": "[-1.0, -2.0, 0.0]", "occupied_thresh": "0.65",
+         "free_thresh": "0.25"}
+
+
+def _meta_yaml(**over):
+    fields = {**_GOOD, **over}
+    return ("image: m.pgm\nnegate: 0\n" + "".join(f"{k}: {v}\n" for k, v in fields.items())).encode()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("resolution", ".nan"), ("resolution", ".inf"), ("resolution", "nan"),
+    ("origin", "[.nan, 0.0, 0.0]"), ("origin", "[0.0, -.inf, 0.0]"), ("origin", "[0.0, 0.0, .nan]"),
+    ("occupied_thresh", ".nan"), ("occupied_thresh", ".inf"),
+    ("free_thresh", ".nan"), ("free_thresh", "-.inf"),
+])
+def test_non_finite_values_rejected(field, value):
+    with pytest.raises(MapFileError, match=field):
+        parse_map(_meta_yaml(**{field: value}), {"m.pgm": _encode(ROW)})
+
+
+@pytest.mark.parametrize("field,value", [
+    ("occupied_thresh", "1.5"), ("occupied_thresh", "-0.1"), ("free_thresh", "2"),
+])
+def test_thresholds_outside_unit_interval_rejected(field, value):
+    with pytest.raises(MapFileError, match=f"{field} must be between 0 and 1"):
+        parse_map(_meta_yaml(**{field: value}), {"m.pgm": _encode(ROW)})
+
+
+@pytest.mark.parametrize("value", ["0.0", "1.0"])
+def test_threshold_bounds_inclusive(value):
+    parse_map(_meta_yaml(occupied_thresh=value), {"m.pgm": _encode(ROW)})
+
+
+def test_origin_must_be_a_list():
+    with pytest.raises(MapFileError, match="origin"):
+        parse_map(_meta_yaml(origin="5"), {"m.pgm": _encode(ROW)})

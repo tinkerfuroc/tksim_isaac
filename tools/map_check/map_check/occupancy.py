@@ -1,5 +1,6 @@
 """Nav2 occupancy maps (yaml + image) and the closed outlines drawn in them."""
 import io
+import math
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Mapping
@@ -33,6 +34,24 @@ class Outline:
     cy: float
 
 
+def _finite(value, field: str) -> float:
+    """value as a finite float, else a MapFileError naming the yaml field."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError) as e:
+        raise MapFileError(f"map yaml {field} is not a number: {value!r}") from e
+    if not math.isfinite(f):
+        raise MapFileError(f"map yaml {field} must be a finite number, got {value!r}")
+    return f
+
+
+def _threshold(meta: dict, field: str, default: float) -> float:
+    t = _finite(meta.get(field, default), field)
+    if not 0.0 <= t <= 1.0:
+        raise MapFileError(f"map yaml {field} must be between 0 and 1, got {t}")
+    return t
+
+
 def parse_map(yaml_bytes: bytes, files: Mapping[str, bytes]) -> OccupancyMap:
     try:
         meta = yaml.safe_load(yaml_bytes)
@@ -43,14 +62,17 @@ def parse_map(yaml_bytes: bytes, files: Mapping[str, bytes]) -> OccupancyMap:
     for key in ("image", "resolution", "origin"):
         if key not in meta:
             raise MapFileError(f"map yaml has no '{key}'")
-    try:
-        res = float(meta["resolution"])
-        origin = (float(meta["origin"][0]), float(meta["origin"][1]))
-        thresh = float(meta.get("occupied_thresh", 0.65))
-    except (TypeError, ValueError, IndexError, KeyError) as e:
-        raise MapFileError(f"map yaml has a bad resolution/origin/occupied_thresh: {e}") from e
+    res = _finite(meta["resolution"], "resolution")
     if res <= 0:
         raise MapFileError(f"map yaml resolution must be positive, got {res}")
+    raw_origin = meta["origin"]
+    if not isinstance(raw_origin, (list, tuple)) or len(raw_origin) < 2:
+        raise MapFileError(f"map yaml origin must be a list [x, y, yaw], got {raw_origin!r}")
+    origin = (_finite(raw_origin[0], "origin"), _finite(raw_origin[1], "origin"))
+    for extra in raw_origin[2:]:
+        _finite(extra, "origin")
+    thresh = _threshold(meta, "occupied_thresh", 0.65)
+    _threshold(meta, "free_thresh", 0.25)  # unused by the trinary rule, but must be sane
     name = PurePosixPath(str(meta["image"]).replace("\\", "/")).name
     if name not in files:
         raise MapFileError(f"map image '{name}' (from yaml image: {meta['image']}) was not provided")
