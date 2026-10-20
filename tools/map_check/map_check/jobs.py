@@ -175,6 +175,9 @@ class JobRunner:
             _, boxes, arena_dir = self._arenas.load_current(map_name)
         except (OSError, ValueError, KeyError, TypeError) as e:
             raise ValueError(f"no Map Check arena for {map_name}: {e}") from e
+        with self._lock:  # checked again when queuing; this one beats a GPU-busy answer
+            if self._pending_locked(map_name):
+                raise ValueError(f"A render for {map_name} is already queued or running.")
         if not override:
             busy = self._gpu_probe(own_pids=self._own_pids()).busy
             if busy:
@@ -187,6 +190,8 @@ class JobRunner:
         with self._lock:
             if self._stopping:
                 raise RuntimeError("the render queue is shut down")
+            if self._pending_locked(map_name):
+                raise ValueError(f"A render for {map_name} is already queued or running.")
             self._queue.append(job)
             self._advance_locked()
             return copy.copy(job.status)
@@ -223,6 +228,11 @@ class JobRunner:
         os.close(self._lock_fd)  # releases the state dir for the next server
 
     # -- queue (call with the lock held) --
+    def _pending_locked(self, map_name: str) -> bool:
+        if self._current is not None and self._current.status.map == map_name:
+            return True
+        return any(j.status.map == map_name for j in self._queue)
+
     def _relevant_locked(self, map_name: str) -> JobStatus | None:
         if self._current and self._current.status.map == map_name:
             return self._current.status

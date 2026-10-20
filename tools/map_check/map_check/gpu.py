@@ -3,7 +3,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PATTERNS = ("run_sim.py", "gpsr-stack", "isaac-sim", "omni.kit")
+# isaac_render: another Map Check server's render (this server's own job is excluded by pid).
+PATTERNS = ("run_sim.py", "gpsr-stack", "isaac-sim", "omni.kit", "isaacsim", "isaac_render")
 SHELLS = ("bash", "sh", "zsh", "dash")
 CMD_MAX = 200
 SMI_TIMEOUT_S = 5

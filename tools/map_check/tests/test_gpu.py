@@ -104,3 +104,24 @@ def test_text_mentioning_marker_not_busy(tmp_path):
     add_proc(tmp_path, 23, ["tail", "-F", "/runs/run_sim.py.log"])
     add_proc(tmp_path, 24, ["python3", "-c", "import run_sim.py"])
     assert gpu_status(run=fake_run(), proc_root=tmp_path).busy == []
+
+
+def test_isaacsim_and_other_map_check_renders_busy(tmp_path):
+    add_proc(tmp_path, 31, ["/repo/.venv/bin/python", "-m", "isaacsim", "--headless"])
+    add_proc(tmp_path, 32, ["/repo/.venv/bin/python", "-m", "map_check.render.isaac_render",
+                            "/other/state/jobs/j1.json"])
+    add_proc(tmp_path, 33, ["/opt/isaacsim/python.sh", "standalone.py"])
+    st = gpu_status(run=fake_run(), proc_root=tmp_path)
+    assert [(r.pid, r.name) for r in st.busy] == [(31, "isaacsim"), (32, "isaac_render"),
+                                                  (33, "isaacsim")]
+
+
+def test_own_render_not_busy(tmp_path):
+    """This server's own job (and what it spawns) matches isaac_render but is excluded."""
+    add_proc(tmp_path, 41, ["/repo/.venv/bin/python", "-m", "map_check.render.isaac_render",
+                            "/state/jobs/mine.json"])
+    add_proc(tmp_path, 42, ["/repo/.venv/bin/python", "-m", "isaacsim.kit"], ppid=41)
+    add_proc(tmp_path, 43, ["/repo/.venv/bin/python", "-m", "map_check.render.isaac_render",
+                            "/other/jobs/theirs.json"])
+    st = gpu_status(run=fake_run(), proc_root=tmp_path, own_pids=frozenset({41}))
+    assert [r.pid for r in st.busy] == [43]

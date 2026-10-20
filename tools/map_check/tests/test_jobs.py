@@ -189,16 +189,20 @@ def test_queue_fifo(tmp_path, settings, runners):
     assert b.position is None
 
 
-def test_same_map_second_click_queues(tmp_path, settings, runners):
+def test_same_map_second_render_refused_until_done(tmp_path, settings, runners):
     bench = BenchStore(settings.state_dir)
     r = runner(runners, settings, bench, fake_command(tmp_path, sleep=0.3))
     first = r.submit("m1", override=False)
-    second = r.submit("m1", override=False)
-    assert second.status == "queued" and second.position == 1 and second.id != first.id
-    # the map shows the job that is rendering, not the one waiting behind it
-    assert r.status("m1").id == first.id
-    wait_for(lambda: r.status("m1").id == second.id and r.status("m1").status == "done")
-    assert bench.get("m1").last_render.job_id == second.id
+    other = r.submit("m2", override=False)  # queued behind it
+    for m in ("m1", "m2"):  # running, and queued
+        with pytest.raises(ValueError, match=f"^A render for {m} is already queued or running.$"):
+            r.submit(m, override=True)
+    assert r.status("m1").id == first.id and r.status("m2").id == other.id
+    assert finished(r, "m1").status == "done"
+    again = r.submit("m1", override=False)  # finished: a new render is fine
+    assert again.id != first.id
+    wait_for(lambda: r.status("m1").id == again.id and r.status("m1").status == "done")
+    assert bench.get("m1").last_render.job_id == again.id
 
 
 def test_timeout_kills_group(tmp_path, settings, runners):

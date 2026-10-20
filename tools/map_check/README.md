@@ -77,9 +77,11 @@ before Nav2 can load the map; Map Check does not do this for you.
 
 Renders use Isaac Sim, one process per job, which exits when the job is done. Map Check
 will not start a render while the GPU looks busy: any `nvidia-smi` compute app on either
-GPU, or a running process whose command is `run_sim.py`, `gpsr-stack`, `isaac-sim` or
-`omni.kit` (Map Check's own job does not count). The UI says what is using it. If you know
-it is safe, the override is one explicit click per render; it is not remembered. When both
+GPU, or a running process whose command is `run_sim.py`, `gpsr-stack`, `isaac-sim`,
+`omni.kit`, `isaacsim` or `isaac_render` (another Map Check's render; this server's own job
+does not count). The UI says what is using it. If you know it is safe, the override is one
+explicit click per render; it is not remembered. A map with a render already queued or
+running refuses another until that one finishes. When both
 GPUs are free, GPU 1 is used. The render sees only that GPU (`CUDA_VISIBLE_DEVICES`, as
 `scripts/gpsr-stack` pins its stages). Each job has a hard timeout of
 `min(1800, 120 + 20 x views)` seconds, after which its whole process group is killed. The
