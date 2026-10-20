@@ -95,8 +95,6 @@ def slow_start_message(gpu: int, seconds: float) -> str:
     return SLOW_TEXT.format(seconds=seconds, gpu=gpu)
 
 
-
-
 def display_name(pose) -> str:
     """The pose name as the teammate sees it; pasted rows can share a Map Studio name."""
     return f"{pose.name} (pasted)" if pose.key.startswith("pasted:") else pose.name

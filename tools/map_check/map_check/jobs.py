@@ -366,7 +366,8 @@ class JobRunner:
                     except subprocess.TimeoutExpired:
                         pass
                     now = time.monotonic()
-                    if job.no_gpu.is_set():  # Kit has no device: it won't render, stop it now
+                    # Kit has no device: it won't render, stop it now (a finished render wins)
+                    if job.no_gpu.is_set() and not job.done.is_set():
                         break
                     if job.done.is_set():  # finished; don't wait long for Isaac to exit
                         done_at = done_at or now
@@ -383,7 +384,7 @@ class JobRunner:
                 proc.stdout.close()
                 (self._jobs_dir / ACTIVE).unlink(missing_ok=True)
 
-        if job.no_gpu.is_set():
+        if job.no_gpu.is_set() and not job.done.is_set():
             return "failed", job.error
         if timed_out:
             return "timeout", f"no result after {timeout:g} s; the render was stopped"

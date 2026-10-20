@@ -43,6 +43,10 @@ FAKE = textwrap.dedent("""
         open(os.path.join(job["out_dir"], name), "wb").close()
         print(json.dumps({"event": "view", "key": key, "view": view, "file": name}), flush=True)
     print(json.dumps({"event": "done"}), flush=True)
+    for stream, line in cfg.get("after_done", []):  # Kit shutting down
+        time.sleep(0.2)
+        print(line, file=sys.stderr if stream == "err" else sys.stdout, flush=True)
+    time.sleep(cfg.get("linger", 0))
     sys.exit(cfg.get("exit", 0))
 """)
 
@@ -485,3 +489,18 @@ def test_kit_gpu_warnings_alone_do_not_stop_render(tmp_path, settings, runners):
     assert st.done_views == 3
     log = (settings.state_dir / "jobs" / f"{job.id}.log").read_text()
     assert "Skipping NVIDIA graphics device" in log  # stderr reaches the log through the reader
+
+
+def test_finished_render_wins_over_late_kit_no_gpu_line(tmp_path, settings, runners):
+    """Kit may print the no-GPU line while shutting down after "done": the job stays done."""
+    bench = BenchStore(settings.state_dir)
+    cmd = fake_command(tmp_path, after_done=[("err", KIT_FAILED_LINE)], linger=0.5)
+    r = runner(runners, settings, bench, cmd)
+    job = r.submit("m1", override=False)
+    st = finished(r, "m1")
+    assert st.status == "done" and st.message == "", st.message
+    assert st.done_views == 3
+    rec = bench.get("m1").last_render
+    assert rec is not None and rec.job_id == job.id
+    log = (settings.state_dir / "jobs" / f"{job.id}.log").read_text()
+    assert KIT_FAILED_LINE in log  # the late line was seen, and ignored
