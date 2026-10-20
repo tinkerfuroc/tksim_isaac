@@ -3,6 +3,7 @@
 // (arena_build.build_boxes), so `boxesFor` must give the rectangles it gives.
 import type { MapBody, Outline, SaveRequest, ShapeSetting, WebGrid } from '../api';
 import { mergeRects, type Rect } from '../rects';
+import { classifyRings, owners, type Rings } from './rings';
 
 /** Cell codes of the web grid: 0 free, 1..254 the closed outline with that id, 255 occupied. */
 export const FREE = 0;
@@ -36,9 +37,15 @@ export interface EditState {
   baseline: Baseline; // as last loaded or saved
 }
 
+/**
+ * The arena's boxes, in the saved arena's group order: walls at the wall height, raised wall
+ * strips by ascending height, then each filled shape by id (its interior plus the free edges of
+ * its outline that it owns).
+ */
 export interface Boxes {
-  walls: Rect[];
-  shapes: Record<number, Rect[]>; // filled shapes only, as in the saved arena
+  walls: Rect[]; // at wallHeight
+  raised: { h: number; rects: Rect[] }[]; // wall strips behind shapes taller than the walls
+  shapes: Record<number, Rect[]>; // filled shapes only, at their own height
 }
 
 const FALLBACK_SHAPE_HEIGHT = 0.6;
@@ -245,15 +252,96 @@ function shapeBounds(g: Grid) {
   return b;
 }
 
+/** Filled shape id -> height. */
+function filledHeights(s: EditState): Record<number, number> {
+  const out: Record<number, number> = {};
+  for (const o of s.outlines) {
+    const v = s.shapes[o.id];
+    if (v?.fill) out[o.id] = v.height;
+  }
+  return out;
+}
+
+// The last ring classification per grid, with the erased set and the filled ids it was made for.
+const ringsCache = new WeakMap<Grid, { erased: Set<number>; filled: string; rings: Rings }>();
+
 /**
- * The arena's boxes as grid rectangles [row0, col0, nrows, ncols]: occupied cells that are
- * not erased as walls, then each filled outline. Same merge and order as the server.
+ * The ring classification of the edit's filled shapes. It depends only on the grid, the erased
+ * cells (by identity: every erase or undo makes a new set) and which shapes are filled, so
+ * height edits return the same object without reclassifying.
+ */
+export function ringsFor(s: EditState, g: Grid): Rings {
+  const ids = Object.keys(filledHeights(s)).map(Number).sort((a, b) => a - b);
+  const filled = ids.join(',');
+  const hit = ringsCache.get(g);
+  if (hit && hit.erased === s.erased && hit.filled === filled) return hit.rings;
+  const rings = classifyRings(g, s.erased, new Set(ids));
+  ringsCache.set(g, { erased: s.erased, filled, rings });
+  return rings;
+}
+
+/**
+ * Per cell, the filled shape whose free edge it is (built at that shape's height), 0 for every
+ * other cell. Ring cells that continue a wall line (the strip) stay wall and read 0.
+ */
+export function freeEdgeOwners(s: EditState, g: Grid): Int32Array {
+  const rings = ringsFor(s, g);
+  const own = owners(g, rings, filledHeights(s));
+  for (let i = 0; i < own.length; i++) if (rings.strip[i]) own[i] = 0;
+  return own;
+}
+
+/** mergeRects over the cells of [r0, r1) x [c0, c1) that `keep`, in map coordinates. */
+function mergeWhere(g: Grid, r0: number, c0: number, r1: number, c1: number, keep: (i: number) => boolean): Rect[] {
+  // The merge only looks at runs, so merging the crop and shifting back equals a full-map merge.
+  const w = c1 - c0;
+  const h = r1 - r0;
+  if (w <= 0 || h <= 0) return [];
+  const crop = new Uint8Array(w * h);
+  for (let r = 0; r < h; r++) {
+    for (let c = 0; c < w; c++) crop[r * w + c] = keep((r0 + r) * g.W + c0 + c) ? 1 : 0;
+  }
+  return mergeRects(crop, w, h).map(([a, b2, nr, nc]) => [a + r0, b2 + c0, nr, nc] as Rect);
+}
+
+/**
+ * The arena's boxes as grid rectangles [row0, col0, nrows, ncols], built exactly as the server's
+ * arena_build.build_boxes (rule: rings.ts): occupied cells that are not erased are walls, except
+ * that a filled shape's outline takes the shape's height. Its free edges join the shape; where
+ * the outline is part of a wall line (the strip) it stays wall at max(wall height, shape height).
+ * Same groups, merge and order as the server.
  */
 export function boxesFor(s: EditState, g: Grid): Boxes {
-  const wallMask = new Uint8Array(g.W * g.H);
-  for (let i = 0; i < wallMask.length; i++) wallMask[i] = g.cells[i] === WALL ? 1 : 0;
+  const n = g.W * g.H;
+  const rings = ringsFor(s, g);
+  const heights = filledHeights(s);
+  const own = owners(g, rings, heights);
+
+  const wallMask = new Uint8Array(n);
+  for (let i = 0; i < n; i++) wallMask[i] = g.cells[i] === WALL ? 1 : 0;
   for (const i of s.erased) wallMask[i] = 0;
+  const raisedH = new Float64Array(n); // a raised strip cell's height, 0 elsewhere
+  const raisedBox = new Map<number, [number, number, number, number]>(); // height -> [r0, c0, r1, c1)
+  for (let i = 0; i < n; i++) {
+    if (!rings.inRing[i]) continue;
+    if (!rings.strip[i]) { wallMask[i] = 0; continue; } // free edge: built with its shape
+    const h = heights[own[i]];
+    if (!(h > s.wallHeight)) continue; // strip at the wall height: part of the walls
+    wallMask[i] = 0;
+    raisedH[i] = h;
+    const r = Math.floor(i / g.W), c = i - r * g.W;
+    const bb = raisedBox.get(h);
+    if (!bb) raisedBox.set(h, [r, c, r + 1, c + 1]);
+    else {
+      bb[0] = Math.min(bb[0], r); bb[1] = Math.min(bb[1], c);
+      bb[2] = Math.max(bb[2], r + 1); bb[3] = Math.max(bb[3], c + 1);
+    }
+  }
   const walls = mergeRects(wallMask, g.W, g.H);
+  const raised = [...raisedBox.keys()].sort((a, b) => a - b).map((h) => {
+    const [r0, c0, r1, c1] = raisedBox.get(h)!;
+    return { h, rects: mergeWhere(g, r0, c0, r1, c1, (i) => raisedH[i] === h) };
+  });
 
   const shapes: Record<number, Rect[]> = {};
   const bounds = shapeBounds(g);
@@ -261,18 +349,13 @@ export function boxesFor(s: EditState, g: Grid): Boxes {
     if (!s.shapes[o.id]?.fill) continue;
     const bb = bounds.get(o.id);
     if (!bb) { shapes[o.id] = []; continue; }
-    // Merge inside the outline's bounding box and shift back: the merge only looks at
-    // runs, so the rectangles (and their sorted order) equal a full-map merge.
-    const [r0, c0, r1, c1] = bb;
-    const w = c1 - c0;
-    const h = r1 - r0;
-    const mask = new Uint8Array(w * h);
-    for (let r = 0; r < h; r++) {
-      for (let c = 0; c < w; c++) mask[r * w + c] = g.cells[(r0 + r) * g.W + c0 + c] === o.id ? 1 : 0;
-    }
-    shapes[o.id] = mergeRects(mask, w, h).map(([a, b, n, m]) => [a + r0, b + c0, n, m] as Rect);
+    // The interior's box grown by one cell holds its whole outline ring.
+    const id = o.id;
+    shapes[id] = mergeWhere(g, Math.max(0, bb[0] - 1), Math.max(0, bb[1] - 1),
+      Math.min(g.H, bb[2] + 1), Math.min(g.W, bb[3] + 1),
+      (i) => g.cells[i] === id || (own[i] === id && !rings.strip[i]));
   }
-  return { walls, shapes };
+  return { walls, raised, shapes };
 }
 
 /** The POST /api/map/save body. */

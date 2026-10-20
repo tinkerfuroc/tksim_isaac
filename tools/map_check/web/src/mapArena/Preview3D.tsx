@@ -177,7 +177,12 @@ export default function Preview3D({ grid, edit }: Props) {
       const { grid: g, edit: s } = latest.current;
       const b = boxesFor(s, g);
       clearGroup(t.group);
-      const walls = instanced(g, b.walls.map((rect) => ({ rect, h: s.wallHeight })), t.box, t.wallMat);
+      // Walls at the wall height, then the strips raised behind taller shapes, each at its own height.
+      const wallRects = [
+        ...b.walls.map((rect) => ({ rect, h: s.wallHeight })),
+        ...b.raised.flatMap(({ h, rects }) => rects.map((rect) => ({ rect, h }))),
+      ];
+      const walls = instanced(g, wallRects, t.box, t.wallMat);
       const shapeRects = Object.entries(b.shapes).flatMap(([id, rects]) => {
         const h = s.shapes[Number(id)].height;
         const color = Number(id) === s.selected ? selColor : shapeColor;
@@ -186,7 +191,7 @@ export default function Preview3D({ grid, edit }: Props) {
       const shapes = instanced(g, shapeRects, t.box, t.shapeMat);
       if (walls) t.group.add(walls);
       if (shapes) t.group.add(shapes);
-      const n = b.walls.length + shapeRects.length;
+      const n = wallRects.length + shapeRects.length;
       setStats(`${n} boxes · walls ${s.wallHeight.toFixed(2)} m`);
       t.render();
     });

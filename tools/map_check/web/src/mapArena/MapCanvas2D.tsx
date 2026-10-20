@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
-import { FREE, WALL, cellCenter, contentBounds, type EditState, type Grid } from './editState';
+import { FREE, WALL, cellCenter, contentBounds, freeEdgeOwners, type EditState, type Grid } from './editState';
 import { PALETTE, rgb } from './palette';
 import { fitView, pointToCell, type Fit } from './view2d';
 
@@ -27,12 +27,13 @@ const COLORS = {
   selected: rgb(PALETTE.selected),
 };
 
-function describeCell(g: Grid, edit: EditState, [r, c]: Cell): string {
+function describeCell(g: Grid, edit: EditState, edges: Int32Array, [r, c]: Cell): string {
   const [x, y] = cellCenter(g, r, c);
-  const v = g.cells[r * g.W + c];
+  const i = r * g.W + c;
+  const v = g.cells[i];
   let kind: string;
   if (v === FREE) kind = 'free';
-  else if (v === WALL) kind = edit.erased.has(r * g.W + c) ? 'wall, erased' : 'wall';
+  else if (v === WALL) kind = edit.erased.has(i) ? 'wall, erased' : edges[i] ? `shape ${edges[i]} edge` : 'wall';
   else kind = `shape ${v}${edit.shapes[v]?.fill ? '' : ' (not filled)'}`;
   return `x ${x.toFixed(2)}  y ${y.toFixed(2)}  ·  ${kind}`;
 }
@@ -48,6 +49,9 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
   const [fit, setFit] = useState<Fit | null>(null); // canvas box in stage px; null while hidden
   const [hover, setHover] = useState<Cell | null>(null);
   const drag = useRef<Cell | null>(null); // last cell of the brush drag in progress
+  // The free edges of filled outlines (built at the shape's height) and the shape each belongs to.
+  // The ring classification behind it is cached in editState, so height edits don't redo it.
+  const edges = useMemo(() => freeEdgeOwners(edit, grid), [grid, edit.erased, edit.shapes]);
 
   // Fit the canvas to the pane on every resize (and when a hidden tab is shown again).
   useLayoutEffect(() => {
@@ -77,15 +81,17 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
         const v = grid.cells[i];
         let col: readonly number[];
         if (v === FREE) col = COLORS.free;
-        else if (v === WALL) col = edit.erased.has(i) ? COLORS.erase : COLORS.wall;
-        else if (edit.selected === v) col = COLORS.selected;
+        else if (v === WALL) {
+          const k = edges[i]; // a free edge takes its shape's colour; a shared strip stays wall
+          col = edit.erased.has(i) ? COLORS.erase : !k ? COLORS.wall : k === edit.selected ? COLORS.selected : COLORS.shape;
+        } else if (edit.selected === v) col = COLORS.selected;
         else col = edit.shapes[v]?.fill ? COLORS.shape : COLORS.shapeOff;
         const o = ((r - r0) * w + (c - c0)) * 4;
         px[o] = col[0]; px[o + 1] = col[1]; px[o + 2] = col[2]; px[o + 3] = 255;
       }
     }
     ctx.putImageData(img, 0, 0);
-  }, [grid, view, edit.erased, edit.shapes, edit.selected]);
+  }, [grid, view, edges, edit.erased, edit.shapes, edit.selected]);
 
   // Pointer position -> map cell, through the same fit the canvas is placed with.
   const toCell = (e: PointerEvent, clamp: boolean): Cell | null => {
@@ -106,8 +112,9 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
       onErase(cell[0], cell[1], cell[0], cell[1], true);
       return;
     }
-    const v = grid.cells[cell[0] * grid.W + cell[1]];
-    const id = v !== FREE && v !== WALL ? v : null;
+    const i = cell[0] * grid.W + cell[1];
+    const v = grid.cells[i];
+    const id = v !== FREE && v !== WALL ? v : edges[i] || null; // a free edge selects its shape
     onSelect(id !== null && id === edit.selected ? null : id);
   };
   const onPointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
@@ -133,7 +140,7 @@ export function MapCanvas2D({ grid, edit, erasing, brush, onSelect, onErase }: P
 
   return (
     <section className="ma-pane">
-      <h2>2D map <span>{hover ? describeCell(grid, edit, hover) : 'hover a cell'}</span></h2>
+      <h2>2D map <span>{hover ? describeCell(grid, edit, edges, hover) : 'hover a cell'}</span></h2>
       <div className="ma-stage" ref={stage}>
         <canvas
           ref={canvas}

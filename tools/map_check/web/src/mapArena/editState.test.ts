@@ -165,11 +165,13 @@ describe('boxesFor', () => {
   it('leaves erased cells out of the walls and unfilled shapes out entirely', () => {
     const g = gridOf(ROWS);
     let s = initEdit(g, OUTLINES, DEFAULTS);
-    expect(boxesFor(s, g).shapes).toEqual({ 1: [[1, 1, 2, 2]], 2: [[1, 4, 1, 1]] });
+    // Each filled shape takes its free-standing outline ring with it (rings.test.ts has the rule).
+    expect(boxesFor(s, g).shapes).toEqual({ 1: [[0, 0, 4, 4]], 2: [[0, 4, 1, 1], [1, 4, 1, 2], [2, 4, 1, 1]] });
     s = toggleShape(s, 2);
     s = eraseAt(s, g, 4, 5, 1);
     const b = boxesFor(s, g);
-    expect(b.shapes).toEqual({ 1: [[1, 1, 2, 2]] });
+    expect(b.shapes).toEqual({ 1: [[0, 0, 4, 4]] });
+    expect(b.walls).toEqual([[0, 4, 1, 1], [1, 5, 1, 1], [2, 4, 1, 1]]); // shape 2's ring, now plain wall
     expect(b.walls.some(([r0, c0]) => r0 === 4 && c0 === 5)).toBe(false);
   });
 });
