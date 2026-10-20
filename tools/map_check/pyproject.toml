@@ -4,21 +4,26 @@ version = "0.1.0"
 description = "Localhost tool to check poses against a measured arena map"
 requires-python = ">=3.10"
 dependencies = [
-    "fastapi",
-    "uvicorn",
-    "python-multipart",
-    "numpy",
-    "scipy",
-    "pyyaml",
-    "pillow",
-    "usd-core",
+    # Exact pins, all published before 2026-10-05 (Ruling 5; [tool.uv] exclude-newer enforces it).
+    "fastapi==0.142.2",
+    "uvicorn==0.54.0",
+    "python-multipart==0.0.32",
+    "numpy==2.2.6; python_version < '3.11'",
+    "numpy==2.4.6; python_version == '3.11'",
+    "numpy==2.5.3; python_version >= '3.12'",
+    "scipy==1.15.3; python_version < '3.11'",
+    "scipy==1.17.1; python_version == '3.11'",
+    "scipy==1.18.1; python_version >= '3.12'",
+    "pyyaml==6.0.3",
+    "pillow==12.3.0",
+    "usd-core==26.8",
 ]
 
 [dependency-groups]
-dev = ["pytest", "httpx>=0.27,<1"]
+dev = ["pytest==9.1.1", "httpx==0.28.1"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -26,5 +31,9 @@ packages = ["map_check"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-# Starlette prefers httpx2; the dev pin stays on the stable httpx 0.28 line.
+# Starlette prefers httpx2; the dev pin stays on the stable httpx 0.28 line (Ruling 5).
 filterwarnings = ["ignore:Using .httpx. with .starlette.testclient. is deprecated"]
+
+[tool.uv]
+# Ruling 5: only versions published at least two weeks before the branch was cut.
+exclude-newer = "2026-10-05T00:00:00Z"

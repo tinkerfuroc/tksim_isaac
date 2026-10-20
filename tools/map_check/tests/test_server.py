@@ -244,7 +244,7 @@ def test_bench_ops_paste_and_errors(client, settings):
     assert client.get("/api/bench/..bad").status_code in (400, 404)
 
 
-def read_events(client, url, n, out, ready=None):
+def read_events(client, url, n, out):
     """Read the first n SSE events (event name, data) from a bounded stream."""
     events = []
     with client.stream("GET", url) as r:
@@ -254,8 +254,6 @@ def read_events(client, url, n, out, ready=None):
                 name = line.split(":", 1)[1].strip()
             elif line.startswith("data:"):
                 events.append((name, json.loads(line.split(":", 1)[1])))
-                if ready is not None and len(events) == 1:
-                    ready.set()
                 if len(events) >= n:
                     break
     out.extend(events)
@@ -264,18 +262,22 @@ def read_events(client, url, n, out, ready=None):
 def test_bench_ops_and_events(client, settings):
     bench_ready(client, settings)
     v0 = client.get("/api/bench/bar").json()["version"]
-    out, ready = [], threading.Event()
+    out = []
     t = threading.Thread(target=read_events,
-                         args=(client, "/api/events?map=bar&max_events=2", 2, out, ready))
+                         args=(client, "/api/events?map=bar&max_events=2", 2, out))
     t.start()
-    assert ready.wait(10)
-    r = client.post("/api/bench/bar/ops", json={"ops": [
-        {"op": "set_row", "row": "saved:a", "fields": {"tilt_deg": 30}}]})
-    assert r.status_code == 200
-    t.join(10)
+    # The TestClient may hand the stream over only once it ends, so the first event can't be
+    # awaited: keep changing the bench until the bounded stream has seen two versions.
+    end, tilt = time.monotonic() + 10, 30
+    while t.is_alive() and time.monotonic() < end:
+        r = client.post("/api/bench/bar/ops", json={"ops": [
+            {"op": "set_row", "row": "saved:a", "fields": {"tilt_deg": tilt}}]})
+        assert r.status_code == 200
+        tilt = 61 - tilt
+        t.join(0.2)
     assert not t.is_alive()
     bench = [d for n, d in out if n == "bench"]
-    assert bench[0] == v0 and bench[-1] > v0
+    assert len(bench) == 2 and v0 <= bench[0] < bench[1]
 
 
 def test_events_bad_map_400(client):
