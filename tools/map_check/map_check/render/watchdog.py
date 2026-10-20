@@ -55,8 +55,10 @@ class Watchdog:
     """
 
     def __init__(self, deadline: float, start_ppid: int, *, clock=None, getppid=None, exit=None,
-                 sleep=None, report=None, interval: float = CHECK_INTERVAL_S):
-        self.deadline, self.start_ppid = float(deadline), int(start_ppid)
+                 sleep=None, report=None, interval: float = CHECK_INTERVAL_S,
+                 exit_code: int = EXIT_CODE):
+        self.deadline, self.start_ppid, self.exit_code = float(deadline), int(start_ppid), exit_code
+        self._cancelled = threading.Event()
         self._clock, self._getppid = clock or time.time, getppid or os.getppid
         self._exit, self._sleep = exit or os._exit, sleep or time.sleep
         self._report, self._interval = report, interval
@@ -65,6 +67,8 @@ class Watchdog:
 
     def check(self) -> str | None:
         """One poll: exits (through the injected exit) and returns the reason when expired."""
+        if self._cancelled.is_set():
+            return None
         reason = expired(self.deadline, self.start_ppid, self._clock(), self._getppid())
         if reason is not None:
             self.reason = reason
@@ -73,11 +77,15 @@ class Watchdog:
                     self._report(reason)
                 except Exception:  # noqa: BLE001
                     pass
-            self._exit(EXIT_CODE)
+            self._exit(self.exit_code)
         return reason
 
+    def cancel(self) -> None:
+        """Stand down: the thread ends at its next poll and never exits the process."""
+        self._cancelled.set()
+
     def _run(self) -> None:
-        while self.check() is None:
+        while self.check() is None and not self._cancelled.is_set():
             self._sleep(self._interval)
 
     def start(self) -> "Watchdog":

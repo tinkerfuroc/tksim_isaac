@@ -167,3 +167,20 @@ def test_guard_rechecks_after_prctl(monkeypatch):
     monkeypatch.setattr(watchdog.Watchdog, "start", lambda self: self)
     watchdog.guard(time.time() + 600, start_ppid=4242)
     assert exits == [EXIT_CODE]
+
+
+def test_cancel_stands_down_and_exit_code_is_configurable():
+    f = Fake()
+    d = f.dog(exit_code=4)
+    d.cancel()
+    f.now = 99999.0
+    assert d.check() is None and f.exits == []
+    d2 = f.dog(exit_code=4)
+    assert d2.check() is not None and f.exits == [4]
+
+
+def test_cancelled_thread_ends_without_exit():
+    f = Fake()
+    d = f.dog(sleep=lambda s: d.cancel(), interval=0.01)
+    d.start().thread.join(5)
+    assert not d.thread.is_alive() and f.exits == []

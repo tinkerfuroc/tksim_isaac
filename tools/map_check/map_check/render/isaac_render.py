@@ -19,6 +19,7 @@ import math
 import os
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from map_check import robot
 from map_check.render import cameras
 from map_check.render.jobfile import OVERVIEW, JobFile, done_event, error_event, view_event
 from map_check.render.labels import place_labels
-from map_check.render.watchdog import guard
+from map_check.render.watchdog import Watchdog, guard
 
 APP_W, APP_H = 1280, 800
 WARMUP_UPDATES = 80  # app updates after the scene is built, before the first step
@@ -41,10 +42,54 @@ FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 HEADER_PX = 52  # overview title bar
 CLOSEUP_HEADER_PX = 40
 CAPTION = {"behind": "behind-left", "top": "top-down", "head": "head cam"}
+NO_GPU_EXIT = 4  # Isaac started without a usable GPU device
+# Backstop when the device check can't tell: in live runs the first image came ~35 s after
+# start (warm shader cache), so 120 s is a wide margin yet well under the job timeout.
+FIRST_IMAGE_S = 120.0
+NO_GPU_TEXT = "Isaac could not create a GPU device on GPU {gpu} (see the job log)"
+_on_view: list = []  # callbacks run after each view event (the first-image backstop)
 
 
 def emit(line: str) -> None:
     print(line, flush=True)
+
+
+def emit_view(key: str, view: str, file: str) -> None:
+    emit(view_event(key, view, file))
+    for cb in list(_on_view):
+        cb()
+
+
+def app_config() -> dict:
+    """The SimulationApp config, mirroring validation/run_sim.py (Ruling 11).
+
+    The server pins the GPU with CUDA_VISIBLE_DEVICES (jobs.job_env). No --/renderer/activeGpu:
+    it indexes Omniverse's devices over both physical GPUs, not the CUDA-visible ones, so
+    activeGpu=0 under CUDA_VISIBLE_DEVICES=1 left Kit with no device at all.
+    """
+    return {
+        "headless": True, "renderer": "RaytracedLighting", "width": APP_W, "height": APP_H,
+        "fast_shutdown": True,
+        "multi_gpu": False, "max_gpu_count": 1, "physics_gpu": -1,
+        "extra_args": ["--/physics/useGpu=false", "--/physics/cudaDevice=-1"],
+    }
+
+
+def no_device_message(gpu: int, device_count) -> str | None:
+    """The error when Kit created no GPU device; None when it did or the count is unknown."""
+    if device_count is not None and device_count < 1:
+        return NO_GPU_TEXT.format(gpu=gpu)
+    return None
+
+
+def _gpu_device_count() -> int | None:
+    """Devices omni.gpu_foundation created, or None if that can't be asked (Isaac only)."""
+    try:
+        import omni.gpu_foundation_factory as gff
+
+        return int(gff.get_gpu_foundation_factory_interface().get_device_count())
+    except Exception:  # noqa: BLE001 - unknown API or state: the first-image backstop decides
+        return None
 
 
 def display_name(pose) -> str:
@@ -274,7 +319,7 @@ class Renderer:
             title += f" · {n_flagged} flagged"
         draw.text((16, 10), title, fill=(240, 240, 240), font=self.fonts["title"])
         img.save(self.out / "overview.png")
-        emit(view_event(OVERVIEW, OVERVIEW, "overview.png"))
+        emit_view(OVERVIEW, OVERVIEW, "overview.png")
 
     def closeups(self) -> None:
         """One step per pose with only that robot shown: at most 3 render products per step."""
@@ -301,7 +346,7 @@ class Renderer:
                 for v in p.views:
                     name = f"{_file_stem(i, p.name)}_{v}.png"
                     self._save_closeup(frames[v], p, v, name)
-                    emit(view_event(p.key, v, name))
+                    emit_view(p.key, v, name)
         finally:
             for v in used:
                 self.detach(rig[v][2], rig[v][3])
@@ -343,16 +388,23 @@ def main(argv: list[str] | None = None) -> int:
     # Isaac can't hold the GPU after its server died without stopping it.
     guard(job.deadline, start_ppid, report=lambda why: emit(error_event(f"{why}; render stopped")))
 
+    # Fail fast without a GPU device rather than hang until the job timeout: the backstop
+    # covers the case the device count can't detect; the first image stands it down.
+    no_gpu = NO_GPU_TEXT.format(gpu=job.gpu)
+    first = Watchdog(time.time() + FIRST_IMAGE_S, start_ppid, getppid=lambda: start_ppid,
+                     exit_code=NO_GPU_EXIT,  # time only: guard() handles a dead server
+                     report=lambda _: emit(error_event(
+                         f"no image after {FIRST_IMAGE_S:g} s: {no_gpu}")))
+    _on_view.append(first.cancel)
+    first.start()
+
     from isaacsim import SimulationApp
 
-    app = SimulationApp({
-        "headless": True, "renderer": "RaytracedLighting", "width": APP_W, "height": APP_H,
-        "fast_shutdown": True,
-        # The server sets CUDA_VISIBLE_DEVICES to job.gpu (jobs.job_env), so the chosen GPU
-        # is device 0 here, as in scripts/gpsr-stack; physics stays off the GPU.
-        "extra_args": ["--/renderer/multiGpu/enabled=false", "--/renderer/activeGpu=0",
-                       "--/physics/cudaDevice=-1"],
-    })
+    app = SimulationApp(app_config())
+    msg = no_device_message(job.gpu, _gpu_device_count())
+    if msg:
+        emit(error_event(msg))
+        os._exit(NO_GPU_EXIT)  # app.close() may hang without a device; the server reaps us
     code = 0
     try:
         r = Renderer(app, job, extra)
@@ -365,6 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         emit(error_event(f"{type(e).__name__}: {e}"))
         code = 1
     finally:
+        first.cancel()  # finished or failed with a message: the backstop has nothing to add
         app.close()
     return code
 

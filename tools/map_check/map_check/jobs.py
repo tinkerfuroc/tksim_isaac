@@ -63,9 +63,8 @@ def default_isaac_command(jobfile: Path, settings: Settings | None = None) -> li
 def job_env(gpu: int) -> dict[str, str]:
     """The server's environment minus ROS paths, plus the Kit EULA and map_check on the path.
 
-    The render sees only the chosen GPU, as scripts/gpsr-stack pins its stages: with
-    CUDA_VISIBLE_DEVICES set, Isaac renders on its device 0 (isaac_render passes
-    --/renderer/activeGpu=0).
+    The render sees only the chosen GPU through CUDA_VISIBLE_DEVICES, as scripts/gpsr-stack
+    and validation/run_sim.py run Isaac; isaac_render sets no --/renderer/activeGpu (Ruling 11).
     """
     env = {k: v for k, v in os.environ.items() if k not in UNSET_ENV}
     env["CUDA_VISIBLE_DEVICES"] = str(int(gpu))
