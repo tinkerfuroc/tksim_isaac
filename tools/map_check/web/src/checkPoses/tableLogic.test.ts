@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { BenchBody, BenchRow, Flag, JobStatus, LastRender, RowState } from '../api';
 import {
-  applyOps, clashByKey, clashText, duplicateNames, estimateText, flagTone, headerState, headerToggleOps,
-  jobText, panTiltOps, poseKey, rangeOps, summary, viewerItems, visibleRows,
+  applyOps, clashByKey, clashText, duplicateNames, estimateText, exportText, flagTone, headerState,
+  headerToggleOps, jobText, panTiltOps, poseKey, rangeOps, summary, viewerItems, visibleRows, yamlName,
 } from './tableLogic';
 
 const STATE: RowState = { included: false, behind: true, top: false, head: false, pan_deg: 0, tilt_deg: 20 };
@@ -157,6 +157,23 @@ describe('clashes', () => {
     const rows = [row('kitchen', { included: true }), row('POS_KITCHEN', {}, 'pasted'), row('hall')];
     expect(duplicateNames(rows, 'all')).toEqual(['kitchen']);
     expect(duplicateNames(rows, 'ticked')).toEqual([]);
+  });
+
+  it('yaml export keeps Map Studio names verbatim, so only exact matches clash', () => {
+    expect(yamlName('TestSpawn')).toBe('TestSpawn');
+    expect(yamlName('POS_TEST_SPAWN')).toBe('test_spawn');
+    const rows = [row('TestSpawn'), row('POS_TESTSPAWN', {}, 'pasted'), row('hall'), row('POS_HALL', {}, 'pasted')];
+    expect(duplicateNames(rows, 'all', 'code')).toEqual(['testspawn', 'hall']);
+    expect(duplicateNames(rows, 'all', 'yaml')).toEqual(['hall']);
+  });
+
+  it('export text is used only when it answers the current format and which', () => {
+    const r = { format: 'code' as const, which: 'all' as const, text: 'POS_A = ...' };
+    expect(exportText(r, 'code', 'all')).toBe('POS_A = ...');
+    expect(exportText(r, 'yaml', 'all')).toBeNull();
+    expect(exportText(r, 'code', 'ticked')).toBeNull();
+    expect(exportText(null, 'code', 'all')).toBeNull();
+    expect(exportText({ ...r, text: '' }, 'code', 'all')).toBe('');
   });
 });
 

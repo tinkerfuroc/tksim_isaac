@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { exportList, type BenchRow } from '../api';
 import { copyText, downloadText } from './clipboard';
-import { duplicateNames } from './tableLogic';
+import { duplicateNames, exportText, type ExportFormat, type ExportResult, type ExportWhich } from './tableLogic';
 import { errorText } from './useBench';
 
-type Format = 'code' | 'yaml';
-type Which = 'all' | 'ticked';
+type Format = ExportFormat;
+type Which = ExportWhich;
 
 interface Props {
   map: string;
@@ -22,7 +22,8 @@ interface Props {
 export function ExportDialog({ map, rows, version, flush, onClose, active }: Props) {
   const [format, setFormat] = useState<Format>('code');
   const [which, setWhich] = useState<Which>('all');
-  const [text, setText] = useState('');
+  // Tagged with the choice it answers: while a new choice loads, the old text must not be saved.
+  const [result, setResult] = useState<ExportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const area = useRef<HTMLTextAreaElement>(null);
@@ -35,7 +36,7 @@ export function ExportDialog({ map, rows, version, flush, onClose, active }: Pro
       try {
         await flush();
         const t = await exportList(map, format, which);
-        if (live) { setText(t); setError(null); }
+        if (live) { setResult({ format, which, text: t }); setError(null); }
       } catch (e) {
         if (live) setError(errorText(e));
       }
@@ -57,10 +58,13 @@ export function ExportDialog({ map, rows, version, flush, onClose, active }: Pro
   }, [active, onClose]);
 
   const count = which === 'all' ? rows.length : rows.filter((r) => r.state.included).length;
-  const dupes = duplicateNames(rows, which);
+  const dupes = duplicateNames(rows, which, format);
+  const text = exportText(result, format, which);
+  const ready = text !== null && !error;
   const filename = format === 'code' ? `${map}_poses.py` : `${map}.poses.yaml`;
 
   const copy = async () => {
+    if (text === null) return;
     if (await copyText(text)) setNote('Copied');
     else { area.current?.select(); setNote('Press Ctrl+C to copy'); }
   };
@@ -86,14 +90,15 @@ export function ExportDialog({ map, rows, version, flush, onClose, active }: Pro
           </fieldset>
           {error
             ? <div className="cp-msg err" role="alert">Couldn't export: {error}</div>
-            : <textarea ref={area} className="cp-xtext" readOnly value={text} aria-label="Exported poses" spellCheck={false} />}
+            : <textarea ref={area} className="cp-xtext" readOnly value={text ?? ''} placeholder="Loading…"
+                        aria-label="Exported poses" aria-busy={text === null} spellCheck={false} />}
           <div className="cp-row">
-            <button type="button" className="cp-btn primary" disabled={!!error || !text} onClick={() => void copy()}>Copy</button>
-            <button type="button" className="cp-btn" disabled={!!error || !text}
-                    onClick={() => downloadText(text, filename, format === 'code' ? 'text/x-python' : 'application/yaml')}
+            <button type="button" className="cp-btn primary" disabled={!ready || !text} onClick={() => void copy()}>Copy</button>
+            <button type="button" className="cp-btn" disabled={!ready || !text}
+                    onClick={() => { if (text !== null) downloadText(text, filename, format === 'code' ? 'text/x-python' : 'application/yaml'); }}
                     title={`Saves ${filename}`}>Download</button>
             <span className="cp-hint" aria-live="polite">
-              {note ?? `${count} pose${count === 1 ? '' : 's'}`}
+              {text === null && !error ? 'Loading…' : note ?? `${count} pose${count === 1 ? '' : 's'}`}
             </span>
           </div>
           {dupes.length > 0 && (

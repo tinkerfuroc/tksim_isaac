@@ -114,16 +114,37 @@ export function clashText(m: number): string {
   return cm < 1 ? 'same name · under 1 cm apart' : `same name · ${cm} cm apart`;
 }
 
+/**
+ * A pose's name in an exported .poses.yaml (poses.yaml_name on the server): Map Studio names
+ * stay exactly as written; pasted code names lose POS_ and are lowercased.
+ */
+export const yamlName = (name: string) => (name.startsWith('POS_') ? name.slice(4).toLowerCase() : name);
+
+export type ExportFormat = 'code' | 'yaml';
+export type ExportWhich = 'all' | 'ticked';
+
 /** Export names that appear more than once (Map Studio keeps the later one). */
-export function duplicateNames(rows: BenchRow[], which: 'all' | 'ticked'): string[] {
+export function duplicateNames(rows: BenchRow[], which: ExportWhich, format: ExportFormat = 'code'): string[] {
+  const name = format === 'yaml' ? yamlName : poseKey;
   const seen = new Set<string>();
   const dup = new Set<string>();
   for (const r of rows) {
     if (which === 'ticked' && !r.state.included) continue;
-    const k = poseKey(r.pose.name);
+    const k = name(r.pose.name);
     if (seen.has(k)) dup.add(k); else seen.add(k);
   }
   return [...dup];
+}
+
+/** One fetched export, tagged with the choice it answers. */
+export interface ExportResult { format: ExportFormat; which: ExportWhich; text: string }
+
+/**
+ * The export text when it answers the current choice, else null (still loading): Copy and
+ * Download must never save the previous format's text under the new file name.
+ */
+export function exportText(result: ExportResult | null, format: ExportFormat, which: ExportWhich): string | null {
+  return result && result.format === format && result.which === which ? result.text : null;
 }
 
 /** "near" (inside the margin, not touching) is amber; a real overlap or leaving the arena is red. */
