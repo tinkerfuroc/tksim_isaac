@@ -241,20 +241,32 @@ def test_measured_map_defaults_unchanged(measured):
     assert np.array_equal(got, old, equal_nan=True)
 
 
-def test_measured_map_strip_counts_and_speed(measured):
+def test_measured_map_strip_counts(measured):
     m, labels, outlines = measured
     heights = {o.id: 0.6 for o in outlines}
-    t = time.perf_counter()
     rings = classify_rings(m.occupied, labels, heights)
-    elapsed = time.perf_counter() - t
     counts = {k: int((rings.strip & (rings.owner == k)).sum()) for k in heights}
     assert {k: n for k, n in counts.items() if n} == {5: 16, 6: 40, 7: 20, 8: 16, 14: 9}
     for k in (3, 4, 9, 10, 11, 13):  # free-standing: whole ring is free edge
         assert (rings.owner == k).any() and counts[k] == 0
-    assert elapsed < 0.25
-    t = time.perf_counter()
-    build_boxes(m, labels, default_settings(m, outlines))
-    assert time.perf_counter() - t < 0.5
+
+
+def _best_of_3(fn):
+    best = float("inf")
+    for _ in range(3):
+        t = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t)
+    return best
+
+
+def test_measured_map_speed(measured):
+    """Loose limits (measured ~11 ms / ~21 ms): the CPU is shared with Isaac runs."""
+    m, labels, outlines = measured
+    heights = {o.id: 0.6 for o in outlines}
+    s = default_settings(m, outlines)
+    assert _best_of_3(lambda: classify_rings(m.occupied, labels, heights)) < 2.0
+    assert _best_of_3(lambda: build_boxes(m, labels, s)) < 3.0
 
 
 def _png():

@@ -4,6 +4,8 @@ For every map in the Map Studio maps folder, with default settings, it checks th
 the filled shapes' rings has the same built height under the old rule (every occupied cell at the
 wall height, filled interiors at their shape height) and the new one. It also checks the vectorised
 classifier against the prototype's per-cell loop, and prints free-edge and strip counts and timings.
+A second pass sets every filled shape to 0.45 m and then 1.50 m (both unlike the 0.60 m wall) and
+checks the outside-ring invariant alone, printing how many ring cells changed height.
 
 Usage (from the repo root):
   env -u PYTHONPATH -u AMENT_PREFIX_PATH uv run --project tools/map_check \
@@ -16,7 +18,7 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 
-from map_check.arena_build import build_boxes, default_settings
+from map_check.arena_build import BuildSettings, ShapeSetting, build_boxes, default_settings
 from map_check.occupancy import MapFileError, closed_outlines, load_map_dir
 from map_check.rings import classify_rings
 
@@ -121,7 +123,38 @@ def main(maps_dir: Path) -> int:
         checked += 1
     print(f"\n{checked} maps checked, all assertions passed; "
           f"slowest classify {worst[0] * 1e3:.1f} ms ({worst[1]})")
+    second_pass(paths)
     return 0
+
+
+def second_pass(paths, heights=(0.45, 1.5)):
+    """Every filled shape at a height unlike the wall's: only cells inside rings may change."""
+    print(f"\nsecond pass: filled shapes at {', '.join(f'{h:.2f}' for h in heights)} m; "
+          "outside-ring invariant only")
+    print(f"{'map':40} " + " ".join(f"{f'ring cells changed @{h:.2f}':>24}" for h in heights))
+    checked = 0
+    for p in paths:
+        name = p.name[:-len(".yaml")]
+        try:
+            m = load_map_dir(p)
+        except (MapFileError, OSError):
+            continue
+        labels, outlines = closed_outlines(m)
+        base = default_settings(m, outlines)
+        cols = []
+        for h in heights:
+            s = BuildSettings(wall_height=base.wall_height, erased=base.erased,
+                              shapes={k: ShapeSetting(fill=st.fill, height=h)
+                                      for k, st in base.shapes.items()})
+            filled = {k: st.height for k, st in s.shapes.items() if st.fill}
+            ring = classify_rings(m.occupied, labels, filled).owner > 0
+            new, old = built_heights(m, build_boxes(m, labels, s)), old_heights(m, labels, s)
+            assert np.array_equal(new[~ring], old[~ring], equal_nan=True), \
+                f"{name} @ {h}: outside rings differ"
+            cols.append(f"{int((new[ring] != old[ring]).sum()):>6} of {int(ring.sum()):<6}")
+        print(f"{name:40} " + " ".join(f"{c:>24}" for c in cols))
+        checked += 1
+    print(f"\n{checked} maps checked in the second pass, all assertions passed")
 
 
 if __name__ == "__main__":
