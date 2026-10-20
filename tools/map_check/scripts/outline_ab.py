@@ -176,6 +176,8 @@ def main(maps_dir: Path) -> int:
           f"slowest classify {worst[0] * 1e3:.1f} ms ({worst[1]})")
     print(f"step 3b moved {moved_total} cells from free edge to strip over {moved_maps} maps "
           f"(corner-proto.py: {CORNER_PROTO[0]} over {CORNER_PROTO[1]})")
+    if maps_dir == MAPS:  # the folder the prototype ran on; other folders only print
+        assert (moved_total, moved_maps) == CORNER_PROTO, "step 3b total != corner-proto.py"
     second_pass(paths)
     return 0
 

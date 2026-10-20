@@ -41,9 +41,9 @@ ssh -N -L 9081:127.0.0.1:9081 <host>
   - Where the outline is part of a wall line, that strip stays wall, at the taller of the
     wall height and the shape height. This includes a wall that turns a corner at the
     shape, such as a table in a room corner whose back wall ends at a doorway.
-  - Arenas saved before this change keep the 0.6 m rim around filled shapes until they are
-    saved again. The editor starts from the default settings, so heights and erases must be
-    redone before saving.
+  - Arenas saved before this change keep a rim at their saved wall height around filled
+    shapes until they are saved again. The editor starts from the default settings, so
+    heights and erases must be redone before saving.
 - **Check poses**: pick a map that has a saved arena, tick the poses to check (from its
   Map Studio `<map>.poses.yaml`, read only), choose views (including behind views and
   head pan/tilt), choose an arm pose, and render. Poses are flagged when the robot's

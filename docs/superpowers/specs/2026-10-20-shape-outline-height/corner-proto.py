@@ -1,4 +1,7 @@
 """Throwaway: one-step L-corner extension of the strip test, on top of map_check.rings."""
+# Stale driver: this script ran against classify_rings at 438ffe8, before step 3b was built in.
+# classify_rings now includes step 3b, so re-running it applies 3b twice and its counts mean nothing.
+# The file is kept for extend(), the reference for step 3b (ported into test_rings.py and outline_ab.py).
 import json, sys
 import numpy as np
 from pathlib import Path
