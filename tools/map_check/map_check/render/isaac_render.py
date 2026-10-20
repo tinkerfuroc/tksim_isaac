@@ -4,7 +4,7 @@ Runs under the repo's Isaac Python (map_check.jobs starts it with PYTHONPATH set
 to tools/map_check). The scene follows prototypes/render_rooms.py: the arena on
 a floor slab, dome and sun lights, and one kinematically posed Tinker copy per
 pose (URDF FK with that pose's arm, pan and tilt; physics off, joints prim
-inactive). The overview renders first in its own step, labelled with
+inactive; recoloured to look like the real robot by robot_look). The overview renders first in its own step, labelled with
 place_labels. Close-ups follow one pose at a time, with every other robot moved
 to z = -100, through at most one render product per close-up view.
 
@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from map_check import robot
-from map_check.render import cameras
+from map_check.render import cameras, robot_look
 from map_check.render.jobfile import OVERVIEW, JobFile, done_event, error_event, view_event
 from map_check.render.labels import place_labels
 from map_check.render.watchdog import Watchdog, guard
@@ -166,15 +166,7 @@ class Renderer:
         return self._fk_cache[k]
 
     def _material(self, path, rgb, rough):
-        from pxr import Gf, Sdf, UsdShade
-
-        mat = UsdShade.Material.Define(self.stage, path)
-        sh = UsdShade.Shader.Define(self.stage, path + "/Shader")
-        sh.CreateIdAttr("UsdPreviewSurface")
-        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
-        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(rough)
-        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
-        return mat
+        return robot_look.preview_material(self.stage, path, rgb, rough)
 
     def _build_scene(self, extra):
         from pxr import Gf, UsdGeom, UsdLux, UsdShade
@@ -200,6 +192,7 @@ class Renderer:
         sun.CreateIntensityAttr(1100)
         sun.CreateAngleAttr(1.0)
         UsdGeom.Xformable(sun).AddRotateXYZOp().Set(Gf.Vec3f(35, 20, 30))
+        self.robot_mats = robot_look.define_materials(stage, "/World/Looks/Robot")
         self.root_ops = [self._add_robot(i, p) for i, p in enumerate(self.job.poses)]
         return _bounds(self.job, extra, rng)
 
@@ -213,6 +206,9 @@ class Renderer:
         root.AddRotateZOp().Set(math.degrees(pose.yaw))
         tinker = self.stage.DefinePrim(f"/World/Robots/r{i:03d}/Tinker", "Xform")
         tinker.GetReferences().AddReference(str(Path(self.job.robot_usd).resolve()))
+        missing = robot_look.apply(self.stage, tinker, self.robot_mats)
+        if missing and i == 0:  # job log only; those parts keep the artifact's colours
+            print(f"robot colours: links not in the artifact: {', '.join(missing)}", flush=True)
         fk = self.fk(pose)
         for child in tinker.GetChildren():
             t = fk.get(child.GetName())
