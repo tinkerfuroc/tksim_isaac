@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { BenchBody, BenchRow, Flag, JobStatus, LastRender, RowState } from '../api';
 import {
-  applyOps, clashByKey, clashText, duplicateNames, estimateText, exportText, flagTone, headerState,
-  headerToggleOps, jobText, panTiltOps, poseKey, rangeOps, summary, viewerItems, visibleRows, yamlName,
+  applyOps, arenaMaps, clashByKey, clashText, duplicateNames, estimateText, exportText, flagTone, headerState,
+  headerToggleOps, jobText, mapToShow, panTiltOps, poseKey, rangeOps, summary, viewerItems, visibleRows, yamlName,
 } from './tableLogic';
 
 const STATE: RowState = { included: false, behind: true, top: false, head: false, pan_deg: 0, tilt_deg: 20 };
@@ -225,3 +225,18 @@ describe('viewerItems', () => {
 function flag2(): Flag {
   return { kind: 'overlap', part: 'base', target: 'wall', distance_m: -0.03, text: 'base overlaps wall by 3 cm' };
 }
+
+describe('map list', () => {
+  it('lists only Map Studio maps that have a Map Check arena', () => {
+    expect(arenaMaps(null)).toEqual([]);
+    expect(arenaMaps({ studio: ['a', 'b', 'c'], arenas: ['c', 'a', 'sim_only'] })).toEqual(['a', 'c']);
+    expect(arenaMaps({ studio: ['a'], arenas: [] })).toEqual([]);
+  });
+
+  it('keeps the stored map while listed, else falls back to the first', () => {
+    expect(mapToShow(['a', 'c'], 'c')).toBe('c');
+    expect(mapToShow(['a', 'c'], 'b')).toBe('a'); // stored map lost its arena
+    expect(mapToShow(['a', 'c'], null)).toBe('a');
+    expect(mapToShow([], 'b')).toBeNull();
+  });
+});

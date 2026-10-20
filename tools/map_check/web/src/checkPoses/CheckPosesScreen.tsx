@@ -5,7 +5,7 @@ import { PastePanel } from './PastePanel';
 import { PoseTable } from './PoseTable';
 import { RenderBar } from './RenderBar';
 import { ResultsStrip } from './ResultsStrip';
-import { clashByKey, summary, viewerItems, visibleRows } from './tableLogic';
+import { arenaMaps, clashByKey, mapToShow, summary, viewerItems, visibleRows } from './tableLogic';
 import { errorText, useBench } from './useBench';
 import { Viewer } from './Viewer';
 import './checkPoses.css';
@@ -38,8 +38,10 @@ export function CheckPosesScreen({ active = true }: { active?: boolean }) {
   const [confirming, setConfirming] = useState(false);
   const [starting, setStarting] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
+  // Only maps with a Map Check arena are listed (spec, Ruling 9).
+  const choices = useMemo(() => arenaMaps(maps), [maps]);
   // Load a bench only for a map the list confirms (a stored name may be gone).
-  const known = maps && map && maps.studio.includes(map) ? map : null;
+  const known = maps && map && choices.includes(map) ? map : null;
   const { bench, loadError, opError, clearOpError, send, flushAll, refresh, setJob } = useBench(known);
   const gpuSeq = useRef(0);
 
@@ -63,15 +65,22 @@ export function CheckPosesScreen({ active = true }: { active?: boolean }) {
     refreshMaps();
     void refresh();
     refreshGpu();
-    const t = setInterval(refreshGpu, GPU_POLL_MS);
-    return () => clearInterval(t);
+    // No polling from a hidden browser tab; catch up as soon as it is shown again.
+    const t = setInterval(() => { if (!document.hidden) refreshGpu(); }, GPU_POLL_MS);
+    const onVisible = () => { if (!document.hidden) refreshGpu(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [active, refreshMaps, refresh, refreshGpu]);
 
-  // A stored map that is gone (or none yet): the first map with an arena, else the first map.
+  // A stored map that is no longer listed (or none yet): the first map listed.
   useEffect(() => {
-    if (!maps || (map && maps.studio.includes(map))) return;
-    setMap(maps.studio.find((n) => maps.arenas.includes(n)) ?? maps.studio[0] ?? null);
-  }, [maps, map]);
+    if (!maps) return;
+    const next = mapToShow(choices, map);
+    if (next !== map) setMap(next);
+  }, [maps, choices, map]);
 
   const pickMap = (name: string) => {
     storeMap(name);
@@ -132,12 +141,10 @@ export function CheckPosesScreen({ active = true }: { active?: boolean }) {
       <div className="cp-ctx">
         <div className="cp-field">
           <label className="cp-lbl" htmlFor="cp-map">Map</label>
-          <select id="cp-map" value={map ?? ''} disabled={!maps?.studio.length}
+          <select id="cp-map" value={known ?? ''} disabled={!choices.length}
                   onChange={(e) => { if (e.target.value) pickMap(e.target.value); }}>
-            {!map && <option value="" disabled>{maps ? 'No maps in Map Studio yet' : 'Loading maps…'}</option>}
-            {maps?.studio.map((n) => (
-              <option key={n} value={n}>{maps.arenas.includes(n) ? n : `${n} · no arena yet`}</option>
-            ))}
+            {!known && <option value="" disabled>{maps ? 'No arenas yet' : 'Loading maps…'}</option>}
+            {choices.map((n) => <option key={n} value={n}>{n}</option>)}
           </select>
         </div>
         <div className="cp-field">
@@ -153,6 +160,11 @@ export function CheckPosesScreen({ active = true }: { active?: boolean }) {
             ))}
           </select>
         </div>
+        {maps && !choices.length && (
+          <div className="cp-msg warn cp-noarena" role="status">
+            <span>No arenas yet — build one on <a href="#/arena">Map → arena</a>.</span>
+          </div>
+        )}
         {noArena && (
           <div className="cp-msg warn cp-noarena" role="status">
             <span><code>{map}</code> has no Map Check arena yet, so it can't be rendered or checked for overlaps.
@@ -163,7 +175,7 @@ export function CheckPosesScreen({ active = true }: { active?: boolean }) {
 
       {mapsError && <div className="cp-wrap"><div className="cp-msg err" role="alert">Couldn't list the maps: {mapsError}</div></div>}
 
-      <ResultsStrip last={last} loading={!bench && !loadError && !mapsError && (!maps || maps.studio.length > 0)} onOpen={setViewer} />
+      <ResultsStrip last={last} loading={!bench && !loadError && !mapsError && (!maps || choices.length > 0)} onOpen={setViewer} />
 
       <div className="cp-wrap cp-grow">
         {loadError && <div className="cp-msg err" role="alert">Couldn't load the poses for {map}: {loadError}</div>}
@@ -188,7 +200,7 @@ export function CheckPosesScreen({ active = true }: { active?: boolean }) {
               <PoseTable rows={rows} shown={shown} filter={filter} removedCount={bench.removed_count}
                          clash={clash} tiltDownSign={bench.tilt_down_sign} send={send} />
             ) : (
-              <div className="cp-tablewrap cp-center">{loadError ? '' : map ? 'Loading poses…' : 'Pick a map.'}</div>
+              <div className="cp-tablewrap cp-center">{loadError ? '' : known ? 'Loading poses…' : maps && !choices.length ? 'No arenas yet.' : 'Pick a map.'}</div>
             )}
             <div className="cp-legend">
               <span><i className="bad" />robot overlaps a wall or shape</span>

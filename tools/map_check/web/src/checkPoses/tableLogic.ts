@@ -1,5 +1,5 @@
 // Pure rules behind the Check poses table, render bar and viewer.
-import type { BenchBody, BenchOp, BenchRow, Flag, JobStatus, LastRender, RowState } from '../api';
+import type { BenchBody, BenchOp, BenchRow, Flag, JobStatus, LastRender, MapsList, RowState } from '../api';
 
 export type Col = 'included' | 'behind' | 'top' | 'head';
 export type HeaderState = 'all' | 'none' | 'some' | 'disabled';
@@ -176,4 +176,16 @@ export function viewerItems(last: LastRender | null): ViewerItem[] {
     for (const v of it.views) out.push({ url: v.url, title: it.name, caption: v.caption, note, key: `${it.key}/${v.view}` });
   }
   return out;
+}
+
+/** The maps Check poses lists: Map Studio maps that have a Map Check arena (spec, Ruling 9). */
+export function arenaMaps(maps: MapsList | null): string[] {
+  if (!maps) return [];
+  const arenas = new Set(maps.arenas);
+  return maps.studio.filter((n) => arenas.has(n));
+}
+
+/** The map to show: the stored one while it is listed, else the first listed, else none. */
+export function mapToShow(choices: string[], stored: string | null): string | null {
+  return stored && choices.includes(stored) ? stored : choices[0] ?? null;
 }
