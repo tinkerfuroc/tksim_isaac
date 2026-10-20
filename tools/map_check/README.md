@@ -73,8 +73,11 @@ will not start a render while the GPU looks busy: any `nvidia-smi` compute app o
 GPU, or a running process whose command is `run_sim.py`, `gpsr-stack`, `isaac-sim` or
 `omni.kit` (Map Check's own job does not count). The UI says what is using it. If you know
 it is safe, the override is one explicit click per render; it is not remembered. When both
-GPUs are free, GPU 1 is used. Each job has a hard timeout of `min(1800, 120 + 20 x views)`
-seconds, after which its whole process group is killed. The UI estimate is
+GPUs are free, GPU 1 is used. The render sees only that GPU (`CUDA_VISIBLE_DEVICES`, as
+`scripts/gpsr-stack` pins its stages). Each job has a hard timeout of
+`min(1800, 120 + 20 x views)` seconds, after which its whole process group is killed. The
+render also stops itself if the server dies (Ctrl+C twice, a dropped ssh session, a kill)
+or its deadline passes, so a hung Isaac cannot hold the GPU. The UI estimate is
 `40 + 3 x views` seconds. Check with whoever owns the GPU before overriding.
 
 ## Settings

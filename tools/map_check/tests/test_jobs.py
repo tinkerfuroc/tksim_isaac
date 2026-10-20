@@ -381,7 +381,40 @@ def test_child_env(tmp_path, settings, runners, monkeypatch):
     assert str(Path(__file__).resolve().parents[1]) in env["PYTHONPATH"].split(os.pathsep)
     assert env["PYTHONPATH"] == str(Path(__file__).resolve().parents[1])
     assert not any(k in env for k in UNSET_ENV if k != "PYTHONPATH")
-    assert env.get("CUDA_VISIBLE_DEVICES") == os.environ.get("CUDA_VISIBLE_DEVICES")
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"  # free_gpu: both free, GPU 1 preferred
+
+
+def test_child_env_pins_chosen_gpu(tmp_path, settings, runners, monkeypatch):
+    """CUDA_VISIBLE_DEVICES carries the chosen GPU, overriding whatever the server had."""
+    from map_check.gpu import BusyReason as BR
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    d = tmp_path / "envdump"
+    d.mkdir()
+    (d / "render.py").write_text(
+        'import json, os, sys\njob = json.load(open(sys.argv[-1]))\n'
+        f'json.dump({{"env": os.environ.get("CUDA_VISIBLE_DEVICES"), "gpu": job["gpu"]}}, '
+        f'open({str(tmp_path / "gpu.json")!r}, "w"))\n'
+        'print(json.dumps({"event": "done"}), flush=True)\n')
+
+    def gpu1_busy(own_pids=frozenset()):  # GPU 1 in use, overridden: GPU 0 is chosen
+        return GpuStatus(gpus=[0, 1], busy=[BR(1, 99, "isaac-sim", "isaac-sim")])
+    bench = BenchStore(settings.state_dir)
+    r = runner(runners, settings, bench, lambda jf: [sys.executable, str(d / "render.py"), str(jf)],
+               gpu_probe=gpu1_busy)
+    r.submit("m1", override=True)
+    assert finished(r, "m1").status == "done"
+    got = json.loads((tmp_path / "gpu.json").read_text())
+    assert got == {"env": "0", "gpu": 0}
+
+
+def test_job_file_has_deadline(tmp_path, settings, runners):
+    bench = BenchStore(settings.state_dir)
+    r = runner(runners, settings, bench, fake_command(tmp_path), timeout_s=50.0, kill_grace_s=2.0)
+    before = time.time()
+    job = r.submit("m1", override=False)
+    finished(r, "m1")
+    jf = json.loads((settings.state_dir / "jobs" / f"{job.id}.json").read_text())
+    assert before + 52.0 <= jf["deadline"] <= time.time() + 52.0
 
 
 def test_isaac_render_imports_without_isaac():

@@ -7,6 +7,7 @@ The Isaac script prints one JSON object per progress line on stdout:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,9 @@ class JobFile:
     arm_deg: list[float]
     poses: list[JobPose]
     overview: bool
+    # Epoch seconds (start + the job timeout); the render exits by itself after it,
+    # even when the server that would have killed it is gone (render.watchdog).
+    deadline: float
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -55,7 +59,7 @@ class JobFile:
                        robot_usd=str(d["robot_usd"]), robot_urdf=str(d["robot_urdf"]),
                        z0=float(d["z0"]), gpu=int(d["gpu"]), out_dir=str(d["out_dir"]),
                        arm_deg=[float(a) for a in d["arm_deg"]], poses=poses,
-                       overview=bool(d["overview"]))
+                       overview=bool(d["overview"]), deadline=_deadline(d["deadline"]))
         except KeyError as e:
             raise ValueError(f"job file: missing {e.args[0]}") from e
         except (TypeError, ValueError) as e:
@@ -71,6 +75,13 @@ class JobFile:
         except (OSError, ValueError) as e:
             raise ValueError(f"{path}: cannot read: {e}") from e
         return cls.from_dict(doc)
+
+
+def _deadline(v: Any) -> float:
+    t = float(v)
+    if not math.isfinite(t) or t <= 0:
+        raise ValueError(f"deadline must be a positive epoch time, got {v!r}")
+    return t
 
 
 def _pose(p: Any) -> JobPose:

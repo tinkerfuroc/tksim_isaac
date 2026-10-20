@@ -446,7 +446,8 @@ def pid_alive(pid):
     return stat[stat.rindex(")") + 2] != "Z"
 
 
-def test_sigint_with_open_event_stream_stops_server_and_render(settings, tmp_path):
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGHUP], ids=["SIGINT", "SIGHUP"])
+def test_signal_with_open_event_stream_stops_server_and_render(settings, tmp_path, sig):
     import httpx
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
@@ -491,9 +492,9 @@ def test_sigint_with_open_event_stream_stops_server_and_render(settings, tmp_pat
         stream = httpx.stream("GET", base + "/api/events?map=bar", timeout=10)
         resp = stream.__enter__()
         assert next(resp.iter_lines()).startswith("event:")  # the stream is open
-        # signal the python process (timeout's child), as Ctrl+C reaches it
+        # signal the python process (timeout's child), as Ctrl+C or a dropped ssh session does
         server_pid = int(subprocess.check_output(["pgrep", "-P", str(proc.pid)]).split()[0])
-        os.kill(server_pid, signal.SIGINT)
+        os.kill(server_pid, sig)
         proc.wait(timeout=15)  # without the fix this hangs at "Waiting for connections to close"
         end = time.monotonic() + 10
         while pid_alive(render_pid) and time.monotonic() < end:
@@ -511,6 +512,25 @@ def test_sigint_with_open_event_stream_stops_server_and_render(settings, tmp_pat
         pf = tmp_path / "render.pid"
         if pf.exists() and pid_alive(int(pf.read_text())):
             os.kill(int(pf.read_text()), signal.SIGKILL)
+
+
+def test_capture_signals_adds_sighup_unless_ignored():
+    from types import SimpleNamespace
+    import uvicorn
+    from map_check.server import _Server
+    srv = _Server(uvicorn.Config(lambda *a: None), SimpleNamespace(state=SimpleNamespace()))
+    before = signal.getsignal(signal.SIGHUP)
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        with srv.capture_signals():
+            assert signal.getsignal(signal.SIGHUP) == srv.handle_exit
+            assert signal.getsignal(signal.SIGTERM) == srv.handle_exit
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_DFL
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)  # started under nohup
+        with srv.capture_signals():
+            assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, before)
 
 
 def save_via(base, token):

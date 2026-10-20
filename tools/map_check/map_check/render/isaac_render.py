@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sys
 import traceback
@@ -27,6 +28,7 @@ from map_check import robot
 from map_check.render import cameras
 from map_check.render.jobfile import OVERVIEW, JobFile, done_event, error_event, view_event
 from map_check.render.labels import place_labels
+from map_check.render.watchdog import guard
 
 APP_W, APP_H = 1280, 800
 WARMUP_UPDATES = 80  # app updates after the scene is built, before the first step
@@ -326,6 +328,7 @@ class Renderer:
 
 
 def main(argv: list[str] | None = None) -> int:
+    start_ppid = os.getppid()  # first thing: the server that started us
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
         emit(error_event("usage: python -m map_check.render.isaac_render <job.json>"))
@@ -336,13 +339,19 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         emit(error_event(str(e)))
         return 2
+    # Before Isaac loads: exit at the job's deadline or when the server is gone, so a hung
+    # Isaac can't hold the GPU after its server died without stopping it.
+    guard(job.deadline, start_ppid, report=lambda why: emit(error_event(f"{why}; render stopped")))
 
     from isaacsim import SimulationApp
 
     app = SimulationApp({
         "headless": True, "renderer": "RaytracedLighting", "width": APP_W, "height": APP_H,
         "fast_shutdown": True,
-        "extra_args": ["--/renderer/multiGpu/enabled=false", f"--/renderer/activeGpu={job.gpu}"],
+        # The server sets CUDA_VISIBLE_DEVICES to job.gpu (jobs.job_env), so the chosen GPU
+        # is device 0 here, as in scripts/gpsr-stack; physics stays off the GPU.
+        "extra_args": ["--/renderer/multiGpu/enabled=false", "--/renderer/activeGpu=0",
+                       "--/physics/cudaDevice=-1"],
     })
     code = 0
     try:

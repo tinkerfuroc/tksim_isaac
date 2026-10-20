@@ -60,12 +60,15 @@ def default_isaac_command(jobfile: Path, settings: Settings | None = None) -> li
     return [str(settings.isaac_python), "-m", ISAAC_MODULE, str(jobfile)]
 
 
-def job_env() -> dict[str, str]:
+def job_env(gpu: int) -> dict[str, str]:
     """The server's environment minus ROS paths, plus the Kit EULA and map_check on the path.
 
-    CUDA and everything else are untouched; the GPU goes in via the job file.
+    The render sees only the chosen GPU, as scripts/gpsr-stack pins its stages: with
+    CUDA_VISIBLE_DEVICES set, Isaac renders on its device 0 (isaac_render passes
+    --/renderer/activeGpu=0).
     """
     env = {k: v for k, v in os.environ.items() if k not in UNSET_ENV}
+    env["CUDA_VISIBLE_DEVICES"] = str(int(gpu))
     env["OMNI_KIT_ACCEPT_EULA"] = "YES"
     env["PYTHONPATH"] = str(PACKAGE_ROOT)
     return env
@@ -301,14 +304,18 @@ class JobRunner:
             return "failed", f"the GPU became busy while queued: {describe(gpus.busy)}"
         out_dir = self._renders_dir / st.map / st.id
         out_dir.mkdir(parents=True, exist_ok=True)
+        timeout = self._timeout_s or self.timeout_for(st.total_views)
+        gpu = choose_gpu(gpus)
         jf = JobFile(
             job_id=st.id, map=st.map, arena_usd=str(job.arena_dir / "arena.usd"),
             robot_usd=str(model.usd), robot_urdf=str(model.urdf), z0=float(model.z0),
-            gpu=choose_gpu(gpus), out_dir=str(out_dir), arm_deg=list(job.arm_deg),
+            gpu=gpu, out_dir=str(out_dir), arm_deg=list(job.arm_deg),
             poses=[JobPose(key=k, name=p.name, x=p.x, y=p.y, yaw=p.yaw,
                            views=[v for v in VIEWS if getattr(s, v)],
                            pan_deg=s.pan_deg, tilt_deg=s.tilt_deg) for k, p, s in job.rows],
-            overview=True)
+            # The render's own backstop (render.watchdog): start + the job timeout, plus the
+            # kill grace so the server's timeout, reported as "timeout", always acts first.
+            overview=True, deadline=time.time() + timeout + self._grace)
         # Beyond the JobFile schema: what the overview marks, computed here, not in Isaac.
         doc = jf.to_dict()
         doc["flagged"] = [k for k, _, _ in job.rows if job.flags[k]]
@@ -318,11 +325,10 @@ class JobRunner:
         jobfile.write_text(json.dumps(doc, indent=2) + "\n")
         log_path = self._jobs_dir / f"{st.id}.log"
 
-        timeout = self._timeout_s or self.timeout_for(st.total_views)
         with open(log_path, "ab") as log:
             proc = subprocess.Popen(self._command(jobfile), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=log, start_new_session=True,
-                                    env=job_env())
+                                    env=job_env(gpu))
             reader = None
             try:
                 started = time.monotonic()

@@ -217,7 +217,7 @@ def _job():
         poses=[jobfile.JobPose(key="kitchen_table_0_0", name="kitchen_table_0_0", x=12.35, y=2.646,
                                yaw=0.0, views=["behind", "head"], pan_deg=180.0, tilt_deg=-30.0),
                jobfile.JobPose(key="a", name="POS_A", x=0.0, y=0.0, yaw=-1.5, views=["top"])],
-        overview=True)
+        overview=True, deadline=1_792_000_000.5)
 
 
 def test_jobfile_roundtrip(tmp_path):
@@ -230,7 +230,7 @@ def test_jobfile_roundtrip(tmp_path):
     assert d["poses"][0] == {"key": "kitchen_table_0_0", "name": "kitchen_table_0_0", "x": 12.35,
                              "y": 2.646, "yaw": 0.0, "views": ["behind", "head"], "pan_deg": 180.0,
                              "tilt_deg": -30.0}
-    assert d["gpu"] == 1 and d["overview"] is True
+    assert d["gpu"] == 1 and d["overview"] is True and d["deadline"] == 1_792_000_000.5
     bad = job.to_dict()
     bad["poses"][1]["views"] = ["side"]
     with pytest.raises(ValueError, match="side"):
@@ -239,6 +239,18 @@ def test_jobfile_roundtrip(tmp_path):
     del bad["z0"]
     with pytest.raises(ValueError, match="z0"):
         jobfile.JobFile.from_dict(bad)
+
+
+def test_jobfile_deadline_required_and_checked():
+    bad = _job().to_dict()
+    del bad["deadline"]
+    with pytest.raises(ValueError, match="missing deadline"):
+        jobfile.JobFile.from_dict(bad)
+    for v in (float("nan"), float("inf"), 0, -5, "soon"):
+        bad = _job().to_dict()
+        bad["deadline"] = v
+        with pytest.raises(ValueError, match="deadline|could not convert"):
+            jobfile.JobFile.from_dict(bad)
 
 
 def test_progress_events():
@@ -256,5 +268,6 @@ def test_progress_events():
 def test_render_modules_import_numpy_only():
     code = ("import sys\n"
             "for m in ('yaml', 'scipy', 'pxr', 'fastapi', 'PIL'): sys.modules[m] = None\n"
-            "import map_check.render.cameras, map_check.render.labels, map_check.render.jobfile\n")
+            "import map_check.render.cameras, map_check.render.labels, map_check.render.jobfile\n"
+            "import map_check.render.watchdog\n")
     subprocess.run([sys.executable, "-c", code], check=True, cwd=Path(__file__).resolve().parents[1])

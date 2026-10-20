@@ -9,6 +9,7 @@ import json
 import io
 import re
 import secrets
+import signal
 import threading
 import time
 import warnings
@@ -421,6 +422,28 @@ class _Server(uvicorn.Server):
     def __init__(self, config, app):
         super().__init__(config)
         self._app = app
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        """uvicorn's (0.54) handling, plus SIGHUP: a dropped ssh session must stop the render too.
+
+        A SIGHUP ignored on entry (nohup) stays ignored.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        sigs = [signal.SIGINT, signal.SIGTERM]
+        if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+            sigs.append(signal.SIGHUP)
+        original = {sig: signal.signal(sig, self.handle_exit) for sig in sigs}
+        try:
+            yield
+        finally:
+            for sig, handler in original.items():
+                signal.signal(sig, handler)
+        # As uvicorn does: after the graceful shutdown, re-raise for the default behaviour.
+        for captured in reversed(self._captured_signals):
+            signal.raise_signal(captured)
 
     def handle_exit(self, sig, frame):
         again = self.should_exit
