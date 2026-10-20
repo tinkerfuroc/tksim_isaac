@@ -21,7 +21,8 @@ export interface Rings {
  * occupied cells. A ring cell is strip when walking from it left, right, up or down through ring
  * cells first leaves the ring onto a W cell whose W run along the walk is strictly longer than
  * its run across it. Every cell of a straight ring run leaves it at the same two cells (one past
- * each end), so a whole run qualifies when either end's outer neighbour does.
+ * each end), so a whole run qualifies when either end's outer neighbour does. Then, once, a ring run
+ * with a strip end cell where the wall turns a corner becomes all strip (step 3b, `cornerExtension`).
  */
 export function classifyRings(g: Grid, erased: ReadonlySet<number>, filled: ReadonlySet<number>): Rings {
   const { W, H, cells } = g;
@@ -103,7 +104,43 @@ export function classifyRings(g: Grid, erased: ReadonlySet<number>, filled: Read
       }
     }
   }
-  return { inRing, strip };
+  return { inRing, strip: cornerExtension(W, H, occ, inRing, strip) };
+}
+
+/**
+ * Step 3b, applied once to the step-3 `strip`: a straight ring run becomes all strip when one of its
+ * end cells is strip and the occupied line across the run at that cell does not continue on both
+ * sides (the wall turns a corner there: an L, not a T). Only step-3 strip cells trigger it, in both
+ * directions, so the cells it adds trigger nothing (no chaining).
+ */
+function cornerExtension(W: number, H: number, occ: Uint8Array, inRing: Uint8Array, strip: Uint8Array): Uint8Array {
+  const out = strip.slice();
+  const o = (r: number, c: number) => r >= 0 && r < H && c >= 0 && c < W && occ[r * W + c] === 1;
+  const turns = (r: number, c: number, horiz: boolean) =>
+    strip[r * W + c] === 1 && !(horiz ? o(r - 1, c) && o(r + 1, c) : o(r, c - 1) && o(r, c + 1));
+  for (let r = 0; r < H; r++) {
+    let c = 0;
+    while (c < W) {
+      if (!inRing[r * W + c]) { c++; continue; }
+      const c0 = c;
+      while (c < W && inRing[r * W + c]) c++;
+      if (turns(r, c0, true) || turns(r, c - 1, true)) {
+        for (let k = c0; k < c; k++) out[r * W + k] = 1;
+      }
+    }
+  }
+  for (let c = 0; c < W; c++) {
+    let r = 0;
+    while (r < H) {
+      if (!inRing[r * W + c]) { r++; continue; }
+      const r0 = r;
+      while (r < H && inRing[r * W + c]) r++;
+      if (turns(r0, c, false) || turns(r - 1, c, false)) {
+        for (let k = r0; k < r; k++) out[k * W + c] = 1;
+      }
+    }
+  }
+  return out;
 }
 
 /**

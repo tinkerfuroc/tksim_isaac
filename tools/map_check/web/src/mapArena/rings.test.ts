@@ -177,7 +177,10 @@ describe('outline rings', () => {
 });
 
 describe('classifyRings and owners', () => {
-  /** The prototype's per-cell walk (outline-proto.py) and the spec's ownership rule, cell by cell. */
+  /**
+   * The prototypes' per-cell walks and the spec's ownership rule, cell by cell: `strip3` is the strip
+   * by step 3 (outline-proto.py), `strip` adds step 3b (corner-proto.py's extend()).
+   */
   function reference(g: Grid, erased: Set<number>, heights: Record<number, number>) {
     const { W, H } = g;
     const occ = (r: number, c: number) => g.cells[r * W + c] === 255 && !erased.has(r * W + c);
@@ -205,7 +208,7 @@ describe('classifyRings and owners', () => {
       for (let rr = r + dr, cc = c + dc; wall(rr, cc); rr += dr, cc += dc) n++;
       return n;
     };
-    const strip = new Uint8Array(W * H);
+    const strip3 = new Uint8Array(W * H);
     for (let r = 0; r < H; r++) {
       for (let c = 0; c < W; c++) {
         if (!ring[r * W + c]) continue;
@@ -215,17 +218,39 @@ describe('classifyRings and owners', () => {
           if (!wall(rr, cc)) continue;
           const hr = 1 + run(rr, cc, 0, -1) + run(rr, cc, 0, 1);
           const vr = 1 + run(rr, cc, -1, 0) + run(rr, cc, 1, 0);
-          if (horiz ? hr > vr : vr > hr) { strip[r * W + c] = 1; break; }
+          if (horiz ? hr > vr : vr > hr) { strip3[r * W + c] = 1; break; }
         }
       }
     }
-    return { owner, strip, ring };
+    // Step 3b: a ring run that step 3 left partly non-strip becomes strip when one of its end cells
+    // is strip by step 3 and the occupied line across it does not continue both ways (an L corner).
+    const o = (r: number, c: number) => r >= 0 && r < H && c >= 0 && c < W && occ(r, c);
+    const strip = strip3.slice();
+    for (const horiz of [true, false]) {
+      for (let a = 0; a < (horiz ? H : W); a++) {
+        let run: [number, number][] = [];
+        for (let b = 0; b <= (horiz ? W : H); b++) {
+          const [r, c] = horiz ? [a, b] : [b, a];
+          if (b < (horiz ? W : H) && ring[r * W + c]) { run.push([r, c]); continue; }
+          if (run.length && !run.every(([rr, cc]) => strip3[rr * W + cc])) {
+            for (const [er, ec] of [run[0], run[run.length - 1]]) {
+              if (!strip3[er * W + ec]) continue;
+              const across = horiz ? o(er - 1, ec) && o(er + 1, ec) : o(er, ec - 1) && o(er, ec + 1);
+              if (!across) { for (const [rr, cc] of run) strip[rr * W + cc] = 1; break; }
+            }
+          }
+          run = [];
+        }
+      }
+    }
+    return { owner, strip3, strip, ring };
   }
 
   it('match the per-cell reference walk on random grids', () => {
     let seed = 20261020;
     const rand = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2 ** 32; };
     let checked = 0;
+    let extended = 0;
     for (let t = 0; t < 400; t++) {
       const H = 4 + Math.floor(rand() * 20);
       const W = 4 + Math.floor(rand() * 20);
@@ -248,8 +273,10 @@ describe('classifyRings and owners', () => {
       expect([...rings.strip]).toEqual([...ref.strip]);
       expect([...own]).toEqual([...ref.owner]);
       if (filled.size) checked++;
+      if (ref.strip.some((v, i) => v !== ref.strip3[i])) extended++;
     }
     expect(checked).toBeGreaterThan(200);
+    expect(extended).toBeGreaterThan(20);
   });
 
   it('owners follow height edits without reclassifying (tallest wins, lowest id on a tie)', () => {

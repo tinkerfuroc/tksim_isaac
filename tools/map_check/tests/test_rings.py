@@ -158,7 +158,8 @@ def test_box_group_order():
 
 
 def _reference(occ, labels, heights):
-    """The prototype's per-cell loop (outline-proto.py), plus the spec's ownership rule."""
+    """The prototypes' per-cell loops, plus the spec's ownership rule: (owner, strip by step 3
+    (outline-proto.py), strip after step 3b (corner-proto.py))."""
     from scipy import ndimage
     ring = np.zeros_like(occ)
     owner = np.zeros(occ.shape, np.int32)
@@ -191,12 +192,63 @@ def _reference(occ, labels, heights):
                 if (horiz and hr > vr) or (not horiz and vr > hr):
                     strip[r, c] = True
                     break
-    return owner, strip
+    return owner, strip, _corner_extension(occ, ring, strip)
+
+
+def _ring_runs(ring, horiz):
+    """Maximal straight runs of ring cells, each a list of (r, c)."""
+    h, w = ring.shape
+    out = []
+    for a in range(h if horiz else w):
+        cur = []
+        for b in range(w if horiz else h):
+            r, c = (a, b) if horiz else (b, a)
+            if ring[r, c]:
+                cur.append((r, c))
+            elif cur:
+                out.append(cur)
+                cur = []
+        if cur:
+            out.append(cur)
+    return out
+
+
+def _corner_extension(occ, ring, strip):
+    """corner-proto.py's extend(): step 3b, judged on the step-3 strip only (no chaining)."""
+    h, w = occ.shape
+
+    def o(r, c):
+        return 0 <= r < h and 0 <= c < w and occ[r, c]
+
+    new = strip.copy()
+    for horiz in (True, False):
+        for run in _ring_runs(ring, horiz):
+            if all(strip[p] for p in run):
+                continue
+            for r, c in (run[0], run[-1]):
+                if not strip[r, c]:
+                    continue
+                a, b = ((r - 1, c), (r + 1, c)) if horiz else ((r, c - 1), (r, c + 1))
+                if not (o(*a) and o(*b)):  # the wall turns a corner at the end cell (L, not T)
+                    for p in run:
+                        new[p] = True
+                    break
+    return new
+
+
+def test_corner_extension_no_chaining():
+    """N2: the back row becomes strip by step 3b, but its far end cell, strip only by 3b, does
+    not extend the far side edge, which stays a free edge."""
+    case = next(c for c in CASES if c["name"] == "N2_corner_wall_ends_at_table")
+    m, labels, s = case_inputs(case)
+    rings = classify_rings(erased_occ(m, s), labels, {1: s.shapes[1].height})
+    assert rings.strip[0, :8].all()  # the back row, far corner (0, 7) included
+    assert (rings.owner[1:4, 7] == 1).all() and not rings.strip[1:4, 7].any()
 
 
 def test_matches_reference_loop_on_random_grids():
     rng = np.random.default_rng(20261020)
-    checked = 0
+    checked = extended = 0
     for _ in range(300):
         h, w = rng.integers(4, 24, size=2)
         occ = rng.random((h, w)) < rng.uniform(0.3, 0.75)
@@ -206,10 +258,11 @@ def test_matches_reference_loop_on_random_grids():
         heights = {o.id: float(rng.choice([0.3, 0.6, 0.9])) for o in outlines if rng.random() < 0.7}
         work = occ & (rng.random((h, w)) > 0.1)  # some cells erased
         got = classify_rings(work, labels, heights)
-        owner, strip = _reference(work, labels, heights)
+        owner, strip3, strip = _reference(work, labels, heights)
         assert (got.owner == owner).all() and (got.strip == strip).all()
         checked += bool(heights)
-    assert checked > 100
+        extended += bool((strip != strip3).any())
+    assert checked > 100 and extended > 20
 
 
 @pytest.fixture

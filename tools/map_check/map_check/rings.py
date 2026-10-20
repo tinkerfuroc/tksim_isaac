@@ -1,7 +1,8 @@
 """Outline rings of filled shapes: free edges versus shared wall strip.
 
 Implements "The rule, exactly" of docs/superpowers/specs/2026-10-20-shape-outline-height-design.md.
-The strip test is vectorised; it equals the prototype's per-cell walk (see ``classify_rings``).
+The strip test and its corner extension (step 3b) are vectorised; they equal the prototypes'
+per-cell loops (outline-proto.py and corner-proto.py's ``extend()``).
 """
 from dataclasses import dataclass
 
@@ -53,6 +54,27 @@ def _walk_hits(ring: np.ndarray, target: np.ndarray, structure: np.ndarray, step
     return good[lab]
 
 
+def _corner_extension(occ: np.ndarray, ring: np.ndarray, strip: np.ndarray) -> np.ndarray:
+    """Step 3b, applied once to the step-3 ``strip``: a straight ring run becomes all strip when
+    one of its end cells is strip and the occupied line across the run at that cell does not
+    continue on both sides (the wall turns a corner there: an L, not a T).
+
+    Only step-3 strip cells trigger it, in both directions, so cells it adds trigger nothing
+    (no chaining). A run that is already all strip is unchanged by the union.
+    """
+    out = strip.copy()
+    for structure, along, across in ((_ROW, ((0, -1), (0, 1)), ((-1, 0), (1, 0))),
+                                     (_COL, ((-1, 0), (1, 0)), ((0, -1), (0, 1)))):
+        lab, n = ndimage.label(ring, structure=structure)
+        end = ring & ~(_shift(ring, *along[0], False) & _shift(ring, *along[1], False))
+        tee = _shift(occ, *across[0], False) & _shift(occ, *across[1], False)
+        good = np.zeros(n + 1, bool)
+        good[lab[end & strip & ~tee]] = True
+        good[0] = False
+        out |= good[lab]
+    return out
+
+
 def classify_rings(occ: np.ndarray, labels: np.ndarray, heights: dict) -> Rings:
     """Classify the rings of filled shapes.
 
@@ -60,7 +82,8 @@ def classify_rings(occ: np.ndarray, labels: np.ndarray, heights: dict) -> Rings:
     id -> height. Ring of k = cells of occ 8-adjacent to an interior cell of k; a cell's owner is
     the tallest such filled shape, the lowest id on a tie. A ring cell is strip when walking from
     it left, right, up or down through ring cells first leaves the ring onto a remaining wall
-    cell w whose wall run along the walk is strictly longer than its run across it.
+    cell w whose wall run along the walk is strictly longer than its run across it. Then, once,
+    a ring run with a strip end cell where the wall turns a corner becomes all strip (step 3b).
     """
     occ = np.asarray(occ, bool)
     labels = np.asarray(labels)
@@ -86,4 +109,4 @@ def classify_rings(occ: np.ndarray, labels: np.ndarray, heights: dict) -> Rings:
     vrun = _run_length(wall, _COL)
     strip = (_walk_hits(ring, wall & (hrun > vrun), _ROW, ((0, 1), (0, -1)))
              | _walk_hits(ring, wall & (vrun > hrun), _COL, ((1, 0), (-1, 0))))
-    return Rings(owner=owner, strip=strip & ring)
+    return Rings(owner=owner, strip=_corner_extension(occ, ring, strip & ring))

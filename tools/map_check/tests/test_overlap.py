@@ -1,3 +1,4 @@
+import json
 import math
 import time
 from pathlib import Path
@@ -6,9 +7,9 @@ import numpy as np
 import pytest
 
 from map_check import robot
-from map_check.arena_build import Box, build_boxes, default_settings
+from map_check.arena_build import Box, BuildSettings, ShapeSetting, build_boxes, default_settings
 from map_check.config import Settings
-from map_check.occupancy import closed_outlines, load_map_dir
+from map_check.occupancy import OccupancyMap, closed_outlines, load_map_dir
 from map_check.overlap import Flag, RobotModel, arena_bounds, check_pose, part_name
 from map_check.poses import Pose
 
@@ -159,6 +160,30 @@ def test_check_pose_text_rounding():
     [f] = one(wall(0.0, 0.1, -0.1, 0.1, 0.3))  # touching
     assert f.kind == "near" and f.text == "arm (link3) 1 cm from wall (under 2 cm)"
     assert one(wall(0.02, 0.1, -0.1, 0.1)) == []  # exactly the margin is clear
+
+
+def test_table_edge_flags_as_shape():
+    """Case A (a free-standing table at 0.45) at 5 cm cells: a point 1 cm outside its outline ring,
+    below the table top, is flagged against shape 1, not against a wall."""
+    fixture = Path(__file__).parent / "fixtures" / "outline_golden.json"
+    case = next(c for c in json.loads(fixture.read_text()) if c["name"] == "A_free_standing")
+    cells = np.array(case["cells"])
+    m = OccupancyMap(occupied=cells == 255, resolution=0.05, origin=(0.0, 0.0), meta={},
+                     image_name="", yaml_bytes=b"", image_bytes=b"")
+    labels, _ = closed_outlines(m)
+    settings = BuildSettings(wall_height=case["wall_height"], erased=frozenset(),
+                             shapes={int(k): ShapeSetting(v["fill"], v["height"])
+                                     for k, v in case["shapes"].items()})
+    boxes = build_boxes(m, labels, settings)
+    bounds = arena_bounds(boxes)
+    ring_x0 = 2 * 0.05  # the ring's left column is column 2
+    y = (5 - 2.5) * 0.05  # the middle of row 2 (row 0 is the top)
+    pose = Pose("p", 0.25, y, 0.0)
+    pts = {"link3": np.array([[ring_x0 - 0.01 - pose.x, 0.0, 0.2]])}
+    [f] = check_pose(pose, boxes, bounds, pts, {"link3": np.eye(4)}, 0.0)
+    assert (f.kind, f.target) == ("near", "shape 1")
+    assert f.distance_m == pytest.approx(0.01)
+    assert "shape 1" in f.text and "wall" not in f.text
 
 
 @pytest.fixture

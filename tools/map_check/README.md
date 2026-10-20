@@ -37,6 +37,13 @@ ssh -N -L 9081:127.0.0.1:9081 <host>
 - **Map → arena**: pick a Map Studio map or upload a new map (yaml + image). The tool
   finds the closed outlines, and you set the wall height, whether each outline is filled,
   each shape's height, and erase stray wall cells. Saving writes a 3D arena the sim can use.
+  - A filled shape is built as one solid block at its height, outline included.
+  - Where the outline is part of a wall line, that strip stays wall, at the taller of the
+    wall height and the shape height. This includes a wall that turns a corner at the
+    shape, such as a table in a room corner whose back wall ends at a doorway.
+  - Arenas saved before this change keep the 0.6 m rim around filled shapes until they are
+    saved again. The editor starts from the default settings, so heights and erases must be
+    redone before saving.
 - **Check poses**: pick a map that has a saved arena, tick the poses to check (from its
   Map Studio `<map>.poses.yaml`, read only), choose views (including behind views and
   head pan/tilt), choose an arm pose, and render. Poses are flagged when the robot's

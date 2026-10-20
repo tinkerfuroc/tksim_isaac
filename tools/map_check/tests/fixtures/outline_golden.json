@@ -453,7 +453,7 @@
   },
   {
     "name": "J2_erase_one_side",
-    "comment": "C with only the wall cell left of the strip erased: the right-hand wall still continues the line, so the back row stays strip",
+    "comment": "C with only the wall cell left of the strip erased: the right-hand wall still continues the line, so the back row stays strip; nothing continues past its left end cell (an L), so step 3b makes the left side edge strip too, at wall height",
     "wall_height": 0.6,
     "shapes": {"1": {"fill": true, "height": 0.45}},
     "erased": [3],
@@ -466,24 +466,24 @@
     ],
     "sketch": [
       "###xSSSSSSS####",
-      "....fiiiiif....",
-      "....fiiiiif....",
-      "....fffffff....",
+      "....Siiiiif....",
+      "....Siiiiif....",
+      "....Sffffff....",
       "..............."
     ],
     "legend": {".": [null, ""], "x": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
     "heights": [
       [0.6, 0.6, 0.6, null, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6],
-      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
-      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
-      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.6, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.6, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.6, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
       [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
     ],
     "kinds": [
       ["wall", "wall", "wall", "", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
-      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
-      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
-      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
       ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
     ]
   },
@@ -521,6 +521,86 @@
       ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "wall", ""],
       ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
       ["", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "N_corner_doorway",
+    "comment": "table (0.30) in a room corner whose back wall ends one cell past it at a doorway: step 3 makes only the corner column strip (the wall left past the table is a 1x1 speck); step 3b makes the whole back row strip at that L corner; the side facing the doorway and the edge facing the room stay free at 0.30",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.3}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "SSSSSSSS#....###",
+      "Siiiiiif........",
+      "Siiiiiif........",
+      "Sfffffff........",
+      "#...............",
+      "#..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.3, "shape:1"], "i": [0.3, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, null, null, null, null, 0.6, 0.6, 0.6],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "", "", "", "", "wall", "wall", "wall"],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "N2_corner_wall_ends_at_table",
+    "comment": "as N but the back wall ends exactly at the table's far corner: step 3b makes the back row strip; the far side edge stays free at 0.30, since its top cell is strip only by step 3b (no chaining)",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.3}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 255, 255, 255],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "SSSSSSSS.....###",
+      "Siiiiiif........",
+      "Siiiiiif........",
+      "Sfffffff........",
+      "#...............",
+      "#..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.3, "shape:1"], "i": [0.3, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, null, null, null, null, null, 0.6, 0.6, 0.6],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "", "", "", "", "", "wall", "wall", "wall"],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
     ]
   }
 ]
