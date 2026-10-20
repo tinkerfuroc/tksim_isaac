@@ -6,10 +6,13 @@ from typing import Literal
 import numpy as np
 
 from map_check.occupancy import OccupancyMap
+from map_check.rings import classify_rings
 
 # mockup tokens --wall #7f9cc0, --shape #d2a865 as RGB floats
 WALL_COLOR = (0.498, 0.612, 0.753)
 SHAPE_COLOR = (0.824, 0.659, 0.396)
+# manifest settings.outline_rule: filled shapes' rings take the shape height (rings.py)
+OUTLINE_RULE = "shape-height-v1"
 
 
 @dataclass(frozen=True)
@@ -73,23 +76,43 @@ def _boxes(m, mask, kind, shape_id, height):
     res = m.resolution
     ox, oy = m.origin
     out = []
-    for r0, c0, nr, nc in merge_rects(mask):
+    rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+    if not rows.size:
+        return out
+    # merge within the bounding box only; a constant offset keeps merge_rects order
+    ra, ca = int(rows[0]), int(cols[0])
+    crop = mask[ra:int(rows[-1]) + 1, ca:int(cols[-1]) + 1]
+    for r0, c0, nr, nc in ((r + ra, c + ca, nr, nc) for r, c, nr, nc in merge_rects(crop)):
         out.append(Box(kind, shape_id, ox + c0 * res, ox + (c0 + nc) * res,
                        oy + (h - r0 - nr) * res, oy + (h - r0) * res, 0.0, height))
     return out
 
 
 def build_boxes(m: OccupancyMap, labels, settings: BuildSettings):
-    walls = m.occupied.copy()
+    """Boxes for the walls and filled shapes (rule: OUTLINE_RULE, see rings.py).
+
+    Groups, in order: walls at the wall height (remaining wall plus strip cells not raised);
+    raised strip walls by ascending height; then each filled shape by id (its interior plus
+    the free edges it owns). Each group's rects come in merge_rects order.
+    """
+    occ = m.occupied.copy()
     if settings.erased:
-        flat = walls.reshape(-1)
+        flat = occ.reshape(-1)
         idx = np.fromiter(settings.erased, dtype=np.int64)
         flat[idx] = False
-    boxes = _boxes(m, walls, "wall", None, settings.wall_height)
-    for k in sorted(settings.shapes):
-        s = settings.shapes[k]
-        if s.fill:
-            boxes += _boxes(m, labels == k, "shape", k, s.height)
+    wall_h = settings.wall_height
+    filled = {k: s.height for k, s in settings.shapes.items() if s.fill}
+    rings = classify_rings(occ, labels, filled)
+    free = (rings.owner > 0) & ~rings.strip
+    owner_h = np.zeros(occ.shape)
+    for k, h in filled.items():
+        owner_h[rings.owner == k] = h
+    raised = rings.strip & (owner_h > wall_h)  # strip height = max(wall, tallest owner)
+    boxes = _boxes(m, occ & ~free & ~raised, "wall", None, wall_h)
+    for h in sorted(set(owner_h[raised].tolist())):
+        boxes += _boxes(m, raised & (owner_h == h), "wall", None, h)
+    for k in sorted(filled):
+        boxes += _boxes(m, (labels == k) | (free & (rings.owner == k)), "shape", k, filled[k])
     return boxes
 
 

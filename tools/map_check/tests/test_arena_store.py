@@ -110,7 +110,7 @@ def test_arena_versions_accumulate(store):
     assert vdir == v2.version_dir and boxes == _boxes()
     assert man["built_by"] == "map_check" and man["boxes"] == 2
     assert man["settings"] == {"wall_height": 0.6, "shapes": {"1": {"fill": True, "height": 0.5}},
-                               "erased": [1, 3]}
+                               "erased": [1, 3], "outline_rule": "shape-height-v1"}
     assert (v2.version_dir / "map.yaml").read_text().count("image: map.png") == 1
     assert not [p for p in (store.settings.arena_root / "a1").iterdir()
                 if p.name.startswith(".tmp-")]

@@ -12,7 +12,7 @@ from typing import Mapping
 
 import yaml
 
-from .arena_build import Box, BuildSettings, arena_usda
+from .arena_build import OUTLINE_RULE, Box, BuildSettings, arena_usda
 from .names import check_map_name
 from .occupancy import MapFileError, OccupancyMap, load_map_dir, parse_map
 
@@ -186,6 +186,7 @@ class ArenaStore:
                 "shapes": {str(k): {"fill": s.fill, "height": s.height}
                            for k, s in sorted(settings_used.shapes.items())},
                 "erased": sorted(int(i) for i in settings_used.erased),
+                "outline_rule": OUTLINE_RULE,
             },
             "boxes": len(boxes),
             "created_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

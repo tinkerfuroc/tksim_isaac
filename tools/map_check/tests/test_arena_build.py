@@ -9,6 +9,7 @@ import pytest
 from map_check.arena_build import (arena_usda, build_boxes, default_settings, merge_rects,
                                    web_grid)
 from map_check.occupancy import closed_outlines, load_map_dir
+from map_check.rings import classify_rings
 
 MAP = Path("/home/tinker/tk25_ws/src/tk26_navigation/src/navigation_bringup/maps/"
            "robocup_home_2026_measured_5cm.yaml")
@@ -46,17 +47,24 @@ def test_merge_rects_exact_cover():
         assert (cnt == mask.astype(int)).all()
 
 
+def free_edges(occ, labels, s):
+    rings = classify_rings(occ, labels, {k: v.height for k, v in s.shapes.items() if v.fill})
+    return rings.owner, (rings.owner > 0) & ~rings.strip
+
+
 def test_build_boxes_partition(real):
     m, labels, outlines = real
     s = default_settings(m, outlines)
     boxes = build_boxes(m, labels, s)
+    owner, free = free_edges(m.occupied, labels, s)
+    assert free.any()
     walls = [b for b in boxes if b.kind == "wall"]
-    assert (cover(walls, m) == m.occupied.astype(int)).all()
+    assert (cover(walls, m) == (m.occupied & ~free).astype(int)).all()
     assert all(b.z0 == 0 and b.z1 == s.wall_height for b in walls)
     for k, st in s.shapes.items():
         sb = [b for b in boxes if b.shape_id == k]
         if st.fill:
-            assert (cover(sb, m) == (labels == k).astype(int)).all()
+            assert (cover(sb, m) == ((labels == k) | (free & (owner == k))).astype(int)).all()
             assert all(b.z1 == st.height for b in sb)
         else:
             assert not sb
@@ -75,8 +83,11 @@ def test_erased_excluded(real):
     r, c = map(int, np.argwhere(m.occupied)[0])
     s = replace(default_settings(m, outlines), erased=frozenset({r * m.occupied.shape[1] + c}))
     walls = [b for b in build_boxes(m, labels, s) if b.kind == "wall"]
-    want = m.occupied.astype(int)
-    want[r, c] = 0
+    occ = m.occupied.copy()
+    occ[r, c] = False
+    _, free = free_edges(occ, labels, s)
+    want = (occ & ~free).astype(int)
+    assert want[r, c] == 0 and m.occupied[r, c]
     assert (cover(walls, m) == want).all()
 
 
