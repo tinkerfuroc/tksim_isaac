@@ -27,7 +27,7 @@ import uvicorn
 
 from . import robot as robot_mod
 from .arena_build import BuildSettings, ShapeSetting, build_boxes, default_settings, web_grid
-from .arena_store import ArenaStore, NameTaken
+from .arena_store import ArenaStore, NameTaken, check_image_suffix
 from .bench import BenchStore
 from .gpu import describe, gpu_status
 from .jobs import GpuBusy, JobRunner, default_isaac_command
@@ -210,6 +210,7 @@ def create_app(settings, job_command_factory=default_isaac_command, robot_model=
         _check_image_size(image_bytes)
         files = {Path((image.filename or '').replace('\\', '/')).name: image_bytes}
         m = parse_map(yaml_bytes, files)
+        check_image_suffix(m.image_name)  # refused now, not after the teammate's edits
         identical = store.identical_existing(yaml_bytes, files)
         name = _suggest(yaml.filename)
         token = hold(_Held(0, 'upload', name, m, identical))

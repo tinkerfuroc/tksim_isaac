@@ -131,3 +131,93 @@ def test_arenas_only_map_check(store):
     (d / "current.json").write_text(json.dumps({"manifest": "artifacts/arena/rcw2026/v1/manifest.json"}))
     store.save_arena("mine", _bs(), _boxes(), _map())
     assert store.arenas() == ["mine"]
+
+
+def test_arena_root_outside_repo_writes_absolute_pointer(tmp_path):
+    """MAP_CHECK_ARENA_ROOT outside the repo: the save works and leaves no orphan version."""
+    s = replace(Settings(), maps_dir=tmp_path / "maps", repo_root=tmp_path / "repo",
+                arena_root=tmp_path / "elsewhere" / "arena")
+    store = ArenaStore(s)
+    v = store.save_arena("outside", _bs(), _boxes(), _map())
+    cur = json.loads((s.arena_root / "outside" / "current.json").read_text())
+    assert Path(cur["manifest"]).is_absolute()
+    assert Path(cur["manifest"]) == (v.version_dir / "manifest.json").resolve()
+    assert [p.name for p in (s.arena_root / "outside").iterdir() if p.is_dir()] == [v.version_dir.name]
+    assert store.load_current("outside")[2] == v.version_dir.resolve()
+    # run_sim reads only <root>/artifacts/arena; linked there, it accepts the absolute manifest
+    root = tmp_path / "simroot"
+    (root / "artifacts").mkdir(parents=True)
+    (root / "artifacts" / "arena").symlink_to(s.arena_root)
+    assert rs.resolve_arena_artifact(root, "outside") == v.version_dir.resolve()
+
+
+def test_arena_root_inside_repo_keeps_relative_pointer(store):
+    store.save_arena("rel", _bs(), _boxes(), _map())
+    cur = json.loads((store.settings.arena_root / "rel" / "current.json").read_text())
+    assert cur["manifest"].startswith("artifacts/arena/rel/")
+
+
+def test_upload_image_suffix_restricted(store):
+    for bad in ("m.jpg", "m", "m.PGM.bak"):
+        with pytest.raises(ValueError, match=r"\.pgm or \.png"):
+            store.save_uploaded_map("bar", yaml_for(bad), {bad: png_bytes()})
+    assert snapshot(store.settings.maps_dir) == []
+    store.save_uploaded_map("bar", yaml_for("M.PNG"), {"M.PNG": png_bytes()})
+    assert snapshot(store.settings.maps_dir) == ["bar.png", "bar.yaml"]
+
+
+def test_upload_existing_image_file_is_name_taken(store):
+    s = store.settings
+    (s.maps_dir / "bar.png").write_bytes(b"someone else's image")
+    with pytest.raises(NameTaken, match="bar.png"):
+        store.save_uploaded_map("bar", yaml_for("foo.png"), {"foo.png": png_bytes()})
+    assert snapshot(s.maps_dir) == ["bar.png"]
+    assert (s.maps_dir / "bar.png").read_bytes() == b"someone else's image"
+
+
+@pytest.mark.parametrize("yaml_text", [
+    '"image": foo.png\nresolution: 0.05\norigin: [0.0, 0.0, 0.0]\n',
+    '{image: foo.png, resolution: 0.05, origin: [0.0, 0.0, 0.0]}\n',
+])
+def test_upload_image_rewrite_is_verified(store, yaml_text):
+    with pytest.raises(ValueError, match="could not point the map yaml's image at 'bar.png'"):
+        store.save_uploaded_map("bar", yaml_text.encode(), {"foo.png": png_bytes()})
+    assert snapshot(store.settings.maps_dir) == []
+
+
+def _foreign_arena(store, name, manifest):
+    d = store.settings.arena_root / name
+    (d / "v1").mkdir(parents=True)
+    (d / "v1" / "manifest.json").write_text(json.dumps(manifest))
+    (d / "current.json").write_text(json.dumps({"manifest": f"artifacts/arena/{name}/v1/manifest.json"}))
+    return d
+
+
+def test_save_refuses_arena_not_built_by_map_check(store):
+    d = _foreign_arena(store, "rcw2026", {"kind": "arena", "id": "rcw2026"})
+    before = (snapshot(d), (d / "current.json").read_text())
+    with pytest.raises(NameTaken, match="not built by Map Check"):
+        store.save_arena("rcw2026", _bs(), _boxes(), _map())
+    assert (snapshot(d), (d / "current.json").read_text()) == before
+
+
+def test_save_refuses_dir_without_pointer_but_reuses_empty_one(store):
+    d = store.settings.arena_root / "loose"
+    (d / "something").mkdir(parents=True)
+    with pytest.raises(NameTaken, match="without a current.json"):
+        store.save_arena("loose", _bs(), _boxes(), _map())
+    (store.settings.arena_root / "empty").mkdir()
+    store.save_arena("empty", _bs(), _boxes(), _map())
+    store.save_arena("empty", _bs(), _boxes(), _map())  # its own arena: a new version
+    assert store.arenas() == ["empty"]
+
+
+def test_manifest_source_is_saved_name(store):
+    img = png_bytes()
+    store.save_uploaded_map("aaa_orig", yaml_for("f.png"), {"f.png": img})
+    m = parse_map(yaml_for("f.png"), {"f.png": img})
+    man = store.save_arena("zzz_copy", _bs(), _boxes(), m).manifest
+    assert man["source_map"]["name"] == "zzz_copy"
+    assert man["source_map"]["identical_to"] == "aaa_orig"
+    own = store.save_arena("aaa_orig", _bs(), _boxes(), m).manifest
+    assert own["source_map"]["name"] == "aaa_orig" and "identical_to" not in own["source_map"]

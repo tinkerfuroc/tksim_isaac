@@ -59,7 +59,14 @@ version. A name already used by a map or an arena is refused. Map names match
 
 The sim uses a saved arena by name: `validation/run_sim.py --arena <name>` calls
 `resolve_arena_artifact`, which follows `artifacts/arena/<name>/current.json` to the
-manifest's directory and needs `arena.usd` and `map.yaml` there.
+manifest's directory and needs `arena.usd` and `map.yaml` there. It only looks in
+`<repo>/artifacts/arena`: an arena saved under another `MAP_CHECK_ARENA_ROOT` (its
+`current.json` then holds an absolute manifest path) is invisible to `--arena <name>` until
+that directory is linked or copied there.
+
+Saving a picked Map Studio map is refused when an arena of that name exists that Map Check
+did not build (for example a hand-made sim arena), so its `current.json` is never repointed.
+Uploaded map images must be `.pgm` or `.png`.
 
 ### After uploading a new map
 
@@ -76,8 +83,9 @@ it is safe, the override is one explicit click per render; it is not remembered.
 GPUs are free, GPU 1 is used. The render sees only that GPU (`CUDA_VISIBLE_DEVICES`, as
 `scripts/gpsr-stack` pins its stages). Each job has a hard timeout of
 `min(1800, 120 + 20 x views)` seconds, after which its whole process group is killed. The
-render also stops itself if the server dies (Ctrl+C twice, a dropped ssh session, a kill)
-or its deadline passes, so a hung Isaac cannot hold the GPU. The UI estimate is
+render also stops itself if its deadline passes or the server dies without stopping it
+(killed, out of memory), so a hung Isaac cannot hold the GPU. A dropped ssh session
+(SIGHUP) stops the server and its render like Ctrl+C. The UI estimate is
 `40 + 3 x views` seconds. Check with whoever owns the GPU before overriding.
 
 ## Settings

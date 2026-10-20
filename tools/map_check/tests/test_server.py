@@ -117,6 +117,42 @@ def save(client, token, name, **extra):
     return client.post("/api/map/save", json=body)
 
 
+def test_upload_refuses_other_image_types(client, settings):
+    yaml, img = map_files()
+    r = client.post("/api/map/upload", files={
+        "yaml": ("f.yaml", yaml.replace(b"m.png", b"m.jpg"), "text/yaml"),
+        "image": ("m.jpg", img, "image/jpeg")})
+    assert r.status_code == 400 and ".pgm or .png" in r.json()["detail"]
+
+
+def test_picked_map_refuses_foreign_arena_of_same_name(client, settings):
+    yaml, img = map_files()
+    (settings.maps_dir / "rcw.yaml").write_bytes(yaml)
+    (settings.maps_dir / "m.png").write_bytes(img)
+    d = settings.arena_root / "rcw" / "v1"
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text(json.dumps({"kind": "arena", "id": "rcw"}))
+    pointer = json.dumps({"manifest": "arena/rcw/v1/manifest.json"})
+    (settings.arena_root / "rcw" / "current.json").write_text(pointer)
+    token = client.get("/api/map/studio/rcw").json()["token"]
+    r = save(client, token, "rcw")
+    assert r.status_code == 409 and "not built by Map Check" in r.json()["detail"]
+    assert (settings.arena_root / "rcw" / "current.json").read_text() == pointer
+    assert sorted(p.name for p in (settings.arena_root / "rcw").iterdir()) == ["current.json", "v1"]
+
+
+def test_picked_map_manifest_names_it(client, settings):
+    yaml, img = map_files()
+    for n in ("aaa", "zzz"):  # identical maps: the manifest names the one picked
+        (settings.maps_dir / f"{n}.yaml").write_bytes(yaml)
+    (settings.maps_dir / "m.png").write_bytes(img)
+    token = client.get("/api/map/studio/zzz").json()["token"]
+    assert save(client, token, "zzz").status_code == 200
+    cur = json.loads((settings.arena_root / "zzz" / "current.json").read_text())
+    man = json.loads((settings.repo_root / cur["manifest"]).read_text())
+    assert man["source_map"]["name"] == "zzz" and man["source_map"]["identical_to"] == "aaa"
+
+
 def test_cross_origin_refused(client):
     assert client.get("/api/maps", headers={"Origin": "http://evil.example"}).status_code == 403
     assert client.get("/api/maps").status_code == 200
