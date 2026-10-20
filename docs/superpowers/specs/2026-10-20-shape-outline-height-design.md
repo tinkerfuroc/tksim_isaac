@@ -63,6 +63,17 @@ Inputs:
 
    This means the shape's wall line continues into a real wall running the same way. A thick wall's cross-section
    or a lone speck doesn't qualify.
+3b. **Corner extension (added 2026-10-20 after the final review; the user chose it).** Applied once, after
+   step 3, with no chaining:
+   - Look at each straight ring run that step 3 left partly or wholly non-strip.
+   - Take an end cell e of that run that is a strip cell **by step 3**.
+   - Look at the occupied straight line through e, perpendicular to the run. If that line does **not** continue
+     on both sides of e, so the wall turns a corner at e (an L, not a T), every cell of the run becomes strip.
+   - Why: a table in a room corner whose back wall ends at a doorway right after it would otherwise lower that
+     stretch of room wall to table height.
+   - Known cost, accepted by the user: a table edge next to a wall corner that turns can stay at wall height. For
+     example, after erasing the wall beside a table (case J2), the table's side edge keeps wall height.
+   - No change on the measured map. 556 cells across 36 noisier maps move from free edge to strip.
 4. Every other cell of R is a **free edge**.
 5. **Heights:**
    - a free-edge cell takes the max of the heights of the filled shapes whose rings contain it;
@@ -112,6 +123,8 @@ These cases also serve as test fixtures. Each is a small synthetic grid, plus th
 | I. A room (closed outline above the fill limit, unfilled) | No change from today. |
 | J. Erased ring cells | Erased cells produce no box at all, the same as erased wall cells today. |
 | K. Measured map, defaults (all 16 filled at 0.60) | The same set of boxes in 3D as today, apart from box kinds and ids: the heights all equal 0.60 anyway. |
+| N. Table in a room corner, back wall ends one cell past the table at a doorway, 0.30 | The whole back-wall row and the corner column stay at 0.60. Only the table's inner edges (the side facing the doorway and the edge facing the room) drop to 0.30. |
+| N2. Like N, but the wall ends exactly at the table's far corner | The back-wall row and the corner column stay at 0.60. The far side edge stays a table edge (no chaining). |
 | L. Measured map, shape 4 (free-standing) at 1.50 | No 0.60 rim remains around it in the preview or in the saved `arena.usd`. |
 
 ## Where it applies

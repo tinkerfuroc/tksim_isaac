@@ -162,3 +162,51 @@ The controller's acceptance check comes after both tasks:
 - a browser check of case L (shape 4 at 1.50 with no 0.60 rim) and a low table against a wall (e.g. shape 6 at
   0.45: the back strip stays at 0.60, the free edges drop);
 - one live render if the user allows the GPU.
+
+### Task 3: Corner extension (rule step 3b), README, overlap naming test
+
+This task was added after the final review. The user chose to protect a room wall that ends at a doorway beside a
+corner table. The spec's rule step 3b is binding. The prototype is
+`docs/superpowers/specs/2026-10-20-shape-outline-height/corner-proto.py` (its `extend()`).
+
+**Files:**
+- Modify:
+  - `tools/map_check/map_check/rings.py`
+  - `tools/map_check/web/src/mapArena/rings.ts`
+  - `tools/map_check/tests/fixtures/outline_golden.json`
+  - `tools/map_check/scripts/outline_ab.py`
+  - `tools/map_check/README.md`
+- Test:
+  - `tools/map_check/tests/test_rings.py`
+  - `tools/map_check/web/src/mapArena/rings.test.ts`
+  - `tools/map_check/tests/test_overlap.py`
+
+**Interfaces:**
+- No signature changes. `classify_rings` and `classifyRings` return strip masks that include step 3b. Step 3b
+  depends only on the classification inputs (occupied, erased, filled set), so the TS cache key is unchanged.
+
+- [ ] **Step 1: Fixture.**
+  - Add cases `N_corner_doorway` and `N2_corner_wall_ends_at_table`. Derive their `heights` and `kinds` by hand
+    from the spec's case table and rule 3b.
+  - Update `J2_erase_one_side` by hand: its left side edge becomes strip (wall height), as the spec states.
+  - No other case may change.
+- [ ] **Step 2: Failing tests.**
+  - The existing golden tests in both languages now fail on N, N2 and J2.
+  - Add `test_corner_extension_no_chaining` (Python): on N2, the far side edge stays a free edge.
+  - Add `test_table_edge_flags_as_shape` (in `test_overlap.py`): build boxes for fixture case A, then call
+    `check_pose` (or `RobotModel.flags` with a stub robot point set) with a point 1 cm outside the ring. The
+    flag names "shape 1", not "wall".
+- [ ] **Step 3: Implement** step 3b in `rings.py` and `rings.ts`. The results must equal the prototype's
+  `extend()` cell for cell. Extend the existing random-grid and real-map differential checks to cover it.
+- [ ] **Step 4: A/B script.**
+  - The measured map's counts stay the spec's.
+  - Report the per-map count of cells step 3b moves. The prototype's total is 556 over 36 maps, and the script's
+    total must match it.
+- [ ] **Step 5: README.** In "The two screens", add:
+  - a filled shape is built as one solid block at its height, outline included;
+  - where the outline is part of a wall line (including a wall that turns a corner at the shape), that strip stays
+    wall at the taller of the two heights;
+  - arenas saved before this change keep the 0.6 m rim until they are saved again. The editor starts from default
+    settings, so heights and erases must be redone.
+- [ ] **Step 6: Run** both suites and the web build. Expected: all pass.
+- [ ] **Step 7: Commit:** `feat(map-check): a wall turning a corner at a shape stays wall`.
