@@ -137,6 +137,15 @@ def export_code(poses) -> str:
     return CODE_IMPORTS + "\n" + "\n".join(blocks)
 
 
+def yaml_name(name: str) -> str:
+    """The pose's name in an exported .poses.yaml.
+
+    Map Studio keeps saved names exactly as written ("TestSpawn" stays "TestSpawn"),
+    so only pasted code names (POS_FOO) are converted, to "foo".
+    """
+    return name[4:].lower() if name.startswith("POS_") else name
+
+
 def _yaw_text(yaw):
     return f"{min(max(round(yaw, 4), -3.1415), 3.1415):.4f}"
 
@@ -145,7 +154,7 @@ def export_yaml(map_name: str, poses) -> str:
     lines = [f"map: {json.dumps(map_name)}", "frame_id: map"]
     if poses:
         lines.append("poses:")
-        lines += [f"  {json.dumps(key(p.name))}: {{x: {p.x:.4f}, y: {p.y:.4f}, "
+        lines += [f"  {json.dumps(yaml_name(p.name))}: {{x: {p.x:.4f}, y: {p.y:.4f}, "
                   f"yaw: {_yaw_text(p.yaw)}}}" for p in poses]
     else:
         lines.append("poses: {}")

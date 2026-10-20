@@ -105,6 +105,26 @@ def test_export_yaml_roundtrip(tmp_path):
         assert (b.x, b.y, b.yaw) == pytest.approx((a.x, a.y, a.yaw), abs=1e-4)
 
 
+def test_export_yaml_keeps_map_studio_names_verbatim(tmp_path):
+    poses = [Pose("TestSpawn", 1.0, 2.0, 0.0), Pose("kitchen_A2", 0.5, 0.5, 0.0)]
+    text = export_yaml("m1", poses)
+    assert '  "TestSpawn": {x: 1.0000' in text and '  "kitchen_A2": {x: 0.5000' in text
+    (tmp_path / "m1.poses.yaml").write_text(text)
+    assert [p.name for p in read_map_studio_poses(tmp_path, "m1")] == ["TestSpawn", "kitchen_A2"]
+
+
+def test_export_yaml_converts_pasted_code_names():
+    text = export_yaml("m1", [Pose("POS_DININGROOM_TABLE_2_0", 12.8, 5.45, 0.0),
+                              Pose("TestSpawn", 0.0, 0.0, 0.0)])
+    assert '  "diningroom_table_2_0": {x: 12.8000' in text
+    assert '  "TestSpawn": {x: 0.0000' in text
+    assert "POS_" not in text
+
+
+def test_export_code_unchanged_for_mixed_case_names():
+    assert "POS_TESTSPAWN = PoseStamped(" in export_code([Pose("TestSpawn", 0.0, 0.0, 0.0)])
+
+
 def test_clash_distance():
     saved = [Pose("diningroom_table_2_0", 12.835, 5.45, 0.0)]
     pasted = [Pose("POS_DININGROOM_TABLE_2_0", 12.95, 5.45, 0.0), Pose("POS_OTHER", 0, 0, 0)]
