@@ -59,6 +59,7 @@ class Watchdog:
                  exit_code: int = EXIT_CODE):
         self.deadline, self.start_ppid, self.exit_code = float(deadline), int(start_ppid), exit_code
         self._cancelled = threading.Event()
+        self._lock = threading.Lock()  # cancel() vs. the decision to exit
         self._clock, self._getppid = clock or time.time, getppid or os.getppid
         self._exit, self._sleep = exit or os._exit, sleep or time.sleep
         self._report, self._interval = report, interval
@@ -70,7 +71,11 @@ class Watchdog:
         if self._cancelled.is_set():
             return None
         reason = expired(self.deadline, self.start_ppid, self._clock(), self._getppid())
-        if reason is not None:
+        if reason is None:
+            return None
+        with self._lock:  # a cancel() that won the race stands this poll down
+            if self._cancelled.is_set():
+                return None
             self.reason = reason
             if self._report is not None:
                 try:  # the reader may be gone with the server; never let that block the exit
@@ -81,8 +86,9 @@ class Watchdog:
         return reason
 
     def cancel(self) -> None:
-        """Stand down: the thread ends at its next poll and never exits the process."""
-        self._cancelled.set()
+        """Stand down: once this returns, the watchdog never exits the process."""
+        with self._lock:
+            self._cancelled.set()
 
     def _run(self) -> None:
         while self.check() is None and not self._cancelled.is_set():

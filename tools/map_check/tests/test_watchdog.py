@@ -184,3 +184,42 @@ def test_cancelled_thread_ends_without_exit():
     d = f.dog(sleep=lambda s: d.cancel(), interval=0.01)
     d.start().thread.join(5)
     assert not d.thread.is_alive() and f.exits == []
+
+
+def test_cancel_racing_the_exit_wins():
+    """cancel() lands after the reason is computed but before the exit: no exit, no report."""
+    f = Fake()
+
+    def clock():  # the deadline has passed, and the first image arrives at this very moment
+        d.cancel()
+        return 2000.0
+
+    d = Watchdog(1010.0, 4242, clock=clock, getppid=lambda: f.ppid, exit=f.exits.append,
+                 report=f.reports.append)
+    assert d.check() is None
+    assert f.exits == [] and f.reports == [] and d.reason is None
+
+
+def test_cancel_waits_for_an_exit_in_progress():
+    """A cancel() during report/exit blocks on the lock; the exit that began still happens."""
+    import threading
+    f = Fake(now=2000.0)
+    in_report, release = threading.Event(), threading.Event()
+
+    def report(_):
+        in_report.set()
+        release.wait(5)
+
+    d = Watchdog(1010.0, 4242, clock=lambda: f.now, getppid=lambda: f.ppid, exit=f.exits.append,
+                 report=report)
+    t = threading.Thread(target=d.check)
+    t.start()
+    assert in_report.wait(5)
+    c = threading.Thread(target=d.cancel)
+    c.start()
+    c.join(0.2)
+    assert c.is_alive()  # held off until the exit decision completes
+    release.set()
+    t.join(5)
+    c.join(5)
+    assert f.exits == [EXIT_CODE] and not c.is_alive()

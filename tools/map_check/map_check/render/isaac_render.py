@@ -43,10 +43,15 @@ HEADER_PX = 52  # overview title bar
 CLOSEUP_HEADER_PX = 40
 CAPTION = {"behind": "behind-left", "top": "top-down", "head": "head cam"}
 NO_GPU_EXIT = 4  # Isaac started without a usable GPU device
-# Backstop when the device check can't tell: in live runs the first image came ~35 s after
-# start (warm shader cache), so 120 s is a wide margin yet well under the job timeout.
-FIRST_IMAGE_S = 120.0
+# First-image backstop, for when the device check can't tell. A warm start shows its first
+# image ~35 s in; a cold RTX shader cache (after a driver or Isaac update) can take minutes,
+# so the budget is generous and scales with the job: see first_image_budget().
+FIRST_IMAGE_MIN_S = 300.0
+FIRST_IMAGE_SHARE = 0.5  # of the time left before the job's deadline
+FIRST_IMAGE_MARGIN_S = 15.0  # always fires this long before the job's own deadline
 NO_GPU_TEXT = "Isaac could not create a GPU device on GPU {gpu} (see the job log)"
+SLOW_TEXT = ("No image after {seconds:.0f} s: Isaac may have no GPU device on GPU {gpu}, "
+             "or startup is slow (see the job log)")
 _on_view: list = []  # callbacks run after each view event (the first-image backstop)
 
 
@@ -73,6 +78,21 @@ def app_config() -> dict:
         "multi_gpu": False, "max_gpu_count": 1, "physics_gpu": -1,
         "extra_args": ["--/physics/useGpu=false", "--/physics/cudaDevice=-1"],
     }
+
+
+def first_image_budget(deadline: float, now: float) -> float | None:
+    """Seconds the first image may take: min(left − 15, max(300, 0.5 × left)).
+
+    left = deadline − now. None (no backstop) when that leaves nothing before the job's own
+    deadline, which then stops the render itself.
+    """
+    left = deadline - now
+    budget = min(left - FIRST_IMAGE_MARGIN_S, max(FIRST_IMAGE_MIN_S, FIRST_IMAGE_SHARE * left))
+    return budget if budget > 0 else None
+
+
+def slow_start_message(gpu: int, seconds: float) -> str:
+    return SLOW_TEXT.format(seconds=seconds, gpu=gpu)
 
 
 def no_device_message(gpu: int, device_count) -> str | None:
@@ -390,13 +410,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # Fail fast without a GPU device rather than hang until the job timeout: the backstop
     # covers the case the device count can't detect; the first image stands it down.
-    no_gpu = NO_GPU_TEXT.format(gpu=job.gpu)
-    first = Watchdog(time.time() + FIRST_IMAGE_S, start_ppid, getppid=lambda: start_ppid,
-                     exit_code=NO_GPU_EXIT,  # time only: guard() handles a dead server
-                     report=lambda _: emit(error_event(
-                         f"no image after {FIRST_IMAGE_S:g} s: {no_gpu}")))
-    _on_view.append(first.cancel)
-    first.start()
+    now = time.time()
+    budget = first_image_budget(job.deadline, now)
+    first = None
+    if budget is not None:
+        slow = slow_start_message(job.gpu, budget)
+        first = Watchdog(now + budget, start_ppid, getppid=lambda: start_ppid,
+                         exit_code=NO_GPU_EXIT,  # time only: guard() handles a dead server
+                         report=lambda _: emit(error_event(slow)))
+        _on_view.append(first.cancel)
+        first.start()
 
     from isaacsim import SimulationApp
 
@@ -417,7 +440,8 @@ def main(argv: list[str] | None = None) -> int:
         emit(error_event(f"{type(e).__name__}: {e}"))
         code = 1
     finally:
-        first.cancel()  # finished or failed with a message: the backstop has nothing to add
+        if first is not None:  # finished or failed with a message: nothing to add
+            first.cancel()
         app.close()
     return code
 
