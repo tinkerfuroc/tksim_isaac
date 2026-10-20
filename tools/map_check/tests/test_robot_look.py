@@ -69,13 +69,13 @@ def test_untouched_parts_keep_the_artifact_materials(robot_usd):
     assert all(str(m).startswith("/World/Tinker/Looks/") for ms in after.values() for m in ms)
 
 
-def test_base_box_black_beams_grey(robot_usd):
+def test_base_box_dark_grey_beams_grey(robot_usd):
     stage, tinker, mats = _stage_with(robot_usd)
     robot_look.apply(stage, tinker, mats)
     (mesh,) = _visual_gprims(tinker, robot_look.BASE_LINK)
     subsets = {s.GetPrim().GetName(): s for s in UsdShade.MaterialBindingAPI(mesh).GetMaterialBindSubsets()}
     assert set(subsets) == {"base", "beams"}
-    assert _bound(subsets["base"].GetPrim()) == mats["black"].GetPath()
+    assert _bound(subsets["base"].GetPrim()) == mats["dark_grey"].GetPath()
     assert _bound(subsets["beams"].GetPrim()) == mats["grey"].GetPath()
 
     m = UsdGeom.Mesh(mesh)

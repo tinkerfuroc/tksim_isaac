@@ -3,7 +3,7 @@
 The shared robot artifact (also loaded by GPSR and tk27) is nearly all white: the base box
 and its supporting beams are one white mesh (base_link), and the URDF's dark wheels and
 lidar lose their colour on import. Renders recolour only Map Check's referenced copy, in
-the render stage: black base and wheels, grey beams, dark lidar, white xArm. Links not
+the render stage: dark-grey base, black wheels, grey beams, dark lidar, white xArm. Links not
 listed keep the artifact's materials; a link the artifact lacks is reported and skipped.
 
 pxr is imported inside the functions, so importing this module needs only numpy.
@@ -14,6 +14,7 @@ import numpy as np
 
 COLOURS = {  # name: (rgb, roughness)
     "black": ((0.035, 0.035, 0.04), 0.6),
+    "dark_grey": ((0.14, 0.14, 0.15), 0.55),
     "grey": ((0.42, 0.43, 0.45), 0.45),
     "lidar": ((0.07, 0.07, 0.075), 0.4),
     "white": ((0.92, 0.92, 0.9), 0.35),
@@ -87,7 +88,7 @@ def _split_base(mesh, link_prim, mats) -> None:
 
     top = face_top_z(mesh, link_prim)
     api = UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim())
-    for name, faces, look in (("base", np.flatnonzero(top <= BASE_TOP_Z), "black"),
+    for name, faces, look in (("base", np.flatnonzero(top <= BASE_TOP_Z), "dark_grey"),
                               ("beams", np.flatnonzero(top > BASE_TOP_Z), "grey")):
         subset = api.CreateMaterialBindSubset(name, faces.tolist(), UsdGeom.Tokens.face)
         UsdShade.MaterialBindingAPI.Apply(subset.GetPrim()).Bind(mats[look])
