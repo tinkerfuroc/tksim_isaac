@@ -33,6 +33,7 @@ from tinker_sim_deploy.arena_artifact import (
     select_asset_artifact,
 )
 from tinker_sim_deploy.arena_map import livox_scan_band, rasterize
+from tinker_sim_deploy.arena_outline import _furniture_instance_suffixes  # noqa: F401
 from tinker_sim_deploy.arena_surfaces import PlacementSurface, placement_json, world_surface
 from tinker_sim_deploy.arena_world import (
     ArenaLayout,
@@ -319,24 +320,6 @@ def _furniture_payload(usd_path: Path, model_id: str) -> dict[str, bytes]:
 # --------------------------------------------------------------------------- #
 # placement surfaces / attribution
 # --------------------------------------------------------------------------- #
-def _furniture_instance_suffixes(furniture: Sequence[object]) -> dict[int, str]:
-    """Map each placement's ``id()`` to the disambiguating suffix
-    ``arena_convert.compose_arena`` would give its furniture prim: computed
-    the same way (iterate placements in order, first-seen bare, later
-    instances of the same model_id get an incrementing ``_NN`` suffix) so
-    ``placement.json`` surface_ids always name the same instance as the
-    corresponding ``arena.usd`` prim. ``id()`` is safe here because every
-    placement is a distinct object built once during ``parse_world``.
-    """
-    counts: dict[str, int] = {}
-    suffixes: dict[int, str] = {}
-    for placement in furniture:
-        counts[placement.model_id] = counts.get(placement.model_id, 0) + 1
-        count = counts[placement.model_id]
-        suffixes[id(placement)] = "" if count == 1 else f"_{count:02d}"
-    return suffixes
-
-
 def _build_surfaces(layout: ArenaLayout, surface_specs: Sequence[Mapping[str, object]]) -> list[PlacementSurface]:
     instance_suffixes = _furniture_instance_suffixes(layout.furniture)
     surfaces: list[PlacementSurface] = []

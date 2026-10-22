@@ -137,5 +137,24 @@ class RasterizeTest(unittest.TestCase):
         self.assertFalse(grid.occupied_at_world(1.0, 1.0))
 
 
+class RasterizeRefactorTest(unittest.TestCase):
+    def test_rasterize_unchanged_by_refactor(self):
+        import hashlib
+        w = arena_world
+        walls = (w.WallBox("n", (4.1, 0.1, 1.2), (0, 2, 0.6), 0.0),
+                 w.WallBox("e", (3.0, 0.1, 1.2), (2, 0, 0.6), 0.4))
+        furniture = (w.FurniturePlacement("a", (1, 1, 0), 0.5, True),
+                     w.FurniturePlacement("b", (-1, -0.5, 0), -1.0, True))
+        colliders = {
+            "a": (w.BoxCollider((0.8, 0.4, 0.04), (0, 0, 0.72), 0.0),
+                  w.BoxCollider((0.7, 0.3, 0.7), (0.1, 0.05, 0.35), 0.3)),
+            "b": (w.BoxCollider((0.5, 0.5, 1.0), (0, 0.1, 0.5), 0.2),),
+        }
+        pgm, _ = arena_map.rasterize(w.ArenaLayout(walls, furniture), colliders,
+                                     scan_band=(0.2725, 2.2725))
+        self.assertEqual(hashlib.sha256(pgm).hexdigest(),
+                         "f44954ae35a533a2b72ddab3a764e911f3918ea11b20d831a18c32e7f78f4519")
+
+
 if __name__ == "__main__":
     unittest.main()

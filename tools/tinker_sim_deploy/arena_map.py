@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import math
 import xml.etree.ElementTree as ET
-from typing import Mapping
+from typing import Mapping, Sequence
 
-from .arena_world import ArenaLayout, BoxCollider
+from .arena_world import ArenaLayout, BoxCollider, FurniturePlacement
 from .robot_geometry import base_rest_height
 
 _OCCUPIED = 0
@@ -53,6 +53,27 @@ def livox_scan_band(robot_urdf_bytes: bytes) -> tuple[float, float]:
     return sensor + SCAN_BAND_MIN_ABOVE_SENSOR_M, sensor + SCAN_BAND_MAX_ABOVE_SENSOR_M
 
 
+def instance_footprints(
+    item: FurniturePlacement,
+    boxes: Sequence[BoxCollider],
+    band: tuple[float, float],
+) -> list[tuple[float, float, float, float, float]]:
+    """(cx, cy, half_x, half_y, yaw) rectangles of one furniture item's boxes
+    whose z-range overlaps the band."""
+    low, high = band
+    rects = []
+    for box in boxes:
+        world_z = item.position[2] + box.center[2]
+        if not (world_z - box.size[2] / 2.0 <= high and low <= world_z + box.size[2] / 2.0):
+            continue
+        cos_y, sin_y = math.cos(item.yaw), math.sin(item.yaw)
+        cx = item.position[0] + cos_y * box.center[0] - sin_y * box.center[1]
+        cy = item.position[1] + sin_y * box.center[0] + cos_y * box.center[1]
+        rects.append((cx, cy, box.size[0] / 2.0, box.size[1] / 2.0,
+                      item.yaw + box.yaw))
+    return rects
+
+
 def _footprints_at(
     layout: ArenaLayout,
     colliders: Mapping[str, tuple[BoxCollider, ...]],
@@ -68,15 +89,7 @@ def _footprints_at(
             rects.append((wall.center[0], wall.center[1],
                           wall.size[0] / 2.0, wall.size[1] / 2.0, wall.yaw))
     for item in layout.furniture:
-        for box in colliders.get(item.model_id, ()):
-            world_z = item.position[2] + box.center[2]
-            if not (world_z - box.size[2] / 2.0 <= high and low <= world_z + box.size[2] / 2.0):
-                continue
-            cos_y, sin_y = math.cos(item.yaw), math.sin(item.yaw)
-            cx = item.position[0] + cos_y * box.center[0] - sin_y * box.center[1]
-            cy = item.position[1] + sin_y * box.center[0] + cos_y * box.center[1]
-            rects.append((cx, cy, box.size[0] / 2.0, box.size[1] / 2.0,
-                          item.yaw + box.yaw))
+        rects.extend(instance_footprints(item, colliders.get(item.model_id, ()), band))
     if not rects:
         raise ArenaMapError("no geometry intersects the scan band")
     return rects
