@@ -65,12 +65,21 @@ class ConvexPiece:
 
 def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> list[ConvexPiece]:
     """Decompose a triangle mesh into convex pieces sorted by (min z, min y, min x)."""
+    verts = np.asarray(vertices, dtype=np.float64)
+    tris = np.asarray(faces, dtype=np.int64)
+    if verts.ndim != 2 or verts.shape[1] != 3 or len(verts) < 4:
+        raise ValueError(f"decompose needs (N, 3) vertices with N >= 4, got {verts.shape}")
+    if tris.ndim != 2 or tris.shape[1] != 3 or len(tris) < 4:
+        raise ValueError(f"decompose needs (M, 3) faces with M >= 4, got {tris.shape}")
+    if not np.isfinite(verts).all():
+        raise ValueError("decompose vertices contain non-finite values")
+    if tris.min() < 0 or tris.max() >= len(verts):
+        raise ValueError("decompose face indices out of range")
+
     import coacd
 
     coacd.set_log_level("error")
-    mesh = coacd.Mesh(
-        np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int64)
-    )
+    mesh = coacd.Mesh(verts, tris)
     parts = coacd.run_coacd(
         mesh,
         threshold=params.threshold,
@@ -86,6 +95,8 @@ def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> l
         max_ch_vertex=params.max_ch_vertex,
         seed=params.seed,
     )
+    if not parts:
+        raise ValueError("CoACD returned no convex pieces")
     pieces = [
         ConvexPiece(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64))
         for v, f in parts

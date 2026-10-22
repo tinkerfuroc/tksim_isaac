@@ -83,6 +83,34 @@ class DecomposeTests(unittest.TestCase):
             self.assertTrue(np_equal(x.faces, y.faces))
 
 
+class DecomposeFailClosedTests(unittest.TestCase):
+    def test_rejects_malformed_input(self):
+        import numpy as np
+
+        params = CoacdParams.from_config(_config())
+        v = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], dtype=float)
+        f = np.array([(0, 2, 1), (0, 1, 3), (1, 2, 3), (0, 3, 2)])
+        for bad_v, bad_f in (
+            (np.zeros((0, 3)), np.zeros((0, 3), dtype=int)),
+            (v[:3], f),
+            (v[:, :2], f),
+            (v, f[:3]),
+            (v, f[:, :2]),
+            (v, f + 10),
+            (v, f - 1),
+        ):
+            with self.assertRaises(ValueError):
+                decompose(bad_v, bad_f, params)
+
+    def test_zero_pieces_raises(self):
+        coacd = pytest.importorskip("coacd")
+        mesh = _l_shape()
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(coacd, "run_coacd", lambda *a, **k: [])
+            with self.assertRaises(ValueError):
+                decompose(mesh.vertices, mesh.faces, CoacdParams.from_config(_config()))
+
+
 def np_equal(a, b) -> bool:
     import numpy as np
 
