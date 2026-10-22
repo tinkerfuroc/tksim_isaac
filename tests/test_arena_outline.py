@@ -115,6 +115,32 @@ class OutlineTest(unittest.TestCase):
             self.assertEqual(len(data["instances"]), 2)
             self.assertEqual(sorted(p.name for p in Path(tmp).glob("*.png")), ["m.png", "m_02.png"])
 
+    def test_thin_map_box_without_hull_fails(self):
+        _, _, outline, _ = _deps()
+        thin = arena_world.BoxCollider(size=(0.8, 0.006, 0.72), center=(0, 0, 0.36), yaw=0.0)
+        layout = arena_world.ArenaLayout(walls=(), furniture=(_item(),))
+        r = outline.check_arena(layout, {"m": (thin,)}, {"m": []}, BAND)[0]
+        self.assertEqual(r.smaller_mm, float("inf"))
+        self.assertFalse(r.passed)
+
+    def test_hull_without_map_footprint_fails(self):
+        _, _, outline, _ = _deps()
+        layout = arena_world.ArenaLayout(walls=(), furniture=(_item(),))
+        r = outline.check_arena(
+            layout, {}, {"m": [_box_piece((0.8, 0.6, 0.72), (0, 0, 0.36))]}, BAND)[0]
+        self.assertEqual(r.bigger_mm, float("inf"))
+        self.assertFalse(r.passed)
+
+    def test_report_writes_null_for_infinite_distance(self):
+        _, _, outline, _ = _deps()
+        layout = arena_world.ArenaLayout(walls=(), furniture=(_item(),))
+        res = outline.check_arena(layout, {"m": (BOX,)}, {"m": []}, BAND)
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = outline.write_outline_report(res, Path(tmp))
+            data = json.loads(summary.read_text())
+            self.assertIsNone(data["instances"][0]["smaller_mm"])
+            self.assertFalse(data["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

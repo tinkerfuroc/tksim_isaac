@@ -117,8 +117,9 @@ def _max_distance(only: np.ndarray, other: np.ndarray, resolution: float) -> flo
     cells = only & ~other
     if not cells.any():
         return 0.0
-    # An empty ``other`` shape: measure how deep the cells sit inside ``only``.
-    dist = distance_transform_edt(~other) if other.any() else distance_transform_edt(only)
+    if not other.any():
+        return math.inf  # one shape missing entirely: always a failure
+    dist = distance_transform_edt(~other)
     return float(dist[cells].max()) * 1000.0 * resolution
 
 
@@ -190,6 +191,18 @@ _MAX_PX = 1000
 _HEADER_PX = 16
 
 
+def _title_distances(result: InstanceOutline) -> str:
+    if math.isinf(result.smaller_mm):
+        return "no hull in band"
+    if math.isinf(result.bigger_mm):
+        return "no map footprint"
+    return f"bigger {result.bigger_mm:.1f} mm  smaller {result.smaller_mm:.1f} mm"
+
+
+def _json_mm(value: float) -> float | None:
+    return None if math.isinf(value) else round(value, 1)
+
+
 def _write_png(result: InstanceOutline, path: Path) -> None:
     import numpy as np
     from PIL import Image, ImageDraw
@@ -210,8 +223,7 @@ def _write_png(result: InstanceOutline, path: Path) -> None:
     canvas.paste(image, (0, _HEADER_PX))
     ImageDraw.Draw(canvas).text(
         (2, 2),
-        f"{result.instance}  bigger {result.bigger_mm:.1f} mm  smaller {result.smaller_mm:.1f} mm  "
-        f"{'PASS' if result.passed else 'FAIL'}",
+        f"{result.instance}  {_title_distances(result)}  {'PASS' if result.passed else 'FAIL'}",
         fill=(0, 0, 0))
     canvas.save(path)
 
@@ -226,7 +238,7 @@ def write_outline_report(results: Sequence[InstanceOutline], out_dir: Path) -> P
         "passed": all(r.passed for r in results),
         "instances": [
             {"instance": r.instance, "model_id": r.model_id,
-             "bigger_mm": round(r.bigger_mm, 1), "smaller_mm": round(r.smaller_mm, 1),
+             "bigger_mm": _json_mm(r.bigger_mm), "smaller_mm": _json_mm(r.smaller_mm),
              "passed": r.passed}
             for r in results
         ],
