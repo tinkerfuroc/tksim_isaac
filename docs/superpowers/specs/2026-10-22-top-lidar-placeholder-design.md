@@ -1,6 +1,6 @@
 # Top-down Livox placeholder, and CoACD furniture hulls — design
 
-Status: for approval · 2026-10-22 (builder check done)
+Status: approved by the user on 2026-10-22 (builder check done)
 
 ## Why
 
