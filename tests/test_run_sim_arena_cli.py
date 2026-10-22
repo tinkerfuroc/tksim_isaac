@@ -12,10 +12,13 @@ Isaac Sim process.
 """
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +70,44 @@ class ResolveArenaArtifactTest(unittest.TestCase):
         (pub.artifact_dir / "arena.usd").unlink()
         with self.assertRaises(FileNotFoundError):
             rs.resolve_arena_artifact(self.root, "rcw2026")
+
+    def test_override_env_returns_that_dir(self):
+        other = self._publish({"arena.usd": b"other-usd", "map.yaml": b"image: other.pgm\n"})
+        selected = self._publish()
+        self.assertEqual(rs.resolve_arena_artifact(self.root, "rcw2026"), selected.artifact_dir)
+        self.assertNotEqual(selected.artifact_dir, other.artifact_dir)
+        with mock.patch.dict(os.environ, {"TINKER_SIM_ARENA_ARTIFACT_DIR": str(other.artifact_dir)}):
+            resolved = rs.resolve_arena_artifact(self.root, "rcw2026")
+        self.assertEqual(resolved, other.artifact_dir)
+
+    def test_override_outside_arena_kind_rejected(self):
+        other = arena_artifact.publish_asset_artifact(
+            self.root,
+            kind="arena",
+            asset_id="other",
+            payload={"arena.usd": b"usd-bytes", "map.yaml": b"image: map.pgm\n"},
+            source_lock=_SOURCE_LOCK,
+        )
+        self._publish()
+        with mock.patch.dict(os.environ, {"TINKER_SIM_ARENA_ARTIFACT_DIR": str(other.artifact_dir)}):
+            with self.assertRaisesRegex(ValueError, "direct child"):
+                rs.resolve_arena_artifact(self.root, "rcw2026")
+
+    def test_override_identity_mismatch_rejected(self):
+        pub = self._publish()
+        manifest_path = pub.artifact_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["identity"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"TINKER_SIM_ARENA_ARTIFACT_DIR": str(pub.artifact_dir)}):
+            with self.assertRaisesRegex(ValueError, "identity"):
+                rs.resolve_arena_artifact(self.root, "rcw2026")
+
+    def test_empty_override_follows_pointer(self):
+        pub = self._publish()
+        with mock.patch.dict(os.environ, {"TINKER_SIM_ARENA_ARTIFACT_DIR": ""}):
+            resolved = rs.resolve_arena_artifact(self.root, "rcw2026")
+        self.assertEqual(resolved, pub.artifact_dir)
 
 
 class ArenaFlagSupportedTest(unittest.TestCase):

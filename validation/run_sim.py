@@ -371,7 +371,32 @@ def resolve_arena_artifact(root: Path, arena_id: str) -> Path:
     closed with ``FileNotFoundError``/``ValueError`` on a missing pointer
     file, a missing or invalid ``manifest`` key, a missing manifest file, or
     a missing ``arena.usd``/``map.yaml`` payload in the resolved directory.
+
+    ``TINKER_SIM_ARENA_ARTIFACT_DIR`` (opt-in, for live checks of an artifact
+    that was published without being selected) bypasses the pointer: it must
+    name a direct child of ``artifacts/arena/<arena_id>/`` holding
+    ``manifest.json``/``arena.usd``/``map.yaml`` whose manifest ``identity``
+    equals the directory name. Unset or empty keeps the pointer behaviour.
     """
+    override = os.environ.get("TINKER_SIM_ARENA_ARTIFACT_DIR", "")
+    if override:
+        override_dir = Path(override)
+        kind_dir = root / "artifacts/arena" / arena_id
+        if override_dir.resolve().parent != kind_dir.resolve():
+            raise ValueError(
+                f"arena artifact override is not a direct child of {kind_dir}: {override_dir}"
+            )
+        for name in ("manifest.json", "arena.usd", "map.yaml"):
+            if not (override_dir / name).is_file():
+                raise ValueError(f"arena artifact override missing {name}: {override_dir}")
+        manifest = json.loads((override_dir / "manifest.json").read_text(encoding="utf-8"))
+        if manifest.get("identity") != override_dir.name:
+            raise ValueError(
+                f"arena artifact override identity mismatch: manifest identity "
+                f"{manifest.get('identity')!r} != directory name {override_dir.name!r}"
+            )
+        print(f"arena artifact override: {override_dir}", file=sys.stderr)
+        return override_dir
     pointer_path = root / "artifacts/arena" / arena_id / "current.json"
     if not pointer_path.is_file():
         raise FileNotFoundError(f"missing arena artifact pointer: {pointer_path}")
