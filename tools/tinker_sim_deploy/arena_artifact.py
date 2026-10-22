@@ -105,6 +105,15 @@ def _validate_payload_name(name: object) -> str:
     return name  # type: ignore[return-value]
 
 
+def _pointer_bytes(kind: str, asset_id: str, identity: str) -> bytes:
+    return _canonical(
+        {
+            "schema_version": 1,
+            "manifest": f"artifacts/{kind}/{asset_id}/{identity}/manifest.json",
+        }
+    )
+
+
 def publish_asset_artifact(
     repo_root: Path,
     *,
@@ -112,6 +121,7 @@ def publish_asset_artifact(
     asset_id: str,
     payload: Mapping[str, bytes],
     source_lock: Mapping[str, object],
+    select: bool = True,
 ) -> AssetPublication:
     repo_root = Path(repo_root)
     _validate_segment(kind, "kind")
@@ -149,12 +159,7 @@ def publish_asset_artifact(
             "payload": payload_hashes,
         }
     )
-    pointer_bytes = _canonical(
-        {
-            "schema_version": 1,
-            "manifest": f"artifacts/{kind}/{asset_id}/{identity}/manifest.json",
-        }
-    )
+    pointer_bytes = _pointer_bytes(kind, asset_id, identity)
 
     with _publication_lock(artifact_root):
         _recover_staging(artifact_root)
@@ -176,9 +181,37 @@ def publish_asset_artifact(
                 shutil.rmtree(stage, ignore_errors=True)
                 raise
             _fsync_directory(artifact_root)
-        _atomic_write(artifact_root / "current.json", pointer_bytes)
+        if select:
+            _atomic_write(artifact_root / "current.json", pointer_bytes)
 
     return AssetPublication(artifact_dir=final_dir, identity=identity, created=created)
+
+
+def select_asset_artifact(repo_root: Path, *, kind: str, asset_id: str, identity: str) -> Path:
+    """Point ``current.json`` at an already-published artifact; return the pointer path.
+
+    The artifact must exist and pass ``verify_asset_artifact``; nothing is
+    written otherwise.
+    """
+    repo_root = Path(repo_root)
+    _validate_segment(kind, "kind")
+    _validate_segment(asset_id, "asset_id")
+    _validate_segment(identity, "identity")
+    artifact_root = repo_root / "artifacts" / kind / asset_id
+    if not artifact_root.is_dir():
+        raise AssetArtifactError(f"no published {kind}/{asset_id} artifacts under {repo_root}")
+    with _publication_lock(artifact_root):
+        target = artifact_root / identity
+        if target.is_symlink() or not target.is_dir():
+            raise AssetArtifactError(f"unknown artifact identity for {kind}/{asset_id}: {identity}")
+        problems = verify_asset_artifact(target)
+        if problems:
+            raise AssetArtifactError(
+                f"artifact {identity} failed verification: " + "; ".join(problems)
+            )
+        pointer = artifact_root / "current.json"
+        _atomic_write(pointer, _pointer_bytes(kind, asset_id, identity))
+    return pointer
 
 
 def verify_asset_artifact(artifact_dir: Path) -> list[str]:

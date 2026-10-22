@@ -30,6 +30,7 @@ from tinker_sim_deploy.arena_artifact import (
     AssetPublication,
     attribution_markdown,
     publish_asset_artifact,
+    select_asset_artifact,
 )
 from tinker_sim_deploy.arena_map import livox_scan_band, rasterize
 from tinker_sim_deploy.arena_surfaces import PlacementSurface, placement_json, world_surface
@@ -450,9 +451,17 @@ def run_import(
             asset_id=str(config["arena_id"]),
             payload=payload,
             source_lock=source_lock,
+            select=False,
         )
 
-    print(f"published arena artifact rcw2026: identity={publication.identity} dir={publication.artifact_dir}")
+    print(
+        f"published arena artifact {config['arena_id']}: identity={publication.identity} "
+        f"dir={publication.artifact_dir}"
+    )
+    print(
+        f"NOT selected: current.json is unchanged; to select it run: "
+        f"python tools/arena_import.py --config <config> --select {publication.identity}"
+    )
     print(
         "operator reminder: register the arena.usd path + sha256 under "
         "generated_arena_usds in artifacts/asset-manifest.json for offline bundling"
@@ -541,7 +550,7 @@ class ReuseFurnitureHooks:
         return self._real.measure_bounds(usd_path)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, repo_root: Path | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument(
@@ -564,10 +573,27 @@ def main(argv: list[str] | None = None) -> int:
              "published arena artifact dir (re-authoring colliders with pxr) instead "
              "of re-running the GLB conversion under a SimulationApp",
     )
+    parser.add_argument(
+        "--select",
+        metavar="IDENTITY",
+        default=None,
+        help="point current.json at an already-published arena artifact and exit "
+             "(no clone, no import)",
+    )
     args = parser.parse_args(argv)
+    if args.select is not None and (args.report_bounds or args.reuse_furniture_from is not None):
+        parser.error("--select cannot be combined with --report-bounds or --reuse-furniture-from")
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
-    repo_root = ROOT
+    if repo_root is None:
+        repo_root = ROOT
+
+    if args.select is not None:
+        pointer = select_asset_artifact(
+            repo_root, kind="arena", asset_id=str(config["arena_id"]), identity=args.select
+        )
+        print(f"arena_import: selected {args.select} ({pointer})", flush=True)
+        return 0
 
     checkout = args.checkout
     if checkout is None:

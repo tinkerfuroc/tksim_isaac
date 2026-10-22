@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -231,6 +232,35 @@ class RunImportTest(unittest.TestCase):
         self.assertIn("models/rcw26_kitchen_table/model.sdf", recorded_paths)
         self.assertIn("models/rcw26_kitchen_table/meshes/x.glb", recorded_paths)
         self.assertIn("LICENSE", recorded_paths)
+
+    def test_import_does_not_select(self):
+        pointer = self.repo_root / "artifacts" / "arena" / "rcw2026" / "current.json"
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_bytes(b'{"schema_version":1,"manifest":"old"}')
+
+        arena_import.run_import(_base_config(self.commit), self.repo_root, self.checkout, StubHooks())
+
+        self.assertEqual(pointer.read_bytes(), b'{"schema_version":1,"manifest":"old"}')
+
+    def test_select_flag_selects_without_import(self):
+        publication = arena_import.run_import(
+            _base_config(self.commit), self.repo_root, self.checkout, StubHooks()
+        )
+        pointer = self.repo_root / "artifacts" / "arena" / "rcw2026" / "current.json"
+        self.assertFalse(pointer.exists())
+        cfg = self.root / "arena-import.json"
+        cfg.write_text(json.dumps(_base_config(self.commit)))
+
+        with mock.patch.object(arena_import, "clone_pin", side_effect=AssertionError("cloned")):
+            rc = arena_import.main(
+                ["--config", str(cfg), "--select", publication.identity], repo_root=self.repo_root
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            json.loads(pointer.read_text())["manifest"],
+            f"artifacts/arena/rcw2026/{publication.identity}/manifest.json",
+        )
 
     def test_pin_mismatch_fails_closed(self):
         config = _base_config("f" * 40)
