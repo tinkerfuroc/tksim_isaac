@@ -19,11 +19,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import arena_import  # noqa: E402
-from tinker_sim_deploy import arena_artifact, arena_world  # noqa: E402
+from tinker_sim_deploy import arena_artifact, arena_map, arena_world  # noqa: E402
+from tinker_sim_deploy.arena_coacd import ConvexPiece  # noqa: E402
 
 _ROBOT_URDF = b"""<robot name="t">
   <joint name="livox_joint" type="fixed">
@@ -147,7 +150,37 @@ def _base_config(commit: str) -> dict[str, object]:
             }
         ],
         "bounds_tolerance_m": 0.01,
+        "coacd": {
+            "threshold": 0.02,
+            "max_convex_hull": -1,
+            "preprocess_mode": "auto",
+            "preprocess_resolution": 50,
+            "resolution": 2000,
+            "mcts_nodes": 20,
+            "mcts_iterations": 150,
+            "mcts_max_depth": 3,
+            "pca": False,
+            "merge": True,
+            "max_ch_vertex": 64,
+            "seed": 0,
+            "plate_surfaces": [],
+        },
     }
+
+
+def _box_piece(size, center) -> ConvexPiece:
+    """A box as a ConvexPiece: 8 corners, 12 triangles."""
+    hx, hy, hz = (s / 2.0 for s in size)
+    cx, cy, cz = center
+    verts = np.array(
+        [[cx + sx * hx, cy + sy * hy, cz + sz * hz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+    )
+    faces = np.array(
+        [[0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5], [0, 4, 5], [0, 5, 1],
+         [2, 3, 7], [2, 7, 6], [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]],
+        dtype=np.int64,
+    )
+    return ConvexPiece(vertices=verts, faces=faces)
 
 
 class StubHooks:
@@ -158,10 +191,17 @@ class StubHooks:
     behaves exactly like the brief's original stub.
     """
 
-    def __init__(self, measure_bounds_return=((-0.6, -0.3, 0.0), (0.6, 0.3, 0.74)), write_texture=False):
+    def __init__(self, measure_bounds_return=((-0.6, -0.3, 0.0), (0.6, 0.3, 0.74)), write_texture=False,
+                 pieces=None):
         self._measure_bounds_return = measure_bounds_return
         self._write_texture = write_texture
         self.convert_calls: list[dict[str, object]] = []
+        self.author_coacd_calls: list[tuple[Path, object]] = []
+        self.author_box_calls: list[tuple[Path, tuple]] = []
+        # model_id -> pieces; default is one box equal to the kitchen table's map box
+        self.pieces = pieces if pieces is not None else {
+            "rcw26_kitchen_table": [_box_piece((1.2, 0.6, 0.74), (0.0, 0.0, 0.37))]
+        }
 
     def convert_glb_to_usd(self, glb, usd, *, mesh_scale=(1.0, 1.0, 1.0), mesh_pose=(0.0,) * 6):
         self.convert_calls.append({"glb": glb, "usd": usd, "mesh_scale": mesh_scale, "mesh_pose": mesh_pose})
@@ -175,7 +215,14 @@ class StubHooks:
             (texture_dir / "tex0.png").write_bytes(b"fake-png-bytes")
 
     def author_model_colliders(self, usd, colliders):
-        pass
+        self.author_box_calls.append((usd, tuple(colliders)))
+
+    def author_coacd_colliders(self, usd, params):
+        self.author_coacd_calls.append((usd, params))
+        return len(self.pieces.get(usd.stem, ()))
+
+    def read_collider_pieces(self, usd):
+        return list(self.pieces.get(usd.stem, ()))
 
     def compose_arena(self, arena_usd, layout, furniture_dir_name="furniture"):
         arena_usd.write_bytes(b"stub-arena")
@@ -197,7 +244,7 @@ class RunImportTest(unittest.TestCase):
         config = _base_config(self.commit)
         hooks = StubHooks()
 
-        publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks)
+        publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks).publication
 
         self.assertTrue(publication.created)
         artifact_dir = publication.artifact_dir
@@ -245,7 +292,7 @@ class RunImportTest(unittest.TestCase):
     def test_select_flag_selects_without_import(self):
         publication = arena_import.run_import(
             _base_config(self.commit), self.repo_root, self.checkout, StubHooks()
-        )
+        ).publication
         pointer = self.repo_root / "artifacts" / "arena" / "rcw2026" / "current.json"
         self.assertFalse(pointer.exists())
         cfg = self.root / "arena-import.json"
@@ -293,7 +340,7 @@ class RunImportTest(unittest.TestCase):
         config["bounds_check_exceptions"] = ["rcw26_kitchen_table"]
         hooks = StubHooks(measure_bounds_return=((-0.6, -0.3, 0.0), (0.65, 0.3, 0.74)))
 
-        publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks)
+        publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks).publication
 
         self.assertEqual(arena_artifact.verify_asset_artifact(publication.artifact_dir), [])
 
@@ -337,7 +384,7 @@ class RunImportTest(unittest.TestCase):
 
         config = _base_config(commit)
         hooks = StubHooks()
-        publication = arena_import.run_import(config, self.repo_root, checkout, hooks)
+        publication = arena_import.run_import(config, self.repo_root, checkout, hooks).publication
 
         lock = json.loads((publication.artifact_dir / "source-lock.json").read_bytes())
         recorded_paths = {record["path"] for record in lock["records"]}
@@ -353,7 +400,7 @@ class RunImportTest(unittest.TestCase):
         config = _base_config(self.commit)
         hooks = StubHooks(write_texture=True)
 
-        publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks)
+        publication = arena_import.run_import(config, self.repo_root, self.checkout, hooks).publication
 
         texture_path = publication.artifact_dir / "furniture" / "textures" / "rcw26_kitchen_table" / "tex0.png"
         self.assertTrue(texture_path.is_file())
@@ -388,11 +435,129 @@ class RunImportTest(unittest.TestCase):
 
         config = _base_config(commit)
         hooks = StubHooks()
-        publication = arena_import.run_import(config, self.repo_root, checkout, hooks)
+        publication = arena_import.run_import(config, self.repo_root, checkout, hooks).publication
 
         placement = json.loads((publication.artifact_dir / "placement.json").read_bytes())
         surface_ids = sorted(record["surface_id"] for record in placement["surfaces"])
         self.assertEqual(surface_ids, ["kitchen_table#top", "kitchen_table_02#top"])
+
+
+class CoacdWiringTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.checkout = _build_checkout(self.root)
+        self.repo_root = _build_repo_root(self.root)
+        self.commit = _git_head(self.checkout)
+
+    def _run(self, config=None, hooks=None):
+        hooks = hooks or StubHooks()
+        outcome = arena_import.run_import(
+            config or _base_config(self.commit), self.repo_root, self.checkout, hooks
+        )
+        return outcome, hooks
+
+    def test_coacd_authored_for_models_without_override(self):
+        _, hooks = self._run()
+        self.assertEqual(len(hooks.author_coacd_calls), 1)
+        self.assertEqual(hooks.author_coacd_calls[0][0].stem, "rcw26_kitchen_table")
+        self.assertEqual(hooks.author_box_calls, [])
+
+    def test_override_models_keep_boxes(self):
+        config = _base_config(self.commit)
+        config["collision_overrides"] = {
+            "rcw26_kitchen_table": {
+                "kind": "open_shelf",
+                "footprint_x": [-0.6, 0.6], "footprint_y": [-0.3, 0.3], "footprint_z": [0.0, 0.74],
+                "boards_z": [[0.0, 0.04], [0.70, 0.74]],
+            }
+        }
+        expected = arena_world.collision_overrides_from_config(config)["rcw26_kitchen_table"]
+        _, hooks = self._run(config)
+        self.assertEqual(hooks.author_coacd_calls, [])
+        self.assertEqual(len(hooks.author_box_calls), 1)
+        self.assertEqual(hooks.author_box_calls[0][1], tuple(expected))
+
+    def test_plate_added_for_listed_surface(self):
+        config = _base_config(self.commit)
+        config["coacd"]["plate_surfaces"] = ["rcw26_kitchen_table"]
+        _, hooks = self._run(config)
+        self.assertEqual(len(hooks.author_coacd_calls), 1)
+        self.assertEqual(len(hooks.author_box_calls), 1)
+        plates = hooks.author_box_calls[0][1]
+        self.assertEqual(len(plates), 1)
+        plate = plates[0]
+        self.assertAlmostEqual(plate.size[0], 1.2)
+        self.assertAlmostEqual(plate.size[1], 0.6)
+        self.assertAlmostEqual(plate.center[2] + plate.size[2] / 2.0, 0.74)
+
+    def test_map_unchanged_by_coacd(self):
+        seen = {}
+        real = arena_map.rasterize
+
+        def recorder(layout, colliders, **kwargs):
+            seen.update(colliders)
+            return real(layout, colliders, **kwargs)
+
+        hooks = StubHooks(pieces={"rcw26_kitchen_table": [_box_piece((0.5, 0.5, 0.5), (0.0, 0.0, 0.25))]})
+        with mock.patch.object(arena_import, "rasterize", recorder):
+            self._run(hooks=hooks)
+        boxes = seen["rcw26_kitchen_table"]
+        self.assertEqual(len(boxes), 1)
+        self.assertIsInstance(boxes[0], arena_world.BoxCollider)
+        self.assertEqual(tuple(boxes[0].size), (1.2, 0.6, 0.74))
+        self.assertEqual(tuple(boxes[0].center), (0.0, 0.0, 0.37))
+
+    def test_outline_failure_reported_not_selected(self):
+        hooks = StubHooks(pieces={
+            "rcw26_kitchen_table": [_box_piece((1.24, 0.64, 0.74), (0.0, 0.0, 0.37))]})
+        outcome, _ = self._run(hooks=hooks)
+        self.assertFalse(outcome.outlines[0].passed)
+        summary = json.loads(outcome.report.read_text())
+        self.assertFalse(summary["passed"])
+        self.assertEqual(
+            outcome.report.parent,
+            self.repo_root / "reports" / "arena-outline" / outcome.publication.identity[:12],
+        )
+        pointer = self.repo_root / "artifacts" / "arena" / "rcw2026" / "current.json"
+        self.assertFalse(pointer.exists())
+
+    def test_outline_pass_report(self):
+        outcome, _ = self._run()
+        self.assertTrue(all(o.passed for o in outcome.outlines))
+        self.assertTrue(json.loads(outcome.report.read_text())["passed"])
+
+    def test_main_exits_zero_on_outline_failure(self):
+        cfg = self.root / "arena-import.json"
+        cfg.write_text(json.dumps(_base_config(self.commit)))
+        hooks = StubHooks(pieces={
+            "rcw26_kitchen_table": [_box_piece((1.24, 0.64, 0.74), (0.0, 0.0, 0.37))]})
+        with mock.patch.object(arena_import, "_build_real_converter", return_value=hooks), \
+                mock.patch.object(arena_import, "ReuseFurnitureHooks", return_value=hooks):
+            art = self.root / "reuse"
+            (art / "furniture").mkdir(parents=True)
+            rc = arena_import.main(
+                ["--config", str(cfg), "--checkout", str(self.checkout),
+                 "--reuse-furniture-from", str(art)],
+                repo_root=self.repo_root,
+            )
+        self.assertEqual(rc, 0)
+        self.assertTrue(list((self.repo_root / "reports" / "arena-outline").glob("*/summary.json")))
+
+    def test_collision_record_in_payload(self):
+        config = _base_config(self.commit)
+        outcome, _ = self._run(config)
+        record = json.loads((outcome.publication.artifact_dir / "collision.json").read_bytes())
+        self.assertEqual(record["coacd"], arena_import.CoacdParams.from_config(config["coacd"]).as_record())
+        self.assertEqual(record["pieces"], {"rcw26_kitchen_table": 1})
+        self.assertEqual(record["overrides"], [])
+        self.assertEqual(record["plates"], [])
+
+    def test_reimport_is_idempotent_with_coacd(self):
+        first, _ = self._run()
+        second, _ = self._run()
+        self.assertEqual(first.publication.identity, second.publication.identity)
 
 
 class FurnitureInstanceSuffixTest(unittest.TestCase):

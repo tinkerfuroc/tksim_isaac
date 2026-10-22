@@ -27,13 +27,20 @@ from typing import Mapping, Protocol, Sequence
 
 from tinker_sim_deploy.arena_artifact import (
     AssetArtifactError,
+    _canonical,
     AssetPublication,
     attribution_markdown,
     publish_asset_artifact,
     select_asset_artifact,
 )
+from tinker_sim_deploy.arena_coacd import CoacdParams, ConvexPiece
 from tinker_sim_deploy.arena_map import livox_scan_band, rasterize
-from tinker_sim_deploy.arena_outline import _furniture_instance_suffixes  # noqa: F401
+from tinker_sim_deploy.arena_outline import (  # noqa: F401
+    InstanceOutline,
+    _furniture_instance_suffixes,
+    check_arena,
+    write_outline_report,
+)
 from tinker_sim_deploy.arena_surfaces import PlacementSurface, placement_json, world_surface
 from tinker_sim_deploy.arena_world import (
     ArenaLayout,
@@ -57,7 +64,7 @@ _IDENTITY_SCALE = (1.0, 1.0, 1.0)
 
 
 class ConverterHooks(Protocol):
-    """The four Kit/pxr operations ``run_import`` needs, injectable so the
+    """The Kit/pxr operations ``run_import`` needs, injectable so the
     orchestration in this module can be exercised without a running
     SimulationApp. The real implementation lives in ``arena_convert.py``;
     ``main()`` passes that module directly (its functions structurally
@@ -77,6 +84,10 @@ class ConverterHooks(Protocol):
         self, usd_path: Path, colliders: tuple[BoxCollider | MeshCollider, ...]
     ) -> None: ...
 
+    def author_coacd_colliders(self, usd_path: Path, params: CoacdParams) -> int: ...
+
+    def read_collider_pieces(self, usd_path: Path) -> list[ConvexPiece]: ...
+
     def compose_arena(
         self, arena_usd: Path, layout: ArenaLayout, furniture_dir_name: str = "furniture"
     ) -> None: ...
@@ -91,6 +102,7 @@ class _FurnitureConversion:
     model_id: str
     payload: dict[str, bytes]
     map_colliders: tuple[BoxCollider, ...]
+    pieces: tuple[ConvexPiece, ...]
     source_records: tuple[dict[str, object], ...]
 
 
@@ -237,6 +249,8 @@ def _convert_model(
     model_id: str,
     converter: ConverterHooks,
     collider_override: tuple[BoxCollider, ...] | None = None,
+    coacd: CoacdParams | None = None,
+    plates: tuple[BoxCollider, ...] = (),
 ) -> tuple[Path, bytes, tuple[BoxCollider | MeshCollider, ...], tuple[float, ...], tuple[float, ...]]:
     sdf_bytes = _read_upstream(checkout, f"models/{model_id}/model.sdf")
     # A config "collision_overrides" entry replaces the SDF's own colliders
@@ -248,7 +262,14 @@ def _convert_model(
 
     usd_path = scratch / "furniture" / f"{model_id}.usd"
     converter.convert_glb_to_usd(glb_path, usd_path, mesh_scale=scale, mesh_pose=pose)
-    converter.author_model_colliders(usd_path, colliders)
+    if coacd is None or collider_override is not None:
+        converter.author_model_colliders(usd_path, colliders)
+    else:
+        # The published collider is the CoACD hull set; ``colliders`` (the
+        # SDF's own) are still returned for the nav map and bounds check.
+        converter.author_coacd_colliders(usd_path, coacd)
+        if plates:
+            converter.author_model_colliders(usd_path, plates)
     return usd_path, sdf_bytes, colliders, uri, glb_path
 
 
@@ -269,9 +290,11 @@ def convert_furniture_model(
     tolerance: float,
     bounds_check_exceptions: frozenset[str] = frozenset(),
     collider_override: tuple[BoxCollider, ...] | None = None,
+    coacd: CoacdParams | None = None,
+    plates: tuple[BoxCollider, ...] = (),
 ) -> _FurnitureConversion:
     usd_path, sdf_bytes, colliders, uri, glb_path = _convert_model(
-        checkout, scratch, model_id, converter, collider_override
+        checkout, scratch, model_id, converter, collider_override, coacd, plates
     )
     measured = converter.measure_bounds(usd_path)
 
@@ -296,6 +319,7 @@ def convert_furniture_model(
         model_id=model_id,
         payload=_furniture_payload(usd_path, model_id),
         map_colliders=map_colliders,
+        pieces=tuple(converter.read_collider_pieces(usd_path)) if coacd is not None else (),
         source_records=records,
     )
 
@@ -315,6 +339,20 @@ def _furniture_payload(usd_path: Path, model_id: str) -> dict[str, bytes]:
             if texture_file.is_file():
                 payload[f"furniture/textures/{model_id}/{texture_file.name}"] = texture_file.read_bytes()
     return payload
+
+
+def _plates_for(model_id: str, surface_specs: Sequence[Mapping[str, object]]) -> tuple[BoxCollider, ...]:
+    """One thin box under each configured surface of ``model_id``, its top
+    face exactly at the surface height (a plate the hulls would otherwise
+    round off, so objects placed on the surface rest on it)."""
+    plates = []
+    for spec in surface_specs:
+        if str(spec["model_id"]) != model_id:
+            continue
+        cx, cy, cz = (float(v) for v in spec["local_center"])
+        sx, sy = (float(v) for v in spec["size_xy"])
+        plates.append(BoxCollider(size=(sx, sy, 0.01), center=(cx, cy, cz - 0.005), yaw=0.0))
+    return tuple(plates)
 
 
 # --------------------------------------------------------------------------- #
@@ -373,9 +411,16 @@ def _read_robot_urdf(repo_root: Path) -> bytes:
 # --------------------------------------------------------------------------- #
 # orchestration
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ImportOutcome:
+    publication: AssetPublication
+    outlines: tuple[InstanceOutline, ...]
+    report: Path  # summary.json of the outline report
+
+
 def run_import(
     config: Mapping[str, object], repo_root: Path, checkout: Path, converter: ConverterHooks
-) -> AssetPublication:
+) -> ImportOutcome:
     repo_root = Path(repo_root)
     checkout = Path(checkout)
     commit = str(config["commit"])
@@ -388,21 +433,27 @@ def run_import(
     tolerance = float(config.get("bounds_tolerance_m", 0.01))
     bounds_check_exceptions = frozenset(str(item) for item in config.get("bounds_check_exceptions", ()))
     collider_overrides = collision_overrides_from_config(config)
+    coacd = CoacdParams.from_config(config.get("coacd"))
+    surface_specs = config.get("surfaces", ())
     model_ids = sorted({item.model_id for item in layout.furniture})
 
     with tempfile.TemporaryDirectory(prefix="arena-import-scratch-") as scratch_dir:
         scratch = Path(scratch_dir)
         payload: dict[str, bytes] = {}
         map_colliders: dict[str, tuple[BoxCollider, ...]] = {}
+        pieces: dict[str, tuple[ConvexPiece, ...]] = {}
         records: list[dict[str, object]] = [_source_record(str(config["world"]), world_bytes)]
 
         for model_id in model_ids:
             conversion = convert_furniture_model(
                 checkout, scratch, model_id, converter, tolerance, bounds_check_exceptions,
                 collider_override=collider_overrides.get(model_id),
+                coacd=coacd,
+                plates=_plates_for(model_id, surface_specs) if model_id in coacd.plate_surfaces else (),
             )
             payload.update(conversion.payload)
             map_colliders[model_id] = conversion.map_colliders
+            pieces[model_id] = conversion.pieces
             records.extend(conversion.source_records)
 
         arena_usd_path = scratch / "arena.usd"
@@ -414,7 +465,20 @@ def run_import(
         payload["map.pgm"] = pgm_bytes
         payload["map.yaml"] = map_yaml_bytes
 
-        surfaces = _build_surfaces(layout, config.get("surfaces", ()))
+        outlines = check_arena(layout, map_colliders, pieces, scan_band)
+
+        collision = {
+            "coacd": coacd.as_record(),
+            "pieces": {model_id: len(pieces[model_id]) for model_id in model_ids},
+            "overrides": sorted(m for m in model_ids if m in collider_overrides),
+            "plates": sorted(
+                m for m in model_ids
+                if m in coacd.plate_surfaces and m not in collider_overrides
+            ),
+        }
+        payload["collision.json"] = _canonical(collision)
+
+        surfaces = _build_surfaces(layout, surface_specs)
         payload["placement.json"] = placement_json(str(config["arena_id"]), surfaces)
 
         license_bytes = _read_upstream(checkout, "LICENSE")
@@ -437,6 +501,9 @@ def run_import(
             select=False,
         )
 
+    report = write_outline_report(
+        outlines, repo_root / "reports" / "arena-outline" / publication.identity[:12]
+    )
     print(
         f"published arena artifact {config['arena_id']}: identity={publication.identity} "
         f"dir={publication.artifact_dir}"
@@ -449,7 +516,12 @@ def run_import(
         "operator reminder: register the arena.usd path + sha256 under "
         "generated_arena_usds in artifacts/asset-manifest.json for offline bundling"
     )
-    return publication
+    failed = [item for item in outlines if not item.passed]
+    for item in failed:
+        print(f"outline FAIL {item.instance}: bigger {item.bigger_mm:.1f} mm, smaller {item.smaller_mm:.1f} mm")
+    print(f"outline report: {report}")
+    print("outline check: PASS" if not failed else f"outline check: FAIL ({len(failed)} instances)")
+    return ImportOutcome(publication=publication, outlines=tuple(outlines), report=report)
 
 
 def report_bounds(config: Mapping[str, object], checkout: Path, converter: ConverterHooks) -> None:
@@ -525,6 +597,12 @@ class ReuseFurnitureHooks:
 
     def author_model_colliders(self, usd_path: Path, colliders) -> None:
         self._real.author_model_colliders(usd_path, colliders)
+
+    def author_coacd_colliders(self, usd_path: Path, params: CoacdParams) -> int:
+        return self._real.author_coacd_colliders(usd_path, params)
+
+    def read_collider_pieces(self, usd_path: Path) -> list[ConvexPiece]:
+        return self._real.read_collider_pieces(usd_path)
 
     def compose_arena(self, arena_usd: Path, layout: ArenaLayout, furniture_dir_name: str = "furniture") -> None:
         self._real.compose_arena(arena_usd, layout, furniture_dir_name=furniture_dir_name)
