@@ -179,8 +179,8 @@ order: the top lidar is not useful until the furniture looks right from above.
 
 ### The mount
 
-- Pose is relative to `base_link`, and every value is a setting, because the
-  mechanical design is not final:
+- Pose is relative to `base_link`, and every value is a parameter of the
+  variant build script (below), because the mechanical design is not final:
   - height: 1.0–1.5 m above the floor. *My call:* default **1.2 m above the
     floor**, i.e. `z = 1.2 − 0.0775` in `base_link`, using base_link's rest
     height as `arena_map.livox_scan_height` does.
@@ -195,12 +195,47 @@ order: the top lidar is not useful until the furniture looks right from above.
   mast and arm and is removed by the self-filter. From 1.2 m, the forward
   edge reaches a 0.75 m tabletop about 0.6 m ahead and the floor about 1.5 m
   ahead.
-- The sensor floats: no link mass, no collision, no visual. *My call:* it is
-  **not** a new robot artifact. `robot.urdf` and `robot.usd` are unchanged.
-  The mount is a sim-side setting, and the frame comes from a static
-  transform, the same way `livox360` is published today. That keeps the
-  checksummed `tinker2` artifact, the canonicalizer and the nav map
-  untouched.
+- The sensor floats: no link mass, no collision, no visual.
+
+### A separate robot model (user requirement)
+
+The user does not want this temporary, experimental feature to be able to
+interrupt normal sim runs. So it lives in its own files, and the normal sim
+never loads any of them:
+
+- **Its own robot artifact,** under a separate robot name, e.g.
+  `artifacts/robot/tinker2-toplidar/`, with its own `current.json`. It is
+  the current tinker2 model plus one frame link, `livox_top`, on a fixed
+  joint from `base_link` at the mount pose above. That gives `robot.urdf`
+  the link and joint, and `robot.usd` a matching `livox_top` prim. Nothing
+  else differs: same meshes, physics, drives and arm.
+  - `artifacts/tinker2/current.json` and every existing tinker2 artifact
+    stay untouched. `artifacts/` is gitignored, so the variant is produced
+    by a committed build script that takes the mount pose (height, offset,
+    tilt) as parameters and derives from the tinker2 artifact `current.json`
+    selects. Changing the pose means re-running the script, not editing the
+    sim.
+  - How the USD gets the extra prim is left to the builder: a layer that
+    references the tinker2 `robot.usd` and adds the frame, or a re-import.
+    Either way, the physics must be identical to tinker2.
+- **Its own sensor config,** e.g. `simulation/sensors/top-lidar.json`: the
+  same lidar contract as `hardware-parity.json`, with `mount_prim:
+  livox_top`, topic `/livox/lidar_top` and frame `livox_top`.
+  `hardware-parity.json` is not edited.
+- **Its own launch,** which selects the variant artifact and the top-lidar
+  config, and runs the sim, `robot_state_publisher` with the variant URDF
+  (the source of the `livox_top` transform), `base_facade`, the static
+  `map → odom`, and the route driver. Existing launch files are not edited.
+- **Shared code is touched as little as possible**, and only in ways that
+  leave normal runs identical:
+  - the lidar rig applies the mount link's rotation, which is identity for
+    today's `livox_frame`;
+  - the gateway and `run_sim` take the robot artifact, sensor config, topic
+    and frame from arguments that default to today's values, where these
+    are hard-coded now (e.g. `/livox/lidar` and `livox360` in
+    `ros_gateway.py`).
+  - Tests pin the defaults (see Checks) so a normal run can't pick up the
+    experiment by accident.
 
 ### The sensor
 
@@ -224,15 +259,17 @@ order: the top lidar is not useful until the furniture looks right from above.
 - Publishes `sensor_msgs/PointCloud2` on **`/livox/lidar_top`**, frame
   **`livox_top`**, 10 Hz, sensor-data QoS, with the same point layout as
   `/livox/lidar`. *My call on both names*, so nothing confuses it with the nav
-  lidar. A static transform `base_link → livox_top` is published from the
-  same mount settings that place the rays, from one source so the two cannot
+  lidar. The variant URDF is the one source of the mount pose. The sim
+  places the rays from the `livox_top` prim, and `robot_state_publisher`
+  publishes `base_link → livox_top` from the same joint, so the two cannot
   drift apart.
 
 ### One lidar at a time
 
-- A launch-time switch selects the top lidar. With it on, the raycast lidar
-  rides the top mount: `/livox/lidar`, `/scan` and Nav2 do not run. With it
-  off (the default), nothing about today's runs changes.
+- Running the top-lidar launch is the only way to get the top lidar. In it,
+  the raycast lidar rides the `livox_top` mount, and `/livox/lidar`, `/scan`
+  and Nav2 do not run. Every existing launch and command stays exactly as it
+  is today.
 
 ### Driving a commanded route
 
@@ -255,15 +292,21 @@ order: the top lidar is not useful until the furniture looks right from above.
 
 ### Checks
 
-1. **Mount geometry (no sim).** Given the mount settings, the computed ray
-   directions and the published static transform agree, and a forward ray at
-   sensor elevation 0° points 45° below horizontal.
-2. **Base lidar unchanged (no sim).** With the top lidar off, the base
-   lidar's ray origins, directions, time offsets, mount translation and
-   rotation, topic and frame are identical to before Part 2. A live run is
-   not bit-reproducible, so this is checked on the computed pattern and
-   mount, not on live frames.
-3. **Sees the tops (live).** Drive the default route. The evaluator side (it
+1. **Mount geometry (no sim).** For the variant URDF, the computed ray
+   directions and the `base_link → livox_top` transform agree, and a forward
+   ray at sensor elevation 0° points 45° below horizontal.
+2. **Variant is only the extra frame (no sim).** The variant's `robot.urdf`
+   equals tinker2's plus exactly the `livox_top` link and joint, and its
+   `robot.usd` adds only the `livox_top` prim, with no change to any
+   physics, collision, mass or drive attribute.
+3. **Normal runs unchanged (no sim).** With default arguments, `run_sim`
+   and the gateway resolve the tinker2 artifact and `hardware-parity.json`,
+   publish `/livox/lidar` in `livox360`, and build the base lidar with ray
+   origins, directions, time offsets, mount translation and rotation
+   identical to before Part 2. `tinker2/current.json` is unchanged. A live
+   run is not bit-reproducible, so this is checked on the computed values,
+   not on live frames.
+4. **Sees the tops (live).** Drive the default route. The evaluator side (it
    may read truth) transforms the top cloud into the world frame and
    confirms, for each of the five placement surfaces, that points land inside
    the surface rectangle at its declared height (±3 cm). Also save an rviz
@@ -285,10 +328,8 @@ order: the top lidar is not useful until the furniture looks right from above.
 
 - CoACD parameters (concavity threshold, max pieces per model), as long as
   the checks pass and the values are pinned.
-- How the mount settings are exposed (environment variables, a launch
-  argument, a small config file), as long as one source drives both the rays
-  and the static transform.
-- Whether the top-lidar mode gets its own launch file or a flag on an
-  existing one.
+- How the variant build script takes its parameters, and how the variant's
+  USD gets the `livox_top` prim (see "A separate robot model").
+- The exact names of the variant artifact, sensor config and launch file.
 - The route file format and the default route's exact waypoints.
 - The route driver's control law and speed.
