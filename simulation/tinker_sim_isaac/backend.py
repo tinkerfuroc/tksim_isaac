@@ -2189,20 +2189,18 @@ class IsaacWholeRobotBackend:
         if not targets:
             return 0
         import omni.usd
-        from pxr import Usd, UsdPhysics
+        from pxr import UsdPhysics
+        from tinker_sim_isaac.arena_surface_colliders import (
+            support_surface_box_targets,
+        )
 
         stage = omni.usd.get_context().get_stage()
         boxed = 0
-        for furniture_path in sorted(targets):
-            furniture = stage.GetPrimAtPath(furniture_path)
-            if not furniture.IsValid():
-                continue
-            for prim in Usd.PrimRange(furniture):
-                if prim.HasAPI(UsdPhysics.MeshCollisionAPI):
-                    UsdPhysics.MeshCollisionAPI(prim).CreateApproximationAttr(
-                        "boundingCube"
-                    )
-                    boxed += 1
+        # Legacy whole-visual-mesh colliders only; CoACD hulls under a
+        # furniture's Colliders scope keep their convex-hull approximation.
+        for prim in support_surface_box_targets(stage, sorted(targets)):
+            UsdPhysics.MeshCollisionAPI(prim).CreateApproximationAttr("boundingCube")
+            boxed += 1
         print(json.dumps({"arena_surface_boxes": boxed}, sort_keys=True), flush=True)
         return boxed
 
