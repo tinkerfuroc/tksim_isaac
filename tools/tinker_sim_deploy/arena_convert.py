@@ -410,6 +410,157 @@ def author_model_colliders(
     _resave_fresh(stage, usd_path)
 
 
+def _default_prim_or_raise(stage, usd_path: Path):
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim:
+        raise RuntimeError(f"{usd_path}: no default prim")
+    return default_prim
+
+
+def _prim_points_in_model_frame(prim, cache, root_inverse):
+    """A ``UsdGeom.Mesh``'s points as an (N, 3) float64 array in the default prim's frame."""
+    import numpy as np
+
+    points = np.asarray(_mesh_points(prim), dtype=np.float64).reshape(-1, 3)
+    matrix = cache.GetLocalToWorldTransform(prim) * root_inverse
+    # USD matrices act on row vectors: p' = p * M.
+    m = np.array([[matrix[r][c] for c in range(4)] for r in range(4)], dtype=np.float64)
+    return points @ m[:3, :3] + m[3, :3]
+
+
+def _mesh_points(prim):
+    from pxr import UsdGeom
+
+    return UsdGeom.Mesh(prim).GetPointsAttr().Get() or []
+
+
+def read_visual_mesh(usd_path: Path):
+    """Every ``UsdGeom.Mesh`` under ``<default prim>/geom`` as one ``(vertices, faces)`` pair.
+
+    Points are transformed (``XformCache``, so the ``geom`` correction ops are
+    applied) into the default prim's frame -- the model-local frame the
+    colliders are authored in. Faces are fan-triangulated and merged.
+    """
+    import numpy as np
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.Open(str(usd_path))
+    default_prim = _default_prim_or_raise(stage, usd_path)
+    geom = stage.GetPrimAtPath(default_prim.GetPath().AppendChild("geom"))
+    if not geom:
+        raise RuntimeError(f"{usd_path}: no geom prim under the default prim")
+    cache = UsdGeom.XformCache()
+    root_inverse = cache.GetLocalToWorldTransform(default_prim).GetInverse()
+    all_vertices: list = []
+    all_faces: list = []
+    offset = 0
+    for prim in Usd.PrimRange(geom):
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        mesh = UsdGeom.Mesh(prim)
+        vertices = _prim_points_in_model_frame(prim, cache, root_inverse)
+        counts = list(mesh.GetFaceVertexCountsAttr().Get() or [])
+        indices = list(mesh.GetFaceVertexIndicesAttr().Get() or [])
+        cursor = 0
+        for count in counts:
+            face = indices[cursor : cursor + count]
+            cursor += count
+            for k in range(1, count - 1):
+                all_faces.append((offset + face[0], offset + face[k], offset + face[k + 1]))
+        all_vertices.append(vertices)
+        offset += len(vertices)
+    if not all_vertices:
+        raise RuntimeError(f"{usd_path}: no visual meshes under geom")
+    return (
+        np.concatenate(all_vertices, axis=0),
+        np.asarray(all_faces, dtype=np.int64).reshape(-1, 3),
+    )
+
+
+def author_coacd_colliders(usd_path: Path, params) -> int:
+    """Replace a furniture USD's colliders with CoACD convex hulls of its visual mesh.
+
+    Each piece becomes an invisible ``UsdGeom.Mesh`` ``hull_NN`` under
+    ``<default prim>/Colliders`` with ``CollisionAPI`` and a ``convexHull``
+    ``MeshCollisionAPI``; the visual meshes get no collision API. Returns the
+    piece count.
+    """
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics, Vt
+
+    from .arena_coacd import decompose
+
+    pieces = decompose(*read_visual_mesh(usd_path), params)
+    stage = Usd.Stage.Open(str(usd_path))
+    default_prim = _default_prim_or_raise(stage, usd_path)
+    colliders_path = default_prim.GetPath().AppendChild("Colliders")
+    UsdGeom.Scope.Define(stage, colliders_path)
+    for index, piece in enumerate(pieces):
+        mesh = UsdGeom.Mesh.Define(stage, colliders_path.AppendChild(f"hull_{index:02d}"))
+        mesh.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*map(float, v)) for v in piece.vertices]))
+        mesh.CreateFaceVertexCountsAttr(Vt.IntArray([3] * len(piece.faces)))
+        mesh.CreateFaceVertexIndicesAttr(Vt.IntArray([int(i) for i in piece.faces.reshape(-1)]))
+        UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+        UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr("convexHull")
+        UsdGeom.Imageable(mesh.GetPrim()).MakeInvisible()
+    _resave_fresh(stage, usd_path)
+    return len(pieces)
+
+
+def read_collider_pieces(usd_path: Path) -> list:
+    """Every collider under ``<default prim>/Colliders`` as a ``ConvexPiece`` in model-local frame.
+
+    ``hull_*`` meshes are returned as stored; ``box_*`` cubes (from
+    ``author_model_colliders``) as their 8 corners and 12 triangles after
+    their translate/rotateZ/scale ops. Hulls come first, then boxes.
+    """
+    import numpy as np
+    from pxr import Usd, UsdGeom
+
+    from .arena_coacd import ConvexPiece
+
+    stage = Usd.Stage.Open(str(usd_path))
+    default_prim = _default_prim_or_raise(stage, usd_path)
+    colliders = stage.GetPrimAtPath(default_prim.GetPath().AppendChild("Colliders"))
+    if not colliders:
+        return []
+    cache = UsdGeom.XformCache()
+    root_inverse = cache.GetLocalToWorldTransform(default_prim).GetInverse()
+    hulls: list = []
+    boxes: list = []
+    corners = np.array(
+        [(x, y, z) for x in (-0.5, 0.5) for y in (-0.5, 0.5) for z in (-0.5, 0.5)],
+        dtype=np.float64,
+    )
+    # Corner index = 4*x + 2*y + z (each 0/1); two triangles per cube face.
+    box_faces = np.array(
+        [(0, 2, 3), (0, 3, 1), (4, 5, 7), (4, 7, 6), (0, 1, 5), (0, 5, 4),
+         (2, 6, 7), (2, 7, 3), (0, 4, 6), (0, 6, 2), (1, 3, 7), (1, 7, 5)],
+        dtype=np.int64,
+    )
+    for prim in colliders.GetChildren():
+        name = prim.GetName()
+        if name.startswith("hull_") and prim.IsA(UsdGeom.Mesh):
+            mesh = UsdGeom.Mesh(prim)
+            counts = list(mesh.GetFaceVertexCountsAttr().Get() or [])
+            if any(c != 3 for c in counts):
+                raise RuntimeError(f"{usd_path}: {prim.GetPath()} is not a triangle mesh")
+            faces = np.asarray(mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int64)
+            hulls.append(
+                ConvexPiece(
+                    vertices=_prim_points_in_model_frame(prim, cache, root_inverse),
+                    faces=faces.reshape(-1, 3),
+                )
+            )
+        elif name.startswith("box_") and prim.IsA(UsdGeom.Cube):
+            size = float(UsdGeom.Cube(prim).GetSizeAttr().Get())
+            matrix = cache.GetLocalToWorldTransform(prim) * root_inverse
+            m = np.array([[matrix[r][c] for c in range(4)] for r in range(4)], dtype=np.float64)
+            boxes.append(
+                ConvexPiece(vertices=(corners * size) @ m[:3, :3] + m[3, :3], faces=box_faces.copy())
+            )
+    return hulls + boxes
+
+
 def strip_model_colliders(usd_path: Path) -> None:
     """Undo ``author_model_colliders`` on a converted furniture USD, in place.
 
