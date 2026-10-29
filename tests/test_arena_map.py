@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import unittest
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -135,6 +138,70 @@ class RasterizeTest(unittest.TestCase):
     def test_a_single_height_is_still_a_plane_slice(self):
         grid = self._load(self._one_box(0.72, 0.04), scan_height=0.195)
         self.assertFalse(grid.occupied_at_world(1.0, 1.0))
+
+
+class OutlineRasterizeTest(unittest.TestCase):
+    BAND = (0.2725, 2.2725)
+    TABLE = {"rcw26_kitchen_table": (
+        arena_world.BoxCollider(size=(0.8, 0.8, 0.72), center=(0.0, 0.0, 0.36), yaw=0.0),)}
+
+    @staticmethod
+    def _grid(pgm, yaml_bytes):
+        import tempfile, pathlib
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "map.pgm").write_bytes(pgm)
+            meta = dict(line.partition(":")[::2] for line in yaml_bytes.decode().splitlines())
+            origin = json.loads(meta["origin"])
+            return OccupancyMap.from_pgm(pathlib.Path(tmp) / "map.pgm", resolution=0.05,
+                                         origin_x=origin[0], origin_y=origin[1])
+
+    def test_outlines_change_only_furniture_cells(self):
+        np = pytest.importorskip("numpy")
+        pytest.importorskip("scipy")
+        layout = _square_room()
+        box_pgm, box_yaml = arena_map.rasterize(layout, self.TABLE, scan_band=self.BAND)
+        angles = np.linspace(0.0, 2 * np.pi, 32, endpoint=False)
+        circle = np.stack([1.0 + 0.4 * np.cos(angles), 1.0 + 0.4 * np.sin(angles)], axis=1)
+        pgm, yaml_bytes = arena_map.rasterize(
+            layout, self.TABLE, scan_band=self.BAND,
+            furniture_outlines={"rcw26_kitchen_table": [circle]})
+        self.assertEqual(yaml_bytes, box_yaml)
+        old, new = self._grid(box_pgm, box_yaml), self._grid(pgm, yaml_bytes)
+        for x, y in ((0.0, 2.0), (-2.0, 0.0), (0.0, -2.0), (2.0, 0.0)):   # walls
+            self.assertTrue(new.occupied_at_world(x, y))
+        for dx in (-0.375, 0.375):
+            for dy in (-0.375, 0.375):
+                self.assertTrue(old.occupied_at_world(1.0 + dx, 1.0 + dy))
+                self.assertFalse(new.occupied_at_world(1.0 + dx, 1.0 + dy))
+        self.assertTrue(new.occupied_at_world(1.0, 1.0))
+        # everything outside the table box is identical
+        self.assertEqual(old.occupied_at_world(0.0, 0.0), new.occupied_at_world(0.0, 0.0))
+
+    def test_thin_ring_rasterizes_and_fills(self):
+        np = pytest.importorskip("numpy")
+        pytest.importorskip("scipy")
+        quads = []
+        n = 64
+        for i in range(n):
+            a0, a1 = 2 * np.pi * i / n, 2 * np.pi * (i + 1) / n
+            quads.append(np.array([
+                [1.0 + 0.195 * np.cos(a0), 1.0 + 0.195 * np.sin(a0)],
+                [1.0 + 0.205 * np.cos(a0), 1.0 + 0.205 * np.sin(a0)],
+                [1.0 + 0.205 * np.cos(a1), 1.0 + 0.205 * np.sin(a1)],
+                [1.0 + 0.195 * np.cos(a1), 1.0 + 0.195 * np.sin(a1)]]))
+        pgm, yaml_bytes = arena_map.rasterize(
+            _square_room(), self.TABLE, scan_band=self.BAND,
+            furniture_outlines={"rcw26_kitchen_table": quads})
+        grid = self._grid(pgm, yaml_bytes)
+        for ix in range(-8, 9):
+            for iy in range(-8, 9):
+                x, y = 1.0 + 0.05 * ix, 1.0 + 0.05 * iy      # cell centres of the 5 cm grid
+                x, y = math.floor(x / 0.05) * 0.05 + 0.025, math.floor(y / 0.05) * 0.05 + 0.025
+                r = math.hypot(x - 1.0, y - 1.0)
+                if r <= 0.18:
+                    self.assertTrue(grid.occupied_at_world(x, y), (x, y))
+                elif r > 0.27:
+                    self.assertFalse(grid.occupied_at_world(x, y), (x, y))
 
 
 class RasterizeRefactorTest(unittest.TestCase):

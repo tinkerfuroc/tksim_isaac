@@ -1,10 +1,12 @@
 """Hull-vs-map outline check for the RoboCup arena import.
 
-Each furniture instance's convex-hull colliders, seen from above inside the
-2-D scan's height band, must match the declared boxes the nav map is
-rasterized from: no bigger and no smaller, within ``TOLERANCE_MM``. Both
-shapes are rasterized on one 1 mm grid and compared by Euclidean distance
-transform. numpy/scipy/trimesh/Pillow are imported lazily so that
+The nav map draws each furniture instance from its convex-hull colliders,
+seen from above inside the 2-D scan's height band. The gate is that the hull
+outline's bounding-box centre stays within ``CENTER_TOLERANCE_MM`` of the
+declared map box's, so the furniture keeps its place on the map. The old
+"no bigger, no smaller within ``TOLERANCE_MM``" distances (both shapes
+rasterized on one 1 mm grid, compared by Euclidean distance transform) are
+still computed and reported as information. numpy/scipy/trimesh/Pillow are imported lazily so that
 ``arena_import`` can import the instance-name helper under plain Python.
 """
 from __future__ import annotations
@@ -23,7 +25,8 @@ if TYPE_CHECKING:
 
     from .arena_coacd import ConvexPiece
 
-TOLERANCE_MM = 5.0
+TOLERANCE_MM = 5.0  # the old outline rule: reported, no longer a gate
+CENTER_TOLERANCE_MM = 25.0  # half a 5 cm map cell
 RESOLUTION_M = 0.001
 _MARGIN_M = 0.010
 
@@ -161,8 +164,40 @@ class InstanceOutline:
     model_id: str
     bigger_mm: float
     smaller_mm: float
-    passed: bool         # both <= TOLERANCE_MM
+    center_shift_mm: float  # hull bbox centre vs map-box bbox centre; inf if either is empty
+    passed: bool         # center_shift_mm <= CENTER_TOLERANCE_MM, or both shapes empty
     diff: OutlineDiff
+
+
+def _bbox_center(points: Sequence[np.ndarray]) -> np.ndarray | None:
+    import numpy as np
+
+    if not len(points):
+        return None
+    allp = np.concatenate([np.asarray(p, dtype=np.float64) for p in points])
+    return (allp.min(axis=0) + allp.max(axis=0)) / 2.0
+
+
+def _center_shift_mm(polygons: Sequence[np.ndarray],
+                     rects: Sequence[tuple[float, float, float, float, float]]) -> float:
+    import numpy as np
+
+    hull_center = _bbox_center(polygons)
+    map_center = _bbox_center([_rect_corners(rect) for rect in rects])
+    if hull_center is None or map_center is None:
+        return math.inf
+    return float(np.linalg.norm(hull_center - map_center)) * 1000.0
+
+
+def instance_outlines(layout: ArenaLayout,
+                      pieces: Mapping[str, Sequence[ConvexPiece]],
+                      band: tuple[float, float]) -> dict[str, list[np.ndarray]]:
+    """Instance name (as in ``check_arena``) -> its hull outline polygons in the band."""
+    suffixes = _furniture_instance_suffixes(layout.furniture)
+    return {
+        item.model_id + suffixes[id(item)]: band_polygons(pieces.get(item.model_id, ()), item, band)
+        for item in layout.furniture
+    }
 
 
 def check_arena(layout: ArenaLayout,
@@ -175,12 +210,14 @@ def check_arena(layout: ArenaLayout,
         rects = instance_footprints(item, map_colliders.get(item.model_id, ()), band)
         polygons = band_polygons(pieces.get(item.model_id, ()), item, band)
         diff = compare_outlines(polygons, rects)
+        shift = _center_shift_mm(polygons, rects)
         results.append(InstanceOutline(
             instance=item.model_id + suffixes[id(item)],
             model_id=item.model_id,
             bigger_mm=diff.bigger_mm,
             smaller_mm=diff.smaller_mm,
-            passed=diff.bigger_mm <= TOLERANCE_MM and diff.smaller_mm <= TOLERANCE_MM,
+            center_shift_mm=shift,
+            passed=shift <= CENTER_TOLERANCE_MM or (not polygons and not rects),
             diff=diff,
         ))
     return results
@@ -196,7 +233,8 @@ def _title_distances(result: InstanceOutline) -> str:
         return "no hull in band"
     if math.isinf(result.bigger_mm):
         return "no map footprint"
-    return f"bigger {result.bigger_mm:.1f} mm  smaller {result.smaller_mm:.1f} mm"
+    return (f"bigger {result.bigger_mm:.1f} mm  smaller {result.smaller_mm:.1f} mm  "
+            f"centre shift {result.center_shift_mm:.1f} mm")
 
 
 def _json_mm(value: float) -> float | None:
@@ -235,10 +273,12 @@ def write_outline_report(results: Sequence[InstanceOutline], out_dir: Path) -> P
         _write_png(result, out_dir / f"{result.instance}.png")
     summary = {
         "tolerance_mm": TOLERANCE_MM,
+        "center_tolerance_mm": CENTER_TOLERANCE_MM,
         "passed": all(r.passed for r in results),
         "instances": [
             {"instance": r.instance, "model_id": r.model_id,
              "bigger_mm": _json_mm(r.bigger_mm), "smaller_mm": _json_mm(r.smaller_mm),
+             "center_shift_mm": _json_mm(r.center_shift_mm),
              "passed": r.passed}
             for r in results
         ],
@@ -246,3 +286,28 @@ def write_outline_report(results: Sequence[InstanceOutline], out_dir: Path) -> P
     path = out_dir / "summary.json"
     path.write_text(json.dumps(summary, indent=2) + "\n")
     return path
+
+
+def write_map_diff(old_pgm: bytes, new_pgm: bytes, path: Path) -> None:
+    """PNG of two same-size P5 maps: occupied in both grey, old only blue,
+    new only red, free white."""
+    import numpy as np
+    from PIL import Image
+
+    def occupied(pgm: bytes) -> np.ndarray:
+        magic, dims, _maxval, body = pgm.split(b"\n", 3)
+        if magic != b"P5":
+            raise ValueError("not a P5 image")
+        width, height = (int(v) for v in dims.split())
+        return (np.frombuffer(body, dtype=np.uint8, count=width * height)
+                .reshape(height, width) == 0)
+
+    old, new = occupied(old_pgm), occupied(new_pgm)
+    if old.shape != new.shape:
+        raise ValueError(f"map sizes differ: {old.shape} vs {new.shape}")
+    rgb = np.empty(old.shape + (3,), dtype=np.uint8)
+    rgb[:] = _WHITE
+    rgb[old & new] = _GREY
+    rgb[old & ~new] = _BLUE
+    rgb[new & ~old] = _RED
+    Image.fromarray(rgb).save(Path(path))

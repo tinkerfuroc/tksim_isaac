@@ -39,6 +39,8 @@ from tinker_sim_deploy.arena_outline import (  # noqa: F401
     InstanceOutline,
     _furniture_instance_suffixes,
     check_arena,
+    instance_outlines,
+    write_map_diff,
     write_outline_report,
 )
 from tinker_sim_deploy.arena_surfaces import PlacementSurface, placement_json, world_surface
@@ -461,11 +463,16 @@ def run_import(
         payload["arena.usd"] = arena_usd_path.read_bytes()
 
         scan_band = livox_scan_band(_read_robot_urdf(repo_root))
-        pgm_bytes, map_yaml_bytes = rasterize(layout, map_colliders, scan_band=scan_band)
+        outlines = check_arena(layout, map_colliders, pieces, scan_band)
+        box_pgm, box_yaml = rasterize(layout, map_colliders, scan_band=scan_band)
+        pgm_bytes, map_yaml_bytes = rasterize(
+            layout, map_colliders, scan_band=scan_band,
+            furniture_outlines=instance_outlines(layout, pieces, scan_band),
+        )
+        if map_yaml_bytes != box_yaml:
+            raise RuntimeError("map frame changed when furniture was drawn from hulls")
         payload["map.pgm"] = pgm_bytes
         payload["map.yaml"] = map_yaml_bytes
-
-        outlines = check_arena(layout, map_colliders, pieces, scan_band)
 
         collision = {
             "coacd": coacd.as_record(),
@@ -504,6 +511,8 @@ def run_import(
     report = write_outline_report(
         outlines, repo_root / "reports" / "arena-outline" / publication.identity[:12]
     )
+    write_map_diff(box_pgm, pgm_bytes, report.parent / "map-diff.png")
+    print("map: furniture drawn from hulls; map.yaml unchanged")
     print(
         f"published arena artifact {config['arena_id']}: identity={publication.identity} "
         f"dir={publication.artifact_dir}"
@@ -518,7 +527,8 @@ def run_import(
     )
     failed = [item for item in outlines if not item.passed]
     for item in failed:
-        print(f"outline FAIL {item.instance}: bigger {item.bigger_mm:.1f} mm, smaller {item.smaller_mm:.1f} mm")
+        print(f"outline FAIL {item.instance}: centre shift {item.center_shift_mm:.1f} mm "
+              f"(bigger {item.bigger_mm:.1f} mm, smaller {item.smaller_mm:.1f} mm)")
     print(f"outline report: {report}")
     print("outline check: PASS" if not failed else f"outline check: FAIL ({len(failed)} instances)")
     return ImportOutcome(publication=publication, outlines=tuple(outlines), report=report)

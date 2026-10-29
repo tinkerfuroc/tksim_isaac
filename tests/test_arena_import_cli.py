@@ -511,7 +511,7 @@ class CoacdWiringTest(unittest.TestCase):
 
     def test_outline_failure_reported_not_selected(self):
         hooks = StubHooks(pieces={
-            "rcw26_kitchen_table": [_box_piece((1.24, 0.64, 0.74), (0.0, 0.0, 0.37))]})
+            "rcw26_kitchen_table": [_box_piece((1.2, 0.6, 0.74), (0.04, 0.0, 0.37))]})
         outcome, _ = self._run(hooks=hooks)
         self.assertFalse(outcome.outlines[0].passed)
         summary = json.loads(outcome.report.read_text())
@@ -523,6 +523,26 @@ class CoacdWiringTest(unittest.TestCase):
         pointer = self.repo_root / "artifacts" / "arena" / "rcw2026" / "current.json"
         self.assertFalse(pointer.exists())
 
+    def test_map_drawn_from_outlines_frame_unchanged(self):
+        hooks = StubHooks(pieces={
+            "rcw26_kitchen_table": [_box_piece((0.5, 0.3, 0.74), (0.0, 0.0, 0.37))]})
+        box_maps = []
+        real = arena_map.rasterize
+
+        def recorder(layout, colliders, **kwargs):
+            result = real(layout, colliders, **kwargs)
+            if kwargs.get("furniture_outlines") is None:
+                box_maps.append(result)
+            return result
+
+        with mock.patch.object(arena_import, "rasterize", recorder):
+            outcome, _ = self._run(hooks=hooks)
+        (box_pgm, box_yaml), = box_maps
+        art = outcome.publication.artifact_dir
+        self.assertEqual((art / "map.yaml").read_bytes(), box_yaml)
+        self.assertNotEqual((art / "map.pgm").read_bytes(), box_pgm)
+        self.assertTrue((outcome.report.parent / "map-diff.png").is_file())
+
     def test_outline_pass_report(self):
         outcome, _ = self._run()
         self.assertTrue(all(o.passed for o in outcome.outlines))
@@ -532,7 +552,7 @@ class CoacdWiringTest(unittest.TestCase):
         cfg = self.root / "arena-import.json"
         cfg.write_text(json.dumps(_base_config(self.commit)))
         hooks = StubHooks(pieces={
-            "rcw26_kitchen_table": [_box_piece((1.24, 0.64, 0.74), (0.0, 0.0, 0.37))]})
+            "rcw26_kitchen_table": [_box_piece((1.2, 0.6, 0.74), (0.04, 0.0, 0.37))]})
         with mock.patch.object(arena_import, "_build_real_converter", return_value=hooks), \
                 mock.patch.object(arena_import, "ReuseFurnitureHooks", return_value=hooks):
             art = self.root / "reuse"

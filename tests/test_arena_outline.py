@@ -64,22 +64,34 @@ class OutlineTest(unittest.TestCase):
         self.assertLess(r.smaller_mm, 1.5)
         self.assertTrue(r.passed)
 
-    def test_hull_10mm_bigger_fails(self):
+    def test_hull_10mm_bigger_is_reported_but_passes(self):
+        # Hull grows 10 mm on the +x side: bigger_mm is information now; the
+        # bbox centre moved 5 mm, well inside the centre tolerance.
         r = _check(_box_piece((0.81, 0.6, 0.72), (0.005, 0, 0.36)), BOX)
         self.assertTrue(9 <= r.bigger_mm <= 11, r.bigger_mm)
+        self.assertTrue(r.passed)
+
+    def test_center_shift_gate(self):
+        r = _check(_box_piece((0.8, 0.6, 0.72), (0.030, 0, 0.36)), BOX)
+        self.assertAlmostEqual(r.center_shift_mm, 30.0, delta=1.0)
         self.assertFalse(r.passed)
+        r = _check(_box_piece((0.8, 0.6, 0.72), (0.010, 0, 0.36)), BOX)
+        self.assertAlmostEqual(r.center_shift_mm, 10.0, delta=1.0)
+        self.assertAlmostEqual(r.bigger_mm, 10.0, delta=1.5)
+        self.assertTrue(r.passed)
 
     def test_hull_4mm_bigger_passes(self):
         r = _check(_box_piece((0.804, 0.6, 0.72), (0.002, 0, 0.36)), BOX)
         self.assertTrue(r.passed, (r.bigger_mm, r.smaller_mm))
 
-    def test_round_table_inscribed_in_box_fails_smaller(self):
+    def test_round_table_inscribed_in_box_passes_centred(self):
         piece = _prism_piece(0.4, 0.72)
         piece = type(piece)(vertices=piece.vertices + [0, 0, 0.36], faces=piece.faces)
         box = arena_world.BoxCollider(size=(0.8, 0.8, 0.72), center=(0, 0, 0.36), yaw=0.0)
         r = _check(piece, box)
         self.assertGreater(r.smaller_mm, 150)
-        self.assertFalse(r.passed)
+        self.assertLess(r.center_shift_mm, 1.0)
+        self.assertTrue(r.passed)
 
     def test_piece_outside_band_contributes_nothing(self):
         _, _, outline, _ = _deps()
@@ -106,12 +118,14 @@ class OutlineTest(unittest.TestCase):
         layout = arena_world.ArenaLayout(
             walls=(), furniture=(_item((0, 0, 0)), _item((3, 0, 0))))
         res = outline.check_arena(
-            layout, {"m": (BOX,)}, {"m": [_box_piece((0.81, 0.6, 0.72), (0.005, 0, 0.36))]}, BAND)
+            layout, {"m": (BOX,)}, {"m": [_box_piece((0.8, 0.6, 0.72), (0.03, 0, 0.36))]}, BAND)
         with tempfile.TemporaryDirectory() as tmp:
             summary = outline.write_outline_report(res, Path(tmp))
             data = json.loads(summary.read_text())
             self.assertEqual(data["tolerance_mm"], 5.0)
+            self.assertEqual(data["center_tolerance_mm"], 25.0)
             self.assertFalse(data["passed"])
+            self.assertAlmostEqual(data["instances"][0]["center_shift_mm"], 30.0, delta=1.0)
             self.assertEqual(len(data["instances"]), 2)
             self.assertEqual(sorted(p.name for p in Path(tmp).glob("*.png")), ["m.png", "m_02.png"])
 
@@ -122,6 +136,29 @@ class OutlineTest(unittest.TestCase):
         r = outline.check_arena(layout, {"m": (thin,)}, {"m": []}, BAND)[0]
         self.assertEqual(r.smaller_mm, float("inf"))
         self.assertFalse(r.passed)
+
+    def test_missing_hull_fails_gate(self):
+        _, _, outline, _ = _deps()
+        layout = arena_world.ArenaLayout(walls=(), furniture=(_item(),))
+        r = outline.check_arena(layout, {"m": (BOX,)}, {"m": []}, BAND)[0]
+        self.assertEqual(r.center_shift_mm, float("inf"))
+        self.assertFalse(r.passed)
+
+    def test_both_shapes_empty_passes(self):
+        _, _, outline, _ = _deps()
+        layout = arena_world.ArenaLayout(walls=(), furniture=(_item(),))
+        r = outline.check_arena(layout, {}, {"m": []}, BAND)[0]
+        self.assertTrue(r.passed)
+
+    def test_instance_outlines_keyed_like_check_arena(self):
+        _, _, outline, _ = _deps()
+        layout = arena_world.ArenaLayout(
+            walls=(), furniture=(_item((0, 0, 0)), _item((3, 0, 0))))
+        out = outline.instance_outlines(
+            layout, {"m": [_box_piece((0.8, 0.6, 0.72), (0, 0, 0.36))]}, BAND)
+        self.assertEqual(list(out), ["m", "m_02"])
+        self.assertEqual(len(out["m_02"]), 1)
+        self.assertAlmostEqual(float(out["m_02"][0][:, 0].mean()), 3.0, delta=1e-6)
 
     def test_hull_without_map_footprint_fails(self):
         _, _, outline, _ = _deps()
@@ -140,6 +177,31 @@ class OutlineTest(unittest.TestCase):
             data = json.loads(summary.read_text())
             self.assertIsNone(data["instances"][0]["smaller_mm"])
             self.assertFalse(data["passed"])
+
+
+def _pgm(rows):
+    h, w = len(rows), len(rows[0])
+    return b"P5\n%d %d\n255\n" % (w, h) + bytes(0 if c == "#" else 254 for r in rows for c in r)
+
+
+class MapDiffTest(unittest.TestCase):
+    def test_write_map_diff_colours(self):
+        _, _, outline, _ = _deps()
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "map-diff.png"
+            outline.write_map_diff(_pgm(["#.#.", "...."]), _pgm(["##..", "...."]), path)
+            img = Image.open(path).convert("RGB")
+            self.assertEqual(img.getpixel((0, 0)), (200, 200, 200))   # both
+            self.assertEqual(img.getpixel((1, 0)), (220, 40, 40))     # new only
+            self.assertEqual(img.getpixel((2, 0)), (40, 80, 220))     # old only
+            self.assertEqual(img.getpixel((3, 0)), (255, 255, 255))   # free
+
+    def test_write_map_diff_rejects_size_mismatch(self):
+        _, _, outline, _ = _deps()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                outline.write_map_diff(_pgm(["##"]), _pgm(["###"]), Path(tmp) / "x.png")
 
 
 if __name__ == "__main__":
