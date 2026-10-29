@@ -25,8 +25,10 @@ the top lidar is useful.
 
 1. Every piece of rcw2026 arena furniture collides as a CoACD convex
    decomposition of its visual mesh, in **every** run, not only top-lidar runs.
-2. A check proves the CoACD hulls' **top-down projection is still the same**
-   as the navigation map's (user requirement).
+2. The navigation map's furniture footprints are **redrawn from the CoACD
+   hulls** (user decision, 2026-10-29: "keep the real shape and redraw the map
+   from the hulls, but keep the center and orientation the same"). Walls and
+   the map frame stay as they are.
 3. A top-lidar test mode: one simulated Mid-360 at the planned high mount,
    upside down and tilted 45°, publishing a point cloud while the robot drives
    a commanded route.
@@ -52,8 +54,9 @@ the top lidar is useful.
   frame and topic, the `livox360` transform, the robot artifact and the nav
   map stay as they were after Part 1. (Part 1 intentionally changes what the
   base lidar hits, because the furniture colliders change in every run.)
-- The navigation map silently changes. The projection check exists to catch
-  that.
+- The navigation map changes anywhere except the furniture footprints, or the
+  map frame moves (origin, size or resolution). Poses already marked on the
+  map must stay valid.
 - Objects placed on tables, desks, shelves or the sofa start getting flung off
   again. That is the reason the box override in
   `backend.py:_apply_arena_support_surface_colliders` exists.
@@ -111,13 +114,21 @@ order: the top lidar is not useful until the furniture looks right from above.
   - *My call:* run CoACD with a fixed seed and pinned parameters recorded in
     the artifact, so the import stays reproducible like the rest of the
     pipeline. Picking the parameters is left to the builder.
-- **The map keeps its current source.** *My call, following the user's "check
-  their top-down projection is still the same":* the declared SDF boxes (and
-  the mesh-model AABBs) stay in the import as map-only data. `arena_map.py`
-  keeps rasterizing from them, so the new artifact's `map.pgm` comes out
-  identical to today's. CoACD hulls are physics colliders only. The
-  projection check compares the hulls against that unchanged map, so it is
-  not circular.
+- **The map's furniture is drawn from the hulls** (user decision,
+  2026-10-29, replacing the earlier "map keeps its current source" call; see
+  "Checkpoint outcome" under Checks):
+  - Each furniture piece keeps its placement (position and yaw). Its map
+    footprint is the top-down outline of its hulls inside the scan band.
+  - Walls are rasterized exactly as before. The map frame (`map.yaml`
+    origin, size and resolution) stays byte-identical to the box-based map,
+    so poses marked on the map stay valid.
+  - A map cell is occupied if any part of a hull outline touches it, so
+    thin parts such as a bin's wall still show. Hollows enclosed by one
+    piece's outline are filled, so open containers stay solid on the map.
+    (The bins' colliders already have a bottom; it sits below the scan
+    band.)
+  - The declared SDF boxes and mesh AABBs stay in the import, now only to fix
+    the map frame and to report how far each footprint's centre moved.
 - **Retire the support-surface box override** in
   `backend.py:_apply_arena_support_surface_colliders` for models that now
   carry CoACD hulls. Otherwise it would turn the tables back into boxes
@@ -162,6 +173,26 @@ order: the top lidar is not useful until the furniture looks right from above.
    - Any failing model blocks the `current.json` switch until the user has
      seen the diff and decided. This is a planned checkpoint with the user,
      partway through Part 1.
+   - **Checkpoint outcome (2026-10-29).** With CoACD at
+     `preprocess_resolution` 100, 25 of 27 instances failed. Nearly all
+     failures were the old boxes being coarser than the real meshes: a round
+     kitchen table in a square box (175 mm), open bins, chairs, plants, the
+     TV and the cushion. The two shelves passed. The user chose to keep the
+     real shapes and redraw the map from the hulls, keeping each piece's
+     centre and orientation. Each hull follows its mesh to within 0.2 mm;
+     the old boxes' centres differ from the meshes' by up to 17 mm (tall
+     plant), with the dishwasher at 8 mm and the TV and chair at about 5 mm.
+     So the outline numbers stay in the report as information, and check 1b
+     below replaces this check as the gate.
+1b. **Map redraw check.** For each instance: it has a hull outline in the
+   band wherever the old map had a footprint (no furniture vanishes from the
+   map), and the centre of its new footprint is within **25 mm** of the old
+   box's centre (*my call:* half a 5 cm map cell, the smallest move the map
+   can show; the largest measured is 17 mm). Orientation is unchanged by
+   construction (same yaw). `map.yaml` is byte-identical to the box-based
+   map's, and only furniture cells differ. The import also writes a map
+   diff image (cells only in the old map, only in the new, in both) for the
+   user.
 2. **Placement still holds.** A live check drops a test object onto every
    declared placement surface (kitchen table top, shelf plate, side table
    top, laundry desk top, sofa seat). Each object must come to rest on the

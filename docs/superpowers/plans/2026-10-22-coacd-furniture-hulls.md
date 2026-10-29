@@ -16,7 +16,7 @@
 - Tests that need `pxr` or `coacd` start with `pytest.importorskip("pxr")` / `pytest.importorskip("coacd")`, as `tests/test_arena_collision_overrides.py` does. Kit-only modules (`omni.*`) can't be imported in tests.
 - Outline rule (user's words): hull outline "roughly the same as the map outline, no bigger and no smaller. Very small corners (<5mm) are acceptable." Tolerance is **5.0 mm**, in both directions.
 - Outline band = `arena_map.livox_scan_band(<tinker2 robot.urdf>)`, about 0.27–2.27 m above the floor, the same band the map uses.
-- The new artifact's `map.pgm` and `map.yaml` must be byte-identical to the current rcw2026 artifact's (`artifacts/arena/rcw2026/669e13f7…/`).
+- ~~The new artifact's `map.pgm` and `map.yaml` must be byte-identical to the current rcw2026 artifact's.~~ **Amended 2026-10-29 (user decision, see spec Checks 1/1b):** furniture footprints are redrawn from the hulls; `map.yaml` stays byte-identical to the box-based map's (`artifacts/arena/rcw2026/669e13f7…/`) and only furniture cells of `map.pgm` may differ. Execution order after Task 8's checkpoint: Task 10 → Task 11 → Task 9.
 - `collision_overrides` in `config/arena-import.json` keep precedence over CoACD.
 - CoACD parameters and seed are pinned in `config/arena-import.json` under `"coacd"` and recorded in the artifact.
 - Nothing selects the new arena (writes `artifacts/arena/rcw2026/current.json`) until Task 9's user confirmation.
@@ -479,3 +479,70 @@ Expected: both logs contain `live raycast lidar:` (else the run used the occupan
 .venv/bin/python tools/arena_import.py --config config/arena-import.json --select <new id>
 ```
 Expected: `artifacts/arena/rcw2026/current.json` names the new manifest. Then register the new `arena.usd` path and sha256 under `generated_arena_usds` in `artifacts/asset-manifest.json`, as the importer's operator reminder says.
+
+---
+
+## Amendment 2026-10-29 — map drawn from the hulls
+
+At Task 8's checkpoint the user chose: "keep the real shape and redraw the map from the hulls, but keep the center and orientation the same." Tasks 10 and 11 implement that; Task 9 runs after them. Spec: Part 1 "What changes" (map bullet) and Checks 1 (checkpoint outcome) and 1b.
+
+### Task 10: Map furniture drawn from hull outlines; centre-shift gate
+
+**Files:**
+- Modify: `tools/tinker_sim_deploy/arena_map.py` (`rasterize` gains `furniture_outlines`)
+- Modify: `tools/tinker_sim_deploy/arena_outline.py` (`instance_outlines`, centre-shift gate, `write_map_diff`)
+- Modify: `tools/arena_import.py` (`run_import` draws the map from outlines and checks the frame)
+- Test: `tests/test_arena_map.py`, `tests/test_arena_outline.py`, `tests/test_arena_import_cli.py`
+
+**Interfaces:**
+- Consumes: `band_polygons`, `check_arena`, `InstanceOutline`, `write_outline_report`, `_furniture_instance_suffixes` (Task 5); `instance_footprints` (Task 5, arena_map); `ImportOutcome` and the `run_import` flow (Task 6).
+- Produces in `arena_outline.py`:
+  - `instance_outlines(layout: ArenaLayout, pieces: Mapping[str, Sequence[ConvexPiece]], band: tuple[float, float]) -> dict[str, list[np.ndarray]]`: instance name → that instance's `band_polygons` (world XY), keyed with the same `_furniture_instance_suffixes` names `check_arena` uses.
+  - `CENTER_TOLERANCE_MM = 25.0` (half a 5 cm map cell).
+  - `InstanceOutline` gains `center_shift_mm: float`: distance between the bbox centre (world XY) of the instance's hull outline and the bbox centre of its map-box outline (`instance_footprints` rectangles' corners); `inf` when either is empty. `passed` becomes: `center_shift_mm <= CENTER_TOLERANCE_MM`, or both shapes empty. `bigger_mm`/`smaller_mm` stay as information. `TOLERANCE_MM` stays defined (it is still printed as the old outline rule) but no longer gates.
+  - `summary.json` gains per instance `center_shift_mm` (null when infinite) and top-level `"center_tolerance_mm": 25.0`; `"passed"` follows the new rule. PNG titles add `centre shift <x> mm`.
+  - `write_map_diff(old_pgm: bytes, new_pgm: bytes, path: Path) -> None`: same-size P5 images → PNG with cells occupied in both = grey, old only = blue, new only = red, free = white. Raises `ValueError` if sizes differ.
+- Produces in `arena_map.py`: `rasterize(..., furniture_outlines: Mapping[str, Sequence[np.ndarray]] | None = None)`.
+  - `None` (default): byte-identical to today (pinned by `test_rasterize_unchanged_by_refactor`).
+  - Given: the grid origin, width and height are computed exactly as today from walls + `furniture_box_colliders` (so `map.yaml` is byte-identical); walls are rasterized exactly as today; furniture boxes are **not** drawn; instead each instance's polygons are rasterized on a 0.005 m sub-grid over that instance's bbox window (sub-cell centre inside a convex polygon by half-plane test), enclosed hollows filled per instance with `scipy.ndimage.binary_fill_holes`, and a map cell is occupied if **any** of its sub-cells is. numpy/scipy are imported only in this branch (the default path stays importable under system python).
+- `run_import`: computes `outlines = instance_outlines(layout, pieces, scan_band)`, builds the box map exactly as before (`box_pgm, box_yaml = rasterize(layout, map_colliders, scan_band=scan_band)`), then the published map with `rasterize(..., furniture_outlines=outlines)`; raises `ArenaImportError`/`RuntimeError` if the new `map.yaml` bytes differ from `box_yaml`. It writes `map-diff.png` (old box map vs new map) into the outline report dir, and prints `map: furniture drawn from hulls; map.yaml unchanged`.
+
+- [ ] **Step 1: Write the failing tests**
+  - `tests/test_arena_map.py::test_outlines_change_only_furniture_cells`: a synthetic layout with walls and one 0.8×0.8 box-declared table whose outline is a 32-gon of radius 0.4 → `map.yaml` bytes equal the box map's; every wall cell equal; the four corner cells of the table box are free; the centre cell occupied.
+  - `test_thin_ring_rasterizes_and_fills`: an outline made of 64 thin convex quads forming a 1 cm-thick ring of radius 0.2 → every cell whose centre is within 0.18 m of the ring centre is occupied (filled), and cells farther than 0.27 m are free.
+  - `test_default_rasterize_unchanged`: the existing sha test still passes with no `furniture_outlines`.
+  - `tests/test_arena_outline.py::test_center_shift_gate`: hull box shifted 30 mm → `center_shift_mm ≈ 30`, not passed; shifted 10 mm → passed even though `bigger_mm` ≈ 10; round hull inside a square map box (centred) → passed, `smaller_mm` > 150.
+  - `test_missing_hull_fails_gate`: map footprint present, no hull in band → `center_shift_mm == inf`, not passed.
+  - `test_write_map_diff_colours` and `test_write_map_diff_rejects_size_mismatch`.
+  - `tests/test_arena_import_cli.py::test_map_drawn_from_outlines_frame_unchanged`: with stub pieces smaller than the map box, the published `map.yaml` equals the box map's yaml (compute it with `rasterize(layout, map_colliders, scan_band=...)` in the test), `map.pgm` differs, and `map-diff.png` exists in the report dir.
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `scripts/pytest-clean tests/test_arena_map.py tests/test_arena_outline.py tests/test_arena_import_cli.py -q`
+Expected: the new tests FAIL; existing ones PASS except those whose expectations the new gate changes (update those to the new rule in Step 3 and say which in the report).
+
+- [ ] **Step 3: Implement**
+
+- [ ] **Step 4: Run the tests**
+
+Run: `scripts/pytest-clean tests/test_arena_map.py tests/test_arena_outline.py tests/test_arena_import_cli.py tests/test_arena_artifact.py -q`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tools/tinker_sim_deploy/arena_map.py tools/tinker_sim_deploy/arena_outline.py tools/arena_import.py tests/test_arena_map.py tests/test_arena_outline.py tests/test_arena_import_cli.py
+git commit -m "feat(arena-import): draw map furniture from hull outlines; centre-shift gate"
+```
+
+### Task 11: Rebuild the candidate arena with the hull-drawn map
+
+No product code. CPU only, like Task 8, and no user stop unless something below fails.
+
+- [ ] **Step 1: Import** with the same command as Task 8 Step 1 (current settings: `preprocess_resolution` 100; reuse the SOBITS checkout), in the background, `timeout -k 10 3600`.
+Expected: `outline check: PASS` under the centre-shift gate, `map: furniture drawn from hulls; map.yaml unchanged`, a new unselected identity, `artifacts/arena/rcw2026/current.json` unchanged.
+
+- [ ] **Step 2: Check the map**
+  - `cmp <new>/map.yaml <669e13f7…>/map.yaml` → identical.
+  - Using the two `map.pgm` files: every differing cell lies within 0.30 m of some furniture instance's placement position's footprint (walls unchanged). Report the count of cells freed and added, and look at `map-diff.png`.
+- [ ] **Step 3: Report** per instance the centre shift (expected ≤ 17 mm, tall plant largest), the piece counts from `collision.json` (trash bin ~119, laundry basket ~641), and the `map-diff.png` path. If any instance fails the gate or a wall cell changed, stop and report to the user instead of continuing to Task 9.
