@@ -5,7 +5,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "validation"))
 
-from placement_settle_check import judge_rest, spawn_poses  # noqa: E402
+from placement_settle_check import (  # noqa: E402
+    WaitTimeout, judge_rest, spawn_poses, wait_fresh, wait_sim,
+)  # noqa: E402
 
 SURFACES = [
     {"center_xyz": [2.587, -3.058, 0.724], "edge_margin": 0.05,
@@ -73,6 +75,66 @@ class JudgeRestTest(unittest.TestCase):
         point = (0.0, 0.4, 0.7)  # inside the yawed rect, outside the unrotated one
         self.assertEqual(judge_rest(WIDE, point, point), (False, "fell off"))
         self.assertEqual(judge_rest(YAWED, point, point), (True, "rests"))
+
+
+class FakeSim:
+    """Fake wall + sim clocks; each spin advances wall by 0.1 s."""
+
+    def __init__(self, sim_rate=1.0, first_clock_after=0.0, sim_t0=500.0):
+        self.wall = 0.0
+        self.rate = sim_rate
+        self.first = first_clock_after
+        self.t0 = sim_t0
+
+    def monotonic(self):
+        return self.wall
+
+    def spin(self):
+        self.wall += 0.1
+
+    def read_clock(self):
+        if self.wall < self.first:
+            return None
+        return self.t0 + (self.wall - self.first) * self.rate
+
+
+class WaitTest(unittest.TestCase):
+    def test_settle_waits_full_sim_duration_from_first_clock_message(self):
+        sim = FakeSim(first_clock_after=2.0)
+        wait_sim(sim.read_clock, sim.spin, sim.monotonic, 8.0)
+        # 2 s with no clock, then 8 s of sim time (not 0 s).
+        self.assertGreaterEqual(sim.wall, 10.0 - 1e-6)
+
+    def test_stalled_clock_raises_after_wall_deadline(self):
+        sim = FakeSim(sim_rate=0.0)
+        with self.assertRaises(WaitTimeout):
+            wait_sim(sim.read_clock, sim.spin, sim.monotonic, 8.0)
+        self.assertGreaterEqual(sim.wall, 40.0 - 1e-6)  # max(30, 5 * 8)
+
+    def test_no_clock_publisher_raises(self):
+        sim = FakeSim(first_clock_after=1e9)
+        with self.assertRaises(WaitTimeout):
+            wait_sim(sim.read_clock, sim.spin, sim.monotonic, 1.0)
+
+    def test_identical_stamp_samples_are_not_fresh(self):
+        sim = FakeSim()
+        stamps = {"a": (5, 0), "b": (5, 0)}
+        fresh = wait_fresh(lambda: stamps, dict(stamps), ["a", "b"],
+                           sim.spin, sim.monotonic, wall_timeout_s=2.0)
+        self.assertEqual(fresh, set())
+
+    def test_new_stamp_is_fresh(self):
+        sim = FakeSim()
+        stamps = {"a": (5, 0), "b": (5, 0)}
+        baseline = dict(stamps)
+
+        def spin():
+            sim.spin()
+            stamps["a"] = (6, 0)
+            stamps["b"] = (6, 0)
+
+        fresh = wait_fresh(lambda: stamps, baseline, ["a", "b"], spin, sim.monotonic)
+        self.assertEqual(fresh, {"a", "b"})
 
 
 if __name__ == "__main__":

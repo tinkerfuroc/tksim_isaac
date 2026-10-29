@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -63,6 +64,52 @@ def judge_rest(
     return True, "rests"
 
 
+class WaitTimeout(RuntimeError):
+    """A wall-clock bound expired while waiting on the sim."""
+
+
+def wait_sim(read_clock, spin, monotonic, seconds: float, wall_timeout_s: float | None = None) -> None:
+    """Spin until `seconds` of sim time pass, counted from the first /clock message.
+
+    `read_clock()` returns the latest sim time or None before any message;
+    `spin()` processes callbacks once; `monotonic()` is the wall clock.
+    Raises WaitTimeout if the wall deadline (default max(30, 5 * seconds))
+    expires first, e.g. because /clock stalled.
+    """
+    if wall_timeout_s is None:
+        wall_timeout_s = max(30.0, 5.0 * seconds)
+    deadline = monotonic() + wall_timeout_s
+    start = None
+    while True:
+        now = read_clock()
+        if now is not None:
+            if start is None:
+                start = now
+            if now - start >= seconds:
+                return
+        if monotonic() >= deadline:
+            raise WaitTimeout(
+                f"/clock did not advance {seconds:.1f}s of sim time within "
+                f"{wall_timeout_s:.0f}s wall (sim stalled or no /clock publisher)"
+            )
+        spin()
+
+
+def wait_fresh(get_stamps, baseline, ids, spin, monotonic, wall_timeout_s: float = 10.0) -> set:
+    """Spin until every id in `ids` has a stamp differing from `baseline[id]`.
+
+    Returns the ids that did get a new message (all of them unless the wall
+    timeout expired first).
+    """
+    deadline = monotonic() + wall_timeout_s
+    while True:
+        stamps = get_stamps()
+        fresh = {i for i in ids if i in stamps and stamps[i] != baseline.get(i)}
+        if len(fresh) == len(set(ids)) or monotonic() >= deadline:
+            return fresh
+        spin()
+
+
 def _asset_path(asset: str) -> str:
     pointer = json.loads((REPO_ROOT / "artifacts/objects/ycb/current.json").read_text())
     manifest = REPO_ROOT / pointer["manifest"]
@@ -97,15 +144,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     # _make_ros_service_client waits for services_ready and for both services.
     client = _make_ros_service_client()
     node = rclpy.create_node("placement_settle_check")
-    clock = {"t": 0.0}
-    latest: dict[str, tuple[float, float, float]] = {}
+    clock: dict[str, float | None] = {"t": None}
+    latest: dict[str, tuple[tuple[float, float, float], tuple[int, int]]] = {}
 
     def _on_clock(msg):
         clock["t"] = msg.clock.sec + msg.clock.nanosec * 1e-9
 
     def _on_truth(msg):
         p = msg.pose.position
-        latest[msg.object_id] = (p.x, p.y, p.z)
+        latest[msg.object_id] = ((p.x, p.y, p.z), (msg.stamp.sec, msg.stamp.nanosec))
 
     node.create_subscription(Clock, "/clock", _on_clock, 10)
     node.create_subscription(
@@ -113,10 +160,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE),
     )
 
+    def _spin() -> None:
+        rclpy.spin_once(node, timeout_sec=0.1)
+
     def _wait_sim(seconds: float) -> None:
-        start = clock["t"]
-        while rclpy.ok() and clock["t"] - start < seconds:
-            rclpy.spin_once(node, timeout_sec=0.1)
+        wait_sim(lambda: clock["t"], _spin, time.monotonic, seconds)
 
     spawned: list[tuple[str, str]] = []  # (surface_id, entity)
     verdicts = []
@@ -131,18 +179,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         _wait_sim(args.settle_s)
         first = dict(latest)
         _wait_sim(SAMPLE_GAP_S)
+        ids = [entity.rstrip("/").rsplit("/", 1)[-1] for _, entity in spawned]
+        baseline = {i: first[i][1] for i in ids if i in first}
+        fresh = wait_fresh(lambda: {k: v[1] for k, v in latest.items()},
+                           baseline, ids, _spin, time.monotonic)
         last = dict(latest)
-        for surface_id, entity in spawned:
-            object_id = entity.rstrip("/").rsplit("/", 1)[-1]
-            if object_id not in first or object_id not in last:
+        for (surface_id, _), object_id in zip(spawned, ids):
+            if object_id not in first or object_id not in fresh:
                 verdicts.append({"surface_id": surface_id, "object_id": object_id,
-                                 "passed": False, "reason": "no truth sample"})
+                                 "passed": False, "reason": "no fresh truth sample"})
                 continue
-            ok, reason = judge_rest(surfaces[surface_id], first[object_id], last[object_id])
+            ok, reason = judge_rest(surfaces[surface_id], first[object_id][0], last[object_id][0])
             verdicts.append({
                 "surface_id": surface_id, "object_id": object_id,
                 "passed": ok, "reason": reason,
-                "first_xyz": list(first[object_id]), "last_xyz": list(last[object_id]),
+                "first_xyz": list(first[object_id][0]), "last_xyz": list(last[object_id][0]),
             })
     finally:
         for _, entity in spawned:
