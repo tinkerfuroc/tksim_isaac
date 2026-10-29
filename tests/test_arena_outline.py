@@ -53,6 +53,12 @@ def _check(piece, box, item=None):
     return outline.check_arena(layout, {"m": (box,)}, {"m": [piece]}, BAND)[0]
 
 
+def _check_pieces(pieces, box, item):
+    _, _, outline, _ = _deps()
+    layout = arena_world.ArenaLayout(walls=(), furniture=(item,))
+    return outline.check_arena(layout, {"m": (box,)}, {"m": pieces}, BAND)[0]
+
+
 # A 0.72 m tall box centred at z=0.36 spans the band low edge (0.2725).
 BOX = arena_world.BoxCollider(size=(0.8, 0.6, 0.72), center=(0.0, 0.0, 0.36), yaw=0.0)
 
@@ -79,6 +85,16 @@ class OutlineTest(unittest.TestCase):
         self.assertAlmostEqual(r.center_shift_mm, 10.0, delta=1.0)
         self.assertAlmostEqual(r.bigger_mm, 10.0, delta=1.5)
         self.assertTrue(r.passed)
+
+    def test_center_shift_is_measured_in_the_furniture_frame(self):
+        np, trimesh, _, ConvexPiece = _deps()
+        # L-shape: two boxes whose union bbox is 0.8 x 0.6, same as the map box.
+        a = _box_piece((0.8, 0.2, 0.72), (0.0, -0.2, 0.36))
+        b = _box_piece((0.2, 0.6, 0.72), (-0.3, 0.0, 0.36))
+        for yaw in (0.0, math.pi / 3):
+            r = _check_pieces([a, b], BOX, _item((1.0, 2.0, 0.0), yaw))
+            self.assertLess(r.center_shift_mm, 1.0, yaw)
+            self.assertTrue(r.passed, yaw)
 
     def test_hull_4mm_bigger_passes(self):
         r = _check(_box_piece((0.804, 0.6, 0.72), (0.002, 0, 0.36)), BOX)

@@ -2,7 +2,7 @@
 
 The nav map draws each furniture instance from its convex-hull colliders,
 seen from above inside the 2-D scan's height band. The gate is that the hull
-outline's bounding-box centre stays within ``CENTER_TOLERANCE_MM`` of the
+outline's bounding-box centre (in the furniture's own frame) stays within ``CENTER_TOLERANCE_MM`` of the
 declared map box's, so the furniture keeps its place on the map. The old
 "no bigger, no smaller within ``TOLERANCE_MM``" distances (both shapes
 rasterized on one 1 mm grid, compared by Euclidean distance transform) are
@@ -164,26 +164,33 @@ class InstanceOutline:
     model_id: str
     bigger_mm: float
     smaller_mm: float
-    center_shift_mm: float  # hull bbox centre vs map-box bbox centre; inf if either is empty
+    center_shift_mm: float  # hull vs map-box bbox centre, in the furniture's own frame; inf if either is empty
     passed: bool         # center_shift_mm <= CENTER_TOLERANCE_MM, or both shapes empty
     diff: OutlineDiff
 
 
-def _bbox_center(points: Sequence[np.ndarray]) -> np.ndarray | None:
+def _bbox_center(points: Sequence[np.ndarray], item: FurniturePlacement) -> np.ndarray | None:
+    """Bounding-box centre of ``points`` in the furniture's own frame (translated
+    by -position, rotated by -yaw), so the value does not depend on placement yaw."""
     import numpy as np
 
     if not len(points):
         return None
     allp = np.concatenate([np.asarray(p, dtype=np.float64) for p in points])
-    return (allp.min(axis=0) + allp.max(axis=0)) / 2.0
+    c, s = math.cos(item.yaw), math.sin(item.yaw)
+    local = (allp - np.asarray(item.position[:2])) @ np.array([[c, -s], [s, c]])
+    return (local.min(axis=0) + local.max(axis=0)) / 2.0
 
 
 def _center_shift_mm(polygons: Sequence[np.ndarray],
-                     rects: Sequence[tuple[float, float, float, float, float]]) -> float:
+                     rects: Sequence[tuple[float, float, float, float, float]],
+                     item: FurniturePlacement) -> float:
+    """Distance (mm) between the hull and map-box bbox centres, both measured
+    in the furniture's own frame."""
     import numpy as np
 
-    hull_center = _bbox_center(polygons)
-    map_center = _bbox_center([_rect_corners(rect) for rect in rects])
+    hull_center = _bbox_center(polygons, item)
+    map_center = _bbox_center([_rect_corners(rect) for rect in rects], item)
     if hull_center is None or map_center is None:
         return math.inf
     return float(np.linalg.norm(hull_center - map_center)) * 1000.0
@@ -210,7 +217,7 @@ def check_arena(layout: ArenaLayout,
         rects = instance_footprints(item, map_colliders.get(item.model_id, ()), band)
         polygons = band_polygons(pieces.get(item.model_id, ()), item, band)
         diff = compare_outlines(polygons, rects)
-        shift = _center_shift_mm(polygons, rects)
+        shift = _center_shift_mm(polygons, rects, item)
         results.append(InstanceOutline(
             instance=item.model_id + suffixes[id(item)],
             model_id=item.model_id,
