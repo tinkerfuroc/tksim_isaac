@@ -245,10 +245,12 @@ convention: `artifacts/arena/rcw2026/<identity>/` and
 `artifacts/objects/ycb/<identity>/`, each with a `current.json` pointer, a
 `manifest.json`, a `source-lock.json` (per consumed upstream file: relative
 path, size, sha256), and an `ATTRIBUTION.md`. Re-running an importer against
-unchanged upstream content and config is a byte-identical no-op (proven live
-by two consecutive runs of each importer publishing under the same identity:
-the second run reports `created=False` and atomically rewrites `current.json`
-with identical bytes).
+unchanged upstream content and config is a byte-identical no-op: it publishes
+under the same identity and reports `created=False`. The YCB importer then
+rewrites `current.json` with identical bytes; the arena importer never moves
+`current.json` — it prints the new identity and the command that selects it,
+`tools/arena_import.py --config config/arena-import.json --select <identity>`,
+to run once the import's checks have been reviewed.
 
 Provenance: the arena is converted from
 [`TeamSOBITS/sobits_gazebo_worlds`](https://github.com/TeamSOBITS/sobits_gazebo_worlds)
@@ -285,8 +287,13 @@ export ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES  # only after TINKER_ACCEPT_OMNIVE
 `config/arena-import.json` carries the pin, the furniture allowlist, a
 `model_skiplist` for benign non-furniture includes, `bounds_check_exceptions`
 for the two models whose upstream SDF deliberately under-sizes the collision
-box (see Status below), the placement-surface definitions, and
-`bounds_tolerance_m`. `config/ycb-import.json` carries the pin, `models_root`,
+box (see Status below), the placement-surface definitions,
+`bounds_tolerance_m`, `collision_overrides` (exact boxes for the open shelf),
+and the `coacd` block: every other furniture model collides as a CoACD convex
+decomposition of its visual mesh, with those pinned parameters recorded in the
+artifact's `collision.json`. Each decomposition runs single-threaded (CoACD is
+not reproducible multi-threaded), up to eight models at a time in a process
+pool. `config/ycb-import.json` carries the pin, `models_root`,
 and the object allowlist. Both accept `--checkout <path>` to reuse an
 existing pinned checkout instead of cloning fresh; `tools/arena_import.py`
 additionally accepts `--report-bounds` to print per-model measured bounds and
@@ -298,11 +305,17 @@ Python with no GPU or Isaac Sim installed; the adapter itself is exercised
 only by the live import.
 
 The arena's `map.yaml`/`map.pgm` (ROS `map_server` PGM/YAML, resolution
-0.05m, trinary mode) is derived, not hand-authored: it rasterizes the same
-pinned world file's wall and furniture collision footprints, sliced at the
-tinker2 Livox sensor's mounted height (read from the robot URDF's
-`livox_joint` origin) — the pinned world file is the single source of truth
-for both the 3D scene and the 2D navigation map. `placement.json` records
+0.05m, trinary mode) is derived, not hand-authored, from the same pinned world
+file as the 3D scene: walls are rasterized from their collision boxes, and
+each furniture footprint is the top-down outline of that model's collider
+pieces (its CoACD hulls) inside the height band the 2-D scan is built from
+(set relative to the tinker2 Livox sensor's mounted height, read from the
+robot URDF's `livox_joint` origin), placed at the furniture's position and
+yaw. The map frame (`map.yaml` origin, size and resolution) is still fixed by
+the declared SDF boxes and mesh bounds, so it is byte-identical to the earlier
+box-footprint map's and marked poses stay valid.
+Each import writes an outline report and a map diff image under
+`reports/arena-outline/<identity prefix>/`. `placement.json` records
 world-frame placement surfaces (for example `kitchen_table#top`, the
 `rcw26_` model-id prefix stripped) for tabletop object spawning.
 
