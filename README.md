@@ -291,7 +291,9 @@ box (see Status below), the placement-surface definitions,
 `bounds_tolerance_m`, `collision_overrides` (exact boxes for the open shelf),
 and the `coacd` block: every other furniture model collides as a CoACD convex
 decomposition of its visual mesh, with those pinned parameters recorded in the
-artifact's `collision.json`. Each decomposition runs single-threaded (CoACD is
+artifact's `collision.json`. `coacd.single_piece_tops` (`{model: [z_bottom, z_top]}`)
+makes that model's top slab one flat convex piece and decomposes only the mesh
+below and above it. Each decomposition runs single-threaded (CoACD is
 not reproducible multi-threaded), up to eight models at a time in a process
 pool. `config/ycb-import.json` carries the pin, `models_root`,
 and the object allowlist. Both accept `--checkout <path>` to reuse an

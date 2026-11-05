@@ -14,7 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from tinker_sim_deploy.arena_coacd import CoacdParams, decompose  # noqa: E402
+from tinker_sim_deploy.arena_coacd import CoacdParams, decompose, single_piece_slab  # noqa: E402
 
 
 def _config() -> dict:
@@ -44,6 +44,13 @@ class CoacdParamsTests(unittest.TestCase):
         self.assertIs(params.decimate, True)
         self.assertEqual(params.seed, 0)
         self.assertEqual(params.plate_surfaces, ())
+        self.assertEqual(params.threshold, 0.10)
+        self.assertEqual(
+            sorted(params.single_piece_tops),
+            ["rcw26_laundry_desk", "rcw26_side_table", "rcw26_sink", "rcw26_tv_stand"],
+        )
+        self.assertEqual(params.single_piece_tops["rcw26_side_table"], (0.585, 0.602))
+        self.assertEqual(params.as_record()["single_piece_tops"]["rcw26_sink"], [0.606, 0.636])
         self.assertIs(params.as_record()["decimate"], True)
 
     def test_from_config_rejects_missing_key(self):
@@ -77,6 +84,15 @@ class CoacdParamsTests(unittest.TestCase):
             ("preprocess_mode", 1),
             ("plate_surfaces", "rcw26_kitchen_table"),
             ("plate_surfaces", [1]),
+            ("single_piece_tops", [["a", 0.1, 0.2]]),
+            ("single_piece_tops", {"a": [0.1]}),
+            ("single_piece_tops", {"a": [0.1, 0.2, 0.3]}),
+            ("single_piece_tops", {"a": [0.2, 0.1]}),
+            ("single_piece_tops", {"a": [0.1, 0.1]}),
+            ("single_piece_tops", {"a": ["0.1", 0.2]}),
+            ("single_piece_tops", {"a": [True, 0.2]}),
+            ("single_piece_tops", {"a": [0.1, float("inf")]}),
+            ("single_piece_tops", {1: [0.1, 0.2]}),
         ):
             cfg = _config()
             cfg[key] = bad
@@ -260,6 +276,150 @@ class DecomposeDeterminismTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("OMP_NUM_THREADS", result.stderr)
+
+
+def _xy_area(vertices) -> float:
+    from scipy.spatial import ConvexHull
+
+    return float(ConvexHull(vertices[:, :2]).volume)
+
+
+def _table(slab_z=(0.585, 0.602)):
+    """Watertight "table": a 1.0 x 0.6 top slab and four separate leg boxes below it."""
+    np = pytest.importorskip("numpy")
+    trimesh = pytest.importorskip("trimesh")
+    z0, z1 = slab_z
+    slab = trimesh.creation.box(
+        extents=(1.0, 0.6, z1 - z0), transform=trimesh.transformations.translation_matrix((0, 0, (z0 + z1) / 2))
+    )
+    parts = [slab]
+    for sx in (-0.45, 0.45):
+        for sy in (-0.25, 0.25):
+            parts.append(
+                trimesh.creation.box(
+                    extents=(0.05, 0.05, z0),
+                    transform=trimesh.transformations.translation_matrix((sx, sy, z0 / 2)),
+                )
+            )
+    table = trimesh.util.concatenate(parts)
+    assert table.is_watertight
+    return table
+
+
+def _rounded_slab(z0=0.585, z1=0.602, radius=0.1, per_corner=14):
+    """Convex slab 1.0 x 0.6 whose corners are arcs (4 * per_corner > 32 outline points)."""
+    np = pytest.importorskip("numpy")
+    trimesh = pytest.importorskip("trimesh")
+    pts = []
+    for cx, cy, a0 in ((0.4, 0.2, 0.0), (-0.4, 0.2, 90.0), (-0.4, -0.2, 180.0), (0.4, -0.2, 270.0)):
+        for a in np.radians(np.linspace(a0, a0 + 90.0, per_corner)):
+            pts.append((cx + radius * np.cos(a), cy + radius * np.sin(a)))
+    pts = np.array(pts)
+    return trimesh.convex.convex_hull(
+        np.vstack([np.column_stack([pts, np.full(len(pts), z)]) for z in (z0, z1)])
+    )
+
+
+class SinglePieceTopTests(unittest.TestCase):
+    BAND = (0.585, 0.602)
+
+    def setUp(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("scipy")
+        pytest.importorskip("trimesh")
+
+    def test_slab_is_one_flat_prism_at_the_real_top(self):
+        table = _table()
+        slab = single_piece_slab(table.vertices, table.faces, self.BAND, 64)
+        self.assertAlmostEqual(float(slab.vertices[:, 2].max()), 0.602, places=9)
+        self.assertAlmostEqual(float(slab.vertices[:, 2].min()), 0.585, places=9)
+        self.assertGreaterEqual(_xy_area(slab.vertices), 0.98 * 0.6)
+        self.assertLessEqual(len(slab.vertices), 64)
+
+    def test_slab_is_a_closed_convex_solid(self):
+        import trimesh
+
+        table = _table()
+        slab = single_piece_slab(table.vertices, table.faces, self.BAND, 64)
+        mesh = trimesh.Trimesh(slab.vertices, slab.faces)
+        self.assertTrue(mesh.is_watertight)
+        self.assertTrue(mesh.is_winding_consistent)
+        self.assertTrue(mesh.is_convex)
+        self.assertAlmostEqual(mesh.volume, 1.0 * 0.6 * 0.017, places=6)
+
+    def test_rounded_top_is_reduced_to_32_outline_points_with_small_area_loss(self):
+        top = _rounded_slab()
+        self.assertGreater(len(set(map(tuple, top.vertices[:, :2].round(9)))), 32)
+        slab = single_piece_slab(top.vertices, top.faces, self.BAND, 64)
+        self.assertLessEqual(len(slab.vertices), 64)
+        full = _xy_area(top.vertices)
+        self.assertGreaterEqual(_xy_area(slab.vertices), 0.98 * full)
+        self.assertAlmostEqual(float(slab.vertices[:, 2].max()), 0.602, places=9)
+
+    def test_slab_is_deterministic(self):
+        import numpy as np
+
+        top = _rounded_slab()
+        a = single_piece_slab(top.vertices, top.faces, self.BAND, 64)
+        b = single_piece_slab(top.vertices, top.faces, self.BAND, 64)
+        self.assertTrue(np.array_equal(a.vertices, b.vertices))
+        self.assertTrue(np.array_equal(a.faces, b.faces))
+
+    def test_band_cutting_through_a_slab_extrudes_between_the_band_planes(self):
+        table = _table((0.55, 0.65))
+        slab = single_piece_slab(table.vertices, table.faces, (0.6, 0.64), 64)
+        self.assertAlmostEqual(float(slab.vertices[:, 2].min()), 0.6, places=9)
+        self.assertAlmostEqual(float(slab.vertices[:, 2].max()), 0.64, places=9)
+
+    def test_bad_bands_are_errors(self):
+        table = _table()
+        for band in ((0.7, 0.8), (-0.2, -0.1), (0.3, 0.2), (0.3, 0.3)):
+            with self.assertRaises(ValueError, msg=str(band)):
+                single_piece_slab(table.vertices, table.faces, band, 64)
+
+    def test_band_over_a_gap_with_no_geometry_is_an_error(self):
+        import trimesh
+
+        low = _table()
+        high = low.copy()
+        high.apply_translation((0, 0, 1.0))
+        two = trimesh.util.concatenate([low, high])
+        with self.assertRaisesRegex(ValueError, "no mesh geometry"):
+            single_piece_slab(two.vertices, two.faces, (0.7, 0.9), 64)
+
+    def test_decompose_with_a_band_returns_one_top_piece_and_no_other_reaches_it(self):
+        _require_coacd()
+        table = _table()
+        cfg = {**_config(), "mcts_iterations": 20, "mcts_nodes": 8, "resolution": 500}
+        params = CoacdParams.from_config(cfg)
+        pieces = decompose(table.vertices, table.faces, params, band=self.BAND)
+        spanning = [p for p in pieces if p.vertices[:, 2].max() > 0.585 + 0.001]
+        self.assertEqual(len(spanning), 1)
+        top = spanning[0]
+        self.assertAlmostEqual(float(top.vertices[:, 2].max()), 0.602, delta=0.001)
+        self.assertGreaterEqual(_xy_area(top.vertices), 0.98 * 0.6)
+        self.assertLessEqual(len(top.vertices), 64)
+        self.assertGreaterEqual(len(pieces), 2)  # the legs are decomposed too
+        again = decompose(table.vertices, table.faces, params, band=self.BAND)
+        self.assertEqual(len(pieces), len(again))
+        for x, y in zip(pieces, again):
+            self.assertTrue(np_equal(x.vertices, y.vertices))
+            self.assertTrue(np_equal(x.faces, y.faces))
+
+    def test_decompose_all_applies_each_model_its_own_band(self):
+        _require_coacd()
+        from tinker_sim_deploy import arena_coacd
+
+        table = _table()
+        cfg = {**_config(), "mcts_iterations": 20, "mcts_nodes": 8, "resolution": 500,
+               "single_piece_tops": {"with_band": [0.585, 0.602]}}
+        params = CoacdParams.from_config(cfg)
+        meshes = {"with_band": (table.vertices, table.faces), "plain": (table.vertices, table.faces)}
+        results = arena_coacd.decompose_all(meshes, params, workers=2)
+        def spanning(pieces):
+            return [p for p in pieces if p.vertices[:, 2].max() > 0.586]
+        self.assertEqual(len(spanning(results["with_band"])), 1)
+        self.assertGreaterEqual(len(spanning(results["plain"])), 1)
 
 
 def np_equal(a, b) -> bool:

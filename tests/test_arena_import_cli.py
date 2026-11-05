@@ -165,6 +165,7 @@ def _base_config(commit: str) -> dict[str, object]:
             "max_ch_vertex": 64,
             "seed": 0,
             "plate_surfaces": [],
+            "single_piece_tops": {},
         },
     }
 
@@ -498,6 +499,31 @@ class CoacdWiringTest(unittest.TestCase):
         self.assertEqual(hooks.author_piece_calls, [])
         self.assertEqual(len(hooks.author_box_calls), 1)
         self.assertEqual(hooks.author_box_calls[0][1], tuple(expected))
+
+    def test_single_piece_band_is_recorded_in_collision_json(self):
+        config = _base_config(self.commit)
+        config["coacd"]["single_piece_tops"] = {"rcw26_kitchen_table": [0.7, 0.74]}
+        _, hooks = self._run(config)
+        self.assertEqual(
+            hooks.decompose_calls[0][1].single_piece_tops, {"rcw26_kitchen_table": (0.7, 0.74)}
+        )
+
+    def test_single_piece_band_for_unknown_or_overridden_model_is_an_error(self):
+        config = _base_config(self.commit)
+        config["coacd"]["single_piece_tops"] = {"rcw26_nonexistent": [0.7, 0.74]}
+        with self.assertRaisesRegex(ValueError, "rcw26_nonexistent"):
+            self._run(config)
+        config = _base_config(self.commit)
+        config["coacd"]["single_piece_tops"] = {"rcw26_kitchen_table": [0.7, 0.74]}
+        config["collision_overrides"] = {
+            "rcw26_kitchen_table": {
+                "kind": "open_shelf",
+                "footprint_x": [-0.6, 0.6], "footprint_y": [-0.3, 0.3], "footprint_z": [0.0, 0.74],
+                "boards_z": [[0.0, 0.04], [0.70, 0.74]],
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "collision override"):
+            self._run(config)
 
     def test_plate_added_for_listed_surface(self):
         config = _base_config(self.commit)

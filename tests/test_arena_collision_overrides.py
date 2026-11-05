@@ -260,7 +260,10 @@ class RunImportOverrideTest(unittest.TestCase):
             "world": "worlds/rcw2026_arena.world.xacro", "arena_id": "rcw2026",
             "model_allowlist": ["rcw26_shelf"], "model_skiplist": [], "bounds_check_exceptions": [],
             "surfaces": [], "bounds_tolerance_m": 0.02,
-            "coacd": json.loads((ROOT / "config" / "arena-import.json").read_text())["coacd"],
+            "coacd": {
+                **json.loads((ROOT / "config" / "arena-import.json").read_text())["coacd"],
+                "single_piece_tops": {},
+            },
         }
 
     def test_without_override_coacd_hulls_replace_the_sdf_mesh_collider(self):

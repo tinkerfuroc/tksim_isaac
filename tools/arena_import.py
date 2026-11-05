@@ -450,6 +450,11 @@ def run_import(
     bounds_check_exceptions = frozenset(str(item) for item in config.get("bounds_check_exceptions", ()))
     collider_overrides = collision_overrides_from_config(config)
     coacd = CoacdParams.from_config(config.get("coacd"))
+    for model_id in sorted(coacd.single_piece_tops):
+        if model_id in collider_overrides:
+            raise ValueError(f"coacd.single_piece_tops names {model_id!r}, which has a collision override")
+        if model_id not in {item.model_id for item in layout.furniture}:
+            raise ValueError(f"coacd.single_piece_tops names {model_id!r}, which is not a furniture model of the world")
     surface_specs = config.get("surfaces", ())
     model_ids = sorted({item.model_id for item in layout.furniture})
 
