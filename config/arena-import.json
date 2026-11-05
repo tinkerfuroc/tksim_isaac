@@ -93,7 +93,7 @@
     "mcts_iterations": 150, "mcts_max_depth": 3, "pca": false, "merge": true,
     "decimate": true, "max_ch_vertex": 64, "seed": 0, "plate_surfaces": [],
     "single_piece_tops": {
-      "rcw26_side_table": [0.585, 0.602], "rcw26_sink": [0.606, 0.636],
+      "rcw26_side_table": [0.585, 0.603], "rcw26_sink": [0.606, 0.639],
       "rcw26_tv_stand": [0.526, 0.544], "rcw26_laundry_desk": [0.716, 0.734]
     }
   },
