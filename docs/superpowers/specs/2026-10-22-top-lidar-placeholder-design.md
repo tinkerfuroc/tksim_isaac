@@ -114,6 +114,17 @@ order: the top lidar is not useful until the furniture looks right from above.
   - *My call:* run CoACD with a fixed seed and pinned parameters recorded in
     the artifact, so the import stays reproducible like the rest of the
     pipeline. Picking the parameters is left to the builder.
+- **Coarser hulls, one-piece tops** (user decision, 2026-11-05, to win back
+  sim speed). The concavity threshold is 0.10 for every model. Four models
+  get their top as ONE flat convex piece instead of whatever CoACD splits it
+  into: `rcw26_side_table`, `rcw26_sink`, `rcw26_tv_stand`,
+  `rcw26_laundry_desk`. For each, the config names a model-local z band (the
+  top slab, measured from the mesh); the slab is a single prism (the convex
+  outline of the mesh inside the band, extruded over the band) with its top
+  face at the slab's real height, and CoACD decomposes only what lies below
+  and above the band. The sink's slab covers the basin (one convex piece
+  cannot have a hole); the backsplash above it stays CoACD. Plants and every
+  other model may come out as coarse blobs.
 - **The map's furniture is drawn from the hulls** (user decision,
   2026-10-29, replacing the earlier "map keeps its current source" call; see
   "Checkpoint outcome" under Checks):

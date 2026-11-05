@@ -546,3 +546,17 @@ Expected: `outline check: PASS` under the centre-shift gate, `map: furniture dra
   - `cmp <new>/map.yaml <669e13f7…>/map.yaml` → identical.
   - Using the two `map.pgm` files: every differing cell lies within 0.30 m of some furniture instance's placement position's footprint (walls unchanged). Report the count of cells freed and added, and look at `map-diff.png`.
 - [ ] **Step 3: Report** per instance the centre shift (expected ≤ 17 mm, tall plant largest), the piece counts from `collision.json` (trash bin ~119, laundry basket ~641), and the `map-diff.png` path. If any instance fails the gate or a wall cell changed, stop and report to the user instead of continuing to Task 9.
+
+### Task 12: Threshold 0.10 and one-piece tops for four models
+
+User decision 2026-11-05 (spec, "Coarser hulls, one-piece tops"). Order after this: rebuild (as Task 11), offline checks, live settle + RTF (as Task 9), then the select question.
+
+**Files:** `config/arena-import.json` (coacd block), `tools/tinker_sim_deploy/arena_coacd.py`, `tools/arena_import.py` (only if the per-model band must be threaded through), `tests/test_arena_coacd.py`, README arena-import paragraph if it names the threshold.
+
+**Interfaces:**
+- Config: `coacd.threshold` 0.1; new key `coacd.single_piece_tops`: `{model_id: [z_bottom, z_top]}` (model-local metres). Values: `rcw26_side_table` [0.585, 0.602], `rcw26_sink` [0.606, 0.636], `rcw26_tv_stand` [0.526, 0.544], `rcw26_laundry_desk` [0.716, 0.734]. `CoacdParams` gains the field (type-checked like the others: dict of str → two floats, z_bottom < z_top; recorded by `as_record`, so it lands in `collision.json` and the identity).
+- For a model with a band: the slab piece = 2-D convex hull of the xy of all mesh points inside the band (mesh vertices in the band plus edge/plane intersection points at both band planes), reduced to ≤ 32 outline vertices by repeatedly dropping the vertex whose removal loses the least area, extruded from the lowest to the highest z of that geometry (so ≤ 64 vertices, top face flat at the slab's real top). CoACD runs on the mesh part below the band and on the part above it (if non-empty) with the normal params; pieces from all parts are returned together, sorted as today. Determinism, the spawn pool, the ≤ 64-vertex fail-closed check and the "main process never imports coacd" rule all still hold.
+- A band naming a model that is not CoACD-decomposed (unknown, or in `collision_overrides`), or a band outside the mesh's z range or containing no mesh geometry, is an error at import, not a silent skip.
+
+- [ ] Tests (synthetic, fast): a watertight "table" (top slab box + four separate leg boxes) with a band on the slab → exactly one piece spans the band; its max z equals the slab top within 1 mm; its xy area ≥ 98 % of the slab's; ≤ 64 vertices; no other piece reaches above band bottom + 1 mm. A rounded-corner top (cylinder-cornered slab with > 32 outline points) → still one piece, ≤ 64 vertices, area loss ≤ 2 %. Bad band config cases rejected. Determinism: same input twice → identical pieces.
+- [ ] Commit: `feat(arena-import): one-piece tops for configured furniture; CoACD threshold 0.10`.
