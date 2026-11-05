@@ -50,7 +50,7 @@ class CoacdParamsTests(unittest.TestCase):
             ["rcw26_laundry_desk", "rcw26_side_table", "rcw26_sink", "rcw26_tv_stand"],
         )
         self.assertEqual(params.single_piece_tops["rcw26_side_table"], (0.585, 0.602))
-        self.assertEqual(params.as_record()["single_piece_tops"]["rcw26_sink"], [0.606, 0.636])
+        self.assertEqual(params.as_record()["single_piece_tops"]["rcw26_sink"], [0.606, 0.639])
         self.assertIs(params.as_record()["decimate"], True)
 
     def test_from_config_rejects_missing_key(self):
