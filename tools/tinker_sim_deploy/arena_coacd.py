@@ -3,20 +3,30 @@
 Parameters come from the ``coacd`` block of ``config/arena-import.json`` and are
 recorded with the artifact; ``decompose`` returns pieces in a stable order so
 the authored USD is reproducible.
+
+Multi-threaded, CoACD (its bundled libgomp) gives the same mesh different
+pieces run to run, so every decomposition runs single-threaded:
+``OMP_NUM_THREADS=1`` is put in the environment before coacd is first imported
+(libgomp reads it once, when it loads). ``decompose_all`` gets the wall time
+back by decomposing many meshes at once in a spawn-context process pool, one
+single-threaded mesh per worker; the calling process (the importer's Kit
+process) never imports coacd.
+
+Nothing here imports pxr at module level: the importer loads this module before
+``SimulationApp`` starts, and pxr must not load before it.
 """
 from __future__ import annotations
 
+import multiprocessing
+import os
+import sys
 from dataclasses import asdict, dataclass, fields
 from typing import Mapping
 
 import numpy as np
 
-# coacd's native libs break a later first import of pxr (segfault in
-# pxr.Tf.PreparePythonModule), so pxr must be loaded before coacd is.
-try:
-    from pxr import Usd, UsdGeom, UsdPhysics  # noqa: F401
-except ImportError:
-    pass
+#: Upper bound on ``decompose_all``'s worker processes (the host is shared).
+MAX_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -63,8 +73,38 @@ class ConvexPiece:
     faces: np.ndarray  # (M, 3) int64 triangle indices
 
 
+def _import_coacd(*, load_pxr_first: bool = True):
+    """Import coacd single-threaded (see the module docstring).
+
+    The first import sets ``OMP_NUM_THREADS=1`` and, unless ``load_pxr_first``
+    is false (pool workers never use pxr), loads pxr before coacd: coacd's
+    native libs break a later first import of pxr (segfault in
+    pxr.Tf.PreparePythonModule). Fails closed if coacd is already loaded
+    without ``OMP_NUM_THREADS=1``.
+    """
+    if "coacd" not in sys.modules:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        if load_pxr_first:
+            try:
+                from pxr import Usd, UsdGeom, UsdPhysics  # noqa: F401
+            except ImportError:
+                pass
+    elif os.environ.get("OMP_NUM_THREADS") != "1":
+        raise RuntimeError(
+            "coacd was imported before OMP_NUM_THREADS=1 was set; its decompositions "
+            "would not be reproducible"
+        )
+    import coacd
+
+    return coacd
+
+
 def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> list[ConvexPiece]:
-    """Decompose a triangle mesh into convex pieces sorted by (min z, min y, min x)."""
+    """Decompose a triangle mesh into convex pieces sorted by (min z, min y, min x).
+
+    Single-threaded, so the same mesh and parameters give the same pieces in
+    any process.
+    """
     verts = np.asarray(vertices, dtype=np.float64)
     tris = np.asarray(faces, dtype=np.int64)
     if verts.ndim != 2 or verts.shape[1] != 3 or len(verts) < 4:
@@ -76,8 +116,7 @@ def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> l
     if tris.min() < 0 or tris.max() >= len(verts):
         raise ValueError("decompose face indices out of range")
 
-    import coacd
-
+    coacd = _import_coacd()
     coacd.set_log_level("error")
     mesh = coacd.Mesh(verts, tris)
     parts = coacd.run_coacd(
@@ -103,3 +142,37 @@ def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> l
     ]
     pieces.sort(key=lambda p: tuple(p.vertices.min(axis=0)[::-1]))
     return pieces
+
+
+def _init_worker() -> None:
+    _import_coacd(load_pxr_first=False)
+
+
+def _decompose_task(name: str, vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> list[ConvexPiece]:
+    try:
+        return decompose(vertices, faces, params)
+    except ValueError as exc:
+        raise ValueError(f"{name}: {exc}") from None
+
+
+def decompose_all(
+    meshes: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    params: CoacdParams,
+    *,
+    workers: int = MAX_WORKERS,
+) -> dict[str, list[ConvexPiece]]:
+    """``decompose`` every ``name -> (vertices, faces)`` mesh in a process pool.
+
+    A spawn-context pool of at most ``workers`` (capped at ``MAX_WORKERS``)
+    processes, each with ``OMP_NUM_THREADS=1`` set before it imports coacd;
+    biggest meshes go first. Each result equals a ``decompose`` call in a
+    fresh process. Returns ``{name: pieces}`` sorted by name.
+    """
+    names = sorted(meshes, key=lambda name: (-len(meshes[name][1]), name))
+    if not names:
+        return {}
+    count = max(1, min(workers, MAX_WORKERS, len(names)))
+    tasks = [(name, meshes[name][0], meshes[name][1], params) for name in names]
+    with multiprocessing.get_context("spawn").Pool(count, initializer=_init_worker) as pool:
+        results = pool.starmap(_decompose_task, tasks, chunksize=1)
+    return dict(sorted(zip(names, results), key=lambda item: item[0]))

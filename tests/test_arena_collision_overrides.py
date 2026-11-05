@@ -195,6 +195,7 @@ def _repo_root(root: Path) -> Path:
 class _Hooks:
     def __init__(self):
         self.authored: dict[str, tuple] = {}
+        self.hulls: dict[str, tuple] = {}
 
     def convert_glb_to_usd(self, glb, usd, *, mesh_scale=(1.0,) * 3, mesh_pose=(0.0,) * 6):
         usd.parent.mkdir(parents=True, exist_ok=True)
@@ -203,11 +204,48 @@ class _Hooks:
     def author_model_colliders(self, usd, colliders):
         self.authored[usd.stem] = tuple(colliders)
 
+    def read_visual_mesh(self, usd):
+        piece = _aabb_piece()
+        return piece.vertices, piece.faces
+
+    def decompose_all(self, meshes, params):
+        # One convex piece per model: the measured AABB below.
+        return {model_id: [_aabb_piece()] for model_id in meshes}
+
+    def author_collider_pieces(self, usd, pieces):
+        self.hulls[usd.stem] = tuple(pieces)
+
+    def read_collider_pieces(self, usd):
+        if usd.stem in self.hulls:
+            return list(self.hulls[usd.stem])
+        return [_aabb_piece(b) for b in self.authored.get(usd.stem, ()) if isinstance(b, BoxCollider)]
+
     def compose_arena(self, arena_usd, layout, furniture_dir_name="furniture"):
         arena_usd.write_bytes(b"stub-arena")
 
     def measure_bounds(self, usd):
         return ((-0.43, -0.15, 0.0), (0.43, 0.15, 2.02))
+
+
+def _aabb_piece(box: BoxCollider | None = None):
+    """A box ``ConvexPiece`` (8 corners, 12 triangles); default: the _Hooks measured AABB."""
+    import numpy as np
+    from tinker_sim_deploy.arena_coacd import ConvexPiece
+
+    if box is None:
+        box = BoxCollider(size=(0.86, 0.30, 2.02), center=(0.0, 0.0, 1.01), yaw=0.0)
+    lo = [c - s / 2.0 for c, s in zip(box.center, box.size)]
+    hi = [c + s / 2.0 for c, s in zip(box.center, box.size)]
+    verts = np.array(
+        [(x, y, z) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])],
+        dtype=np.float64,
+    )
+    faces = np.array(
+        [(0, 2, 3), (0, 3, 1), (4, 5, 7), (4, 7, 6), (0, 1, 5), (0, 5, 4),
+         (2, 6, 7), (2, 7, 3), (0, 4, 6), (0, 6, 2), (1, 3, 7), (1, 7, 5)],
+        dtype=np.int64,
+    )
+    return ConvexPiece(vertices=verts, faces=faces)
 
 
 class RunImportOverrideTest(unittest.TestCase):
@@ -222,17 +260,22 @@ class RunImportOverrideTest(unittest.TestCase):
             "world": "worlds/rcw2026_arena.world.xacro", "arena_id": "rcw2026",
             "model_allowlist": ["rcw26_shelf"], "model_skiplist": [], "bounds_check_exceptions": [],
             "surfaces": [], "bounds_tolerance_m": 0.02,
+            "coacd": json.loads((ROOT / "config" / "arena-import.json").read_text())["coacd"],
         }
 
-    def test_without_override_the_sdf_mesh_collider_is_authored(self):
+    def test_without_override_coacd_hulls_replace_the_sdf_mesh_collider(self):
         hooks = _Hooks()
         arena_import.run_import(self.config, self.repo, self.checkout, hooks)
-        self.assertEqual(hooks.authored["rcw26_shelf"], (MeshCollider(uri="model://rcw26_shelf/meshes/shelf.glb"),))
+        self.assertEqual(len(hooks.hulls["rcw26_shelf"]), 1)
+        # The SDF's own <mesh> collider (one convex hull of the whole shelf) is
+        # no longer authored.
+        self.assertNotIn("rcw26_shelf", hooks.authored)
 
     def test_override_replaces_sdf_colliders_and_keeps_measured_map_box(self):
         hooks = _Hooks()
         config = {**self.config, "collision_overrides": {"rcw26_shelf": SHELF_SPEC}}
-        publication = arena_import.run_import(config, self.repo, self.checkout, hooks)
+        publication = arena_import.run_import(config, self.repo, self.checkout, hooks).publication
+        self.assertEqual(hooks.hulls, {})
         authored = hooks.authored["rcw26_shelf"]
         self.assertEqual(len(authored), 10)
         self.assertTrue(all(isinstance(c, BoxCollider) for c in authored))

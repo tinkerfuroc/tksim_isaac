@@ -1,7 +1,6 @@
 """Authoring and reading CoACD hull colliders in converted furniture USDs."""
 from __future__ import annotations
 
-import json
 import math
 import sys
 import tempfile
@@ -48,22 +47,44 @@ def _write_l_usd(path: Path) -> None:
     stage.GetRootLayer().Save()
 
 
+def _box_pieces(*boxes):
+    """Box-shaped ``ConvexPiece``s (8 corners, 12 triangles) for (lo, hi) corner pairs."""
+    import numpy as np
+    from tinker_sim_deploy.arena_coacd import ConvexPiece
+
+    faces = np.array(
+        [(0, 2, 3), (0, 3, 1), (4, 5, 7), (4, 7, 6), (0, 1, 5), (0, 5, 4),
+         (2, 6, 7), (2, 7, 3), (0, 4, 6), (0, 6, 2), (1, 3, 7), (1, 7, 5)],
+        dtype=np.int64,
+    )
+    pieces = []
+    for lo, hi in boxes:
+        verts = np.array(
+            [(x, y, z) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])],
+            dtype=np.float64,
+        )
+        pieces.append(ConvexPiece(vertices=verts, faces=faces.copy()))
+    return pieces
+
+
 class CoacdUsdTests(unittest.TestCase):
+    """pxr only: hull pieces come from ``arena_coacd.decompose_all`` in the
+    importer, so authoring/reading is tested here with fixed box-shaped pieces
+    (CoACD itself is covered by tests/test_arena_coacd.py)."""
+
     def setUp(self):
-        # pxr's native modules must load before coacd's, or the first
-        # ``from pxr import Usd`` segfaults.
         pytest.importorskip("pxr.Usd")
-        pytest.importorskip("coacd")
+        pytest.importorskip("numpy")
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.usd = Path(self._tmp.name) / "l.usd"
         _write_l_usd(self.usd)
         from tinker_sim_deploy import arena_convert
-        from tinker_sim_deploy.arena_coacd import CoacdParams
 
         self.convert = arena_convert
-        self.params = CoacdParams.from_config(
-            json.load(open(ROOT / "config/arena-import.json"))["coacd"]
+        # The L of _write_l_usd in the model frame (geom is translated by (1, 2, 3)).
+        self.pieces = _box_pieces(
+            ((1.0, 2.0, 3.0), (2.0, 2.4, 3.2)), ((1.0, 2.0, 3.2), (1.2, 2.4, 4.0))
         )
 
     def test_read_visual_mesh_triangulates_and_merges(self):
@@ -75,14 +96,13 @@ class CoacdUsdTests(unittest.TestCase):
         self.assertAlmostEqual(vertices[:, 1].min(), 2.0)
         self.assertAlmostEqual(vertices[:, 2].max(), 4.0)
 
-    def test_author_coacd_colliders_writes_invisible_convex_hulls(self):
+    def test_author_collider_pieces_writes_invisible_convex_hulls(self):
         from pxr import Usd, UsdGeom, UsdPhysics
 
-        count = self.convert.author_coacd_colliders(self.usd, self.params)
-        self.assertGreaterEqual(count, 2)
+        self.convert.author_collider_pieces(self.usd, self.pieces)
         stage = Usd.Stage.Open(str(self.usd))
         hulls = [p for p in stage.GetPrimAtPath("/World/Colliders").GetChildren()]
-        self.assertEqual([p.GetName() for p in hulls], [f"hull_{i:02d}" for i in range(count)])
+        self.assertEqual([p.GetName() for p in hulls], ["hull_00", "hull_01"])
         for prim in hulls:
             self.assertTrue(prim.HasAPI(UsdPhysics.CollisionAPI))
             self.assertEqual(
@@ -100,11 +120,15 @@ class CoacdUsdTests(unittest.TestCase):
         import numpy as np
         from tinker_sim_deploy.arena_world import BoxCollider
 
-        count = self.convert.author_coacd_colliders(self.usd, self.params)
+        self.convert.author_collider_pieces(self.usd, self.pieces)
         box = BoxCollider(size=(0.2, 0.2, 0.01), center=(0, 0, 0.7), yaw=0.5)
         self.convert.author_model_colliders(self.usd, (box,))
         pieces = self.convert.read_collider_pieces(self.usd)
-        self.assertEqual(len(pieces), count + 1)
+        self.assertEqual(len(pieces), len(self.pieces) + 1)
+        for got, want in zip(pieces, self.pieces):
+            # Stored as float32 points.
+            np.testing.assert_allclose(got.vertices, want.vertices, atol=1e-6)
+            np.testing.assert_array_equal(got.faces, want.faces)
         box_piece = pieces[-1]
         self.assertEqual(box_piece.faces.shape, (12, 3))
         c, s = math.cos(0.5), math.sin(0.5)
@@ -118,10 +142,31 @@ class CoacdUsdTests(unittest.TestCase):
         for g, e in zip(got, sorted(expected)):
             np.testing.assert_allclose(g, e, atol=1e-9)
 
+    def test_reauthoring_fewer_pieces_leaves_no_stale_colliders(self):
+        from pxr import Usd
+        from tinker_sim_deploy.arena_world import BoxCollider
+
+        three = self.pieces + _box_pieces(((1.5, 2.0, 3.2), (1.7, 2.4, 3.4)))
+        self.convert.author_collider_pieces(self.usd, three)
+        plate = BoxCollider(size=(0.2, 0.2, 0.01), center=(0, 0, 0.7), yaw=0.0)
+        self.convert.author_model_colliders(self.usd, (plate, plate))
+        self.convert.author_collider_pieces(self.usd, self.pieces[:1])
+        stage = Usd.Stage.Open(str(self.usd))
+        names = [p.GetName() for p in stage.GetPrimAtPath("/World/Colliders").GetChildren()]
+        self.assertEqual(names, ["hull_00"])
+        self.assertEqual(len(self.convert.read_collider_pieces(self.usd)), 1)
+
+    def test_same_pieces_give_byte_identical_usd(self):
+        other = self.usd.with_name("other.usd")
+        _write_l_usd(other)
+        self.convert.author_collider_pieces(self.usd, self.pieces)
+        self.convert.author_collider_pieces(other, self.pieces)
+        self.assertEqual(self.usd.read_bytes(), other.read_bytes())
+
     def test_strip_removes_coacd_hulls(self):
         from pxr import Usd
 
-        self.convert.author_coacd_colliders(self.usd, self.params)
+        self.convert.author_collider_pieces(self.usd, self.pieces)
         self.convert.strip_model_colliders(self.usd)
         stage = Usd.Stage.Open(str(self.usd))
         self.assertFalse(stage.GetPrimAtPath("/World/Colliders"))

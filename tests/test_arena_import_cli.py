@@ -196,7 +196,9 @@ class StubHooks:
         self._measure_bounds_return = measure_bounds_return
         self._write_texture = write_texture
         self.convert_calls: list[dict[str, object]] = []
-        self.author_coacd_calls: list[tuple[Path, object]] = []
+        self.read_mesh_calls: list[Path] = []
+        self.decompose_calls: list[tuple[list[str], object]] = []
+        self.author_piece_calls: list[tuple[Path, tuple]] = []
         self.author_box_calls: list[tuple[Path, tuple]] = []
         # model_id -> pieces; default is one box equal to the kitchen table's map box
         self.pieces = pieces if pieces is not None else {
@@ -217,9 +219,16 @@ class StubHooks:
     def author_model_colliders(self, usd, colliders):
         self.author_box_calls.append((usd, tuple(colliders)))
 
-    def author_coacd_colliders(self, usd, params):
-        self.author_coacd_calls.append((usd, params))
-        return len(self.pieces.get(usd.stem, ()))
+    def read_visual_mesh(self, usd):
+        self.read_mesh_calls.append(usd)
+        return np.zeros((4, 3)), np.array([(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)])
+
+    def decompose_all(self, meshes, params):
+        self.decompose_calls.append((sorted(meshes), params))
+        return {model_id: list(self.pieces.get(model_id, ())) for model_id in meshes}
+
+    def author_collider_pieces(self, usd, pieces):
+        self.author_piece_calls.append((usd, tuple(pieces)))
 
     def read_collider_pieces(self, usd):
         return list(self.pieces.get(usd.stem, ()))
@@ -459,9 +468,18 @@ class CoacdWiringTest(unittest.TestCase):
         return outcome, hooks
 
     def test_coacd_authored_for_models_without_override(self):
-        _, hooks = self._run()
-        self.assertEqual(len(hooks.author_coacd_calls), 1)
-        self.assertEqual(hooks.author_coacd_calls[0][0].stem, "rcw26_kitchen_table")
+        config = _base_config(self.commit)
+        _, hooks = self._run(config)
+        self.assertEqual([usd.stem for usd in hooks.read_mesh_calls], ["rcw26_kitchen_table"])
+        # One decompose_all call for every model at once (the process pool).
+        self.assertEqual(
+            hooks.decompose_calls,
+            [(["rcw26_kitchen_table"], arena_import.CoacdParams.from_config(config["coacd"]))],
+        )
+        self.assertEqual(len(hooks.author_piece_calls), 1)
+        usd, pieces = hooks.author_piece_calls[0]
+        self.assertEqual(usd.stem, "rcw26_kitchen_table")
+        self.assertEqual(pieces, tuple(hooks.pieces["rcw26_kitchen_table"]))
         self.assertEqual(hooks.author_box_calls, [])
 
     def test_override_models_keep_boxes(self):
@@ -475,7 +493,8 @@ class CoacdWiringTest(unittest.TestCase):
         }
         expected = arena_world.collision_overrides_from_config(config)["rcw26_kitchen_table"]
         _, hooks = self._run(config)
-        self.assertEqual(hooks.author_coacd_calls, [])
+        self.assertEqual(hooks.read_mesh_calls, [])
+        self.assertEqual(hooks.author_piece_calls, [])
         self.assertEqual(len(hooks.author_box_calls), 1)
         self.assertEqual(hooks.author_box_calls[0][1], tuple(expected))
 
@@ -483,7 +502,7 @@ class CoacdWiringTest(unittest.TestCase):
         config = _base_config(self.commit)
         config["coacd"]["plate_surfaces"] = ["rcw26_kitchen_table"]
         _, hooks = self._run(config)
-        self.assertEqual(len(hooks.author_coacd_calls), 1)
+        self.assertEqual(len(hooks.author_piece_calls), 1)
         self.assertEqual(len(hooks.author_box_calls), 1)
         plates = hooks.author_box_calls[0][1]
         self.assertEqual(len(plates), 1)
@@ -574,10 +593,35 @@ class CoacdWiringTest(unittest.TestCase):
         self.assertEqual(record["overrides"], [])
         self.assertEqual(record["plates"], [])
 
-    def test_reimport_is_idempotent_with_coacd(self):
+    def test_reimport_identity_follows_the_hull_pieces(self):
+        # Wiring only: the artifact identity is a function of the hull pieces
+        # (same pieces -> same identity, different pieces -> a new one), so a
+        # reproducible import needs reproducible CoACD output -- proven with
+        # real CoACD by test_arena_coacd.DecomposeDeterminismTest.
         first, _ = self._run()
         second, _ = self._run()
         self.assertEqual(first.publication.identity, second.publication.identity)
+        hooks = StubHooks(pieces={
+            "rcw26_kitchen_table": [_box_piece((1.2, 0.5, 0.74), (0.0, 0.0, 0.37))]})
+        third, _ = self._run(hooks=hooks)
+        self.assertNotEqual(third.publication.identity, first.publication.identity)
+
+
+class ImportIsolationTest(unittest.TestCase):
+    def test_importing_arena_import_loads_neither_pxr_nor_coacd(self):
+        # The Kit path imports this module before SimulationApp starts, and
+        # Isaac Sim requires pxr to load after it; coacd only ever loads in
+        # arena_coacd.decompose_all's pool workers.
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import arena_import; "
+            "print(sorted(m for m in ('pxr', 'coacd') if m in sys.modules))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(ROOT / "tools")],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]")
 
 
 class FurnitureInstanceSuffixTest(unittest.TestCase):

@@ -71,6 +71,10 @@ class ConverterHooks(Protocol):
     SimulationApp. The real implementation lives in ``arena_convert.py``;
     ``main()`` passes that module directly (its functions structurally
     satisfy this protocol).
+
+    CoACD hulls take three steps: ``read_visual_mesh`` per model, one
+    ``decompose_all`` for every model (a process pool; this process never
+    imports coacd), then ``author_collider_pieces`` per model.
     """
 
     def convert_glb_to_usd(
@@ -86,7 +90,13 @@ class ConverterHooks(Protocol):
         self, usd_path: Path, colliders: tuple[BoxCollider | MeshCollider, ...]
     ) -> None: ...
 
-    def author_coacd_colliders(self, usd_path: Path, params: CoacdParams) -> int: ...
+    def read_visual_mesh(self, usd_path: Path) -> tuple[object, object]: ...
+
+    def decompose_all(
+        self, meshes: Mapping[str, tuple[object, object]], params: CoacdParams
+    ) -> Mapping[str, Sequence[ConvexPiece]]: ...
+
+    def author_collider_pieces(self, usd_path: Path, pieces: Sequence[ConvexPiece]) -> None: ...
 
     def read_collider_pieces(self, usd_path: Path) -> list[ConvexPiece]: ...
 
@@ -128,7 +138,7 @@ def _visual_mesh_info(sdf_bytes: bytes) -> tuple[str, tuple[float, float, float]
     report for why ``convert_glb_to_usd`` grew ``mesh_scale``/``mesh_pose``).
 
     Fails closed if the model SDF declares more than one visual mesh: the
-    importer only converts a single GLB per model (``convert_furniture_model``
+    importer only converts a single GLB per model (``_convert_model``
     produces exactly one ``furniture/<id>.usd``), so silently picking the
     first match would drop the second mesh's geometry and its GLB would
     never enter the source lock.
@@ -251,9 +261,14 @@ def _convert_model(
     model_id: str,
     converter: ConverterHooks,
     collider_override: tuple[BoxCollider, ...] | None = None,
-    coacd: CoacdParams | None = None,
-    plates: tuple[BoxCollider, ...] = (),
-) -> tuple[Path, bytes, tuple[BoxCollider | MeshCollider, ...], tuple[float, ...], tuple[float, ...]]:
+    hulls: bool = False,
+) -> tuple[Path, bytes, tuple[BoxCollider | MeshCollider, ...], str, Path]:
+    """Convert one model's GLB to ``scratch/furniture/<model_id>.usd``.
+
+    Authors its box/SDF colliders now, unless ``hulls``: then its CoACD hulls
+    are authored later (``finish_furniture_model``), once every model's mesh
+    has been decomposed in one process pool.
+    """
     sdf_bytes = _read_upstream(checkout, f"models/{model_id}/model.sdf")
     # A config "collision_overrides" entry replaces the SDF's own colliders
     # (see arena_world.expand_collision_override): the open shelves' SDF
@@ -264,14 +279,8 @@ def _convert_model(
 
     usd_path = scratch / "furniture" / f"{model_id}.usd"
     converter.convert_glb_to_usd(glb_path, usd_path, mesh_scale=scale, mesh_pose=pose)
-    if coacd is None or collider_override is not None:
+    if not hulls:
         converter.author_model_colliders(usd_path, colliders)
-    else:
-        # The published collider is the CoACD hull set; ``colliders`` (the
-        # SDF's own) are still returned for the nav map and bounds check.
-        converter.author_coacd_colliders(usd_path, coacd)
-        if plates:
-            converter.author_model_colliders(usd_path, plates)
     return usd_path, sdf_bytes, colliders, uri, glb_path
 
 
@@ -284,20 +293,25 @@ def _relative_glb_record_path(checkout: Path, glb_path: Path) -> str:
     return glb_path.relative_to(checkout).as_posix()
 
 
-def convert_furniture_model(
+def finish_furniture_model(
     checkout: Path,
-    scratch: Path,
     model_id: str,
+    converted: tuple[Path, bytes, tuple[BoxCollider | MeshCollider, ...], str, Path],
     converter: ConverterHooks,
     tolerance: float,
     bounds_check_exceptions: frozenset[str] = frozenset(),
-    collider_override: tuple[BoxCollider, ...] | None = None,
-    coacd: CoacdParams | None = None,
+    hulls: Sequence[ConvexPiece] | None = None,
     plates: tuple[BoxCollider, ...] = (),
 ) -> _FurnitureConversion:
-    usd_path, sdf_bytes, colliders, uri, glb_path = _convert_model(
-        checkout, scratch, model_id, converter, collider_override, coacd, plates
-    )
+    """Author a ``_convert_model`` result's CoACD ``hulls`` (if any) plus its
+    surface ``plates``, check its bounds, and collect its payload and pieces."""
+    usd_path, sdf_bytes, colliders, _uri, glb_path = converted
+    if hulls is not None:
+        # The published collider is the CoACD hull set; ``colliders`` (the
+        # SDF's own) are still used for the nav map and bounds check.
+        converter.author_collider_pieces(usd_path, hulls)
+        if plates:
+            converter.author_model_colliders(usd_path, plates)
     measured = converter.measure_bounds(usd_path)
 
     box_colliders = tuple(item for item in colliders if isinstance(item, BoxCollider))
@@ -321,7 +335,7 @@ def convert_furniture_model(
         model_id=model_id,
         payload=_furniture_payload(usd_path, model_id),
         map_colliders=map_colliders,
-        pieces=tuple(converter.read_collider_pieces(usd_path)) if coacd is not None else (),
+        pieces=tuple(converter.read_collider_pieces(usd_path)),
         source_records=records,
     )
 
@@ -446,11 +460,25 @@ def run_import(
         pieces: dict[str, tuple[ConvexPiece, ...]] = {}
         records: list[dict[str, object]] = [_source_record(str(config["world"]), world_bytes)]
 
+        converted = {}
+        meshes = {}
         for model_id in model_ids:
-            conversion = convert_furniture_model(
-                checkout, scratch, model_id, converter, tolerance, bounds_check_exceptions,
-                collider_override=collider_overrides.get(model_id),
-                coacd=coacd,
+            # Models with a collision override keep its boxes; every other
+            # model gets CoACD hulls of its visual mesh.
+            hulls = model_id not in collider_overrides
+            converted[model_id] = _convert_model(
+                checkout, scratch, model_id, converter, collider_overrides.get(model_id), hulls=hulls
+            )
+            if hulls:
+                meshes[model_id] = converter.read_visual_mesh(converted[model_id][0])
+        # All decompositions at once: a pool of single-threaded workers, so
+        # the hulls are reproducible (see arena_coacd) without a serial wait.
+        hull_pieces = converter.decompose_all(meshes, coacd)
+
+        for model_id in model_ids:
+            conversion = finish_furniture_model(
+                checkout, model_id, converted[model_id], converter, tolerance, bounds_check_exceptions,
+                hulls=hull_pieces[model_id] if model_id in meshes else None,
                 plates=_plates_for(model_id, surface_specs) if model_id in coacd.plate_surfaces else (),
             )
             payload.update(conversion.payload)
@@ -572,9 +600,9 @@ class ReuseFurnitureHooks:
     .usd`` (+ its ``textures/<model_id>`` directory) from a previously
     published artifact and strips the colliders authored there
     (``arena_convert.strip_model_colliders``), giving the same corrected mesh
-    Kit's converter would produce; collider authoring, composition and
-    measurement then run through the real pxr-only ``arena_convert``
-    functions. Use it when only collider/composition logic changed and the
+    Kit's converter would produce; collider authoring (CoACD decomposition
+    included), composition and measurement then run through the real
+    pxr-only ``arena_convert`` functions. Use it when only collider/composition logic changed and the
     GLB->USD conversion (which needs a running Kit / ``omni.kit.asset_converter``)
     would be a no-op re-run. The source lock is still derived from the pinned
     checkout's SDF/GLB bytes, exactly as in a full import.
@@ -608,8 +636,14 @@ class ReuseFurnitureHooks:
     def author_model_colliders(self, usd_path: Path, colliders) -> None:
         self._real.author_model_colliders(usd_path, colliders)
 
-    def author_coacd_colliders(self, usd_path: Path, params: CoacdParams) -> int:
-        return self._real.author_coacd_colliders(usd_path, params)
+    def read_visual_mesh(self, usd_path: Path):
+        return self._real.read_visual_mesh(usd_path)
+
+    def decompose_all(self, meshes, params: CoacdParams):
+        return self._real.decompose_all(meshes, params)
+
+    def author_collider_pieces(self, usd_path: Path, pieces) -> None:
+        self._real.author_collider_pieces(usd_path, pieces)
 
     def read_collider_pieces(self, usd_path: Path) -> list[ConvexPiece]:
         return self._real.read_collider_pieces(usd_path)

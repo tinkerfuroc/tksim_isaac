@@ -477,22 +477,37 @@ def read_visual_mesh(usd_path: Path):
     )
 
 
-def author_coacd_colliders(usd_path: Path, params) -> int:
-    """Replace a furniture USD's colliders with CoACD convex hulls of its visual mesh.
+def decompose_all(meshes, params) -> dict:
+    """CoACD pieces for every ``model_id -> read_visual_mesh(...)`` mesh.
+
+    ``arena_coacd.decompose_all``: a process pool of single-threaded workers
+    (reproducible pieces); this process never imports coacd itself.
+    """
+    from .arena_coacd import decompose_all as _decompose_all
+
+    return _decompose_all(meshes, params)
+
+
+def author_collider_pieces(usd_path: Path, pieces) -> None:
+    """Replace a furniture USD's colliders with convex hull pieces (from ``decompose_all``).
 
     Each piece becomes an invisible ``UsdGeom.Mesh`` ``hull_NN`` under
     ``<default prim>/Colliders`` with ``CollisionAPI`` and a ``convexHull``
-    ``MeshCollisionAPI``; the visual meshes get no collision API. Returns the
-    piece count.
+    ``MeshCollisionAPI``; the visual meshes get no collision API. Any
+    ``hull_*``/``box_*`` colliders already there are removed first, so a
+    re-run with fewer pieces leaves nothing stale (surface plates are
+    authored after this, by ``author_model_colliders``).
     """
     from pxr import Gf, Usd, UsdGeom, UsdPhysics, Vt
 
-    from .arena_coacd import decompose
-
-    pieces = decompose(*read_visual_mesh(usd_path), params)
     stage = Usd.Stage.Open(str(usd_path))
     default_prim = _default_prim_or_raise(stage, usd_path)
     colliders_path = default_prim.GetPath().AppendChild("Colliders")
+    existing = stage.GetPrimAtPath(colliders_path)
+    if existing:
+        stale = [p.GetPath() for p in existing.GetChildren() if p.GetName().startswith(("hull_", "box_"))]
+        for path in stale:
+            stage.RemovePrim(path)
     UsdGeom.Scope.Define(stage, colliders_path)
     for index, piece in enumerate(pieces):
         mesh = UsdGeom.Mesh.Define(stage, colliders_path.AppendChild(f"hull_{index:02d}"))
@@ -503,7 +518,6 @@ def author_coacd_colliders(usd_path: Path, params) -> int:
         UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr("convexHull")
         UsdGeom.Imageable(mesh.GetPrim()).MakeInvisible()
     _resave_fresh(stage, usd_path)
-    return len(pieces)
 
 
 def read_collider_pieces(usd_path: Path) -> list:
