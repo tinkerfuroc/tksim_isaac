@@ -29,6 +29,22 @@ import numpy as np
 MAX_WORKERS = 8
 
 
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+# CoacdParams field annotation -> value check (annotations are strings here).
+_TYPE_CHECKS = {
+    "bool": lambda value: isinstance(value, bool),
+    "int": _is_int,
+    "float": lambda value: _is_int(value) or isinstance(value, float),
+    "str": lambda value: isinstance(value, str),
+    "tuple[str, ...]": lambda value: (
+        isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value)
+    ),
+}
+
+
 @dataclass(frozen=True)
 class CoacdParams:
     threshold: float
@@ -41,6 +57,7 @@ class CoacdParams:
     mcts_max_depth: int
     pca: bool
     merge: bool
+    decimate: bool
     max_ch_vertex: int
     seed: int
     plate_surfaces: tuple[str, ...] = ()
@@ -57,8 +74,12 @@ class CoacdParams:
             raise ValueError(f"coacd config missing keys: {missing}")
         if extra:
             raise ValueError(f"coacd config has unknown keys: {extra}")
+        for f in fields(cls):
+            if not _TYPE_CHECKS[f.type](config[f.name]):
+                raise ValueError(f"coacd config {f.name!r} must be {f.type}, got {config[f.name]!r}")
         values = {k: config[k] for k in names}
-        values["plate_surfaces"] = tuple(str(s) for s in values["plate_surfaces"])
+        values["threshold"] = float(values["threshold"])
+        values["plate_surfaces"] = tuple(values["plate_surfaces"])
         return cls(**values)
 
     def as_record(self) -> dict[str, object]:
@@ -103,7 +124,9 @@ def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> l
     """Decompose a triangle mesh into convex pieces sorted by (min z, min y, min x).
 
     Single-threaded, so the same mesh and parameters give the same pieces in
-    any process.
+    any process. Fails closed if a piece has more than ``max_ch_vertex``
+    vertices (``decimate`` is what enforces that cap; PhysX would otherwise
+    re-cook the hull into a different shape).
     """
     verts = np.asarray(vertices, dtype=np.float64)
     tris = np.asarray(faces, dtype=np.int64)
@@ -131,6 +154,7 @@ def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> l
         mcts_max_depth=params.mcts_max_depth,
         pca=params.pca,
         merge=params.merge,
+        decimate=params.decimate,
         max_ch_vertex=params.max_ch_vertex,
         seed=params.seed,
     )
@@ -140,6 +164,12 @@ def decompose(vertices: np.ndarray, faces: np.ndarray, params: CoacdParams) -> l
         ConvexPiece(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64))
         for v, f in parts
     ]
+    oversized = [len(p.vertices) for p in pieces if len(p.vertices) > params.max_ch_vertex]
+    if oversized:
+        raise ValueError(
+            f"CoACD returned {len(oversized)} pieces over max_ch_vertex={params.max_ch_vertex} "
+            f"vertices (largest {max(oversized)}; decimate={params.decimate})"
+        )
     pieces.sort(key=lambda p: tuple(p.vertices.min(axis=0)[::-1]))
     return pieces
 

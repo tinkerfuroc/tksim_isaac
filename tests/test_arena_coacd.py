@@ -41,8 +41,10 @@ class CoacdParamsTests(unittest.TestCase):
     def test_from_config_reads_repo_config(self):
         params = CoacdParams.from_config(_config())
         self.assertEqual(params.max_ch_vertex, 64)
+        self.assertIs(params.decimate, True)
         self.assertEqual(params.seed, 0)
         self.assertEqual(params.plate_surfaces, ())
+        self.assertIs(params.as_record()["decimate"], True)
 
     def test_from_config_rejects_missing_key(self):
         cfg = _config()
@@ -60,6 +62,32 @@ class CoacdParamsTests(unittest.TestCase):
         cfg = _config()
         cfg["_other"] = "x"
         CoacdParams.from_config(cfg)
+
+    def test_from_config_rejects_wrongly_typed_values(self):
+        for key, bad in (
+            ("decimate", "false"),
+            ("decimate", 0),
+            ("pca", None),
+            ("merge", "true"),
+            ("seed", True),
+            ("max_ch_vertex", 64.0),
+            ("resolution", "2000"),
+            ("threshold", "0.02"),
+            ("threshold", False),
+            ("preprocess_mode", 1),
+            ("plate_surfaces", "rcw26_kitchen_table"),
+            ("plate_surfaces", [1]),
+        ):
+            cfg = _config()
+            cfg[key] = bad
+            with self.assertRaises(ValueError, msg=f"{key}={bad!r}"):
+                CoacdParams.from_config(cfg)
+
+    def test_from_config_accepts_an_integer_threshold_as_float(self):
+        cfg = _config()
+        cfg["threshold"] = 1
+        params = CoacdParams.from_config(cfg)
+        self.assertIsInstance(params.threshold, float)
 
 
 class DecomposeTests(unittest.TestCase):
@@ -92,6 +120,25 @@ class DecomposeTests(unittest.TestCase):
             self.assertTrue(np_equal(x.vertices, y.vertices))
             self.assertTrue(np_equal(x.faces, y.faces))
 
+    def test_decimate_caps_hull_vertices_on_a_curved_mesh(self):
+        # A 96-section cylinder is one convex piece of 192 vertices unless
+        # decimate enforces max_ch_vertex (PhysX's 64-vertex hull limit).
+        _require_coacd()
+        trimesh = pytest.importorskip("trimesh")
+        mesh = trimesh.creation.cylinder(radius=0.2, height=0.3, sections=96)
+        pieces = decompose(mesh.vertices, mesh.faces, CoacdParams.from_config(_config()))
+        self.assertTrue(pieces)
+        for p in pieces:
+            self.assertLessEqual(len(p.vertices), 64)
+
+    def test_pieces_over_the_vertex_cap_fail_closed(self):
+        _require_coacd()
+        trimesh = pytest.importorskip("trimesh")
+        mesh = trimesh.creation.cylinder(radius=0.2, height=0.3, sections=96)
+        cfg = _config()
+        cfg["decimate"] = False
+        with self.assertRaisesRegex(ValueError, "max_ch_vertex"):
+            decompose(mesh.vertices, mesh.faces, CoacdParams.from_config(cfg))
 
 
 class DecomposeFailClosedTests(unittest.TestCase):

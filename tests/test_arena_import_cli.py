@@ -161,6 +161,7 @@ def _base_config(commit: str) -> dict[str, object]:
             "mcts_max_depth": 3,
             "pca": False,
             "merge": True,
+            "decimate": True,
             "max_ch_vertex": 64,
             "seed": 0,
             "plate_surfaces": [],

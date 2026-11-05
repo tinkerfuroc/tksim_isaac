@@ -87,11 +87,11 @@
     }
   },
   "coacd": {
-    "_comment": "CoACD convex decomposition of every furniture visual mesh (collision_overrides keep precedence). max_ch_vertex 64: PhysX's convexHull cooking caps hulls at 64 vertices by default, so larger pieces would be re-simplified at load time and stop matching what the outline check measured. seed fixed for reproducible artifacts.",
+    "_comment": "CoACD convex decomposition of every furniture visual mesh (collision_overrides keep precedence). max_ch_vertex 64: PhysX's convexHull cooking caps hulls at 64 vertices by default, so larger pieces would be re-simplified at load time and stop matching what the outline check measured; decimate is what enforces that cap (CoACD ignores max_ch_vertex without it), and the import fails closed on any piece over it. seed fixed and every decomposition single-threaded for reproducible artifacts.",
     "threshold": 0.02, "max_convex_hull": -1, "preprocess_mode": "auto",
     "preprocess_resolution": 100, "resolution": 2000, "mcts_nodes": 20,
     "mcts_iterations": 150, "mcts_max_depth": 3, "pca": false, "merge": true,
-    "max_ch_vertex": 64, "seed": 0, "plate_surfaces": []
+    "decimate": true, "max_ch_vertex": 64, "seed": 0, "plate_surfaces": []
   },
   "bounds_tolerance_m": 0.02
 }
