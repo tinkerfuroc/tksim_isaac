@@ -42,6 +42,62 @@ class PublicationTest(unittest.TestCase):
             source_lock=_SOURCE_LOCK,
         )
 
+    def _pointer(self):
+        return self.root / "artifacts" / "arena" / "rcw2026" / "current.json"
+
+    def _publish_b(self, **kwargs):
+        return arena_artifact.publish_asset_artifact(
+            self.root,
+            kind="arena",
+            asset_id="rcw2026",
+            payload={"arena.usd": b"usd-bytes-B"},
+            source_lock=_SOURCE_LOCK,
+            **kwargs,
+        )
+
+    def test_publish_without_select_keeps_existing_pointer(self):
+        self._publish(self.root)
+        before = self._pointer().read_bytes()
+        pub_b = self._publish_b(select=False)
+        self.assertEqual(self._pointer().read_bytes(), before)
+        self.assertTrue(pub_b.artifact_dir.is_dir())
+
+    def test_publish_without_select_first_time_writes_no_pointer(self):
+        self._publish_b(select=False)
+        self.assertFalse(self._pointer().exists())
+
+    def test_select_points_at_identity(self):
+        self._publish(self.root)
+        pub_b = self._publish_b(select=False)
+        pointer = arena_artifact.select_asset_artifact(
+            self.root, kind="arena", asset_id="rcw2026", identity=pub_b.identity
+        )
+        self.assertEqual(pointer, self._pointer())
+        self.assertEqual(
+            json.loads(pointer.read_text())["manifest"],
+            f"artifacts/arena/rcw2026/{pub_b.identity}/manifest.json",
+        )
+
+    def test_select_rejects_unknown_identity(self):
+        self._publish(self.root)
+        before = self._pointer().read_bytes()
+        with self.assertRaises(arena_artifact.AssetArtifactError):
+            arena_artifact.select_asset_artifact(
+                self.root, kind="arena", asset_id="rcw2026", identity="0" * 64
+            )
+        self.assertEqual(self._pointer().read_bytes(), before)
+
+    def test_select_rejects_mutated_artifact(self):
+        self._publish(self.root)
+        before = self._pointer().read_bytes()
+        pub_b = self._publish_b(select=False)
+        (pub_b.artifact_dir / "arena.usd").write_bytes(b"tampered")
+        with self.assertRaises(arena_artifact.AssetArtifactError):
+            arena_artifact.select_asset_artifact(
+                self.root, kind="arena", asset_id="rcw2026", identity=pub_b.identity
+            )
+        self.assertEqual(self._pointer().read_bytes(), before)
+
     def test_publish_creates_immutable_dir_and_pointer(self):
         root = self.root
         pub = self._publish(root)

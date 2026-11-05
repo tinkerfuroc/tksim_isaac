@@ -1,0 +1,32 @@
+/* Dark tokens from mockups/check-poses-v7.html. */
+:root {
+  color-scheme: dark;
+  --ink: #e4e9f0;
+  --muted: #8d99a9;
+  --line: #2a323d;
+  --ground: #11151b;
+  --panel: #181d25;
+  --raise: #1f2630;
+  --accent: #6aa5ec;
+  --accent-ink: #0d1520;
+  --accent-soft: #1d2d42;
+  --warn: #f0b04a; --warn-soft: #3a2c12;
+  --bad: #f2776c;  --bad-soft: #3d1c1a;
+  --ok: #67c993;   --ok-soft: #173326;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); font-size: 14px; }
+.muted { color: var(--muted); }
+.top { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--raise); border-bottom: 1px solid var(--line); }
+.top h1 { margin: 0; font-size: 15px; font-weight: 600; }
+.top nav { display: flex; gap: 4px; }
+.tab { padding: 6px 12px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+.tab:hover { background: var(--panel); color: var(--ink); }
+.tab.on { background: var(--accent-soft); color: var(--accent); }
+.screen { padding: 20px; }
+button, input, select, textarea { font-family: inherit; font-size: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 500; }
+.mono { font-family: var(--mono); }

@@ -157,6 +157,7 @@ class RosStandardGateway:
         # scene, including bodies spawned after boot, which the map raycast
         # structurally cannot.
         self.lidar_rig = lidar_rig
+        self._lidar_folds_on_substep = self._attach_lidar_to_substeps()
         self.node = Node("tinker_isaac_gateway")
         # Keep commands and safety transitions in one FIFO.  Draining separate
         # queues by category can apply an old command after a stop has been
@@ -1422,6 +1423,12 @@ class RosStandardGateway:
         prof["n"] = 0
         return out
 
+    def lidar_profile_snapshot(self) -> dict | None:
+        """Per-fold ms attribution of the raycast lidar, or None without one."""
+        rig = getattr(self, "lidar_rig", None)
+        reader = getattr(rig, "profile_snapshot", None)
+        return None if reader is None else reader()
+
     def camera_profile_snapshot(self) -> dict:
         """Per-call ms attribution of publish_cameras(); resets the window."""
         prof = self._camera_profile
@@ -1465,16 +1472,10 @@ class RosStandardGateway:
             self.imu_pub.publish(self._imu_message(stamp))
         _lap("imu")
         rig = getattr(self, "lidar_rig", None)
-        if rig is not None:
-            # Drive the frame accumulator from the publish path as well as
-            # from the rig's physics callback. The callback is only dispatched
-            # when physics is stepped through SimulationManager; the
-            # production loop steps through IsaacLab's SimulationContext, where
-            # it is not, and the first live nav battery consequently saw
-            # /livox/lidar silent for an entire run while the sensor happily
-            # cast rays. Folding is deduplicated by physics step, so having
-            # both drivers is safe rather than double-counting.
-            rig.accumulate()
+        # The rig is normally folded after every physics substep by the
+        # backend (see _attach_lidar_to_substeps); this poll is only the
+        # fallback for backends without substep hooks.
+        self._poll_lidar_if_unattached()
         if self._cloud_publish_enabled():
             if rig is not None:
                 cloud = self._live_point_cloud(stamp)
@@ -1912,6 +1913,27 @@ class RosStandardGateway:
         if rig is not None:
             return bool(rig.frame_ready)
         return bool(self.development_lidar) and self._tick % self._lidar_stride == 0
+
+    def _attach_lidar_to_substeps(self) -> bool:
+        """Fold the lidar after every physics substep, if the backend allows.
+
+        The sweep fires one slice per PHYSICS step; polling once per control
+        step drops all but the last substep's slice. Returns whether the rig
+        is now driven by the backend, in which case the publish path must
+        not poll it as well.
+        """
+        rig = getattr(self, "lidar_rig", None)
+        register = getattr(self.backend, "add_post_substep_hook", None)
+        if rig is None or register is None:
+            return False
+        register(lambda: rig.accumulate(source="substep"))
+        return True
+
+    def _poll_lidar_if_unattached(self) -> None:
+        """Publish-path fallback for backends without substep hooks."""
+        rig = getattr(self, "lidar_rig", None)
+        if rig is not None and not getattr(self, "_lidar_folds_on_substep", False):
+            rig.accumulate()
 
     def _lidar_diagnostics(self):
         """Frame-assembly counters for the status heartbeat, or ``None``."""

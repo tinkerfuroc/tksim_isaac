@@ -26,6 +26,7 @@ by hand unless you're debugging a specific stage.
   --manipulation mock --sim-gpu 0                 # hybrid: manipulation mocked
 ./scripts/gpsr-stack up --scenario gpsr-rcw2026-bench --seed 0 \
   --manipulation live --sim-gpu 0 --manip-gpu 1    # live manipulation, separate GPU
+./scripts/gpsr-stack up ... --lidar battery|parity|planar   # lidar preset (default battery: raycast pinned to 24 channels)
 ./scripts/gpsr-stack status                        # one-shot interface census
 ./scripts/gpsr-stack down                          # tears down the newest run dir
 ./scripts/gpsr-stack up ... --evidence              # arena observer camera on (contact sheets); costs RTF, off for batteries
@@ -69,7 +70,8 @@ This **MUST be empty**. If it is not, wait — do not contend for the GPU.
 
 ## Conventions used in every stage below
 
-- All six stacks share `ROS_DOMAIN_ID=42` (the plan's live-run domain; the
+- Every stack stage (sim, bridge, vision, manipulation, nav_extras,
+  rtf_monitor) shares `ROS_DOMAIN_ID=42` (the plan's live-run domain; the
   repo's own `deployment.env.example` default of `25` is for other
   workflows — override it here).
 - `TINKER_WS=/home/tinker/tk25_ws` is the external Humble workspace; it holds
@@ -217,8 +219,49 @@ Expected RTF (simulated / wall; gpsr-rcw2026, rcw2026 arena, this host):
 | `TINKER_SIM_CONTROL_HZ=30` | 1.88 | ~0.85 | — |
 | arena camera on (`--evidence`) | — | — | **~0.58 idle** (0.54-0.59, 2026-08-29 bench measurement, vision attached — not directly comparable to the 0.81 row above, measured without vision) |
 
-Adding `TINKER_SIM_CPU_THREADS=16` (Kit's worker pool; default 32 on this
-host) is worth ~0.03-0.05 on every bridge-attached figure and is safe.
+#### Measured driving RTF per lidar preset (2026-10-11)
+
+Full GPSR stack (`--manipulation mock --sim-gpu 1`), GPU 1 shared by the sim
+and vision, loadavg 13-23 (shared host), RTF = `rtf_monitor` mean over four
+Nav2 goals. Run-to-run noise is about ±0.04.
+
+Preset mechanics: the raycast lidar is `run_sim`'s default (PR #29; unset scale
+is 44 channels), so `battery` and `parity` pass no lidar flag. `battery` pins
+`TINKER_SIM_LIDAR_CHANNELS` to 24 (a caller export wins). `parity` sets
+`TINKER_SIM_LIDAR_CHANNELS`/`_COLUMNS` explicitly to the contract values read
+from `simulation/sensors/hardware-parity.json` (exported shell values do not
+leak in; a missing contract file is an error). `planar` passes `--map-lidar`,
+the opt-out.
+
+| `--lidar` preset | RTF while driving |
+|---|---|
+| `planar` (`--map-lidar`, no raycast) | 0.478 |
+| `battery`, 24 ch (default) | 0.381 (one of 4 goals hit its 150 s timeout) |
+| `battery`, 16 ch (`TINKER_SIM_LIDAR_CHANNELS=16`) | 0.373 |
+| `battery`, 32 ch | 0.317 |
+| `parity` (contract 57 ch) | 0.255 |
+
+The target of RTF >= 0.5 with the raycast lidar is **not met** on this host:
+even `planar` stays under 0.5 here. The ~0.68 planar figure above was
+measured on a quieter host without vision on the sim's GPU and does not
+compare with this table. `TINKER_SIM_CPU_THREADS=16` gave no gain on this
+stack (0.342 vs 0.381) and is not a default; the 24-channel default stays.
+
+Per-run RTF: the `rtf_monitor` stage appends 30 s-window RTF samples to
+`$GPSR_RUN_DIR/rtf.jsonl` and logs a WARN line (`05-rtf_monitor.log` in mock
+mode): once when `rtf_30s` crosses below 0.5, then a reminder every 60 s
+while it stays below, plus an OK line on recovery. Per-trial RTF:
+`python3 tools/rtf_monitor.py --summarise <rtf.jsonl> --from <wall> --to <wall>`.
+
+`GPSR_ROS_DOMAIN_ID` puts every stage on a private DDS domain (pick one no
+other session uses). Export the same `ROS_DOMAIN_ID` for your own CLI
+commands and for `scripts/kill-domain-nodes <id>`, or they will look at
+domain 42. `GPSR_VISION_GPU=<n>` runs vision on another GPU than the
+sim (opt-in; its RTF gain is unmeasured).
+
+`TINKER_SIM_CPU_THREADS=16` (Kit's worker pool; default 32 on this host) gave
+no gain on the full stack (0.342 vs 0.381, see the table above); it is safe
+but not a default.
 
 What bounds RTF at control 60 is the PhysX solve (~9 ms per control step)
 and Kit's render pump for both RTX cameras (~30 ms per camera frame, scaling

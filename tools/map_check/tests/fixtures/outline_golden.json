@@ -1,0 +1,606 @@
+[
+  {
+    "name": "A_free_standing",
+    "comment": "free-standing table: ring and interior all at 0.45",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}},
+    "erased": [],
+    "cells": [
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [0, 0, 255, 255, 255, 255, 255, 255, 0, 0],
+      [0, 0, 255, 1, 1, 1, 1, 255, 0, 0],
+      [0, 0, 255, 255, 255, 255, 255, 255, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "..........",
+      "..ffffff..",
+      "..fiiiif..",
+      "..ffffff..",
+      ".........."
+    ],
+    "legend": {".": [null, ""], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
+    "heights": [
+      [null, null, null, null, null, null, null, null, null, null],
+      [null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null],
+      [null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null],
+      [null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null],
+      [null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["", "", "", "", "", "", "", "", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "B_free_standing_tall",
+    "comment": "as A at 1.50",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 1.5}},
+    "erased": [],
+    "cells": [
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [0, 0, 255, 255, 255, 255, 255, 255, 0, 0],
+      [0, 0, 255, 1, 1, 1, 1, 255, 0, 0],
+      [0, 0, 255, 255, 255, 255, 255, 255, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "..........",
+      "..ffffff..",
+      "..fiiiif..",
+      "..ffffff..",
+      ".........."
+    ],
+    "legend": {".": [null, ""], "f": [1.5, "shape:1"], "i": [1.5, "shape:1"]},
+    "heights": [
+      [null, null, null, null, null, null, null, null, null, null],
+      [null, null, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null],
+      [null, null, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null],
+      [null, null, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null],
+      [null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["", "", "", "", "", "", "", "", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "C_wall_1cell",
+    "comment": "table against a 1-cell wall: back strip (S, incl. both junction cells) stays wall 0.60",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "####SSSSSSS####",
+      "....fiiiiif....",
+      "....fiiiiif....",
+      "....fffffff....",
+      "..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6],
+      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "D_wall_1cell_tall",
+    "comment": "as C at 1.50: back strip R rises to 1.50 as wall, the wall beyond stays 0.60",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 1.5}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "####RRRRRRR####",
+      "....fiiiiif....",
+      "....fiiiiif....",
+      "....fffffff....",
+      "..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "R": [1.5, "wall"], "f": [1.5, "shape:1"], "i": [1.5, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.6, 0.6, 0.6, 0.6],
+      [null, null, null, null, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null, null, null],
+      [null, null, null, null, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null, null, null],
+      [null, null, null, null, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null, null, null],
+      [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "D2_pair_on_wall",
+    "comment": "tables 1 (0.45) and 2 (1.50) side by side on a wall, sharing column 8: shared cells owned by 2; strip behind 1 stays 0.60 (S), behind 2 and at the shared cell 1.50 (R)",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}, "2": {"fill": true, "height": 1.5}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [0, 0, 0, 255, 1, 1, 1, 1, 255, 2, 2, 2, 2, 255, 0, 0],
+      [0, 0, 0, 255, 1, 1, 1, 1, 255, 2, 2, 2, 2, 255, 0, 0],
+      [0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "###SSSSSRRRRRR##",
+      "...aaaaabbbbbb..",
+      "...aaaaabbbbbb..",
+      "...aaaaabbbbbb..",
+      "................"
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "R": [1.5, "wall"], "a": [0.45, "shape:1"], "b": [1.5, "shape:2"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.6, 0.6],
+      [null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null],
+      [null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null],
+      [null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, null, null],
+      [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "", ""],
+      ["", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "", ""],
+      ["", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "", ""],
+      ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "E_wall_2cell",
+    "comment": "2-cell-thick wall (wall height 0.80): side edges are free edges; only the wall row touching the table is strip (at 0.80 = wall height)",
+    "wall_height": 0.8,
+    "shapes": {"1": {"fill": true, "height": 0.45}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "###############",
+      "####SSSSSSS####",
+      "....fiiiiif....",
+      "....fffffff....",
+      "..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.8, "wall"], "S": [0.8, "wall"], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
+    "heights": [
+      [0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8],
+      [0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8],
+      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "F_corner",
+    "comment": "table in a room corner: top row and left column are strip at 0.60, incl. corner and junctions; right and bottom edges are free at 0.45",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [255, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "SSSSSS####",
+      "Siiiif....",
+      "Siiiif....",
+      "Sfffff....",
+      "#.........",
+      "#........."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6],
+      [0.6, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [0.6, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [0.6, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "G_two_tables",
+    "comment": "two free-standing tables sharing column 5: the shared cells take the taller (0.75)",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}, "2": {"fill": true, "height": 0.75}},
+    "erased": [],
+    "cells": [
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0],
+      [0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 0],
+      [0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 0],
+      [0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "...........",
+      ".aaaabbbbb.",
+      ".aaaabbbbb.",
+      ".aaaabbbbb.",
+      ".aaaabbbbb.",
+      "..........."
+    ],
+    "legend": {".": [null, ""], "a": [0.45, "shape:1"], "b": [0.75, "shape:2"]},
+    "heights": [
+      [null, null, null, null, null, null, null, null, null, null, null],
+      [null, 0.45, 0.45, 0.45, 0.45, 0.75, 0.75, 0.75, 0.75, 0.75, null],
+      [null, 0.45, 0.45, 0.45, 0.45, 0.75, 0.75, 0.75, 0.75, 0.75, null],
+      [null, 0.45, 0.45, 0.45, 0.45, 0.75, 0.75, 0.75, 0.75, 0.75, null],
+      [null, 0.45, 0.45, 0.45, 0.45, 0.75, 0.75, 0.75, 0.75, 0.75, null],
+      [null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["", "", "", "", "", "", "", "", "", "", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "G2_two_tables_tie",
+    "comment": "as G with equal heights: the shared column goes to the lowest id (shape 1)",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.5}, "2": {"fill": true, "height": 0.5}},
+    "erased": [],
+    "cells": [
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0],
+      [0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 0],
+      [0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 0],
+      [0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "...........",
+      ".aaaaabbbb.",
+      ".aaaaabbbb.",
+      ".aaaaabbbb.",
+      ".aaaaabbbb.",
+      "..........."
+    ],
+    "legend": {".": [null, ""], "a": [0.5, "shape:1"], "b": [0.5, "shape:2"]},
+    "heights": [
+      [null, null, null, null, null, null, null, null, null, null, null],
+      [null, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, null],
+      [null, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, null],
+      [null, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, null],
+      [null, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, null],
+      [null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["", "", "", "", "", "", "", "", "", "", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:2", "shape:2", "shape:2", "shape:2", ""],
+      ["", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "H_unfilled",
+    "comment": "C unfilled: ring all wall 0.60, interior empty",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": false, "height": 0.45}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "###############",
+      "....#.....#....",
+      "....#.....#....",
+      "....#######....",
+      "..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6],
+      [null, null, null, null, 0.6, null, null, null, null, null, 0.6, null, null, null, null],
+      [null, null, null, null, 0.6, null, null, null, null, null, 0.6, null, null, null, null],
+      [null, null, null, null, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, null, null, null, null],
+      [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["", "", "", "", "wall", "", "", "", "", "", "wall", "", "", "", ""],
+      ["", "", "", "", "wall", "", "", "", "", "", "wall", "", "", "", ""],
+      ["", "", "", "", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "", "", "", ""],
+      ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "I_room_unfilled",
+    "comment": "unfilled room 1 around a filled free-standing table 2 (1.20): room walls unchanged",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": false, "height": 0.6}, "2": {"fill": true, "height": 1.2}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [255, 1, 1, 1, 1, 1, 1, 1, 1, 255],
+      [255, 1, 255, 255, 255, 255, 255, 255, 1, 255],
+      [255, 1, 255, 2, 2, 2, 2, 255, 1, 255],
+      [255, 1, 255, 255, 255, 255, 255, 255, 1, 255],
+      [255, 1, 1, 1, 1, 1, 1, 1, 1, 255],
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+    ],
+    "sketch": [
+      "##########",
+      "#........#",
+      "#.tttttt.#",
+      "#.tttttt.#",
+      "#.tttttt.#",
+      "#........#",
+      "##########"
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "t": [1.2, "shape:2"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6],
+      [0.6, null, null, null, null, null, null, null, null, 0.6],
+      [0.6, null, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, null, 0.6],
+      [0.6, null, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, null, 0.6],
+      [0.6, null, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, null, 0.6],
+      [0.6, null, null, null, null, null, null, null, null, 0.6],
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["wall", "", "", "", "", "", "", "", "", "wall"],
+      ["wall", "", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "", "wall"],
+      ["wall", "", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "", "wall"],
+      ["wall", "", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "shape:2", "", "wall"],
+      ["wall", "", "", "", "", "", "", "", "", "wall"],
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"]
+    ]
+  },
+  {
+    "name": "J_erase_beside_strip",
+    "comment": "C with the wall cells either side of the strip erased (x) and one ring cell erased: the back row is no longer strip and drops to 0.45; erased cells have no box",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}},
+    "erased": [3, 11, 52],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "###xfffffffx###",
+      "....fiiiiif....",
+      "....fiiiiif....",
+      "....fffxfff....",
+      "..............."
+    ],
+    "legend": {".": [null, ""], "x": [null, ""], "#": [0.6, "wall"], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, 0.6, 0.6, 0.6],
+      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.45, 0.45, 0.45, null, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "wall", "wall", "wall"],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "shape:1", "shape:1", "shape:1", "", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "J2_erase_one_side",
+    "comment": "C with only the wall cell left of the strip erased: the right-hand wall still continues the line, so the back row stays strip; nothing continues past its left end cell (an L), so step 3b makes the left side edge strip too, at wall height",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}},
+    "erased": [3],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "###xSSSSSSS####",
+      "....Siiiiif....",
+      "....Siiiiif....",
+      "....Sffffff....",
+      "..............."
+    ],
+    "legend": {".": [null, ""], "x": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, null, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6],
+      [null, null, null, null, 0.6, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.6, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, 0.6, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null, null, null],
+      [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall"],
+      ["", "", "", "", "wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", ""],
+      ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "M_lone_speck",
+    "comment": "a lone wall speck beside a ring: runs 1 and 1, not strictly longer, so the ring stays free; the speck stays wall",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.45}},
+    "erased": [],
+    "cells": [
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [0, 0, 255, 255, 255, 255, 255, 255, 0, 0],
+      [0, 0, 255, 1, 1, 1, 1, 255, 255, 0],
+      [0, 0, 255, 255, 255, 255, 255, 255, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "..........",
+      "..ffffff..",
+      "..fiiiif#.",
+      "..ffffff..",
+      ".........."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "f": [0.45, "shape:1"], "i": [0.45, "shape:1"]},
+    "heights": [
+      [null, null, null, null, null, null, null, null, null, null],
+      [null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null],
+      [null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, 0.6, null],
+      [null, null, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45, null, null],
+      [null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["", "", "", "", "", "", "", "", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "wall", ""],
+      ["", "", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", ""],
+      ["", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "N_corner_doorway",
+    "comment": "table (0.30) in a room corner whose back wall ends one cell past it at a doorway: step 3 makes only the corner column strip (the wall left past the table is a 1x1 speck); step 3b makes the whole back row strip at that L corner; the side facing the doorway and the edge facing the room stay free at 0.30",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.3}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "SSSSSSSS#....###",
+      "Siiiiiif........",
+      "Siiiiiif........",
+      "Sfffffff........",
+      "#...............",
+      "#..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.3, "shape:1"], "i": [0.3, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, null, null, null, null, 0.6, 0.6, 0.6],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "", "", "", "", "wall", "wall", "wall"],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  },
+  {
+    "name": "N2_corner_wall_ends_at_table",
+    "comment": "as N but the back wall ends exactly at the table's far corner: step 3b makes the back row strip; the far side edge stays free at 0.30, since its top cell is strip only by step 3b (no chaining)",
+    "wall_height": 0.6,
+    "shapes": {"1": {"fill": true, "height": 0.3}},
+    "erased": [],
+    "cells": [
+      [255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 255, 255, 255],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 1, 1, 1, 1, 1, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      [255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ],
+    "sketch": [
+      "SSSSSSSS.....###",
+      "Siiiiiif........",
+      "Siiiiiif........",
+      "Sfffffff........",
+      "#...............",
+      "#..............."
+    ],
+    "legend": {".": [null, ""], "#": [0.6, "wall"], "S": [0.6, "wall"], "f": [0.3, "shape:1"], "i": [0.3, "shape:1"]},
+    "heights": [
+      [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, null, null, null, null, null, 0.6, 0.6, 0.6],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+      [0.6, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+    ],
+    "kinds": [
+      ["wall", "wall", "wall", "wall", "wall", "wall", "wall", "wall", "", "", "", "", "", "wall", "wall", "wall"],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "shape:1", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
+      ["wall", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    ]
+  }
+]

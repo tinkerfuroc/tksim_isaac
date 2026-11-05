@@ -54,6 +54,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -526,6 +528,7 @@ class RaycastLidar:
         self._last_physics_step: int | None = None
         self._callback_folds = 0
         self._poll_folds = 0
+        self._substep_folds = 0
         self._last_reading_len = -1
         self._last_points = -1
         self._last_raw_hits = -1
@@ -534,6 +537,12 @@ class RaycastLidar:
         #: First hit prim path seen, kept once so the status heartbeat can show
         #: WHAT the sensor is actually hitting without streaming every path.
         self._last_sample_path = ""
+        #: Opt-in wall-time attribution (TINKER_SIM_PROFILE=1), read like the
+        #: backend's step profile: where the lidar's Python cost per fold goes.
+        self.profile_enabled = os.environ.get("TINKER_SIM_PROFILE") == "1"
+        self._profile = {"get_data": 0.0, "self_mask": 0.0, "fold": 0.0, "calls": 0}
+        #: Physics-step counter the de-dup keys on; injectable for tests.
+        self._step_counter = self._sensor_module_step_count
 
     # -- lifecycle ------------------------------------------------------
 
@@ -596,11 +605,12 @@ class RaycastLidar:
         # sequence.
         #
         # Measured caveat: in the production loop this callback is never
-        # dispatched at all (`callback_folds` stayed 0 across a full run while
-        # `poll_folds` reached 1261), because physics is stepped through
-        # IsaacLab's SimulationContext rather than SimulationManager. The
-        # gateway's publish-path poll is what actually drives the accumulator;
-        # this subscription is kept for loops that DO step through
+        # dispatched (`callback_folds` stayed 0 across a full run), because
+        # physics is stepped through IsaacLab's SimulationContext rather than
+        # SimulationManager. The backend's post-substep hook
+        # (`add_post_substep_hook`, source="substep") is what drives the
+        # accumulator; the gateway's publish-path poll is only a fallback.
+        # This subscription is kept for loops that DO step through
         # SimulationManager, and double-driving is safe because folding is
         # deduplicated by physics step.
         self._callback_uid = SimulationManager.register_callback(
@@ -643,9 +653,10 @@ class RaycastLidar:
         through IsaacLab's ``SimulationContext``, where the event is not
         guaranteed to be dispatched -- which is exactly how the first live nav
         battery produced a sensor that cast rays (GPU busy, no errors logged)
-        while ``/livox/lidar`` stayed silent for the entire run. The gateway
-        therefore also polls ``accumulate()`` on its publish path, and folding
-        is deduplicated by physics step so both drivers together stay correct.
+        while ``/livox/lidar`` stayed silent for the entire run. The backend's
+        post-substep hook drives ``accumulate()`` in production; the gateway's
+        publish-path poll is only a fallback, and folding is deduplicated by
+        physics step so both drivers together stay correct.
         """
         self.accumulate(source="callback")
 
@@ -659,21 +670,25 @@ class RaycastLidar:
         """
         if self.sensor is None or self._accumulator is None:
             return
+        clock = time.perf_counter if self.profile_enabled else None
+        t0 = clock() if clock else 0.0
         try:
-            data = self.sensor.get_data()
-            step = data.get("physics_step")
+            step, hits, paths = self._read()
             if step is not None and step == self._last_physics_step:
                 # This physics step was already folded by the other driver.
                 return
             self._last_physics_step = step
-            hits = data["hit_positions"]
+            t1 = clock() if clock else 0.0
             if self.spec.self_filter:
-                hits = self._drop_self_hits(hits, data.get("hit_prim_paths"))
+                hits = self._drop_self_hits(hits, paths)
+            t2 = clock() if clock else 0.0
         except Exception as exc:  # noqa: BLE001
             self._report_once("read", exc)
             return
         if source == "callback":
             self._callback_folds += 1
+        elif source == "substep":
+            self._substep_folds += 1
         else:
             self._poll_folds += 1
         try:
@@ -689,6 +704,38 @@ class RaycastLidar:
             self._pending = self._accumulator.take_frame()
             self._last_points = int(self._pending[0].shape[0])
             self._frame_ready = True
+        if clock:
+            t3 = clock()
+            prof = self._profile
+            prof["get_data"] += t1 - t0
+            prof["self_mask"] += t2 - t1
+            prof["fold"] += t3 - t2
+            prof["calls"] += 1
+
+    def _sensor_module_step_count(self) -> int:
+        """The step counter `RaycastSensor.get_data()` stamps its frames with.
+
+        Isaac Lab rebinds ``isaacsim.core.simulation_manager.SimulationManager``
+        after the sensor module has bound it; use the sensor module's own
+        binding, exactly what get_data() uses. Resolved at call time because
+        ``self.sensor`` only exists after initialize().
+        """
+        module = sys.modules[type(self.sensor).__module__]
+        return int(module.SimulationManager.get_num_physics_steps())
+
+    def _read(self) -> tuple[int | None, Any, Any]:
+        """``(physics_step, hit_positions, hit_prim_paths)`` from the raw reading.
+
+        `RaycastSensor.get_data()` converts every field of the C++ reading to
+        Python on each call -- depths, normals and one path string per ray --
+        while the rig uses only positions and (for the self-filter) paths.
+        Reading the struct directly skips the rest.
+        """
+        reading = self.sensor.get_sensor_reading()
+        if not reading.is_valid:
+            return self._step_counter(), np.zeros((0, 3), dtype=np.float32), None
+        paths = reading.hit_prim_paths if self.spec.self_filter else None
+        return self._step_counter(), reading.hit_positions, paths
 
     def _drop_self_hits(self, hit_positions: Any, hit_prim_paths: Any) -> np.ndarray:
         """Zero out returns that landed on the robot.
@@ -747,6 +794,7 @@ class RaycastLidar:
             "window_steps": accumulator.window_steps if accumulator else 0,
             "callback_folds": self._callback_folds,
             "poll_folds": self._poll_folds,
+            "substep_folds": self._substep_folds,
             # Length of the last reading and the sensor's own validity flag.
             # A sensor that constructs cleanly but is never EVALUATED returns a
             # zero-length reading forever; the accumulator tolerates that (an
@@ -781,6 +829,20 @@ class RaycastLidar:
                 report["is_valid"] = None
                 report["reading_error"] = repr(exc)[:120]
         return report
+
+    def profile_snapshot(self) -> dict[str, float | int]:
+        """Per-fold ms attribution since the last snapshot; resets the window."""
+        prof = self._profile
+        calls = prof["calls"]
+        n = max(1, calls)
+        out: dict[str, float | int] = {
+            key: round(1000.0 * prof[key] / n, 3) for key in ("get_data", "self_mask", "fold")
+        }
+        out["calls"] = calls
+        for key in ("get_data", "self_mask", "fold"):
+            prof[key] = 0.0
+        prof["calls"] = 0
+        return out
 
     def take_frame(self) -> tuple[np.ndarray, np.ndarray] | None:
         """The most recent complete frame, or ``None`` if one is not ready."""

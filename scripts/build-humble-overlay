@@ -14,4 +14,4 @@ cd "${project_root}/ros2_ws"
 # bound colcon package workers; a pre-set higher MAKEFLAGS cannot escape it.
 export MAKEFLAGS="-j2 -l2"
 exec colcon build --symlink-install --parallel-workers 2 \
-  --packages-select tinker_sim_interfaces tinker_sim_bridge
+  --packages-select tinker_sim_interfaces tinker_sim_bridge tinker_sim_nav_plugins

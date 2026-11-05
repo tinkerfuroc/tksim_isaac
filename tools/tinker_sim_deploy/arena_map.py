@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import math
 import xml.etree.ElementTree as ET
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping, Sequence
 
-from .arena_world import ArenaLayout, BoxCollider
+from .arena_world import ArenaLayout, BoxCollider, FurniturePlacement
 from .robot_geometry import base_rest_height
+
+if TYPE_CHECKING:
+    import numpy as np
 
 _OCCUPIED = 0
 _FREE = 254
@@ -53,12 +56,30 @@ def livox_scan_band(robot_urdf_bytes: bytes) -> tuple[float, float]:
     return sensor + SCAN_BAND_MIN_ABOVE_SENSOR_M, sensor + SCAN_BAND_MAX_ABOVE_SENSOR_M
 
 
-def _footprints_at(
-    layout: ArenaLayout,
-    colliders: Mapping[str, tuple[BoxCollider, ...]],
+def instance_footprints(
+    item: FurniturePlacement,
+    boxes: Sequence[BoxCollider],
     band: tuple[float, float],
 ) -> list[tuple[float, float, float, float, float]]:
-    """(cx, cy, half_x, half_y, yaw) rectangles whose z-range overlaps the band."""
+    """(cx, cy, half_x, half_y, yaw) rectangles of one furniture item's boxes
+    whose z-range overlaps the band."""
+    low, high = band
+    rects = []
+    for box in boxes:
+        world_z = item.position[2] + box.center[2]
+        if not (world_z - box.size[2] / 2.0 <= high and low <= world_z + box.size[2] / 2.0):
+            continue
+        cos_y, sin_y = math.cos(item.yaw), math.sin(item.yaw)
+        cx = item.position[0] + cos_y * box.center[0] - sin_y * box.center[1]
+        cy = item.position[1] + sin_y * box.center[0] + cos_y * box.center[1]
+        rects.append((cx, cy, box.size[0] / 2.0, box.size[1] / 2.0,
+                      item.yaw + box.yaw))
+    return rects
+
+
+def _wall_footprints(
+    layout: ArenaLayout, band: tuple[float, float]
+) -> list[tuple[float, float, float, float, float]]:
     low, high = band
     rects = []
     for wall in layout.walls:
@@ -67,19 +88,69 @@ def _footprints_at(
         if z_low <= high and low <= z_high:
             rects.append((wall.center[0], wall.center[1],
                           wall.size[0] / 2.0, wall.size[1] / 2.0, wall.yaw))
+    return rects
+
+
+def _footprints_at(
+    layout: ArenaLayout,
+    colliders: Mapping[str, tuple[BoxCollider, ...]],
+    band: tuple[float, float],
+) -> list[tuple[float, float, float, float, float]]:
+    """(cx, cy, half_x, half_y, yaw) rectangles whose z-range overlaps the band."""
+    rects = _wall_footprints(layout, band)
     for item in layout.furniture:
-        for box in colliders.get(item.model_id, ()):
-            world_z = item.position[2] + box.center[2]
-            if not (world_z - box.size[2] / 2.0 <= high and low <= world_z + box.size[2] / 2.0):
-                continue
-            cos_y, sin_y = math.cos(item.yaw), math.sin(item.yaw)
-            cx = item.position[0] + cos_y * box.center[0] - sin_y * box.center[1]
-            cy = item.position[1] + sin_y * box.center[0] + cos_y * box.center[1]
-            rects.append((cx, cy, box.size[0] / 2.0, box.size[1] / 2.0,
-                          item.yaw + box.yaw))
+        rects.extend(instance_footprints(item, colliders.get(item.model_id, ()), band))
     if not rects:
         raise ArenaMapError("no geometry intersects the scan band")
     return rects
+
+
+_SUBCELL_M = 0.005
+
+
+def _outline_cells(
+    outlines: Mapping[str, Sequence[np.ndarray]],
+    origin_x: float, origin_y: float, width: int, height: int, resolution: float,
+) -> np.ndarray:
+    """(height, width) bool, row 0 = lowest world y: the map cells touched by
+    any instance's outline. Each instance is rasterized on a 0.005 m sub-grid
+    over its bounding window, enclosed hollows are filled, and a cell is
+    occupied if any of its sub-cells is."""
+    import numpy as np
+    from scipy.ndimage import binary_fill_holes
+
+    factor = max(1, int(round(resolution / _SUBCELL_M)))
+    sub = resolution / factor
+    cells = np.zeros((height, width), dtype=bool)
+    for polygons in outlines.values():
+        polys = [np.asarray(p, dtype=np.float64) for p in polygons]
+        if not polys:
+            continue
+        allp = np.concatenate(polys)
+        lo, hi = allp.min(axis=0), allp.max(axis=0)
+        c0 = int(math.floor((lo[0] - origin_x) / resolution))
+        c1 = int(math.floor((hi[0] - origin_x) / resolution)) + 1
+        r0 = int(math.floor((lo[1] - origin_y) / resolution))
+        r1 = int(math.floor((hi[1] - origin_y) / resolution)) + 1
+        nx, ny = c1 - c0, r1 - r0
+        xs = origin_x + c0 * resolution + (np.arange(nx * factor) + 0.5) * sub
+        ys = origin_y + r0 * resolution + (np.arange(ny * factor) + 0.5) * sub
+        mask = np.zeros((ny * factor, nx * factor), dtype=bool)
+        for poly in polys:
+            inside = np.ones(mask.shape, dtype=bool)
+            for i in range(len(poly)):
+                x0, y0 = poly[i]
+                x1, y1 = poly[(i + 1) % len(poly)]
+                inside &= (x1 - x0) * (ys[:, None] - y0) - (y1 - y0) * (xs[None, :] - x0) >= 0.0
+            mask |= inside
+        mask = binary_fill_holes(mask)
+        window = mask.reshape(ny, factor, nx, factor).any(axis=(1, 3))
+        # crop the window to the grid
+        gr0, gr1 = max(r0, 0), min(r1, height)
+        gc0, gc1 = max(c0, 0), min(c1, width)
+        if gr0 < gr1 and gc0 < gc1:
+            cells[gr0:gr1, gc0:gc1] |= window[gr0 - r0:gr1 - r0, gc0 - c0:gc1 - c0]
+    return cells
 
 
 def rasterize(
@@ -90,8 +161,13 @@ def rasterize(
     scan_height: float | None = None,
     resolution: float = 0.05,
     padding_m: float = 0.5,
+    furniture_outlines: Mapping[str, Sequence[np.ndarray]] | None = None,
 ) -> tuple[bytes, bytes]:
-    """``scan_band`` (low, high) above the floor; ``scan_height`` alone is a plane slice."""
+    """``scan_band`` (low, high) above the floor; ``scan_height`` alone is a plane slice.
+
+    ``furniture_outlines`` (instance name -> world-XY convex polygons) draws
+    each furniture instance from its outline instead of its boxes; the grid
+    frame is still computed from walls + boxes, so ``map.yaml`` is the same."""
     if (scan_band is None) == (scan_height is None):
         raise ArenaMapError("pass exactly one of scan_band or scan_height")
     band = scan_band if scan_band is not None else (scan_height, scan_height)
@@ -118,12 +194,21 @@ def rasterize(
                 return True
         return False
 
+    if furniture_outlines is not None:
+        rects = _wall_footprints(layout, band)  # boxes are not drawn; cell_occupied sees walls only
+        drawn = _outline_cells(furniture_outlines, origin_x, origin_y, width, height, resolution)
+    else:
+        drawn = None
+
     rows = bytearray()
     for row in range(height):                      # top row = highest world y
         world_y = origin_y + (height - row - 0.5) * resolution
         for col in range(width):
             world_x = origin_x + (col + 0.5) * resolution
-            rows.append(_OCCUPIED if cell_occupied(world_x, world_y) else _FREE)
+            if cell_occupied(world_x, world_y) or (drawn is not None and drawn[height - row - 1][col]):
+                rows.append(_OCCUPIED)
+            else:
+                rows.append(_FREE)
     pgm = b"P5\n%d %d\n255\n" % (width, height) + bytes(rows)
     map_yaml = (
         "image: map.pgm\n"

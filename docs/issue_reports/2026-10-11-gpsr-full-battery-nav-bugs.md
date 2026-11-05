@@ -16,7 +16,7 @@ Timestamps below are epoch seconds minus 1791640000.
 
 ## Bug A: RPP "collision ahead" loops at stand poses next to furniture
 
-**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-pos-time-fix) for the fixed furniture nav poses and the sim-time goto budget. Both decision items are implemented in tk25_decision `e4e8b5f` (dev-gpsr-2), pending live verification.
+**Owners:** Nav2 config (debug-gpsr-nav-issue) for the controller and recovery side; approach planner (gpsr-issue-2-approach-planner) for stand-pose selection; decision (gpsr-pos-time-fix) for the fixed furniture nav poses and the sim-time goto budget. Both decision items are implemented in tk25_decision `e4e8b5f` (dev-gpsr-2) and were **verified live on 2026-10-11** by gpsr-pos-time-fix (`bench/t2-navpose-20261011/RESULTS.md`), and merged to main as tk25_decision PR #16 (`7cddbf8`). Furniture poses: 8/8 BT gotos SUCCESS with 0 collision-ahead, 0 patience aborts and 0 goto timeouts over 4 arrivals and 4 returns. Sim-time budget: a 20 s budget cancelled at 20.0 s of Nav2 time = 61.2 wall-s (RTF about 0.33), where the old code would have fired at 20 wall-s. No leg went past 120 wall-s at the default budget (longest 119 s).
 
 ### Symptom
 
@@ -101,7 +101,26 @@ This section supersedes parts of the root cause above. It comes from a live repr
   - The live test was inconclusive because `set_parameters` on the local_costmap footprint timed out.
   - Not done: this needs the tinker2_sim profile in tk25_basic (`feat/tinker2-sim-profile`), and merging that is the user's call.
 - **Approach planner footprint: withdrawn, not a problem.** The startup line `[(0.25,±0.25),(−0.3,±0.25)]` is only the YAML fallback, which is the hardware footprint. With `use_published_footprint: true`, the planner switches to `/global_costmap/published_footprint` about 2.4 s after startup and logs `adopted live footprint ... [(0.21, ±0.28), (−0.46, ±0.28)]`. That is tinker2_sim plus about 1 cm of costmap padding, adopted long before the first goal in both the d217 battery and the d219 run (verified in `05-nav_extras-0.log` and `04-nav_extras-0.log`).
-- **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the working tree carries an uncommitted 0.2 from another session, and stacks run with 0.2. `d30439d` doesn't depend on either value.
+- **Config drift:** HEAD has `xy_goal_tolerance` 0.3, but the shared working tree carries an uncommitted hunk in `nav_params_overlay.py`. Because the bridge is a develop install, every shared-tree stack runs that hunk.
+  - What it changes: xy 0.2, yaw 0.25, GridBased tolerance 0.35, AMCL `max_particles` 3000, `recovery_alpha_fast` 0.1, `recovery_alpha_slow` 0.001.
+  - Origin: an orphaned 2026-09-11 stash ("nav-tuning-v2"), applied and never committed. No session owns it.
+  - Every shared-tree live result on 2026-10-10/11 ran with it.
+  - **Resolved 2026-10-12 (`e78863d`, user approved):** the tolerances were committed as they ran (xy 0.2, yaw 0.25, GridBased 0.35, RPP `min_lookahead_dist` 0.25). The AMCL `max_particles` and recovery alphas were dropped.
+- **Clean AMCL re-check (debug-gpsr-nav-issue, 2026-10-12):** run from an origin/dev `9eb4b8f` worktree with the fixed 10 Hz 24-channel scan and committed values. Pose error vs truth, 4 stops × 5 headings, mean / median / max:
+
+  | Setting | Error (m) |
+  |---|---|
+  | committed, `update_min_a` 3.0 | 0.055–0.076 / 0.044–0.060 / 0.080–0.252 |
+  | `update_min_a` 1.0 | 0.060 / 0.054 / 0.132 |
+  | `update_min_a` 0.1 | 0.042–0.049 / 0.038–0.039 / 0.079–0.104 |
+  | upstream alphas at 0.1 | 0.075 / 0.073 / 0.145 |
+  | stale hunk's AMCL and tolerance values | 0.061 / 0.065 / 0.094 |
+
+  - Alphas 0.05 (`37931d5`) hold.
+  - `update_min_a` 3.0 still prevents the side_table_02 pivot loop at xy 0.3 (158–165° of rotation). At 0.1 the loop returns: 381°, with the goal distance flip-flopping 0.28–0.31 m across the boundary.
+  - The cost of 3.0 is about 1–3 cm of stop accuracy, because AMCL can't refine during goal pivots. Getting both would need hysteresis on RPP's xy-tolerance pivot decision, which is a controller design call.
+  - The stale hunk's AMCL values show no measurable benefit.
+  - Still seen: the side_table_02 → home departure from a pose parked 0.3 m from the goal gave 28–30 collision-ahead warnings and 1 patience abort per run.
 
 ### Live check of the approach-planner fix (2026-10-11, tk26_navigation PR #11, merged as `f82e397` and installed in `~/tk25_ws/install`)
 
@@ -129,8 +148,15 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
     - tinker-sim `5329467`; tk25_basic `f381bc5` on `feat/tinker2-sim-profile`, not pushed. `tinker_robot_config` is rebuilt in `~/tk25_ws/install`, so new stacks get it.
     - The approach planner adopts the live footprint, so it follows automatically.
     - `costmap_check.py` now checks `SIM` (new) and `SIM_OLD` (the numbers in this report). Static: departure pose (1.06, 1.75) 22 → 10/72 lethal; PR #11 stand pose (1.08, 1.73) 18 → 0/72; kitchen_table nav pose (3.56, −2.14) 0/72.
-    - Live check pending.
+    - **Live check (debug-gpsr-nav-issue, 2026-10-11 22:26, plain NavigateToPose, RTF ~0.3):** the PR #11 departure deadlock did not reproduce.
+      - Like-for-like, robot placed at the PR #11 departure pose (AMCL (1.08, 1.73), facing ~175°): stand → kitchen nav pose had 0 warnings and 0 patience aborts in both of 2 runs, against 85 warnings and 1 patience abort in PR #11.
+      - Seven legs near side_table_02 had 0 patience aborts in total.
+      - The only warnings were 29 on one departure from a pose 0.2 m closer to the table, (1.10, 1.94). That departure still completed without a costmap clear.
+      - home → side_table_02 nav pose: 0 warnings, against 34 in PR #11.
+      - Small N.
+      - Logs: `/tmp/claude-1002/bugA/stack-d211/20261011T222630`.
 - **Remaining issue 2:** with the chairs, every kitchen_table stand pose sits at the 1.0 m stand-off maximum (1.10–1.19 m from the target, vs about 0.95 m before the PR). Manipulation should check whether that is within grasp reach.
+  - **Follow-up:** this is tracked as tk25_decision issue #17. The arm base is at x −0.03 from base_link, with about 0.62–0.70 m of reach. The decision asks for 0.75 m but passes no `max_distance`, so the planner returns its 1.0 m maximum, and RPP then parks 0.18–0.19 m short of that. A live-manip check has not been run yet.
 - **Misleading warning:** "no usable stand pose with 0.15 m clearance" in K2 actually means a 0.15 m candidate existed but failed TURN. Reworded in PR #11 `054d8a7` to "chosen pose (x, y) has only 0.05 m footprint clearance (preferred 0.15 m): …"; grep for "has only" in future logs.
 
 ### Related: wheels kept driving after `/cmd_vel` went to zero (sim base drive, open)
@@ -145,7 +171,7 @@ Run by gpsr-issue-2-approach-planner. Setup: GPU 0, domain 219, mock manipulatio
   - The stall overflowed the depth-50 `/isaac_joint_commands` reader. The Isaac gateway's strict snapshot contiguity then rejected every later packet.
   - The backend held its last wheel velocity until the 5 s command-stream timeout fired (`command_stream_lost` in `01-sim.log`, wall_age 19.47 s). That matches odom dropping to 0 at t+67.60.
   - Separately, the wheel slew wrote its slewed value back into the command buffer, so a zero command braked by only one slew step per packet.
-- **Fix:** branch `fix/wheel-overrun-command-gap` (`b284a7e`, not merged).
+- **Fix:** merged to dev as PR #30 (`76414f4`, merge `9915150`); originally branch `fix/wheel-overrun-command-gap` (`b284a7e`).
   - A forward snapshot gap now stops the robot immediately; it recovers on the next 0.25 s safety heartbeat.
   - The slew no longer overwrites the command buffer.
   - 7 new unit tests. Not yet re-run live.
